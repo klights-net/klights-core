@@ -5,10 +5,171 @@ use super::task::{
 };
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::process::{ExitStatus, Output};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessShutdownPolicy {
+    /// Terminate and reap the child when root shutdown begins.
+    KillAndReap,
+    /// Intentionally leave a still-running child alive during root shutdown
+    /// while releasing its supervisor registration. This is reserved for
+    /// externally recoverable daemons whose shutdown contract explicitly
+    /// preserves their workloads. Dropping the control handle without root
+    /// shutdown always kills and reaps the child.
+    Preserve,
+}
+
+#[derive(Debug)]
+pub enum ProcessError {
+    Admission(TaskAdmissionError),
+    Spawn(std::io::Error),
+    Io {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    Join(TaskJoinError),
+    Cancelled,
+    Preserved,
+    ControlClosed,
+}
+
+impl fmt::Display for ProcessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Admission(error) => error.fmt(formatter),
+            Self::Spawn(error) => write!(formatter, "failed to spawn process: {error}"),
+            Self::Io { operation, source } => {
+                write!(formatter, "process {operation} failed: {source}")
+            }
+            Self::Join(error) => write!(formatter, "supervised process task failed: {error}"),
+            Self::Cancelled => formatter.write_str("process cancelled by supervisor shutdown"),
+            Self::Preserved => {
+                formatter.write_str("process intentionally preserved after shutdown")
+            }
+            Self::ControlClosed => formatter.write_str("supervised process control channel closed"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Admission(error) => Some(error),
+            Self::Spawn(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
+            Self::Join(error) => Some(error),
+            Self::Cancelled | Self::Preserved | Self::ControlClosed => None,
+        }
+    }
+}
+
+impl From<TaskAdmissionError> for ProcessError {
+    fn from(error: TaskAdmissionError) -> Self {
+        Self::Admission(error)
+    }
+}
+
+impl From<TaskJoinError> for ProcessError {
+    fn from(error: TaskJoinError) -> Self {
+        Self::Join(error)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ProcessTerminal {
+    Exited(ExitStatus),
+    Io {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    Preserved,
+}
+
+impl ProcessTerminal {
+    fn wait_result(&self) -> std::result::Result<ExitStatus, ProcessError> {
+        match self {
+            Self::Exited(status) => Ok(*status),
+            Self::Io {
+                operation,
+                kind,
+                message,
+            } => Err(ProcessError::Io {
+                operation,
+                source: std::io::Error::new(*kind, message.clone()),
+            }),
+            Self::Preserved => Err(ProcessError::Preserved),
+        }
+    }
+}
+
+enum ProcessCommand {
+    Wait(oneshot::Sender<std::result::Result<ExitStatus, ProcessError>>),
+    Kill(oneshot::Sender<std::result::Result<(), ProcessError>>),
+}
+
+/// Control handle for a child whose lifetime is owned and observed by
+/// [`TaskSupervisor`]. Dropping the handle kills and reaps the child. The
+/// explicit shutdown policy applies only when root shutdown begins, allowing
+/// selected daemons to be deliberately detached for an external owner to
+/// reuse.
+#[derive(Debug)]
+pub struct SupervisedChild {
+    pid: u32,
+    control: Option<mpsc::Sender<ProcessCommand>>,
+    terminal: Arc<Mutex<Option<ProcessTerminal>>>,
+}
+
+impl SupervisedChild {
+    pub fn id(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    pub async fn wait(&mut self) -> std::result::Result<ExitStatus, ProcessError> {
+        if let Some(terminal) = lock_recover(&self.terminal).clone() {
+            return terminal.wait_result();
+        }
+        let (reply, result) = oneshot::channel();
+        let Some(control) = &self.control else {
+            return Err(ProcessError::ControlClosed);
+        };
+        if control.send(ProcessCommand::Wait(reply)).await.is_err() {
+            return lock_recover(&self.terminal)
+                .clone()
+                .map_or(Err(ProcessError::ControlClosed), |terminal| {
+                    terminal.wait_result()
+                });
+        }
+        result.await.unwrap_or_else(|_| {
+            lock_recover(&self.terminal)
+                .clone()
+                .map_or(Err(ProcessError::ControlClosed), |terminal| {
+                    terminal.wait_result()
+                })
+        })
+    }
+
+    pub async fn kill(&mut self) -> std::result::Result<(), ProcessError> {
+        if let Some(terminal) = lock_recover(&self.terminal).clone() {
+            return terminal.wait_result().map(|_| ());
+        }
+        let (reply, result) = oneshot::channel();
+        let Some(control) = &self.control else {
+            return Err(ProcessError::ControlClosed);
+        };
+        control
+            .send(ProcessCommand::Kill(reply))
+            .await
+            .map_err(|_| ProcessError::ControlClosed)?;
+        result.await.unwrap_or(Err(ProcessError::ControlClosed))
+    }
+}
 
 #[derive(Clone)]
 pub struct TaskSupervisor {
@@ -28,6 +189,8 @@ struct TaskSupervisorInner {
     category_free_notifies: HashMap<TaskCategory, Arc<Notify>>,
     #[cfg(test)]
     terminal_cleanup_pause: Mutex<Option<Arc<TerminalCleanupPause>>>,
+    #[cfg(test)]
+    process_startup_pause: Mutex<Option<Arc<ProcessStartupPause>>>,
 }
 
 #[derive(Clone)]
@@ -35,6 +198,7 @@ struct ManagedTaskControl {
     abort_handle: tokio::task::AbortHandle,
     completion: Arc<TaskCompletion>,
     abort_source: Arc<AtomicU8>,
+    abort_on_shutdown_timeout: bool,
 }
 
 struct LifecycleState {
@@ -85,6 +249,8 @@ impl TaskSupervisor {
                 category_free_notifies,
                 #[cfg(test)]
                 terminal_cleanup_pause: Mutex::new(None),
+                #[cfg(test)]
+                process_startup_pause: Mutex::new(None),
             }),
         }
     }
@@ -181,11 +347,33 @@ impl TaskSupervisor {
         pause
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_next_process_startup_handoff(&self) -> Arc<ProcessStartupPause> {
+        let pause = Arc::new(ProcessStartupPause::new());
+        *lock_recover(&self.inner.process_startup_pause) = Some(pause.clone());
+        pause
+    }
+
     pub async fn spawn_async<T, F>(
         &self,
         category: TaskCategory,
         name: impl Into<String>,
         future: F,
+    ) -> std::result::Result<SupervisedJoinHandle<T>, TaskAdmissionError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        self.spawn_async_with_shutdown_abort(category, name, future, true)
+            .await
+    }
+
+    async fn spawn_async_with_shutdown_abort<T, F>(
+        &self,
+        category: TaskCategory,
+        name: impl Into<String>,
+        future: F,
+        abort_on_shutdown_timeout: bool,
     ) -> std::result::Result<SupervisedJoinHandle<T>, TaskAdmissionError>
     where
         T: Send + 'static,
@@ -255,6 +443,7 @@ impl TaskSupervisor {
                 abort_handle: handle.abort_handle(),
                 completion,
                 abort_source: abort_source.clone(),
+                abort_on_shutdown_timeout,
             },
         );
         let _ = start_tx.send(());
@@ -306,6 +495,84 @@ impl TaskSupervisor {
         F: FnOnce() -> T + Send + 'static,
     {
         self.run_blocking(TaskCategory::File, name, f).await
+    }
+
+    /// Run a short-lived command to completion as an asynchronous managed
+    /// task. Both output pipes are drained concurrently, and root shutdown
+    /// kills and reaps the child before the task registration is released.
+    pub async fn run_process_output(
+        &self,
+        category: TaskCategory,
+        name: impl Into<String>,
+        command: std::process::Command,
+    ) -> std::result::Result<Output, ProcessError> {
+        let cancellation = self.root_cancellation_token();
+        self.spawn_async_with_shutdown_abort(
+            category,
+            name,
+            async move { run_process_output(cancellation, command).await },
+            false,
+        )
+        .await?
+        .join()
+        .await?
+    }
+
+    /// Spawn a child whose lifecycle remains supervised until it exits, is
+    /// killed and reaped, or is explicitly preserved by shutdown policy.
+    pub async fn spawn_process(
+        &self,
+        category: TaskCategory,
+        name: impl Into<String>,
+        command: std::process::Command,
+        shutdown_policy: ProcessShutdownPolicy,
+    ) -> std::result::Result<SupervisedChild, ProcessError> {
+        let cancellation = self.root_cancellation_token();
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let (startup_tx, startup_rx) = oneshot::channel();
+        let terminal = Arc::new(Mutex::new(None));
+        let actor_terminal = terminal.clone();
+        #[cfg(test)]
+        let startup_pause = lock_recover(&self.inner.process_startup_pause).take();
+        let managed = self
+            .spawn_async_with_shutdown_abort(
+                category,
+                name,
+                async move {
+                    run_process_actor(
+                        cancellation,
+                        command,
+                        shutdown_policy,
+                        control_rx,
+                        startup_tx,
+                        actor_terminal,
+                        #[cfg(test)]
+                        startup_pause,
+                    )
+                    .await;
+                },
+                false,
+            )
+            .await?;
+
+        match startup_rx.await {
+            Ok(Ok(pid)) => {
+                drop(managed);
+                Ok(SupervisedChild {
+                    pid,
+                    control: Some(control_tx),
+                    terminal,
+                })
+            }
+            Ok(Err(error)) => {
+                managed.join().await?;
+                Err(error)
+            }
+            Err(_) => {
+                managed.join().await?;
+                Err(ProcessError::ControlClosed)
+            }
+        }
     }
 
     /// Backend-neutral supervised DB blocking helper.
@@ -592,6 +859,9 @@ impl TaskSupervisor {
         let mut abort_requests = Vec::new();
         if timed_out {
             for control in &pending {
+                if !control.abort_on_shutdown_timeout {
+                    continue;
+                }
                 control
                     .abort_source
                     .compare_exchange(
@@ -911,6 +1181,60 @@ impl TerminalCleanupPause {
     }
 }
 
+#[cfg(test)]
+pub(crate) struct ProcessStartupPause {
+    pid: AtomicU64,
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: AtomicBool,
+    release_notify: Notify,
+}
+
+#[cfg(test)]
+impl ProcessStartupPause {
+    fn new() -> Self {
+        Self {
+            pid: AtomicU64::new(0),
+            entered: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+            released: AtomicBool::new(false),
+            release_notify: Notify::new(),
+        }
+    }
+
+    async fn pause(&self, pid: u32) {
+        self.pid.store(u64::from(pid), Ordering::Release);
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_one();
+        let released = self.release_notify.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if !self.released.load(Ordering::Acquire) {
+            released.await;
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        let entered = self.entered_notify.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        if !self.entered.load(Ordering::Acquire) {
+            entered.await;
+        }
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
+        u32::try_from(self.pid.load(Ordering::Acquire))
+            .ok()
+            .filter(|pid| *pid != 0)
+    }
+
+    pub(crate) fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_one();
+    }
+}
+
 #[derive(Debug)]
 pub struct SupervisedJoinHandle<T> {
     inner: tokio::task::JoinHandle<T>,
@@ -928,6 +1252,255 @@ impl<T> SupervisedJoinHandle<T> {
     pub async fn join(self) -> std::result::Result<T, TaskJoinError> {
         self.inner.await.map_err(TaskJoinError::new)
     }
+}
+
+async fn run_process_output(
+    cancellation: CancellationToken,
+    command: std::process::Command,
+) -> std::result::Result<Output, ProcessError> {
+    if cancellation.is_cancelled() {
+        return Err(ProcessError::Admission(TaskAdmissionError::ShuttingDown));
+    }
+    let mut command = tokio::process::Command::from(command);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+    let mut stdout = child.stdout.take().ok_or_else(|| ProcessError::Io {
+        operation: "capture stdout",
+        source: std::io::Error::other("spawned process has no stdout pipe"),
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| ProcessError::Io {
+        operation: "capture stderr",
+        source: std::io::Error::other("spawned process has no stderr pipe"),
+    })?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+
+    enum Completion {
+        Finished(
+            std::io::Result<ExitStatus>,
+            std::io::Result<usize>,
+            std::io::Result<usize>,
+        ),
+        Cancelled,
+    }
+
+    let completion = {
+        let completion = async {
+            tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes)
+            )
+        };
+        tokio::pin!(completion);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Completion::Cancelled,
+            result = &mut completion => Completion::Finished(result.0, result.1, result.2),
+        }
+    };
+
+    match completion {
+        Completion::Finished(status, stdout_result, stderr_result) => {
+            let status = status.map_err(|source| ProcessError::Io {
+                operation: "wait",
+                source,
+            })?;
+            stdout_result.map_err(|source| ProcessError::Io {
+                operation: "read stdout",
+                source,
+            })?;
+            stderr_result.map_err(|source| ProcessError::Io {
+                operation: "read stderr",
+                source,
+            })?;
+            Ok(Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            })
+        }
+        Completion::Cancelled => {
+            let kill_error = child.start_kill().err();
+            let (status, stdout_result, stderr_result) = tokio::join!(
+                child.wait(),
+                stdout.read_to_end(&mut stdout_bytes),
+                stderr.read_to_end(&mut stderr_bytes)
+            );
+            if let Err(source) = status {
+                return Err(ProcessError::Io {
+                    operation: if kill_error.is_some() {
+                        "kill and reap during shutdown"
+                    } else {
+                        "reap during shutdown"
+                    },
+                    source: kill_error.unwrap_or(source),
+                });
+            }
+            stdout_result.map_err(|source| ProcessError::Io {
+                operation: "drain stdout during shutdown",
+                source,
+            })?;
+            stderr_result.map_err(|source| ProcessError::Io {
+                operation: "drain stderr during shutdown",
+                source,
+            })?;
+            Err(ProcessError::Cancelled)
+        }
+    }
+}
+
+async fn run_process_actor(
+    cancellation: CancellationToken,
+    command: std::process::Command,
+    shutdown_policy: ProcessShutdownPolicy,
+    mut control_rx: mpsc::Receiver<ProcessCommand>,
+    startup_tx: oneshot::Sender<std::result::Result<u32, ProcessError>>,
+    terminal_state: Arc<Mutex<Option<ProcessTerminal>>>,
+    #[cfg(test)] startup_pause: Option<Arc<ProcessStartupPause>>,
+) {
+    if cancellation.is_cancelled() {
+        let _ = startup_tx.send(Err(ProcessError::Admission(
+            TaskAdmissionError::ShuttingDown,
+        )));
+        return;
+    }
+
+    let mut command = tokio::process::Command::from(command);
+    command.kill_on_drop(shutdown_policy == ProcessShutdownPolicy::KillAndReap);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = startup_tx.send(Err(ProcessError::Spawn(error)));
+            return;
+        }
+    };
+    let pid = child.id().expect("a freshly spawned child must have a pid");
+    #[cfg(test)]
+    if let Some(pause) = startup_pause {
+        pause.pause(pid).await;
+    }
+    if startup_tx.send(Ok(pid)).is_err() {
+        finish_process_child(
+            &mut child,
+            ProcessShutdownPolicy::KillAndReap,
+            &terminal_state,
+        )
+        .await;
+        return;
+    }
+
+    let mut waiters = Vec::new();
+    loop {
+        enum Event {
+            Shutdown,
+            Command(Option<ProcessCommand>),
+            Exited(std::io::Result<ExitStatus>),
+        }
+
+        let event = {
+            let wait = child.wait();
+            tokio::pin!(wait);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Event::Shutdown,
+                command = control_rx.recv() => Event::Command(command),
+                status = &mut wait => Event::Exited(status),
+            }
+        };
+
+        let terminal = match event {
+            Event::Shutdown => {
+                finish_process_child(&mut child, shutdown_policy, &terminal_state).await
+            }
+            Event::Command(None) => {
+                finish_process_child(
+                    &mut child,
+                    ProcessShutdownPolicy::KillAndReap,
+                    &terminal_state,
+                )
+                .await
+            }
+            Event::Command(Some(ProcessCommand::Wait(reply))) => {
+                waiters.push(reply);
+                continue;
+            }
+            Event::Command(Some(ProcessCommand::Kill(reply))) => {
+                let terminal = kill_and_reap_child(&mut child).await;
+                let _ = reply.send(terminal.wait_result().map(|_| ()));
+                set_process_terminal(&terminal_state, terminal.clone());
+                terminal
+            }
+            Event::Exited(status) => {
+                let terminal = terminal_from_wait("wait", status);
+                set_process_terminal(&terminal_state, terminal.clone());
+                terminal
+            }
+        };
+
+        for waiter in waiters {
+            let _ = waiter.send(terminal.wait_result());
+        }
+        return;
+    }
+}
+
+async fn finish_process_child(
+    child: &mut tokio::process::Child,
+    shutdown_policy: ProcessShutdownPolicy,
+    terminal_state: &Mutex<Option<ProcessTerminal>>,
+) -> ProcessTerminal {
+    let terminal = match child.try_wait() {
+        Ok(Some(status)) => ProcessTerminal::Exited(status),
+        Ok(None) if shutdown_policy == ProcessShutdownPolicy::Preserve => {
+            ProcessTerminal::Preserved
+        }
+        Ok(None) => kill_and_reap_child(child).await,
+        Err(error) => stored_process_io("inspect before shutdown", error),
+    };
+    set_process_terminal(terminal_state, terminal.clone());
+    terminal
+}
+
+async fn kill_and_reap_child(child: &mut tokio::process::Child) -> ProcessTerminal {
+    let kill_error = child.start_kill().err();
+    match child.wait().await {
+        Ok(status) => ProcessTerminal::Exited(status),
+        Err(wait_error) => stored_process_io(
+            if kill_error.is_some() {
+                "kill and reap"
+            } else {
+                "reap"
+            },
+            kill_error.unwrap_or(wait_error),
+        ),
+    }
+}
+
+fn terminal_from_wait(
+    operation: &'static str,
+    result: std::io::Result<ExitStatus>,
+) -> ProcessTerminal {
+    match result {
+        Ok(status) => ProcessTerminal::Exited(status),
+        Err(error) => stored_process_io(operation, error),
+    }
+}
+
+fn stored_process_io(operation: &'static str, error: std::io::Error) -> ProcessTerminal {
+    ProcessTerminal::Io {
+        operation,
+        kind: error.kind(),
+        message: error.to_string(),
+    }
+}
+
+fn set_process_terminal(state: &Mutex<Option<ProcessTerminal>>, terminal: ProcessTerminal) {
+    *lock_recover(state) = Some(terminal);
 }
 
 fn encode_outcome(outcome: TaskOutcome) -> u8 {

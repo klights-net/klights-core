@@ -3,10 +3,10 @@
   "packages": {
     "klights": {
       "count": 43103,
-      "sha256": "a8f5f9a94859def17a7cd93cd8fdb48731a207e4c0c18e974c1918ec83dc4d06",
+      "sha256": "1661cbb91c01d9a704a3c78456e84c2837ce5728d3020c55424edb588aeb8928",
       "source": {
-        "count": 515299,
-        "sha256": "ac71e48195edefcef41fe6996ecad841a208ce0f776f0d0d04a93e114d4eaa5c"
+        "count": 515807,
+        "sha256": "8d751d20c237a997701052c48db82bac6e8ad8e26661c60d8a4e67d0ce8cab6a"
       }
     },
     "klights-apiserver": {
@@ -14,7 +14,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-auth": {
@@ -22,7 +22,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-cluster-core": {
@@ -30,7 +30,7 @@
       "sha256": "c192e327fd8c79f68ddc8fba847ad1b2f6afb1ac9aac4628e7e63a4c6251d350",
       "source": {
         "count": 12941,
-        "sha256": "10ddd9397ef21ea0c75d3efc12fc8972fcd53f9186a60e055d39abf44902990f"
+        "sha256": "754d62aa7073be759edd39f6592aa90ca7f74f465572d81fbab21e0639989cd9"
       }
     },
     "klights-cluster-datastore": {
@@ -38,7 +38,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-cluster-store": {
@@ -46,7 +46,7 @@
       "sha256": "3978fe3bd6853c742d2e94d713e1262239e78238be8ed23a20ede7b77ed02d60",
       "source": {
         "count": 10267,
-        "sha256": "c10261dbe37dd0f999a643e3c6c055cc44ec876f5e4e87937a56a69b9d1a6925"
+        "sha256": "10b93e561da7a5fe1f6b236fca965efdcf687a01151302594470100979bb6d5a"
       }
     },
     "klights-controllers": {
@@ -54,7 +54,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-internal-protobuf": {
@@ -62,7 +62,7 @@
       "sha256": "fc18c9aeb21c83c2f52bfda037bde0ab59942535365806e230c16312d080ea90",
       "source": {
         "count": 8562,
-        "sha256": "704466a61b3545f018112d126fe58557217ddc4e602b9a4be51637d9f361fd4e"
+        "sha256": "e029007844290a6994e8d6e8a1983869354f404650d010b108fed2b26494807e"
       }
     },
     "klights-kube-protobuf": {
@@ -70,7 +70,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-kubelet": {
@@ -78,7 +78,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-leader-api": {
@@ -86,7 +86,7 @@
       "sha256": "44d677b0669a4b9b529c09780be7fdf543f9bce93a0bc092f7a31dc7ae981ba4",
       "source": {
         "count": 12846,
-        "sha256": "f855918c6e18a840a843a272175651898c015ddbe8e12a053d4b834753f4a327"
+        "sha256": "8d27e5564af933f72e9212cefd36b3c16e04a55c59a84d11e5a932a347561af4"
       }
     },
     "klights-network-api": {
@@ -94,7 +94,7 @@
       "sha256": "22ce094b58431050c441d119bb00b295dca1aafdf659965942af01fbf7b93455",
       "source": {
         "count": 9551,
-        "sha256": "2dda7e05faa42bd0f1586bdd658182abcca4f1b370d69943600cb5b05f7c0162"
+        "sha256": "e1ee8d86f476482be80e95c7e3b988bb6a8ac8bc3782513087f146ed5e7f901a"
       }
     },
     "klights-networking": {
@@ -102,7 +102,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-node-api": {
@@ -110,7 +110,7 @@
       "sha256": "03a6f48f6b253a7b3ff1473a4cc1d75cec871f5a7e6771bc3e84d35bfa9f2556",
       "source": {
         "count": 10177,
-        "sha256": "51114c091521a70cb7faeeaa1b8b0e325b209869b2ae5e9a956cdecb4acf1d3c"
+        "sha256": "7623045bb7d21f1ae5f56200bd5697463f274f615f3f30fdcf29d78dffe5e39b"
       }
     },
     "klights-node-datastore": {
@@ -118,7 +118,7 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-node-store": {
@@ -126,7 +126,7 @@
       "sha256": "2ecac9bb1d42dc8f628673cfd279ef351af7f6c9425f1622c563611f4e728afb",
       "source": {
         "count": 12042,
-        "sha256": "1ed8fec2ac46f11ad33cee444be2e7b5d0633642050e5d933dc9c86f52f2b8e5"
+        "sha256": "08ba2586f1eee39c192d454885d6ca7cb9a9a5c6e1d547f73e38b710eac95078"
       }
     },
     "klights-pod-api": {
@@ -134,7 +134,7 @@
       "sha256": "e66294c02fe158061f621046d81c2650a4e766c7a66d4c7cabcfa13271914f09",
       "source": {
         "count": 8773,
-        "sha256": "af46309d4efe70a6733fc4d2bd4fb73256d5fb000e7061064ad29fafdc6172d1"
+        "sha256": "5507b80d32cc3b774e80ebc1966bc96fa0b595ac1dd73e4e79edde6c39029b44"
       }
     },
     "klights-reconcile-api": {
@@ -142,7 +142,7 @@
       "sha256": "ad019da2d345439d4dfb0d26404336b69894e6dde99a0eae0223e4bbaba7e8b5",
       "source": {
         "count": 7976,
-        "sha256": "ba345773129740dad6464e1765dba0fa68497963a4cc4c4bcef79c4eca7b419c"
+        "sha256": "91d6d32f4451195f8e2ed4bf523767c97c9467e4aae11bd0fccf0e94d0cf6b44"
       }
     },
     "klights-replication": {
@@ -150,15 +150,15 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
         "count": 7354,
-        "sha256": "42ffc702b32516e89106fc1de348f5a6592b6743e9672276a41caba075c92fbb"
+        "sha256": "c98c2cc1659b0b0b82a3b6e378bd8411d4990c5519108736eeed349b1fe9bc33"
       }
     },
     "klights-supervisor": {
-      "count": 558,
-      "sha256": "368b7ba9ce35fd23852bacdbede0618c5559ec8d73b56002407f1da00ab26386",
+      "count": 686,
+      "sha256": "457f83adaafffe62bbc29a1d2c4b00c863ed1614fc3b66403bc531919d55648a",
       "source": {
-        "count": 10265,
-        "sha256": "7e7f73a3a047e833e56ceb5e69ba472d8e22eecaa70082476cfad3c35c712a95"
+        "count": 11370,
+        "sha256": "94497b90a77ea69f9b0d9c945eb3e11d654bd65331c56fa54a2b50d1bfd37fa4"
       }
     },
     "klights-types": {
@@ -166,7 +166,7 @@
       "sha256": "6d05f816c8d698558b7b1e23fc04f7cf0cc084af9efef6bab4536a08523f314a",
       "source": {
         "count": 10093,
-        "sha256": "44b363d9763b7bd354967a2a35cf21afa289eb88d9887bbf5aa50979e0a38bf8"
+        "sha256": "6628e35016b21ae47dba4dac57267239abe78a6ca34d43103177fc8dee3a075b"
       }
     },
     "klights-watch": {
@@ -174,7 +174,7 @@
       "sha256": "b3e6441088d1bd620fc667b74bf558461df135614621488a8a6a22f6ad05f278",
       "source": {
         "count": 10774,
-        "sha256": "02de1239c556bb2c823d2fd74657975ae5a7ae57f7dc46e961df46ca85ec3365"
+        "sha256": "649889f4db151fdf1aba8e21ad407c79de88bed7e1946d4802121004a58e1744"
       }
     }
   },

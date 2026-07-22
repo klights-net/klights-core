@@ -1,6 +1,52 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use tokio::process::Command;
+
+async fn run_shutdown_command(
+    name: &'static str,
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    run_shutdown_command_with(
+        &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
+        name,
+        program,
+        args,
+    )
+    .await
+}
+
+async fn run_shutdown_command_with(
+    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    name: &'static str,
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    runner
+        .run(
+            crate::task_supervisor::TaskCategory::File,
+            name,
+            program,
+            args,
+        )
+        .await
+}
+
+fn require_success<'a>(
+    program: &str,
+    args: &[&str],
+    output: &'a std::process::Output,
+) -> Result<&'a std::process::Output> {
+    if output.status.success() {
+        return Ok(output);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!(
+        "{program} {} exited with {}: {}",
+        args.join(" "),
+        output.status,
+        stderr.trim()
+    )
+}
 
 /// Stop and remove all pod sandboxes on shutdown.
 pub async fn cleanup_pod_sandboxes(
@@ -180,13 +226,29 @@ fn find_mount_points_under_roots(mount_output: &str, roots: &[&str]) -> Vec<Stri
 }
 
 async fn unmount_mount_points(mount_points: &[String], label: &str) -> Result<()> {
+    unmount_mount_points_with_runner(
+        mount_points,
+        label,
+        &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
+    )
+    .await
+}
+
+async fn unmount_mount_points_with_runner(
+    mount_points: &[String],
+    label: &str,
+    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+) -> Result<()> {
     let mut count = 0u32;
+    let mut failures = Vec::new();
     for mount_point in mount_points {
-        let result = Command::new("umount")
-            .arg("-l")
-            .arg(mount_point)
-            .output()
-            .await;
+        let result = run_shutdown_command_with(
+            runner,
+            "shutdown_unmount_mount_point",
+            "umount",
+            &["-l", mount_point],
+        )
+        .await;
 
         match result {
             Ok(out) if out.status.success() => {
@@ -195,15 +257,29 @@ async fn unmount_mount_points(mount_points: &[String], label: &str) -> Result<()
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!("Failed to unmount {}: {}", mount_point, stderr.trim());
+                failures.push(format!(
+                    "{mount_point}: exited with {}: {}",
+                    out.status,
+                    stderr.trim()
+                ));
             }
             Err(e) => {
                 tracing::warn!("Failed to run umount for {}: {}", mount_point, e);
+                failures.push(format!("{mount_point}: {e}"));
             }
         }
     }
 
     if count > 0 {
         tracing::info!("Unmounted {} {} mounts", count, label);
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "failed to unmount {} {} mount(s): {}",
+            failures.len(),
+            label,
+            failures.join("; ")
+        );
     }
     Ok(())
 }
@@ -247,11 +323,11 @@ fn find_overlay_rootfs_mount_points(mount_output: &str, containerd_base: &str) -
 /// These are at `{containerd_base}/*/io.containerd.runtime.v2.task/k8s.io/*/rootfs`
 /// and must be unmounted before containerd data/state directories can be removed.
 pub async fn cleanup_overlay_rootfs_mounts(containerd_base: &str) -> Result<()> {
-    let output = Command::new("mount")
-        .args(["-t", "overlay"])
-        .output()
+    let args = ["-t", "overlay"];
+    let output = run_shutdown_command("shutdown_list_overlay_mounts", "mount", &args)
         .await
         .context("Failed to run mount")?;
+    require_success("mount", &args, &output)?;
 
     let mount_output = String::from_utf8_lossy(&output.stdout);
     let mount_points = find_overlay_rootfs_mount_points(&mount_output, containerd_base);
@@ -262,10 +338,10 @@ pub async fn cleanup_overlay_rootfs_mounts(containerd_base: &str) -> Result<()> 
 /// These are at {state_dir}/io.containerd.grpc.v1.cri/sandboxes/*/shm
 /// and must be unmounted before containerd can cleanly shut down.
 pub async fn cleanup_shm_mounts(state_dir: &str) -> Result<()> {
-    let output = Command::new("mount")
-        .output()
+    let output = run_shutdown_command("shutdown_list_shm_mounts", "mount", &[])
         .await
         .context("Failed to run mount")?;
+    require_success("mount", &[], &output)?;
 
     let mount_output = String::from_utf8_lossy(&output.stdout);
     let mount_points = find_shm_mount_points(&mount_output, state_dir);
@@ -282,10 +358,10 @@ pub async fn cleanup_containerd_sandbox_mounts(
     containerd_state_dir: &str,
     containerd_base_dir: &str,
 ) -> Result<()> {
-    let output = Command::new("mount")
-        .output()
+    let output = run_shutdown_command("shutdown_list_containerd_mounts", "mount", &[])
         .await
         .context("Failed to run mount")?;
+    require_success("mount", &[], &output)?;
 
     let mount_output = String::from_utf8_lossy(&output.stdout);
     let sandbox_state_root = format!(
@@ -426,35 +502,69 @@ fn volume_cleanup_roots(namespace: &str) -> Vec<std::path::PathBuf> {
 /// Remove pod volume directories for the given containerd namespace.
 pub async fn cleanup_volume_dirs(namespace: &str) -> Result<()> {
     for volumes_root in volume_cleanup_roots(namespace) {
-        if crate::utils::path_exists_async(&volumes_root).await? {
-            let mut roots = vec![volumes_root.to_string_lossy().into_owned()];
-            if let Ok(canonical) = crate::utils::canonicalize_async(&volumes_root).await {
-                roots.push(canonical.to_string_lossy().into_owned());
-            }
-            let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
-            let output = Command::new("mount")
-                .output()
-                .await
-                .context("Failed to run mount")?;
-            let mount_output = String::from_utf8_lossy(&output.stdout);
-            let mount_points = find_mount_points_under_roots(&mount_output, &root_refs);
-            unmount_mount_points(&mount_points, "pod volume").await?;
-
-            crate::utils::remove_dir_all_if_exists_async(&volumes_root)
-                .await
-                .context(format!(
-                    "Failed to remove volume dir {}",
-                    volumes_root.display()
-                ))?;
-            tracing::info!("Removed volume dir: {}", volumes_root.display());
-        }
+        cleanup_volume_root_with_runner(
+            &volumes_root,
+            &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
+        )
+        .await?;
     }
+    Ok(())
+}
+
+async fn cleanup_volume_root_with_runner(
+    volumes_root: &std::path::Path,
+    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+) -> Result<()> {
+    if !crate::utils::path_exists_async(volumes_root).await? {
+        return Ok(());
+    }
+
+    let mut roots = vec![volumes_root.to_string_lossy().into_owned()];
+    if let Ok(canonical) = crate::utils::canonicalize_async(volumes_root).await {
+        roots.push(canonical.to_string_lossy().into_owned());
+    }
+    let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+    let output = run_shutdown_command_with(runner, "shutdown_list_volume_mounts", "mount", &[])
+        .await
+        .context("Failed to run mount")?;
+    require_success("mount", &[], &output)?;
+    let mount_output = String::from_utf8_lossy(&output.stdout);
+    let mount_points = find_mount_points_under_roots(&mount_output, &root_refs);
+    unmount_mount_points_with_runner(&mount_points, "pod volume", runner).await?;
+
+    crate::utils::remove_dir_all_if_exists_async(volumes_root)
+        .await
+        .with_context(|| format!("Failed to remove volume dir {}", volumes_root.display()))?;
+    tracing::info!("Removed volume dir: {}", volumes_root.display());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kubelet::file_blocking::process_test_support::{FakeProcessOutputRunner, output};
+
+    #[tokio::test]
+    async fn failed_volume_unmount_prevents_directory_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let volume_root = temp.path().join("volumes");
+        let mounted = volume_root.join("pod-a/volumes/empty-dir/cache");
+        std::fs::create_dir_all(&mounted).unwrap();
+        let mount_line = format!("tmpfs on {} type tmpfs (rw,relatime)\n", mounted.display());
+        let runner = FakeProcessOutputRunner::new(vec![
+            Ok(output(0, mount_line.as_bytes(), b"")),
+            Ok(output(32, b"", b"target is busy")),
+        ]);
+
+        let result = cleanup_volume_root_with_runner(&volume_root, &runner).await;
+
+        assert!(result.is_err(), "failed unmount must fail closed");
+        assert!(
+            volume_root.exists(),
+            "volume data must not be removed after a failed unmount"
+        );
+        assert_eq!(runner.calls().len(), 2);
+    }
 
     #[test]
     fn test_find_shm_mount_points_matches_correct_namespace() {
@@ -856,6 +966,36 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
                     .join("termination"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_commands_use_the_supervised_process_boundary() {
+        let executable = std::env::current_exe().expect("test executable");
+        let executable = executable.to_string_lossy();
+        let output = run_shutdown_command(
+            "shutdown_test_process_output",
+            &executable,
+            &[
+                "--ignored",
+                "--exact",
+                "shutdown::tests::shutdown_process_fixture",
+                "--nocapture",
+            ],
+        )
+        .await
+        .expect("supervised shutdown command");
+
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("supervised-shutdown"),
+            "fixture output must be captured"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn shutdown_process_fixture() {
+        print!("supervised-shutdown");
     }
 
     #[tokio::test]

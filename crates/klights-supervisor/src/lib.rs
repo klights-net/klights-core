@@ -5,7 +5,9 @@ mod supervisor;
 mod task;
 
 pub use category::{TaskCategory, TaskCategoryConfig};
-pub use supervisor::{SupervisedJoinHandle, TaskSupervisor};
+pub use supervisor::{
+    ProcessError, ProcessShutdownPolicy, SupervisedChild, SupervisedJoinHandle, TaskSupervisor,
+};
 pub use task::{
     ActiveTaskStatus, DbQueryLoggingStatus, ShutdownReport, TaskAdmissionError, TaskCategoryStatus,
     TaskJoinError, TaskOutcome, TaskOutcomeStatus,

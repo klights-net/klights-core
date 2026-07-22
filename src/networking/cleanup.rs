@@ -7,13 +7,65 @@
 //! Rootless cleanup only runs when the process is inside rootlesskit, so link
 //! and nft commands target the user network namespace rather than the host.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 use crate::bootstrap::NodeMode;
+
+async fn run_network_command(
+    name: &'static str,
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    run_network_command_with(
+        &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
+        name,
+        program,
+        args,
+    )
+    .await
+}
+
+async fn run_network_command_with(
+    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    name: &'static str,
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output> {
+    runner
+        .run(
+            crate::task_supervisor::TaskCategory::Network,
+            name,
+            program,
+            args,
+        )
+        .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupDisposition {
+    Absent,
+    Removed,
+}
+
+fn command_failure(program: &str, args: &[&str], output: &std::process::Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::anyhow!(
+        "{program} {} exited with {}: {}",
+        args.join(" "),
+        output.status,
+        stderr.trim()
+    )
+}
+
+fn inspection_reports_not_found(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("does not exist")
+        || stderr.contains("cannot find device")
+        || stderr.contains("no such file or directory")
+}
 
 #[derive(Clone, Debug)]
 enum NetworkCleanupMode {
@@ -227,10 +279,12 @@ impl NetworkCleanup {
     }
 
     async fn cleanup_recorded_veth(&self, sandbox_id: &str, iface: &str) {
-        let check = match Command::new("ip")
-            .args(["link", "show", iface])
-            .output()
-            .await
+        let check = match run_network_command(
+            "network_cleanup_recorded_veth_inspect",
+            "ip",
+            &["link", "show", iface],
+        )
+        .await
         {
             Ok(out) => out,
             Err(e) => {
@@ -247,10 +301,12 @@ impl NetworkCleanup {
             return;
         }
 
-        match Command::new("ip")
-            .args(link_delete_args(iface))
-            .output()
-            .await
+        match run_network_command(
+            "network_cleanup_recorded_veth_delete",
+            "ip",
+            &link_delete_args(iface),
+        )
+        .await
         {
             Ok(out) if out.status.success() => {
                 tracing::info!(
@@ -282,27 +338,46 @@ impl NetworkCleanup {
     /// Clean up the owned bridge interface in the current network namespace.
     /// Rootless cleanup is active only inside rootlesskit, never from the host.
     pub async fn cleanup_bridge(&self) -> Result<()> {
+        self.cleanup_bridge_with_runner(
+            &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn cleanup_bridge_with_runner(
+        &self,
+        runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    ) -> Result<CleanupDisposition> {
         let Some(bridge_name) = self.current_namespace_bridge_name() else {
             tracing::debug!("network cleanup: skipping bridge delete outside owned namespace");
-            return Ok(());
+            return Ok(CleanupDisposition::Absent);
         };
 
-        let check = Command::new("ip")
-            .args(bridge_show_args(bridge_name))
-            .output()
-            .await?;
+        let show_args = bridge_show_args(bridge_name);
+        let check =
+            run_network_command_with(runner, "network_cleanup_bridge_inspect", "ip", &show_args)
+                .await?;
 
-        if check.status.success() {
-            Command::new("ip")
-                .args(bridge_delete_args(bridge_name))
-                .output()
-                .await
-                .context("Failed to delete bridge")?;
-
-            tracing::info!("Deleted bridge interface: {}", bridge_name);
+        if !check.status.success() {
+            if inspection_reports_not_found(&check) {
+                return Ok(CleanupDisposition::Absent);
+            }
+            return Err(command_failure("ip", &show_args, &check))
+                .context("Failed to inspect bridge");
         }
 
-        Ok(())
+        let delete_args = bridge_delete_args(bridge_name);
+        let delete =
+            run_network_command_with(runner, "network_cleanup_bridge_delete", "ip", &delete_args)
+                .await
+                .context("Failed to delete bridge")?;
+        if !delete.status.success() {
+            bail!(command_failure("ip", &delete_args, &delete));
+        }
+
+        tracing::info!("Deleted bridge interface: {}", bridge_name);
+        Ok(CleanupDisposition::Removed)
     }
 
     /// Clean up veth pairs attached to the owned bridge before the bridge is
@@ -313,21 +388,32 @@ impl NetworkCleanup {
             return Ok(());
         };
 
-        let output = Command::new("ip")
-            .args(orphaned_veth_list_args(bridge_name))
-            .output()
-            .await
-            .context("Failed to list network interfaces")?;
+        let output = run_network_command(
+            "network_cleanup_orphaned_veth_list",
+            "ip",
+            &orphaned_veth_list_args(bridge_name),
+        )
+        .await
+        .context("Failed to list network interfaces")?;
+        if !output.status.success() {
+            return Err(command_failure(
+                "ip",
+                &orphaned_veth_list_args(bridge_name),
+                &output,
+            ));
+        }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let veths = parse_veth_names(&stdout);
 
         let mut count = 0u32;
         for iface in veths {
-            let delete = Command::new("ip")
-                .args(link_delete_args(&iface))
-                .output()
-                .await;
+            let delete = run_network_command(
+                "network_cleanup_orphaned_veth_delete",
+                "ip",
+                &link_delete_args(&iface),
+            )
+            .await;
 
             match delete {
                 Ok(out) if out.status.success() => {
@@ -369,27 +455,39 @@ impl NetworkCleanup {
             return Ok(());
         };
 
-        let check = Command::new("ip")
-            .args(wireguard_show_args(wireguard_device))
-            .output()
-            .await?;
+        let check = run_network_command(
+            "network_cleanup_wireguard_inspect",
+            "ip",
+            &wireguard_show_args(wireguard_device),
+        )
+        .await?;
 
-        if check.status.success() {
-            let delete = Command::new("ip")
-                .args(wireguard_delete_args(wireguard_device))
-                .output()
-                .await
-                .context("Failed to delete WireGuard interface")?;
-            if delete.status.success() {
-                tracing::info!("Deleted WireGuard interface: {}", wireguard_device);
-            } else {
-                let stderr = String::from_utf8_lossy(&delete.stderr);
-                tracing::warn!(
-                    wireguard = wireguard_device,
-                    stderr = %stderr.trim(),
-                    "Failed to delete WireGuard interface"
-                );
+        if !check.status.success() {
+            if inspection_reports_not_found(&check) {
+                return Ok(());
             }
+            return Err(command_failure(
+                "ip",
+                &wireguard_show_args(wireguard_device),
+                &check,
+            ));
+        }
+
+        let delete = run_network_command(
+            "network_cleanup_wireguard_delete",
+            "ip",
+            &wireguard_delete_args(wireguard_device),
+        )
+        .await
+        .context("Failed to delete WireGuard interface")?;
+        if delete.status.success() {
+            tracing::info!("Deleted WireGuard interface: {}", wireguard_device);
+        } else {
+            return Err(command_failure(
+                "ip",
+                &wireguard_delete_args(wireguard_device),
+                &delete,
+            ));
         }
 
         Ok(())
@@ -401,27 +499,39 @@ impl NetworkCleanup {
             return Ok(());
         };
 
-        let check = Command::new("nft")
-            .args(nft_list_table_args(nft_table_name))
-            .output()
-            .await?;
+        let check = run_network_command(
+            "network_cleanup_nft_table_inspect",
+            "nft",
+            &nft_list_table_args(nft_table_name),
+        )
+        .await?;
 
-        if check.status.success() {
-            let delete = Command::new("nft")
-                .args(nft_delete_table_args(nft_table_name))
-                .output()
-                .await
-                .context("Failed to delete nftables table")?;
-            if delete.status.success() {
-                tracing::info!("Deleted nftables table inet {}", nft_table_name);
-            } else {
-                let stderr = String::from_utf8_lossy(&delete.stderr);
-                tracing::warn!(
-                    table = nft_table_name,
-                    stderr = %stderr.trim(),
-                    "Failed to delete nftables table"
-                );
+        if !check.status.success() {
+            if inspection_reports_not_found(&check) {
+                return Ok(());
             }
+            return Err(command_failure(
+                "nft",
+                &nft_list_table_args(nft_table_name),
+                &check,
+            ));
+        }
+
+        let delete = run_network_command(
+            "network_cleanup_nft_table_delete",
+            "nft",
+            &nft_delete_table_args(nft_table_name),
+        )
+        .await
+        .context("Failed to delete nftables table")?;
+        if delete.status.success() {
+            tracing::info!("Deleted nftables table inet {}", nft_table_name);
+        } else {
+            return Err(command_failure(
+                "nft",
+                &nft_delete_table_args(nft_table_name),
+                &delete,
+            ));
         }
 
         Ok(())
@@ -455,10 +565,12 @@ impl NetworkCleanup {
             return;
         }
 
-        match Command::new("ip")
-            .args(netns_delete_args(netns_name))
-            .output()
-            .await
+        match run_network_command(
+            "network_cleanup_cni_netns_delete",
+            "ip",
+            &netns_delete_args(netns_name),
+        )
+        .await
         {
             Ok(out) if out.status.success() => {
                 tracing::info!("Deleted CNI netns: {}", netns_name);
@@ -835,6 +947,75 @@ fn cni_netns_basename(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kubelet::file_blocking::process_test_support::{FakeProcessOutputRunner, output};
+
+    #[tokio::test]
+    async fn bridge_cleanup_obeys_spawn_status_not_found_and_mutation_results() {
+        struct Case {
+            name: &'static str,
+            results: Vec<Result<std::process::Output>>,
+            expect_error: bool,
+            expect_removed: bool,
+            expected_calls: usize,
+        }
+
+        let cases = vec![
+            Case {
+                name: "spawn error",
+                results: vec![Err(anyhow::anyhow!("spawn failed"))],
+                expect_error: true,
+                expect_removed: false,
+                expected_calls: 1,
+            },
+            Case {
+                name: "nonzero inspect",
+                results: vec![Ok(output(2, b"", b"permission denied"))],
+                expect_error: true,
+                expect_removed: false,
+                expected_calls: 1,
+            },
+            Case {
+                name: "not found",
+                results: vec![Ok(output(
+                    1,
+                    b"",
+                    b"Device \"klights-test\" does not exist.",
+                ))],
+                expect_error: false,
+                expect_removed: false,
+                expected_calls: 1,
+            },
+            Case {
+                name: "nonzero mutation",
+                results: vec![Ok(output(0, b"", b"")), Ok(output(1, b"", b"device busy"))],
+                expect_error: true,
+                expect_removed: false,
+                expected_calls: 2,
+            },
+            Case {
+                name: "success",
+                results: vec![Ok(output(0, b"", b"")), Ok(output(0, b"", b""))],
+                expect_error: false,
+                expect_removed: true,
+                expected_calls: 2,
+            },
+        ];
+
+        for case in cases {
+            let cleanup = NetworkCleanup::root("klights-test");
+            let runner = FakeProcessOutputRunner::new(case.results);
+            let result = cleanup.cleanup_bridge_with_runner(&runner).await;
+
+            assert_eq!(result.is_err(), case.expect_error, "{}", case.name);
+            assert_eq!(
+                result.ok() == Some(CleanupDisposition::Removed),
+                case.expect_removed,
+                "{} must not report/log removal unless mutation succeeded",
+                case.name
+            );
+            assert_eq!(runner.calls().len(), case.expected_calls, "{}", case.name);
+        }
+    }
 
     #[test]
     fn root_cleanup_handle_has_root_ip_command_plans_without_datapath() {

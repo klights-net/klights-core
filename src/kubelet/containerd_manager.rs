@@ -182,7 +182,7 @@ pub struct ContainerdStartConfig<'a> {
 }
 
 enum ContainerdProcess {
-    Spawned(tokio::process::Child),
+    Spawned(crate::task_supervisor::SupervisedChild),
     Reused,
 }
 
@@ -555,10 +555,20 @@ state = "{state_dir}"
 
         // Spawn containerd subprocess in a private mount namespace.
         // See `apply_private_mount_namespace` for rationale.
-        let mut cmd = tokio::process::Command::new("containerd");
+        let mut cmd = std::process::Command::new("containerd");
         cmd.arg("--config").arg(&config_path);
-        apply_private_mount_namespace(cmd.as_std_mut());
-        let child = cmd.spawn().context("Failed to spawn containerd process")?;
+        apply_private_mount_namespace(&mut cmd);
+        let child = task_supervisor
+            .spawn_process(
+                crate::task_supervisor::TaskCategory::Others,
+                "containerd_process_spawn",
+                cmd,
+                // A soft klights shutdown deliberately leaves containerd and
+                // its workloads running for the next process to reuse.
+                crate::task_supervisor::ProcessShutdownPolicy::Preserve,
+            )
+            .await
+            .context("Failed to spawn containerd process")?;
 
         // Wait for socket file using inotify (30s timeout)
         let socket_dir = Path::new(&socket_path)
@@ -727,6 +737,10 @@ state = "{state_dir}"
 
     /// Graceful shutdown: SIGTERM, wait, SIGKILL if needed
     pub async fn stop(&mut self) -> Result<()> {
+        self.stop_with_grace_period(Duration::from_secs(10)).await
+    }
+
+    async fn stop_with_grace_period(&mut self, grace_period: Duration) -> Result<()> {
         let ContainerdProcess::Spawned(child) = &mut self.process else {
             tracing::debug!(
                 "ContainerdManager::stop called for reused containerd; cleanup owns teardown"
@@ -751,11 +765,7 @@ state = "{state_dir}"
         // Wait up to 10 seconds for graceful exit
         let wait_result = self
             .task_supervisor
-            .timeout(
-                "containerd_stop_wait",
-                Duration::from_secs(10),
-                child.wait(),
-            )
+            .timeout("containerd_stop_wait", grace_period, child.wait())
             .await;
 
         match wait_result {
@@ -1126,6 +1136,92 @@ mod tests {
             .join(ns)
             .to_string_lossy()
             .into_owned()
+    }
+
+    fn containerd_stop_fixture_command(ignore_sigterm: bool) -> std::process::Command {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("kubelet::containerd_manager::tests::containerd_stop_fixture")
+            .arg("--nocapture");
+        if ignore_sigterm {
+            // SAFETY: this test-only pre-exec hook makes SIGTERM ignored before
+            // exec; SIG_IGN is async-signal-safe and persists across exec.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        command
+    }
+
+    async fn test_containerd_manager_with_fixture(ignore_sigterm: bool) -> ContainerdManager {
+        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let child = task_supervisor
+            .spawn_process(
+                crate::task_supervisor::TaskCategory::Others,
+                "containerd_stop_fixture",
+                containerd_stop_fixture_command(ignore_sigterm),
+                crate::task_supervisor::ProcessShutdownPolicy::Preserve,
+            )
+            .await
+            .expect("spawn containerd stop fixture");
+        ContainerdManager {
+            process: ContainerdProcess::Spawned(child),
+            socket_path: "/tmp/klights-containerd-stop-fixture.sock".to_string(),
+            _config_path: String::new(),
+            _data_dir: String::new(),
+            _state_dir: String::new(),
+            task_supervisor,
+        }
+    }
+
+    #[tokio::test]
+    async fn containerd_stop_reaps_after_sigterm() {
+        let mut manager = test_containerd_manager_with_fixture(false).await;
+
+        manager
+            .stop_with_grace_period(Duration::from_secs(1))
+            .await
+            .expect("SIGTERM stop");
+
+        assert!(
+            manager
+                .task_supervisor
+                .active_tasks(Some(crate::task_supervisor::TaskCategory::Others))
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn containerd_stop_escalates_to_sigkill_and_reaps() {
+        let mut manager = test_containerd_manager_with_fixture(true).await;
+
+        manager
+            .stop_with_grace_period(Duration::from_millis(20))
+            .await
+            .expect("SIGKILL escalation stop");
+
+        assert!(
+            manager
+                .task_supervisor
+                .active_tasks(Some(crate::task_supervisor::TaskCategory::Others))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn containerd_stop_fixture() {
+        loop {
+            std::thread::park();
+        }
     }
 
     /// Spawns a child with apply_private_mount_namespace and verifies the

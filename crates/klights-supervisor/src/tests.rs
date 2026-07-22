@@ -1,3 +1,4 @@
+use crate::supervisor::{ProcessError, ProcessShutdownPolicy};
 use crate::{TaskAdmissionError, TaskCategory, TaskCategoryConfig, TaskOutcome, TaskSupervisor};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -1717,6 +1718,551 @@ async fn blocking_permit_held_during_caller_cancellation() {
     release_gate(&gate, 1);
     let result = second_task.await.unwrap();
     assert_eq!(result.unwrap(), 99);
+}
+
+#[tokio::test]
+async fn process_output_runs_through_the_selected_supervised_category() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let command = process_fixture_command("success");
+
+    let output = supervisor
+        .run_process_output(TaskCategory::Network, "process-output", command)
+        .await
+        .expect("supervised process output");
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("supervised-process"),
+        "fixture output must be captured"
+    );
+    assert!(
+        supervisor
+            .active_tasks(Some(TaskCategory::Network))
+            .is_empty(),
+        "completed process output must leave no active task registration"
+    );
+}
+
+#[tokio::test]
+async fn process_spawn_is_admitted_through_the_selected_supervised_category() {
+    let config = TaskCategoryConfig {
+        others: 1,
+        ..TaskCategoryConfig::default()
+    };
+    let supervisor = TaskSupervisor::new(config);
+    let command = process_fixture_command("park");
+
+    let mut child = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-spawn",
+            command,
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect("supervised process spawn");
+
+    assert_eq!(
+        category_status(&supervisor, TaskCategory::Others).active,
+        1,
+        "long-lived child must retain its active registration and permit"
+    );
+    child.kill().await.expect("kill supervised child");
+    let status = child.wait().await.expect("wait for killed process");
+    assert!(!status.success());
+    assert!(
+        supervisor
+            .active_tasks(Some(TaskCategory::Others))
+            .is_empty(),
+        "completed process admission must leave no active task registration"
+    );
+}
+
+#[tokio::test]
+async fn unexpected_process_exit_is_reaped_and_releases_accounting() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let mut child = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-unexpected-exit",
+            process_fixture_command("success"),
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect("spawn short-lived process");
+
+    let status = child.wait().await.expect("reaped process status");
+
+    assert!(status.success());
+    assert_eq!(category_status(&supervisor, TaskCategory::Others).active, 0);
+}
+
+#[tokio::test]
+async fn dropping_kill_policy_handle_kills_and_reaps_process() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let child = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-handle-drop",
+            process_fixture_command("park"),
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect("spawn parked process");
+    let pid = child.id().expect("child pid");
+    assert!(process_fixture_is_running(pid));
+
+    drop(child);
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Others).active == 0,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert!(
+        !process_fixture_is_running(pid),
+        "dropping KillAndReap handle must not leave a live child"
+    );
+}
+
+#[tokio::test]
+async fn dropping_preserve_handle_without_root_shutdown_kills_and_reaps() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let child = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-preserve-handle-drop",
+            process_fixture_command("park"),
+            ProcessShutdownPolicy::Preserve,
+        )
+        .await
+        .expect("spawn parked process");
+    let pid = child.id().expect("child pid");
+
+    drop(child);
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Others).active == 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    let still_running = process_fixture_is_running(pid);
+    if still_running {
+        terminate_and_reap_fixture(pid);
+    }
+
+    assert!(
+        !still_running,
+        "Preserve is a root-shutdown policy, not permission to orphan a dropped handle"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_preserve_spawn_before_handoff_kills_and_reaps() {
+    let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let startup = supervisor.pause_next_process_startup_handoff();
+    let spawn = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            supervisor
+                .spawn_process(
+                    TaskCategory::Others,
+                    "process-cancelled-before-handoff",
+                    process_fixture_command("park"),
+                    ProcessShutdownPolicy::Preserve,
+                )
+                .await
+        })
+    };
+    startup.wait_until_entered().await;
+    let pid = startup.pid().expect("paused child pid");
+
+    spawn.abort();
+    assert!(
+        spawn
+            .await
+            .expect_err("spawn caller cancelled")
+            .is_cancelled()
+    );
+    startup.release();
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Others).active == 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    let still_running = process_fixture_is_running(pid);
+    if still_running {
+        terminate_and_reap_fixture(pid);
+    }
+
+    assert!(
+        !still_running,
+        "a process whose ownership handoff failed must be killed and reaped"
+    );
+}
+
+#[tokio::test]
+async fn process_output_preserves_nonzero_status_and_stderr() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let output = supervisor
+        .run_process_output(
+            TaskCategory::Network,
+            "process-nonzero",
+            process_fixture_command("nonzero"),
+        )
+        .await
+        .expect("nonzero exit is a normal process output");
+
+    assert_eq!(output.status.code(), Some(23));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixture-stderr"));
+}
+
+#[tokio::test]
+async fn process_output_drains_large_stdout_and_stderr_without_deadlock() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let output = supervisor
+        .run_process_output(
+            TaskCategory::Network,
+            "process-large-dual-pipe",
+            process_fixture_command("large-dual-pipe"),
+        )
+        .await
+        .expect("large stdout/stderr process");
+
+    assert!(output.status.success());
+    assert!(output.stdout.iter().filter(|byte| **byte == b'o').count() >= 256 * 1024);
+    assert!(output.stderr.iter().filter(|byte| **byte == b'e').count() >= 256 * 1024);
+}
+
+#[tokio::test]
+async fn process_spawn_failure_cleans_registration_and_permit() {
+    let config = TaskCategoryConfig {
+        others: 1,
+        ..TaskCategoryConfig::default()
+    };
+    let supervisor = TaskSupervisor::new(config);
+    let command = std::process::Command::new("/definitely/missing/klights-process-fixture");
+
+    let error = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-missing",
+            command,
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect_err("missing executable must fail at spawn");
+
+    assert!(matches!(error, ProcessError::Spawn(_)));
+    assert_eq!(category_status(&supervisor, TaskCategory::Others).active, 0);
+    assert_eq!(category_status(&supervisor, TaskCategory::Others).queued, 0);
+}
+
+#[tokio::test]
+async fn running_output_process_is_killed_and_reaped_on_shutdown() {
+    let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let output_task = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            supervisor
+                .run_process_output(
+                    TaskCategory::Network,
+                    "process-output-shutdown",
+                    process_fixture_command("park"),
+                )
+                .await
+        })
+    };
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Network).active == 1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let report = supervisor.shutdown(Duration::from_secs(2)).await;
+    let result = output_task.await.expect("output caller task");
+
+    assert!(matches!(result, Err(ProcessError::Cancelled)));
+    assert!(!report.timed_out);
+    assert_eq!(report.remaining_active, 0);
+    assert_eq!(
+        category_status(&supervisor, TaskCategory::Network).active,
+        0
+    );
+}
+
+#[tokio::test]
+async fn zero_timeout_shutdown_does_not_abort_process_cleanup_actor() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let mut child = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-zero-timeout-shutdown",
+            process_fixture_command("park"),
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect("spawn parked process");
+    let pid = child.id().expect("child pid");
+
+    let report = supervisor.shutdown(Duration::ZERO).await;
+    let status = child.wait().await.expect("cleanup actor must reap child");
+
+    assert!(report.timed_out);
+    assert_eq!(report.aborted, 0, "cleanup-critical actor is not abortable");
+    assert!(!status.success());
+    assert!(!process_fixture_is_running(pid));
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+#[tokio::test]
+async fn cancelling_output_caller_keeps_managed_process_accounted_until_shutdown() {
+    let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let caller = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            supervisor
+                .run_process_output(
+                    TaskCategory::Network,
+                    "process-cancelled-caller",
+                    process_fixture_command("park"),
+                )
+                .await
+        })
+    };
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Network).active == 1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    caller.abort();
+    assert!(caller.await.expect_err("caller cancelled").is_cancelled());
+    assert_eq!(
+        category_status(&supervisor, TaskCategory::Network).active,
+        1,
+        "caller cancellation must not release accounting while its process runs"
+    );
+
+    let report = supervisor.shutdown(Duration::from_secs(2)).await;
+    assert!(!report.timed_out);
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+#[tokio::test]
+async fn queued_process_spawn_is_rejected_when_shutdown_starts() {
+    let config = TaskCategoryConfig {
+        others: 1,
+        ..TaskCategoryConfig::default()
+    };
+    let supervisor = Arc::new(TaskSupervisor::new(config));
+    let first = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-holder",
+            process_fixture_command("park"),
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect("first process");
+    let queued = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            supervisor
+                .spawn_process(
+                    TaskCategory::Others,
+                    "process-queued",
+                    process_fixture_command("success"),
+                    ProcessShutdownPolicy::KillAndReap,
+                )
+                .await
+        })
+    };
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Others).queued == 1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let report = supervisor.shutdown(Duration::from_secs(2)).await;
+    let queued_error = queued
+        .await
+        .expect("queued caller task")
+        .expect_err("queued process must be rejected");
+
+    assert!(matches!(
+        queued_error,
+        ProcessError::Admission(TaskAdmissionError::ShuttingDown)
+    ));
+    assert!(!report.timed_out);
+    drop(first);
+}
+
+#[tokio::test]
+async fn cancelling_queued_process_spawn_recovers_queue_without_spawning() {
+    let config = TaskCategoryConfig {
+        others: 1,
+        ..TaskCategoryConfig::default()
+    };
+    let supervisor = Arc::new(TaskSupervisor::new(config));
+    let mut holder = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-queue-holder",
+            process_fixture_command("park"),
+            ProcessShutdownPolicy::KillAndReap,
+        )
+        .await
+        .expect("holder process");
+    let queued = {
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            supervisor
+                .spawn_process(
+                    TaskCategory::Others,
+                    "process-queued-caller-cancelled",
+                    process_fixture_command("success"),
+                    ProcessShutdownPolicy::KillAndReap,
+                )
+                .await
+        })
+    };
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Others).queued == 1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    queued.abort();
+    assert!(
+        queued
+            .await
+            .expect_err("queued caller cancelled")
+            .is_cancelled()
+    );
+    assert_eq!(category_status(&supervisor, TaskCategory::Others).queued, 0);
+    assert_eq!(
+        category_status(&supervisor, TaskCategory::Others).active,
+        1,
+        "only the holder process may exist"
+    );
+
+    holder.kill().await.expect("kill holder");
+    holder.wait().await.expect("reap holder");
+}
+
+#[tokio::test]
+async fn output_process_is_rejected_after_shutdown_without_spawning() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    supervisor.shutdown(Duration::from_secs(1)).await;
+
+    let error = supervisor
+        .run_process_output(
+            TaskCategory::Network,
+            "process-output-after-shutdown",
+            process_fixture_command("success"),
+        )
+        .await
+        .expect_err("shutdown must reject output process admission");
+
+    assert!(matches!(
+        error,
+        ProcessError::Admission(TaskAdmissionError::ShuttingDown)
+    ));
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+#[tokio::test]
+async fn preserve_policy_is_explicit_and_releases_supervisor_accounting() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let mut child = supervisor
+        .spawn_process(
+            TaskCategory::Others,
+            "process-preserved",
+            process_fixture_command("park"),
+            ProcessShutdownPolicy::Preserve,
+        )
+        .await
+        .expect("preserved child");
+    let pid = child.id().expect("child pid");
+
+    let report = supervisor.shutdown(Duration::from_secs(2)).await;
+    let wait_error = child
+        .wait()
+        .await
+        .expect_err("preserved process is intentionally detached");
+
+    assert!(matches!(wait_error, ProcessError::Preserved));
+    assert!(!report.timed_out);
+    assert_eq!(report.remaining_active, 0);
+
+    terminate_and_reap_fixture(pid);
+}
+
+fn process_fixture_command(mode: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("tests::process_test_fixture")
+        .arg("--nocapture")
+        .env("KLIGHTS_PROCESS_TEST_MODE", mode);
+    command
+}
+
+fn terminate_and_reap_fixture(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+        fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    // SAFETY: the pid belongs to the dedicated test fixture child, and the
+    // status pointer remains valid for the duration of waitpid.
+    unsafe {
+        let _ = kill(pid as i32, SIGKILL);
+        let mut status = 0;
+        let _ = waitpid(pid as i32, &mut status, 0);
+    }
+}
+
+fn process_fixture_is_running(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: signal 0 performs existence/permission checking only and does
+    // not mutate the process.
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[test]
+#[ignore]
+fn process_test_fixture() {
+    use std::io::Write;
+
+    match std::env::var("KLIGHTS_PROCESS_TEST_MODE").as_deref() {
+        Ok("success") => print!("supervised-process"),
+        Ok("nonzero") => {
+            eprint!("fixture-stderr");
+            std::process::exit(23);
+        }
+        Ok("large-dual-pipe") => {
+            let stdout = std::thread::spawn(|| {
+                std::io::stdout()
+                    .write_all(&vec![b'o'; 256 * 1024])
+                    .unwrap();
+            });
+            let stderr = std::thread::spawn(|| {
+                std::io::stderr()
+                    .write_all(&vec![b'e'; 256 * 1024])
+                    .unwrap();
+            });
+            stdout.join().unwrap();
+            stderr.join().unwrap();
+        }
+        Ok("park") => loop {
+            std::thread::park();
+        },
+        mode => panic!("unexpected process fixture mode: {mode:?}"),
+    }
 }
 
 async fn wait_for_bool(flag: &AtomicBool, timeout: Duration) -> bool {
