@@ -74,6 +74,7 @@ pub(crate) async fn start_leader_peer_endpoint_observer(
             },
         )
         .await
+        .map_err(Into::into)
 }
 
 async fn run_leader_peer_endpoint_observer(

@@ -3133,7 +3133,7 @@ async fn handle_node_exec_stream_request(
             &runtime_cancel,
         )
         .await;
-        return Err(err);
+        return Err(err.into());
     }
     Ok(())
 }
@@ -3294,7 +3294,7 @@ async fn handle_pod_log_follow_request(
             &runtime_cancel,
         )
         .await;
-        return Err(error);
+        return Err(error.into());
     }
     Ok(())
 }

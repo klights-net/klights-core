@@ -1,3 +1,5 @@
+//! Supervised task categories and their concurrency configuration.
+
 use serde::Serialize;
 use std::env;
 

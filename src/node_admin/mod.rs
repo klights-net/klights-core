@@ -135,6 +135,7 @@ pub async fn start_node_admin(
             }
         })
         .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

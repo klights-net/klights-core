@@ -717,6 +717,7 @@ impl OutboxDispatcher {
                 },
             )
             .await
+            .map_err(Into::into)
     }
 
     pub async fn run(

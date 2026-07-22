@@ -1,8 +1,14 @@
-use super::category::{TaskCategory, TaskCategoryConfig};
-use super::supervisor::TaskSupervisor;
+use crate::{TaskAdmissionError, TaskCategory, TaskCategoryConfig, TaskOutcome, TaskSupervisor};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
+use tracing::field::{Field, Visit};
+use tracing::subscriber::Interest;
+use tracing::{Event, Id, Metadata, Subscriber};
 
 #[test]
 fn defaults_match_p0_category_limits() {
@@ -181,13 +187,26 @@ async fn category_free_notify_fires_when_slot_releases() {
     assert!(supervisor.is_category_free(TaskCategory::Background));
 }
 
-#[test]
-fn active_task_tracking_adds_and_removes_entries() {
+#[tokio::test]
+async fn active_task_tracking_adds_and_removes_entries() {
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
     assert!(supervisor.active_tasks(None).is_empty());
-
-    let _guard_a = supervisor.start_task_for_test(TaskCategory::Background, "worker-a");
-    let guard_b = supervisor.start_task_for_test(TaskCategory::File, "render-volume");
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let wait_a = release_a.clone();
+    let wait_b = release_b.clone();
+    let guard_a = supervisor
+        .spawn_async(TaskCategory::Background, "worker-a", async move {
+            wait_a.notified().await
+        })
+        .await
+        .unwrap();
+    let guard_b = supervisor
+        .spawn_async(TaskCategory::File, "render-volume", async move {
+            wait_b.notified().await
+        })
+        .await
+        .unwrap();
 
     let all = supervisor.active_tasks(None);
     assert_eq!(all.len(), 2);
@@ -196,10 +215,13 @@ fn active_task_tracking_adds_and_removes_entries() {
         "render-volume"
     );
 
-    drop(guard_b);
+    release_b.notify_one();
+    guard_b.join().await.unwrap();
     let all_after = supervisor.active_tasks(None);
     assert_eq!(all_after.len(), 1);
     assert_eq!(all_after[0].name, "worker-a");
+    release_a.notify_one();
+    guard_a.join().await.unwrap();
 }
 
 #[tokio::test]
@@ -413,7 +435,7 @@ async fn same_key_waiters_do_not_occupy_global_file_permits() {
 fn category_status(
     supervisor: &TaskSupervisor,
     category: TaskCategory,
-) -> super::task::TaskCategoryStatus {
+) -> crate::TaskCategoryStatus {
     supervisor
         .category_statuses()
         .into_iter()
@@ -478,7 +500,50 @@ async fn shutdown_root_cancellation_wakes_managed_tasks() {
     let report = supervisor.shutdown(Duration::from_secs(1)).await;
     assert!(report.joined >= 1);
     assert_eq!(woke.load(Ordering::SeqCst), 1);
-    assert_eq!(supervisor.managed_task_count(), 0);
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(move |context| Poll::Ready(future.as_mut().poll(context))).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_completion_is_event_driven_without_timer_advance() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let cancellation = supervisor.root_cancellation_token();
+    let cancellation_seen = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let cancellation_seen_for_task = cancellation_seen.clone();
+    let release_for_task = release.clone();
+    let task = supervisor
+        .spawn_async(
+            TaskCategory::Background,
+            "event-driven-shutdown",
+            async move {
+                cancellation.cancelled().await;
+                cancellation_seen_for_task.notify_one();
+                release_for_task.notified().await;
+            },
+        )
+        .await
+        .unwrap();
+
+    let started_at = tokio::time::Instant::now();
+    let mut shutdown = Box::pin(supervisor.shutdown(Duration::from_secs(30)));
+    assert!(matches!(poll_once(shutdown.as_mut()).await, Poll::Pending));
+    cancellation_seen.notified().await;
+    release.notify_one();
+    task.join().await.unwrap();
+    assert_eq!(tokio::time::Instant::now(), started_at);
+
+    let Poll::Ready(report) = poll_once(shutdown.as_mut()).await else {
+        panic!("shutdown waited for a polling timer after managed task completion");
+    };
+    assert_eq!(report.total_managed, 1);
+    assert_eq!(report.joined, 1);
+    assert_eq!(report.aborted, 0);
+    assert!(!report.timed_out);
+    assert_eq!(report.remaining_active, 0);
 }
 
 #[tokio::test]
@@ -533,7 +598,363 @@ async fn shutdown_leaves_no_managed_tasks_active() {
     let report = supervisor.shutdown(Duration::from_secs(1)).await;
     assert_eq!(report.remaining_active, 0);
     assert_eq!(supervisor.active_tasks(None).len(), 0);
-    assert_eq!(supervisor.managed_task_count(), 0);
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawn_after_shutdown_is_rejected_and_future_never_runs() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    supervisor.shutdown(Duration::ZERO).await;
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_task = ran.clone();
+
+    let error = supervisor
+        .spawn_async(TaskCategory::File, "late", async move {
+            ran_in_task.store(true, Ordering::SeqCst);
+        })
+        .await
+        .expect_err("shutdown must close task admission");
+
+    assert_eq!(error, TaskAdmissionError::ShuttingDown);
+    assert!(!ran.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unlimited_category_cannot_start_after_shutdown() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    supervisor.shutdown(Duration::ZERO).await;
+
+    let error = supervisor
+        .spawn_async(TaskCategory::Background, "late-unlimited", async {})
+        .await
+        .expect_err("unlimited categories must share the admission gate");
+    assert_eq!(error, TaskAdmissionError::ShuttingDown);
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_spawn_is_rejected_when_shutdown_precedes_permit_release() {
+    let config = TaskCategoryConfig {
+        file: 1,
+        ..TaskCategoryConfig::default()
+    };
+    let supervisor = Arc::new(TaskSupervisor::new(config));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_in_task = release.clone();
+    let first = supervisor
+        .spawn_async(TaskCategory::File, "holder", async move {
+            release_in_task.notified().await;
+        })
+        .await
+        .unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_task = ran.clone();
+    let queued_supervisor = supervisor.clone();
+    let queued = tokio::spawn(async move {
+        queued_supervisor
+            .spawn_async(TaskCategory::File, "queued", async move {
+                ran_in_task.store(true, Ordering::SeqCst);
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(category_status(&supervisor, TaskCategory::File).queued, 1);
+
+    let report = supervisor.shutdown(Duration::ZERO).await;
+    release.notify_one();
+    let error = queued
+        .await
+        .unwrap()
+        .expect_err("queued admission must close");
+    assert_eq!(error, TaskAdmissionError::ShuttingDown);
+    assert_eq!(category_status(&supervisor, TaskCategory::File).queued, 0);
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(report.abort_confirmed, 1);
+    assert!(first.join().await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_accounting_returns_to_zero_when_shutdown_cancels_admission() {
+    let config = TaskCategoryConfig {
+        file: 1,
+        ..TaskCategoryConfig::default()
+    };
+    let supervisor = Arc::new(TaskSupervisor::new(config));
+    let holder = supervisor
+        .spawn_async(
+            TaskCategory::File,
+            "queued-counter-holder",
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+    let queued_supervisor = supervisor.clone();
+    let queued = tokio::spawn(async move {
+        queued_supervisor
+            .spawn_async(TaskCategory::File, "queued-counter-waiter", async {})
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(category_status(&supervisor, TaskCategory::File).queued, 1);
+
+    supervisor.shutdown(Duration::ZERO).await;
+    assert_eq!(
+        queued.await.unwrap().unwrap_err(),
+        TaskAdmissionError::ShuttingDown
+    );
+    assert_eq!(category_status(&supervisor, TaskCategory::File).queued, 0);
+    assert!(holder.join().await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn caller_and_shutdown_abort_are_attributed_exactly_once() {
+    let caller = TaskSupervisor::new(TaskCategoryConfig::default());
+    let caller_handle = caller
+        .spawn_async(
+            TaskCategory::Background,
+            "caller-abort",
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+    caller_handle.abort();
+    assert!(caller_handle.join().await.unwrap_err().is_cancelled());
+    assert_eq!(
+        caller
+            .recent_task_outcomes()
+            .iter()
+            .filter(
+                |entry| entry.name == "caller-abort" && entry.outcome == TaskOutcome::CallerAborted
+            )
+            .count(),
+        1
+    );
+
+    let shutdown = TaskSupervisor::new(TaskCategoryConfig::default());
+    let _handle = shutdown
+        .spawn_async(
+            TaskCategory::Background,
+            "shutdown-abort",
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap();
+    let report = shutdown.shutdown(Duration::ZERO).await;
+    assert_eq!(report.aborted, 1);
+    assert_eq!(report.abort_confirmed, 1);
+    assert_eq!(
+        shutdown
+            .recent_task_outcomes()
+            .iter()
+            .filter(|entry| entry.name == "shutdown-abort"
+                && entry.outcome == TaskOutcome::ShutdownAborted)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn registration_and_shutdown_snapshot_are_linearizable() {
+    let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let task_supervisor = supervisor.clone();
+    let handle = supervisor
+        .spawn_async(
+            TaskCategory::Background,
+            "registered-before-run",
+            async move {
+                assert!(
+                    task_supervisor
+                        .active_tasks(None)
+                        .iter()
+                        .any(|task| task.name == "registered-before-run")
+                );
+            },
+        )
+        .await
+        .unwrap();
+    handle.join().await.unwrap();
+    let report = supervisor.shutdown(Duration::ZERO).await;
+    assert_eq!(report.remaining_active, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_handle_panic_remains_attributable() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered_in_task = entered.clone();
+    let release_in_task = release.clone();
+    let handle = supervisor
+        .spawn_async(TaskCategory::Background, "dropped-panic", async move {
+            entered_in_task.notify_one();
+            release_in_task.notified().await;
+            panic!("intentional dropped-handle panic");
+        })
+        .await
+        .unwrap();
+    entered.notified().await;
+    drop(handle);
+    release.notify_one();
+    let report = supervisor.shutdown(Duration::from_secs(30)).await;
+
+    assert_eq!(report.joined, 0);
+    assert_eq!(
+        supervisor
+            .recent_task_outcomes()
+            .iter()
+            .filter(|entry| entry.name == "dropped-panic" && entry.outcome == TaskOutcome::Panicked)
+            .count(),
+        1
+    );
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn panic_during_shutdown_is_not_a_successful_join() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let cancellation = supervisor.root_cancellation_token();
+    let _handle = supervisor
+        .spawn_async(TaskCategory::Background, "shutdown-panic", async move {
+            cancellation.cancelled().await;
+            panic!("panic after observing shutdown");
+        })
+        .await
+        .unwrap();
+
+    let report = supervisor.shutdown(Duration::from_secs(30)).await;
+    assert_eq!(report.joined, 0);
+    assert_eq!(report.aborted, 0);
+    assert!(
+        supervisor.recent_task_outcomes().iter().any(|entry| {
+            entry.name == "shutdown-panic" && entry.outcome == TaskOutcome::Panicked
+        })
+    );
+    assert!(supervisor.active_tasks(None).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_cleanup_cannot_publish_a_terminal_outcome() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let cleanup = supervisor.pause_next_terminal_cleanup();
+    let handle = supervisor
+        .spawn_async(TaskCategory::Background, "blocked-cleanup", async {})
+        .await
+        .unwrap();
+    cleanup.wait_until_entered().await;
+
+    assert!(
+        supervisor
+            .active_tasks(None)
+            .iter()
+            .any(|task| task.name == "blocked-cleanup")
+    );
+    assert!(
+        !supervisor
+            .recent_task_outcomes()
+            .iter()
+            .any(|task| task.name == "blocked-cleanup")
+    );
+
+    cleanup.release();
+    handle.join().await.unwrap();
+    assert!(supervisor.active_tasks(None).is_empty());
+    assert!(
+        supervisor.recent_task_outcomes().iter().any(|task| {
+            task.name == "blocked-cleanup" && task.outcome == TaskOutcome::Completed
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn recent_task_outcome_history_is_bounded() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    for index in 0..257 {
+        supervisor
+            .spawn_async(
+                TaskCategory::Background,
+                format!("bounded-{index}"),
+                async {},
+            )
+            .await
+            .unwrap()
+            .join()
+            .await
+            .unwrap();
+    }
+
+    let outcomes = supervisor.recent_task_outcomes();
+    assert_eq!(outcomes.len(), 256);
+    assert_eq!(outcomes.first().unwrap().name, "bounded-1");
+    assert_eq!(outcomes.last().unwrap().name, "bounded-256");
+}
+
+#[tokio::test(start_paused = true)]
+async fn multiple_coalesced_completions_need_no_time_advance() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let cancellation_count = Arc::new(AtomicUsize::new(0));
+    let all_cancelled = Arc::new(tokio::sync::Notify::new());
+    let mut handles = Vec::new();
+    for name in ["coalesced-a", "coalesced-b"] {
+        let cancellation = supervisor.root_cancellation_token();
+        let release_in_task = release.clone();
+        let cancellation_count = cancellation_count.clone();
+        let all_cancelled = all_cancelled.clone();
+        handles.push(
+            supervisor
+                .spawn_async(TaskCategory::Background, name, async move {
+                    cancellation.cancelled().await;
+                    if cancellation_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                        all_cancelled.notify_one();
+                    }
+                    release_in_task.notified().await;
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let started_at = tokio::time::Instant::now();
+    let mut shutdown = Box::pin(supervisor.shutdown(Duration::from_secs(30)));
+    assert!(matches!(poll_once(shutdown.as_mut()).await, Poll::Pending));
+    all_cancelled.notified().await;
+    release.notify_waiters();
+    for handle in handles {
+        handle.join().await.unwrap();
+    }
+    let report = shutdown.await;
+    assert_eq!(tokio::time::Instant::now(), started_at);
+    assert_eq!(report.joined, 2);
+    assert_eq!(report.aborted, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn completion_just_before_abort_is_not_aborted() {
+    let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+    let cancellation = supervisor.root_cancellation_token();
+    let cancellation_seen = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let seen_in_task = cancellation_seen.clone();
+    let release_in_task = release.clone();
+    let handle = supervisor
+        .spawn_async(
+            TaskCategory::Background,
+            "pre-abort-completion",
+            async move {
+                cancellation.cancelled().await;
+                seen_in_task.notify_one();
+                release_in_task.notified().await;
+            },
+        )
+        .await
+        .unwrap();
+    let mut shutdown = Box::pin(supervisor.shutdown(Duration::from_secs(30)));
+    assert!(matches!(poll_once(shutdown.as_mut()).await, Poll::Pending));
+    cancellation_seen.notified().await;
+    release.notify_one();
+    handle.join().await.unwrap();
+    let report = shutdown.await;
+    assert_eq!(report.joined, 1);
+    assert_eq!(report.aborted, 0);
+    assert_eq!(report.abort_confirmed, 0);
 }
 
 #[tokio::test]
@@ -589,16 +1010,7 @@ async fn spawn_async_removes_completed_task_from_managed_registry() {
     handle.join().await.unwrap();
 
     // Give the drop guard a moment to release the lock if needed.
-    wait_for(
-        || supervisor.managed_task_count() == 0,
-        Duration::from_secs(2),
-    )
-    .await;
-    assert_eq!(
-        supervisor.managed_task_count(),
-        0,
-        "completed supervised tasks must not remain in the managed task registry"
-    );
+    assert!(supervisor.active_tasks(None).is_empty());
 }
 
 #[tokio::test]
@@ -613,16 +1025,7 @@ async fn spawn_async_removes_panicked_task_from_managed_registry() {
         .unwrap();
     assert!(handle.join().await.is_err());
 
-    wait_for(
-        || supervisor.managed_task_count() == 0,
-        Duration::from_secs(2),
-    )
-    .await;
-    assert_eq!(
-        supervisor.managed_task_count(),
-        0,
-        "panicked supervised tasks must be removed by drop cleanup"
-    );
+    assert!(supervisor.active_tasks(None).is_empty());
 }
 
 #[tokio::test]
@@ -646,7 +1049,7 @@ async fn spawn_delay_does_not_run_future_after_root_cancellation() {
         "delayed future must not run when root cancellation wins the race"
     );
     assert_eq!(report.remaining_active, 0);
-    assert_eq!(supervisor.managed_task_count(), 0);
+    assert!(supervisor.active_tasks(None).is_empty());
 }
 
 #[tokio::test]
@@ -792,6 +1195,8 @@ async fn db_active_status_only_while_call_in_flight() {
 async fn db_query_logging_default_off_and_toggle() {
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
     let conn = tokio_rusqlite::Connection::open_in_memory().await.unwrap();
+    let capture = Arc::new(TraceCapture::default());
+    let _default = tracing::subscriber::set_default(capture.clone());
 
     assert!(!(supervisor.db_query_logging_status().enabled));
     supervisor
@@ -800,7 +1205,7 @@ async fn db_query_logging_default_off_and_toggle() {
         })
         .await
         .unwrap();
-    assert!(supervisor.db_query_logs_for_test().is_empty());
+    assert!(capture.events().is_empty());
 
     assert!(supervisor.set_db_query_logging(true).enabled);
     supervisor
@@ -809,10 +1214,16 @@ async fn db_query_logging_default_off_and_toggle() {
         })
         .await
         .unwrap();
-    let logs = supervisor.db_query_logs_for_test();
-    assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0].query_name, "metadata-only");
-    assert_eq!(logs[0].connection_key, "conn-a");
+    let events = capture.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].get("query_name").map(String::as_str),
+        Some("metadata-only")
+    );
+    assert_eq!(
+        events[0].get("connection_key").map(String::as_str),
+        Some("conn-a")
+    );
 }
 
 #[tokio::test]
@@ -820,6 +1231,8 @@ async fn db_query_logging_entries_never_include_payload_values() {
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
     let conn = tokio_rusqlite::Connection::open_in_memory().await.unwrap();
     supervisor.set_db_query_logging(true);
+    let capture = Arc::new(TraceCapture::default());
+    let _default = tracing::subscriber::set_default(capture.clone());
 
     let secret_payload = "top-secret-value";
     supervisor
@@ -830,8 +1243,72 @@ async fn db_query_logging_entries_never_include_payload_values() {
         .await
         .unwrap();
 
-    let serialized = serde_json::to_string(&supervisor.db_query_logs_for_test()).unwrap();
-    assert!(!serialized.contains("top-secret-value"));
+    let serialized = serde_json::to_string(&capture.events()).unwrap();
+    assert!(serialized.contains("payload-check"));
+    assert!(!serialized.contains(secret_payload));
+}
+
+#[derive(Default)]
+struct TraceCapture {
+    events: Mutex<Vec<BTreeMap<String, String>>>,
+}
+
+impl TraceCapture {
+    fn events(&self) -> Vec<BTreeMap<String, String>> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[derive(Default)]
+struct FieldCapture(BTreeMap<String, String>);
+
+impl Visit for FieldCapture {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.0.insert(field.name().to_owned(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+}
+
+impl Subscriber for TraceCapture {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.target() == "klights::task_supervisor::db"
+    }
+
+    fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+    fn event(&self, event: &Event<'_>) {
+        let mut capture = FieldCapture::default();
+        event.record(&mut capture);
+        self.events.lock().unwrap().push(capture.0);
+    }
+    fn enter(&self, _span: &Id) {}
+    fn exit(&self, _span: &Id) {}
+
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if self.enabled(metadata) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn clone_span(&self, id: &Id) -> Id {
+        id.clone()
+    }
+    fn try_close(&self, _id: Id) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------

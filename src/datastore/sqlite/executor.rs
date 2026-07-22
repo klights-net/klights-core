@@ -614,32 +614,4 @@ mod tests {
         write.await.unwrap();
         read.await.unwrap();
     }
-
-    #[tokio::test]
-    async fn db_executor_query_logging_metadata_only() {
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        supervisor.set_db_query_logging(true);
-        let executor = DbExecutor::open_in_memory(supervisor.clone(), "query-log-test")
-            .await
-            .unwrap();
-        let secret_value = "very-secret-token-value";
-
-        executor
-            .call_raw("insert_secret_like_data", move |conn| {
-                conn.execute("CREATE TABLE t (v TEXT)", [])?;
-                conn.execute("INSERT INTO t(v) VALUES (?1)", [secret_value])?;
-                Ok::<_, tokio_rusqlite::Error>(())
-            })
-            .await
-            .unwrap();
-
-        let logs = supervisor.db_query_logs_for_test();
-        assert!(!logs.is_empty(), "query log should include metadata entry");
-        let serialized = serde_json::to_string(&logs).unwrap();
-        assert!(
-            !serialized.contains(secret_value),
-            "query metadata logs must not contain SQL parameter or row values"
-        );
-        assert!(serialized.contains("insert_secret_like_data"));
-    }
 }

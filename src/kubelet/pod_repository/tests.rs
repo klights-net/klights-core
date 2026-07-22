@@ -10043,7 +10043,7 @@ async fn pod_annotation_patch_does_not_scan_services_or_enqueue_service() {
         .create("default", "anno-pod", seed)
         .await
         .unwrap();
-    let managed_tasks_before = repo.supervisor.managed_task_count();
+    let managed_tasks_before = repo.supervisor.active_tasks(None).len();
 
     for i in 0..50 {
         let patch = json!({
@@ -10073,7 +10073,7 @@ async fn pod_annotation_patch_does_not_scan_services_or_enqueue_service() {
         "annotation-only patches must not enqueue Service reconciles"
     );
     assert_eq!(
-        repo.supervisor.managed_task_count(),
+        repo.supervisor.active_tasks(None).len(),
         managed_tasks_before,
         "annotation-only patches must not create background retry or timer tasks"
     );

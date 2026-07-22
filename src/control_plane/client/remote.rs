@@ -202,7 +202,7 @@ impl RemoteApiClient {
                 Err(err) => {
                     self.worker_informers_started
                         .store(false, Ordering::Release);
-                    return Err(err);
+                    return Err(err.into());
                 }
             }
         }

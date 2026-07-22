@@ -2032,6 +2032,7 @@ dependencies = [
  "klights-node-api",
  "klights-pod-api",
  "klights-reconcile-api",
+ "klights-supervisor",
  "klights-types",
  "klights-watch",
  "kube",
@@ -2216,6 +2217,16 @@ version = "0.0.0"
 [[package]]
 name = "klights-supervisor"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rusqlite",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "klights-types"
@@ -4624,6 +4635,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "slab",
  "tokio",

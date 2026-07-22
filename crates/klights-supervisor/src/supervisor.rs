@@ -1,11 +1,12 @@
 use super::category::{TaskCategory, TaskCategoryConfig};
-use super::task::{ActiveTaskStatus, DbQueryLoggingStatus, ShutdownReport, TaskCategoryStatus};
-use crate::task_supervisor::task::ActiveTask;
-use crate::utils::lock_recover;
+use super::task::{
+    ActiveTask, ActiveTaskStatus, DbQueryLoggingStatus, ShutdownReport, TaskAdmissionError,
+    TaskCategoryStatus, TaskJoinError, TaskOutcome, TaskOutcomeStatus,
+};
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -19,26 +20,40 @@ struct TaskSupervisorInner {
     next_task_id: AtomicU64,
     root_cancellation: CancellationToken,
     db_query_logging_enabled: AtomicBool,
-    active_tasks: Mutex<HashMap<u64, ActiveTask>>,
-    managed_tasks: Mutex<HashMap<u64, ManagedTaskControl>>,
-    db_query_logs: Mutex<Vec<DbQueryLogEntry>>,
+    lifecycle: Mutex<LifecycleState>,
+    managed_task_change: Notify,
     queued_by_category: Mutex<HashMap<TaskCategory, usize>>,
     file_keyed_guards: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     semaphores: HashMap<TaskCategory, Arc<Semaphore>>,
     category_free_notifies: HashMap<TaskCategory, Arc<Notify>>,
+    #[cfg(test)]
+    terminal_cleanup_pause: Mutex<Option<Arc<TerminalCleanupPause>>>,
 }
 
+#[derive(Clone)]
 struct ManagedTaskControl {
     abort_handle: tokio::task::AbortHandle,
-    done: Arc<AtomicBool>,
+    completion: Arc<TaskCompletion>,
+    abort_source: Arc<AtomicU8>,
 }
 
-#[derive(Clone, serde::Serialize)]
-pub struct DbQueryLogEntry {
-    pub query_name: String,
-    pub connection_key: String,
-    pub duration_ms: u64,
+struct LifecycleState {
+    accepting: bool,
+    active_tasks: HashMap<u64, ActiveTask>,
+    managed_tasks: HashMap<u64, ManagedTaskControl>,
+    recent_outcomes: VecDeque<TaskOutcomeStatus>,
 }
+
+struct TaskCompletion {
+    terminal: AtomicBool,
+    outcome: AtomicU8,
+}
+
+const OUTCOME_HISTORY_LIMIT: usize = 256;
+const OUTCOME_PENDING: u8 = 0;
+const ABORT_NONE: u8 = 0;
+const ABORT_CALLER: u8 = 1;
+const ABORT_SHUTDOWN: u8 = 2;
 
 impl TaskSupervisor {
     pub fn new(config: TaskCategoryConfig) -> Self {
@@ -57,13 +72,19 @@ impl TaskSupervisor {
                 next_task_id: AtomicU64::new(1),
                 root_cancellation: CancellationToken::new(),
                 db_query_logging_enabled: AtomicBool::new(false),
-                active_tasks: Mutex::new(HashMap::new()),
-                managed_tasks: Mutex::new(HashMap::new()),
-                db_query_logs: Mutex::new(Vec::new()),
+                lifecycle: Mutex::new(LifecycleState {
+                    accepting: true,
+                    active_tasks: HashMap::new(),
+                    managed_tasks: HashMap::new(),
+                    recent_outcomes: VecDeque::with_capacity(OUTCOME_HISTORY_LIMIT),
+                }),
+                managed_task_change: Notify::new(),
                 queued_by_category: Mutex::new(HashMap::new()),
                 file_keyed_guards: Mutex::new(HashMap::new()),
                 semaphores,
                 category_free_notifies,
+                #[cfg(test)]
+                terminal_cleanup_pause: Mutex::new(None),
             }),
         }
     }
@@ -95,10 +116,10 @@ impl TaskSupervisor {
     }
 
     pub fn category_statuses(&self) -> Vec<TaskCategoryStatus> {
-        let active = lock_recover(&self.inner.active_tasks);
+        let lifecycle = lock_recover(&self.inner.lifecycle);
         let queued = lock_recover(&self.inner.queued_by_category);
         let mut active_by_category = HashMap::<TaskCategory, usize>::new();
-        for task in active.values() {
+        for task in lifecycle.active_tasks.values() {
             *active_by_category.entry(task.category).or_insert(0) += 1;
         }
 
@@ -117,8 +138,9 @@ impl TaskSupervisor {
     }
 
     pub fn active_tasks(&self, category: Option<TaskCategory>) -> Vec<ActiveTaskStatus> {
-        let active = lock_recover(&self.inner.active_tasks);
-        let mut rows: Vec<ActiveTaskStatus> = active
+        let lifecycle = lock_recover(&self.inner.lifecycle);
+        let mut rows: Vec<ActiveTaskStatus> = lifecycle
+            .active_tasks
             .values()
             .filter(|task| category.is_none_or(|selected| selected == task.category))
             .map(ActiveTask::to_status)
@@ -144,24 +166,19 @@ impl TaskSupervisor {
         self.inner.root_cancellation.clone()
     }
 
-    pub fn managed_task_count(&self) -> usize {
-        lock_recover(&self.inner.managed_tasks).len()
+    pub fn recent_task_outcomes(&self) -> Vec<TaskOutcomeStatus> {
+        lock_recover(&self.inner.lifecycle)
+            .recent_outcomes
+            .iter()
+            .cloned()
+            .collect()
     }
 
-    pub fn db_query_logs_for_test(&self) -> Vec<DbQueryLogEntry> {
-        lock_recover(&self.inner.db_query_logs).clone()
-    }
-
-    pub fn start_task_for_test(
-        &self,
-        category: TaskCategory,
-        name: impl Into<String>,
-    ) -> SupervisedTaskGuard {
-        let id = self.start_task(category, name.into());
-        SupervisedTaskGuard {
-            supervisor: self.clone(),
-            task_id: id,
-        }
+    #[cfg(test)]
+    pub(crate) fn pause_next_terminal_cleanup(&self) -> Arc<TerminalCleanupPause> {
+        let pause = Arc::new(TerminalCleanupPause::new());
+        *lock_recover(&self.inner.terminal_cleanup_pause) = Some(pause.clone());
+        pause
     }
 
     pub async fn spawn_async<T, F>(
@@ -169,42 +186,83 @@ impl TaskSupervisor {
         category: TaskCategory,
         name: impl Into<String>,
         future: F,
-    ) -> Result<SupervisedJoinHandle<T>>
+    ) -> std::result::Result<SupervisedJoinHandle<T>, TaskAdmissionError>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
         let permit = self.acquire_permit(category).await?;
-        let task_id = self.start_task(category, name.into());
-        let done_flag = Arc::new(AtomicBool::new(false));
+        let name = name.into();
+        let mut lifecycle = lock_recover(&self.inner.lifecycle);
+        if !lifecycle.accepting {
+            return Err(TaskAdmissionError::ShuttingDown);
+        }
+        let task_id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
+        let completion = Arc::new(TaskCompletion {
+            terminal: AtomicBool::new(false),
+            outcome: AtomicU8::new(OUTCOME_PENDING),
+        });
+        let abort_source = Arc::new(AtomicU8::new(ABORT_NONE));
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
         let guard = ManagedTaskGuard {
             supervisor: self.clone(),
-            task_id,
-            done: done_flag.clone(),
+            task: ActiveTask {
+                id: task_id,
+                category,
+                name: name.clone(),
+            },
+            completion: completion.clone(),
+            abort_source: abort_source.clone(),
+            outcome: TaskOutcome::RuntimeCancelled,
         };
         let handle = tokio::spawn(async move {
-            // Sole owner of finalization. Drops on normal return, panic, or abort.
-            let _guard = guard;
+            let _ = start_rx.await;
+            let mut guard = guard;
             let _permit = permit;
-            future.await
-        });
-        {
-            let mut managed = lock_recover(&self.inner.managed_tasks);
-            managed.insert(
-                task_id,
-                ManagedTaskControl {
-                    abort_handle: handle.abort_handle(),
-                    done: done_flag.clone(),
-                },
-            );
-            // Race: a very fast task may have completed (and its drop may have
-            // tried to remove an entry that did not yet exist) before we got
-            // the lock. Detect and clean up.
-            if done_flag.load(Ordering::SeqCst) {
-                managed.remove(&task_id);
+            let mut future = Box::pin(future);
+            let outcome = std::future::poll_fn(|context| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    future.as_mut().poll(context)
+                })) {
+                    Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+                    Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+                    Err(payload) => std::task::Poll::Ready(Err(payload)),
+                }
+            })
+            .await;
+            match outcome {
+                Ok(output) => {
+                    guard.outcome = TaskOutcome::Completed;
+                    output
+                }
+                Err(payload) => {
+                    guard.outcome = TaskOutcome::Panicked;
+                    std::panic::resume_unwind(payload)
+                }
             }
-        }
-        Ok(SupervisedJoinHandle { inner: handle })
+        });
+        lifecycle.active_tasks.insert(
+            task_id,
+            ActiveTask {
+                id: task_id,
+                category,
+                name,
+            },
+        );
+        lifecycle.managed_tasks.insert(
+            task_id,
+            ManagedTaskControl {
+                abort_handle: handle.abort_handle(),
+                completion,
+                abort_source: abort_source.clone(),
+            },
+        );
+        let _ = start_tx.send(());
+        drop(lifecycle);
+        Ok(SupervisedJoinHandle {
+            inner: handle,
+            abort_source,
+        })
     }
 
     pub async fn run_blocking<T, F>(
@@ -219,7 +277,7 @@ impl TaskSupervisor {
     {
         let name: String = name.into();
         let permit = self.acquire_permit(category).await?;
-        let task_id = self.start_task(category, name.clone());
+        let task_id = self.start_task(category, name.clone())?;
 
         // Detach into a task that holds the permit for the true duration
         // of the blocking work. If the caller future is cancelled, the
@@ -350,7 +408,9 @@ impl TaskSupervisor {
         let permit = self.acquire_permit(category).await.map_err(|e| {
             tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(e.to_string())))
         })?;
-        let task_id = self.start_task(category, query_name.clone());
+        let task_id = self
+            .start_task(category, query_name.clone())
+            .map_err(|error| tokio_rusqlite::Error::Other(Box::new(error)))?;
 
         // Detach into a task that holds the DB permit for the true duration
         // of the DB call. If the caller future is cancelled, the permit
@@ -369,19 +429,13 @@ impl TaskSupervisor {
             let started = std::time::Instant::now();
             let result = connection.call(f).await;
             if db_logging {
-                let entry = DbQueryLogEntry {
-                    query_name: query_name_for_log,
-                    connection_key: connection_key_for_log,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                };
                 tracing::info!(
                     target: "klights::task_supervisor::db",
-                    "db_query query_name={} connection_key={} duration_ms={}",
-                    entry.query_name,
-                    entry.connection_key,
-                    entry.duration_ms
+                    query_name = %query_name_for_log,
+                    connection_key = %connection_key_for_log,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "db_query"
                 );
-                lock_recover(&supervisor.inner.db_query_logs).push(entry);
             }
             let _ = tx.send(result);
         });
@@ -403,17 +457,18 @@ impl TaskSupervisor {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let token = self.root_cancellation_token();
-        self.spawn_async(TaskCategory::Timer, name, async move {
-            tokio::select! {
-                _ = tokio::time::sleep(delay) => {
-                    future.await;
+        Ok(self
+            .spawn_async(TaskCategory::Timer, name, async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {
+                        future.await;
+                    }
+                    _ = token.cancelled() => {
+                        // dropped — future never runs
+                    }
                 }
-                _ = token.cancelled() => {
-                    // dropped — future never runs
-                }
-            }
-        })
-        .await
+            })
+            .await?)
     }
 
     pub async fn spawn_interval<F, Fut>(
@@ -427,20 +482,21 @@ impl TaskSupervisor {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let token = self.root_cancellation_token();
-        self.spawn_async(TaskCategory::Timer, name, async move {
-            let mut count = 0u64;
-            let mut interval = tokio::time::interval(period);
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = interval.tick() => {
-                        tick(count).await;
-                        count += 1;
+        Ok(self
+            .spawn_async(TaskCategory::Timer, name, async move {
+                let mut count = 0u64;
+                let mut interval = tokio::time::interval(period);
+                loop {
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = interval.tick() => {
+                            tick(count).await;
+                            count += 1;
+                        }
                     }
                 }
-            }
-        })
-        .await
+            })
+            .await?)
     }
 
     pub async fn sleep(
@@ -449,7 +505,7 @@ impl TaskSupervisor {
         duration: std::time::Duration,
     ) -> Result<()> {
         let permit = self.acquire_permit(TaskCategory::Timer).await?;
-        let task_id = self.start_task(TaskCategory::Timer, name.into());
+        let task_id = self.start_task(TaskCategory::Timer, name.into())?;
         let _guard = RunningTaskGuard {
             supervisor: self.clone(),
             task_id,
@@ -469,7 +525,7 @@ impl TaskSupervisor {
         deadline: tokio::time::Instant,
     ) -> Result<()> {
         let permit = self.acquire_permit(TaskCategory::Timer).await?;
-        let task_id = self.start_task(TaskCategory::Timer, name.into());
+        let task_id = self.start_task(TaskCategory::Timer, name.into())?;
         let _guard = RunningTaskGuard {
             supervisor: self.clone(),
             task_id,
@@ -493,7 +549,7 @@ impl TaskSupervisor {
         F: std::future::Future,
     {
         let permit = self.acquire_permit(TaskCategory::Timer).await?;
-        let task_id = self.start_task(TaskCategory::Timer, name.into());
+        let task_id = self.start_task(TaskCategory::Timer, name.into())?;
         let _guard = RunningTaskGuard {
             supervisor: self.clone(),
             task_id,
@@ -510,79 +566,143 @@ impl TaskSupervisor {
     }
 
     pub async fn shutdown(&self, timeout: std::time::Duration) -> ShutdownReport {
+        let managed = {
+            let mut lifecycle = lock_recover(&self.inner.lifecycle);
+            lifecycle.accepting = false;
+            lifecycle
+                .managed_tasks
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         self.inner.root_cancellation.cancel();
 
-        let managed = {
-            let mut managed = lock_recover(&self.inner.managed_tasks);
-            std::mem::take(&mut *managed)
-        };
-
         let total_managed = managed.len();
-        let mut pending = Vec::new();
+        let mut pending = managed;
         let mut joined = 0usize;
-        for control in managed.into_values() {
-            if control.done.load(Ordering::SeqCst) {
-                joined += 1;
-            } else {
-                pending.push(control);
-            }
-        }
 
-        let start = tokio::time::Instant::now();
-        while !pending.is_empty() && start.elapsed() < timeout {
-            pending.retain(|control| {
-                if control.done.load(Ordering::SeqCst) {
-                    joined += 1;
-                    return false;
-                }
-                true
-            });
-            if pending.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let shutdown_deadline = tokio::time::Instant::now() + timeout;
+        self.wait_for_managed_tasks(&mut pending, shutdown_deadline, Some(&mut joined))
+            .await;
 
+        // A completion at the graceful deadline wins over an abort request.
+        Self::retain_pending(&mut pending, Some(&mut joined));
         let timed_out = !pending.is_empty();
         let mut aborted = 0usize;
+        let mut abort_requests = Vec::new();
         if timed_out {
             for control in &pending {
+                control
+                    .abort_source
+                    .compare_exchange(
+                        ABORT_NONE,
+                        ABORT_SHUTDOWN,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .ok();
                 control.abort_handle.abort();
                 aborted += 1;
+                abort_requests.push(control.clone());
             }
-            for _ in 0..10 {
-                if pending
-                    .iter()
-                    .all(|control| control.done.load(Ordering::SeqCst))
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            let abort_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+            self.wait_for_managed_tasks(&mut pending, abort_deadline, None)
+                .await;
         }
 
         let remaining_active = self.active_tasks(None).len();
+        let abort_confirmed = abort_requests
+            .iter()
+            .filter(|control| {
+                matches!(
+                    decode_outcome(control.completion.outcome.load(Ordering::Acquire)),
+                    Some(TaskOutcome::CallerAborted | TaskOutcome::ShutdownAborted)
+                )
+            })
+            .count();
         ShutdownReport {
             total_managed,
             joined,
             aborted,
+            abort_confirmed,
             timed_out,
             remaining_active,
         }
     }
 
-    fn start_task(&self, category: TaskCategory, name: String) -> u64 {
+    async fn wait_for_managed_tasks(
+        &self,
+        pending: &mut Vec<ManagedTaskControl>,
+        deadline: tokio::time::Instant,
+        mut joined: Option<&mut usize>,
+    ) {
+        loop {
+            // Register before inspecting the atomic flags so completion cannot
+            // race between the scan and the await. One notification is enough:
+            // every wake rescans all controls and removes every completed task.
+            let completion = self.inner.managed_task_change.notified();
+            tokio::pin!(completion);
+            completion.as_mut().enable();
+
+            Self::retain_pending(pending, joined.as_deref_mut());
+            if pending.is_empty() || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+
+            tokio::select! {
+                _ = &mut completion => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    Self::retain_pending(pending, joined.as_deref_mut());
+                    return;
+                },
+            }
+        }
+    }
+
+    fn retain_pending(pending: &mut Vec<ManagedTaskControl>, mut joined: Option<&mut usize>) {
+        pending.retain(|control| {
+            if !control.completion.terminal.load(Ordering::Acquire) {
+                return true;
+            }
+            if decode_outcome(control.completion.outcome.load(Ordering::Acquire))
+                == Some(TaskOutcome::Completed)
+                && let Some(count) = joined.as_deref_mut()
+            {
+                *count += 1;
+            }
+            false
+        });
+    }
+
+    fn start_task(
+        &self,
+        category: TaskCategory,
+        name: String,
+    ) -> std::result::Result<u64, TaskAdmissionError> {
+        let mut lifecycle = lock_recover(&self.inner.lifecycle);
+        if !lifecycle.accepting {
+            return Err(TaskAdmissionError::ShuttingDown);
+        }
         let id = self.inner.next_task_id.fetch_add(1, Ordering::Relaxed);
         let active = ActiveTask { id, category, name };
-        lock_recover(&self.inner.active_tasks).insert(id, active);
-        id
+        lifecycle.active_tasks.insert(id, active);
+        Ok(id)
     }
 
     fn finish_task(&self, task_id: u64) {
-        lock_recover(&self.inner.active_tasks).remove(&task_id);
+        lock_recover(&self.inner.lifecycle)
+            .active_tasks
+            .remove(&task_id);
     }
 
-    async fn acquire_permit(&self, category: TaskCategory) -> Result<Option<CategoryPermit>> {
+    async fn acquire_permit(
+        &self,
+        category: TaskCategory,
+    ) -> std::result::Result<Option<CategoryPermit>, TaskAdmissionError> {
+        if !lock_recover(&self.inner.lifecycle).accepting {
+            return Err(TaskAdmissionError::ShuttingDown);
+        }
         let Some(semaphore) = self.inner.semaphores.get(&category).cloned() else {
             return Ok(None);
         };
@@ -594,13 +714,21 @@ impl TaskSupervisor {
         // that was parked here leaves `queued` stuck high forever (observed as
         // steady `db queued>0, active=0` on the live leader).
         let queued_guard = QueuedGuard::new(self.clone(), category);
-        let permit = semaphore
-            .acquire_owned()
-            .await
-            .map_err(|error| anyhow!("task category semaphore closed: {error}"))?;
+        let cancellation = self.inner.root_cancellation.clone();
+        let permit = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(TaskAdmissionError::ShuttingDown),
+            permit = semaphore.acquire_owned() => {
+                permit.map_err(|_| TaskAdmissionError::CategoryClosed(category))?
+            }
+        };
         drop(queued_guard);
+        if !lock_recover(&self.inner.lifecycle).accepting {
+            drop(permit);
+            return Err(TaskAdmissionError::ShuttingDown);
+        }
         Ok(Some(CategoryPermit {
-            _permit: permit,
+            permit: Some(permit),
             notify: self.inner.category_free_notifies.get(&category).cloned(),
         }))
     }
@@ -640,27 +768,17 @@ impl Drop for QueuedGuard {
     }
 }
 
-pub struct SupervisedTaskGuard {
-    supervisor: TaskSupervisor,
-    task_id: u64,
-}
-
 struct CategoryPermit {
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
     notify: Option<Arc<Notify>>,
 }
 
 impl Drop for CategoryPermit {
     fn drop(&mut self) {
+        drop(self.permit.take());
         if let Some(notify) = &self.notify {
             notify.notify_one();
         }
-    }
-}
-
-impl Drop for SupervisedTaskGuard {
-    fn drop(&mut self) {
-        self.supervisor.finish_task(self.task_id);
     }
 }
 
@@ -703,31 +821,139 @@ impl Drop for BlockingTaskGuard {
 /// runs all three cleanups.
 struct ManagedTaskGuard {
     supervisor: TaskSupervisor,
-    task_id: u64,
-    done: Arc<AtomicBool>,
+    task: ActiveTask,
+    completion: Arc<TaskCompletion>,
+    abort_source: Arc<AtomicU8>,
+    outcome: TaskOutcome,
 }
 
 impl Drop for ManagedTaskGuard {
     fn drop(&mut self) {
-        // Order matters: set `done` first so a concurrent `shutdown()` that
-        // already took the managed_tasks map sees this entry as joined rather
-        // than aborting it.
-        self.done.store(true, Ordering::SeqCst);
-        self.supervisor.finish_task(self.task_id);
-        lock_recover(&self.supervisor.inner.managed_tasks).remove(&self.task_id);
+        let outcome = if self.outcome == TaskOutcome::Panicked || std::thread::panicking() {
+            TaskOutcome::Panicked
+        } else if self.outcome == TaskOutcome::Completed {
+            TaskOutcome::Completed
+        } else {
+            match self.abort_source.load(Ordering::SeqCst) {
+                ABORT_CALLER => TaskOutcome::CallerAborted,
+                ABORT_SHUTDOWN => TaskOutcome::ShutdownAborted,
+                _ => TaskOutcome::RuntimeCancelled,
+            }
+        };
+        #[cfg(test)]
+        if let Some(pause) = lock_recover(&self.supervisor.inner.terminal_cleanup_pause).take() {
+            pause.block_cleanup();
+        }
+        let mut lifecycle = lock_recover(&self.supervisor.inner.lifecycle);
+        lifecycle.active_tasks.remove(&self.task.id);
+        lifecycle.managed_tasks.remove(&self.task.id);
+        if lifecycle.recent_outcomes.len() == OUTCOME_HISTORY_LIMIT {
+            lifecycle.recent_outcomes.pop_front();
+        }
+        lifecycle.recent_outcomes.push_back(TaskOutcomeStatus {
+            id: self.task.id,
+            category: self.task.category,
+            name: self.task.name.clone(),
+            outcome,
+        });
+        drop(lifecycle);
+        self.completion
+            .outcome
+            .store(encode_outcome(outcome), Ordering::Release);
+        self.completion.terminal.store(true, Ordering::Release);
+        self.supervisor.inner.managed_task_change.notify_one();
     }
 }
 
+#[cfg(test)]
+pub(crate) struct TerminalCleanupPause {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: Mutex<bool>,
+    release_condvar: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TerminalCleanupPause {
+    fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+            released: Mutex::new(false),
+            release_condvar: std::sync::Condvar::new(),
+        }
+    }
+
+    fn block_cleanup(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_one();
+        let mut released = lock_recover(&self.released);
+        while !*released {
+            released = match self.release_condvar.wait(released) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        let entered = self.entered_notify.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        if !self.entered.load(Ordering::Acquire) {
+            entered.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        *lock_recover(&self.released) = true;
+        self.release_condvar.notify_one();
+    }
+}
+
+#[derive(Debug)]
 pub struct SupervisedJoinHandle<T> {
     inner: tokio::task::JoinHandle<T>,
+    abort_source: Arc<AtomicU8>,
 }
 
 impl<T> SupervisedJoinHandle<T> {
     pub fn abort(&self) {
+        self.abort_source
+            .compare_exchange(ABORT_NONE, ABORT_CALLER, Ordering::SeqCst, Ordering::SeqCst)
+            .ok();
         self.inner.abort();
     }
 
-    pub async fn join(self) -> std::result::Result<T, tokio::task::JoinError> {
-        self.inner.await
+    pub async fn join(self) -> std::result::Result<T, TaskJoinError> {
+        self.inner.await.map_err(TaskJoinError::new)
+    }
+}
+
+fn encode_outcome(outcome: TaskOutcome) -> u8 {
+    match outcome {
+        TaskOutcome::Completed => 1,
+        TaskOutcome::Panicked => 2,
+        TaskOutcome::CallerAborted => 3,
+        TaskOutcome::ShutdownAborted => 4,
+        TaskOutcome::RuntimeCancelled => 5,
+    }
+}
+
+fn decode_outcome(value: u8) -> Option<TaskOutcome> {
+    match value {
+        1 => Some(TaskOutcome::Completed),
+        2 => Some(TaskOutcome::Panicked),
+        3 => Some(TaskOutcome::CallerAborted),
+        4 => Some(TaskOutcome::ShutdownAborted),
+        5 => Some(TaskOutcome::RuntimeCancelled),
+        _ => None,
+    }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }

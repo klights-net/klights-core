@@ -3350,7 +3350,7 @@ mod tests {
             "watches without allowWatchBookmarks must not spawn timer work"
         );
         assert_eq!(
-            supervisor.managed_task_count(),
+            supervisor.active_tasks(None).len(),
             0,
             "no managed task entries should leak when bookmarks are disabled"
         );

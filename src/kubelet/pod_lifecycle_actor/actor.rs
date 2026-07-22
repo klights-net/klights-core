@@ -641,7 +641,7 @@ impl PodLifecycleActor {
                         .complete_matching_work(&key.uid, operation_id, kind);
                 }
                 if let Some(synth) = synth {
-                    let _ = completion_tx.send(synth(err)).await;
+                    let _ = completion_tx.send(synth(err.into())).await;
                 }
                 None
             }

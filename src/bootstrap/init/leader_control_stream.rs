@@ -20,6 +20,7 @@ pub async fn start_worker_leader_control_stream(
             },
         )
         .await
+        .map_err(Into::into)
 }
 
 async fn run_worker_leader_control_stream(

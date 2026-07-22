@@ -1,10 +1,12 @@
-use super::category::TaskCategory;
 use crate::api::{AppError, AppState};
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::HeaderMap,
     routing::get,
+};
+use klights_supervisor::{
+    ActiveTaskStatus, DbQueryLoggingStatus, TaskCategory, TaskCategoryStatus,
 };
 use std::sync::Arc;
 
@@ -27,7 +29,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 async fn get_categories(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<Vec<super::task::TaskCategoryStatus>>, AppError> {
+) -> Result<Json<Vec<TaskCategoryStatus>>, AppError> {
     ensure_admin(&headers)?;
     Ok(Json(state.task_supervisor.category_statuses()))
 }
@@ -35,7 +37,7 @@ async fn get_categories(
 async fn get_tasks(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<Vec<super::task::ActiveTaskStatus>>, AppError> {
+) -> Result<Json<Vec<ActiveTaskStatus>>, AppError> {
     ensure_admin(&headers)?;
     Ok(Json(state.task_supervisor.active_tasks(None)))
 }
@@ -44,7 +46,7 @@ async fn get_tasks_by_category(
     State(state): State<Arc<AppState>>,
     Path(category): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Vec<super::task::ActiveTaskStatus>>, AppError> {
+) -> Result<Json<Vec<ActiveTaskStatus>>, AppError> {
     ensure_admin(&headers)?;
     let category = parse_category(&category)?;
     Ok(Json(state.task_supervisor.active_tasks(Some(category))))
@@ -53,7 +55,7 @@ async fn get_tasks_by_category(
 async fn get_db_query_logging(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<super::task::DbQueryLoggingStatus>, AppError> {
+) -> Result<Json<DbQueryLoggingStatus>, AppError> {
     ensure_admin(&headers)?;
     Ok(Json(state.task_supervisor.db_query_logging_status()))
 }
@@ -62,7 +64,7 @@ async fn put_db_query_logging(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(payload): Json<DbQueryLoggingUpdate>,
-) -> Result<Json<super::task::DbQueryLoggingStatus>, AppError> {
+) -> Result<Json<DbQueryLoggingStatus>, AppError> {
     ensure_admin(&headers)?;
     Ok(Json(
         state.task_supervisor.set_db_query_logging(payload.enabled),

@@ -1,13 +1,7 @@
 pub mod api;
 
-mod category;
-mod supervisor;
-mod task;
-
-pub use category::TaskCategory;
-pub use category::TaskCategoryConfig;
-pub use supervisor::SupervisedJoinHandle;
-pub use supervisor::TaskSupervisor;
-
-#[cfg(test)]
-mod tests;
+// TRANSITION(Phase 7.3): remove these four root compatibility reexports after
+// application consumers import the leaf lifecycle contract directly.
+pub use klights_supervisor::{
+    SupervisedJoinHandle, TaskCategory, TaskCategoryConfig, TaskSupervisor,
+};

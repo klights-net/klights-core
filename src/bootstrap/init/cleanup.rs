@@ -251,7 +251,7 @@ async fn start_cleanup_cni_rpc_server(
         Ok(handle) => handle,
         Err(e) => {
             let _ = crate::utils::remove_file_if_exists_async(&socket_path).await;
-            return Err(e);
+            return Err(e.into());
         }
     };
     Ok(CleanupCniRpcServer { cancel, handle })

@@ -574,7 +574,7 @@ impl ReplicationService {
             .await
         {
             self.fanout_started.store(false, Ordering::Release);
-            return Err(err);
+            return Err(err.into());
         }
         Ok(())
     }
