@@ -62,6 +62,7 @@ klights-reconcile-api = { path = "crates/klights-reconcile-api" }
 klights-network-api = { path = "crates/klights-network-api" }
 klights-supervisor = { path = "crates/klights-supervisor" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
+klights-kube-protobuf = { path = "crates/klights-kube-protobuf" }
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
 tokio = { version = ">=1.51.0, <1.52.0", features = ["rt", "rt-multi-thread", "macros", "time", "signal", "sync", "net", "process", "fs", "io-util"] }
@@ -199,6 +200,7 @@ klights-reconcile-api = { workspace = true }
 klights-network-api = { workspace = true }
 klights-supervisor = { workspace = true }
 klights-internal-protobuf = { workspace = true }
+klights-kube-protobuf = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }
@@ -239,7 +241,6 @@ tonic-reflection = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 prost-reflect = { workspace = true }
-k8s-pb = { workspace = true }
 async-trait = { workspace = true }
 k8s-cri = { workspace = true }
 chrono = { workspace = true, features = ["clock", "oldtime", "wasmbind"] }

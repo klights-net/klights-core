@@ -1,3 +1,7 @@
+// TEMPORARY(Phase 8.1): keep existing codec and consumer paths source-compatible
+// while the generated owner lands first. REMOVE(Phase 8.3) after consumer cleanup.
+extern crate klights_kube_protobuf as k8s_pb;
+
 pub mod admission;
 mod allocator;
 pub mod api;

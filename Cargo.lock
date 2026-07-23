@@ -2023,10 +2023,10 @@ dependencies = [
  "jsonwebtoken",
  "k8s-cri",
  "k8s-openapi",
- "k8s-pb",
  "klights-cluster-core",
  "klights-cluster-store",
  "klights-internal-protobuf",
+ "klights-kube-protobuf",
  "klights-leader-api",
  "klights-network-api",
  "klights-node-api",
@@ -2149,6 +2149,10 @@ dependencies = [
 [[package]]
 name = "klights-kube-protobuf"
 version = "0.0.0"
+dependencies = [
+ "k8s-pb",
+ "prost",
+]
 
 [[package]]
 name = "klights-kubelet"
