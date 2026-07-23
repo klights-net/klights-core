@@ -53,4 +53,51 @@ mod tests {
         );
         assert_eq!(unknown.raw, [0x0a, 0x00]);
     }
+
+    #[test]
+    fn watch_frames_preserve_each_kubernetes_event_type() {
+        for event_type in ["ADDED", "MODIFIED", "DELETED", "BOOKMARK"] {
+            let object_envelope =
+                crate::wrap_protobuf_resource_envelope("v1", "Pod", vec![0x0a, 0x00]).unwrap();
+            let frame = encode_watch_event_frame(event_type, object_envelope);
+            let event = WatchEvent::decode(&frame[4..]).unwrap();
+            assert_eq!(event.r#type.as_deref(), Some(event_type));
+            assert_eq!(
+                event
+                    .object
+                    .and_then(|object| object.raw)
+                    .as_deref()
+                    .map(|raw| &raw[..4]),
+                Some(&b"k8s\0"[..]),
+            );
+        }
+    }
+
+    #[test]
+    fn concatenated_watch_frames_retain_exact_boundaries() {
+        let mut stream = Vec::new();
+        for (event_type, kind) in [
+            ("ADDED", "Pod"),
+            ("MODIFIED", "ConfigMap"),
+            ("DELETED", "Node"),
+        ] {
+            let object_envelope =
+                crate::wrap_protobuf_resource_envelope("v1", kind, vec![0x0a, 0x00]).unwrap();
+            stream.extend(encode_watch_event_frame(event_type, object_envelope));
+        }
+
+        let mut offset = 0;
+        let mut decoded = Vec::new();
+        while offset < stream.len() {
+            let payload_len =
+                u32::from_be_bytes(stream[offset..offset + 4].try_into().unwrap()) as usize;
+            let frame_end = offset + 4 + payload_len;
+            let event = WatchEvent::decode(&stream[offset + 4..frame_end]).unwrap();
+            decoded.push(event.r#type.unwrap());
+            offset = frame_end;
+        }
+
+        assert_eq!(offset, stream.len());
+        assert_eq!(decoded, ["ADDED", "MODIFIED", "DELETED"]);
+    }
 }

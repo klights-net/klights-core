@@ -7,7 +7,7 @@ pub async fn pod_eviction(
 ) -> Result<Response, AppError> {
     // Parse the Eviction object from the request body (JSON or protobuf)
     let eviction: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
-        crate::protobuf::decode_protobuf(&body[4..]).map_err(|e| {
+        klights_kube_protobuf::decode_protobuf(&body[4..]).map_err(|e| {
             AppError::BadRequest(format!("failed to decode eviction protobuf: {}", e))
         })?
     } else if body.is_empty() {

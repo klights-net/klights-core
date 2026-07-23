@@ -1,7 +1,7 @@
 //! Full-stack protobuf/controller characterization retained by the root until
 //! Phase 8.4 assigns cross-adapter parity fixtures to the base harness.
 
-use crate::protobuf::{decode_protobuf, encode_protobuf};
+use klights_kube_protobuf::{decode_protobuf, encode_protobuf};
 use serde_json::json;
 
 #[tokio::test]

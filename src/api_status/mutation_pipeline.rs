@@ -75,7 +75,7 @@ pub struct K8sStatusMutationDecoder;
 impl StatusMutationDecoder for K8sStatusMutationDecoder {
     fn decode_patch_body(&self, body: &Bytes) -> Result<Value, AppError> {
         if body.len() >= 4 && &body[..4] == b"k8s\x00" {
-            crate::protobuf::decode_protobuf(&body[4..])
+            klights_kube_protobuf::decode_protobuf(&body[4..])
                 .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))
         } else {
             serde_json::from_slice(body)

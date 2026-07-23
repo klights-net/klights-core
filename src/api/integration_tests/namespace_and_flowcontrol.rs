@@ -201,8 +201,8 @@ async fn test_cronjob_status_put_protobuf_updates_last_schedule_time() {
 
     let updated_time = "2026-07-04T06:22:00Z";
     update_body["status"]["lastScheduleTime"] = json!(updated_time);
-    let protobuf_body =
-        crate::protobuf::encode_protobuf(&update_body).expect("CronJob status update encodes");
+    let protobuf_body = klights_kube_protobuf::encode_protobuf(&update_body)
+        .expect("CronJob status update encodes");
     let req = Request::builder()
         .method("PUT")
         .uri("/apis/batch/v1/namespaces/default/cronjobs/status-put-cj/status")
@@ -284,7 +284,7 @@ async fn test_job_status_put_protobuf_updates_existing_custom_condition_timestam
     let updated_time = "2026-06-30T18:14:07Z";
     update_body["status"]["conditions"][0]["lastTransitionTime"] = json!(updated_time);
     let protobuf_body =
-        crate::protobuf::encode_protobuf(&update_body).expect("Job status update encodes");
+        klights_kube_protobuf::encode_protobuf(&update_body).expect("Job status update encodes");
     let req = Request::builder()
         .method("PUT")
         .uri("/apis/batch/v1/namespaces/job-status-protobuf/jobs/job1/status")

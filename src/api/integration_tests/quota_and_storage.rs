@@ -1,4 +1,5 @@
 use super::*;
+use klights_kube_protobuf as k8s_pb;
 
 #[tokio::test]
 async fn test_put_node_status_preserves_extended_resource_capacity() {
@@ -1245,7 +1246,7 @@ async fn test_csistoragecapacity_list_protobuf_decodes_as_native_list() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&body[0..4], b"k8s\0");
-    let unknown = crate::protobuf::Unknown::decode(&body[4..]).unwrap();
+    let unknown = klights_kube_protobuf::Unknown::decode(&body[4..]).unwrap();
     assert!(
         unknown.content_type.is_empty(),
         "CSIStorageCapacityList must use native protobuf, not JSON-in-Unknown"
@@ -1728,8 +1729,8 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     }
 
     fn build_envelope(raw: Vec<u8>, kind: &str) -> Vec<u8> {
-        let envelope = crate::protobuf::Unknown {
-            type_meta: Some(crate::protobuf::TypeMeta {
+        let envelope = klights_kube_protobuf::Unknown {
+            type_meta: Some(klights_kube_protobuf::TypeMeta {
                 api_version: "v1".to_string(),
                 kind: kind.to_string(),
             }),
@@ -2087,7 +2088,7 @@ async fn test_runtimeclass_admission_rejects_protobuf_pod_with_missing_runtimecl
             "containers": [{"name": "c", "image": "busybox"}]
         }
     });
-    let pod_pb = crate::protobuf::encode_protobuf(&pod_json).unwrap();
+    let pod_pb = klights_kube_protobuf::encode_protobuf(&pod_json).unwrap();
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/namespaces/runtime-protobuf/pods")
@@ -2153,7 +2154,7 @@ async fn test_pod_security_admission_accepts_restricted_protobuf_pod_with_pod_se
             }]
         }
     });
-    let pod_pb = crate::protobuf::encode_protobuf(&pod_json).unwrap();
+    let pod_pb = klights_kube_protobuf::encode_protobuf(&pod_json).unwrap();
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/namespaces/restricted-protobuf/pods")
@@ -2230,7 +2231,7 @@ async fn test_protobuf_pod_create_respects_non_matching_node_selector() {
             }]
         }
     });
-    let pod_pb = crate::protobuf::encode_protobuf(&pod_json).unwrap();
+    let pod_pb = klights_kube_protobuf::encode_protobuf(&pod_json).unwrap();
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/namespaces/protobuf-selector/pods")
@@ -2292,7 +2293,7 @@ async fn test_runtimeclass_admission_rejects_dry_run_pod_with_missing_runtimecla
             "containers": [{"name": "c", "image": "busybox"}]
         }
     });
-    let pod_pb = crate::protobuf::encode_protobuf(&pod_json).unwrap();
+    let pod_pb = klights_kube_protobuf::encode_protobuf(&pod_json).unwrap();
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/namespaces/runtime-dryrun/pods?dryRun=All")
@@ -2491,7 +2492,7 @@ async fn test_events_v1_create_is_listed_via_core_events_source_selector() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let listed = crate::protobuf::decode_protobuf(&bytes[4..]).unwrap();
+    let listed = klights_kube_protobuf::decode_protobuf(&bytes[4..]).unwrap();
     let items = listed["items"].as_array().expect("items must be array");
     assert_eq!(
         items.len(),
@@ -2626,8 +2627,8 @@ async fn test_events_v1_protobuf_create_is_listed_via_core_events_source_selecto
     };
     let mut raw = Vec::new();
     prost::Message::encode(&event, &mut raw).unwrap();
-    let envelope = crate::protobuf::Unknown {
-        type_meta: Some(crate::protobuf::TypeMeta {
+    let envelope = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
             api_version: String::new(),
             kind: "Event".to_string(),
         }),
@@ -2721,7 +2722,7 @@ async fn test_core_event_update_protobuf_preserves_series() {
         "count": 100,
         "lastObservedTime": "2017-09-19T13:49:16Z"
     });
-    let updated_pb = crate::protobuf::encode_protobuf(&updated).unwrap();
+    let updated_pb = klights_kube_protobuf::encode_protobuf(&updated).unwrap();
     let req = Request::builder()
         .method("PUT")
         .uri("/api/v1/namespaces/event-series-test/events/event-test")
@@ -2794,7 +2795,7 @@ async fn test_ingress_status_update_with_protobuf_preserves_load_balancer() {
             }
         }
     });
-    let status_update_pb = crate::protobuf::encode_protobuf(&status_update).unwrap();
+    let status_update_pb = klights_kube_protobuf::encode_protobuf(&status_update).unwrap();
     let req = Request::builder()
         .method("PUT")
         .uri("/apis/networking.k8s.io/v1/namespaces/ingress-status-test/ingresses/ing/status")
@@ -2819,7 +2820,7 @@ async fn test_ingress_status_update_with_protobuf_preserves_load_balancer() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let unknown = crate::protobuf::Unknown::decode(&body[4..]).unwrap();
+    let unknown = klights_kube_protobuf::Unknown::decode(&body[4..]).unwrap();
     let decoded = k8s_pb::api::networking::v1::Ingress::decode(unknown.raw.as_slice()).unwrap();
     let status = decoded.status.expect("Ingress protobuf status must be set");
     let lb = status
@@ -3579,7 +3580,7 @@ async fn test_mutating_webhook_pod_create_applies_init_container_defaults_after_
         "metadata": {"name": "pod-defaults-after-mutation-protobuf"},
         "spec": {"containers": [{"name": "app", "image": "busybox"}]}
     });
-    let pod_pb = crate::protobuf::encode_protobuf(&pod_json).unwrap();
+    let pod_pb = klights_kube_protobuf::encode_protobuf(&pod_json).unwrap();
 
     let pod_create = app
         .clone()
@@ -3606,7 +3607,7 @@ async fn test_mutating_webhook_pod_create_applies_init_container_defaults_after_
         .await
         .unwrap();
     let pod: serde_json::Value = if content_type.contains("application/vnd.kubernetes.protobuf") {
-        crate::protobuf::decode_protobuf(&response_bytes).unwrap()
+        klights_kube_protobuf::decode_protobuf(&response_bytes).unwrap()
     } else {
         serde_json::from_slice(&response_bytes).unwrap()
     };
@@ -5096,7 +5097,7 @@ async fn test_ephemeral_containers_patch_visible_on_pod_get_for_followup_put() {
         "normal pod GET should exercise protobuf response path, got {content_type}"
     );
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let mut pod = crate::protobuf::decode_protobuf(&bytes).unwrap();
+    let mut pod = klights_kube_protobuf::decode_protobuf(&bytes).unwrap();
 
     let ephemeral = pod
         .pointer("/spec/ephemeralContainers")

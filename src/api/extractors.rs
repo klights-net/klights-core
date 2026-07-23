@@ -10,7 +10,7 @@ pub struct LenientJson<T>(pub T);
 pub fn parse_lenient_value_from_bytes(bytes: &[u8]) -> Result<serde_json::Value, AppError> {
     // Check for K8s protobuf magic bytes.
     if bytes.len() >= 4 && &bytes[..4] == b"k8s\x00" {
-        crate::protobuf::decode_protobuf(&bytes[4..])
+        klights_kube_protobuf::decode_protobuf(&bytes[4..])
             .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))
     } else {
         serde_json::from_slice(bytes)
@@ -20,7 +20,7 @@ pub fn parse_lenient_value_from_bytes(bytes: &[u8]) -> Result<serde_json::Value,
 
 pub fn decode_json_or_proto(body: &[u8]) -> Result<serde_json::Value, AppError> {
     if body.len() >= 4 && &body[..4] == b"k8s\x00" {
-        crate::protobuf::decode_protobuf(&body[4..])
+        klights_kube_protobuf::decode_protobuf(&body[4..])
             .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))
     } else {
         serde_json::from_slice(body)

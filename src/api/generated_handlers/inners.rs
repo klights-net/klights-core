@@ -1920,7 +1920,7 @@ pub async fn patch_inner(
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
 
     let patch: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
-        crate::protobuf::decode_protobuf(&body[4..])
+        klights_kube_protobuf::decode_protobuf(&body[4..])
             .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))?
     } else if content_type == Some("application/apply-patch+yaml") {
         parse_apply_yaml(&body)?

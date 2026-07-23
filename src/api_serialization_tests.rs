@@ -1,3 +1,4 @@
+use klights_kube_protobuf as k8s_pb;
 use rstest::rstest;
 use serde_json::{Value, json};
 
@@ -406,7 +407,7 @@ fn json_to_protobuf_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
 fn decode_resource(bytes: &[u8], format: &str) -> anyhow::Result<Value> {
     match format {
         "json" => Ok(serde_json::from_slice(bytes)?),
-        "protobuf" => Ok(crate::protobuf::decode_protobuf(bytes)?),
+        "protobuf" => Ok(klights_kube_protobuf::decode_protobuf(bytes)?),
         _ => anyhow::bail!("Unknown format: {}", format),
     }
 }
@@ -671,8 +672,9 @@ fn pod_status_merge_json_and_protobuf_paths_match() {
             "spec": {"containers": [{"name": "app", "image": "busybox"}]},
             "status": status,
         });
-        let bytes = crate::protobuf::encode_protobuf(&pod).expect("encode pod to protobuf");
-        let decoded = crate::protobuf::decode_protobuf(&bytes).expect("decode pod from protobuf");
+        let bytes = klights_kube_protobuf::encode_protobuf(&pod).expect("encode pod to protobuf");
+        let decoded =
+            klights_kube_protobuf::decode_protobuf(&bytes).expect("decode pod from protobuf");
         decoded.get("status").cloned().unwrap_or_else(|| json!({}))
     }
 

@@ -1,4 +1,5 @@
 use super::*;
+use klights_kube_protobuf as k8s_pb;
 
 #[tokio::test]
 async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
@@ -57,7 +58,7 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
         "kubectl-compatible list requests should be served as Kubernetes protobuf"
     );
     let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
-    let list_json = crate::protobuf::decode_protobuf(&list_body).unwrap();
+    let list_json = klights_kube_protobuf::decode_protobuf(&list_body).unwrap();
     let start_rv = list_json
         .pointer("/metadata/resourceVersion")
         .and_then(|value| value.as_str())
@@ -149,7 +150,7 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
         .and_then(|object| object.raw)
         .expect("protobuf watch event must carry object bytes");
     assert_eq!(&object[..4], b"k8s\0");
-    let envelope = crate::protobuf::Unknown::decode(&object[4..]).unwrap();
+    let envelope = klights_kube_protobuf::Unknown::decode(&object[4..]).unwrap();
     assert_eq!(
         envelope
             .type_meta
@@ -1390,8 +1391,8 @@ async fn test_cluster_scoped_selector_watch_from_list_rv_delivers_modified_witho
         };
         let mut raw = Vec::new();
         binding.encode(&mut raw).unwrap();
-        let envelope = crate::protobuf::Unknown {
-            type_meta: Some(crate::protobuf::TypeMeta {
+        let envelope = klights_kube_protobuf::Unknown {
+            type_meta: Some(klights_kube_protobuf::TypeMeta {
                 api_version: "admissionregistration.k8s.io/v1".to_string(),
                 kind: "ValidatingAdmissionPolicyBinding".to_string(),
             }),
@@ -1464,7 +1465,7 @@ async fn test_cluster_scoped_selector_watch_from_list_rv_delivers_modified_witho
         .unwrap();
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
-    let list = crate::protobuf::decode_protobuf(&list_body).unwrap();
+    let list = klights_kube_protobuf::decode_protobuf(&list_body).unwrap();
     let list_rv = list
         .pointer("/metadata/resourceVersion")
         .and_then(|value| value.as_str())
@@ -1525,7 +1526,7 @@ async fn test_cluster_scoped_selector_watch_from_list_rv_delivers_modified_witho
         .unwrap();
     assert_eq!(get_resp.status(), StatusCode::OK);
     let get_body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
-    let mut updated = crate::protobuf::decode_protobuf(&get_body).unwrap();
+    let mut updated = klights_kube_protobuf::decode_protobuf(&get_body).unwrap();
     updated["metadata"]["annotations"]["updated"] = json!("true");
     updated["spec"]["validationActions"] = json!(["Deny"]);
 
@@ -1543,7 +1544,7 @@ async fn test_cluster_scoped_selector_watch_from_list_rv_delivers_modified_witho
                     "application/vnd.kubernetes.protobuf,application/json",
                 )
                 .body(Body::from(
-                    crate::protobuf::encode_protobuf(&updated).unwrap(),
+                    klights_kube_protobuf::encode_protobuf(&updated).unwrap(),
                 ))
                 .unwrap(),
         )
@@ -6366,7 +6367,7 @@ async fn test_guestbook_selector_pod_list_returns_fresh_running_status_json_and_
                 content_type.contains("application/vnd.kubernetes.protobuf"),
                 "protobuf Accept must return Kubernetes protobuf, got {content_type}"
             );
-            crate::protobuf::decode_protobuf(&body).unwrap()
+            klights_kube_protobuf::decode_protobuf(&body).unwrap()
         } else {
             serde_json::from_slice(&body).unwrap()
         }
@@ -6712,7 +6713,7 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
         .unwrap();
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
-    let list = crate::protobuf::decode_protobuf(&list_body).unwrap();
+    let list = klights_kube_protobuf::decode_protobuf(&list_body).unwrap();
     assert_eq!(
         list.pointer("/items/0/status/phase"),
         Some(&json!("Pending"))

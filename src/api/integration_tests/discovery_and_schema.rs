@@ -2172,7 +2172,7 @@ async fn test_service_status_subresource_preserves_fields_and_negotiates_json_pr
                 content_type.contains("application/vnd.kubernetes.protobuf"),
                 "protobuf Accept must return Service protobuf, got {content_type}"
             );
-            crate::protobuf::decode_protobuf(&body[4..]).unwrap()
+            klights_kube_protobuf::decode_protobuf(&body[4..]).unwrap()
         } else {
             assert!(
                 content_type.starts_with("application/json"),
@@ -2305,7 +2305,7 @@ async fn test_service_status_subresource_preserves_fields_and_negotiates_json_pr
     let mut last_rv = created.resource_version;
     for case in cases {
         let body = if case.request_content_type.contains("protobuf") {
-            Body::from(crate::protobuf::encode_protobuf(&case.request_body).unwrap())
+            Body::from(klights_kube_protobuf::encode_protobuf(&case.request_body).unwrap())
         } else {
             Body::from(serde_json::to_vec(&case.request_body).unwrap())
         };

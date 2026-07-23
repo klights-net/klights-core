@@ -36,6 +36,3 @@ pub use window::WindowPolicy;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod tests_protobuf;

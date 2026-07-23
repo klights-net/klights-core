@@ -505,7 +505,7 @@ async fn negotiate_error_protobuf(request: Request, next: Next) -> Response {
             return Response::from_parts(parts, axum::body::Body::from(bytes));
         }
     };
-    match crate::protobuf::encode_protobuf(&value) {
+    match klights_kube_protobuf::encode_protobuf(&value) {
         Ok(pb) => {
             parts.headers.insert(
                 axum::http::header::CONTENT_TYPE,

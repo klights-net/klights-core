@@ -48,7 +48,7 @@ pub fn ensure_type_meta(
 /// Decode a request body that may be protobuf (k8s\x00 prefix) or JSON.
 pub fn decode_patch_body(body: &Bytes) -> Result<Value, AppError> {
     if body.len() >= 4 && &body[..4] == b"k8s\x00" {
-        crate::protobuf::decode_protobuf(&body[4..])
+        klights_kube_protobuf::decode_protobuf(&body[4..])
             .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))
     } else {
         serde_json::from_slice(body)

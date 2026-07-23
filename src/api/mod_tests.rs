@@ -2,6 +2,7 @@ use super::*;
 use crate::api_discovery::{openapi_v2, openapi_v3_discovery_with_crds};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use klights_kube_protobuf as k8s_pb;
 use serde_json::json;
 use std::sync::{LazyLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -558,8 +559,8 @@ fn test_configmap_protobuf_update_preserves_data() {
     cm.encode(&mut pb_bytes).unwrap();
 
     // Wrap in Unknown envelope (what k8s clients actually send)
-    let envelope = crate::protobuf::Unknown {
-        type_meta: Some(crate::protobuf::TypeMeta {
+    let envelope = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
         }),
@@ -570,7 +571,7 @@ fn test_configmap_protobuf_update_preserves_data() {
     let mut envelope_bytes = Vec::new();
     envelope.encode(&mut envelope_bytes).unwrap();
 
-    let decoded = crate::protobuf::decode_protobuf(&envelope_bytes).unwrap();
+    let decoded = klights_kube_protobuf::decode_protobuf(&envelope_bytes).unwrap();
 
     // This is what the PUT handler receives as `body` — verify data is intact
     assert_eq!(decoded["data"]["log.level"], "info");
@@ -3865,8 +3866,8 @@ fn test_delete_options_protobuf_unknown_envelope_parses_orphan_policy() {
     let mut raw = Vec::new();
     pb.encode(&mut raw).unwrap();
 
-    let unknown = crate::protobuf::Unknown {
-        type_meta: Some(crate::protobuf::TypeMeta {
+    let unknown = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
             api_version: "v1".to_string(),
             kind: "DeleteOptions".to_string(),
         }),

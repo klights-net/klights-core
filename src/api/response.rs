@@ -29,7 +29,7 @@ fn protobuf_supported_for_value(value: &Value) -> bool {
         .get("apiVersion")
         .and_then(|api_version| api_version.as_str())
         .unwrap_or("");
-    crate::protobuf::supports_protobuf_resource(api_version, kind)
+    klights_kube_protobuf::supports_protobuf_resource(api_version, kind)
 }
 
 fn negotiate_unary_response_format(
@@ -100,7 +100,7 @@ impl IntoResponse for K8sResponse {
                     .get("kind")
                     .and_then(|k| k.as_str())
                     .unwrap_or("unknown");
-                match crate::protobuf::encode_protobuf(&self.value) {
+                match klights_kube_protobuf::encode_protobuf(&self.value) {
                     Ok(bytes) => {
                         let mut response = Response::new(Body::from(bytes));
                         response.headers_mut().insert(
@@ -1322,7 +1322,7 @@ mod response_negotiation_tests {
             b"k8s\0",
             "body must be a Kubernetes protobuf envelope"
         );
-        let envelope = crate::protobuf::Unknown::decode(&body[4..]).unwrap();
+        let envelope = klights_kube_protobuf::Unknown::decode(&body[4..]).unwrap();
         let type_meta = envelope.type_meta.as_ref().unwrap();
         assert_eq!(type_meta.kind, "ConfigMap");
         assert_eq!(type_meta.api_version, "v1");
@@ -1369,7 +1369,7 @@ mod response_negotiation_tests {
             .await
             .unwrap();
         assert_eq!(&body[..4], b"k8s\0");
-        let envelope = crate::protobuf::Unknown::decode(&body[4..]).unwrap();
+        let envelope = klights_kube_protobuf::Unknown::decode(&body[4..]).unwrap();
         assert_eq!(envelope.type_meta.as_ref().unwrap().kind, "Status");
     }
 }

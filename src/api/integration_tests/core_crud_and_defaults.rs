@@ -1066,7 +1066,7 @@ async fn api_put_get_networkpolicy_protobuf_roundtrip() {
         }
     });
 
-    let np_pb = crate::protobuf::encode_protobuf(&np_json).unwrap();
+    let np_pb = klights_kube_protobuf::encode_protobuf(&np_json).unwrap();
     let create_resp = app
         .clone()
         .oneshot(
@@ -1118,7 +1118,7 @@ async fn api_put_get_networkpolicy_protobuf_roundtrip() {
         &[0x6b, 0x38, 0x73, 0x00],
         "response body must carry the k8s magic prefix"
     );
-    let decoded = crate::protobuf::decode_protobuf(&body[4..]).unwrap();
+    let decoded = klights_kube_protobuf::decode_protobuf(&body[4..]).unwrap();
     assert_eq!(decoded["apiVersion"], "networking.k8s.io/v1");
     assert_eq!(decoded["kind"], "NetworkPolicy");
     assert_eq!(decoded["metadata"]["name"], "allow-frontend");

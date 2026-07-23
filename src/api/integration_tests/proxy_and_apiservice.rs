@@ -5503,7 +5503,9 @@ async fn test_custom_resource_delete_runs_delete_admission() {
                 .method("POST")
                 .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
                 .header("content-type", "application/vnd.kubernetes.protobuf")
-                .body(Body::from(crate::protobuf::encode_protobuf(&crd).unwrap()))
+                .body(Body::from(
+                    klights_kube_protobuf::encode_protobuf(&crd).unwrap(),
+                ))
                 .unwrap(),
         )
         .await

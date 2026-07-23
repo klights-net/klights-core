@@ -19,6 +19,8 @@ use crate::watch::{RawSignalWatchCursor, WatchCursorError, WatchDeliveryScope};
 use crate::watch::{event_key as watch_event_key, resource_key as resource_to_seen_key};
 use axum::body::Body;
 use axum::http::HeaderMap;
+#[cfg(test)]
+use klights_kube_protobuf as k8s_pb;
 use klights_kube_protobuf::{AcceptValue, ResponseFormat};
 #[cfg(test)]
 use klights_types::LabelSelector;
@@ -83,10 +85,10 @@ pub fn protobuf_watch_supported_for_request(
     let has_selector = label_selector.is_some_and(|selector| !selector.trim().is_empty())
         || field_selector.is_some_and(|selector| !selector.trim().is_empty());
     if has_selector {
-        crate::protobuf::supports_protobuf_resource(api_version, kind)
+        klights_kube_protobuf::supports_protobuf_resource(api_version, kind)
     } else {
-        crate::protobuf::supports_raw_json_protobuf_resource(api_version, kind)
-            || crate::protobuf::supports_protobuf_resource(api_version, kind)
+        klights_kube_protobuf::supports_raw_json_protobuf_resource(api_version, kind)
+            || klights_kube_protobuf::supports_protobuf_resource(api_version, kind)
     }
 }
 
@@ -217,34 +219,38 @@ pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Re
         .and_then(Value::as_str)
         .unwrap_or(kind);
     let raw = if object_kind == "Status" {
-        let raw = crate::protobuf::encode_status_protobuf(&event.object)?;
-        crate::protobuf::wrap_protobuf_resource_envelope("v1", "Status", raw)?
+        let raw = klights_kube_protobuf::encode_status_protobuf(&event.object)?;
+        klights_kube_protobuf::wrap_protobuf_resource_envelope("v1", "Status", raw)?
     } else {
         let api_version = event
             .object
             .get("apiVersion")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let raw = crate::protobuf::encode_protobuf_resource(object_kind, &event.object)?;
-        crate::protobuf::wrap_protobuf_resource_envelope(api_version, object_kind, raw)?
+        let raw = klights_kube_protobuf::encode_protobuf_resource(object_kind, &event.object)?;
+        klights_kube_protobuf::wrap_protobuf_resource_envelope(api_version, object_kind, raw)?
     };
+    let event_type = event.event_type.to_string();
     Ok(klights_kube_protobuf::encode_watch_event_frame(
-        &event.event_type.to_string(),
+        &event_type,
         raw,
     ))
 }
 
 #[cfg(test)]
 pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<Vec<u8>> {
-    let raw = crate::protobuf::encode_protobuf_resource_from_json_bytes(
+    let raw = klights_kube_protobuf::encode_protobuf_resource_from_json_bytes(
         &event.api_version,
         &event.kind,
         &event.object_json,
     )?;
-    let raw =
-        crate::protobuf::wrap_protobuf_resource_envelope(&event.api_version, &event.kind, raw)?;
+    let raw = klights_kube_protobuf::wrap_protobuf_resource_envelope(
+        &event.api_version,
+        &event.kind,
+        raw,
+    )?;
     Ok(klights_kube_protobuf::encode_watch_event_frame(
-        &event.event_type.to_string(),
+        event.event_type.as_ref(),
         raw,
     ))
 }
@@ -1025,7 +1031,10 @@ pub fn legacy_build_label_selector_watch_stream(
             !has_selector
                 && !table_format
                 && (stream_format == WatchStreamFormat::Json
-                    || crate::protobuf::supports_raw_json_protobuf_resource(&api_version, &kind));
+                    || klights_kube_protobuf::supports_raw_json_protobuf_resource(
+                        &api_version,
+                        &kind,
+                    ));
         let replay_target = match (catch_up_mode, watch_namespace.clone()) {
             (WatchCatchUpMode::NamespacedScoped, Some(ns)) => {
                 WatchTarget::namespaced_in_namespace(api_version.clone(), kind.clone(), ns)
@@ -1619,7 +1628,7 @@ mod tests {
                     b"k8s\0",
                     "inner watch object must begin with the k8s\\0 envelope magic",
                 );
-                let inner = crate::protobuf::Unknown::decode(&object_raw[4..])
+                let inner = klights_kube_protobuf::Unknown::decode(&object_raw[4..])
                     .expect("inner object payload must decode as runtime.Unknown");
                 let inner_type_meta = inner
                     .type_meta
@@ -1652,7 +1661,7 @@ mod tests {
             "ConfigMap",
         )
         .unwrap();
-        let outer = crate::protobuf::wrap_protobuf_resource_envelope(
+        let outer = klights_kube_protobuf::wrap_protobuf_resource_envelope(
             "v1",
             "WatchEvent",
             bare[4..].to_vec(),
@@ -3644,14 +3653,14 @@ mod tests {
                 assert_eq!(status.reason.as_deref(), json_object["reason"].as_str());
                 assert_eq!(status.code.map(i64::from), json_object["code"].as_i64());
             } else {
-                let envelope = crate::protobuf::wrap_protobuf_resource_envelope(
+                let envelope = klights_kube_protobuf::wrap_protobuf_resource_envelope(
                     &protobuf_events[index].inner_api_version,
                     &protobuf_events[index].inner_kind,
                     protobuf_events[index].inner_raw.clone(),
                 )
                 .expect("resource envelope");
-                let protobuf_object =
-                    crate::protobuf::decode_protobuf(&envelope).expect("decoded protobuf object");
+                let protobuf_object = klights_kube_protobuf::decode_protobuf(&envelope)
+                    .expect("decoded protobuf object");
                 assert_eq!(
                     protobuf_object["metadata"]["resourceVersion"],
                     json_object["metadata"]["resourceVersion"],

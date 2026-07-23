@@ -1,5 +1,6 @@
 use crate::api::*;
 use axum::http::HeaderMap;
+use klights_kube_protobuf as k8s_pb;
 use serde_json::Value;
 
 pub fn validate_crd_field_selector(
@@ -1603,7 +1604,7 @@ pub fn parse_delete_options_protobuf(body: &[u8]) -> Option<DeleteOptions> {
     fn parse_unknown_payload(payload: &[u8]) -> Option<DeleteOptions> {
         use prost::Message;
 
-        let unknown = crate::protobuf::Unknown::decode(payload).ok()?;
+        let unknown = klights_kube_protobuf::Unknown::decode(payload).ok()?;
 
         if let Ok(opts) = serde_json::from_slice::<DeleteOptions>(&unknown.raw) {
             return Some(opts);

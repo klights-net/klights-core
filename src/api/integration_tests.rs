@@ -2,6 +2,7 @@ use crate::api::test_support::{
     build_test_app_state, build_test_app_state_with_authorizer, build_test_router,
     build_test_router_with_db,
 };
+use klights_kube_protobuf as k8s_pb;
 use serde_json::json;
 
 #[tokio::test]
@@ -194,8 +195,8 @@ fn test_protobuf_decode_preserves_configmap_data_field() {
     cm.encode(&mut cm_buf).unwrap();
 
     // Wrap in Unknown envelope (how K8s actually sends it)
-    let unknown = crate::protobuf::Unknown {
-        type_meta: Some(crate::protobuf::TypeMeta {
+    let unknown = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
         }),
@@ -208,7 +209,7 @@ fn test_protobuf_decode_preserves_configmap_data_field() {
     unknown.encode(&mut envelope_buf).unwrap();
 
     // Decode back to JSON using our protobuf decoder (simulates LenientJson extractor)
-    let json_value = crate::protobuf::decode_protobuf(&envelope_buf).unwrap();
+    let json_value = klights_kube_protobuf::decode_protobuf(&envelope_buf).unwrap();
 
     // Verify data field is present and correct
     assert!(
@@ -249,8 +250,8 @@ fn test_protobuf_decode_preserves_pod_active_deadline_seconds() {
     let mut pod_buf = Vec::new();
     pod.encode(&mut pod_buf).unwrap();
 
-    let unknown = crate::protobuf::Unknown {
-        type_meta: Some(crate::protobuf::TypeMeta {
+    let unknown = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
         }),
@@ -262,7 +263,7 @@ fn test_protobuf_decode_preserves_pod_active_deadline_seconds() {
     let mut envelope_buf = Vec::new();
     unknown.encode(&mut envelope_buf).unwrap();
 
-    let json_value = crate::protobuf::decode_protobuf(&envelope_buf).unwrap();
+    let json_value = klights_kube_protobuf::decode_protobuf(&envelope_buf).unwrap();
     assert_eq!(json_value["spec"]["activeDeadlineSeconds"], 3600);
 }
 
@@ -293,8 +294,8 @@ fn test_protobuf_decode_preserves_pod_runtime_class_name() {
     let mut pod_buf = Vec::new();
     pod.encode(&mut pod_buf).unwrap();
 
-    let unknown = crate::protobuf::Unknown {
-        type_meta: Some(crate::protobuf::TypeMeta {
+    let unknown = klights_kube_protobuf::Unknown {
+        type_meta: Some(klights_kube_protobuf::TypeMeta {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
         }),
@@ -306,7 +307,7 @@ fn test_protobuf_decode_preserves_pod_runtime_class_name() {
     let mut envelope_buf = Vec::new();
     unknown.encode(&mut envelope_buf).unwrap();
 
-    let json_value = crate::protobuf::decode_protobuf(&envelope_buf).unwrap();
+    let json_value = klights_kube_protobuf::decode_protobuf(&envelope_buf).unwrap();
     assert_eq!(
         json_value["spec"]["runtimeClassName"], "missing-runtime",
         "protobuf Pod decode must preserve spec.runtimeClassName for admission"
@@ -1384,7 +1385,8 @@ async fn test_replicationcontroller_protobuf_create_defaults_selector_from_templ
             }
         }
     });
-    let wire = crate::protobuf::encode_protobuf(&rc_body).expect("RC protobuf encode must work");
+    let wire =
+        klights_kube_protobuf::encode_protobuf(&rc_body).expect("RC protobuf encode must work");
 
     let create_rc = Request::builder()
         .method("POST")

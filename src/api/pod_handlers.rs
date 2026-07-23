@@ -365,7 +365,7 @@ pub async fn patch_pod(
     // Parse body based on content-type (parse once, reuse in retry loop)
     let patch: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
         // Protobuf encoded
-        crate::protobuf::decode_protobuf(&body[4..])
+        klights_kube_protobuf::decode_protobuf(&body[4..])
             .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))?
     } else if content_type == Some("application/apply-patch+yaml") {
         // YAML for server-side apply

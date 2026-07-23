@@ -1516,7 +1516,7 @@ async fn mutation_create_defaults_are_persisted_for_json_and_protobuf_pod_paths(
             }]
         }
     });
-    let protobuf_body = crate::protobuf::encode_protobuf(&protobuf_pod).unwrap();
+    let protobuf_body = klights_kube_protobuf::encode_protobuf(&protobuf_pod).unwrap();
     let protobuf_response = request_raw(
         &app,
         "POST",

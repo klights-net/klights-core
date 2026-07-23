@@ -1,7 +1,3 @@
-// TEMPORARY(Phase 8.1): keep generated-message consumers source-compatible
-// until their direct owner imports land. REMOVE(Phase 8.3) after consumer cleanup.
-extern crate klights_kube_protobuf as k8s_pb;
-
 pub mod admission;
 mod allocator;
 pub mod api;
@@ -32,25 +28,6 @@ pub mod paths;
 pub mod pidfile;
 pub(crate) mod pod_endpoint_state;
 pub mod portforward;
-/// TEMPORARY(Phase 8.2): the codec implementation is owned by
-/// `klights-kube-protobuf`; this exact compatibility path expires in Phase 8.3.
-pub mod protobuf {
-    #[cfg(test)]
-    pub(crate) use klights_kube_protobuf::encode_protobuf_resource_from_json_bytes;
-    pub use klights_kube_protobuf::{TypeMeta, Unknown};
-    pub(crate) use klights_kube_protobuf::{
-        encode_protobuf_resource, encode_status_protobuf, supports_protobuf_resource,
-        supports_raw_json_protobuf_resource, wrap_protobuf_resource_envelope,
-    };
-
-    pub fn decode_protobuf(data: &[u8]) -> anyhow::Result<serde_json::Value> {
-        klights_kube_protobuf::decode_protobuf(data).map_err(Into::into)
-    }
-
-    pub fn encode_protobuf(value: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
-        klights_kube_protobuf::encode_protobuf(value).map_err(Into::into)
-    }
-}
 pub mod replication;
 pub mod scheduler;
 pub mod shutdown;
