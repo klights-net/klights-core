@@ -3,10 +3,10 @@
   "packages": {
     "klights": {
       "count": 42963,
-      "sha256": "6dbe59ee7258fc22b585d2bd43047e0e0a11cefb29a512cfcc13c001a4ae919d",
+      "sha256": "1c1f2c5877977865a394904478363041a5484200abc2acb7b727fd8c27d88e3b",
       "source": {
-        "count": 493598,
-        "sha256": "67119a0bf97c01b823e502daabcaf987a4b7aeedfa9b73fba9cf98642de2c595"
+        "count": 492727,
+        "sha256": "2f75b52e4d5547b8e7f0e8d97bdd08cfa0a65257d6c9d4b0b5ea3ef1a1135fa6"
       }
     },
     "klights-apiserver": {
@@ -69,8 +69,8 @@
       "count": 341,
       "sha256": "814682e2905c7c3ecd9ddfb441f77adcc3d60b41c782af0c37c1006c70a3ed42",
       "source": {
-        "count": 30815,
-        "sha256": "7503e876cc489866e50be729e6f046417205b211b455327b8a498e1b3e04e3f7"
+        "count": 31481,
+        "sha256": "e1ea6d7eef6b2f2ff78be231447f82419021df6ac18f42790769b304a77bf257"
       }
     },
     "klights-kubelet": {

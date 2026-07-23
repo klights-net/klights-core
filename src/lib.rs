@@ -40,9 +40,6 @@ pub mod watch;
 #[cfg(test)]
 mod api_handler_tests;
 #[cfg(test)]
-mod api_serialization_tests;
-#[cfg(test)]
-#[cfg(test)]
 mod crd_status_tests;
 #[cfg(test)]
 mod crd_tests;
@@ -57,8 +54,6 @@ mod bootstrap;
 mod deployment_replicaset_error_test;
 #[cfg(test)]
 mod node_conditions_tests;
-#[cfg(test)]
-mod protobuf_full_stack_tests;
 #[cfg(test)]
 mod resource_quota_event_driven_tests;
 #[cfg(test)]

@@ -9,6 +9,9 @@ mod protobuf;
 mod resource;
 mod utils;
 
+#[cfg(test)]
+mod codec_table_tests;
+
 pub use error::CodecError;
 pub use framing::encode_watch_event_frame;
 pub use resource::{ResourceCodecError, decode_resource, encode_resource};

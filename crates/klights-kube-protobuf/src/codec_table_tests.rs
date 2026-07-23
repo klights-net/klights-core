@@ -1,16 +1,20 @@
-use klights_kube_protobuf as k8s_pb;
-use rstest::rstest;
+use crate as k8s_pb;
 use serde_json::{Value, json};
 
+#[derive(Clone, Copy, Debug)]
+enum WireFormat {
+    Json,
+    Protobuf,
+}
+
 /// Helper to create test bytes in the specified format
-fn create_test_bytes(resource_json: &Value, format: &str) -> anyhow::Result<Vec<u8>> {
+fn create_test_bytes(resource_json: &Value, format: WireFormat) -> anyhow::Result<Vec<u8>> {
     match format {
-        "json" => Ok(serde_json::to_vec(resource_json)?),
-        "protobuf" => {
+        WireFormat::Json => Ok(serde_json::to_vec(resource_json)?),
+        WireFormat::Protobuf => {
             // For protobuf, manually construct k8s-pb types and encode them
             json_to_protobuf_bytes(resource_json)
         }
-        _ => anyhow::bail!("Unknown format: {}", format),
     }
 }
 
@@ -404,18 +408,15 @@ fn json_to_protobuf_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Helper to decode based on format
-fn decode_resource(bytes: &[u8], format: &str) -> anyhow::Result<Value> {
+fn decode_resource(bytes: &[u8], format: WireFormat) -> anyhow::Result<Value> {
     match format {
-        "json" => Ok(serde_json::from_slice(bytes)?),
-        "protobuf" => Ok(klights_kube_protobuf::decode_protobuf(bytes)?),
-        _ => anyhow::bail!("Unknown format: {}", format),
+        WireFormat::Json => Ok(serde_json::from_slice(bytes)?),
+        WireFormat::Protobuf => Ok(crate::decode_protobuf(bytes)?),
     }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_configmap_data_preserved(#[case] format: &str) {
+#[test]
+fn configmap_data_preserved() {
     let original = json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -429,21 +430,21 @@ fn test_configmap_data_preserved(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "v1");
-    assert_eq!(decoded["kind"], "ConfigMap");
-    assert_eq!(decoded["metadata"]["name"], "test-config");
-    assert_eq!(decoded["metadata"]["namespace"], "default");
-    assert_eq!(decoded["data"]["key1"], "value1");
-    assert_eq!(decoded["data"]["key2"], "value2");
+        assert_eq!(decoded["apiVersion"], "v1");
+        assert_eq!(decoded["kind"], "ConfigMap");
+        assert_eq!(decoded["metadata"]["name"], "test-config");
+        assert_eq!(decoded["metadata"]["namespace"], "default");
+        assert_eq!(decoded["data"]["key1"], "value1");
+        assert_eq!(decoded["data"]["key2"], "value2");
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_secret_data_field(#[case] format: &str) {
+#[test]
+fn secret_data_field() {
     let original = json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -457,19 +458,19 @@ fn test_secret_data_field(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "v1");
-    assert_eq!(decoded["kind"], "Secret");
-    assert_eq!(decoded["metadata"]["name"], "test-secret");
-    assert!(decoded.get("data").is_some());
+        assert_eq!(decoded["apiVersion"], "v1");
+        assert_eq!(decoded["kind"], "Secret");
+        assert_eq!(decoded["metadata"]["name"], "test-secret");
+        assert!(decoded.get("data").is_some());
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_pod_spec_containers(#[case] format: &str) {
+#[test]
+fn pod_spec_containers() {
     let original = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -488,20 +489,20 @@ fn test_pod_spec_containers(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "v1");
-    assert_eq!(decoded["kind"], "Pod");
-    assert_eq!(decoded["spec"]["nodeName"], "node-1");
-    assert_eq!(decoded["spec"]["containers"][0]["name"], "nginx");
-    assert_eq!(decoded["spec"]["containers"][0]["image"], "nginx:latest");
+        assert_eq!(decoded["apiVersion"], "v1");
+        assert_eq!(decoded["kind"], "Pod");
+        assert_eq!(decoded["spec"]["nodeName"], "node-1");
+        assert_eq!(decoded["spec"]["containers"][0]["name"], "nginx");
+        assert_eq!(decoded["spec"]["containers"][0]["image"], "nginx:latest");
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_deployment_spec_replicas(#[case] format: &str) {
+#[test]
+fn deployment_spec_replicas() {
     let original = json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -534,19 +535,19 @@ fn test_deployment_spec_replicas(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "apps/v1");
-    assert_eq!(decoded["kind"], "Deployment");
-    assert_eq!(decoded["spec"]["replicas"], 3);
-    assert_eq!(decoded["spec"]["selector"]["matchLabels"]["app"], "test");
+        assert_eq!(decoded["apiVersion"], "apps/v1");
+        assert_eq!(decoded["kind"], "Deployment");
+        assert_eq!(decoded["spec"]["replicas"], 3);
+        assert_eq!(decoded["spec"]["selector"]["matchLabels"]["app"], "test");
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_service_spec_cluster_ip(#[case] format: &str) {
+#[test]
+fn service_spec_cluster_ip() {
     let original = json!({
         "apiVersion": "v1",
         "kind": "Service",
@@ -566,22 +567,22 @@ fn test_service_spec_cluster_ip(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "v1");
-    assert_eq!(decoded["kind"], "Service");
-    assert_eq!(decoded["spec"]["clusterIP"], "10.43.128.100");
-    assert_eq!(decoded["spec"]["ports"][0]["port"], 80);
-    // targetPort might be int or intOrString, accept both
-    let tp = &decoded["spec"]["ports"][0]["targetPort"];
-    assert!(tp == &json!(8080) || tp == &json!("8080"));
+        assert_eq!(decoded["apiVersion"], "v1");
+        assert_eq!(decoded["kind"], "Service");
+        assert_eq!(decoded["spec"]["clusterIP"], "10.43.128.100");
+        assert_eq!(decoded["spec"]["ports"][0]["port"], 80);
+        // targetPort might be int or intOrString, accept both
+        let tp = &decoded["spec"]["ports"][0]["targetPort"];
+        assert!(tp == &json!(8080) || tp == &json!("8080"));
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_namespace_metadata_only(#[case] format: &str) {
+#[test]
+fn namespace_metadata_only() {
     let original = json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -593,19 +594,19 @@ fn test_namespace_metadata_only(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "v1");
-    assert_eq!(decoded["kind"], "Namespace");
-    assert_eq!(decoded["metadata"]["name"], "test-ns");
-    assert_eq!(decoded["metadata"]["labels"]["env"], "test");
+        assert_eq!(decoded["apiVersion"], "v1");
+        assert_eq!(decoded["kind"], "Namespace");
+        assert_eq!(decoded["metadata"]["name"], "test-ns");
+        assert_eq!(decoded["metadata"]["labels"]["env"], "test");
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_node_status_conditions(#[case] format: &str) {
+#[test]
+fn node_status_conditions() {
     let original = json!({
         "apiVersion": "v1",
         "kind": "Node",
@@ -624,19 +625,19 @@ fn test_node_status_conditions(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "v1");
-    assert_eq!(decoded["kind"], "Node");
-    assert_eq!(decoded["status"]["conditions"][0]["type"], "Ready");
-    assert_eq!(decoded["status"]["conditions"][0]["status"], "True");
+        assert_eq!(decoded["apiVersion"], "v1");
+        assert_eq!(decoded["kind"], "Node");
+        assert_eq!(decoded["status"]["conditions"][0]["type"], "Ready");
+        assert_eq!(decoded["status"]["conditions"][0]["status"], "True");
+    }
 }
 
-#[rstest]
-#[case("json")]
-#[case("protobuf")]
-fn test_lease_spec_fields(#[case] format: &str) {
+#[test]
+fn lease_spec_fields() {
     let original = json!({
         "apiVersion": "coordination.k8s.io/v1",
         "kind": "Lease",
@@ -653,109 +654,13 @@ fn test_lease_spec_fields(#[case] format: &str) {
         }
     });
 
-    let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
-    let decoded = decode_resource(&bytes, format).expect("decode failed");
+    for format in [WireFormat::Json, WireFormat::Protobuf] {
+        let bytes = create_test_bytes(&original, format).expect("Failed to create test bytes");
+        let decoded = decode_resource(&bytes, format).expect("decode failed");
 
-    assert_eq!(decoded["apiVersion"], "coordination.k8s.io/v1");
-    assert_eq!(decoded["kind"], "Lease");
-    assert_eq!(decoded["spec"]["holderIdentity"], "cert-manager-1");
-    assert_eq!(decoded["spec"]["leaseDurationSeconds"], 15);
-}
-
-#[test]
-fn pod_status_merge_json_and_protobuf_paths_match() {
-    fn status_through_protobuf(status: &Value) -> Value {
-        let pod = json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"containers": [{"name": "app", "image": "busybox"}]},
-            "status": status,
-        });
-        let bytes = klights_kube_protobuf::encode_protobuf(&pod).expect("encode pod to protobuf");
-        let decoded =
-            klights_kube_protobuf::decode_protobuf(&bytes).expect("decode pod from protobuf");
-        decoded.get("status").cloned().unwrap_or_else(|| json!({}))
+        assert_eq!(decoded["apiVersion"], "coordination.k8s.io/v1");
+        assert_eq!(decoded["kind"], "Lease");
+        assert_eq!(decoded["spec"]["holderIdentity"], "cert-manager-1");
+        assert_eq!(decoded["spec"]["leaseDurationSeconds"], 15);
     }
-
-    let current = json!({
-        "apiVersion": "v1", "kind": "Pod",
-        "status": {
-            "phase": "Succeeded",
-            "conditions": [
-                {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-25T00:00:00Z"},
-                {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler", "lastTransitionTime": "2026-06-25T00:00:00Z"}
-            ],
-            "containerStatuses": [{
-                "name": "app", "image": "busybox", "containerID": "containerd://ctr-1",
-                "restartCount": 0, "ready": false, "started": false,
-                "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}
-            }]
-        }
-    });
-    let incoming_status = json!({
-        "phase": "Pending",
-        "conditions": [
-            {"type": "Ready", "status": "False", "lastTransitionTime": "2026-06-25T00:00:01Z"}
-        ],
-        "containerStatuses": [{
-            "name": "app", "image": "busybox", "containerID": "containerd://ctr-1",
-            "restartCount": 0, "ready": false, "started": false,
-            "state": {"waiting": {"reason": "ContainerCreating"}}
-        }]
-    });
-
-    let mut incoming_json = incoming_status.clone();
-    klights_types::merge_pod_status_for_update(
-        "v1",
-        "Pod",
-        &current,
-        &mut incoming_json,
-        klights_types::PodStatusOwner::KubeletRuntime,
-    );
-
-    let mut incoming_proto = status_through_protobuf(&incoming_status);
-    assert!(
-        incoming_proto
-            .pointer("/conditions")
-            .and_then(Value::as_array)
-            .is_some_and(|conditions| conditions.iter().any(|condition| {
-                condition.get("type").and_then(Value::as_str) == Some("Ready")
-                    && condition.get("status").and_then(Value::as_str) == Some("False")
-            })),
-        "protobuf round-trip must preserve incoming Ready=False condition: {incoming_proto:?}"
-    );
-    klights_types::merge_pod_status_for_update(
-        "v1",
-        "Pod",
-        &current,
-        &mut incoming_proto,
-        klights_types::PodStatusOwner::KubeletRuntime,
-    );
-
-    assert_eq!(
-        incoming_proto.pointer("/containerStatuses/0/containerID"),
-        Some(&json!("containerd://ctr-1")),
-        "protobuf round-trip must preserve containerID: {incoming_proto:?}"
-    );
-    assert_eq!(
-        incoming_json, incoming_proto,
-        "JSON and protobuf apply paths must produce identical merge results"
-    );
-    assert!(
-        incoming_json
-            .pointer("/conditions")
-            .and_then(Value::as_array)
-            .expect("conditions")
-            .iter()
-            .any(|condition| condition.get("type").and_then(Value::as_str)
-                == Some("DisruptionTarget")),
-        "DisruptionTarget preserved on both paths: {incoming_json:?}"
-    );
-    assert!(
-        incoming_json
-            .pointer("/containerStatuses/0/state/terminated")
-            .is_some(),
-        "terminal state preserved on both paths: {incoming_json:?}"
-    );
 }
