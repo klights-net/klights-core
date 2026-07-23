@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
 use crate::datastore::command::{CommandMeta, StorageCommand};
-use crate::replication::sequenced_datastore::DatastoreApplier;
+use crate::datastore::sequenced::DatastoreApplier;
 
 use super::Datastore;
 

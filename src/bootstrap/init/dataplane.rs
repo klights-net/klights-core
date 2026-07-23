@@ -18,8 +18,22 @@ pub async fn local_join_dataplane_metadata(
         public_key: identity.public_key,
         endpoint: config.external_endpoint.clone().unwrap_or_default(),
         port: identity.port,
-        mode: identity.mode,
-        encryption: identity.encryption,
+        mode: match identity.mode {
+            crate::networking::wireguard::DataplaneMode::Root => {
+                klights_leader_api::NetworkNodeMode::Root
+            }
+            crate::networking::wireguard::DataplaneMode::Rootless => {
+                klights_leader_api::NetworkNodeMode::Rootless
+            }
+        },
+        encryption: match identity.encryption {
+            crate::networking::wireguard::DataplaneEncryption::Enabled => {
+                klights_leader_api::DataplaneEncryption::WireGuard
+            }
+            crate::networking::wireguard::DataplaneEncryption::Disabled => {
+                klights_leader_api::DataplaneEncryption::Direct
+            }
+        },
     })
 }
 
@@ -215,8 +229,16 @@ pub async fn enqueue_worker_dataplane_metadata_outbox(
             pod_uid: String::new(),
             command: crate::datastore::command::StorageCommand::UpdateNodeDataplane {
                 node_name: node_name.to_string(),
-                mode: dataplane.mode.as_str().to_string(),
-                encryption: dataplane.encryption.as_str().to_string(),
+                mode: match dataplane.mode {
+                    klights_leader_api::NetworkNodeMode::Root => "root",
+                    klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+                }
+                .to_string(),
+                encryption: match dataplane.encryption {
+                    klights_leader_api::DataplaneEncryption::WireGuard => "enabled",
+                    klights_leader_api::DataplaneEncryption::Direct => "disabled",
+                }
+                .to_string(),
                 public_key: dataplane.public_key.clone(),
                 endpoint: dataplane.endpoint.clone(),
                 port: dataplane.port,

@@ -13,11 +13,12 @@ use anyhow::Result;
 pub use klights_cluster_core::ClusterMetadata;
 
 /// Metadata keys stored in `_klights_meta`.
-pub const KEY_CLUSTER_ID: &str = "cluster_id";
-pub const KEY_LEADER_EPOCH: &str = "leader_epoch";
-pub const KEY_RAFT_VOTERS: &str = "voters";
-pub const KEY_RAFT_TERM: &str = "term";
-pub const KEY_RAFT_LEADER_HINT: &str = "leader_hint";
+pub use klights_cluster_store::{
+    CLUSTER_ID_META_KEY as KEY_CLUSTER_ID, LEADER_EPOCH_META_KEY as KEY_LEADER_EPOCH,
+};
+pub const KEY_RAFT_VOTERS: &str = klights_cluster_store::RAFT_VOTERS_META_KEY;
+pub const KEY_RAFT_TERM: &str = klights_cluster_store::RAFT_TERM_META_KEY;
+pub const KEY_RAFT_LEADER_HINT: &str = klights_cluster_store::RAFT_LEADER_HINT_META_KEY;
 
 /// Generate a new random cluster ID (UUID v4).
 #[cfg(test)]

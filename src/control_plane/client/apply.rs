@@ -1,12 +1,13 @@
 use bytes::Bytes;
+use klights_leader_api::{
+    OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
+};
 
 use crate::datastore::DatastoreBackend;
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::command::StorageCommand;
 use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 use crate::log_apply::OutboxStreamWatermark;
-use crate::replication::protocol::ForwardedResource;
 
 #[cfg(test)]
 pub async fn apply_outbox_transactionally(
@@ -76,7 +77,7 @@ pub async fn consume_terminal_outbox_sequence(
                 "failed to encode terminal outbox decision: {error}"
             ))
         })?;
-    match apply_outbox_to_local_leader(
+    match apply_outbox_to_local_leader_with_node_operation(
         db,
         idempotency_key,
         operation,
@@ -116,7 +117,7 @@ pub async fn apply_outbox_to_local_leader(
     authoring_node: &str,
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-    Ok(apply_outbox_to_local_leader_with_resource(
+    apply_outbox_to_local_leader_with_node_operation(
         db,
         idempotency_key,
         operation,
@@ -124,43 +125,29 @@ pub async fn apply_outbox_to_local_leader(
         authoring_node,
         watermark,
     )
-    .await?
-    .result)
+    .await
 }
 
-pub(crate) struct LocalOutboxApply {
-    pub(crate) result: OutboxApplyResult,
-    pub(crate) resource: Option<ForwardedResource>,
-    /// Set when the apply newly persisted a mutation (Applied result). None
-    /// for AlreadyApplied — the side-effect dispatcher must not re-fire on
-    /// duplicate applies.
-    pub(crate) command: Option<StorageCommand>,
-    pub(crate) pod_endpoint_effect: crate::datastore::PodEndpointEffect,
-}
-
-pub(crate) async fn apply_outbox_to_local_leader_with_resource(
+async fn apply_outbox_to_local_leader_with_node_operation(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
     operation: OutboxOperation,
     payload: Bytes,
     authoring_node: &str,
     watermark: Option<OutboxStreamWatermark>,
-) -> std::result::Result<LocalOutboxApply, OutboxApplyError> {
-    let applied = crate::datastore::raft::state_machine::propose_outbox_on_backend_with_watermark(
-        db,
-        idempotency_key,
-        operation,
-        payload,
-        authoring_node,
-        watermark,
+) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
+    Ok(
+        crate::datastore::raft::state_machine::propose_outbox_on_backend_with_watermark(
+            db,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await?
+        .result,
     )
-    .await?;
-    Ok(LocalOutboxApply {
-        result: applied.result,
-        resource: applied.resource,
-        command: applied.command,
-        pod_endpoint_effect: applied.pod_endpoint_effect,
-    })
 }
 
 pub async fn reject_pod_uid_mismatch(
@@ -1180,7 +1167,7 @@ fn resource_command_target(command: &StorageCommand) -> Option<(&str, &str, Opti
 pub fn classify_apply_error(err: anyhow::Error) -> OutboxApplyError {
     let message = err.to_string();
     let lower = message.to_ascii_lowercase();
-    if lower.contains("uid mismatch") {
+    if lower.contains("uid mismatch") || lower.contains("uid precondition failed") {
         return OutboxApplyError::UidMismatch {
             expected: "<unknown>".to_string(),
             actual: "<unknown>".to_string(),

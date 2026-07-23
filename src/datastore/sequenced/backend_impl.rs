@@ -2,21 +2,35 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(test)]
+use klights_cluster_core::CommandMeta;
+use klights_cluster_core::{
+    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
+    StorageCommand, WatchReplayPosition,
+};
+use klights_leader_api::{OutboxDeliveryError, OutboxDeliveryResult};
 use serde_json::Value;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 
 use crate::datastore::backend::DatastoreBackend;
-#[cfg(test)]
-use crate::datastore::command::CommandMeta;
-use crate::datastore::command::StorageCommand;
 use crate::datastore::errors::DatastoreError;
-use crate::datastore::types::*;
+use crate::datastore::types::{
+    AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PodCleanupIntent,
+    PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
+    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplayRead,
+    RawWatchEvent, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SandboxRef,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+};
+#[cfg(test)]
+use crate::datastore::types::{PendingWatchEvent, ReplicatedCreateOptions};
 use klights_watch::WatchTopic;
 
 use super::SequencedDatastore;
 #[cfg(test)]
 use super::apply_command_to_backend;
+
+const NODE_LEASE_RENEW_OPERATION: &str = "LeaseRenew";
 
 fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
     let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) else {
@@ -890,6 +904,16 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.list_watch_replay_floors().await
     }
 
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>> {
+        self.passive
+            .list_watch_replay_floors_paged(after, limit)
+            .await
+    }
+
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
         self.passive.list_deleted_watch_events_since(since_rv).await
     }
@@ -1218,6 +1242,16 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.list_outbox_stream_watermarks().await
     }
 
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        self.passive
+            .list_outbox_stream_watermarks_paged(after, limit)
+            .await
+    }
+
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -1249,25 +1283,17 @@ impl DatastoreBackend for SequencedDatastore {
         operation: &str,
         payload: &[u8],
         authoring_node: &str,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        let command = match crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(payload)
-        {
-            Ok(payload) => payload.command,
+    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
+        let command = match crate::storage_wire_codec::decode_command_protobuf(payload) {
+            Ok(command) => command,
             Err(err) => {
-                return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
-                    err.to_string(),
-                ));
+                return Err(OutboxDeliveryError::Retryable(err.to_string()));
             }
         };
-        if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
+        if operation == NODE_LEASE_RENEW_OPERATION {
             crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
-                .map_err(|err| {
-                    crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(err.to_string())
-                })?;
-            return Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 });
+                .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
+            return Ok(OutboxDeliveryResult::Applied { applied_rv: 0 });
         }
         self.proposal
             .propose_outbox_command(idempotency_key, operation, command, authoring_node, None)
@@ -1281,21 +1307,13 @@ impl DatastoreBackend for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        let payload_decoded = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
-            payload,
-        )
-        .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        let command = payload_decoded.command;
-        if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
+    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
+        let command = crate::storage_wire_codec::decode_command_protobuf(payload)
+            .map_err(|err| OutboxDeliveryError::Retryable(err.to_string()))?;
+        if operation == NODE_LEASE_RENEW_OPERATION {
             crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
-                .map_err(|err| {
-                    crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(err.to_string())
-                })?;
-            return Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 });
+                .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
+            return Ok(OutboxDeliveryResult::Applied { applied_rv: 0 });
         }
         self.proposal
             .propose_outbox_command(
@@ -1315,22 +1333,14 @@ impl DatastoreBackend for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::datastore::CommittedOutboxApply,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        let payload_decoded = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
-            payload,
-        )
-        .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        let command = payload_decoded.command;
-        if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
+    ) -> std::result::Result<crate::datastore::CommittedOutboxApply, OutboxDeliveryError> {
+        let command = crate::storage_wire_codec::decode_command_protobuf(payload)
+            .map_err(|err| OutboxDeliveryError::Retryable(err.to_string()))?;
+        if operation == NODE_LEASE_RENEW_OPERATION {
             crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
-                .map_err(|err| {
-                    crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(err.to_string())
-                })?;
+                .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
             return Ok(crate::datastore::CommittedOutboxApply::new(
-                crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 },
+                OutboxDeliveryResult::Applied { applied_rv: 0 },
                 crate::datastore::ResourceMutationEffect::Unchanged,
                 crate::datastore::PodEndpointEffect::NotApplicable,
             ));
@@ -1363,10 +1373,8 @@ impl DatastoreBackend for SequencedDatastore {
         operation: &str,
         payload: &[u8],
         authoring_node: &str,
-    ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
+    {
         self.passive
             .build_log_apply_commit_for_outbox(idempotency_key, operation, payload, authoring_node)
             .await
@@ -1379,10 +1387,8 @@ impl DatastoreBackend for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
+    {
         self.passive
             .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
@@ -1698,6 +1704,14 @@ impl crate::datastore::WatchHistoryStore for SequencedDatastore {
 
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
         crate::datastore::DatastoreBackend::list_watch_replay_floors(self).await
+    }
+
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>> {
+        crate::datastore::DatastoreBackend::list_watch_replay_floors_paged(self, after, limit).await
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
@@ -2171,6 +2185,24 @@ impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
     ) -> Result<crate::datastore::ClusterMetadataObservation> {
         crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
+            self, request, anchor,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -2513,6 +2545,15 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         crate::datastore::DatastoreBackend::list_outbox_stream_watermarks(self).await
     }
 
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        crate::datastore::DatastoreBackend::list_outbox_stream_watermarks_paged(self, after, limit)
+            .await
+    }
+
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -2555,10 +2596,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         operation: &str,
         payload: &[u8],
         authoring_node: &str,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally(
             self,
             idempotency_key,
@@ -2576,10 +2614,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark(
             self,
             idempotency_key,
@@ -2598,10 +2633,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::datastore::CommittedOutboxApply,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<crate::datastore::CommittedOutboxApply, OutboxDeliveryError> {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
             self,
             idempotency_key,
@@ -2634,10 +2666,8 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         operation: &str,
         payload: &[u8],
         authoring_node: &str,
-    ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
+    {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox(
             self,
             idempotency_key,
@@ -2655,10 +2685,8 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
+    {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox_with_watermark(
             self,
             idempotency_key,

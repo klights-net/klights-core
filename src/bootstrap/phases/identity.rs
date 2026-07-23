@@ -634,12 +634,14 @@ mod tests {
         let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) = crate::auth::generate_ca_full().unwrap();
         drop((ca_cert, ca_key));
         let leader_ca_cert_path = crate::paths::ca_cert_path(&leader_namespace);
-        std::fs::create_dir_all(leader_ca_cert_path.parent().unwrap()).unwrap();
+        let leader_etc_dir = leader_ca_cert_path.parent().unwrap().to_path_buf();
+        let leader_data_root = leader_etc_dir.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&leader_etc_dir).unwrap();
         std::fs::write(&leader_ca_cert_path, ca_cert_pem).unwrap();
-        std::fs::write(crate::paths::ca_key_path(&leader_namespace), ca_key_pem).unwrap();
+        std::fs::write(leader_etc_dir.join("ca.key"), ca_key_pem).unwrap();
         let leader_service_account_signing_key = test_service_account_signing_key();
         std::fs::write(
-            crate::paths::service_account_signing_key_path(&leader_namespace),
+            leader_etc_dir.join("service-account-signing.key"),
             &leader_service_account_signing_key,
         )
         .unwrap();
@@ -684,6 +686,8 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let file_process = klights_supervisor::FileProcessExecutor::new(joiner_supervisor.clone());
+        let joiner_etc_dir = crate::paths::etc_dir_path(&joiner_namespace);
+        let joiner_data_root = joiner_etc_dir.parent().unwrap().to_path_buf();
         let cfg = crate::bootstrap::phases::config::ConfigPhase {
             config: config.clone(),
             node_mode: node_mode.clone(),
@@ -696,9 +700,7 @@ mod tests {
                 file_process,
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
-            etc_dir: crate::paths::etc_dir_path(&joiner_namespace)
-                .to_string_lossy()
-                .into_owned(),
+            etc_dir: joiner_etc_dir.to_string_lossy().into_owned(),
             containerd_data_dir: crate::paths::containerd_data_dir_path(&joiner_namespace)
                 .to_string_lossy()
                 .into_owned(),
@@ -736,10 +738,9 @@ mod tests {
             ),
             "joining controlplane must persist a node client cert without generic CSR bootstrap"
         );
-        let joined_sa_signer = std::fs::read_to_string(
-            crate::paths::service_account_signing_key_path(&joiner_namespace),
-        )
-        .expect("joining controlplane must persist the leader ServiceAccount signing key");
+        let joined_sa_signer =
+            std::fs::read_to_string(joiner_etc_dir.join("service-account-signing.key"))
+                .expect("joining controlplane must persist the leader ServiceAccount signing key");
         assert_eq!(joined_sa_signer, leader_service_account_signing_key);
 
         handle.abort();
@@ -749,8 +750,8 @@ mod tests {
         let _ = leader_supervisor
             .shutdown(std::time::Duration::from_secs(1))
             .await;
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&joiner_namespace));
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&leader_namespace));
+        let _ = std::fs::remove_dir_all(joiner_data_root);
+        let _ = std::fs::remove_dir_all(leader_data_root);
     }
 
     #[tokio::test]
@@ -809,7 +810,7 @@ mod tests {
         assert_eq!(dataplane.endpoint, "10.99.0.14");
         assert_eq!(
             dataplane.encryption,
-            crate::networking::wireguard::DataplaneEncryption::Enabled
+            klights_leader_api::DataplaneEncryption::WireGuard
         );
         assert!(
             dataplane.public_key.is_some(),

@@ -6,6 +6,39 @@ use time::format_description::well_known::Rfc3339;
 use crate::datastore::Resource;
 use crate::datastore::backend::DatastoreBackend;
 
+pub(crate) struct DatastoreBootstrapTokenValidation {
+    db: std::sync::Arc<dyn DatastoreBackend>,
+}
+
+impl DatastoreBootstrapTokenValidation {
+    pub(crate) fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
+        Self { db }
+    }
+}
+
+impl klights_leader_api::BootstrapTokenValidation for DatastoreBootstrapTokenValidation {
+    fn validate_bootstrap_token(
+        &self,
+        request: klights_leader_api::BootstrapTokenValidationRequest,
+    ) -> klights_leader_api::BootstrapTokenValidationFuture<'_> {
+        Box::pin(async move {
+            let (token, scope) = request.into_parts();
+            let scope = match scope {
+                klights_leader_api::BootstrapTokenScope::Worker => BootstrapTokenScope::Worker,
+                klights_leader_api::BootstrapTokenScope::Controlplane => {
+                    BootstrapTokenScope::Controlplane
+                }
+            };
+            validate_bootstrap_token_for_scope(self.db.as_ref(), &token, scope)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    klights_leader_api::BootstrapTokenValidationError::rejected(error.to_string())
+                })
+        })
+    }
+}
+
 const BOOTSTRAP_TOKEN_SECRET_TYPE: &str = "bootstrap.kubernetes.io/token";
 const BOOTSTRAP_TOKEN_NAMESPACE: &str = "kube-system";
 pub const WORKER_BOOTSTRAP_TOKEN_SECRET_NAME: &str = "worker-bootstrap-token";

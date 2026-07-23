@@ -8,7 +8,7 @@
 //! `last_log_id`.
 //!
 //! The on-the-wire payload reuses the existing
-//! `replication::snapshot::generate_snapshot` helper that already powers
+//! `datastore::snapshot_export::generate_snapshot` helper that already powers
 //! the Phase 2 replica join path, so leader and follower share one
 //! source of truth for "what makes up a cluster snapshot".
 
@@ -17,13 +17,20 @@ use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
+use klights_cluster_store::{
+    DurableReplayTarget, SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCapturePageKind,
+    SnapshotPersistenceError,
+};
+use klights_node_store::RaftAppliedStateDurability;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::{
     AnyError, LogId, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::datastore::DatastoreBackend;
+#[cfg(test)]
+use crate::datastore::DatastoreHandle;
+use crate::datastore::DurableRecoveryStore;
 use crate::datastore::raft::types::{NodeId, TypeConfig};
 
 /// Self-describing snapshot envelope. Carries the `last_applied`
@@ -32,7 +39,7 @@ use crate::datastore::raft::types::{NodeId, TypeConfig};
 /// `DatastoreBackend::apply_log_apply_commit`, reconstruct the cluster
 /// data state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RaftSnapshotData {
+pub(crate) struct RaftSnapshotData {
     pub last_applied: Option<LogId<NodeId>>,
     pub membership: StoredMembership<NodeId, openraft::BasicNode>,
     #[serde(default)]
@@ -53,121 +60,499 @@ pub struct RaftSnapshotData {
     /// snapshots from peers predating replay-floor transfer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_metadata: Option<klights_cluster_core::ClusterMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_membership: Option<RaftSnapshotMembership>,
     pub commits: Vec<crate::log_apply::LogApplyCommit>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum RaftSnapshotMembership {
+    AuthoritativeAbsent,
+    Present(klights_cluster_core::ClusterMembership),
+}
+
 impl RaftSnapshotData {
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>> {
-        crate::datastore::raft::compressed::encode(serde_json::to_vec(self)?.as_slice())
+    pub(crate) fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self> {
+        crate::datastore::raft::compressed::decode_json(bytes)
     }
 
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(
-            crate::datastore::raft::compressed::decode(bytes)?.as_slice(),
-        )?)
-    }
-
-    pub fn snapshot_id(&self) -> String {
-        snapshot_id_for(self.last_applied)
-    }
-
+    #[cfg(test)]
     pub async fn serialize_from_backend_to_cursor(
-        db: &dyn DatastoreBackend,
+        db: DatastoreHandle,
         last_applied: Option<LogId<NodeId>>,
         membership: &StoredMembership<NodeId, openraft::BasicNode>,
     ) -> Result<Cursor<Vec<u8>>> {
-        Self::serialize_from_backend_to_cursor_inner(db, last_applied, membership).await
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
+        let (snapshot, _, _) = Self::serialize_from_backend_to_cursor_inner(
+            Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(db)),
+            RaftSnapshotAppliedStateSource::Fixed {
+                last_applied,
+                membership: membership.clone(),
+            },
+            supervisor,
+        )
+        .await?;
+        Ok(snapshot)
     }
 
     async fn serialize_from_backend_to_cursor_inner(
-        db: &dyn DatastoreBackend,
-        last_applied: Option<LogId<NodeId>>,
-        membership: &StoredMembership<NodeId, openraft::BasicNode>,
-    ) -> Result<Cursor<Vec<u8>>> {
-        // P2 (memory-improvement.md): stream the JSON through a zstd encoder
-        // so the uncompressed JSON is never fully materialized in memory.
-        // The old code wrote ALL commits to a raw Cursor<Vec<u8>> (hundreds
-        // of MiB under e2e churn) then compressed the whole Vec in one shot.
-        // This stream-compresses incrementally: each JSON write goes through
-        // the zstd encoder, which flushes compressed blocks to `framed` as
-        // they fill. Peak memory is O(zstd window size + page size), not
-        // O(total snapshot size).
-        let mut framed = Vec::new();
-        // Always emit TAG_ZSTD — the streaming encoder can't know the final
-        // size to decide RAW fallback, and JSON always compresses well.
-        framed.push(crate::datastore::raft::compressed::TAG_ZSTD);
-        let mut encoder = zstd::Encoder::new(&mut framed, 3)?;
-        // Write the JSON envelope through the encoder.
-        encoder.write_all(b"{\"last_applied\":")?;
-        serde_json::to_writer(&mut encoder, &last_applied)?;
-        encoder.write_all(b",\"membership\":")?;
-        serde_json::to_writer(&mut encoder, membership)?;
-        // Freeze the apply-order boundary before the first streamed page.
-        // Concurrent rows are replayed from the Raft log after this snapshot;
-        // certifying them in the snapshot cursor would skip them on failover.
-        let snapshot_position = db.current_watch_replay_position().await?;
-        // The backend fence keeps resources, history, outbox state, allocator,
-        // and replay floors mutation-stable across every awaited page. Emit
-        // commits first and serialize the counters afterward; JSON key order
-        // is irrelevant to serde deserialization.
-        encoder.write_all(b",\"commits\":")?;
-        crate::replication::snapshot::write_snapshot_commits_json_array_through_event_id(
-            db,
-            0,
-            snapshot_position.event_id,
-            &mut encoder,
-        )
-        .await?;
-        let replay_position = db.current_watch_replay_position().await?;
-        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(db);
-        let resource_version_assignment_mode =
-            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                &meta_store,
+        recovery: Arc<dyn DurableRecoveryStore>,
+        applied_state_source: RaftSnapshotAppliedStateSource,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Result<(
+        Cursor<Vec<u8>>,
+        Option<LogId<NodeId>>,
+        StoredMembership<NodeId, openraft::BasicNode>,
+    )> {
+        let anchor = RaftSnapshotCaptureAnchor::new(applied_state_source);
+        let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
+            klights_cluster_store::SnapshotPageLimit::try_new(
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE,
+            )?,
+            std::time::Duration::from_secs(300),
+        )?;
+        let session = recovery
+            .begin_pinned_snapshot_capture_with_anchor(request, &anchor)
+            .await;
+        let captured = anchor.take();
+        let (mut session, captured) = match session {
+            Ok(session) => (
+                session,
+                captured.ok_or_else(|| {
+                    anyhow::anyhow!("snapshot capture omitted applied-state anchor")
+                })?,
+            ),
+            Err(error) => {
+                let Some(captured) = captured else {
+                    return Err(error);
+                };
+                if !is_pristine_raft_state(&captured) || !is_missing_cluster_identity_error(&error)
+                {
+                    return Err(error);
+                }
+                let allocator = recovery.read_durable_allocator_observation().await?;
+                if allocator.position.resource_version != 0
+                    || allocator.position.event_id != 0
+                    || allocator.position.resource_version_filter_through_event_id != 0
+                {
+                    return Err(error);
+                }
+                let snapshot =
+                    encode_pristine_bootstrap_snapshot(captured.clone(), supervisor.clone())
+                        .await?;
+                let (last_applied, membership) = captured;
+                return Ok((Cursor::new(snapshot), last_applied, membership));
+            }
+        };
+        let returned_header = session.header().clone();
+        let (encoder_tx, mut encoder_rx) = tokio::sync::mpsc::channel(1);
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let encoder_header = returned_header.clone();
+        let captured_for_encoder = captured.clone();
+        let blocking_supervisor = supervisor.clone();
+        supervisor
+            .spawn_async(
+                klights_supervisor::TaskCategory::Background,
+                "raft-snapshot-encoder",
+                async move {
+                    let result = blocking_supervisor
+                        .run_blocking(
+                            klights_supervisor::TaskCategory::Others,
+                            "raft-snapshot-json-zstd",
+                            move || {
+                                encode_snapshot_pages(
+                                    encoder_header,
+                                    captured_for_encoder,
+                                    &mut encoder_rx,
+                                )
+                            },
+                        )
+                        .await
+                        .map_err(|error| anyhow::anyhow!("snapshot encoder supervisor: {error}"))
+                        .and_then(|result| result);
+                    let _ = finished_tx.send(result);
+                },
             )
             .await?;
-        let floors = normalize_snapshot_floors(
-            db.list_watch_replay_floors().await?,
-            snapshot_position.event_id,
-            replay_position.resource_version,
-        );
-        encoder.write_all(b",\"current_rv\":")?;
-        serde_json::to_writer(&mut encoder, &replay_position.resource_version)?;
-        encoder.write_all(b",\"resource_version_assignment_mode\":")?;
-        serde_json::to_writer(
-            &mut encoder,
-            &crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
-                resource_version_assignment_mode,
-            ),
-        )?;
-        encoder.write_all(b",\"watch_event_high_water\":")?;
-        serde_json::to_writer(&mut encoder, &snapshot_position.event_id)?;
-        encoder.write_all(b",\"watch_replay_floors\":")?;
-        serde_json::to_writer(&mut encoder, &floors)?;
-        encoder.write_all(b"}")?;
-        // Finish the zstd stream — flushes remaining compressed data to `framed`.
-        encoder.finish()?;
-        Ok(Cursor::new(framed))
+        while let Some(page) = session.next_page().await? {
+            encoder_tx
+                .send(page)
+                .await
+                .map_err(|_| anyhow::anyhow!("snapshot encoder stopped before final page"))?;
+        }
+        drop(encoder_tx);
+        let framed = finished_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("snapshot encoder stopped without a result"))??;
+        let (last_applied, membership) = captured;
+        Ok((Cursor::new(framed), last_applied, membership))
     }
 }
 
-fn normalize_snapshot_floors(
-    mut floors: Vec<crate::datastore::WatchReplayFloor>,
-    high_water_event_id: i64,
-    current_resource_version: i64,
-) -> Vec<crate::datastore::WatchReplayFloor> {
-    for floor in &mut floors {
-        if floor.position_is_exact && floor.floor_event_id > high_water_event_id {
-            // GC may advance after the boundary was captured. Relative to this
-            // snapshot every older cursor is compacted while the boundary
-            // itself remains a valid empty replay position.
-            floor.floor_event_id = high_water_event_id;
-            floor.floor_resource_version = current_resource_version;
-        } else {
-            floor.floor_resource_version =
-                floor.floor_resource_version.min(current_resource_version);
+fn is_pristine_raft_state(captured: &CapturedRaftAppliedState) -> bool {
+    captured.0.is_none() && captured.1 == StoredMembership::default()
+}
+
+fn is_missing_cluster_identity_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string() == "cluster_id is missing")
+}
+
+async fn encode_pristine_bootstrap_snapshot(
+    captured: CapturedRaftAppliedState,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+) -> Result<Vec<u8>> {
+    supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "raft-pristine-bootstrap-snapshot-json-zstd",
+            move || {
+                let data = RaftSnapshotData {
+                    last_applied: captured.0,
+                    membership: captured.1,
+                    current_rv: 0,
+                    resource_version_assignment_mode:
+                        crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
+                            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                        ),
+                    watch_event_high_water: Some(0),
+                    watch_replay_floors: Some(Vec::new()),
+                    cluster_metadata: None,
+                    cluster_membership: None,
+                    commits: Vec::new(),
+                };
+                crate::datastore::raft::compressed::encode(&serde_json::to_vec(&data)?)
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("pristine bootstrap snapshot supervisor: {error}"))?
+}
+
+fn encode_snapshot_pages(
+    header: SnapshotCaptureHeader,
+    captured: CapturedRaftAppliedState,
+    pages: &mut tokio::sync::mpsc::Receiver<SnapshotCapturePage>,
+) -> Result<Vec<u8>> {
+    let mut framed = vec![crate::datastore::raft::compressed::TAG_ZSTD];
+    let mut encoder = zstd::Encoder::new(&mut framed, 3)?;
+    let mut writer = RaftJsonSnapshotEncoder::new(&mut encoder);
+    writer.begin_capture(&header, captured)?;
+    while let Some(page) = pages.blocking_recv() {
+        writer.push_page(page)?;
+    }
+    writer.finish(&header)?;
+    drop(writer);
+    encoder.finish()?;
+    Ok(framed)
+}
+
+enum RaftSnapshotAppliedStateSource {
+    #[cfg(test)]
+    Fixed {
+        last_applied: Option<LogId<NodeId>>,
+        membership: StoredMembership<NodeId, openraft::BasicNode>,
+    },
+    Durable(Arc<dyn RaftAppliedStateDurability>),
+}
+
+type CapturedRaftAppliedState = (
+    Option<LogId<NodeId>>,
+    StoredMembership<NodeId, openraft::BasicNode>,
+);
+
+impl RaftSnapshotAppliedStateSource {
+    async fn load(&self) -> Result<CapturedRaftAppliedState, SnapshotPersistenceError> {
+        let (last_applied, membership) = match self {
+            #[cfg(test)]
+            Self::Fixed {
+                last_applied,
+                membership,
+            } => return Ok((*last_applied, membership.clone())),
+            Self::Durable(applied_state) => applied_state
+                .load_applied_state()
+                .await
+                .map_err(map_raft_durability_snapshot_error)?
+                .into_parts(),
+        };
+        let last_applied = last_applied
+            .map(|bytes| serde_json::from_slice(bytes.as_slice()))
+            .transpose()
+            .map_err(|error| {
+                SnapshotPersistenceError::persistence_failed(format!(
+                    "failed to decode Raft last-applied state: {error}"
+                ))
+            })?;
+        let membership = membership
+            .map(|bytes| serde_json::from_slice(bytes.as_slice()))
+            .transpose()
+            .map_err(|error| {
+                SnapshotPersistenceError::persistence_failed(format!(
+                    "failed to decode Raft membership state: {error}"
+                ))
+            })?
+            .unwrap_or_default();
+        Ok((last_applied, membership))
+    }
+}
+
+struct RaftSnapshotCaptureAnchor {
+    source: RaftSnapshotAppliedStateSource,
+    captured: std::sync::Mutex<Option<CapturedRaftAppliedState>>,
+}
+
+impl RaftSnapshotCaptureAnchor {
+    fn new(source: RaftSnapshotAppliedStateSource) -> Self {
+        Self {
+            source,
+            captured: std::sync::Mutex::new(None),
         }
     }
-    floors
+
+    fn take(&self) -> Option<CapturedRaftAppliedState> {
+        self.captured.lock().unwrap().take()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::datastore::backend::SnapshotCaptureAnchor for RaftSnapshotCaptureAnchor {
+    async fn pin_under_snapshot_fence(&self) -> anyhow::Result<()> {
+        let captured = self.source.load().await?;
+        *self.captured.lock().unwrap() = Some(captured);
+        Ok(())
+    }
+}
+
+fn map_raft_durability_snapshot_error(
+    error: klights_node_store::RaftDurabilityError,
+) -> SnapshotPersistenceError {
+    match error {
+        klights_node_store::RaftDurabilityError::InvalidInput { message, .. }
+        | klights_node_store::RaftDurabilityError::CorruptData { message, .. } => {
+            SnapshotPersistenceError::CorruptData { message }
+        }
+        klights_node_store::RaftDurabilityError::Retryable { message, .. } => {
+            SnapshotPersistenceError::Retryable { message }
+        }
+        klights_node_store::RaftDurabilityError::Timeout => SnapshotPersistenceError::Timeout,
+        klights_node_store::RaftDurabilityError::Cancelled => SnapshotPersistenceError::Cancelled,
+        klights_node_store::RaftDurabilityError::PersistenceFailed { operation, message } => {
+            SnapshotPersistenceError::persistence_failed(format!("{operation}: {message}"))
+        }
+        _ => SnapshotPersistenceError::persistence_failed(error.to_string()),
+    }
+}
+
+struct RaftJsonSnapshotEncoder<'a, W: Write + Send> {
+    writer: &'a mut W,
+    captured_applied_state: Option<CapturedRaftAppliedState>,
+    header: Option<SnapshotCaptureHeader>,
+    first_commit: bool,
+    floors_open: bool,
+    first_floor: bool,
+}
+
+impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
+    fn new(writer: &'a mut W) -> Self {
+        Self {
+            writer,
+            captured_applied_state: None,
+            header: None,
+            first_commit: true,
+            floors_open: false,
+            first_floor: true,
+        }
+    }
+
+    fn write_json<T: Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), SnapshotPersistenceError> {
+        serde_json::to_writer(&mut self.writer, value)
+            .map_err(|error| SnapshotPersistenceError::persistence_failed(error.to_string()))
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SnapshotPersistenceError> {
+        self.writer
+            .write_all(bytes)
+            .map_err(|error| SnapshotPersistenceError::persistence_failed(error.to_string()))
+    }
+
+    fn write_commit(
+        &mut self,
+        commit: &crate::log_apply::LogApplyCommit,
+    ) -> Result<(), SnapshotPersistenceError> {
+        if self.floors_open {
+            return Err(SnapshotPersistenceError::persistence_failed(
+                "snapshot commit page followed replay-floor pages",
+            ));
+        }
+        if !self.first_commit {
+            self.write_bytes(b",")?;
+        }
+        self.first_commit = false;
+        self.write_json(commit)
+    }
+
+    fn open_floors(&mut self) -> Result<(), SnapshotPersistenceError> {
+        if !self.floors_open {
+            self.write_bytes(b"],\"watch_replay_floors\":[")?;
+            self.floors_open = true;
+        }
+        Ok(())
+    }
+
+    fn write_floor(
+        &mut self,
+        floor: klights_cluster_store::DurableReplayFloor,
+    ) -> Result<(), SnapshotPersistenceError> {
+        self.open_floors()?;
+        if !self.first_floor {
+            self.write_bytes(b",")?;
+        }
+        self.first_floor = false;
+        let header = self.header.as_ref().expect("capture header precedes pages");
+        let position = header.position();
+        let (target, mut floor_resource_version, mut floor_event_id, position_is_exact) =
+            floor.into_parts();
+        if position_is_exact && floor_event_id > position.event_id {
+            floor_event_id = position.event_id;
+            floor_resource_version = position.resource_version;
+        } else {
+            floor_resource_version = floor_resource_version.min(position.resource_version);
+        }
+        let (api_version, kind, namespace_key) = match target {
+            DurableReplayTarget::All => ("*".to_string(), "*".to_string(), "*".to_string()),
+            DurableReplayTarget::Cluster { api_version, kind } => {
+                (api_version, kind, "#cluster".to_string())
+            }
+            DurableReplayTarget::Namespaced {
+                api_version,
+                kind,
+                namespace,
+            } => (api_version, kind, namespace),
+        };
+        self.write_json(&crate::datastore::WatchReplayFloor {
+            api_version,
+            kind,
+            namespace_key,
+            floor_resource_version,
+            floor_event_id,
+            position_is_exact,
+        })
+    }
+
+    fn finish(&mut self, returned: &SnapshotCaptureHeader) -> Result<()> {
+        let begun = self
+            .header
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("snapshot capture omitted header"))?;
+        anyhow::ensure!(
+            begun.position() == returned.position()
+                && begun.resource_version_assignment() == returned.resource_version_assignment()
+                && begun.metadata() == returned.metadata()
+                && begun.membership() == returned.membership(),
+            "snapshot capture returned a different header than it began"
+        );
+        self.open_floors()?;
+        self.write_bytes(b"]}")?;
+        Ok(())
+    }
+
+    fn begin_capture(
+        &mut self,
+        header: &SnapshotCaptureHeader,
+        captured: CapturedRaftAppliedState,
+    ) -> Result<(), SnapshotPersistenceError> {
+        if self.header.is_some() {
+            return Err(SnapshotPersistenceError::persistence_failed(
+                "snapshot capture began more than once",
+            ));
+        }
+        let (last_applied, membership) = captured;
+        self.write_bytes(b"{\"last_applied\":")?;
+        self.write_json(&last_applied)?;
+        self.write_bytes(b",\"membership\":")?;
+        self.write_json(&membership)?;
+        self.captured_applied_state = Some((last_applied, membership));
+        self.header = Some(header.clone());
+        let position = header.position();
+        let assignment = match header.resource_version_assignment() {
+            Some(mode) => {
+                crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
+                    mode,
+                )
+            }
+            None => crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot,
+        };
+        self.write_bytes(b",\"current_rv\":")?;
+        self.write_json(&position.resource_version)?;
+        self.write_bytes(b",\"resource_version_assignment_mode\":")?;
+        self.write_json(&assignment)?;
+        self.write_bytes(b",\"watch_event_high_water\":")?;
+        self.write_json(&position.event_id)?;
+        self.write_bytes(b",\"cluster_metadata\":")?;
+        self.write_json(&Some(header.metadata()))?;
+        self.write_bytes(b",\"cluster_membership\":")?;
+        let membership = match header.membership() {
+            klights_cluster_store::SnapshotMembership::LegacyOmitted => None,
+            klights_cluster_store::SnapshotMembership::AuthoritativeAbsent => {
+                Some(RaftSnapshotMembership::AuthoritativeAbsent)
+            }
+            klights_cluster_store::SnapshotMembership::Present(membership) => {
+                Some(RaftSnapshotMembership::Present(membership.clone()))
+            }
+        };
+        self.write_json(&membership)?;
+        self.write_bytes(b",\"commits\":[")
+    }
+
+    fn push_page(&mut self, page: SnapshotCapturePage) -> Result<(), SnapshotPersistenceError> {
+        let current_rv = self
+            .header
+            .as_ref()
+            .ok_or_else(|| {
+                SnapshotPersistenceError::persistence_failed(
+                    "snapshot page arrived before capture header",
+                )
+            })?
+            .position()
+            .resource_version;
+        match page.kind() {
+            SnapshotCapturePageKind::Commits => {
+                for commit in page.into_commits().expect("page kind checked") {
+                    self.write_commit(&commit)?;
+                }
+            }
+            SnapshotCapturePageKind::AppliedOutbox => {
+                for row in page.into_applied_outbox().expect("page kind checked") {
+                    self.write_commit(&crate::log_apply::LogApplyCommit::new(
+                        current_rv,
+                        vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)],
+                    ))?;
+                }
+            }
+            SnapshotCapturePageKind::OutboxWatermarks => {
+                for outbox_watermark in page.into_outbox_watermarks().expect("page kind checked") {
+                    self.write_commit(&crate::log_apply::LogApplyCommit {
+                        resource_version: current_rv,
+                        resource_version_assignment:
+                            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                        outbox_watermark: Some(outbox_watermark),
+                        mutations: Vec::new(),
+                    })?;
+                }
+            }
+            SnapshotCapturePageKind::ReplayFloors => {
+                for floor in page.into_replay_floors().expect("page kind checked") {
+                    self.write_floor(floor)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn snapshot_id_for(last_applied: Option<LogId<NodeId>>) -> String {
@@ -189,43 +574,23 @@ fn snapshot_write_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
 /// `SnapshotMeta` is consistent with the bytes it carries.
 #[derive(Clone)]
 pub struct SqliteRaftSnapshotBuilder {
-    pub(crate) backend: Arc<dyn DatastoreBackend>,
-    pub(crate) node_local: Arc<crate::datastore::node_local::SqliteNodeLocalDb>,
+    pub(crate) recovery: Arc<dyn DurableRecoveryStore>,
+    pub(crate) applied_state: Arc<dyn RaftAppliedStateDurability>,
+    pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let _snapshot_fence = self
-            .backend
-            .acquire_snapshot_exclusive_fence()
+        let (snapshot, last_applied, membership) =
+            RaftSnapshotData::serialize_from_backend_to_cursor_inner(
+                self.recovery.clone(),
+                RaftSnapshotAppliedStateSource::Durable(self.applied_state.clone()),
+                self.supervisor.clone(),
+            )
             .await
             .map_err(snapshot_write_err)?;
-        let last_applied = self
-            .node_local
-            .raft_meta_get("last_applied")
-            .await
-            .map_err(snapshot_write_err)?
-            .map(|bytes| serde_json::from_slice(&bytes))
-            .transpose()
-            .map_err(snapshot_write_err)?;
-        let membership = self
-            .node_local
-            .raft_meta_get("last_membership")
-            .await
-            .map_err(snapshot_write_err)?
-            .map(|bytes| serde_json::from_slice(&bytes))
-            .transpose()
-            .map_err(snapshot_write_err)?
-            .unwrap_or_default();
-        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor_inner(
-            self.backend.as_ref(),
-            last_applied,
-            &membership,
-        )
-        .await
-        .map_err(snapshot_write_err)?;
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership: membership,
@@ -241,7 +606,169 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datastore::DatastoreBackend;
     use crate::datastore::test_support;
+    use klights_node_store::{
+        EncodedRaftAppliedState, RaftAppliedStateWrite, RaftDurabilityFuture,
+    };
+
+    struct BlockingAppliedState {
+        reached: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    }
+
+    impl RaftAppliedStateDurability for BlockingAppliedState {
+        fn load_applied_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftAppliedState> {
+            let reached = self.reached.clone();
+            let resume = self.resume.clone();
+            Box::pin(async move {
+                reached.notify_one();
+                resume.notified().await;
+                Ok(EncodedRaftAppliedState::new(None, None))
+            })
+        }
+
+        fn store_applied_state(
+            &self,
+            _state: RaftAppliedStateWrite,
+        ) -> RaftDurabilityFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn seed_cluster_metadata(db: &dyn DatastoreBackend) {
+        db.set_klights_meta(
+            klights_cluster_store::CLUSTER_ID_META_KEY,
+            "snapshot-test-cluster",
+        )
+        .await
+        .unwrap();
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pristine_pre_cluster_snapshot_is_canonical_and_identity_free() {
+        let db = test_support::in_memory().await;
+        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
+            Arc::new(db),
+            None,
+            &StoredMembership::default(),
+        )
+        .await
+        .expect("OpenRaft must be able to persist its initial Snapshot(None)");
+        let decoded = RaftSnapshotData::deserialize_from_bytes(&snapshot.into_inner()).unwrap();
+
+        assert_eq!(decoded.last_applied, None);
+        assert_eq!(decoded.membership, StoredMembership::default());
+        assert_eq!(decoded.current_rv, 0);
+        assert_eq!(decoded.watch_event_high_water, Some(0));
+        assert_eq!(decoded.watch_replay_floors, Some(Vec::new()));
+        assert_eq!(decoded.cluster_metadata, None);
+        assert_eq!(decoded.cluster_membership, None);
+        assert!(decoded.commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_cluster_identity_is_rejected_after_raft_state_exists() {
+        let log_id = LogId::new(openraft::LeaderId::new(3, 7), 11);
+        let membership = StoredMembership::new(
+            Some(log_id),
+            openraft::Membership::new(
+                vec![std::collections::BTreeSet::from([7])],
+                std::collections::BTreeMap::<NodeId, openraft::BasicNode>::new(),
+            ),
+        );
+        let cases = [
+            (
+                "applied log",
+                Some(log_id),
+                StoredMembership::default(),
+                false,
+            ),
+            ("membership", None, membership, false),
+            (
+                "non-empty allocator",
+                None,
+                StoredMembership::default(),
+                true,
+            ),
+        ];
+
+        for (case, last_applied, membership, seed_resource) in cases {
+            let db = test_support::in_memory().await;
+            if seed_resource {
+                db.create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    "preexisting",
+                    serde_json::json!({"metadata": {"name": "preexisting"}}),
+                )
+                .await
+                .unwrap();
+            }
+            let error = RaftSnapshotData::serialize_from_backend_to_cursor(
+                Arc::new(db),
+                last_applied,
+                &membership,
+            )
+            .await
+            .expect_err(case);
+            assert!(
+                error.to_string().contains("cluster_id is missing"),
+                "{case} must retain authoritative identity validation: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_reads_applied_state_inside_authoritative_capture_fence() {
+        let db = test_support::in_memory().await;
+        seed_cluster_metadata(&db).await;
+        let handle: DatastoreHandle = Arc::new(db.clone());
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let reached_wait = reached.notified();
+        tokio::pin!(reached_wait);
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
+
+        let capture_task = tokio::spawn({
+            let reached = reached.clone();
+            let resume = resume.clone();
+            async move {
+                RaftSnapshotData::serialize_from_backend_to_cursor_inner(
+                    Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(handle)),
+                    RaftSnapshotAppliedStateSource::Durable(Arc::new(BlockingAppliedState {
+                        reached,
+                        resume,
+                    })),
+                    supervisor,
+                )
+                .await
+            }
+        });
+        reached_wait.await;
+
+        let mutation_task = tokio::spawn(async move {
+            crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(&db)
+                .await
+                .unwrap()
+                .expect("sqlite supplies a mutation fence")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !mutation_task.is_finished(),
+            "committed apply must not cross the applied-state read in begin_capture"
+        );
+
+        resume.notify_one();
+        let (_, last_applied, membership) = capture_task.await.unwrap().unwrap();
+        assert_eq!(last_applied, None);
+        assert_eq!(membership, StoredMembership::default());
+        mutation_task.await.unwrap();
+    }
 
     /// P2 (memory): serialize_from_backend_to_cursor must produce a valid
     /// zstd-framed payload that round-trips through deserialize_from_bytes.
@@ -250,6 +777,7 @@ mod tests {
     #[tokio::test]
     async fn streaming_snapshot_round_trips_and_is_zstd_framed() {
         let db = test_support::in_memory().await;
+        seed_cluster_metadata(&db).await;
         crate::controllers::namespace::init_default_namespaces(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             &db,
@@ -267,9 +795,13 @@ mod tests {
         .unwrap();
 
         let membership = StoredMembership::<NodeId, openraft::BasicNode>::default();
-        let cursor = RaftSnapshotData::serialize_from_backend_to_cursor(&db, None, &membership)
-            .await
-            .unwrap();
+        let cursor = RaftSnapshotData::serialize_from_backend_to_cursor(
+            Arc::new(db.clone()),
+            None,
+            &membership,
+        )
+        .await
+        .unwrap();
 
         let framed = cursor.into_inner();
         assert_eq!(
@@ -300,6 +832,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_serialization_preserves_v1_assignment_mode() {
         let db = test_support::in_memory().await;
+        seed_cluster_metadata(&db).await;
         crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
             &db,
             crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
@@ -307,9 +840,13 @@ mod tests {
         .await
         .unwrap();
         let membership = StoredMembership::<NodeId, openraft::BasicNode>::default();
-        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(&db, None, &membership)
-            .await
-            .unwrap();
+        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
+            Arc::new(db.clone()),
+            None,
+            &membership,
+        )
+        .await
+        .unwrap();
         let decoded = RaftSnapshotData::deserialize_from_bytes(&snapshot.into_inner()).unwrap();
         assert_eq!(
             decoded.resource_version_assignment_mode,
@@ -333,6 +870,106 @@ mod tests {
             .unwrap(),
             crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_stream_preserves_rv_event_floor_and_outbox_families() {
+        let db = test_support::in_memory().await;
+        let outbox = crate::log_apply::LogApplyAppliedOutboxRow {
+            idempotency_key: "snapshot-ledger".into(),
+            subject_key: "v1/ConfigMap/default/item/uid".into(),
+            operation: "Update".into(),
+            first_seen_ms: 10,
+            applied_rv: Some(7),
+            result_proto: vec![1, 2, 3],
+            status_stamp: None,
+        };
+        let watermark = crate::log_apply::OutboxStreamWatermark {
+            client_id: "worker-a".into(),
+            stream_id: 4,
+            stream_seq: 1,
+        };
+        db.replace_replicated_resource_state(
+            vec![crate::log_apply::LogApplyCommit {
+                resource_version: 7,
+                resource_version_assignment:
+                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                outbox_watermark: Some(watermark.clone()),
+                mutations: vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
+                    outbox.clone(),
+                )],
+            }],
+            7,
+            Some(11),
+            Some(vec![crate::datastore::WatchReplayFloor {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace_key: "default".into(),
+                floor_resource_version: 6,
+                floor_event_id: 10,
+                position_is_exact: true,
+            }]),
+            Some(crate::datastore::ReplicatedSnapshotMetadata {
+                cluster_id: "snapshot-exact-cluster".into(),
+                leader_epoch: 3,
+                membership: crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent,
+                resource_version_assignment_mode: Some(
+                    crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+                ),
+                snapshot_assignment_mode: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let encoded = RaftSnapshotData::serialize_from_backend_to_cursor(
+            Arc::new(db),
+            None,
+            &StoredMembership::default(),
+        )
+        .await
+        .unwrap();
+        let decoded = RaftSnapshotData::deserialize_from_bytes(&encoded.into_inner()).unwrap();
+
+        assert_eq!(decoded.current_rv, 7);
+        assert_eq!(decoded.watch_event_high_water, Some(11));
+        assert_eq!(
+            decoded.cluster_metadata,
+            Some(klights_cluster_core::ClusterMetadata {
+                cluster_id: "snapshot-exact-cluster".into(),
+                leader_epoch: 3,
+                current_rv: 7,
+            })
+        );
+        assert_eq!(
+            decoded.cluster_membership,
+            Some(RaftSnapshotMembership::AuthoritativeAbsent)
+        );
+        assert_eq!(
+            decoded.resource_version_assignment_mode,
+            crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+            )
+        );
+        let floors = decoded.watch_replay_floors.unwrap();
+        assert_eq!(floors.len(), 1);
+        assert_eq!(floors[0].floor_resource_version, 6);
+        assert_eq!(floors[0].floor_event_id, 10);
+        assert!(
+            decoded
+                .commits
+                .iter()
+                .any(|commit| { commit.outbox_watermark.as_ref() == Some(&watermark) })
+        );
+        assert!(decoded.commits.iter().any(|commit| {
+            commit.mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)
+                        if row == &outbox
+                )
+            })
+        }));
     }
 
     #[test]

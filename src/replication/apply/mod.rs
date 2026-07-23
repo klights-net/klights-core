@@ -12,11 +12,14 @@
 //!   that have already done their own dedup.
 
 use anyhow::{Result, anyhow};
+use klights_cluster_core::{
+    CommandMeta, Resource, ResourcePatchRequest, ResourcePreconditions, StorageCommand,
+};
 
+use crate::datastore::AppliedOutboxRecord;
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::command::{CommandMeta, StorageCommand, encode_response_protobuf};
-use crate::datastore::{AppliedOutboxRecord, ResourcePatchRequest, ResourcePreconditions};
 use crate::replication::protocol::ReplicationEntry;
+use crate::storage_wire_codec::encode_response_protobuf;
 use serde_json::Value;
 
 pub mod codec;
@@ -838,7 +841,7 @@ async fn apply_forwarded_update_against_latest(
     name: &str,
     mut data: Value,
     forwarded_preconditions: &ResourcePreconditions,
-) -> Result<(crate::datastore::Resource, ResourcePreconditions)> {
+) -> Result<(Resource, ResourcePreconditions)> {
     let live = db
         .get_resource(api_version, kind, namespace, name)
         .await?
@@ -865,7 +868,7 @@ async fn apply_forwarded_update_against_latest(
 
 fn validate_forwarded_uid_precondition(
     preconditions: &ResourcePreconditions,
-    live: &crate::datastore::Resource,
+    live: &Resource,
 ) -> Result<()> {
     let Some(expected_uid) = preconditions.uid.as_deref().filter(|uid| !uid.is_empty()) else {
         return Ok(());

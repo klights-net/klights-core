@@ -46,7 +46,7 @@ pub enum KeySource {
 /// Where the connection lives.
 #[derive(Debug, Clone)]
 pub enum OpenPath {
-    InMemory,
+    SharedMemory(PathBuf),
     Disk(PathBuf),
 }
 
@@ -76,7 +76,7 @@ pub struct OpenOpts {
 impl OpenOpts {
     pub fn in_memory() -> Self {
         Self {
-            path: OpenPath::InMemory,
+            path: OpenPath::SharedMemory(shared_memory_uri("cluster")),
             profile: PragmaProfile::Plaintext,
             schema: SchemaKind::Cluster,
             key_source: None,
@@ -96,7 +96,7 @@ impl OpenOpts {
 
     pub fn node_in_memory() -> Self {
         Self {
-            path: OpenPath::InMemory,
+            path: OpenPath::SharedMemory(shared_memory_uri("node")),
             profile: PragmaProfile::Plaintext,
             schema: SchemaKind::NodeLocal,
             key_source: None,
@@ -136,6 +136,13 @@ impl OpenOpts {
             Ok(opts)
         }
     }
+}
+
+fn shared_memory_uri(scope: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "file:klights-{scope}-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    ))
 }
 
 /// Apply the PRAGMA list for `profile` to a freshly-opened connection.

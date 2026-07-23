@@ -333,7 +333,6 @@ mod tests {
         assert!(cli.is_ok(), "klights with no args should parse OK");
         let cli = cli.unwrap();
         assert!(cli.command.is_none(), "no subcommand should yield None");
-        assert_eq!(cli.namespace, "klights");
         assert_eq!(
             cli.anonymous_auth, None,
             "absent CLI flag must leave the config/env default in force"
@@ -893,9 +892,22 @@ mod tests {
     }
 
     #[test]
-    fn namespace_default() {
-        let cli = Cli::try_parse_from(["klights", "start"]).unwrap();
-        assert_eq!(cli.namespace, "klights");
+    fn namespace_declares_klights_default() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        let namespace = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "namespace")
+            .expect("namespace argument");
+        assert_eq!(
+            namespace
+                .get_default_values()
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["klights"]
+        );
     }
 
     #[test]

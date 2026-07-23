@@ -14,24 +14,24 @@
 //! - Restore into staging first.
 //! - Only replace replica datastore after successful validation.
 //! - Failed copy leaves old local data untouched.
+#![allow(
+    dead_code,
+    reason = "legacy snapshot compatibility emitters coexist with the pinned pull-session path"
+)]
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 
 use anyhow::Result;
-
-pub use klights_cluster_core::{MetadataComparison, compare_metadata, needs_confirmation};
+use klights_cluster_core::Resource;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::types::{NodeSubnet, PodCleanupIntent, Resource};
+use crate::datastore::types::{NodeSubnet, PodCleanupIntent};
 use crate::log_apply::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
     LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow,
     LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, PodCleanupMutation,
     ResourceMutation, WatchHistoryMutation,
 };
-
-const SNAPSHOT_JSON_COMMIT_BATCH_SIZE: usize = 128;
 
 /// memory-improvement.md §10 P1: page size for keyset-paginated reads inside
 /// `emit_snapshot_commits`. Bounded so a multi-million-row table is consumed
@@ -60,24 +60,6 @@ pub(crate) fn install_snapshot_watch_page_pause() -> SnapshotWatchPagePause {
     pause
 }
 
-/// Read local replica metadata from the datastore.
-pub async fn read_local_metadata(
-    db: &dyn DatastoreBackend,
-) -> Result<(Option<String>, Option<i64>, Option<i64>)> {
-    let cluster_id = db
-        .get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
-        .await?;
-
-    let leader_epoch = db
-        .get_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH)
-        .await?
-        .and_then(|s| s.parse::<i64>().ok());
-
-    let current_rv = db.get_current_resource_version().await.ok();
-
-    Ok((cluster_id, leader_epoch, current_rv))
-}
-
 /// Leader-side: generate an authoritative snapshot of all cluster-replicated data.
 ///
 /// `after_rv` is the caller's cursor for diagnostics and future non-destructive
@@ -97,32 +79,6 @@ pub async fn generate_snapshot(
     let mut sink = VecSnapshotCommitSink::default();
     stream_snapshot_commits(db, after_rv, &mut sink).await?;
     Ok(sink.entries)
-}
-
-/// Write snapshot commits as a JSON array without materializing the commit list.
-///
-/// This is used by the Raft snapshot builder, whose enclosing object writes
-/// `last_applied`, membership, and the leader RV counter around this array.
-pub async fn write_snapshot_commits_json_array<W: Write>(
-    db: &dyn DatastoreBackend,
-    after_rv: i64,
-    writer: &mut W,
-) -> Result<()> {
-    let high_water = db.current_watch_replay_position().await?.event_id;
-    write_snapshot_commits_json_array_through_event_id(db, after_rv, high_water, writer).await
-}
-
-pub async fn write_snapshot_commits_json_array_through_event_id<W: Write>(
-    db: &dyn DatastoreBackend,
-    after_rv: i64,
-    high_water_event_id: i64,
-    writer: &mut W,
-) -> Result<()> {
-    writer.write_all(b"[")?;
-    let mut sink = JsonArrayCommitSink::new(writer);
-    stream_snapshot_commits_through_event_id(db, after_rv, high_water_event_id, &mut sink).await?;
-    writer.write_all(b"]")?;
-    Ok(())
 }
 
 pub(crate) async fn stream_snapshot_commits<S: SnapshotCommitSink + Unpin>(
@@ -405,47 +361,6 @@ impl SnapshotCommitSink for VecSnapshotCommitSink {
     }
 }
 
-struct JsonArrayCommitSink<'a, W: Write> {
-    writer: &'a mut W,
-    first: bool,
-    pending: Vec<LogApplyCommit>,
-}
-
-impl<'a, W: Write> JsonArrayCommitSink<'a, W> {
-    fn new(writer: &'a mut W) -> Self {
-        Self {
-            writer,
-            first: true,
-            pending: Vec::with_capacity(SNAPSHOT_JSON_COMMIT_BATCH_SIZE),
-        }
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        for commit in self.pending.drain(..) {
-            if !self.first {
-                self.writer.write_all(b",")?;
-            }
-            serde_json::to_writer(&mut *self.writer, &commit)?;
-            self.first = false;
-        }
-        Ok(())
-    }
-}
-
-impl<W: Write> SnapshotCommitSink for JsonArrayCommitSink<'_, W> {
-    async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
-        self.pending.push(commit);
-        if self.pending.len() >= SNAPSHOT_JSON_COMMIT_BATCH_SIZE {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        self.flush()
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 struct SnapshotResourceKey {
     api_version: String,
@@ -487,7 +402,7 @@ fn live_resource_order(resource: &Resource) -> u8 {
     }
 }
 
-fn live_resource_commit(resource: &Resource) -> LogApplyCommit {
+pub(crate) fn live_resource_commit(resource: &Resource) -> LogApplyCommit {
     snapshot_commit_from_family(resource.resource_version, live_resource_mutation(resource))
 }
 
@@ -540,7 +455,11 @@ fn delete_mutation_from_watch_resource(resource: &Resource) -> ClusterMutation {
     }
 }
 
-fn watch_event_mutation(event_id: i64, resource: Resource, event_type: String) -> ClusterMutation {
+pub(crate) fn watch_event_mutation(
+    event_id: i64,
+    resource: Resource,
+    event_type: String,
+) -> ClusterMutation {
     ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(LogApplyWatchEventRow {
         event_id: Some(event_id),
         api_version: resource.api_version,
@@ -583,7 +502,9 @@ fn cluster_network_mutation_from_dataplane(
     ))
 }
 
-fn cluster_pod_cleanup_mutation_from_intent(intent: PodCleanupIntent) -> ClusterMutation {
+pub(crate) fn cluster_pod_cleanup_mutation_from_intent(
+    intent: PodCleanupIntent,
+) -> ClusterMutation {
     ClusterMutation::PodCleanup(PodCleanupMutation::PutPodCleanupIntent(intent.into()))
 }
 
@@ -1690,8 +1611,7 @@ mod tests {
         use crate::replication::grpc::{
             generated, log_apply_commit_from_proto, log_apply_commit_to_proto,
         };
-        use crate::replication::snapshot::SnapshotCommitSink;
-        use crate::replication::snapshot_commit_channel_sink::SnapshotCommitChannelSink;
+        use crate::replication::test_proto_channel_sink::TestProtoChannelSink;
         use tokio::sync::mpsc;
 
         for (case, n_resources, n_outbox) in [
@@ -1754,11 +1674,11 @@ mod tests {
                 mpsc::channel::<Result<generated::ReplicationEntry, tonic::Status>>(64);
             let mut streamed_protos: Vec<generated::ReplicationEntry> = Vec::new();
             let producer = async {
-                let mut sink = SnapshotCommitChannelSink::new(tx);
-                crate::replication::snapshot::stream_snapshot_commits(&leader, 0, &mut sink)
+                let mut sink = TestProtoChannelSink::new(tx);
+                crate::datastore::snapshot_export::stream_snapshot_commits(&leader, 0, &mut sink)
                     .await
                     .unwrap();
-                sink.finish().unwrap();
+                sink.finish();
             };
             let consumer = async {
                 while let Some(item) = rx.recv().await {

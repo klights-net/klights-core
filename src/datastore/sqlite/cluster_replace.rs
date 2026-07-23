@@ -743,7 +743,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             }
             if let Some(mut row) = outbox_template {
                 row.applied_rv = None;
-                row.result_proto = crate::datastore::command::encode_response_protobuf(
+                row.result_proto = crate::storage_wire_codec::encode_response_protobuf(
                     &crate::datastore::command::StorageResponse::Error {
                         message: message.clone(),
                     },
@@ -1153,14 +1153,14 @@ fn stamp_provisional_resource_version_in_tx(
                 }
                 if row.result_proto.is_empty()
                     || (is_committed_apply_v1
-                        && crate::datastore::command::decode_response_protobuf(&row.result_proto)
+                        && crate::storage_wire_codec::decode_response_protobuf(&row.result_proto)
                             .is_ok_and(|response| {
                                 matches!(
                                     response,
                                     crate::datastore::command::StorageResponse::Ack { .. }
                                 )
                             }))
-                    || crate::datastore::command::decode_response_protobuf(&row.result_proto)
+                    || crate::storage_wire_codec::decode_response_protobuf(&row.result_proto)
                         .is_ok_and(|response| {
                             matches!(
                                 response,
@@ -1170,7 +1170,7 @@ fn stamp_provisional_resource_version_in_tx(
                             )
                         })
                 {
-                    row.result_proto = crate::datastore::command::encode_response_protobuf(
+                    row.result_proto = crate::storage_wire_codec::encode_response_protobuf(
                         &crate::datastore::command::StorageResponse::Ack {
                             resource_version: rv,
                         },
@@ -1213,7 +1213,7 @@ fn is_uncommitted_outbox_placeholder(row: &AppliedOutboxRecord) -> bool {
 fn storage_result_from_applied_outbox(
     row: &AppliedOutboxRecord,
 ) -> tokio_rusqlite::Result<crate::datastore::raft::types::StorageCommandResult> {
-    match crate::datastore::command::decode_response_protobuf(&row.result_proto) {
+    match crate::storage_wire_codec::decode_response_protobuf(&row.result_proto) {
         Ok(crate::datastore::command::StorageResponse::Error { message }) => {
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
@@ -1406,7 +1406,7 @@ mod tests {
                     operation: "PodStatus".to_string(),
                     first_seen_ms: status_stamp,
                     applied_rv: None,
-                    result_proto: crate::datastore::command::encode_response_protobuf(
+                    result_proto: crate::storage_wire_codec::encode_response_protobuf(
                         &crate::datastore::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
@@ -1488,7 +1488,7 @@ mod tests {
     }
 
     fn applied_outbox_ack_rv(row: &AppliedOutboxRecord) -> i64 {
-        match crate::datastore::command::decode_response_protobuf(&row.result_proto)
+        match crate::storage_wire_codec::decode_response_protobuf(&row.result_proto)
             .expect("decode applied-outbox response")
         {
             crate::datastore::command::StorageResponse::Ack { resource_version } => {
@@ -2460,7 +2460,7 @@ mod tests {
             operation: "PodStatus".to_string(),
             first_seen_ms: 1,
             applied_rv: None,
-            result_proto: crate::datastore::command::encode_response_protobuf(
+            result_proto: crate::storage_wire_codec::encode_response_protobuf(
                 &crate::datastore::command::StorageResponse::Ack {
                     resource_version: 0,
                 },
@@ -2518,7 +2518,7 @@ mod tests {
                 operation: "PodStatus".to_string(),
                 first_seen_ms: 1,
                 applied_rv: None,
-                result_proto: crate::datastore::command::encode_response_protobuf(
+                result_proto: crate::storage_wire_codec::encode_response_protobuf(
                     &crate::datastore::command::StorageResponse::Ack {
                         resource_version: 0,
                     },
@@ -2575,7 +2575,7 @@ mod tests {
             .unwrap()
             .expect("terminal decision ledger row");
         assert!(matches!(
-            crate::datastore::command::decode_response_protobuf(&terminal_row.result_proto),
+            crate::storage_wire_codec::decode_response_protobuf(&terminal_row.result_proto),
             Ok(crate::datastore::command::StorageResponse::Error { .. })
         ));
 
@@ -5091,7 +5091,7 @@ mod tests {
                     operation: "Create".to_string(),
                     first_seen_ms: 1,
                     applied_rv: None,
-                    result_proto: crate::datastore::command::encode_response_protobuf(
+                    result_proto: crate::storage_wire_codec::encode_response_protobuf(
                         &crate::datastore::command::StorageResponse::Ack {
                             resource_version: 0,
                         },

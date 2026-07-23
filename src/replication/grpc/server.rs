@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use futures::stream::BoxStream;
-use klights_leader_api::LeaderWatch as _;
+use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand, WatchReplayPosition};
+use klights_leader_api::OutboxDeliveryResult;
 use klights_node_api::{
     ExecStreamChannel, ExecTerminalError, NodeExecFrame, NodeExecSyncResult, NodeLogEvent,
     NodeLogTerminalError, NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample,
@@ -11,20 +12,20 @@ use std::sync::Arc;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, metadata::MetadataMap};
 
+#[cfg(test)]
 use crate::controller_dispatcher::ControllerDispatcher;
 #[cfg(test)]
 use crate::datastore::WatchTarget;
 #[cfg(test)]
+use crate::datastore::backend::DatastoreHandle;
+#[cfg(test)]
 use crate::datastore::backend::WatchReplayAnchorStore;
-use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 #[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{ResourcePreconditions, WatchReplayPosition};
-use crate::kubelet::pod_repository::store::PodStore;
-use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+#[cfg(test)]
+#[cfg(test)]
 #[cfg(test)]
 use crate::replication::grpc::watch_replay_expired_status;
 use crate::replication::grpc::{
@@ -39,11 +40,12 @@ use crate::replication::protocol::{
 use crate::replication::service::{
     FollowerCompletionContext, NodeOperationKind, ReplicationService,
 };
-use crate::replication::snapshot::SnapshotCommitSink;
 #[cfg(test)]
 use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
+#[cfg(not(test))]
+use super::ca_files::ReplicationRuntimeFiles;
 
 const MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS: i64 = 100;
 
@@ -76,17 +78,19 @@ where
     Ok((signal_rx, replay_position))
 }
 
-pub fn validate_join_metadata(join: &generated::JoinRequest) -> Result<DataplanePeerMetadata> {
+pub fn validate_join_metadata(
+    join: &generated::JoinRequest,
+) -> Result<klights_leader_api::NetworkDataplane> {
     validate_join_metadata_with_endpoint(join, None)
 }
 
 fn observed_or_advertised_dataplane_endpoint(
     endpoint_override: Option<IpAddr>,
     advertised_endpoint: &str,
-) -> Option<String> {
+) -> Result<IpAddr> {
     endpoint_override
-        .map(|ip| ip.to_string())
-        .or_else(|| Some(advertised_endpoint.to_string()).filter(|value| !value.trim().is_empty()))
+        .or_else(|| advertised_endpoint.trim().parse().ok())
+        .ok_or_else(|| anyhow!("dataplane endpoint must be a canonical IP address"))
 }
 
 fn dataplane_port_from_u32(port: u32) -> Result<Option<u16>> {
@@ -96,6 +100,46 @@ fn dataplane_port_from_u32(port: u32) -> Result<Option<u16>> {
         Ok(Some(
             u16::try_from(port).map_err(|_| anyhow!("dataplane port exceeds u16"))?,
         ))
+    }
+}
+
+fn parse_dataplane_mode(raw: &str) -> Result<klights_leader_api::NetworkNodeMode> {
+    match raw {
+        "root" => Ok(klights_leader_api::NetworkNodeMode::Root),
+        "rootless" => Ok(klights_leader_api::NetworkNodeMode::Rootless),
+        other => Err(anyhow!("unsupported dataplane mode {other:?}")),
+    }
+}
+
+fn parse_dataplane_encryption(raw: &str) -> Result<klights_leader_api::DataplaneEncryption> {
+    match raw {
+        "" | "enabled" | "wireguard" => Ok(klights_leader_api::DataplaneEncryption::WireGuard),
+        "disabled" | "direct" => Ok(klights_leader_api::DataplaneEncryption::Direct),
+        other => Err(anyhow!("unsupported dataplane encryption {other:?}")),
+    }
+}
+
+fn node_subnet_allocation_status(error: klights_leader_api::NodeSubnetAllocationError) -> Status {
+    use klights_leader_api::NodeSubnetAllocationError;
+
+    match error {
+        NodeSubnetAllocationError::InvalidRequest { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        NodeSubnetAllocationError::NotLeader => Status::failed_precondition("not raft leader"),
+        NodeSubnetAllocationError::Unauthorized { .. } => {
+            Status::permission_denied(error.to_string())
+        }
+        NodeSubnetAllocationError::Conflict { .. } => Status::already_exists(error.to_string()),
+        NodeSubnetAllocationError::Exhausted { .. } => {
+            Status::resource_exhausted(error.to_string())
+        }
+        NodeSubnetAllocationError::Timeout => Status::deadline_exceeded(error.to_string()),
+        NodeSubnetAllocationError::Cancelled => Status::cancelled(error.to_string()),
+        NodeSubnetAllocationError::AllocationFailed { .. }
+        | NodeSubnetAllocationError::CorruptResponse { .. } => Status::internal(error.to_string()),
+        NodeSubnetAllocationError::Retryable { .. } => Status::unavailable(error.to_string()),
+        _ => Status::internal(error.to_string()),
     }
 }
 
@@ -118,48 +162,54 @@ fn validate_node_lease_renew_time_skew(
 fn validate_join_metadata_with_endpoint(
     join: &generated::JoinRequest,
     endpoint_override: Option<IpAddr>,
-) -> Result<DataplanePeerMetadata> {
-    let mode = DataplaneMode::parse(&join.dataplane_mode)?;
-    let encryption = DataplaneEncryption::parse(Some(&join.dataplane_encryption))?;
+) -> Result<klights_leader_api::NetworkDataplane> {
+    let mode = parse_dataplane_mode(&join.dataplane_mode)?;
+    let encryption = parse_dataplane_encryption(&join.dataplane_encryption)?;
     let port = dataplane_port_from_u32(join.dataplane_port)?;
     let endpoint =
-        observed_or_advertised_dataplane_endpoint(endpoint_override, &join.dataplane_endpoint);
-    DataplanePeerMetadata::try_new(
+        observed_or_advertised_dataplane_endpoint(endpoint_override, &join.dataplane_endpoint)?;
+    let public_key =
+        Some(join.dataplane_public_key.clone()).filter(|value| !value.trim().is_empty());
+    Ok(klights_leader_api::NetworkDataplane::try_new(
         join.node_name.clone(),
         mode,
         encryption,
-        Some(join.dataplane_public_key.clone()).filter(|value| !value.trim().is_empty()),
+        public_key.as_deref(),
         endpoint,
         port,
-    )
+    )?)
 }
 
 fn validate_controlplane_join_dataplane_metadata_with_endpoint(
     join: &generated::JoinAsControlplaneRequest,
     endpoint_override: Option<IpAddr>,
-) -> Result<DataplanePeerMetadata> {
-    let mode = DataplaneMode::parse(&join.dataplane_mode)?;
-    let encryption = DataplaneEncryption::parse(Some(&join.dataplane_encryption))?;
+) -> Result<klights_leader_api::NetworkDataplane> {
+    let mode = parse_dataplane_mode(&join.dataplane_mode)?;
+    let encryption = parse_dataplane_encryption(&join.dataplane_encryption)?;
     let port = dataplane_port_from_u32(join.dataplane_port)?;
     let endpoint =
-        observed_or_advertised_dataplane_endpoint(endpoint_override, &join.dataplane_endpoint);
-    DataplanePeerMetadata::try_new(
+        observed_or_advertised_dataplane_endpoint(endpoint_override, &join.dataplane_endpoint)?;
+    let public_key =
+        Some(join.dataplane_public_key.clone()).filter(|value| !value.trim().is_empty());
+    Ok(klights_leader_api::NetworkDataplane::try_new(
         join.node_name.clone(),
         mode,
         encryption,
-        Some(join.dataplane_public_key.clone()).filter(|value| !value.trim().is_empty()),
+        public_key.as_deref(),
         endpoint,
         port,
-    )
+    )?)
 }
 
 fn validate_controlplane_node_registration(
     registration: generated::NodeRegistrationSnapshot,
 ) -> Result<crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot> {
-    let node_mode =
-        crate::controllers::annotations::parse_node_peer_mode(Some(&registration.node_mode))
-            .map_err(|err| anyhow!(err))?;
-    let host = crate::kubelet::node::NodeRegistrationHostFacts {
+    let node_mode = match registration.node_mode.as_str() {
+        "root" => crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
+        "rootless" => crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless,
+        other => return Err(anyhow!("unsupported node registration mode {other:?}")),
+    };
+    let host = crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
         cpu_count: registration.cpu_count,
         memory_ki: registration.memory_ki,
         architecture: registration.architecture,
@@ -236,16 +286,61 @@ pub fn insert_tonic_tcp_connect_info<B>(
 /// materializes a `Vec` at all, so no cache is held on the server struct.
 /// The `SnapshotCache` type itself is kept (in `snapshot_cache.rs`) for its
 /// unit tests and any future callers that want the Arc-sharing semantics.
+#[derive(Clone)]
+pub(crate) struct ReplicationServerPorts {
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    projected_token: Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>,
+    pod_cleanup: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    node_lease: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
+    node_subnet: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    topology_query: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+    topology_command: Arc<dyn klights_leader_api::LeaderNetworkTopologyCommand>,
+    authenticated_outbox: Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
+}
+
+impl ReplicationServerPorts {
+    pub(crate) fn from_shared<T>(shared: Arc<T>) -> Self
+    where
+        T: klights_leader_api::LeaderResourceQuery
+            + klights_leader_api::LeaderResourceCommand
+            + klights_leader_api::LeaderWatch
+            + klights_leader_api::LeaderProjectedServiceAccountToken
+            + klights_leader_api::LeaderPodCleanupIntents
+            + klights_leader_api::LeaderNodeLeaseRenewal
+            + klights_leader_api::LeaderNodeSubnetAllocation
+            + klights_leader_api::LeaderNetworkTopologyQuery
+            + klights_leader_api::LeaderNetworkTopologyCommand
+            + klights_leader_api::LeaderAuthenticatedOutboxDelivery
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            resource_query: shared.clone(),
+            resource_command: shared.clone(),
+            watch: shared.clone(),
+            projected_token: shared.clone(),
+            pod_cleanup: shared.clone(),
+            node_lease: shared.clone(),
+            node_subnet: shared.clone(),
+            topology_query: shared.clone(),
+            topology_command: shared.clone(),
+            authenticated_outbox: shared,
+        }
+    }
+}
+
 pub struct GrpcReplicationServer {
     service: Arc<ReplicationService>,
+    ports: ReplicationServerPorts,
+    #[cfg(test)]
     db: DatastoreHandle,
-    positioned_watch: klights_watch::PositionedWatchService,
-    pod_store: Arc<PodStore>,
-    controller_dispatcher: Option<Arc<ControllerDispatcher>>,
-    node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
+    authoritative_snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
     /// Phase 3 raft RPC dispatcher. Populated by the leader bootstrap
     /// (P3-11c) when raft mode is wired. When None, the three Raft
     /// RPCs respond with `RaftRpcRouterError::Disabled` so the client
@@ -271,24 +366,22 @@ pub struct GrpcReplicationServer {
 impl GrpcReplicationServer {
     fn from_parts(
         service: Arc<ReplicationService>,
-        db: DatastoreHandle,
-        controller_dispatcher: Option<Arc<ControllerDispatcher>>,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        ports: ReplicationServerPorts,
+        authoritative_snapshot_capture: Arc<
+            dyn klights_cluster_store::AuthoritativeSnapshotCapture,
+        >,
+        #[cfg(test)] db: DatastoreHandle,
     ) -> Self {
         let controlplane_ca_files = ControlplaneCaFiles::new(service.task_supervisor());
-        let pod_store = Arc::new(PodStore::new(db.clone()));
-        let positioned_watch =
-            crate::control_plane::client::local::datastore_positioned_watch_service(db.clone());
         Self {
             service,
+            ports,
+            #[cfg(test)]
             db,
-            positioned_watch,
-            pod_store,
-            controller_dispatcher,
-            node_lease_tracker,
             node_self_query: None,
             node_self_status: None,
             node_lifecycle_status: None,
+            authoritative_snapshot_capture,
             raft_rpc_router: None,
             controlplane_join_handler: None,
             controlplane_ca_files,
@@ -329,43 +422,85 @@ impl GrpcReplicationServer {
         self
     }
 
+    #[cfg(not(test))]
+    pub(crate) fn new_with_ports(
+        service: Arc<ReplicationService>,
+        ports: ReplicationServerPorts,
+        authoritative_snapshot_capture: Arc<
+            dyn klights_cluster_store::AuthoritativeSnapshotCapture,
+        >,
+    ) -> Self {
+        Self::from_parts(service, ports, authoritative_snapshot_capture)
+    }
+
+    #[cfg(test)]
     pub fn new(service: Arc<ReplicationService>, db: DatastoreHandle) -> Self {
-        Self::from_parts(
+        Self::new_test(
             service,
             db,
-            None,
             Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            None,
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_controller_dispatcher(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
         controller_dispatcher: Arc<ControllerDispatcher>,
     ) -> Self {
-        Self::from_parts(
+        Self::new_test(
             service,
             db,
-            Some(controller_dispatcher),
             Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            Some(controller_dispatcher),
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_node_lease_tracker(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     ) -> Self {
-        Self::from_parts(service, db, None, node_lease_tracker)
+        Self::new_test(service, db, node_lease_tracker, None)
     }
 
+    #[cfg(test)]
     pub fn new_with_controller_dispatcher_and_node_lease_tracker(
         service: Arc<ReplicationService>,
         db: DatastoreHandle,
         controller_dispatcher: Arc<ControllerDispatcher>,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     ) -> Self {
-        Self::from_parts(service, db, Some(controller_dispatcher), node_lease_tracker)
+        Self::new_test(service, db, node_lease_tracker, Some(controller_dispatcher))
+    }
+
+    #[cfg(test)]
+    fn new_test(
+        service: Arc<ReplicationService>,
+        db: DatastoreHandle,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        controller_dispatcher: Option<Arc<ControllerDispatcher>>,
+    ) -> Self {
+        let local = Arc::new(
+            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
+                db.clone(),
+                "grpc-test".to_string(),
+                node_lease_tracker,
+                crate::control_plane::client::local::always_leader_watch(),
+            ),
+        );
+        if let Some(dispatcher) = controller_dispatcher {
+            local.set_controller_dispatcher(dispatcher);
+        }
+        let ports = ReplicationServerPorts::from_shared(local);
+        let capture = Arc::new(
+            crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new_capture(
+                db.clone(),
+            ),
+        );
+        Self::from_parts(service, ports, capture, db)
     }
 
     /// P3-11b: attach a Raft RPC dispatcher so this server can handle
@@ -392,21 +527,22 @@ impl GrpcReplicationServer {
     }
 
     /// Set the containerd namespace for locating CA cert/key files.
+    #[cfg(test)]
     pub fn with_namespace(mut self, namespace: &str) -> Self {
         self.controlplane_ca_files.set_namespace(namespace);
         self
     }
 
+    #[cfg(not(test))]
+    pub(crate) fn with_runtime_files(mut self, files: ReplicationRuntimeFiles) -> Self {
+        self.controlplane_ca_files.set_files(files);
+        self
+    }
+
     async fn service_account_signing_key_pem(&self) -> std::result::Result<String, Status> {
-        let namespace = self.controlplane_ca_files.containerd_namespace()?;
-        let supervisor = self.service.task_supervisor();
-        crate::auth::read_service_account_signing_key_supervised(namespace, supervisor.as_ref())
+        self.controlplane_ca_files
+            .service_account_signing_key_pem()
             .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "ServiceAccount signing key not available: {err:#}"
-                ))
-            })
     }
 
     pub fn with_leader_gate(mut self, is_leader_rx: tokio::sync::watch::Receiver<bool>) -> Self {
@@ -529,12 +665,9 @@ impl GrpcReplicationServer {
             .ok_or_else(|| Status::unauthenticated("missing replication bootstrap token"))?
             .to_str()
             .map_err(|_| Status::unauthenticated("invalid replication bootstrap token metadata"))?;
-        crate::bootstrap::bootstrap_token::validate_bootstrap_token_for_scope(
-            self.db.as_ref(),
-            supplied,
-            crate::bootstrap::bootstrap_token::BootstrapTokenScope::Controlplane,
-        )
-        .await
+        self.service
+            .validate_controlplane_bootstrap_token(supplied)
+            .await
         .map_err(|err| {
             tracing::warn!(error = %err, "invalid controlplane bootstrap token for gRPC unary auth");
             Status::unauthenticated(format!("invalid controlplane bootstrap token: {err}"))
@@ -664,31 +797,22 @@ fn enforce_node_authority(
     }
 }
 
-async fn consume_terminal_outbox_sequence_for_rpc(
-    db: &dyn crate::datastore::DatastoreBackend,
-    idempotency_key: &str,
-    operation: crate::kubelet::outbox::payload::OutboxOperation,
-    authenticated_node: &str,
-    watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-) -> std::result::Result<(), Status> {
-    crate::control_plane::client::apply::consume_terminal_outbox_sequence(
-        db,
-        idempotency_key,
-        operation,
-        authenticated_node,
-        watermark,
-    )
-    .await
-    .map_err(|error| {
-        Status::unavailable(format!(
-            "failed to durably consume terminal outbox sequence: {error}"
-        ))
-    })
-}
-
 fn apply_outbox_error_response(
     error: klights_leader_api::OutboxDeliveryError,
 ) -> Response<generated::ApplyOutboxResponse> {
+    let error = match error {
+        klights_leader_api::OutboxDeliveryError::ConflictTerminal(message)
+            if message
+                .to_ascii_lowercase()
+                .contains("uid precondition failed") =>
+        {
+            klights_leader_api::OutboxDeliveryError::UidMismatch {
+                expected: "<unknown>".to_string(),
+                actual: "<unknown>".to_string(),
+            }
+        }
+        other => other,
+    };
     let error_type = match &error {
         klights_leader_api::OutboxDeliveryError::Retryable(_) => "Retryable",
         klights_leader_api::OutboxDeliveryError::NotFound(_) => "NotFound",
@@ -709,6 +833,69 @@ fn apply_outbox_error_response(
     })
 }
 
+fn snapshot_persistence_status(error: klights_cluster_store::SnapshotPersistenceError) -> Status {
+    match error {
+        klights_cluster_store::SnapshotPersistenceError::Cancelled => {
+            Status::cancelled(error.to_string())
+        }
+        klights_cluster_store::SnapshotPersistenceError::Timeout => {
+            Status::deadline_exceeded(error.to_string())
+        }
+        klights_cluster_store::SnapshotPersistenceError::Retryable { .. } => {
+            Status::unavailable(error.to_string())
+        }
+        klights_cluster_store::SnapshotPersistenceError::ResourceExhausted { .. } => {
+            Status::resource_exhausted(error.to_string())
+        }
+        klights_cluster_store::SnapshotPersistenceError::CorruptData { .. }
+        | klights_cluster_store::SnapshotPersistenceError::InvalidSnapshot { .. } => {
+            Status::data_loss(error.to_string())
+        }
+        klights_cluster_store::SnapshotPersistenceError::UnsupportedMode { .. } => {
+            Status::unimplemented(error.to_string())
+        }
+        klights_cluster_store::SnapshotPersistenceError::PersistenceFailed { .. } => {
+            Status::internal(error.to_string())
+        }
+        _ => Status::internal(error.to_string()),
+    }
+}
+
+fn legacy_snapshot_commits(
+    current_rv: i64,
+    page: klights_cluster_store::SnapshotCapturePage,
+) -> Vec<crate::log_apply::LogApplyCommit> {
+    use klights_cluster_store::SnapshotCapturePageKind;
+    match page.kind() {
+        SnapshotCapturePageKind::Commits => page.into_commits().expect("page kind checked"),
+        SnapshotCapturePageKind::AppliedOutbox => page
+            .into_applied_outbox()
+            .expect("page kind checked")
+            .into_iter()
+            .map(|row| {
+                crate::log_apply::LogApplyCommit::new(
+                    current_rv,
+                    vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)],
+                )
+            })
+            .collect(),
+        SnapshotCapturePageKind::OutboxWatermarks => page
+            .into_outbox_watermarks()
+            .expect("page kind checked")
+            .into_iter()
+            .map(|outbox_watermark| crate::log_apply::LogApplyCommit {
+                resource_version: current_rv,
+                resource_version_assignment:
+                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                outbox_watermark: Some(outbox_watermark),
+                mutations: Vec::new(),
+            })
+            .collect(),
+        SnapshotCapturePageKind::ReplayFloors => Vec::new(),
+    }
+}
+
+#[cfg(test)]
 pub fn mount_service(
     app: axum::Router,
     service: Arc<ReplicationService>,
@@ -718,6 +905,7 @@ pub fn mount_service(
     mount_service_with_controller_dispatcher(app, service, db, None, None, transport_policy)
 }
 
+#[cfg(test)]
 pub fn mount_service_with_controller_dispatcher(
     app: axum::Router,
     service: Arc<ReplicationService>,
@@ -749,6 +937,7 @@ pub fn mount_service_with_controller_dispatcher(
 /// None this is functionally equivalent to
 /// `mount_service_with_controller_dispatcher`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn mount_service_full(
     app: axum::Router,
     service: Arc<ReplicationService>,
@@ -792,6 +981,7 @@ pub fn mount_service_full(
 /// the leader). The over-limit rejection is exercised by
 /// `server_rejects_request_over_policy_message_limit`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn mount_service_full_with_policy(
     app: axum::Router,
     service: Arc<ReplicationService>,
@@ -834,6 +1024,76 @@ pub fn mount_service_full_with_policy(
     grpc = grpc
         .with_namespace(containerd_namespace)
         .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
+    if let Some(is_leader_rx) = is_leader_rx {
+        grpc = grpc.with_leader_gate(is_leader_rx);
+    }
+    if let Some(local_node_name) = local_node_name {
+        grpc = grpc.with_local_node_name(local_node_name);
+    }
+    if let Some(query) = node_self_query {
+        grpc = grpc.with_node_query(query);
+    }
+    if let Some(status) = node_self_status {
+        grpc = grpc.with_node_self_status(status);
+    }
+    if let Some(status) = node_lifecycle_status {
+        grpc = grpc.with_node_lifecycle_status(status);
+    }
+    if let Some(router) = raft_rpc_router {
+        grpc = grpc.with_raft_rpc_router(router);
+    }
+    if let Some(handler) = controlplane_join_handler {
+        grpc = grpc.with_controlplane_join_handler(handler);
+    }
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(crate::replication::grpc::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .expect("failed to build replication gRPC reflection service");
+    let max_message_bytes = transport_policy.max_message_bytes;
+    let grpc_router = tonic::service::Routes::new(
+        generated::replication_server::ReplicationServer::new(grpc)
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes),
+    )
+    .add_service(reflection)
+    .into_axum_router();
+    app.route(
+        "/klights.replication.Replication/{*method}",
+        axum::routing::any_service(grpc_router.clone()),
+    )
+    .route(
+        "/grpc.reflection.v1.ServerReflection/{*method}",
+        axum::routing::any_service(grpc_router.clone()),
+    )
+    .route(
+        "/grpc.reflection.v1alpha.ServerReflection/{*method}",
+        axum::routing::any_service(grpc_router),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(test))]
+pub(crate) fn mount_service_full(
+    app: axum::Router,
+    service: Arc<ReplicationService>,
+    ports: ReplicationServerPorts,
+    authoritative_snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
+    raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
+    controlplane_join_handler: Option<
+        Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
+    >,
+    runtime_files: ReplicationRuntimeFiles,
+    is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    local_node_name: Option<String>,
+    node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+    node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
+    node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
+    transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
+) -> axum::Router {
+    let mut grpc =
+        GrpcReplicationServer::new_with_ports(service, ports, authoritative_snapshot_capture)
+            .with_runtime_files(runtime_files)
+            .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
     if let Some(is_leader_rx) = is_leader_rx {
         grpc = grpc.with_leader_gate(is_leader_rx);
     }
@@ -945,43 +1205,33 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
         let accepted = matches!(response, JoinResponse::Accepted { .. });
         if accepted {
-            self.db
-                .update_node_dataplane(dataplane.clone())
+            self.ports
+                .topology_command
+                .register_node_dataplane(dataplane.clone())
                 .await
-                .map_err(|err| Status::internal(err.to_string()))?;
+                .map_err(|err| Status::unavailable(err.to_string()))?;
             if let (Some(query), Some(status)) = (
                 self.node_self_query.as_deref(),
                 self.node_lifecycle_status.as_deref(),
             ) {
-                refresh_joining_node_from_dataplane(self.db.as_ref(), query, status, &dataplane)
-                    .await
-                    .map_err(|err| Status::internal(err.to_string()))?;
-            } else {
-                refresh_node_routing_metadata_from_dataplane(self.db.as_ref(), &dataplane)
+                publish_joining_node_external_ip(query, status, &dataplane)
                     .await
                     .map_err(|err| Status::internal(err.to_string()))?;
             }
         }
-        let joined_node_name = dataplane.node_name.clone();
+        let joined_node_name = dataplane.node_name().to_string();
         let (mut control_rx, follower_session) = if accepted {
             let (rx, session) = self.service.register_follower(dataplane.clone()).await;
             (Some(rx), Some(session))
         } else {
             (None, None)
         };
-        let first_response = join_response_to_proto(self.db.as_ref(), response).await?;
+        let first_response =
+            join_response_to_proto(self.ports.topology_query.as_ref(), response).await?;
         let service = self.service.clone();
-        // T6: `db` and `controller_dispatcher` were captured by the
-        // legacy Forward handler. The handler is gone; the stream now
-        // only relays Ack / NodeExec / PodLog messages, none of which
-        // need the leader datastore here. Keep the underscore-bound
-        // names so future Raft work has a tap-in point.
-        let db_for_observed_endpoint = self.db.clone();
         let local_node_name_for_observed_endpoint = self.local_node_name.clone();
         let node_self_query_for_observed_endpoint = self.node_self_query.clone();
         let node_self_status_for_observed_endpoint = self.node_self_status.clone();
-        let _db = self.db.clone();
-        let _controller_dispatcher = self.controller_dispatcher.clone();
         let mut entries = if accepted {
             Some(
                 service
@@ -1001,7 +1251,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             });
             if accepted {
                 if let Some(local_node_name) = local_node_name_for_observed_endpoint.as_deref() {
-                    match node_has_external_ip(db_for_observed_endpoint.as_ref(), local_node_name).await {
+                    let Some(query) = node_self_query_for_observed_endpoint.as_deref() else {
+                        yield Err(Status::failed_precondition("local Node query capability is unavailable"));
+                        return;
+                    };
+                    match node_has_external_ip(query, local_node_name).await {
                         Ok(false) => {
                             yield Ok(generated::LeaderMessage {
                                 payload: Some(
@@ -1208,68 +1462,39 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::SnapshotRequest>,
     ) -> std::result::Result<Response<Self::SnapshotStream>, Status> {
         self.require_steady_state_auth(&request).await?;
-        let last_applied_rv = request.into_inner().last_applied_rv;
-        let db = self.db.clone();
+        let _last_applied_rv = request.into_inner().last_applied_rv;
+        let capture = self.authoritative_snapshot_capture.clone();
 
-        // memory-improvement.md §10 P1: stream the snapshot straight to the
-        // wire instead of materializing it into one `Arc<Vec<LogApplyCommit>>`.
-        // The producer drives `emit_snapshot_commits` (which keyset-pages
-        // watch_events) and pushes each commit's protobuf into a bounded
-        // channel; the stream yields from that channel.
-        //
-        // The producer and consumer run COOPERATIVELY on this one stream
-        // future (no spawn): `select!` races the bounded-channel recv against
-        // the producer so that when the channel fills up the producer awaits
-        // while the consumer drains — that backpressure is what bounds peak
-        // resident memory to O(channel capacity + page size), not O(rows).
         let stream = async_stream::stream! {
-            const SNAPSHOT_STREAM_CHANNEL_CAPACITY: usize = 256;
-            let (tx, mut rx) = mpsc::channel::<
-                std::result::Result<generated::ReplicationEntry, Status>,
-            >(SNAPSHOT_STREAM_CHANNEL_CAPACITY);
-            let err_tx = tx.clone();
-            let producer = async move {
-                let mut sink = crate::replication::snapshot_commit_channel_sink::SnapshotCommitChannelSink::new(tx);
-                let result = crate::replication::snapshot::stream_snapshot_commits(
-                    db.as_ref(),
-                    last_applied_rv,
-                    &mut sink,
-                )
-                .await;
-                if let Err(err) = result {
-                    // Surface the generation error as a terminal stream item,
-                    // then close the channel via finish().
-                    let _ = err_tx
-                        .send(Err(Status::internal(err.to_string())))
-                        .await;
+            let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
+                klights_cluster_store::SnapshotPageLimit::try_new(
+                    klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE,
+                ).expect("snapshot maximum is valid"),
+                std::time::Duration::from_secs(30),
+            ).expect("snapshot request is valid");
+            let mut session = match capture.begin_capture(request).await {
+                Ok(session) => session,
+                Err(error) => {
+                    yield Err(snapshot_persistence_status(error));
+                    return;
                 }
-                let _ = sink.finish();
             };
-            tokio::pin!(producer);
-            let mut producer_done = false;
+            let current_rv = session.header().position().resource_version;
             loop {
-                if producer_done {
-                    match rx.recv().await {
-                        Some(Ok(proto)) => yield Ok(proto),
-                        Some(Err(status)) => {
-                            yield Err(status);
-                            return;
-                        }
-                        None => return,
+                let page = match session.next_page().await {
+                    Ok(Some(page)) => page,
+                    Ok(None) => return,
+                    Err(error) => {
+                        yield Err(snapshot_persistence_status(error));
+                        return;
                     }
-                } else {
-                    tokio::select! {
-                        biased;
-                        item = rx.recv() => match item {
-                            Some(Ok(proto)) => yield Ok(proto),
-                            Some(Err(status)) => {
-                                yield Err(status);
-                                return;
-                            }
-                            None => return,
-                        },
-                        _ = &mut producer => {
-                            producer_done = true;
+                };
+                for commit in legacy_snapshot_commits(current_rv, page) {
+                    match crate::replication::grpc::log_apply_commit_to_proto(&commit) {
+                        Ok(proto) => yield Ok(proto),
+                        Err(error) => {
+                            yield Err(Status::internal(error.to_string()));
+                            return;
                         }
                     }
                 }
@@ -1311,17 +1536,12 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             klights_leader_api::ResourceQueryConsistency::LeaderFresh,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let key = query.key();
         let resource = self
-            .db
-            .get_resource(
-                &key.api_version,
-                &key.kind,
-                key.namespace.as_deref(),
-                &key.name,
-            )
+            .ports
+            .resource_query
+            .get_resource(query)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::unavailable(err.to_string()))?;
         Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         Ok(Response::new(match resource {
             Some(resource) => generated::GetResourceResponse {
@@ -1354,32 +1574,22 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let list = self
-            .db
-            .list_resources(
-                query.api_version(),
-                query.kind(),
-                query.namespace(),
-                crate::datastore::ResourceListQuery::new(
-                    query.label_selector(),
-                    query.field_selector(),
-                    query.limit(),
-                    query.continue_token(),
-                ),
-            )
+            .ports
+            .resource_query
+            .list_resources(query)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::unavailable(err.to_string()))?;
         Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
-        let items: Vec<generated::ResourceObject> =
-            list.items.iter().map(resource_to_proto).collect();
+        let (items, resource_version, watch_replay_position, continue_token, remaining_item_count) =
+            list.into_parts();
+        let items: Vec<generated::ResourceObject> = items.iter().map(resource_to_proto).collect();
         Ok(Response::new(generated::ListResourcesResponse {
+            total: items.len() as i64,
             items,
-            total: list.items.len() as i64,
-            continue_token: list.continue_token,
-            resource_version: list.resource_version,
-            remaining_item_count: list.remaining_item_count,
-            watch_replay_position: list
-                .watch_replay_position
-                .map(watch_replay_position_to_proto),
+            continue_token,
+            resource_version,
+            remaining_item_count,
+            watch_replay_position: watch_replay_position.map(watch_replay_position_to_proto),
         }))
     }
 
@@ -1392,11 +1602,12 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let request = resource_command_request_from_proto(request.into_inner())
             .map_err(resource_command_status)?;
-        let result = crate::control_plane::client::local::submit_resource_command_to_store(
-            &self.db, request,
-        )
-        .await
-        .map_err(resource_command_status)?;
+        let result = self
+            .ports
+            .resource_command
+            .submit_resource_command(request)
+            .await
+            .map_err(resource_command_status)?;
         Ok(Response::new(resource_command_result_to_proto(result)))
     }
 
@@ -1424,7 +1635,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
         if canonical_positioned_watch_enabled() {
             let positioned_stream = self
-                .positioned_watch
+                .ports
+                .watch
                 .watch_resources(watch_request)
                 .await
                 .map_err(leader_watch_error_to_status)?;
@@ -1670,14 +1882,10 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             )
             .map_err(projected_token_error_to_status)?;
         enforce_node_authority(&caller, token_request.bound_node_name())?;
-        let signing_key_pem = self.service_account_signing_key_pem().await?;
-        let token =
-            crate::control_plane::service_account_tokens::issue_projected_service_account_token(
-                self.db.as_ref(),
-                self.pod_store.as_ref(),
-                &signing_key_pem,
-                &token_request,
-            )
+        let token = self
+            .ports
+            .projected_token
+            .issue_projected_service_account_token(token_request)
             .await
             .map_err(projected_token_error_to_status)?;
         Ok(Response::new(
@@ -1717,201 +1925,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             req.stream_seq,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let (idempotency_key, delivery_operation, payload, client_id, stream_id, stream_seq) =
-            delivery_request.into_parts();
-        let operation = delivery_operation.into();
-        let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
-            &client_id, stream_id, stream_seq,
-        );
-        let payload = bytes::Bytes::from_owner(payload);
-        let decoded_payload =
-            match crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&payload) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    consume_terminal_outbox_sequence_for_rpc(
-                        self.db.as_ref(),
-                        &idempotency_key,
-                        operation,
-                        authenticated_node,
-                        watermark.clone(),
-                    )
-                    .await?;
-                    return Ok(apply_outbox_error_response(
-                        klights_leader_api::OutboxDeliveryError::invalid(
-                            "delivery.payload",
-                            format!("invalid outbox payload: {error}"),
-                        ),
-                    ));
-                }
-            };
-        if let Err(error) = crate::control_plane::client::apply::authorize_outbox_command(
-            delivery_operation,
-            &decoded_payload.command,
+        let request = klights_leader_api::AuthenticatedOutboxDeliveryRequest::try_new(
             authenticated_node,
-        ) {
-            consume_terminal_outbox_sequence_for_rpc(
-                self.db.as_ref(),
-                &idempotency_key,
-                operation,
-                authenticated_node,
-                watermark.clone(),
-            )
-            .await?;
-            return Ok(apply_outbox_error_response(error));
-        }
-        if delivery_operation == klights_leader_api::OutboxDeliveryOperation::PodMetadata
-            && let Err(error) =
-                crate::control_plane::client::apply::authorize_live_pod_metadata_command(
-                    self.db.as_ref(),
-                    &decoded_payload.command,
-                    authenticated_node,
-                )
-                .await
-        {
-            if error.is_terminal() {
-                consume_terminal_outbox_sequence_for_rpc(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation,
-                    authenticated_node,
-                    watermark.clone(),
-                )
-                .await?;
-                return Ok(apply_outbox_error_response(error));
-            }
-            return Err(Status::unavailable(error.to_string()));
-        }
-        if operation == crate::kubelet::outbox::payload::OutboxOperation::NodeStatus {
-            if let Err(error) = klights_leader_api::NodeSelfStatusRequest::validate_command(
-                &decoded_payload.command,
-            ) {
-                consume_terminal_outbox_sequence_for_rpc(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation,
-                    authenticated_node,
-                    watermark.clone(),
-                )
-                .await?;
-                return Ok(apply_outbox_error_response(
-                    klights_leader_api::OutboxDeliveryError::invalid(
-                        "delivery.payload",
-                        error.to_string(),
-                    ),
-                ));
-            }
-            let crate::datastore::command::StorageCommand::UpdateStatus {
-                name,
-                preconditions,
-                ..
-            } = &decoded_payload.command
-            else {
-                unreachable!("NodeSelfStatusRequest validation admits only UpdateStatus")
-            };
-            if name != authenticated_node {
-                consume_terminal_outbox_sequence_for_rpc(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation,
-                    authenticated_node,
-                    watermark.clone(),
-                )
-                .await?;
-                return Ok(apply_outbox_error_response(
-                    klights_leader_api::OutboxDeliveryError::conflict(format!(
-                        "node {} cannot publish Node status for {name}",
-                        authenticated_node
-                    )),
-                ));
-            }
-            let current = self
-                .db
-                .get_resource("v1", "Node", None, name)
-                .await
-                .map_err(|error| Status::unavailable(error.to_string()))?;
-            let Some(current) = current else {
-                consume_terminal_outbox_sequence_for_rpc(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation,
-                    authenticated_node,
-                    watermark.clone(),
-                )
-                .await?;
-                return Ok(apply_outbox_error_response(
-                    klights_leader_api::OutboxDeliveryError::not_found(format!(
-                        "v1/Node/{name} not found"
-                    )),
-                ));
-            };
-            if preconditions.uid.as_deref() != Some(current.uid.as_str()) {
-                consume_terminal_outbox_sequence_for_rpc(
-                    self.db.as_ref(),
-                    &idempotency_key,
-                    operation,
-                    authenticated_node,
-                    watermark.clone(),
-                )
-                .await?;
-                return Ok(apply_outbox_error_response(
-                    klights_leader_api::OutboxDeliveryError::uid_mismatch(
-                        preconditions.uid.clone().unwrap_or_default(),
-                        current.uid,
-                    ),
-                ));
-            }
-        }
-        let result =
-            crate::control_plane::client::apply::apply_outbox_to_local_leader_with_resource(
-                self.db.as_ref(),
-                &idempotency_key,
-                operation,
-                payload,
-                authenticated_node,
-                watermark,
-            )
+            delivery_request,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let result = self
+            .ports
+            .authenticated_outbox
+            .deliver_authenticated_outbox(request)
             .await;
         match result {
-            Ok(crate::control_plane::client::apply::LocalOutboxApply {
-                result: crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
-                resource,
-                command: Some(command),
-                pod_endpoint_effect,
-                ..
-            }) => {
-                let controller_dispatcher = self.controller_dispatcher.as_ref();
-                let gc_pod_delete_sink = if matches!(
-                    &command,
-                    crate::datastore::command::StorageCommand::DeleteResource {
-                        api_version,
-                        kind,
-                        ..
-                    } if api_version == "v1" && kind == "Pod"
-                ) {
-                    match controller_dispatcher {
-                        Some(dispatcher) => dispatcher.current_pod_repository().await,
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-                crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                    controller_dispatcher.map(|dispatcher| {
-                        dispatcher.as_ref()
-                            as &dyn klights_reconcile_api::ControllerReconcileSink
-                    }),
-                    controller_dispatcher.map(|dispatcher| {
-                        dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
-                    }),
-                    gc_pod_delete_sink.as_deref().map(|sink| {
-                        sink as &dyn klights_reconcile_api::GcPodDeleteSink
-                    }),
-                    &command,
-                    resource.as_ref(),
-                    pod_endpoint_effect,
-                    self.db.as_ref(),
-                )
-                .await;
+            Ok(OutboxDeliveryResult::Applied { applied_rv }) => {
                 Ok(Response::new(generated::ApplyOutboxResponse {
                     already_applied: false,
                     applied_rv,
@@ -1919,24 +1944,14 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     error_type: None,
                 }))
             }
-            Ok(crate::control_plane::client::apply::LocalOutboxApply {
-                result: crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
-                ..
-            }) => Ok(Response::new(generated::ApplyOutboxResponse {
-                already_applied: false,
-                applied_rv,
-                error: None,
-                error_type: None,
-            })),
-            Ok(crate::control_plane::client::apply::LocalOutboxApply {
-                result: crate::kubelet::outbox::OutboxApplyResult::AlreadyApplied { applied_rv },
-                ..
-            }) => Ok(Response::new(generated::ApplyOutboxResponse {
-                already_applied: true,
-                applied_rv: applied_rv.unwrap_or(0),
-                error: None,
-                error_type: None,
-            })),
+            Ok(OutboxDeliveryResult::AlreadyApplied { applied_rv }) => {
+                Ok(Response::new(generated::ApplyOutboxResponse {
+                    already_applied: true,
+                    applied_rv: applied_rv.unwrap_or(0),
+                    error: None,
+                    error_type: None,
+                }))
+            }
             Err(err) => Ok(apply_outbox_error_response(err)),
         }
     }
@@ -1957,23 +1972,17 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             ));
         }
         validate_node_lease_renew_time_skew(&req.renew_time, chrono::Utc::now())?;
-        self.node_lease_tracker
-            .record_from_lease_object(
-                &req.node_name,
-                &serde_json::json!({
-                    "metadata": {
-                        "name": req.node_name,
-                        "namespace": "kube-node-lease"
-                    },
-                    "spec": {
-                        "holderIdentity": req.node_name,
-                        "leaseDurationSeconds": req.lease_duration_seconds,
-                        "renewTime": req.renew_time
-                    }
-                }),
-            )
+        let renewal = klights_leader_api::NodeLeaseRenewalRequest::try_new(
+            req.node_name,
+            req.renew_time,
+            req.lease_duration_seconds,
+        )
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        self.ports
+            .node_lease
+            .renew_node_lease(renewal)
             .await
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+            .map_err(|err| Status::unavailable(err.to_string()))?;
         Ok(Response::new(generated::RenewNodeLeaseResponse {}))
     }
 
@@ -1992,23 +2001,15 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             &req.node_ip,
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let (node_name, cluster_cidr, node_ip) = focused_request.into_parts();
         let subnet = self
-            .db
-            .allocate_node_subnet(&node_name, &cluster_cidr, &node_ip.to_string())
+            .ports
+            .node_subnet
+            .allocate_node_subnet(focused_request)
             .await
-            .map_err(|error| {
-                let message = error.to_string();
-                if crate::control_plane::client::node_subnet_allocation_is_exhausted(&message) {
-                    Status::resource_exhausted(message)
-                } else if message.to_ascii_lowercase().contains("conflict") {
-                    Status::aborted(message)
-                } else {
-                    Status::internal(message)
-                }
-            })?;
+            .map_err(node_subnet_allocation_status)?
+            .into_subnet();
         Ok(Response::new(generated::NodeSubnetResponse {
-            subnet: Some(node_subnet_to_proto(subnet)?),
+            subnet: Some(focused_node_subnet_to_proto(subnet)),
         }))
     }
 
@@ -2022,14 +2023,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let query = klights_leader_api::NodeSubnetQuery::try_new(req.node_name)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let subnet = self
-            .db
-            .get_node_subnet(query.node_name())
+            .ports
+            .topology_query
+            .get_node_subnet(query)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::unavailable(err.to_string()))?
+            .into_option();
         Ok(Response::new(match subnet {
             Some(subnet) => generated::GetNodeSubnetResponse {
                 found: true,
-                subnet: Some(node_subnet_to_proto(subnet)?),
+                subnet: Some(focused_node_subnet_to_proto(subnet)),
             },
             None => generated::GetNodeSubnetResponse {
                 found: false,
@@ -2048,16 +2051,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let query = klights_leader_api::PeerSubnetsQuery::try_new(req.my_node_name)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let items = self
-            .db
-            .list_peer_subnets(query.node_name())
+            .ports
+            .topology_query
+            .list_peer_subnets(query)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?
-            .into_iter()
-            .map(crate::control_plane::client::focused_node_subnet)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| Status::internal(error.to_string()))?;
-        let items = klights_leader_api::PeerSubnetsResult::try_new(query.node_name(), items)
-            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(|err| Status::unavailable(err.to_string()))?
             .into_vec()
             .into_iter()
             .map(focused_node_subnet_to_proto)
@@ -2075,14 +2073,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let query = klights_leader_api::NodeDataplaneQuery::try_new(req.node_name)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let metadata = self
-            .db
-            .get_node_dataplane(query.node_name())
+            .ports
+            .topology_query
+            .get_node_dataplane(query)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::unavailable(err.to_string()))?
+            .into_option();
         Ok(Response::new(match metadata {
             Some(metadata) => generated::GetNodeDataplaneResponse {
                 found: true,
-                metadata: Some(dataplane_metadata_to_proto(metadata)?),
+                metadata: Some(focused_dataplane_to_proto(metadata)),
             },
             None => generated::GetNodeDataplaneResponse {
                 found: false,
@@ -2142,17 +2142,13 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .map_err(pod_cleanup_intent_error_to_status)?;
         enforce_node_authority(&caller, request.node_name())?;
         let items = self
-            .db
-            .list_pod_cleanup_intents_for_node(request.node_name())
+            .ports
+            .pod_cleanup
+            .list_pod_cleanup_intents(request)
             .await
-            .map_err(|error| Status::internal(error.to_string()))?
+            .map_err(pod_cleanup_intent_error_to_status)?
             .into_iter()
-            .map(crate::control_plane::client::local::focused_pod_cleanup_intent)
-            .map(|intent| {
-                intent
-                    .map_err(pod_cleanup_intent_error_to_status)
-                    .and_then(pod_cleanup_intent_to_proto)
-            })
+            .map(pod_cleanup_intent_to_proto)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Response::new(
             generated::ListPodCleanupIntentsForNodeResponse { items },
@@ -2177,11 +2173,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         .map_err(pod_cleanup_intent_error_to_status)?;
         // NodeRestriction: a node may only clear its own pod cleanup intents.
         enforce_node_authority(&caller, request.node_name())?;
-        let (node_name, namespace, pod_name, pod_uid, reason) = request.into_parts();
-        self.db
-            .delete_pod_cleanup_intent(&node_name, &namespace, &pod_name, &pod_uid, &reason)
+        self.ports
+            .pod_cleanup
+            .acknowledge_pod_cleanup_intent(request)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(pod_cleanup_intent_error_to_status)?;
         Ok(Response::new(generated::DeletePodCleanupIntentResponse {}))
     }
 
@@ -2289,8 +2285,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 "JoinAsControlplane requires a valid controlplane bootstrap token (first join) or an existing controlplane membership (rejoin)",
             ));
         }
-        let expected_node_id =
-            crate::datastore::raft::types::raft_node_id_for_node_name(&req.node_name);
+        let expected_node_id = klights_cluster_core::raft_node_id_for_node_name(&req.node_name);
         if req.node_id != expected_node_id {
             return Err(Status::invalid_argument(format!(
                 "JoinAsControlplane node_id {} does not match the ID derived from authenticated node name {}",
@@ -2315,13 +2310,13 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
         if let Some(registration) = node_registration.as_ref() {
             let mode_matches = matches!(
-                (&registration.node_mode, dataplane.mode),
+                (&registration.node_mode, dataplane.mode()),
                 (
-                    crate::controllers::annotations::NodePeerMode::Root,
-                    DataplaneMode::Root
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
+                    klights_leader_api::NetworkNodeMode::Root
                 ) | (
-                    crate::controllers::annotations::NodePeerMode::Rootless,
-                    DataplaneMode::Rootless
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless,
+                    klights_leader_api::NetworkNodeMode::Rootless
                 )
             );
             if !mode_matches {
@@ -2360,10 +2355,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 admitted_as_learner,
                 ..
             } => {
-                self.db
-                    .update_node_dataplane(dataplane)
+                self.ports
+                    .topology_command
+                    .register_node_dataplane(dataplane)
                     .await
-                    .map_err(|err| Status::internal(err.to_string()))?;
+                    .map_err(|err| Status::unavailable(err.to_string()))?;
                 let ca_cert_pem = self
                     .controlplane_ca_files
                     .join_response_ca_cert_pem()
@@ -2542,9 +2538,7 @@ where
     call(router).await.map_err(|err| err.to_string())
 }
 
-pub(crate) fn resource_to_proto(
-    resource: &crate::datastore::Resource,
-) -> generated::ResourceObject {
+pub(crate) fn resource_to_proto(resource: &Resource) -> generated::ResourceObject {
     let mut data = (*resource.data).clone();
     if let Some(root) = data.as_object_mut() {
         root.insert(
@@ -2634,14 +2628,6 @@ fn resource_command_status(error: klights_leader_api::ResourceCommandError) -> S
     }
 }
 
-fn node_subnet_to_proto(
-    subnet: crate::datastore::NodeSubnet,
-) -> std::result::Result<generated::NodeSubnetObject, Status> {
-    crate::control_plane::client::focused_node_subnet(subnet)
-        .map(focused_node_subnet_to_proto)
-        .map_err(|error| Status::internal(error.to_string()))
-}
-
 fn focused_node_subnet_to_proto(
     subnet: klights_leader_api::NodeSubnet,
 ) -> generated::NodeSubnetObject {
@@ -2660,12 +2646,10 @@ fn focused_node_subnet_to_proto(
     }
 }
 
-fn dataplane_metadata_to_proto(
-    metadata: DataplanePeerMetadata,
-) -> std::result::Result<generated::DataplaneMetadataObject, Status> {
-    let metadata = crate::control_plane::client::focused_dataplane(metadata)
-        .map_err(|error| Status::internal(error.to_string()))?;
-    Ok(generated::DataplaneMetadataObject {
+fn focused_dataplane_to_proto(
+    metadata: klights_leader_api::NetworkDataplane,
+) -> generated::DataplaneMetadataObject {
+    generated::DataplaneMetadataObject {
         node_name: metadata.node_name().to_string(),
         mode: match metadata.mode() {
             klights_leader_api::NetworkNodeMode::Root => "root",
@@ -2680,7 +2664,7 @@ fn dataplane_metadata_to_proto(
         public_key: metadata.public_key().map(str::to_owned),
         endpoint: metadata.endpoint().to_string(),
         port: metadata.port().map(u32::from),
-    })
+    }
 }
 
 fn pod_cleanup_intent_to_proto(
@@ -2745,8 +2729,8 @@ fn pod_cleanup_intent_error_to_status(
     }
 }
 
-fn resource_from_event(event: &crate::watch::WatchEvent) -> crate::datastore::Resource {
-    crate::datastore::Resource::from_watch_event_ref(event)
+fn resource_from_event(event: &crate::watch::WatchEvent) -> Resource {
+    Resource::from_watch_event_ref(event)
 }
 
 fn watch_event_type(event: &crate::watch::WatchEvent) -> &'static str {
@@ -2914,77 +2898,32 @@ fn leader_watch_error_to_status(error: klights_leader_api::LeaderWatchError) -> 
     }
 }
 
-async fn refresh_joining_node_from_dataplane(
-    db: &dyn DatastoreBackend,
-    query: &dyn klights_leader_api::LeaderResourceQuery,
-    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
-    dataplane: &DataplanePeerMetadata,
-) -> Result<()> {
-    refresh_node_routing_metadata_from_dataplane(db, dataplane).await?;
-    publish_joining_node_external_ip(query, node_status, dataplane).await
-}
-
-async fn refresh_node_routing_metadata_from_dataplane(
-    db: &dyn DatastoreBackend,
-    dataplane: &DataplanePeerMetadata,
-) -> Result<()> {
-    // Registration/dataplane projection only: this full-object CAS stamps
-    // routing metadata but deliberately does not mutate Node status. ExternalIP
-    // is published separately through the exact UID+RV status capability.
-    let Some(resource) = db
-        .get_resource("v1", "Node", None, &dataplane.node_name)
-        .await?
-    else {
-        return Ok(());
-    };
-    let mut data = (*resource.data).clone();
-    if !crate::kubelet::node::stamp_node_routing_metadata_from_store(
-        db,
-        &dataplane.node_name,
-        &mut data,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    db.update_resource_with_preconditions(
-        "v1",
-        "Node",
-        None,
-        &dataplane.node_name,
-        data,
-        ResourcePreconditions::from_resource(&resource),
-    )
-    .await?;
-    Ok(())
-}
-
 async fn publish_joining_node_external_ip(
     query: &dyn klights_leader_api::LeaderResourceQuery,
     node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
-    dataplane: &DataplanePeerMetadata,
+    dataplane: &klights_leader_api::NetworkDataplane,
 ) -> Result<()> {
     let get = klights_leader_api::node_get_request(
-        &dataplane.node_name,
+        dataplane.node_name(),
         klights_leader_api::ResourceQueryConsistency::LeaderFresh,
     )?;
     let Some(resource) = query.get_resource(get).await? else {
         return Ok(());
     };
     let mut data = (*resource.data).clone();
-    if !crate::kubelet::node::set_node_external_ip(&mut data, &dataplane.endpoint.to_string()) {
+    if !klights_cluster_core::set_node_external_ip(&mut data, &dataplane.endpoint().to_string()) {
         return Ok(());
     }
     let status = data
         .get("status")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let request = klights_leader_api::NodeLifecycleStatusRequest::try_new(
-        crate::datastore::command::StorageCommand::UpdateStatus {
+    let request =
+        klights_leader_api::NodeLifecycleStatusRequest::try_new(StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Node".to_string(),
             namespace: None,
-            name: dataplane.node_name.clone(),
+            name: dataplane.node_name().to_string(),
             status,
             expected_rv: Some(resource.resource_version),
             preconditions: ResourcePreconditions::uid_and_resource_version(
@@ -2992,8 +2931,7 @@ async fn publish_joining_node_external_ip(
                 resource.resource_version,
             ),
             observed_status_stamp: None,
-        },
-    )?;
+        })?;
     node_status.submit_node_lifecycle_status(request).await?;
     Ok(())
 }
@@ -3011,17 +2949,45 @@ async fn refresh_local_node_external_ip_from_observed_endpoint(
     let endpoint_ip = endpoint
         .parse::<std::net::IpAddr>()
         .with_context(|| format!("observed leader endpoint must be an IP address: {endpoint}"))?;
-    crate::kubelet::node::publish_node_external_ip_if_changed(
-        query,
-        node_status,
+    let get = klights_leader_api::node_get_request(
         node_name,
-        &endpoint_ip.to_string(),
-    )
-    .await
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    )?;
+    let Some(resource) = query.get_resource(get).await? else {
+        return Ok(());
+    };
+    let mut data = (*resource.data).clone();
+    if !klights_cluster_core::set_node_external_ip(&mut data, &endpoint_ip.to_string()) {
+        return Ok(());
+    }
+    let status = data
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let request =
+        klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: node_name.to_string(),
+            status,
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid(resource.uid),
+            observed_status_stamp: None,
+        })?;
+    node_status.submit_node_self_status(request).await?;
+    Ok(())
 }
 
-async fn node_has_external_ip(db: &dyn DatastoreBackend, node_name: &str) -> Result<bool> {
-    let Some(node) = db.get_resource("v1", "Node", None, node_name).await? else {
+async fn node_has_external_ip(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_name: &str,
+) -> Result<bool> {
+    let request = klights_leader_api::node_get_request(
+        node_name,
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    )?;
+    let Some(node) = query.get_resource(request).await? else {
         return Ok(false);
     };
     Ok(node
@@ -3040,7 +3006,7 @@ async fn node_has_external_ip(db: &dyn DatastoreBackend, node_name: &str) -> Res
 }
 
 async fn join_response_to_proto(
-    db: &dyn DatastoreBackend,
+    topology: &dyn klights_leader_api::LeaderNetworkTopologyQuery,
     response: JoinResponse,
 ) -> std::result::Result<generated::JoinResponse, Status> {
     match response {
@@ -3049,7 +3015,7 @@ async fn join_response_to_proto(
             leader_epoch,
             current_rv,
         } => {
-            let peers = dataplane_peers_from_db(db).await?;
+            let peers = dataplane_peers_from_topology(topology).await?;
             Ok(generated::JoinResponse {
                 result: Some(generated::join_response::Result::Accepted(
                     generated::JoinAccepted {
@@ -3069,37 +3035,47 @@ async fn join_response_to_proto(
     }
 }
 
-async fn dataplane_peers_from_db(
-    db: &dyn DatastoreBackend,
+async fn dataplane_peers_from_topology(
+    topology: &dyn klights_leader_api::LeaderNetworkTopologyQuery,
 ) -> std::result::Result<Vec<generated::DataplanePeer>, Status> {
-    let mut subnets = db
-        .list_peer_subnets("")
-        .await
+    let query = klights_leader_api::PeerSubnetsQuery::try_new("snapshot-peer-list")
         .map_err(|err| Status::internal(err.to_string()))?;
-    subnets.sort_by(|a, b| a.node_name.as_str().cmp(b.node_name.as_str()));
+    let mut subnets = topology
+        .list_peer_subnets(query)
+        .await
+        .map_err(|err| Status::unavailable(err.to_string()))?
+        .into_vec();
+    subnets.sort_by(|a, b| a.node_name().cmp(b.node_name()));
 
     let mut peers = Vec::with_capacity(subnets.len());
     for subnet in subnets {
-        let node_name = subnet.node_name.to_string();
-        let Some(dataplane) = db
-            .get_node_dataplane(&node_name)
+        let node_name = subnet.node_name().to_string();
+        let query = klights_leader_api::NodeDataplaneQuery::try_new(node_name.clone())
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let Some(dataplane) = topology
+            .get_node_dataplane(query)
             .await
-            .map_err(|err| Status::internal(err.to_string()))?
+            .map_err(|err| Status::unavailable(err.to_string()))?
+            .into_option()
         else {
             continue;
         };
         peers.push(generated::DataplanePeer {
             node_name,
-            pod_cidr: subnet.subnet.to_string(),
-            public_key: dataplane
-                .public_key
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-            endpoint: dataplane.endpoint.to_string(),
-            port: dataplane.port.map(u32::from).unwrap_or_default(),
-            mode: dataplane.mode.as_str().to_string(),
-            encryption: dataplane.encryption.as_str().to_string(),
+            pod_cidr: subnet.subnet().to_string(),
+            public_key: dataplane.public_key().unwrap_or_default().to_string(),
+            endpoint: dataplane.endpoint().to_string(),
+            port: dataplane.port().map(u32::from).unwrap_or_default(),
+            mode: match dataplane.mode() {
+                klights_leader_api::NetworkNodeMode::Root => "root",
+                klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+            }
+            .to_string(),
+            encryption: match dataplane.encryption() {
+                klights_leader_api::DataplaneEncryption::WireGuard => "enabled",
+                klights_leader_api::DataplaneEncryption::Direct => "disabled",
+            }
+            .to_string(),
         });
     }
     Ok(peers)
@@ -3301,6 +3277,53 @@ mod tests {
         generated::{self, JoinRequest, JoinRole, MetadataRequest, SnapshotRequest},
         server::validate_join_metadata,
     };
+
+    #[test]
+    fn snapshot_persistence_errors_preserve_tonic_categories() {
+        let cases = [
+            (
+                klights_cluster_store::SnapshotPersistenceError::Cancelled,
+                tonic::Code::Cancelled,
+            ),
+            (
+                klights_cluster_store::SnapshotPersistenceError::Timeout,
+                tonic::Code::DeadlineExceeded,
+            ),
+            (
+                klights_cluster_store::SnapshotPersistenceError::ResourceExhausted {
+                    message: "capacity".to_string(),
+                },
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                klights_cluster_store::SnapshotPersistenceError::Retryable {
+                    message: "busy".to_string(),
+                },
+                tonic::Code::Unavailable,
+            ),
+            (
+                klights_cluster_store::SnapshotPersistenceError::CorruptData {
+                    message: "bad page".to_string(),
+                },
+                tonic::Code::DataLoss,
+            ),
+            (
+                klights_cluster_store::SnapshotPersistenceError::UnsupportedMode {
+                    message: "unsupported".to_string(),
+                },
+                tonic::Code::Unimplemented,
+            ),
+            (
+                klights_cluster_store::SnapshotPersistenceError::PersistenceFailed {
+                    message: "io".to_string(),
+                },
+                tonic::Code::Internal,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(super::snapshot_persistence_status(error).code(), expected);
+        }
+    }
     use crate::replication::protocol::ReplicationEntry;
     use crate::replication::service::ReplicationService;
     use async_trait::async_trait;
@@ -5096,7 +5119,7 @@ mod tests {
         let status = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
                 generated::SubmitResourceCommandRequest {
-                    command_protobuf: crate::datastore::command::encode_command_protobuf(&command)
+                    command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
                         .expect("encode command"),
                 },
                 "cp1",
@@ -5123,7 +5146,7 @@ mod tests {
         let response = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
                 generated::SubmitResourceCommandRequest {
-                    command_protobuf: crate::datastore::command::encode_command_protobuf(&command)
+                    command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
                         .expect("encode command"),
                 },
                 "cp1",
@@ -5832,7 +5855,7 @@ mod tests {
     #[test]
     fn validate_join_metadata_accepts_enabled_root_and_rootless() {
         let root = validate_join_metadata(&valid_join()).unwrap();
-        assert_eq!(root.node_name, "worker-1");
+        assert_eq!(root.node_name(), "worker-1");
 
         let mut rootless = valid_join();
         rootless.dataplane_mode = "rootless".to_string();
@@ -5875,8 +5898,8 @@ mod tests {
         join.dataplane_encryption.clear();
         let metadata = validate_join_metadata(&join).unwrap();
         assert_eq!(
-            metadata.encryption,
-            crate::networking::wireguard::DataplaneEncryption::Enabled
+            metadata.encryption(),
+            klights_leader_api::DataplaneEncryption::WireGuard
         );
     }
 
@@ -5888,10 +5911,10 @@ mod tests {
         join.dataplane_port = 0;
         let metadata = validate_join_metadata(&join).unwrap();
         assert_eq!(
-            metadata.encryption,
-            crate::networking::wireguard::DataplaneEncryption::Disabled
+            metadata.encryption(),
+            klights_leader_api::DataplaneEncryption::Direct
         );
-        assert!(metadata.public_key.is_none());
+        assert!(metadata.public_key().is_none());
     }
 
     #[tokio::test]
@@ -6061,23 +6084,26 @@ mod tests {
         db.update_node_dataplane(dataplane.clone())
             .await
             .expect("store joining dataplane metadata");
-        let query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
-            Arc::new(crate::control_plane::client::local::LocalApiClient::new(
-                db.clone(),
-                "leader-a".to_string(),
-                crate::control_plane::client::local::always_leader_watch(),
-            ));
+        let local = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+            db.clone(),
+            "leader-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let query: Arc<dyn klights_leader_api::LeaderResourceQuery> = local.clone();
         let status = Arc::new(RecordingNodeLifecycleStatus::default());
         let node_uid = created.uid.clone();
 
-        super::refresh_joining_node_from_dataplane(
-            db.as_ref(),
-            query.as_ref(),
-            status.as_ref(),
-            &dataplane,
+        let focused =
+            crate::control_plane::client::focused_dataplane(dataplane).expect("focused dataplane");
+        klights_leader_api::LeaderNetworkTopologyCommand::register_node_dataplane(
+            local.as_ref(),
+            focused.clone(),
         )
         .await
-        .expect("split joining Node projection");
+        .expect("register joining dataplane");
+        super::publish_joining_node_external_ip(query.as_ref(), status.as_ref(), &focused)
+            .await
+            .expect("split joining Node projection");
 
         let stored = db
             .get_resource("v1", "Node", None, "worker-1")
@@ -7182,9 +7208,8 @@ mod tests {
 
     #[tokio::test]
     async fn channel_proto_sink_forwards_commits_as_protos_round_trip() {
-        use crate::replication::snapshot::SnapshotCommitSink;
-        use crate::replication::snapshot::stream_snapshot_commits;
-        use crate::replication::snapshot_commit_channel_sink::SnapshotCommitChannelSink;
+        use crate::datastore::snapshot_export::stream_snapshot_commits;
+        use crate::replication::test_proto_channel_sink::TestProtoChannelSink;
 
         // Build a fixture cluster with a couple of resources so the snapshot
         // emitter has real commits to stream.
@@ -7215,16 +7240,16 @@ mod tests {
         .unwrap();
 
         // Baseline: the legacy Vec path (equivalence oracle).
-        let baseline = crate::replication::snapshot::generate_snapshot(&db, 0)
+        let baseline = crate::datastore::snapshot_export::generate_snapshot(&db, 0)
             .await
             .unwrap();
 
         // Streaming path: push straight into a bounded channel.
         let (tx, mut rx) = mpsc::channel::<Result<generated::ReplicationEntry, tonic::Status>>(64);
-        let mut sink = SnapshotCommitChannelSink::new(tx);
+        let mut sink = TestProtoChannelSink::new(tx);
         stream_snapshot_commits(&db, 0, &mut sink).await.unwrap();
         // `finish` drops the inner sender so the receiver stream terminates.
-        sink.finish().unwrap();
+        sink.finish();
 
         // Drain the channel, decode each proto back to a LogApplyCommit.
         let mut collected: Vec<crate::log_apply::LogApplyCommit> = Vec::new();

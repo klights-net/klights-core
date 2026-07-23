@@ -20,6 +20,42 @@ async fn redb_db() -> RedbDatastore {
     RedbDatastore::new_in_memory().await.unwrap()
 }
 
+#[tokio::test]
+async fn redb_snapshot_fence_coordinates_capture_and_mutation() {
+    let db = redb_db().await;
+    let exclusive = DatastoreBackend::acquire_snapshot_exclusive_fence(&db)
+        .await
+        .unwrap()
+        .expect("redb must provide an exclusive snapshot fence");
+
+    let mutation = DatastoreBackend::acquire_snapshot_mutation_fence(&db);
+    tokio::pin!(mutation);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut mutation)
+            .await
+            .is_err(),
+        "mutation fence must wait while capture owns the exclusive fence"
+    );
+
+    drop(exclusive);
+    tokio::time::timeout(std::time::Duration::from_secs(2), &mut mutation)
+        .await
+        .expect("mutation fence must become available after capture releases it")
+        .unwrap()
+        .expect("redb must provide a mutation fence");
+}
+
+#[tokio::test]
+async fn redb_applied_outbox_snapshot_page_rejects_unbounded_requests() {
+    let db = redb_db().await;
+    let oversized =
+        std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1).unwrap();
+    assert!(
+        db.list_applied_outbox_paged(None, oversized).await.is_err(),
+        "redb must implement the bounded native page contract instead of the full-list fallback"
+    );
+}
+
 /// Run the same async test body against both backends.
 /// Generates `<name>_sqlite` and `<name>_redb` test functions.
 /// Uses concat_idents! internally to produce the names.
@@ -49,6 +85,55 @@ macro_rules! parametrize_backends {
 }
 
 // ---- Parametrized cross-backend tests ----
+
+parametrize_backends!(
+    applied_outbox_snapshot_pages_are_exclusive_and_lossless,
+    |db| {
+        let row_count = klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1;
+        for index in 0..row_count {
+            db.insert_applied_outbox(AppliedOutboxRecord {
+                idempotency_key: format!("snapshot-page-{index:03}"),
+                subject_key: format!("subject-{index:03}"),
+                operation: "Update".to_string(),
+                first_seen_ms: index as i64,
+                applied_rv: Some(index as i64 + 1),
+                result_proto: vec![index as u8],
+                status_stamp: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let page_limit =
+            std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE).unwrap();
+        let mut after_key = None;
+        let mut keys = Vec::new();
+        let mut page_lengths = Vec::new();
+        loop {
+            let page = db
+                .list_applied_outbox_paged(after_key.as_deref(), page_limit)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() <= page_limit.get());
+            page_lengths.push(page.len());
+            after_key = page.last().map(|row| row.idempotency_key.clone());
+            keys.extend(page.into_iter().map(|row| row.idempotency_key));
+        }
+        assert_eq!(
+            page_lengths,
+            vec![klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE, 1]
+        );
+        assert_eq!(
+            keys,
+            (0..row_count)
+                .map(|index| format!("snapshot-page-{index:03}"))
+                .collect::<Vec<_>>()
+        );
+    }
+);
 
 parametrize_backends!(create_and_get, |db| {
     let pod =
@@ -2030,7 +2115,7 @@ async fn redb_delete_resource_with_tombstone_command_stamps_and_watches_deleted_
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::replication::sequenced_datastore::DatastoreApplier;
+    use crate::datastore::sequenced::DatastoreApplier;
 
     let db = redb_db().await;
     let created = db

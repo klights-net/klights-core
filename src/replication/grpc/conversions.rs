@@ -6,12 +6,13 @@
 //! REMOVE: Phase 5.5 moves the residual gRPC conversion adapter.
 
 use anyhow::Result;
+use klights_cluster_core::WatchReplayPosition;
 
 use super::generated;
-use crate::datastore::command::{
+use crate::log_apply::{decode_commit_protobuf, encode_commit_protobuf};
+use crate::storage_wire_codec::{
     decode_command_protobuf, decode_meta_protobuf, encode_command_protobuf, encode_meta_protobuf,
 };
-use crate::log_apply::{decode_commit_protobuf, encode_commit_protobuf};
 
 pub(crate) fn resource_command_request_to_proto(
     request: &klights_leader_api::ResourceCommandRequest,
@@ -37,7 +38,7 @@ pub(crate) fn resource_command_request_from_proto(
 }
 
 pub(crate) fn watch_replay_position_to_proto(
-    position: crate::datastore::WatchReplayPosition,
+    position: WatchReplayPosition,
 ) -> generated::WatchReplayPosition {
     generated::WatchReplayPosition {
         resource_version: position.resource_version,
@@ -48,8 +49,8 @@ pub(crate) fn watch_replay_position_to_proto(
 
 pub(crate) fn watch_replay_position_from_proto(
     position: &generated::WatchReplayPosition,
-) -> crate::datastore::WatchReplayPosition {
-    crate::datastore::WatchReplayPosition {
+) -> WatchReplayPosition {
+    WatchReplayPosition {
         resource_version: position.resource_version,
         event_id: position.event_id,
         resource_version_filter_through_event_id: position.resource_version_filter_through_event_id,

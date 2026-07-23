@@ -5,42 +5,61 @@ use tonic::Status;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Clone)]
+pub(crate) struct ReplicationRuntimeFiles {
+    pub(crate) ca_cert: PathBuf,
+    pub(crate) ca_key: PathBuf,
+    pub(crate) service_account_signing_key: PathBuf,
+}
+
+#[derive(Clone)]
 pub(super) struct ControlplaneCaFiles {
-    containerd_namespace: String,
+    files: Option<ReplicationRuntimeFiles>,
     supervisor: Arc<TaskSupervisor>,
 }
 
 impl ControlplaneCaFiles {
     pub(super) fn new(supervisor: Arc<TaskSupervisor>) -> Self {
         Self {
-            containerd_namespace: String::new(),
+            files: None,
             supervisor,
         }
     }
 
-    pub(super) fn set_namespace(&mut self, namespace: &str) {
-        self.containerd_namespace = namespace.to_string();
+    #[cfg(not(test))]
+    pub(super) fn set_files(&mut self, files: ReplicationRuntimeFiles) {
+        self.files = Some(files);
     }
 
-    pub(super) fn containerd_namespace(&self) -> Result<&str, Status> {
-        if self.containerd_namespace.is_empty() {
-            return Err(Status::failed_precondition(
-                "ServiceAccount signing key not available on this node",
-            ));
-        }
-        Ok(&self.containerd_namespace)
+    #[cfg(test)]
+    pub(super) fn set_namespace(&mut self, namespace: &str) {
+        self.files = Some(ReplicationRuntimeFiles {
+            ca_cert: crate::paths::ca_cert_path(namespace),
+            ca_key: crate::paths::ca_key_path(namespace),
+            service_account_signing_key: crate::paths::service_account_signing_key_path(namespace),
+        });
+    }
+
+    pub(super) async fn service_account_signing_key_pem(&self) -> Result<String, Status> {
+        let files = self.files.as_ref().ok_or_else(|| {
+            Status::failed_precondition("ServiceAccount signing key not available on this node")
+        })?;
+        crate::auth::read_service_account_signing_key_path_supervised(
+            &files.service_account_signing_key,
+            self.supervisor.as_ref(),
+        )
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!("ServiceAccount signing key not available: {err}"))
+        })
     }
 
     pub(super) async fn join_response_ca_cert_pem(&self) -> Result<String, Status> {
-        if self.containerd_namespace.is_empty() {
+        let Some(files) = self.files.as_ref() else {
             return Ok(String::new());
-        }
+        };
 
         match self
-            .read_text_file(
-                "grpc_controlplane_join_ca_cert",
-                crate::paths::ca_cert_path(&self.containerd_namespace),
-            )
+            .read_text_file("grpc_controlplane_join_ca_cert", files.ca_cert.clone())
             .await?
         {
             Ok(pem) => Ok(pem),
@@ -61,33 +80,25 @@ impl ControlplaneCaFiles {
     }
 
     pub(super) async fn signing_ca_key_pem(&self) -> Result<String, Status> {
-        if self.containerd_namespace.is_empty() {
-            return Err(Status::failed_precondition(
-                "cluster CA key not available on this node",
-            ));
-        }
+        let files = self.files.as_ref().ok_or_else(|| {
+            Status::failed_precondition("cluster CA key not available on this node")
+        })?;
 
-        self.read_text_file(
-            "grpc_controlplane_sign_ca_key",
-            crate::paths::ca_key_path(&self.containerd_namespace),
-        )
-        .await?
-        .map_err(|err| Status::failed_precondition(format!("CA key not available: {err}")))
+        self.read_text_file("grpc_controlplane_sign_ca_key", files.ca_key.clone())
+            .await?
+            .map_err(|err| Status::failed_precondition(format!("CA key not available: {err}")))
     }
 
     async fn read_signing_ca_cert_pem_or_empty(
         &self,
         task_name: &'static str,
     ) -> Result<String, Status> {
-        if self.containerd_namespace.is_empty() {
+        let Some(files) = self.files.as_ref() else {
             return Ok(String::new());
-        }
+        };
 
         match self
-            .read_text_file(
-                task_name,
-                crate::paths::ca_cert_path(&self.containerd_namespace),
-            )
+            .read_text_file(task_name, files.ca_cert.clone())
             .await?
         {
             Ok(pem) => Ok(pem),

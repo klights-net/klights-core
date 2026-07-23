@@ -99,14 +99,14 @@ async fn start_controlplane_leader_control_stream_if_needed(
 
     if let Some(cri) = cri_for_api {
         let exec_handler =
-            std::sync::Arc::new(crate::replication::grpc::client::CriNodeExecRuntime::new(
+            std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
                 cri.clone(),
                 task_supervisor.clone(),
             ));
         client.set_node_exec_runtime(exec_handler).await;
         client
             .set_node_metrics_runtime(std::sync::Arc::new(
-                crate::replication::grpc::client::CriNodeMetricsRuntime::new(
+                crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
@@ -116,7 +116,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
     client
         .set_node_log_runtime(std::sync::Arc::new(
             crate::replication::grpc::client::LocalNodeLogRuntime::new_with_pod_event_store(
-                config.containerd_namespace.clone(),
+                crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
                 crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
                     std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
@@ -753,8 +753,8 @@ mod tests {
             public_key: Some("worker-public-key".to_string()),
             endpoint: "192.0.2.55".to_string(),
             port: Some(7679),
-            mode: crate::networking::wireguard::DataplaneMode::Root,
-            encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
+            mode: klights_leader_api::NetworkNodeMode::Root,
+            encryption: klights_leader_api::DataplaneEncryption::WireGuard,
         };
 
         super::enqueue_worker_dataplane_metadata_outbox(Some(&outbox), "worker-a", &dataplane)

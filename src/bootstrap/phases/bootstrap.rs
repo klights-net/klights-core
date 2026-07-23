@@ -1107,7 +1107,40 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 grpc_node_query.clone(),
                 outbox_runtime.clone(),
             ));
-        crate::replication::grpc::server::mount_service_full(
+        #[cfg(not(test))]
+        let app = {
+            let grpc_ports = crate::replication::grpc::server::ReplicationServerPorts::from_shared(
+                local_api_client.clone(),
+            );
+            let snapshot_capture = Arc::new(
+                crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new_capture(
+                    db_handle.clone(),
+                ),
+            );
+            crate::replication::grpc::server::mount_service_full(
+                api::build_router(state_with_cri),
+                rs,
+                grpc_ports,
+                snapshot_capture,
+                raft_rpc_router,
+                controlplane_join_handler,
+                crate::replication::grpc::ReplicationRuntimeFiles {
+                    ca_cert: crate::paths::ca_cert_path(&config.containerd_namespace),
+                    ca_key: crate::paths::ca_key_path(&config.containerd_namespace),
+                    service_account_signing_key: crate::paths::service_account_signing_key_path(
+                        &config.containerd_namespace,
+                    ),
+                },
+                Some(is_leader_rx_for_grpc),
+                Some(config.node_name.clone()),
+                Some(grpc_node_query),
+                Some(grpc_node_status),
+                Some(local_api_client),
+                grpc_transport_policy,
+            )
+        };
+        #[cfg(test)]
+        let app = crate::replication::grpc::server::mount_service_full(
             api::build_router(state_with_cri),
             rs,
             db_handle.clone(),
@@ -1122,7 +1155,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             Some(grpc_node_status),
             Some(local_api_client),
             grpc_transport_policy,
-        )
+        );
+        app
     } else {
         api::build_router(state_with_cri)
     };
@@ -1162,7 +1196,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
     use crate::replication::grpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };
@@ -1182,8 +1215,8 @@ mod tests {
                 dataplane: JoinDataplaneMetadata {
                     endpoint: String::new(),
                     port: None,
-                    mode: DataplaneMode::Root,
-                    encryption: DataplaneEncryption::Disabled,
+                    mode: klights_leader_api::NetworkNodeMode::Root,
+                    encryption: klights_leader_api::DataplaneEncryption::Direct,
                     public_key: None,
                 },
                 ca_cert_path: None,

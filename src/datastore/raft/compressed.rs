@@ -52,6 +52,23 @@ pub fn decode(framed: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// Decode framed JSON without materializing a second full uncompressed buffer.
+/// Callers must execute this synchronous CPU/codec work on a supervised
+/// blocking lane.
+pub fn decode_json<T: serde::de::DeserializeOwned>(framed: &[u8]) -> Result<T> {
+    let Some((&tag, rest)) = framed.split_first() else {
+        anyhow::bail!("compressed payload missing framing tag");
+    };
+    match tag {
+        TAG_RAW => Ok(serde_json::from_slice(rest)?),
+        TAG_ZSTD => {
+            let decoder = zstd::Decoder::new(rest)?;
+            Ok(serde_json::from_reader(decoder)?)
+        }
+        other => anyhow::bail!("unknown compression framing tag: {other:#x}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

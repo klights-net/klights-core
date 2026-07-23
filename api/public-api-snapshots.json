@@ -2,179 +2,179 @@
   "format": "rustdoc-json-reachable-api-v2",
   "packages": {
     "klights": {
-      "count": 42707,
-      "sha256": "d69e4a4082cfc19fa1ae742046df2e811ed21ce3588256fa1f9793a7cef607b5",
+      "count": 42628,
+      "sha256": "45ee532618e464e59671289306c9e2d88b3a61244e53363cb211584f2e79e571",
       "source": {
-        "count": 496381,
-        "sha256": "67d1e9f2928da1453f6036a5ca20319493691722f6a1d9872f1e99f0bf6c6db6"
+        "count": 501662,
+        "sha256": "838f1a9db8e577603319c4becb2f6751bcce36078d44a1bb95d0231afd9d52f3"
       }
     },
     "klights-apiserver": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-auth": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-cluster-core": {
-      "count": 3029,
-      "sha256": "c192e327fd8c79f68ddc8fba847ad1b2f6afb1ac9aac4628e7e63a4c6251d350",
+      "count": 3030,
+      "sha256": "b98b9f0b37c633d2816b66f16cfd7dd9c71a96ec79179ccd16fc9a123eda1df0",
       "source": {
-        "count": 12970,
-        "sha256": "76b292940b47b33dfd722abf4b29b7ec2a2909eac9286359c25f8b8711121e63"
+        "count": 13017,
+        "sha256": "c6771a4a1625ebe25952a192307f8563d34ecb2d770581169ed35649d1e02a97"
       }
     },
     "klights-cluster-datastore": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-cluster-store": {
-      "count": 1677,
-      "sha256": "3978fe3bd6853c742d2e94d713e1262239e78238be8ed23a20ede7b77ed02d60",
+      "count": 1942,
+      "sha256": "e3bcc9d131c602167afac42463946be6ffbe4d377b60fe314ddee227b5bacf10",
       "source": {
-        "count": 10296,
-        "sha256": "991ceddd2eb5f072e805fb25078de6c79f134db1bb1e963b622731350f36e436"
+        "count": 10499,
+        "sha256": "6c43a0ba5d6bdbb8977f8ad8338f8656a57351dd0e61f013f79842aa005ebcbc"
       }
     },
     "klights-controllers": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-internal-protobuf": {
       "count": 7756,
       "sha256": "fc18c9aeb21c83c2f52bfda037bde0ab59942535365806e230c16312d080ea90",
       "source": {
-        "count": 8591,
-        "sha256": "9bf2ba5e18ea79c0f05edc2e217389dac5c9dd1cb28cd9494d776b4f83150d27"
+        "count": 8593,
+        "sha256": "8bd5b51f5efcd989c771d0f8af23f1c7e03455b809e8897312dbe4ef732811dd"
       }
     },
     "klights-kube-protobuf": {
       "count": 341,
       "sha256": "814682e2905c7c3ecd9ddfb441f77adcc3d60b41c782af0c37c1006c70a3ed42",
       "source": {
-        "count": 31483,
-        "sha256": "b26f243f0378afb3938ebc1186148d396d4d8bc488b3e41408c82005a293cc6a"
+        "count": 31485,
+        "sha256": "205d4b92cdd79097acc2febc4039fc897ad7105948a32e11e722fceb8ddd546a"
       }
     },
     "klights-kubelet": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-leader-api": {
-      "count": 2417,
-      "sha256": "44d677b0669a4b9b529c09780be7fdf543f9bce93a0bc092f7a31dc7ae981ba4",
+      "count": 2599,
+      "sha256": "c094c536dafaa74c9f474dd112059b970a21254bfaab30b9cc5fd16ef8c49438",
       "source": {
-        "count": 12875,
-        "sha256": "2c6b1648f3011f1c191f84bfce63ea50c212ba3a29d9316b9f2818006255d899"
+        "count": 13050,
+        "sha256": "bca59e069935de23fd3553a5ee565165e4c8303cfc1b34aa493dcf786ad2633a"
       }
     },
     "klights-network-api": {
       "count": 1154,
       "sha256": "7c88f0301ffdb34b0f7180261489b8e096a1f68aacc519101c6a8cc8d91223ae",
       "source": {
-        "count": 9734,
-        "sha256": "302567d0164ea0ad2891f1649d02adbe899a7f796d6b013d92de942facbee613"
+        "count": 9736,
+        "sha256": "c4351c038619305dc8a3c6e3d5f26a0e0e5ee83efe34f20854a662eb85e9e609"
       }
     },
     "klights-networking": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-node-api": {
       "count": 1472,
       "sha256": "03a6f48f6b253a7b3ff1473a4cc1d75cec871f5a7e6771bc3e84d35bfa9f2556",
       "source": {
-        "count": 10206,
-        "sha256": "089c54f21cc6dc7ade87948d23cd190c8e0d9091edbeaf20788310a087acae60"
+        "count": 10208,
+        "sha256": "c95ee96e8e722bad3fb1a9272612502ef8bfe30a7c4abc8af15c7769331b6d08"
       }
     },
     "klights-node-datastore": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-node-store": {
-      "count": 2999,
-      "sha256": "c6216a770cb0d0ef5010ef71b9ab1970ce1232e65ba9418be0c856a866c53f49",
+      "count": 3447,
+      "sha256": "231e0642752b1b9247ff20569982e07fc17a067cba30a5b11cab2033691cba3f",
       "source": {
-        "count": 12270,
-        "sha256": "009f3a780c6281fd426020ae5bd15e313f897cb19974c81af638a6e6c10407ae"
+        "count": 12632,
+        "sha256": "ad5e4a3c56f664d6d584204ec17e74f848d3b5eaa8e0481ecea5a1f34976e745"
       }
     },
     "klights-pod-api": {
       "count": 874,
       "sha256": "e66294c02fe158061f621046d81c2650a4e766c7a66d4c7cabcfa13271914f09",
       "source": {
-        "count": 8802,
-        "sha256": "7ac7bea46b26fd738867e9d1382fc1622221724e97f44bcc8d4c21656e2eb8a0"
+        "count": 8804,
+        "sha256": "157e88e9ace85ddfdc71c2fc9ec7fcda8a4eb4550f050c8de716c98d1515344c"
       }
     },
     "klights-reconcile-api": {
       "count": 420,
       "sha256": "ad019da2d345439d4dfb0d26404336b69894e6dde99a0eae0223e4bbaba7e8b5",
       "source": {
-        "count": 8005,
-        "sha256": "26ea2dd1d5e09bc97edb77a07d7d83e6c3264324562e5ab4e7ffab925e706d7a"
+        "count": 8007,
+        "sha256": "c496c36bc26dc55b01a2b4d4b611b470cd7d88a6a95e924adcc2923309c98d8d"
       }
     },
     "klights-replication": {
       "count": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "source": {
-        "count": 7383,
-        "sha256": "0840f123fe307adc2602c821a6233323d88a685af8cc7b31168dfaa08b4e45f7"
+        "count": 7385,
+        "sha256": "a61c1a0570785ae9b6062e4addb843a6612f3573b051ed1da8d4a86652db32ae"
       }
     },
     "klights-supervisor": {
       "count": 726,
       "sha256": "bc7d0d79710f6151e68d5ec6ddbf55608e67acf3c62d8bb3235292516bfaf1d3",
       "source": {
-        "count": 11514,
-        "sha256": "df97bb11474a21d50ed4adb60a5013a52c68a60b11106a37c5a1e4712e9dac68"
+        "count": 11516,
+        "sha256": "33587e4f8e75503e79a690ff1af719a9efb6e1f8b44b21a2d93f34e02bdff559"
       }
     },
     "klights-types": {
       "count": 493,
       "sha256": "6d05f816c8d698558b7b1e23fc04f7cf0cc084af9efef6bab4536a08523f314a",
       "source": {
-        "count": 10122,
-        "sha256": "26c9068d2e00cd551f9ff979f7347d5f0cd8c6d0db88bbf7ddca5d52399a6fbe"
+        "count": 10124,
+        "sha256": "7eff80cf6194c41f7c9015a159a63f8bccdb8868f5775e1cd076cef388f02205"
       }
     },
     "klights-watch": {
       "count": 517,
       "sha256": "b3e6441088d1bd620fc667b74bf558461df135614621488a8a6a22f6ad05f278",
       "source": {
-        "count": 10803,
-        "sha256": "7a98b079a9d3407cefbe8ae8e8c29c7c42893640252d3bb0a9106e4596830ef7"
+        "count": 10805,
+        "sha256": "f8a4aee7fb3e8c4a95da4de81334441b6c4e9a38dcdb8f07c116a0823b867009"
       }
     }
   },

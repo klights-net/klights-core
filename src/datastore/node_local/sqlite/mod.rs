@@ -1,4 +1,5 @@
 mod queries;
+mod raft_durability;
 pub mod schema;
 
 use anyhow::{Result, anyhow};
@@ -7,12 +8,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
-use crate::datastore::command::{StorageCommand, decode_command_protobuf};
 use crate::datastore::sqlite::DbExecutor;
 use crate::datastore::{
     PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkAllocationRequest,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodWorkqueueEntry, PodWorkqueueKind,
 };
+use crate::storage_wire_codec::decode_command_protobuf;
+use klights_cluster_core::StorageCommand;
 
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
@@ -1300,119 +1302,6 @@ impl SqliteNodeLocalDb {
         // T3: returns 0 since the `log_apply_entries` table is gone.
         // The raft `last_applied` index is the authoritative source.
         Ok(0)
-    }
-
-    // --- Phase 3 Raft (openraft storage-v2) -------------------------------
-    // Thin synchronous DB wrappers used by `crate::datastore::raft::log_storage`.
-    // Serialization of openraft Entry blobs happens in the caller — these
-    // methods stay format-agnostic so the same SQL primitives can serve
-    // serde_json, bincode, or protobuf depending on what storage-v2 lands
-    // on. Vote and committed-id rows are stored in raft_meta.
-
-    pub async fn raft_log_append(
-        &self,
-        log_index: u64,
-        term: u64,
-        leader_node_id: u64,
-        entry_blob: Vec<u8>,
-    ) -> Result<()> {
-        self.db_call("node_local:raft_log_append", move |conn| {
-            conn.execute(
-                queries::RAFT_LOG_INSERT,
-                rusqlite::params![
-                    log_index as i64,
-                    term as i64,
-                    leader_node_id as i64,
-                    &entry_blob,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("raft_log_append failed: {e}"))
-    }
-
-    pub async fn raft_log_get_range(&self, start: u64, end: u64) -> Result<Vec<Vec<u8>>> {
-        self.db_call("node_local:raft_log_get_range", move |conn| {
-            let mut stmt = conn.prepare(queries::RAFT_LOG_GET_RANGE)?;
-            let rows = stmt
-                .query_map(rusqlite::params![start as i64, end as i64], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("raft_log_get_range failed: {e}"))
-    }
-
-    /// Return `(log_index, term, leader_node_id)` of the highest-index
-    /// stored entry, or `None` if the log is empty.
-    pub async fn raft_log_last(&self) -> Result<Option<(u64, u64, u64)>> {
-        self.db_call("node_local:raft_log_last", move |conn| {
-            conn.query_row(queries::RAFT_LOG_LAST, [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                ))
-            })
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("raft_log_last failed: {e}"))
-    }
-
-    /// Delete log entries with index >= `from_inclusive`. Used to recover
-    /// from leader-side divergence (the fix for the F1 cycle-2 bug).
-    pub async fn raft_log_truncate_from(&self, from_inclusive: u64) -> Result<()> {
-        self.db_call("node_local:raft_log_truncate_from", move |conn| {
-            conn.execute(
-                queries::RAFT_LOG_TRUNCATE_FROM,
-                rusqlite::params![from_inclusive as i64],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("raft_log_truncate_from failed: {e}"))
-    }
-
-    /// Delete log entries with index <= `upto_inclusive`. Used after a
-    /// snapshot install supersedes log history below `upto_inclusive`.
-    pub async fn raft_log_purge_upto(&self, upto_inclusive: u64) -> Result<()> {
-        self.db_call("node_local:raft_log_purge_upto", move |conn| {
-            conn.execute(
-                queries::RAFT_LOG_PURGE_UPTO,
-                rusqlite::params![upto_inclusive as i64],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("raft_log_purge_upto failed: {e}"))
-    }
-
-    pub async fn raft_meta_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let key = key.to_string();
-        self.db_call("node_local:raft_meta_get", move |conn| {
-            conn.query_row(queries::RAFT_META_GET, rusqlite::params![&key], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("raft_meta_get failed: {e}"))
-    }
-
-    pub async fn raft_meta_set(&self, key: &str, value: Vec<u8>) -> Result<()> {
-        let key = key.to_string();
-        self.db_call("node_local:raft_meta_set", move |conn| {
-            conn.execute(queries::RAFT_META_SET, rusqlite::params![&key, &value])?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("raft_meta_set failed: {e}"))
     }
 
     #[cfg(test)]

@@ -7,6 +7,24 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
+fn snapshot_replay_floor_cursor_key(
+    cursor: &klights_cluster_store::SnapshotReplayFloorCursor,
+) -> (String, String, String) {
+    match cursor.target() {
+        klights_cluster_store::DurableReplayTarget::All => {
+            ("*".to_string(), "*".to_string(), "*".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
+            (api_version.clone(), kind.clone(), "#cluster".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Namespaced {
+            api_version,
+            kind,
+            namespace,
+        } => (api_version.clone(), kind.clone(), namespace.clone()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceMutationEffect {
     Unchanged,
@@ -150,6 +168,11 @@ pub struct SnapshotMutationFence {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
+#[async_trait]
+pub trait SnapshotCaptureAnchor: Send + Sync {
+    async fn pin_under_snapshot_fence(&self) -> Result<()>;
+}
+
 impl SnapshotMutationFence {
     pub(crate) fn new(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
         Self { _guard: guard }
@@ -187,6 +210,23 @@ pub trait DatastoreBackend: Send + Sync {
         Ok(None)
     }
 
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        _request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement pinned snapshot capture"
+        ))
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        _anchor: &dyn SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        self.begin_pinned_snapshot_capture(request).await
+    }
+
     /// Release backend-specific resources (file locks, connections, etc.)
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
@@ -213,7 +253,7 @@ pub trait DatastoreBackend: Send + Sync {
         command: StorageCommand,
         meta: CommandMeta,
     ) -> Result<()> {
-        crate::replication::sequenced_datastore::apply_command_to_backend(self, command, meta).await
+        crate::datastore::sequenced::apply_command_to_backend(self, command, meta).await
     }
 
     /// Atomically replace Kubernetes resource tables from a full leader snapshot.
@@ -994,6 +1034,33 @@ pub trait DatastoreBackend: Send + Sync {
         Ok(Vec::new())
     }
 
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>> {
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow::anyhow!(
+                "watch replay-floor page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let after = after.map(snapshot_replay_floor_cursor_key);
+        let mut rows = self.list_watch_replay_floors().await?;
+        rows.retain(|row| {
+            after.as_ref().is_none_or(|cursor| {
+                (
+                    row.api_version.as_str(),
+                    row.kind.as_str(),
+                    row.namespace_key.as_str(),
+                ) > (cursor.0.as_str(), cursor.1.as_str(), cursor.2.as_str())
+            })
+        });
+        rows.truncate(limit.get());
+        Ok(rows)
+    }
+
     /// List deleted resource watch events after `since_rv` across all scopes.
     ///
     /// Replication reconnect uses this to catch up deletes that cannot be
@@ -1210,6 +1277,28 @@ pub trait DatastoreBackend: Send + Sync {
         Err(anyhow::anyhow!(
             "backend does not support outbox stream watermark listing"
         ))
+    }
+
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow::anyhow!(
+                "outbox-watermark page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let mut rows = self.list_outbox_stream_watermarks().await?;
+        rows.retain(|row| {
+            after.is_none_or(|cursor| {
+                (row.client_id.as_str(), row.stream_id) > (cursor.client_id(), cursor.stream_id())
+            })
+        });
+        rows.truncate(limit.get());
+        Ok(rows)
     }
 
     async fn get_applied_outbox(
@@ -1734,6 +1823,11 @@ pub trait WatchHistoryStore: Send + Sync {
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>>;
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>>;
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>>;
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>>;
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64>;
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
@@ -2001,6 +2095,15 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
 pub trait DurableRecoveryStore: Send + Sync {
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation>;
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation>;
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>>;
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>>;
 }
 
 #[async_trait]
@@ -2012,6 +2115,23 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
         self.as_ref().read_cluster_metadata_observation().await
     }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        self.as_ref().begin_pinned_snapshot_capture(request).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        self.as_ref()
+            .begin_pinned_snapshot_capture_with_anchor(request, anchor)
+            .await
+    }
 }
 
 /// Backend lifecycle hooks owned by bootstrap and replication composition roots.
@@ -2020,6 +2140,76 @@ pub trait BackendLifecycleStore: Send + Sync {
     async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>>;
     async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>>;
     fn close(&self);
+}
+
+/// Transitional focused-port view over the legacy umbrella handle.
+///
+/// REMOVE(Phase 10): selectors return independently typed focused ports once
+/// concrete backends are fully extracted from `DatastoreBackend`.
+pub(crate) struct DatastoreDurableRecoveryPort {
+    db: std::sync::Arc<dyn DatastoreBackend>,
+}
+
+impl DatastoreDurableRecoveryPort {
+    pub(crate) fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl DurableRecoveryStore for DatastoreDurableRecoveryPort {
+    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
+        DatastoreBackend::read_durable_allocator_observation(self.db.as_ref()).await
+    }
+
+    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
+        DatastoreBackend::read_cluster_metadata_observation(self.db.as_ref()).await
+    }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        DatastoreBackend::begin_pinned_snapshot_capture(self.db.as_ref(), request).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
+            self.db.as_ref(),
+            request,
+            anchor,
+        )
+        .await
+    }
+}
+
+pub(crate) struct DatastoreBackendLifecyclePort {
+    db: std::sync::Arc<dyn DatastoreBackend>,
+}
+
+impl DatastoreBackendLifecyclePort {
+    pub(crate) fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl BackendLifecycleStore for DatastoreBackendLifecyclePort {
+    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>> {
+        DatastoreBackend::acquire_snapshot_exclusive_fence(self.db.as_ref()).await
+    }
+
+    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>> {
+        DatastoreBackend::acquire_snapshot_mutation_fence(self.db.as_ref()).await
+    }
+
+    fn close(&self) {
+        DatastoreBackend::close(self.db.as_ref());
+    }
 }
 
 /// Test-only watch bus controls.
@@ -2186,6 +2376,11 @@ pub trait AppliedOutboxStore: Send + Sync {
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize>;
     async fn list_outbox_stream_watermarks(
         &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>>;
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
     ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>>;
     async fn get_applied_outbox(
         &self,

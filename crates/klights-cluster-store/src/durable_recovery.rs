@@ -19,6 +19,9 @@ use klights_cluster_core::{
 
 pub const MAX_WATCH_HISTORY_PAGE: usize = 4096;
 pub const MAX_SNAPSHOT_CAPTURE_PAGE: usize = 512;
+pub const RAFT_VOTERS_META_KEY: &str = "voters";
+pub const RAFT_TERM_META_KEY: &str = "term";
+pub const RAFT_LEADER_HINT_META_KEY: &str = "leader_hint";
 
 /// Persistence failure or invalid request at the durable watch-history boundary.
 #[non_exhaustive]
@@ -723,6 +726,7 @@ pub enum SnapshotPersistenceError {
     PersistenceFailed { message: String },
     CorruptData { message: String },
     UnsupportedMode { message: String },
+    ResourceExhausted { message: String },
     Retryable { message: String },
     Timeout,
     Cancelled,
@@ -749,6 +753,7 @@ impl fmt::Display for SnapshotPersistenceError {
             | Self::PersistenceFailed { message }
             | Self::CorruptData { message }
             | Self::UnsupportedMode { message }
+            | Self::ResourceExhausted { message }
             | Self::Retryable { message } => formatter.write_str(message),
             Self::Timeout => formatter.write_str("snapshot persistence timed out"),
             Self::Cancelled => formatter.write_str("snapshot persistence was cancelled"),
@@ -1018,8 +1023,72 @@ pub trait AuthoritativeSnapshotPersistence: Send + Sync {
     ) -> SnapshotPersistenceFuture<'_>;
 }
 
-/// Metadata captured once under the same exclusive fence as every following
-/// bounded page.
+/// Exclusive keyset continuation for ordered outbox-watermark snapshot pages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotOutboxWatermarkCursor {
+    client_id: String,
+    stream_id: i64,
+}
+
+impl SnapshotOutboxWatermarkCursor {
+    pub fn try_new(
+        client_id: impl Into<String>,
+        stream_id: i64,
+    ) -> Result<Self, SnapshotPersistenceError> {
+        let client_id = client_id.into();
+        if client_id.is_empty() || client_id.contains('\0') || stream_id <= 0 {
+            return Err(SnapshotPersistenceError::invalid(
+                "outbox-watermark cursor requires a non-empty NUL-free client ID and positive stream ID",
+            ));
+        }
+        Ok(Self {
+            client_id,
+            stream_id,
+        })
+    }
+
+    pub fn from_watermark(
+        watermark: &OutboxStreamWatermark,
+    ) -> Result<Self, SnapshotPersistenceError> {
+        Self::try_new(watermark.client_id.clone(), watermark.stream_id)
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub const fn stream_id(&self) -> i64 {
+        self.stream_id
+    }
+}
+
+/// Exclusive keyset continuation for ordered replay-floor snapshot pages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotReplayFloorCursor {
+    target: DurableReplayTarget,
+}
+
+impl SnapshotReplayFloorCursor {
+    pub fn try_new(target: DurableReplayTarget) -> Result<Self, SnapshotPersistenceError> {
+        validate_replay_target(&target)
+            .map_err(|error| SnapshotPersistenceError::invalid(error.to_string()))?;
+        Ok(Self { target })
+    }
+
+    pub fn from_floor(floor: &DurableReplayFloor) -> Self {
+        Self {
+            target: floor.target().clone(),
+        }
+    }
+
+    pub const fn target(&self) -> &DurableReplayTarget {
+        &self.target
+    }
+}
+
+/// Metadata captured while the short exclusive fence pins the backend's
+/// immutable read view. Bounded pages drain that pinned view after the fence
+/// has been released.
 #[derive(Clone, Debug)]
 pub struct SnapshotCaptureHeader {
     resource_version_assignment: Option<ResourceVersionAssignment>,
@@ -1195,16 +1264,101 @@ fn validate_capture_len(len: usize) -> Result<(), SnapshotPersistenceError> {
     Ok(())
 }
 
-pub type SnapshotSinkFuture<'a> = SnapshotPersistenceFuture<'a>;
-pub trait SnapshotCaptureSink: Send {
-    fn push_page(&mut self, page: SnapshotCapturePage) -> SnapshotSinkFuture<'_>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotPageLimit(usize);
+
+impl SnapshotPageLimit {
+    pub fn try_new(value: usize) -> Result<Self, SnapshotPersistenceError> {
+        if value == 0 || value > MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(SnapshotPersistenceError::invalid(format!(
+                "snapshot page limit {value} is outside 1..={MAX_SNAPSHOT_CAPTURE_PAGE}"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotCaptureRequest {
+    page_limit: SnapshotPageLimit,
+    max_lifetime: std::time::Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotCommitCursor {
+    Namespace(String),
+    ClusterResource {
+        api_version: String,
+        kind: String,
+        name: String,
+    },
+    NamespacedResource {
+        api_version: String,
+        kind: String,
+        namespace: String,
+        name: String,
+    },
+    WatchEvent(i64),
+    NodeSubnet(String),
+    NodeDataplane(String),
+    PodCleanup {
+        node_name: String,
+        namespace: String,
+        pod_name: String,
+        pod_uid: String,
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotCaptureCursor {
+    Commit(SnapshotCommitCursor),
+    AppliedOutbox(String),
+    OutboxWatermark(SnapshotOutboxWatermarkCursor),
+    ReplayFloor(SnapshotReplayFloorCursor),
+    Complete,
+}
+
+impl SnapshotCaptureRequest {
+    pub fn try_new(
+        page_limit: SnapshotPageLimit,
+        max_lifetime: std::time::Duration,
+    ) -> Result<Self, SnapshotPersistenceError> {
+        if max_lifetime.is_zero() {
+            return Err(SnapshotPersistenceError::invalid(
+                "snapshot capture max lifetime must be positive",
+            ));
+        }
+        Ok(Self {
+            page_limit,
+            max_lifetime,
+        })
+    }
+
+    pub const fn page_limit(self) -> SnapshotPageLimit {
+        self.page_limit
+    }
+
+    pub const fn max_lifetime(self) -> std::time::Duration {
+        self.max_lifetime
+    }
+}
+
+pub trait SnapshotCaptureSession: Send {
+    fn header(&self) -> &SnapshotCaptureHeader;
+    fn next_page(&mut self) -> SnapshotPersistenceFuture<'_, Option<SnapshotCapturePage>>;
+    fn cancel(&mut self) -> SnapshotPersistenceFuture<'_>;
 }
 
 pub trait AuthoritativeSnapshotCapture: Send + Sync {
-    fn capture_authoritative_snapshot<'a>(
-        &'a self,
-        sink: &'a mut dyn SnapshotCaptureSink,
-    ) -> SnapshotPersistenceFuture<'a, SnapshotCaptureHeader>;
+    fn begin_capture(
+        &self,
+        request: SnapshotCaptureRequest,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>>;
 }
 
 /// Persistence failure while reading canonical cluster metadata.

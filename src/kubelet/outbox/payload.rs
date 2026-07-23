@@ -2,8 +2,8 @@ use std::fmt;
 
 use anyhow::{Result, anyhow};
 
-use crate::datastore::ResourcePreconditions;
-use crate::datastore::command::{StorageCommand, decode_command_protobuf, encode_command_protobuf};
+use crate::storage_wire_codec::{decode_command_protobuf, encode_command_protobuf};
+use klights_cluster_core::{ResourcePreconditions, StorageCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutboxOperation {
@@ -288,7 +288,7 @@ impl OutboxPayload {
     }
 
     pub fn encode_protobuf(&self) -> Result<Vec<u8>> {
-        encode_command_protobuf(&self.command)
+        Ok(encode_command_protobuf(&self.command)?)
     }
 
     pub fn decode_protobuf(bytes: &[u8]) -> Result<Self> {

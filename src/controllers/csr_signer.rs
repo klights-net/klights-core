@@ -302,7 +302,7 @@ mod tests {
     async fn raft_handle() -> crate::datastore::backend::DatastoreHandle {
         use crate::datastore::backend::DatastoreHandle;
         use crate::datastore::command::StorageCommand;
-        use crate::replication::sequenced_datastore::{RaftProposal, SequencedDatastore};
+        use crate::datastore::sequenced::{RaftProposal, SequencedDatastore};
 
         struct InlineProposer {
             inner: DatastoreHandle,

@@ -7,12 +7,13 @@
 //!
 //! Keep this module as pure apply logic: zero `await`, zero
 //! `DatastoreBackend` references, and no runtime side effects.
-use crate::datastore::command::{
-    COMMAND_CODEC_VERSION, CommandMeta, StorageCommand, StorageResponse, new_command_id,
-};
-use crate::datastore::types::{Resource, ResourceBatchOperation};
+use crate::replication::new_command_id;
 use crate::replication::protocol::{
     ForwardedNodeSubnet, ForwardedPodSlotAdmission, ForwardedResource, ReplicationEntry,
+};
+use klights_cluster_core::{
+    COMMAND_CODEC_VERSION, CommandMeta, Resource, ResourceBatchOperation, StorageCommand,
+    StorageResponse,
 };
 
 /// Outcome of applying a forwarded command on this replica.

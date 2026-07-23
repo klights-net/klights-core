@@ -10,26 +10,26 @@ pub mod worker_store;
 use async_trait::async_trait;
 pub use klights_leader_api::{
     CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, DataplaneEncryption,
-    HostPortRange as LeaderHostPortRange, LeaderCacheReadiness, LeaderNetworkTopologyQuery,
-    LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus, LeaderNodeSelfStatus,
-    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
-    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
-    NetworkDataplane, NetworkNodeMode, NetworkTopologyError, NetworkTopologyFuture,
-    NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture,
-    NodeLeaseRenewalRequest, NodeLeaseRenewalResult, NodeLifecycleStatusError,
-    NodeLifecycleStatusFuture, NodeLifecycleStatusRequest, NodeLifecycleStatusResult,
-    NodeSelfStatusError, NodeSelfStatusFuture, NodeSelfStatusRequest, NodeSelfStatusResult,
-    NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
-    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
-    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
-    PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountToken,
-    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
-    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
-    ResourceCommandRequest, ResourceCommandResult, ResourceEvent, ResourceGetRequest,
-    ResourceListRequest, ResourceListResult, ResourceQueryConsistency, ResourceQueryError,
-    ResourceQueryFuture, WatchEventType, WatchRequest, WatchResumeCursor, WatchStream,
-    config_map_get_request, node_get_request, pod_get_request, pods_on_node_list_request,
-    secret_get_request,
+    HostPortRange as LeaderHostPortRange, LeaderCacheReadiness, LeaderNetworkTopologyCommand,
+    LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus,
+    LeaderNodeSelfStatus, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
+    LeaderProjectedServiceAccountToken, LeaderResourceCommand, LeaderResourceQuery, LeaderWatch,
+    LeaderWatchError, LeaderWatchFuture, NetworkDataplane, NetworkNodeMode, NetworkTopologyError,
+    NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError,
+    NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    NodeLifecycleStatusError, NodeLifecycleStatusFuture, NodeLifecycleStatusRequest,
+    NodeLifecycleStatusResult, NodeSelfStatusError, NodeSelfStatusFuture, NodeSelfStatusRequest,
+    NodeSelfStatusResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
+    NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
+    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
+    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
+    ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
+    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceCommandError,
+    ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult, ResourceEvent,
+    ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryConsistency,
+    ResourceQueryError, ResourceQueryFuture, WatchEventType, WatchRequest, WatchResumeCursor,
+    WatchStream, config_map_get_request, node_get_request, pod_get_request,
+    pods_on_node_list_request, secret_get_request,
 };
 
 use crate::datastore::{NodeSubnet, Resource, ResourceList};
@@ -113,6 +113,22 @@ pub(crate) fn focused_dataplane(
         metadata.endpoint,
         metadata.port,
     )
+}
+
+pub(crate) trait IntoFocusedDataplane {
+    fn into_focused_dataplane(self) -> Result<NetworkDataplane, NetworkTopologyError>;
+}
+
+impl IntoFocusedDataplane for NetworkDataplane {
+    fn into_focused_dataplane(self) -> Result<NetworkDataplane, NetworkTopologyError> {
+        Ok(self)
+    }
+}
+
+impl IntoFocusedDataplane for DataplanePeerMetadata {
+    fn into_focused_dataplane(self) -> Result<NetworkDataplane, NetworkTopologyError> {
+        focused_dataplane(self)
+    }
 }
 
 pub(crate) fn legacy_dataplane(
@@ -882,7 +898,7 @@ mod tests {
             .expect("read terminal ledger")
             .expect("terminal ledger row");
         assert!(matches!(
-            crate::datastore::command::decode_response_protobuf(&ledger.result_proto),
+            crate::storage_wire_codec::decode_response_protobuf(&ledger.result_proto),
             Ok(crate::datastore::command::StorageResponse::Error { message })
                 if message.contains("delivery UID mismatch")
         ));

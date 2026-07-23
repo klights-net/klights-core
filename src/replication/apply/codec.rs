@@ -13,10 +13,11 @@
 //! bit-for-bit by delegating to the existing `datastore::command`
 //! functions; no on-wire change.
 
-use crate::datastore::command::{
-    CommandMeta, StorageCommand, StorageResponse, decode_command_protobuf, decode_meta_protobuf,
-    decode_response_protobuf, encode_command_protobuf, encode_meta_protobuf,
-    encode_response_protobuf,
+use klights_cluster_core::{CommandMeta, StorageCommand, StorageResponse};
+
+use crate::storage_wire_codec::{
+    decode_command_protobuf, decode_meta_protobuf, decode_response_protobuf,
+    encode_command_protobuf, encode_meta_protobuf, encode_response_protobuf,
 };
 
 /// Pluggable wire codec for replication entries.
@@ -39,22 +40,22 @@ pub struct ProtobufCommandCodec;
 
 impl CommandCodec for ProtobufCommandCodec {
     fn encode_command(&self, cmd: &StorageCommand) -> anyhow::Result<Vec<u8>> {
-        encode_command_protobuf(cmd)
+        Ok(encode_command_protobuf(cmd)?)
     }
     fn decode_command(&self, bytes: &[u8]) -> anyhow::Result<StorageCommand> {
-        decode_command_protobuf(bytes)
+        Ok(decode_command_protobuf(bytes)?)
     }
     fn encode_response(&self, resp: &StorageResponse) -> anyhow::Result<Vec<u8>> {
-        encode_response_protobuf(resp)
+        Ok(encode_response_protobuf(resp)?)
     }
     fn decode_response(&self, bytes: &[u8]) -> anyhow::Result<StorageResponse> {
-        decode_response_protobuf(bytes)
+        Ok(decode_response_protobuf(bytes)?)
     }
     fn encode_meta(&self, meta: &CommandMeta) -> anyhow::Result<Vec<u8>> {
-        encode_meta_protobuf(meta)
+        Ok(encode_meta_protobuf(meta)?)
     }
     fn decode_meta(&self, bytes: &[u8]) -> anyhow::Result<CommandMeta> {
-        decode_meta_protobuf(bytes)
+        Ok(decode_meta_protobuf(bytes)?)
     }
 }
 

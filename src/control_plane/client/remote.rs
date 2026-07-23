@@ -745,7 +745,6 @@ mod tests {
     use crate::datastore::command::StorageCommand;
     use crate::kubelet::outbox::OutboxApplyError;
     use crate::kubelet::outbox::payload::OutboxPayload;
-    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
     use crate::replication::grpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };
@@ -760,8 +759,8 @@ mod tests {
             public_key: None,
             endpoint: "127.0.0.1".to_string(),
             port: None,
-            mode: DataplaneMode::Root,
-            encryption: DataplaneEncryption::Disabled,
+            mode: klights_leader_api::NetworkNodeMode::Root,
+            encryption: klights_leader_api::DataplaneEncryption::Direct,
         }
     }
 

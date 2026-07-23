@@ -31,6 +31,8 @@ pub(super) const WATCH_REPLAY_POSITION_FLOORS: TableDefinition<&[u8], &[u8]> =
 
 pub(super) const APPLIED_OUTBOX: TableDefinition<&str, &[u8]> =
     TableDefinition::new("applied_outbox");
+pub(super) const OUTBOX_STREAM_WATERMARKS: TableDefinition<&[u8], i64> =
+    TableDefinition::new("outbox_stream_watermarks");
 
 // Materialized owner-reference table.  Key: ordered bytes
 // (owner_uid + NUL + tag_byte + owned_av + NUL + owned_kind + NUL
@@ -60,6 +62,8 @@ pub(super) const POD_ENDPOINTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("pod_endpoints");
 
 pub(super) const POD_WORKQUEUE: TableDefinition<u64, &[u8]> = TableDefinition::new("pod_workqueue");
+pub(super) const POD_CLEANUP_INTENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("pod_cleanup_intents");
 
 pub(super) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 

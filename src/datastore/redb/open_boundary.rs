@@ -153,6 +153,7 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::WATCH_REPLAY_FLOORS);
         let _ = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS);
         let _ = w.open_table(tables::APPLIED_OUTBOX);
+        let _ = w.open_table(tables::OUTBOX_STREAM_WATERMARKS);
         let _ = w.open_table(tables::RESOURCES_BY_OWNER);
         let _ = w.open_table(tables::RV_TO_KEY);
         let _ = w.open_table(tables::POD_SANDBOXES);
@@ -161,6 +162,7 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::POD_SLOT_ADMISSIONS);
         let _ = w.open_table(tables::POD_ENDPOINTS);
         let _ = w.open_table(tables::POD_WORKQUEUE);
+        let _ = w.open_table(tables::POD_CLEANUP_INTENTS);
         let _ = w.open_table(tables::META);
         let _ = w.open_table(tables::KLIGHTS_META);
     }

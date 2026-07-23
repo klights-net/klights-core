@@ -1,5 +1,51 @@
 use serde_json::Value;
 
+/// Projects one canonical ExternalIP address into a Node status object.
+/// Returns whether the value changed.
+pub fn set_node_external_ip(node: &mut Value, external_ip: &str) -> bool {
+    let external_ip = external_ip.trim();
+    if external_ip.is_empty() {
+        return false;
+    }
+    let Some(node) = node.as_object_mut() else {
+        return false;
+    };
+    let status = node
+        .entry("status")
+        .or_insert_with(|| serde_json::json!({}));
+    if !status.is_object() {
+        *status = serde_json::json!({});
+    }
+    let Some(status) = status.as_object_mut() else {
+        return false;
+    };
+    let addresses = status
+        .entry("addresses")
+        .or_insert_with(|| serde_json::json!([]));
+    if !addresses.is_array() {
+        *addresses = serde_json::json!([]);
+    }
+    let Some(addresses) = addresses.as_array_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let mut found = false;
+    for address in addresses.iter_mut() {
+        if address.get("type").and_then(Value::as_str) == Some("ExternalIP") {
+            found = true;
+            if address.get("address").and_then(Value::as_str) != Some(external_ip) {
+                address["address"] = Value::String(external_ip.to_string());
+                changed = true;
+            }
+        }
+    }
+    if !found {
+        addresses.push(serde_json::json!({"type": "ExternalIP", "address": external_ip}));
+        changed = true;
+    }
+    changed
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusApplyFreshness {
     Fresh,

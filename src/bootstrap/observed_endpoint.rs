@@ -291,15 +291,15 @@ async fn ensure_published_if_local_has_external_ip(
 
 fn placeholder_dataplane(node_mode: &NodeMode) -> JoinDataplaneMetadata {
     let mode = match node_mode {
-        NodeMode::Root => crate::networking::wireguard::DataplaneMode::Root,
-        NodeMode::Rootless { .. } => crate::networking::wireguard::DataplaneMode::Rootless,
+        NodeMode::Root => klights_leader_api::NetworkNodeMode::Root,
+        NodeMode::Rootless { .. } => klights_leader_api::NetworkNodeMode::Rootless,
     };
     JoinDataplaneMetadata {
         public_key: None,
         endpoint: String::new(),
         port: None,
         mode,
-        encryption: crate::networking::wireguard::DataplaneEncryption::Disabled,
+        encryption: klights_leader_api::DataplaneEncryption::Direct,
     }
 }
 

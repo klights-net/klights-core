@@ -11,8 +11,9 @@ use klights_cluster_store::{
     ResourceCollectionScope, ResourceContinuation, ResourceGetRequest, ResourceListPage,
     ResourceListRead, ResourceListRequest, ResourceListSnapshot, ResourceReadError,
     ResourceReadFuture, ResourceVersionMatch, SnapshotCaptureHeader, SnapshotCapturePage,
-    SnapshotCaptureSink, SnapshotMembership, SnapshotPersistenceError, SnapshotPersistenceFuture,
-    WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
+    SnapshotCapturePageKind, SnapshotCaptureSession, SnapshotMembership, SnapshotPersistenceError,
+    SnapshotPersistenceFuture, WatchHistoryError, WatchHistoryFuture, WatchHistoryPage,
+    WatchHistoryRead, WatchHistoryRequest,
 };
 
 use super::{DatastoreHandle, ResourceListQuery};
@@ -603,25 +604,47 @@ fn map_allocator_error(error: anyhow::Error) -> AllocatorStateError {
 /// cluster-store ports directly after physical extraction.
 pub(crate) struct DatastoreAuthoritativeSnapshotPersistence {
     db: DatastoreHandle,
+    recovery: std::sync::Arc<dyn crate::datastore::DurableRecoveryStore>,
 }
 
 impl DatastoreAuthoritativeSnapshotPersistence {
+    pub(crate) fn new_capture(db: DatastoreHandle) -> Self {
+        Self::from_legacy_handle(db)
+    }
+
     pub(crate) fn new(
         db: DatastoreHandle,
         _authority: crate::datastore::raft::SnapshotInstallAuthority,
     ) -> Self {
-        Self { db }
+        Self::from_legacy_handle(db)
     }
 
     #[cfg(test)]
     fn new_for_test(db: DatastoreHandle) -> Self {
-        Self { db }
+        Self::from_legacy_handle(db)
+    }
+
+    fn from_legacy_handle(db: DatastoreHandle) -> Self {
+        let recovery = std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+            db.clone(),
+        ));
+        Self { db, recovery }
     }
 
     pub(crate) async fn restore_legacy_raft_snapshot(
         &self,
         data: crate::datastore::raft::snapshot::RaftSnapshotData,
     ) -> anyhow::Result<()> {
+        let metadata = data.cluster_metadata;
+        let membership = match data.cluster_membership {
+            None => crate::datastore::ReplicatedMembershipState::LegacyOmitted,
+            Some(crate::datastore::raft::snapshot::RaftSnapshotMembership::AuthoritativeAbsent) => {
+                crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent
+            }
+            Some(crate::datastore::raft::snapshot::RaftSnapshotMembership::Present(value)) => {
+                crate::datastore::ReplicatedMembershipState::Present(value)
+            }
+        };
         self.db
             .replace_replicated_resource_state(
                 data.commits,
@@ -629,9 +652,14 @@ impl DatastoreAuthoritativeSnapshotPersistence {
                 data.watch_event_high_water,
                 data.watch_replay_floors,
                 Some(crate::datastore::ReplicatedSnapshotMetadata {
-                    cluster_id: String::new(),
-                    leader_epoch: 0,
-                    membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
+                    cluster_id: metadata
+                        .as_ref()
+                        .map(|metadata| metadata.cluster_id.clone())
+                        .unwrap_or_default(),
+                    leader_epoch: metadata
+                        .as_ref()
+                        .map_or(0, |metadata| metadata.leader_epoch),
+                    membership,
                     resource_version_assignment_mode: None,
                     snapshot_assignment_mode: Some(data.resource_version_assignment_mode),
                 }),
@@ -718,188 +746,132 @@ impl AuthoritativeSnapshotPersistence for DatastoreAuthoritativeSnapshotPersiste
     }
 }
 
-struct PortSnapshotCommitSink<'a> {
-    sink: &'a mut dyn SnapshotCaptureSink,
-    pending: Vec<klights_cluster_core::LogApplyCommit>,
+/// Normalizes backend table-family fragments into bounded public commit pages.
+///
+/// A backend may expose several adjacent commit pages while it walks distinct
+/// physical tables. The cluster-store port deliberately exposes one logical
+/// commit family, so combine adjacent fragments up to the caller's page bound.
+/// At most one bounded remainder page is retained between calls; the adapter
+/// never reconstructs or buffers a complete snapshot.
+struct NormalizingSnapshotCaptureSession {
+    inner: Box<dyn SnapshotCaptureSession>,
+    buffered: Option<SnapshotCapturePage>,
+    page_limit: usize,
 }
 
-impl PortSnapshotCommitSink<'_> {
-    async fn flush(&mut self) -> Result<(), SnapshotPersistenceError> {
-        if self.pending.is_empty() {
-            return Ok(());
+impl NormalizingSnapshotCaptureSession {
+    fn new(inner: Box<dyn SnapshotCaptureSession>, page_limit: usize) -> Self {
+        Self {
+            inner,
+            buffered: None,
+            page_limit,
         }
-        let rows = std::mem::replace(
-            &mut self.pending,
-            Vec::with_capacity(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE),
-        );
-        self.sink
-            .push_page(SnapshotCapturePage::try_commits(rows)?)
-            .await
+    }
+
+    async fn next_normalized_page(
+        &mut self,
+    ) -> Result<Option<SnapshotCapturePage>, SnapshotPersistenceError> {
+        let Some(first) = (match self.buffered.take() {
+            Some(page) => Some(page),
+            None => self.inner.next_page().await?,
+        }) else {
+            return Ok(None);
+        };
+        if first.kind() != SnapshotCapturePageKind::Commits {
+            return Ok(Some(first));
+        }
+
+        let mut commits = first
+            .into_commits()
+            .expect("commit page kind must contain commits");
+        while commits.len() < self.page_limit {
+            let Some(next) = self.inner.next_page().await? else {
+                break;
+            };
+            if next.kind() != SnapshotCapturePageKind::Commits {
+                self.buffered = Some(next);
+                break;
+            }
+
+            let remaining = self.page_limit - commits.len();
+            let mut next_commits = next
+                .into_commits()
+                .expect("commit page kind must contain commits");
+            if next_commits.len() <= remaining {
+                commits.append(&mut next_commits);
+                continue;
+            }
+
+            let remainder = next_commits.split_off(remaining);
+            commits.append(&mut next_commits);
+            self.buffered = Some(SnapshotCapturePage::try_commits(remainder)?);
+            break;
+        }
+        Ok(Some(SnapshotCapturePage::try_commits(commits)?))
     }
 }
 
-impl crate::replication::snapshot::SnapshotCommitSink for PortSnapshotCommitSink<'_> {
-    async fn push(
-        &mut self,
-        mut commit: klights_cluster_core::LogApplyCommit,
-    ) -> anyhow::Result<()> {
-        // Applied-outbox rows and stream watermarks are emitted through their
-        // dedicated bounded page families below.  Remove the legacy snapshot
-        // emitter's copies so a capture has exactly one authoritative source
-        // for each durable family.
-        commit.mutations.retain(|mutation| {
-            !matches!(
-                mutation,
-                klights_cluster_core::LogApplyMutation::PutAppliedOutbox(_)
-            )
-        });
-        commit.outbox_watermark = None;
-        if commit.mutations.is_empty() {
-            return Ok(());
-        }
-        self.pending.push(commit);
-        if self.pending.len() == klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
-            self.flush().await.map_err(anyhow::Error::from)?;
-        }
-        Ok(())
+impl SnapshotCaptureSession for NormalizingSnapshotCaptureSession {
+    fn header(&self) -> &SnapshotCaptureHeader {
+        self.inner.header()
+    }
+
+    fn next_page(&mut self) -> SnapshotPersistenceFuture<'_, Option<SnapshotCapturePage>> {
+        Box::pin(self.next_normalized_page())
+    }
+
+    fn cancel(&mut self) -> SnapshotPersistenceFuture<'_> {
+        self.buffered = None;
+        self.inner.cancel()
     }
 }
 
 impl AuthoritativeSnapshotCapture for DatastoreAuthoritativeSnapshotPersistence {
-    fn capture_authoritative_snapshot<'a>(
-        &'a self,
-        sink: &'a mut dyn SnapshotCaptureSink,
-    ) -> SnapshotPersistenceFuture<'a, SnapshotCaptureHeader> {
+    fn begin_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
         Box::pin(async move {
-            let _fence = self
-                .db
-                .acquire_snapshot_exclusive_fence()
-                .await
-                .map_err(map_snapshot_persistence_error)?
-                .ok_or_else(|| SnapshotPersistenceError::UnsupportedMode {
-                    message: "backend does not provide a coherent snapshot capture fence"
-                        .to_string(),
-                })?;
-            let allocator = self
-                .db
-                .read_durable_allocator_observation()
+            let session = self
+                .recovery
+                .begin_pinned_snapshot_capture(request)
                 .await
                 .map_err(map_snapshot_persistence_error)?;
-            let metadata = self
-                .db
-                .read_cluster_metadata_observation()
-                .await
-                .map_err(map_snapshot_persistence_error)?;
-            let membership = match metadata.membership {
-                crate::datastore::ReplicatedMembershipState::LegacyOmitted => {
-                    SnapshotMembership::LegacyOmitted
-                }
-                crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent => {
-                    SnapshotMembership::AuthoritativeAbsent
-                }
-                crate::datastore::ReplicatedMembershipState::Present(value) => {
-                    SnapshotMembership::Present(value)
-                }
-            };
-            let header = SnapshotCaptureHeader::try_new(
-                Some(allocator.resource_version_assignment),
-                allocator.position,
-                metadata.metadata,
-                membership,
-            )?;
-
-            let mut bridge = PortSnapshotCommitSink {
-                sink,
-                pending: Vec::with_capacity(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE),
-            };
-            crate::replication::snapshot::stream_snapshot_commits(self.db.as_ref(), 0, &mut bridge)
-                .await
-                .map_err(map_snapshot_persistence_error)?;
-            bridge.flush().await?;
-
-            let floors = self
-                .db
-                .list_watch_replay_floors()
-                .await
-                .map_err(map_snapshot_persistence_error)?;
-            for chunk in floors.chunks(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE) {
-                let rows = chunk
-                    .iter()
-                    .cloned()
-                    .map(root_floor_to_port)
-                    .collect::<Result<Vec<_>, _>>()?;
-                bridge
-                    .sink
-                    .push_page(SnapshotCapturePage::try_replay_floors(rows)?)
-                    .await?;
-            }
-
-            let watermarks = self
-                .db
-                .list_outbox_stream_watermarks()
-                .await
-                .map_err(map_snapshot_persistence_error)?;
-            for chunk in watermarks.chunks(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE) {
-                bridge
-                    .sink
-                    .push_page(SnapshotCapturePage::try_outbox_watermarks(chunk.to_vec())?)
-                    .await?;
-            }
-
-            let page_limit =
-                std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE)
-                    .expect("capture page bound is nonzero");
-            let mut after_key = None;
-            loop {
-                let rows = self
-                    .db
-                    .list_applied_outbox_paged(after_key.as_deref(), page_limit)
-                    .await
-                    .map_err(map_snapshot_persistence_error)?;
-                if rows.is_empty() {
-                    break;
-                }
-                after_key = rows.last().map(|row| row.idempotency_key.clone());
-                bridge
-                    .sink
-                    .push_page(SnapshotCapturePage::try_applied_outbox(
-                        rows.into_iter().map(Into::into).collect(),
-                    )?)
-                    .await?;
-            }
-            Ok(header)
+            Ok(Box::new(NormalizingSnapshotCaptureSession::new(
+                session,
+                request.page_limit().get(),
+            )) as Box<dyn SnapshotCaptureSession>)
         })
     }
 }
 
-fn root_floor_to_port(
-    floor: crate::datastore::WatchReplayFloor,
-) -> Result<DurableReplayFloor, SnapshotPersistenceError> {
-    let target = match (floor.api_version, floor.kind, floor.namespace_key) {
-        (api_version, kind, namespace) if api_version == "*" && kind == "*" && namespace == "*" => {
-            DurableReplayTarget::All
-        }
-        (api_version, kind, namespace) if namespace == "#cluster" => {
-            DurableReplayTarget::Cluster { api_version, kind }
-        }
-        (api_version, kind, namespace) => DurableReplayTarget::Namespaced {
-            api_version,
-            kind,
-            namespace,
-        },
-    };
-    DurableReplayFloor::new(
-        target,
-        floor.floor_resource_version,
-        floor.floor_event_id,
-        floor.position_is_exact,
-    )
-    .map_err(|error| SnapshotPersistenceError::CorruptData {
-        message: error.to_string(),
-    })
-}
-
 fn map_snapshot_persistence_error(error: anyhow::Error) -> SnapshotPersistenceError {
+    if let Some(error) = error.downcast_ref::<SnapshotPersistenceError>() {
+        return error.clone();
+    }
+    if let Some(error) = error.downcast_ref::<klights_node_store::RaftDurabilityError>() {
+        return match error {
+            klights_node_store::RaftDurabilityError::InvalidInput { message, .. }
+            | klights_node_store::RaftDurabilityError::CorruptData { message, .. } => {
+                SnapshotPersistenceError::CorruptData {
+                    message: message.clone(),
+                }
+            }
+            klights_node_store::RaftDurabilityError::Retryable { message, .. } => {
+                SnapshotPersistenceError::Retryable {
+                    message: message.clone(),
+                }
+            }
+            klights_node_store::RaftDurabilityError::Timeout => SnapshotPersistenceError::Timeout,
+            klights_node_store::RaftDurabilityError::Cancelled => {
+                SnapshotPersistenceError::Cancelled
+            }
+            klights_node_store::RaftDurabilityError::PersistenceFailed { operation, message } => {
+                SnapshotPersistenceError::persistence_failed(format!("{operation}: {message}"))
+            }
+            _ => SnapshotPersistenceError::persistence_failed(error.to_string()),
+        };
+    }
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
     if lower.contains("corrupt") || lower.contains("decode") || lower.contains("invalid") {
@@ -987,6 +959,7 @@ fn map_cluster_metadata_error(error: anyhow::Error) -> ClusterMetadataStoreError
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
     use klights_cluster_core::{
@@ -1004,18 +977,217 @@ mod tests {
         DurableWatchTarget, PrivilegedCommittedRaftApply, ResourceCollectionScope,
         ResourceGetRequest, ResourceListQuery, ResourceListRead, ResourceListRequest,
         ResourceReadError, ResourceVersionMatch, SnapshotCaptureHeader, SnapshotCapturePage,
-        SnapshotCaptureSink, SnapshotMembership, SnapshotPersistenceError, SnapshotSinkFuture,
-        WatchHistoryRead, WatchHistoryRequest,
+        SnapshotCaptureSession, SnapshotMembership, SnapshotPersistenceError,
+        SnapshotPersistenceFuture, WatchHistoryRead, WatchHistoryRequest,
     };
     use serde_json::json;
+
+    type TestSinkFuture<'a> = SnapshotPersistenceFuture<'a>;
+
+    trait TestPageSink: Send {
+        fn begin_capture(&mut self, header: &SnapshotCaptureHeader) -> TestSinkFuture<'_>;
+        fn push_page(&mut self, page: SnapshotCapturePage) -> TestSinkFuture<'_>;
+    }
+
+    trait PullCaptureTestExt {
+        fn collect_snapshot_pages<'a>(
+            &'a self,
+            sink: &'a mut dyn TestPageSink,
+        ) -> SnapshotPersistenceFuture<'a, SnapshotCaptureHeader>;
+    }
+
+    impl<T: AuthoritativeSnapshotCapture + ?Sized> PullCaptureTestExt for T {
+        fn collect_snapshot_pages<'a>(
+            &'a self,
+            sink: &'a mut dyn TestPageSink,
+        ) -> SnapshotPersistenceFuture<'a, SnapshotCaptureHeader> {
+            Box::pin(async move {
+                let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
+                    klights_cluster_store::SnapshotPageLimit::try_new(
+                        klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE,
+                    )?,
+                    std::time::Duration::from_secs(30),
+                )?;
+                let mut session = self.begin_capture(request).await?;
+                let header = session.header().clone();
+                sink.begin_capture(&header).await?;
+                while let Some(page) = session.next_page().await? {
+                    sink.push_page(page).await?;
+                }
+                Ok(header)
+            })
+        }
+    }
 
     use super::{
         DatastoreAuthoritativeSnapshotPersistence, DatastoreClusterMetadataRead,
         DatastoreClusterResourceRead, DatastoreCommittedRaftApply, DatastoreDurableAllocatorRead,
-        DatastoreDurableWatchHistory, map_committed_apply_error, map_snapshot_persistence_error,
+        DatastoreDurableWatchHistory, NormalizingSnapshotCaptureSession, map_committed_apply_error,
+        map_snapshot_persistence_error,
     };
     use crate::datastore::sqlite::Datastore;
     use crate::datastore::{DatastoreBackend, DatastoreHandle};
+
+    async fn persistent_snapshot_store() -> (tempfile::TempDir, Datastore) {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let db = Datastore::new_persistent_paths(
+            &root.path().join("cluster.db"),
+            &root.path().join("node.db"),
+            supervisor,
+            None,
+        )
+        .await
+        .unwrap();
+        (root, db)
+    }
+
+    struct FragmentedCaptureSession {
+        header: SnapshotCaptureHeader,
+        pages: VecDeque<SnapshotCapturePage>,
+    }
+
+    impl SnapshotCaptureSession for FragmentedCaptureSession {
+        fn header(&self) -> &SnapshotCaptureHeader {
+            &self.header
+        }
+
+        fn next_page(&mut self) -> SnapshotPersistenceFuture<'_, Option<SnapshotCapturePage>> {
+            let page = self.pages.pop_front();
+            Box::pin(async move { Ok(page) })
+        }
+
+        fn cancel(&mut self) -> SnapshotPersistenceFuture<'_> {
+            self.pages.clear();
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn normalizing_session_coalesces_commits_with_one_bounded_remainder() {
+        let page_limit = 256;
+        let commit_page = |start: i64| {
+            SnapshotCapturePage::try_commits(
+                (start..start + 200)
+                    .map(|resource_version| LogApplyCommit::new(resource_version, Vec::new()))
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let header = SnapshotCaptureHeader::try_new(
+            Some(ResourceVersionAssignment::LegacyLeaderAssigned),
+            WatchReplayPosition {
+                resource_version: 600,
+                event_id: 0,
+                resource_version_filter_through_event_id: 0,
+            },
+            ClusterMetadata {
+                cluster_id: "normalizing-session".into(),
+                leader_epoch: 1,
+                current_rv: 600,
+            },
+            SnapshotMembership::AuthoritativeAbsent,
+        )
+        .unwrap();
+        let inner = FragmentedCaptureSession {
+            header,
+            pages: VecDeque::from([commit_page(1), commit_page(201), commit_page(401)]),
+        };
+        let mut session = NormalizingSnapshotCaptureSession::new(Box::new(inner), page_limit);
+
+        let mut lengths = Vec::new();
+        while let Some(page) = session.next_page().await.unwrap() {
+            lengths.push(page.len());
+            assert!(page.len() <= page_limit);
+            assert!(
+                session
+                    .buffered
+                    .as_ref()
+                    .is_none_or(|buffered| buffered.len() <= page_limit),
+                "normalization may retain only one bounded remainder page"
+            );
+        }
+        assert_eq!(lengths, vec![256, 256, 88]);
+    }
+
+    #[tokio::test]
+    async fn legacy_raft_restore_replaces_divergent_metadata_and_authoritative_absence() {
+        let destination = Datastore::new_in_memory().await.unwrap();
+        destination
+            .replace_replicated_resource_state(
+                Vec::new(),
+                9,
+                Some(0),
+                Some(Vec::new()),
+                Some(crate::datastore::ReplicatedSnapshotMetadata {
+                    cluster_id: "divergent-cluster".into(),
+                    leader_epoch: 99,
+                    membership: crate::datastore::ReplicatedMembershipState::Present(
+                        ClusterMembership {
+                            cluster_id: "divergent-cluster".into(),
+                            voters: vec!["stale-cp".into()],
+                            term: 99,
+                            leader_hint: Some("stale-cp".into()),
+                        },
+                    ),
+                    resource_version_assignment_mode: Some(
+                        ResourceVersionAssignment::CommittedApplyV1,
+                    ),
+                    snapshot_assignment_mode: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let restore =
+            DatastoreAuthoritativeSnapshotPersistence::new_for_test(Arc::new(destination.clone()));
+        restore
+            .restore_legacy_raft_snapshot(crate::datastore::raft::snapshot::RaftSnapshotData {
+                last_applied: None,
+                membership: openraft::StoredMembership::default(),
+                current_rv: 5,
+                resource_version_assignment_mode:
+                    crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
+                        ResourceVersionAssignment::CommittedApplyV1,
+                    ),
+                watch_event_high_water: Some(0),
+                watch_replay_floors: Some(Vec::new()),
+                cluster_metadata: Some(ClusterMetadata {
+                    cluster_id: "leader-cluster".into(),
+                    leader_epoch: 7,
+                    current_rv: 5,
+                }),
+                cluster_membership: Some(
+                    crate::datastore::raft::snapshot::RaftSnapshotMembership::AuthoritativeAbsent,
+                ),
+                commits: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let observed = destination
+            .read_cluster_metadata_observation()
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.metadata,
+            ClusterMetadata {
+                cluster_id: "leader-cluster".into(),
+                leader_epoch: 7,
+                current_rv: 5,
+            }
+        );
+        assert_eq!(
+            observed.membership,
+            crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent
+        );
+    }
 
     #[test]
     fn adapter_maps_unsupported_backend_and_mode_errors_semantically() {
@@ -1140,7 +1312,7 @@ mod tests {
                 operation: "PodStatus".to_string(),
                 first_seen_ms: status_stamp,
                 applied_rv: None,
-                result_proto: crate::datastore::command::encode_response_protobuf(
+                result_proto: crate::storage_wire_codec::encode_response_protobuf(
                     &crate::datastore::command::StorageResponse::Ack {
                         resource_version: 0,
                     },
@@ -2442,11 +2614,24 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct CapturedPages(Vec<SnapshotCapturePage>);
+    struct CapturedPages {
+        pages: Vec<SnapshotCapturePage>,
+        headers: Vec<SnapshotCaptureHeader>,
+    }
 
-    impl SnapshotCaptureSink for CapturedPages {
-        fn push_page(&mut self, page: SnapshotCapturePage) -> SnapshotSinkFuture<'_> {
-            self.0.push(page);
+    impl TestPageSink for CapturedPages {
+        fn begin_capture(&mut self, header: &SnapshotCaptureHeader) -> TestSinkFuture<'_> {
+            assert!(
+                self.pages.is_empty(),
+                "begin_capture must precede every page"
+            );
+            self.headers.push(header.clone());
+            Box::pin(async { Ok(()) })
+        }
+
+        fn push_page(&mut self, page: SnapshotCapturePage) -> TestSinkFuture<'_> {
+            assert_eq!(self.headers.len(), 1, "capture must begin exactly once");
+            self.pages.push(page);
             Box::pin(async { Ok(()) })
         }
     }
@@ -2457,8 +2642,12 @@ mod tests {
         blocked: bool,
     }
 
-    impl SnapshotCaptureSink for BlockingCaptureSink {
-        fn push_page(&mut self, _page: SnapshotCapturePage) -> SnapshotSinkFuture<'_> {
+    impl TestPageSink for BlockingCaptureSink {
+        fn begin_capture(&mut self, _header: &SnapshotCaptureHeader) -> TestSinkFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn push_page(&mut self, _page: SnapshotCapturePage) -> TestSinkFuture<'_> {
             if self.blocked {
                 return Box::pin(async { Ok(()) });
             }
@@ -2470,6 +2659,26 @@ mod tests {
                 resume.notified().await;
                 Ok(())
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct RejectBeginCapture {
+        pages: usize,
+    }
+
+    impl TestPageSink for RejectBeginCapture {
+        fn begin_capture(&mut self, _header: &SnapshotCaptureHeader) -> TestSinkFuture<'_> {
+            Box::pin(async {
+                Err(SnapshotPersistenceError::UnsupportedMode {
+                    message: "test rejected capture header".to_string(),
+                })
+            })
+        }
+
+        fn push_page(&mut self, _page: SnapshotCapturePage) -> TestSinkFuture<'_> {
+            self.pages += 1;
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -2510,8 +2719,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_holds_exclusive_fence_until_the_sink_accepts_every_page() {
-        let db = Datastore::new_in_memory().await.unwrap();
+    async fn capture_releases_mutation_fence_before_consumer_accepts_first_page() {
+        let (_root, db) = persistent_snapshot_store().await;
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -2546,7 +2755,7 @@ mod tests {
                 resume: capture_resume,
                 blocked: false,
             };
-            capture.capture_authoritative_snapshot(&mut sink).await
+            capture.collect_snapshot_pages(&mut sink).await
         });
         reached_wait.await;
 
@@ -2559,21 +2768,19 @@ mod tests {
             .unwrap()
             .expect("sqlite supplies a mutation fence")
         });
-        tokio::task::yield_now().await;
-        assert!(
-            !mutation_fence_task.is_finished(),
-            "a committed mutation must not cross a blocked capture sink"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), mutation_fence_task)
+            .await
+            .expect("capture must release the mutation fence before consumer backpressure")
+            .unwrap();
 
         resume.notify_one();
         capture_task.await.unwrap().unwrap();
-        mutation_fence_task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn capture_keyset_pages_more_than_the_maximum_applied_outbox_rows() {
+    async fn capture_keyset_pages_every_unbounded_family_without_gaps_or_duplicates() {
         let db = Datastore::new_in_memory().await.unwrap();
-        let result_proto = crate::datastore::command::encode_response_protobuf(
+        let result_proto = crate::storage_wire_codec::encode_response_protobuf(
             &crate::datastore::command::StorageResponse::Ack {
                 resource_version: 1,
             },
@@ -2592,11 +2799,34 @@ mod tests {
                 })
             })
             .collect();
+        let mut commits = vec![LogApplyCommit::new(1, mutations)];
+        commits.extend(
+            (0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE).map(|index| LogApplyCommit {
+                resource_version: 1,
+                resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
+                outbox_watermark: Some(OutboxStreamWatermark {
+                    client_id: format!("worker-{index:04}"),
+                    stream_id: 1,
+                    stream_seq: 1,
+                }),
+                mutations: Vec::new(),
+            }),
+        );
+        let floors = (0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE)
+            .map(|index| crate::datastore::WatchReplayFloor {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace_key: format!("ns-{index:04}"),
+                floor_resource_version: 1,
+                floor_event_id: 0,
+                position_is_exact: true,
+            })
+            .collect();
         db.replace_replicated_resource_state(
-            vec![LogApplyCommit::new(1, mutations)],
+            commits,
             1,
             Some(0),
-            Some(Vec::new()),
+            Some(floors),
             Some(crate::datastore::ReplicatedSnapshotMetadata {
                 cluster_id: "capture-page-cluster".into(),
                 leader_epoch: 1,
@@ -2609,29 +2839,93 @@ mod tests {
         )
         .await
         .unwrap();
+        let oversized =
+            std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1)
+                .unwrap();
+        assert!(
+            db.list_outbox_stream_watermarks_paged(None, oversized)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.list_watch_replay_floors_paged(None, oversized)
+                .await
+                .is_err()
+        );
         let handle: DatastoreHandle = Arc::new(db);
         let capture = DatastoreAuthoritativeSnapshotPersistence::new_for_test(handle);
         let mut pages = CapturedPages::default();
-        capture
-            .capture_authoritative_snapshot(&mut pages)
-            .await
-            .unwrap();
+        let header = capture.collect_snapshot_pages(&mut pages).await.unwrap();
 
-        let page_lengths = pages
-            .0
-            .iter()
-            .filter_map(|page| page.applied_outbox().map(<[_]>::len))
-            .collect::<Vec<_>>();
+        let expected_page_lengths = vec![klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE, 1];
         assert_eq!(
-            page_lengths,
-            vec![klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE, 1]
+            pages
+                .pages
+                .iter()
+                .filter_map(|page| page.applied_outbox().map(<[_]>::len))
+                .collect::<Vec<_>>(),
+            expected_page_lengths
         );
+        assert_eq!(
+            pages
+                .pages
+                .iter()
+                .filter_map(|page| page.outbox_watermarks().map(<[_]>::len))
+                .collect::<Vec<_>>(),
+            expected_page_lengths
+        );
+        assert_eq!(
+            pages
+                .pages
+                .iter()
+                .filter_map(|page| page.replay_floors().map(<[_]>::len))
+                .collect::<Vec<_>>(),
+            expected_page_lengths
+        );
+        let watermark_ids = pages
+            .pages
+            .iter()
+            .filter_map(SnapshotCapturePage::outbox_watermarks)
+            .flatten()
+            .map(|row| row.client_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(watermark_ids.len(), 513);
+        assert!(watermark_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        let floor_namespaces = pages
+            .pages
+            .iter()
+            .filter_map(SnapshotCapturePage::replay_floors)
+            .flatten()
+            .map(|row| match row.target() {
+                DurableReplayTarget::Namespaced { namespace, .. } => namespace.as_str(),
+                _ => panic!("fixture contains namespaced floors only"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(floor_namespaces.len(), 513);
+        assert!(floor_namespaces.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(pages.headers.len(), 1);
+        let begun = &pages.headers[0];
+        assert_eq!(
+            begun.resource_version_assignment(),
+            header.resource_version_assignment()
+        );
+        assert_eq!(begun.position(), header.position());
+        assert_eq!(begun.metadata(), header.metadata());
+        assert_eq!(begun.membership(), header.membership());
+
+        let mut rejected = RejectBeginCapture::default();
+        let error = capture
+            .collect_snapshot_pages(&mut rejected)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test rejected capture header"));
+        assert_eq!(rejected.pages, 0, "begin failure must prevent every page");
     }
 
     #[tokio::test]
     async fn capture_restores_every_durable_family_and_preserves_outbox_dedupe() {
         let source = Datastore::new_in_memory().await.unwrap();
-        let result_proto = crate::datastore::command::encode_response_protobuf(
+        let result_proto = crate::storage_wire_codec::encode_response_protobuf(
             &crate::datastore::command::StorageResponse::Ack {
                 resource_version: 7,
             },
@@ -2804,10 +3098,21 @@ mod tests {
         let source_handle: DatastoreHandle = Arc::new(source.clone());
         let capture = DatastoreAuthoritativeSnapshotPersistence::new_for_test(source_handle);
         let mut pages = CapturedPages::default();
-        let header = capture
-            .capture_authoritative_snapshot(&mut pages)
-            .await
-            .unwrap();
+        let header = capture.collect_snapshot_pages(&mut pages).await.unwrap();
+        assert_eq!(
+            pages
+                .pages
+                .iter()
+                .map(SnapshotCapturePage::kind)
+                .collect::<Vec<_>>(),
+            vec![
+                klights_cluster_store::SnapshotCapturePageKind::Commits,
+                klights_cluster_store::SnapshotCapturePageKind::OutboxWatermarks,
+                klights_cluster_store::SnapshotCapturePageKind::AppliedOutbox,
+                klights_cluster_store::SnapshotCapturePageKind::ReplayFloors,
+            ],
+            "capture families must stay in streaming JSON order"
+        );
 
         let destination = Datastore::new_in_memory().await.unwrap();
         destination
@@ -2824,7 +3129,7 @@ mod tests {
         let restore =
             DatastoreAuthoritativeSnapshotPersistence::new_for_test(destination_handle.clone());
         restore
-            .restore_authoritative_snapshot(snapshot_from_capture(&header, &pages.0))
+            .restore_authoritative_snapshot(snapshot_from_capture(&header, &pages.pages))
             .await
             .unwrap();
 
@@ -2950,30 +3255,27 @@ mod tests {
         let handle: DatastoreHandle = Arc::new(db) as Arc<dyn DatastoreBackend>;
         let capture = DatastoreAuthoritativeSnapshotPersistence::new_for_test(handle);
         let mut pages = CapturedPages::default();
-        let header = capture
-            .capture_authoritative_snapshot(&mut pages)
-            .await
-            .unwrap();
+        let header = capture.collect_snapshot_pages(&mut pages).await.unwrap();
         assert_eq!(header.metadata().cluster_id, "cluster-a");
         assert!(
             pages
-                .0
+                .pages
                 .iter()
                 .all(|page| page.len() <= klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE)
         );
         assert!(
             pages
-                .0
+                .pages
                 .iter()
                 .any(|page| page.applied_outbox().is_some_and(|rows| rows
                     .iter()
                     .any(|row| row.idempotency_key == "capture-ledger")))
         );
-        assert!(pages.0.iter().any(|page| {
+        assert!(pages.pages.iter().any(|page| {
             page.outbox_watermarks()
                 .is_some_and(|rows| rows.iter().any(|row| row.stream_seq == 1))
         }));
-        assert!(pages.0.iter().all(|page| {
+        assert!(pages.pages.iter().all(|page| {
             page.commits().is_none_or(|commits| {
                 commits.iter().all(|commit| {
                     commit.outbox_watermark.is_none()

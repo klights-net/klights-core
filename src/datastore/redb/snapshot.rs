@@ -43,6 +43,7 @@ impl DatastoreSnapshotter for RedbDatastore {
     }
 
     async fn snapshot(&self) -> Result<SnapshotEnvelope> {
+        let _snapshot_fence = self.accessor.acquire_snapshot_exclusive().await;
         let r = self.accessor.db().unwrap().begin_read()?;
 
         let last_applied_rv: i64 = {
@@ -240,6 +241,7 @@ impl DatastoreSnapshotter for RedbDatastore {
         self.validate_envelope(envelope)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        let _snapshot_fence = self.accessor.acquire_snapshot_exclusive().await;
         let w = self.accessor.db().unwrap().begin_write()?;
 
         for table in &envelope.tables {

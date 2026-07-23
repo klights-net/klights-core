@@ -13,12 +13,14 @@
 pub mod apply;
 pub mod grpc;
 pub mod protocol;
-pub(crate) mod sequenced_datastore;
 pub mod service;
-pub mod snapshot;
-pub mod snapshot_commit_channel_sink;
-
+#[cfg(test)]
+pub mod test_proto_channel_sink;
 pub use service::ReplicationService;
+
+pub(crate) fn new_command_id() -> klights_cluster_core::CommandId {
+    klights_cluster_core::CommandId(uuid::Uuid::new_v4().to_string())
+}
 
 #[cfg(test)]
 mod tests {

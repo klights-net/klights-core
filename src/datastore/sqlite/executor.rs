@@ -37,6 +37,7 @@ struct DbExecutorInner {
     task_supervisor: Arc<TaskSupervisor>,
     connection_key: String,
     call_category: TaskCategory,
+    reopen_opts: Option<OpenOpts>,
 }
 
 #[derive(Debug, Error)]
@@ -66,11 +67,12 @@ impl DbExecutor {
         task_supervisor: Arc<TaskSupervisor>,
         connection_key: impl Into<String>,
     ) -> Self {
-        Self::new_with_category(
+        Self::new_with_category_and_opts(
             connection,
             task_supervisor,
             connection_key,
             TaskCategory::Db,
+            None,
         )
     }
 
@@ -93,22 +95,40 @@ impl DbExecutor {
         connection_key: impl Into<String>,
         call_category: TaskCategory,
     ) -> Self {
+        Self::new_with_category_and_opts(
+            connection,
+            task_supervisor,
+            connection_key,
+            call_category,
+            None,
+        )
+    }
+
+    fn new_with_category_and_opts(
+        connection: Connection,
+        task_supervisor: Arc<TaskSupervisor>,
+        connection_key: impl Into<String>,
+        call_category: TaskCategory,
+        reopen_opts: Option<OpenOpts>,
+    ) -> Self {
         Self {
             inner: Arc::new(DbExecutorInner {
                 connection,
                 task_supervisor,
                 connection_key: connection_key.into(),
                 call_category,
+                reopen_opts,
             }),
         }
     }
 
     pub fn read_lane_clone(&self) -> Self {
-        Self::new_with_category(
+        Self::new_with_category_and_opts(
             self.inner.connection.clone(),
             self.inner.task_supervisor.clone(),
             self.inner.connection_key.clone(),
             TaskCategory::DbRead,
+            self.inner.reopen_opts.clone(),
         )
     }
 
@@ -127,12 +147,18 @@ impl DbExecutor {
         connection_key: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let db_path = match &opts.path {
-            OpenPath::InMemory => None,
+            OpenPath::SharedMemory(_) => None,
             OpenPath::Disk(p) => Some(p.clone()),
         };
 
         let connection = match &opts.path {
-            OpenPath::InMemory => Connection::open_in_memory().await?,
+            OpenPath::SharedMemory(uri) => {
+                let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+                Connection::open_with_flags(uri, flags).await?
+            }
             OpenPath::Disk(path) => {
                 // Detect orphaned WAL before SQLite silently creates a new DB.
                 opener::check_orphaned_wal(path)?;
@@ -140,7 +166,13 @@ impl DbExecutor {
                 Connection::open(path).await?
             }
         };
-        let executor = Self::new(connection, task_supervisor.clone(), connection_key);
+        let executor = Self::new_with_category_and_opts(
+            connection,
+            task_supervisor.clone(),
+            connection_key,
+            TaskCategory::Db,
+            Some(opts.clone()),
+        );
         let profile = opts.profile;
         let schema_kind = opts.schema;
         // Build a display path for error messages: real path for disk DBs,
@@ -191,19 +223,32 @@ impl DbExecutor {
         task_supervisor: Arc<TaskSupervisor>,
         connection_key: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let OpenPath::Disk(path) = &opts.path else {
-            return Err(anyhow::anyhow!(
-                "read-only SQLite executor requires an on-disk database"
-            ));
+        let (db_path, flags) = match &opts.path {
+            OpenPath::Disk(path) => {
+                opener::check_orphaned_wal(path)?;
+                ensure_root_only(&task_supervisor, path, opts.allow_existing_perms).await?;
+                (
+                    path.clone(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+            }
+            OpenPath::SharedMemory(uri) => (
+                uri.clone(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ),
         };
-        let db_path = path.clone();
-        opener::check_orphaned_wal(&db_path)?;
-        ensure_root_only(&task_supervisor, &db_path, opts.allow_existing_perms).await?;
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let connection = Connection::open_with_flags(&db_path, flags).await?;
-        let executor = Self::new_read_only(connection, task_supervisor.clone(), connection_key);
+        let executor = Self::new_with_category_and_opts(
+            connection,
+            task_supervisor.clone(),
+            connection_key,
+            TaskCategory::DbRead,
+            Some(opts.clone()),
+        );
         let profile = opts.profile;
         let schema_kind = opts.schema;
         let db_display = db_path.display().to_string();
@@ -236,6 +281,10 @@ impl DbExecutor {
 
     pub fn task_supervisor(&self) -> Arc<TaskSupervisor> {
         self.inner.task_supervisor.clone()
+    }
+
+    pub(super) fn snapshot_open_opts(&self) -> Option<OpenOpts> {
+        self.inner.reopen_opts.clone()
     }
 
     pub async fn open_in_memory(

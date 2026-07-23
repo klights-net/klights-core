@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 async fn make_raft_resourcequota_datastore() -> (
-    crate::replication::sequenced_datastore::SequencedDatastore,
+    crate::datastore::sequenced::SequencedDatastore,
     crate::datastore::sqlite::Datastore,
 ) {
     use crate::datastore::backend::DatastoreHandle;
@@ -20,7 +20,7 @@ async fn make_raft_resourcequota_datastore() -> (
     }
 
     #[async_trait]
-    impl crate::replication::sequenced_datastore::RaftProposal for InlineProposer {
+    impl crate::datastore::sequenced::RaftProposal for InlineProposer {
         async fn propose_command(
             &self,
             command: StorageCommand,
@@ -77,7 +77,7 @@ async fn make_raft_resourcequota_datastore() -> (
 
     let inner = crate::datastore::test_support::in_memory().await;
     let handle: DatastoreHandle = Arc::new(inner.clone());
-    let ds = crate::replication::sequenced_datastore::SequencedDatastore::new(
+    let ds = crate::datastore::sequenced::SequencedDatastore::new(
         handle.clone(),
         Arc::new(InlineProposer { inner: handle }),
     );

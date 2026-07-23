@@ -24,6 +24,7 @@ pub use self::token::generate_sa_token_with_sa_uid;
 pub use self::token::persist_service_account_signing_key;
 pub use self::token::read_service_account_signing_key;
 pub use self::token::read_service_account_signing_key_async;
+pub(crate) use self::token::read_service_account_signing_key_path_supervised;
 pub use self::token::read_service_account_signing_key_supervised;
 pub use self::token::{
     BoundServiceAccountToken, DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,

@@ -244,8 +244,10 @@ pub(super) const RAFT_LOG_INSERT: &str = "INSERT INTO raft_log_entries \
        term = excluded.term, \
        leader_node_id = excluded.leader_node_id, \
        entry_blob = excluded.entry_blob";
-pub(super) const RAFT_LOG_GET_RANGE: &str = "SELECT entry_blob FROM raft_log_entries \
+pub(super) const RAFT_LOG_GET_RANGE: &str = "SELECT log_index, term, leader_node_id, entry_blob FROM raft_log_entries \
      WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC";
+pub(super) const RAFT_LOG_GET_RANGE_UNBOUNDED: &str = "SELECT log_index, term, leader_node_id, entry_blob FROM raft_log_entries \
+     WHERE log_index >= ?1 ORDER BY log_index ASC";
 pub(super) const RAFT_LOG_LAST: &str = "SELECT log_index, term, leader_node_id \
      FROM raft_log_entries ORDER BY log_index DESC LIMIT 1";
 // Truncate logs from log_index (inclusive) onward — used when a follower

@@ -310,14 +310,14 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     }
 
     if let Some(cri) = &cri_for_api {
-        let eh = std::sync::Arc::new(crate::replication::grpc::client::CriNodeExecRuntime::new(
+        let eh = std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
             cri.clone(),
             task_supervisor.clone(),
         ));
         follower_grpc_client.set_node_exec_runtime(eh).await;
         follower_grpc_client
             .set_node_metrics_runtime(std::sync::Arc::new(
-                crate::replication::grpc::client::CriNodeMetricsRuntime::new(
+                crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
@@ -327,7 +327,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     follower_grpc_client
         .set_node_log_runtime(std::sync::Arc::new(
             crate::replication::grpc::client::LocalNodeLogRuntime::new_with_pod_event_store(
-                config.containerd_namespace.clone(),
+                crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
                 crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(db.clone()),
             ),

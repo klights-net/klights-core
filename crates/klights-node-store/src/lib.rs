@@ -2,6 +2,7 @@
 
 mod cache_network;
 mod delivery;
+mod raft_durability;
 mod runtime_work;
 
 pub use cache_network::{
@@ -22,6 +23,11 @@ pub use delivery::{
     PodStatusCheckpoint, PodStatusCheckpointApplied, PodStatusCheckpointStore,
     PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
     RuntimeObservationGeneration, TerminalDeleteClassification,
+};
+pub use raft_durability::{
+    EncodedRaftAppliedState, EncodedRaftLogEntry, EncodedRaftLogState, OpaqueRaftBytes,
+    RaftAppliedStateDurability, RaftAppliedStateWrite, RaftDurabilityError, RaftDurabilityFuture,
+    RaftLogBatch, RaftLogCoordinate, RaftLogDurability, RaftLogRange, RaftPurgeRequest,
 };
 pub use runtime_work::{
     DueTimeMs, ObservedPodVersion, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,

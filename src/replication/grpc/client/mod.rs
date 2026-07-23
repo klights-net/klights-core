@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use hyper_util::rt::TokioIo;
+use klights_cluster_core::Resource;
 use klights_leader_api::{
     LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
     OutboxDeliveryResult,
@@ -19,10 +20,10 @@ use klights_leader_api::{
 use klights_node_api::{
     BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecStreamChannel,
     ExecStreamOptions, ExecTerminalError, NodeExecFrame, NodeExecRequest, NodeExecRuntime,
-    NodeExecRuntimeFuture, NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult,
-    NodeExecTarget, NodeLogEvent, NodeLogFuture, NodeLogRequest, NodeLogResult, NodeLogRuntime,
-    NodeLogSetupError, NodeLogTarget, NodeLogTerminalError, NodeMetricsError, NodeMetricsRequest,
-    NodeMetricsResult, NodeMetricsRuntime, NodeMetricsTarget,
+    NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogEvent, NodeLogFuture,
+    NodeLogRequest, NodeLogResult, NodeLogRuntime, NodeLogSetupError, NodeLogTarget,
+    NodeLogTerminalError, NodeMetricsError, NodeMetricsRequest, NodeMetricsRuntime,
+    NodeMetricsTarget,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::rustls::{
@@ -44,10 +45,7 @@ use crate::control_plane::client::{
     ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandRequest,
     ResourceCommandResult, ResourceEvent, WatchRequest, WatchStream,
 };
-use crate::datastore::Resource;
 use crate::leader_tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
-use crate::metrics::NodeMetricsSampler;
-use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
 use crate::replication::grpc::{
@@ -169,42 +167,8 @@ struct ConnectDispatchContext {
     observed_leader_endpoint: Option<String>,
 }
 
-pub(crate) struct CriNodeExecRuntime {
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: Arc<TaskSupervisor>,
-}
-
-impl CriNodeExecRuntime {
-    pub(crate) fn new(
-        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-        task_supervisor: Arc<TaskSupervisor>,
-    ) -> Self {
-        Self {
-            cri,
-            task_supervisor,
-        }
-    }
-}
-
-pub(crate) struct CriNodeMetricsRuntime {
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: Arc<TaskSupervisor>,
-}
-
-impl CriNodeMetricsRuntime {
-    pub(crate) fn new(
-        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-        task_supervisor: Arc<TaskSupervisor>,
-    ) -> Self {
-        Self {
-            cri,
-            task_supervisor,
-        }
-    }
-}
-
 pub(crate) struct LocalNodeLogRuntime {
-    containerd_namespace: String,
+    pod_logs_root: PathBuf,
     task_supervisor: Arc<TaskSupervisor>,
     pod_log_follow_watch: Option<crate::api_pod_subresources::logs::PodLogFollowWatchSource>,
 }
@@ -213,35 +177,36 @@ impl LocalNodeLogRuntime {
     #[cfg(test)]
     pub(crate) fn new(containerd_namespace: String, task_supervisor: Arc<TaskSupervisor>) -> Self {
         Self {
-            containerd_namespace,
+            pod_logs_root: crate::paths::pod_logs_root_path(&containerd_namespace),
             task_supervisor,
             pod_log_follow_watch: None,
         }
     }
 
     pub(crate) fn new_with_pod_event_store(
-        containerd_namespace: String,
+        pod_logs_root: PathBuf,
         task_supervisor: Arc<TaskSupervisor>,
         pod_log_follow_watch: crate::api_pod_subresources::logs::PodLogFollowWatchSource,
     ) -> Self {
         Self {
-            containerd_namespace,
+            pod_logs_root,
             task_supervisor,
             pod_log_follow_watch: Some(pod_log_follow_watch),
         }
     }
 
     fn log_path(&self, target: &NodeLogTarget) -> String {
-        crate::paths::pod_log_dir_path(
-            &self.containerd_namespace,
-            target.namespace(),
-            target.pod_name(),
-            target.pod_uid(),
-        )
-        .join(target.container_name())
-        .join("0.log")
-        .to_string_lossy()
-        .into_owned()
+        self.pod_logs_root
+            .join(format!(
+                "{}_{}_{}",
+                target.namespace(),
+                target.pod_name(),
+                target.pod_uid()
+            ))
+            .join(target.container_name())
+            .join("0.log")
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -496,107 +461,6 @@ impl Drop for LocalPodLogStreamSession {
     }
 }
 
-impl NodeExecRuntime for CriNodeExecRuntime {
-    fn exec_sync(
-        &self,
-        request: NodeExecSyncRequest,
-    ) -> NodeExecRuntimeFuture<'_, NodeExecSyncResult> {
-        Box::pin(async move {
-            let (target, command, timeout_seconds) = request.into_parts();
-            let result = {
-                let mut cri = self.cri.lock().await;
-                crate::api_pod_subresources::exec_sync_with_created_state_retry(
-                    &mut cri,
-                    self.task_supervisor.as_ref(),
-                    target.container_id(),
-                    &command,
-                    timeout_seconds,
-                )
-                .await
-            };
-            match result {
-                Ok(response) => NodeExecSyncResult::success(
-                    response.stdout,
-                    response.stderr,
-                    response.exit_code,
-                ),
-                Err(err) => NodeExecSyncResult::failed(
-                    Vec::new(),
-                    Vec::new(),
-                    126,
-                    ExecTerminalError::new(err.to_string()),
-                ),
-            }
-        })
-    }
-
-    fn exec_stream(
-        &self,
-        request: NodeExecRequest,
-        mut session: Box<dyn NodeExecSession>,
-    ) -> NodeExecRuntimeFuture<'_, ()> {
-        Box::pin(async move {
-            if let Err(err) = run_cri_node_exec_stream(
-                self.cri.clone(),
-                self.task_supervisor.clone(),
-                request,
-                session.as_mut(),
-            )
-            .await
-            {
-                let _ = session
-                    .send_frame(node_exec_error_frame(format!(
-                        "remote node exec failed: {err:#}"
-                    )))
-                    .await;
-            }
-        })
-    }
-}
-
-impl NodeMetricsRuntime for CriNodeMetricsRuntime {
-    fn collect_metrics(
-        &self,
-        request: NodeMetricsRequest,
-    ) -> klights_node_api::NodeMetricsFuture<'_, NodeMetricsResult> {
-        Box::pin(async move {
-            let node = match crate::metrics::LinuxProcNodeMetricsSampler::new(
-                self.task_supervisor.clone(),
-            )
-            .sample_node()
-            .await
-            {
-                Ok(sample) => Some(sample),
-                Err(error) => {
-                    tracing::debug!(%error, "node resource metrics unavailable");
-                    None
-                }
-            };
-            let mut client = {
-                let guard = self.cri.lock().await;
-                guard.clone()
-            };
-            match client.list_pod_sandbox_stats(None).await {
-                Ok(stats) => Ok(crate::metrics::node_metrics_result_from_pod_sandbox_stats(
-                    &request, node, stats,
-                )),
-                Err(err) => {
-                    tracing::debug!(error = %err, "CRI pod sandbox metrics unavailable");
-                    if let Some(node) = node {
-                        Ok(NodeMetricsResult::new(
-                            request.target().clone(),
-                            Some(node),
-                            Vec::new(),
-                        ))
-                    } else {
-                        Err(NodeMetricsError::unavailable(format!("{err:#}")))
-                    }
-                }
-            }
-        })
-    }
-}
-
 fn node_exec_error_frame(message: String) -> NodeExecFrame {
     NodeExecFrame::new(
         ExecStreamChannel::Error,
@@ -611,198 +475,27 @@ fn node_exec_error_frame(message: String) -> NodeExecFrame {
     )
 }
 
-async fn run_cri_node_exec_stream(
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: Arc<TaskSupervisor>,
-    request: NodeExecRequest,
-    session: &mut dyn NodeExecSession,
-) -> Result<()> {
-    use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
-    use tokio::io::AsyncWriteExt;
-
-    let (target, command, options, attach) = request.into_parts();
-
-    tracing::debug!(
-        container = %target.container_id(),
-        command = ?command,
-        stdin = options.stdin(),
-        stdout = options.stdout(),
-        stderr = options.stderr(),
-        tty = options.tty(),
-        "starting CRI node exec stream"
-    );
-
-    let streaming_url = {
-        let mut cri_client = cri.lock().await;
-        if attach {
-            crate::api_pod_subresources::attach_with_created_state_retry(
-                &mut cri_client,
-                task_supervisor.as_ref(),
-                crate::api_pod_subresources::AttachRequest {
-                    container_id: target.container_id(),
-                    stream_options: crate::api_pod_subresources::ExecStreamOptions {
-                        tty: options.tty(),
-                        stdin: options.stdin(),
-                        stdout: options.stdout(),
-                        stderr: options.stderr() && !options.tty(),
-                    },
-                },
-            )
-            .await?
-            .url
-        } else {
-            crate::api_pod_subresources::exec_with_created_state_retry(
-                &mut cri_client,
-                task_supervisor.as_ref(),
-                crate::api_pod_subresources::ExecRequest {
-                    container_id: target.container_id(),
-                    command: &command,
-                    stream_options: crate::api_pod_subresources::ExecStreamOptions {
-                        tty: options.tty(),
-                        stdin: options.stdin(),
-                        stdout: options.stdout(),
-                        stderr: options.stderr() && !options.tty(),
-                    },
-                },
-            )
-            .await?
-            .url
-        }
-    };
-
-    let mut containerd_stream = SpdyExec::connect_to_streaming_url(&streaming_url).await?;
-    let mut containerd_spdy = SpdyExec::new();
-
-    if options.stdin() {
-        containerd_spdy
-            .write_syn_stream(&mut containerd_stream, 1, StreamType::Stdin)
-            .await?;
-    }
-    if options.stdout() {
-        containerd_spdy
-            .write_syn_stream(&mut containerd_stream, 3, StreamType::Stdout)
-            .await?;
-    }
-    if options.stderr() && !options.tty() {
-        containerd_spdy
-            .write_syn_stream(&mut containerd_stream, 5, StreamType::Stderr)
-            .await?;
-    }
-    containerd_spdy
-        .write_syn_stream(&mut containerd_stream, 7, StreamType::Error)
-        .await?;
-    if options.tty() {
-        containerd_spdy
-            .write_syn_stream(&mut containerd_stream, 9, StreamType::Resize)
-            .await?;
-        let initial_resize = serde_json::json!({"Width": 80, "Height": 24});
-        containerd_spdy
-            .write_data_frame(
-                &mut containerd_stream,
-                9,
-                initial_resize.to_string().as_bytes(),
-                false,
-            )
-            .await?;
-    }
-
-    let mut stdin_closed = !options.stdin();
-    let mut input_closed = false;
-    loop {
-        tokio::select! {
-            frame = session.recv_frame(), if !input_closed && (!stdin_closed || options.tty()) => {
-                match frame {
-                    Ok(Some(frame)) => match frame.channel() {
-                        ExecStreamChannel::Stdin if options.stdin() => {
-                            tracing::debug!(
-                                len = frame.data().len(),
-                                fin = frame.fin(),
-                                "forwarding node exec stdin to containerd"
-                            );
-                            if !frame.data().is_empty() {
-                                containerd_spdy
-                                    .write_data_frame(&mut containerd_stream, 1, frame.data(), false)
-                                    .await?;
-                            }
-                            if frame.fin() {
-                                containerd_spdy
-                                    .write_data_frame(&mut containerd_stream, 1, &[], true)
-                                    .await?;
-                                stdin_closed = true;
-                            }
-                        }
-                        ExecStreamChannel::Resize if options.tty() => {
-                            tracing::debug!(
-                                len = frame.data().len(),
-                                fin = frame.fin(),
-                                "forwarding node exec resize to containerd"
-                            );
-                            if !frame.data().is_empty() {
-                                containerd_spdy
-                                    .write_data_frame(&mut containerd_stream, 9, frame.data(), false)
-                                    .await?;
-                            }
-                        }
-                        _ => {}
-                    },
-                    Ok(None) => {
-                        if options.stdin() && !stdin_closed {
-                            let _ = containerd_spdy
-                                .write_data_frame(&mut containerd_stream, 1, &[], true)
-                                .await;
-                        }
-                        stdin_closed = true;
-                        input_closed = true;
-                    }
-                    Err(error) => return Err(anyhow!(error)),
-                }
-            }
-            frame = containerd_spdy.read_frame(&mut containerd_stream) => {
-                match frame? {
-                    SpdyFrame::Data { stream_id, data, fin } => {
-                        let channel = match stream_id {
-                            3 => Some(ExecStreamChannel::Stdout),
-                            5 => Some(ExecStreamChannel::Stderr),
-                            7 => Some(ExecStreamChannel::Error),
-                            _ => None,
-                        };
-                        if let Some(channel) = channel {
-                            let node_frame = NodeExecFrame::new(channel, data, fin);
-                            let is_terminal_error_frame = node_frame.is_terminal();
-                            tracing::debug!(
-                                channel = node_frame.channel().as_wire_name(),
-                                len = node_frame.data().len(),
-                                fin,
-                                "forwarding containerd exec frame to leader"
-                            );
-                            session.send_frame(node_frame).await.map_err(|error| anyhow!(error))?;
-                            if is_terminal_error_frame {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    SpdyFrame::SynReply { .. } => {}
-                    SpdyFrame::Ping { id } => {
-                        containerd_spdy.write_ping(&mut containerd_stream, id).await?;
-                    }
-                    SpdyFrame::RstStream { .. } | SpdyFrame::GoAway => break,
-                    SpdyFrame::Settings | SpdyFrame::WindowUpdate { .. } | SpdyFrame::Unknown | SpdyFrame::SynStream { .. } => {}
-                }
-            }
-        }
-        let _ = containerd_stream.flush().await;
-    }
-
-    Ok(())
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinDataplaneMetadata {
     pub public_key: Option<String>,
     pub endpoint: String,
     pub port: Option<u16>,
-    pub mode: DataplaneMode,
-    pub encryption: DataplaneEncryption,
+    pub mode: klights_leader_api::NetworkNodeMode,
+    pub encryption: klights_leader_api::DataplaneEncryption,
+}
+
+fn dataplane_mode_wire(mode: klights_leader_api::NetworkNodeMode) -> &'static str {
+    match mode {
+        klights_leader_api::NetworkNodeMode::Root => "root",
+        klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+    }
+}
+
+fn dataplane_encryption_wire(encryption: klights_leader_api::DataplaneEncryption) -> &'static str {
+    match encryption {
+        klights_leader_api::DataplaneEncryption::WireGuard => "enabled",
+        klights_leader_api::DataplaneEncryption::Direct => "disabled",
+    }
 }
 
 // bug-grpc A1: the default per-call unary deadline (15 s — sized above a
@@ -831,12 +524,57 @@ pub struct GrpcClientConfig {
     // would only confuse callers; struct shape simplified.
 }
 
+pub(crate) trait RegistrationSnapshotView {
+    fn remote_snapshot(&self)
+    -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot;
+}
+
+impl RegistrationSnapshotView
+    for crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot
+{
+    fn remote_snapshot(
+        &self,
+    ) -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+        self.clone()
+    }
+}
+
+#[cfg(test)]
+impl RegistrationSnapshotView for crate::kubelet::node::NodeRegistrationSnapshot {
+    fn remote_snapshot(
+        &self,
+    ) -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+        crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+            node_mode: match self.node_mode {
+                crate::controllers::annotations::NodePeerMode::Root => {
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root
+                }
+                crate::controllers::annotations::NodePeerMode::Rootless => {
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless
+                }
+            },
+            host: crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
+                cpu_count: self.host.cpu_count,
+                memory_ki: self.host.memory_ki,
+                architecture: self.host.architecture.clone(),
+                operating_system: self.host.operating_system.clone(),
+                os_image: self.host.os_image.clone(),
+                kernel_version: self.host.kernel_version.clone(),
+                container_runtime_version: self.host.container_runtime_version.clone(),
+                kubelet_version: self.host.kubelet_version.clone(),
+                git_commit: self.host.git_commit.clone(),
+            },
+        }
+    }
+}
+
 pub(crate) fn node_registration_to_proto(
-    registration: &crate::kubelet::node::NodeRegistrationSnapshot,
+    registration: &impl RegistrationSnapshotView,
 ) -> generated::NodeRegistrationSnapshot {
+    let registration = registration.remote_snapshot();
     let node_mode = match &registration.node_mode {
-        crate::controllers::annotations::NodePeerMode::Root => "root",
-        crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
+        crate::replication::grpc::raft_rpc::RemoteNodeMode::Root => "root",
+        crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless => "rootless",
     };
     generated::NodeRegistrationSnapshot {
         cpu_count: registration.host.cpu_count,
@@ -1906,44 +1644,37 @@ impl ReplicationGrpcClient {
         &self,
         node_id: u64,
         addr: &str,
-        registration: &crate::kubelet::node::NodeRegistrationSnapshot,
+        registration: &crate::replication::grpc::raft_rpc::ControlplaneJoinRegistration,
     ) -> Result<crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome> {
         use crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome;
-        registration.validate()?;
+        registration.snapshot.host.validate()?;
         anyhow::ensure!(
             matches!(
-                (&registration.node_mode, self.config.dataplane.mode),
+                (&registration.snapshot.node_mode, self.config.dataplane.mode),
                 (
-                    crate::controllers::annotations::NodePeerMode::Root,
-                    DataplaneMode::Root
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
+                    klights_leader_api::NetworkNodeMode::Root
                 ) | (
-                    crate::controllers::annotations::NodePeerMode::Rootless,
-                    DataplaneMode::Rootless
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless,
+                    klights_leader_api::NetworkNodeMode::Rootless
                 )
             ),
             "Node registration mode must match JoinAsControlplane dataplane mode"
         );
-        let as_learner = match &registration.node_role {
-            crate::bootstrap::NodeRole::Controlplane { as_learner, .. } => *as_learner,
-            other => {
-                return Err(anyhow!(
-                    "JoinAsControlplane requires Controlplane registration, got {other:?}"
-                ));
-            }
-        };
         let request = generated::JoinAsControlplaneRequest {
             node_id,
             addr: addr.to_string(),
             node_name: registration.node_name.clone(),
-            as_learner,
+            as_learner: registration.as_learner,
             dataplane_public_key: self.config.dataplane.public_key.clone().unwrap_or_default(),
             dataplane_endpoint: self.config.dataplane.endpoint.clone(),
             dataplane_port: self.config.dataplane.port.unwrap_or_default() as u32,
-            dataplane_mode: self.config.dataplane.mode.as_str().to_string(),
-            dataplane_encryption: self.config.dataplane.encryption.as_str().to_string(),
-            node_internal_ip: registration.addresses.internal_ip().to_string(),
-            node_git_commit: registration.host.git_commit.clone(),
-            node_registration: Some(node_registration_to_proto(registration)),
+            dataplane_mode: dataplane_mode_wire(self.config.dataplane.mode).to_string(),
+            dataplane_encryption: dataplane_encryption_wire(self.config.dataplane.encryption)
+                .to_string(),
+            node_internal_ip: registration.node_internal_ip.clone(),
+            node_git_commit: registration.snapshot.host.git_commit.clone(),
+            node_registration: Some(node_registration_to_proto(&registration.snapshot)),
             supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
         };
         let join_token = self.controlplane_join_token_value()?;
@@ -2646,8 +2377,9 @@ impl ReplicationGrpcClient {
             dataplane_public_key: self.config.dataplane.public_key.clone().unwrap_or_default(),
             dataplane_endpoint: self.config.dataplane.endpoint.clone(),
             dataplane_port: self.config.dataplane.port.map(u32::from).unwrap_or(0),
-            dataplane_mode: self.config.dataplane.mode.as_str().to_string(),
-            dataplane_encryption: self.config.dataplane.encryption.as_str().to_string(),
+            dataplane_mode: dataplane_mode_wire(self.config.dataplane.mode).to_string(),
+            dataplane_encryption: dataplane_encryption_wire(self.config.dataplane.encryption)
+                .to_string(),
         }
     }
 

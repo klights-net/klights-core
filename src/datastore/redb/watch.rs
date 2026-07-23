@@ -732,6 +732,63 @@ impl RedbWatchStore {
         .await
     }
 
+    pub async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>> {
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow::anyhow!(
+                "watch replay-floor page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let after = after.map(|cursor| match cursor.target() {
+            klights_cluster_store::DurableReplayTarget::All => floor_key("*", "*", "*"),
+            klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
+                floor_key(api_version, kind, CLUSTER_NAMESPACE_KEY)
+            }
+            klights_cluster_store::DurableReplayTarget::Namespaced {
+                api_version,
+                kind,
+                namespace,
+            } => floor_key(api_version, kind, namespace),
+        });
+        let limit = limit.get();
+        self.db_call("list_watch_replay_floors_paged", move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+            let mut floors = Vec::with_capacity(limit);
+            if let Some(after) = after.as_ref() {
+                for entry in table.range(after.as_slice()..)? {
+                    let (key, value) = entry?;
+                    if key.value() <= after.as_slice() {
+                        continue;
+                    }
+                    if let Some(floor) = decode_watch_replay_floor(key.value(), value.value()) {
+                        floors.push(floor);
+                        if floors.len() == limit {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for entry in table.iter()? {
+                    let (key, value) = entry?;
+                    if let Some(floor) = decode_watch_replay_floor(key.value(), value.value()) {
+                        floors.push(floor);
+                        if floors.len() == limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(floors)
+        })
+        .await
+    }
+
     pub async fn modified_since(
         &self,
         av: &str,
@@ -970,6 +1027,24 @@ fn decode_position_floor(encoded: &[u8]) -> Option<(u64, u64)> {
     ))
 }
 
+fn decode_watch_replay_floor(key: &[u8], value: &[u8]) -> Option<WatchReplayFloor> {
+    let mut parts = key.splitn(3, |byte| *byte == 0);
+    let (Some(api_version), Some(kind), Some(namespace_key)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let (floor_resource_version, floor_event_id) = decode_position_floor(value)?;
+    Some(WatchReplayFloor {
+        api_version: String::from_utf8_lossy(api_version).into_owned(),
+        kind: String::from_utf8_lossy(kind).into_owned(),
+        namespace_key: String::from_utf8_lossy(namespace_key).into_owned(),
+        floor_resource_version: floor_resource_version as i64,
+        floor_event_id: floor_event_id as i64,
+        position_is_exact: true,
+    })
+}
+
 fn read_position_floor(
     read_txn: &::redb::ReadTransaction,
     api_version: &str,
@@ -1103,6 +1178,74 @@ mod tests {
         let w = db.begin_write().unwrap();
         helpers::watch_insert(&w, rv, &ev).unwrap();
         w.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_floor_keyset_pages_are_bounded_complete_and_exclusive() {
+        let s = store();
+        let db = s.accessor.db().unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut floors = write
+                .open_table(tables::WATCH_REPLAY_POSITION_FLOORS)
+                .unwrap();
+            for index in 0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+                let key = floor_key("v1", "ConfigMap", &format!("ns-{index:04}"));
+                floors
+                    .insert(
+                        key.as_slice(),
+                        encode_position_floor(index as u64, index as u64).as_slice(),
+                    )
+                    .unwrap();
+            }
+        }
+        write.commit().unwrap();
+
+        let page_limit =
+            std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE).unwrap();
+        let mut after = None;
+        let mut delivered = Vec::new();
+        let mut page_lengths = Vec::new();
+        loop {
+            let page = s
+                .list_watch_replay_floors_paged(after.as_ref(), page_limit)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            page_lengths.push(page.len());
+            delivered.extend(page.iter().map(|floor| floor.namespace_key.clone()));
+            let last = page.last().unwrap();
+            after = Some(
+                klights_cluster_store::SnapshotReplayFloorCursor::try_new(
+                    klights_cluster_store::DurableReplayTarget::Namespaced {
+                        api_version: last.api_version.clone(),
+                        kind: last.kind.clone(),
+                        namespace: last.namespace_key.clone(),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            page_lengths,
+            vec![klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE, 1]
+        );
+        assert_eq!(
+            delivered.len(),
+            klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1
+        );
+        assert!(delivered.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let oversized =
+            std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1)
+                .unwrap();
+        assert!(
+            s.list_watch_replay_floors_paged(None, oversized)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

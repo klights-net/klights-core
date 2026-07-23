@@ -58,8 +58,7 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
 /// Decode a resource key back into its components.
 /// The key no longer has a scope_byte — scope is determined by which table the
 /// key came from (RES_CLUSTER → None, RES_NS → Some(ns)).
-#[cfg(test)]
-pub fn decode_resource_key(
+pub(super) fn decode_resource_key(
     key: &[u8],
     namespaced: bool,
 ) -> Option<(&str, &str, Option<&str>, &str)> {
@@ -75,7 +74,6 @@ pub fn decode_resource_key(
     Some((av, kind, ns, name))
 }
 
-#[cfg(test)]
 fn pop_str(data: &[u8]) -> Option<(&str, &[u8])> {
     let (&len, rest) = data.split_first()?;
     let len = len as usize;

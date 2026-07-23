@@ -15,25 +15,31 @@ use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
+use klights_node_store::{
+    EncodedRaftLogEntry, OpaqueRaftBytes, RaftLogBatch, RaftLogCoordinate, RaftLogDurability,
+    RaftLogRange, RaftPurgeRequest,
+};
 use openraft::AnyError;
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{LogId, RaftLogReader, StorageError, StorageIOError, Vote};
 
-use crate::datastore::node_local::SqliteNodeLocalDb;
 use crate::datastore::raft::types::{NodeId, TypeConfig};
-
-const META_KEY_VOTE: &str = "vote";
-const META_KEY_LAST_PURGED: &str = "last_purged_log_id";
-const META_KEY_COMMITTED: &str = "committed";
 
 #[derive(Clone)]
 pub struct SqliteRaftLogStorage {
-    db: Arc<SqliteNodeLocalDb>,
+    durability: Arc<dyn RaftLogDurability>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl SqliteRaftLogStorage {
-    pub fn new(db: Arc<SqliteNodeLocalDb>) -> Self {
-        Self { db }
+    pub fn new(
+        durability: Arc<dyn RaftLogDurability>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
+        Self {
+            durability,
+            supervisor,
+        }
     }
 }
 
@@ -61,18 +67,25 @@ fn ioerr_write_vote(e: impl std::fmt::Display) -> StorageError<NodeId> {
     }
 }
 
-fn range_bounds(range: impl RangeBounds<u64>) -> (u64, u64) {
+fn range_bounds(
+    range: impl RangeBounds<u64>,
+) -> Result<RaftLogRange, klights_node_store::RaftDurabilityError> {
+    let empty_after_max =
+        matches!(range.start_bound(), Bound::Excluded(value) if *value == u64::MAX);
     let start = match range.start_bound() {
         Bound::Included(s) => *s,
-        Bound::Excluded(s) => s.saturating_add(1),
+        Bound::Excluded(s) => s.checked_add(1).unwrap_or(u64::MAX),
         Bound::Unbounded => 0,
     };
-    let end = match range.end_bound() {
-        Bound::Included(e) => e.saturating_add(1),
-        Bound::Excluded(e) => *e,
-        Bound::Unbounded => u64::MAX,
+    let mut end = match range.end_bound() {
+        Bound::Included(e) => e.checked_add(1),
+        Bound::Excluded(e) => Some(*e),
+        Bound::Unbounded => None,
     };
-    (start, end)
+    if empty_after_max {
+        end = Some(u64::MAX);
+    }
+    RaftLogRange::new(start, end)
 }
 
 impl RaftLogReader<TypeConfig> for SqliteRaftLogStorage {
@@ -80,19 +93,36 @@ impl RaftLogReader<TypeConfig> for SqliteRaftLogStorage {
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<NodeId>> {
-        let (start, end) = range_bounds(range);
-        let blobs = self
-            .db
-            .raft_log_get_range(start, end)
+        let entries = self
+            .durability
+            .read_log_range(range_bounds(range).map_err(ioerr_read)?)
             .await
             .map_err(ioerr_read)?;
-        let mut out = Vec::with_capacity(blobs.len());
-        for blob in blobs {
-            let entry: openraft::Entry<TypeConfig> =
-                serde_json::from_slice(&blob).map_err(ioerr_read)?;
-            out.push(entry);
-        }
-        Ok(out)
+        self.supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "raft-log-entry-batch-decode",
+                move || -> anyhow::Result<Vec<openraft::Entry<TypeConfig>>> {
+                    let mut out = Vec::with_capacity(entries.len());
+                    for encoded in entries {
+                        let (coordinate, blob) = encoded.into_parts();
+                        let entry: openraft::Entry<TypeConfig> =
+                            serde_json::from_slice(blob.as_slice())?;
+                        anyhow::ensure!(
+                            entry.log_id.index == coordinate.index()
+                                && entry.log_id.leader_id.term == coordinate.term()
+                                && entry.log_id.leader_id.voted_for().unwrap_or_default()
+                                    == coordinate.leader_node_id(),
+                            "persisted Raft coordinate does not match entry bytes"
+                        );
+                        out.push(entry);
+                    }
+                    Ok(out)
+                },
+            )
+            .await
+            .map_err(ioerr_read)?
+            .map_err(ioerr_read)
     }
 }
 
@@ -100,19 +130,21 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_purged = match self
-            .db
-            .raft_meta_get(META_KEY_LAST_PURGED)
+        let (last_entry, encoded_last_purged) = self
+            .durability
+            .load_log_state()
             .await
             .map_err(ioerr_read)?
-        {
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(ioerr_read)?,
+            .into_parts();
+        let last_purged = match encoded_last_purged {
+            Some(bytes) => serde_json::from_slice(bytes.as_slice()).map_err(ioerr_read)?,
             None => None,
         };
-        let last_log_id = match self.db.raft_log_last().await.map_err(ioerr_read)? {
-            Some((index, term, leader_node_id)) => {
-                let leader_id = openraft::LeaderId::new(term, leader_node_id);
-                Some(LogId::new(leader_id, index))
+        let last_log_id = match last_entry {
+            Some(coordinate) => {
+                let leader_id =
+                    openraft::LeaderId::new(coordinate.term(), coordinate.leader_node_id());
+                Some(LogId::new(leader_id, coordinate.index()))
             }
             None => last_purged,
         };
@@ -128,21 +160,16 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let bytes = serde_json::to_vec(vote).map_err(ioerr_write_vote)?;
-        self.db
-            .raft_meta_set(META_KEY_VOTE, bytes)
+        self.durability
+            .store_vote(OpaqueRaftBytes::new(bytes))
             .await
             .map_err(ioerr_write_vote)
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        match self
-            .db
-            .raft_meta_get(META_KEY_VOTE)
-            .await
-            .map_err(ioerr_read_vote)?
-        {
+        match self.durability.load_vote().await.map_err(ioerr_read_vote)? {
             Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).map_err(ioerr_read_vote)?,
+                serde_json::from_slice(bytes.as_slice()).map_err(ioerr_read_vote)?,
             )),
             None => Ok(None),
         }
@@ -153,20 +180,15 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = serde_json::to_vec(&committed).map_err(ioerr_write)?;
-        self.db
-            .raft_meta_set(META_KEY_COMMITTED, bytes)
+        self.durability
+            .store_committed(OpaqueRaftBytes::new(bytes))
             .await
             .map_err(ioerr_write)
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        match self
-            .db
-            .raft_meta_get(META_KEY_COMMITTED)
-            .await
-            .map_err(ioerr_read)?
-        {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).map_err(ioerr_read)?),
+        match self.durability.load_committed().await.map_err(ioerr_read)? {
+            Some(bytes) => Ok(serde_json::from_slice(bytes.as_slice()).map_err(ioerr_read)?),
             None => Ok(None),
         }
     }
@@ -180,16 +202,37 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
         I: IntoIterator<Item = openraft::Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
-        for entry in entries {
-            let log_index = entry.log_id.index;
-            let term = entry.log_id.leader_id.term;
-            let leader_node_id = entry.log_id.leader_id.voted_for().unwrap_or_default();
-            let blob = serde_json::to_vec(&entry).map_err(ioerr_write)?;
-            self.db
-                .raft_log_append(log_index, term, leader_node_id, blob)
-                .await
-                .map_err(ioerr_write)?;
-        }
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        let encoded_entries = self
+            .supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "raft-log-entry-batch-encode",
+                move || -> anyhow::Result<Vec<EncodedRaftLogEntry>> {
+                    entries
+                        .into_iter()
+                        .map(|entry| {
+                            let coordinate = RaftLogCoordinate::new(
+                                entry.log_id.index,
+                                entry.log_id.leader_id.term,
+                                entry.log_id.leader_id.voted_for().unwrap_or_default(),
+                            );
+                            Ok(EncodedRaftLogEntry::new(
+                                coordinate,
+                                OpaqueRaftBytes::new(serde_json::to_vec(&entry)?),
+                            ))
+                        })
+                        .collect()
+                },
+            )
+            .await
+            .map_err(ioerr_write)?
+            .map_err(ioerr_write)?;
+        let batch = RaftLogBatch::new(encoded_entries).map_err(ioerr_write)?;
+        self.durability
+            .append_log_entries(batch)
+            .await
+            .map_err(ioerr_write)?;
         // SQLite db_call writes commit synchronously; on return the data
         // is durable so we can report flush completion immediately.
         callback.log_io_completed(Ok(()));
@@ -197,20 +240,23 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.db
-            .raft_log_truncate_from(log_id.index)
+        self.durability
+            .truncate_log_from(log_id.index)
             .await
             .map_err(ioerr_write)
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.db
-            .raft_log_purge_upto(log_id.index)
-            .await
-            .map_err(ioerr_write)?;
         let bytes = serde_json::to_vec(&Some(log_id)).map_err(ioerr_write)?;
-        self.db
-            .raft_meta_set(META_KEY_LAST_PURGED, bytes)
+        self.durability
+            .purge_log_through(RaftPurgeRequest::new(
+                RaftLogCoordinate::new(
+                    log_id.index,
+                    log_id.leader_id.term,
+                    log_id.leader_id.voted_for().unwrap_or_default(),
+                ),
+                OpaqueRaftBytes::new(bytes),
+            ))
             .await
             .map_err(ioerr_write)
     }
@@ -219,7 +265,7 @@ impl RaftLogStorage<TypeConfig> for SqliteRaftLogStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::node_local::SqliteNodeLocalDb;
+    use crate::datastore::node_local::sqlite::SqliteNodeLocalDb;
     use crate::datastore::raft::types::{NodeId, StorageCommandPayload};
     use crate::datastore::sqlite::{DbExecutor, opener};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
@@ -236,24 +282,29 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let executor = DbExecutor::open_with_opts(
             opener::OpenOpts::node_in_memory(),
-            supervisor,
+            supervisor.clone(),
             "sqlite:raft-log-test",
         )
         .await
         .expect("open node-local executor");
-        let nl = SqliteNodeLocalDb::from_executor(executor).expect("create node-local db");
-        SqliteRaftLogStorage::new(Arc::new(nl))
+        let nl: Arc<dyn RaftLogDurability> =
+            Arc::new(SqliteNodeLocalDb::from_executor(executor).expect("create node-local db"));
+        SqliteRaftLogStorage::new(nl, supervisor)
     }
 
     async fn append_one(s: &SqliteRaftLogStorage, e: &Entry<TypeConfig>) {
-        s.db.raft_log_append(
-            e.log_id.index,
-            e.log_id.leader_id.term,
-            e.log_id.leader_id.voted_for().unwrap_or_default(),
-            serde_json::to_vec(e).unwrap(),
-        )
-        .await
-        .unwrap();
+        let encoded = EncodedRaftLogEntry::new(
+            RaftLogCoordinate::new(
+                e.log_id.index,
+                e.log_id.leader_id.term,
+                e.log_id.leader_id.voted_for().unwrap_or_default(),
+            ),
+            OpaqueRaftBytes::new(serde_json::to_vec(e).unwrap()),
+        );
+        s.durability
+            .append_log_entries(RaftLogBatch::new(vec![encoded]).unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -274,6 +325,13 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].log_id.index, 1);
         assert_eq!(got[2].log_id.index, 3);
+    }
+
+    #[test]
+    fn range_after_max_is_empty_instead_of_becoming_unbounded() {
+        let range = range_bounds((Bound::Excluded(u64::MAX), Bound::Unbounded)).unwrap();
+        assert_eq!(range.start_inclusive(), u64::MAX);
+        assert_eq!(range.end_exclusive(), Some(u64::MAX));
     }
 
     #[tokio::test]

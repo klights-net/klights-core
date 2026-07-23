@@ -33,6 +33,7 @@ pub mod scheduler;
 pub mod shutdown;
 pub mod side_effects;
 pub mod spdy;
+pub(crate) mod storage_wire_codec;
 pub mod utils;
 pub mod version;
 pub mod watch;

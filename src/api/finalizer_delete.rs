@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::replication::sequenced_datastore::RaftProposal for OrphanFinalizerReinjectingProposer {
+    impl crate::datastore::sequenced::RaftProposal for OrphanFinalizerReinjectingProposer {
         async fn propose_command(
             &self,
             command: StorageCommand,
@@ -744,10 +744,7 @@ mod tests {
             inner: inner.clone(),
             reinjected: AtomicBool::new(false),
         });
-        let db = crate::replication::sequenced_datastore::SequencedDatastore::new(
-            inner,
-            proposer.clone(),
-        );
+        let db = crate::datastore::sequenced::SequencedDatastore::new(inner, proposer.clone());
 
         db.create_namespace(
             "orphan-raft-race",

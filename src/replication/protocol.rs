@@ -4,20 +4,20 @@
 //! All types are serde-serializable for the JSON codec and have protobuf
 //! equivalents in the `klights-internal-protobuf` replication schema.
 
+#[cfg(test)]
+use crate::datastore::types::{NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState};
+#[cfg(test)]
+use crate::networking::{NodeName, PodSubnet};
+#[cfg(test)]
 use anyhow::{Context, Result, anyhow};
+use klights_cluster_core::{ClusterMetadata, CommandMeta, Resource, StorageCommand};
 use klights_node_api::{
     NodeExecFrame, NodeExecRequest, NodeExecSyncRequest, NodeExecSyncResult, NodeMetricsError,
     NodeMetricsRequest, NodeMetricsResult,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::net::Ipv4Addr;
-
-use crate::bootstrap::cluster_meta::ClusterMetadata;
-use crate::datastore::command::{CommandMeta, StorageCommand};
-use crate::datastore::types::{
-    NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState, Resource,
-};
-use crate::networking::{NodeName, PodSubnet};
 
 /// A replication envelope wrapping a command with its metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -227,6 +227,7 @@ impl ForwardedResource {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ForwardedNodeSubnet {
     pub node_name: String,
@@ -238,6 +239,7 @@ pub struct ForwardedNodeSubnet {
     pub hostport_range: Option<String>,
 }
 
+#[cfg(test)]
 impl From<NodeSubnet> for ForwardedNodeSubnet {
     fn from(subnet: NodeSubnet) -> Self {
         Self {
@@ -256,6 +258,7 @@ impl From<NodeSubnet> for ForwardedNodeSubnet {
     }
 }
 
+#[cfg(test)]
 impl ForwardedNodeSubnet {
     pub fn into_node_subnet(self) -> Result<NodeSubnet> {
         let node_name = NodeName::parse(&self.node_name)
@@ -291,6 +294,7 @@ impl ForwardedNodeSubnet {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardedPodSlotAdmission {
     pub admitted: bool,
@@ -300,6 +304,7 @@ pub struct ForwardedPodSlotAdmission {
     pub resource_version: i64,
 }
 
+#[cfg(test)]
 impl From<PodSlotAdmissionResult> for ForwardedPodSlotAdmission {
     fn from(result: PodSlotAdmissionResult) -> Self {
         match result {
@@ -326,6 +331,7 @@ impl From<PodSlotAdmissionResult> for ForwardedPodSlotAdmission {
     }
 }
 
+#[cfg(test)]
 impl ForwardedPodSlotAdmission {
     pub fn into_result(self) -> Result<PodSlotAdmissionResult> {
         if self.admitted {

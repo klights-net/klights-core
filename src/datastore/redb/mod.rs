@@ -29,6 +29,7 @@ mod position_membership;
 mod replay_floor;
 pub mod sandbox;
 pub mod snapshot;
+mod snapshot_capture;
 pub mod tables;
 pub mod watch;
 pub mod workqueue;
@@ -76,6 +77,7 @@ pub struct RedbDatastore {
     rv_store: RedbRvStore,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
+    snapshot_sessions: Arc<tokio::sync::Semaphore>,
 }
 
 impl Clone for RedbDatastore {
@@ -85,6 +87,7 @@ impl Clone for RedbDatastore {
             self.watch_bus.clone(),
             self.pod_endpoint_tx.clone(),
             self.pod_slot_admission_tx.clone(),
+            self.snapshot_sessions.clone(),
         )
     }
 }
@@ -95,6 +98,7 @@ impl RedbDatastore {
         watch_bus: Arc<WatchBus>,
         pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
         pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
+        snapshot_sessions: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self {
             resources: RedbResourceStore::new(accessor.clone(), watch_bus.clone()),
@@ -109,6 +113,7 @@ impl RedbDatastore {
             watch_bus,
             pod_endpoint_tx,
             pod_slot_admission_tx,
+            snapshot_sessions,
         }
     }
 
@@ -138,6 +143,7 @@ impl RedbDatastore {
             Arc::new(WatchBus::new(1024)),
             pod_endpoint_tx,
             pod_slot_admission_tx,
+            Arc::new(tokio::sync::Semaphore::new(1)),
         ))
     }
 
@@ -152,6 +158,7 @@ impl RedbDatastore {
             Arc::new(WatchBus::new(1024)),
             pod_endpoint_tx,
             pod_slot_admission_tx,
+            Arc::new(tokio::sync::Semaphore::new(1)),
         ))
     }
 
@@ -167,6 +174,7 @@ impl RedbDatastore {
             Arc::new(WatchBus::new(1024)),
             pod_endpoint_tx,
             pod_slot_admission_tx,
+            Arc::new(tokio::sync::Semaphore::new(1)),
         ))
     }
 }

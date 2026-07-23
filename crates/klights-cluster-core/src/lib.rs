@@ -44,6 +44,7 @@ pub use resource::{
     ResourceIdentityError, ResourcePatchRequest, ResourcePreconditions,
 };
 pub use stale_resource::apply_same_uid_stale_full_resource_policy;
+pub use status::set_node_external_ip;
 pub use status::{
     ConditionMergeMode, FieldMergeMode, FreshStatusMode, GenericStaleStatusMode,
     GenericStatusMergePolicy, StatusApplyFreshness, StatusApplyOrigin, StatusMergeProfile,

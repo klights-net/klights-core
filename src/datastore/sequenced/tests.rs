@@ -945,8 +945,8 @@ mod cases {
             },
             observed_status_stamp: None,
         };
-        let encoded = crate::datastore::command::encode_command_protobuf(&command).unwrap();
-        let decoded = crate::datastore::command::decode_command_protobuf(&encoded).unwrap();
+        let encoded = crate::storage_wire_codec::encode_command_protobuf(&command).unwrap();
+        let decoded = crate::storage_wire_codec::decode_command_protobuf(&encoded).unwrap();
 
         apply_command_to_backend(
             &db,
@@ -2894,7 +2894,7 @@ mod cases {
         use crate::datastore::command::{
             COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
         };
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let meta = CommandMeta {
@@ -2916,14 +2916,14 @@ mod cases {
         .await
         .unwrap();
         assert_eq!(
-            db.get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
+            db.get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
                 .await
                 .unwrap()
                 .as_deref(),
             Some("test-uuid-001")
         );
         assert_eq!(
-            db.get_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH)
+            db.get_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -2944,7 +2944,7 @@ mod cases {
         .await
         .unwrap();
         assert_eq!(
-            db.get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
+            db.get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -2955,7 +2955,8 @@ mod cases {
 
     #[test]
     fn ensure_cluster_metadata_protobuf_round_trip() {
-        use crate::datastore::command::{StorageCommand, codec};
+        use crate::datastore::command::StorageCommand;
+        use crate::storage_wire_codec as codec;
 
         let cmd = StorageCommand::EnsureClusterMetadata {
             cluster_id: "round-trip-uuid".into(),
@@ -3227,7 +3228,7 @@ mod cases {
     /// `DisruptionTarget` condition is not dropped on the floor.
     #[tokio::test]
     async fn replicated_update_resource_preserves_disruption_target_over_newer_kubelet_status() {
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         // Victim is already Running on the node with the four kubelet-rebuilt
@@ -3379,7 +3380,7 @@ mod cases {
     /// waits for Running time out on a pod that kubelet never admits.
     #[tokio::test]
     async fn replicated_scheduler_bind_overwrites_pod_scheduled_pending_condition() {
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
@@ -3509,7 +3510,7 @@ mod cases {
     /// DisruptionTarget.
     #[tokio::test]
     async fn leader_direct_status_apply_preserves_disruption_target_without_outbox_stamp() {
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         // Post-preemption victim: terminating with the four kubelet-rebuilt
@@ -3612,7 +3613,7 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_stale_status_preserves_live_job_status_scalars() {
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
@@ -3718,7 +3719,7 @@ mod cases {
     async fn apply_replicated_stale_status_case(
         case: ReplicatedStaleStatusCase,
     ) -> crate::datastore::Resource {
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
@@ -4078,7 +4079,7 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_fresh_service_status_replaces_load_balancer_and_preserves_conditions() {
-        use crate::replication::sequenced_datastore::apply_command_to_backend;
+        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db

@@ -14,8 +14,30 @@ use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::selector::PassiveStoreOpenRequest;
-use crate::replication::sequenced_datastore::RaftProposal;
+use crate::datastore::sequenced::RaftProposal;
 use klights_supervisor::TaskSupervisor;
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "datastore backend `{backend}` cannot start in Raft mode: missing {required_capability}; \
+     redb is experimental passive-store only until exact Raft apply and authoritative restore land"
+)]
+struct RaftBackendCapabilityError {
+    backend: BackendKind,
+    required_capability: &'static str,
+}
+
+fn validate_raft_backend_capability(
+    backend: BackendKind,
+) -> std::result::Result<(), RaftBackendCapabilityError> {
+    match backend {
+        BackendKind::Sqlite => Ok(()),
+        BackendKind::Redb => Err(RaftBackendCapabilityError {
+            backend,
+            required_capability: "raft apply and authoritative restore",
+        }),
+    }
+}
 
 pub struct OpenLeaderArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
@@ -103,6 +125,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     } = args;
     use crate::bootstrap::init::predicates::uses_leader_runtime;
 
+    // Raft is the only production cluster replication mode. A backend must
+    // implement both committed apply and exact authoritative replacement
+    // before it can enter this composition root; capture-only support is not
+    // sufficient because followers must be able to install and advance.
+    validate_raft_backend_capability(config.datastore_backend)?;
+
     let passive_backend =
         crate::datastore::selector::open(passive_store_open_request(config), supervisor.clone())
             .await
@@ -151,8 +179,25 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     } else {
         Some(config.node_db_path.as_path())
     };
-    let (node_local, node_local_sqlite) =
-        crate::datastore::node_local::selector::open_node_local_with_sqlite(
+    let leader_node_local = if uses_leader_runtime(role) {
+        Some(
+            crate::datastore::node_local::selector::open_leader_node_local(
+                config.node_local_backend,
+                node_local_db_path,
+                supervisor.clone(),
+                config.db_key_file.as_deref(),
+                "sqlite:node-local",
+            )
+            .await
+            .context("Failed to open leader node-local datastore")?,
+        )
+    } else {
+        None
+    };
+    let node_local = if let Some(stores) = leader_node_local.as_ref() {
+        stores.node.clone()
+    } else {
+        crate::datastore::node_local::selector::open_node_local(
             config.node_local_backend,
             node_local_db_path,
             supervisor.clone(),
@@ -160,7 +205,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             "sqlite:node-local",
         )
         .await
-        .context("Failed to open node-local datastore")?;
+        .context("Failed to open node-local datastore")?
+    };
 
     // P3-11c: when running in raft mode on a leader-class boot,
     // construct the RaftNode that backs this voter. Solo seed boots
@@ -176,9 +222,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let member_feature_probe;
     let (raft_node, db_handle, local_api_client, leader_proxy, cluster_api) = match (
         role,
-        node_local_sqlite.as_ref(),
+        leader_node_local.as_ref(),
     ) {
-        (r, Some(sqlite)) if uses_leader_runtime(r) => {
+        (r, Some(stores)) if uses_leader_runtime(r) => {
             let node_id =
                 crate::datastore::raft::types::raft_node_id_for_node_name(&config.node_name);
             let advertise_addr = format!(
@@ -250,20 +296,20 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     node_id,
                     config.node_name.clone(),
                     passive_backend.clone(),
-                    sqlite.clone(),
+                    stores.raft_log.clone(),
+                    stores.raft_applied_state.clone(),
+                    supervisor.clone(),
                     raft_network,
                 )
                 .await
                 .context("Failed to start RaftNode for leader-class boot")?,
             );
-            let proposal: Arc<dyn crate::replication::sequenced_datastore::RaftProposal> =
-                raft.clone();
-            let db_handle: DatastoreHandle = Arc::new(
-                crate::replication::sequenced_datastore::SequencedDatastore::new(
+            let proposal: Arc<dyn crate::datastore::sequenced::RaftProposal> = raft.clone();
+            let db_handle: DatastoreHandle =
+                Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
                     passive_backend.clone(),
                     proposal,
-                ),
-            );
+                ));
             // The local command client is built only from the fully constructed
             // sequenced facade. It never receives the passive backend used by
             // Raft proposal materialization and committed apply.
@@ -424,6 +470,41 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         Some(config.tls_port),
                     )
                     .await;
+                let join_node_registration =
+                    crate::replication::grpc::raft_rpc::ControlplaneJoinRegistration {
+                        node_name: join_node_registration.node_name.clone(),
+                        node_internal_ip: join_node_registration
+                            .addresses
+                            .internal_ip()
+                            .to_string(),
+                        as_learner: join_node_registration
+                            .controlplane_as_learner()
+                            .expect("control-plane bootstrap captured a control-plane role"),
+                        snapshot:
+                            crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+                                node_mode: match join_node_registration.node_mode {
+                                    crate::controllers::annotations::NodePeerMode::Root => {
+                                        crate::replication::grpc::raft_rpc::RemoteNodeMode::Root
+                                    }
+                                    crate::controllers::annotations::NodePeerMode::Rootless => {
+                                        crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless
+                                    }
+                                },
+                                host: crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
+                                    cpu_count: join_node_registration.host.cpu_count,
+                                    memory_ki: join_node_registration.host.memory_ki,
+                                    architecture: join_node_registration.host.architecture,
+                                    operating_system: join_node_registration.host.operating_system,
+                                    os_image: join_node_registration.host.os_image,
+                                    kernel_version: join_node_registration.host.kernel_version,
+                                    container_runtime_version: join_node_registration
+                                        .host
+                                        .container_runtime_version,
+                                    kubelet_version: join_node_registration.host.kubelet_version,
+                                    git_commit: join_node_registration.host.git_commit,
+                                },
+                            },
+                    };
                 let join_namespace = config.containerd_namespace.clone();
                 let join_supervisor_for_loop = join_supervisor.clone();
                 let join_grpc_transport_policy = grpc_transport_policy.clone();
@@ -615,10 +696,23 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_proxy.clone();
     let node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal> =
         leader_proxy.clone();
-    let replication_service = Some(Arc::new(crate::replication::ReplicationService::new(
-        db_handle.clone(),
-        supervisor.clone(),
-    )));
+    let replication_metadata = Arc::new(
+        crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(
+            db_handle.clone(),
+        ),
+    );
+    let replication_bootstrap_tokens = Arc::new(
+        crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(
+            db_handle.clone(),
+        ),
+    );
+    let replication_service = Some(Arc::new(
+        crate::replication::ReplicationService::new_with_ports(
+            replication_metadata,
+            replication_bootstrap_tokens,
+            supervisor.clone(),
+        ),
+    ));
 
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -958,6 +1052,29 @@ mod tests {
     use crate::bootstrap::node_role::{LeaderBootstrap, LeaderPeer, NodeRole};
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::selector::PassiveStoreOpenRequest;
+
+    #[test]
+    fn redb_is_rejected_before_raft_composition() {
+        let error = super::validate_raft_backend_capability(BackendKind::Redb)
+            .expect_err("redb must not be admitted to the Raft composition root");
+
+        assert_eq!(error.backend, BackendKind::Redb);
+        assert_eq!(
+            error.required_capability,
+            "raft apply and authoritative restore"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("experimental passive-store only")
+        );
+    }
+
+    #[test]
+    fn sqlite_is_admitted_to_raft_composition() {
+        super::validate_raft_backend_capability(BackendKind::Sqlite)
+            .expect("sqlite implements the complete Raft persistence contract");
+    }
 
     #[test]
     fn passive_store_open_request_maps_all_root_config_combinations() {
@@ -1369,8 +1486,8 @@ mod tests {
             public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             endpoint: "10.99.0.14".to_string(),
             port: Some(7679),
-            mode: crate::networking::wireguard::DataplaneMode::Root,
-            encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
+            mode: klights_leader_api::NetworkNodeMode::Root,
+            encryption: klights_leader_api::DataplaneEncryption::WireGuard,
         }
     }
 

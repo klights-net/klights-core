@@ -171,7 +171,7 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = DbExecutor::open_with_opts(
             opener::OpenOpts::node_in_memory(),
-            supervisor,
+            supervisor.clone(),
             "sqlite:raft-leader-test",
         )
         .await
@@ -180,9 +180,16 @@ mod tests {
             Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
         let backend: Arc<dyn crate::datastore::DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        RaftNode::start(id, format!("n{id}"), backend, node_local)
-            .await
-            .expect("start raft node")
+        RaftNode::start(
+            id,
+            format!("n{id}"),
+            backend,
+            node_local.clone(),
+            node_local,
+            supervisor,
+        )
+        .await
+        .expect("start raft node")
     }
 
     #[tokio::test]

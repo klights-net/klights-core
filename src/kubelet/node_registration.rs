@@ -211,6 +211,13 @@ impl NodeRegistrationSnapshot {
         }
         self.host.validate()
     }
+
+    pub fn controlplane_as_learner(&self) -> Option<bool> {
+        match &self.node_role {
+            crate::bootstrap::NodeRole::Controlplane { as_learner, .. } => Some(*as_learner),
+            _ => None,
+        }
+    }
 }
 
 fn validate_node_registration_text(field: &str, value: &str, max_len: usize) -> Result<()> {

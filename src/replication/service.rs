@@ -33,9 +33,10 @@ use super::protocol::{
     RoutedNodeMetricsResponse,
 };
 
+#[cfg(test)]
 use crate::datastore::backend::DatastoreBackend;
-use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::replication::grpc::fanout::FanoutPool;
+use klights_leader_api::NetworkDataplane;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 
 const STREAM_FOLLOWER_QUEUE_CAPACITY: usize = 1024;
@@ -125,7 +126,7 @@ pub struct FollowerStatus {
 
 #[derive(Clone, Debug)]
 struct FollowerState {
-    metadata: DataplanePeerMetadata,
+    metadata: NetworkDataplane,
     applied_rv: i64,
     control_tx: mpsc::Sender<FollowerControlMessage>,
     session_id: u64,
@@ -143,8 +144,13 @@ pub struct ReplicationService {
     stream_tx: broadcast::Sender<ReplicationEntry>,
     /// Current replication position (resource version).
     current_rv: AtomicI64,
-    /// Datastore reference for metadata/token validation.
-    db: Arc<dyn DatastoreBackend>,
+    /// Test-only datastore access for token fixture setup.
+    #[cfg(test)]
+    db: Option<Arc<dyn DatastoreBackend>>,
+    /// Canonical cluster metadata observation port.
+    metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
+    /// Bootstrap-token admission port shared by worker and control-plane joins.
+    bootstrap_tokens: Arc<dyn klights_leader_api::BootstrapTokenValidation>,
     /// Task supervisor for all spawned tasks.
     supervisor: Arc<TaskSupervisor>,
     next_follower_session: AtomicU64,
@@ -341,14 +347,41 @@ impl ReplicationService {
     ///
     /// The service is idle-silent until a replica connects.
     /// No background tasks are spawned at creation time.
+    #[cfg(test)]
     pub fn new(db: Arc<dyn DatastoreBackend>, supervisor: Arc<TaskSupervisor>) -> Self {
-        Self::new_with_containerd_namespace(db, supervisor, crate::paths::runtime_namespace())
+        let metadata = Arc::new(
+            crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(db.clone()),
+        );
+        let bootstrap_tokens = Arc::new(
+            crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db.clone()),
+        );
+        let mut service = Self::new_with_ports(metadata, bootstrap_tokens, supervisor);
+        service.db = Some(db);
+        service
     }
 
+    #[cfg(test)]
     pub fn new_with_containerd_namespace(
         db: Arc<dyn DatastoreBackend>,
         supervisor: Arc<TaskSupervisor>,
-        _containerd_namespace: String,
+        containerd_namespace: String,
+    ) -> Self {
+        let metadata = Arc::new(
+            crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(db.clone()),
+        );
+        let bootstrap_tokens = Arc::new(
+            crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db.clone()),
+        );
+        let _ = containerd_namespace;
+        let mut service = Self::new_with_ports(metadata, bootstrap_tokens, supervisor);
+        service.db = Some(db);
+        service
+    }
+
+    pub(crate) fn new_with_ports(
+        metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead>,
+        bootstrap_tokens: Arc<dyn klights_leader_api::BootstrapTokenValidation>,
+        supervisor: Arc<TaskSupervisor>,
     ) -> Self {
         let (entry_tx, _) = watch::channel(None);
         let (stream_tx, _) = broadcast::channel(1024);
@@ -356,7 +389,10 @@ impl ReplicationService {
             entry_tx,
             stream_tx,
             current_rv: AtomicI64::new(0),
-            db,
+            #[cfg(test)]
+            db: None,
+            metadata,
+            bootstrap_tokens,
             supervisor,
             next_follower_session: AtomicU64::new(1),
             next_pending_generation: AtomicU64::new(1),
@@ -460,13 +496,18 @@ impl ReplicationService {
     ///
     /// Validates the Kubernetes-style bootstrap token and returns accepted/rejected.
     pub async fn handle_join(&self, req: JoinRequest) -> JoinResponse {
-        if let Err(err) = crate::bootstrap::bootstrap_token::validate_bootstrap_token_for_scope(
-            self.db.as_ref(),
-            &req.token,
-            crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker,
-        )
-        .await
-        {
+        let validation = klights_leader_api::BootstrapTokenValidationRequest::try_new(
+            req.token.clone(),
+            klights_leader_api::BootstrapTokenScope::Worker,
+        );
+        if let Err(err) = match validation {
+            Ok(request) => {
+                self.bootstrap_tokens
+                    .validate_bootstrap_token(request)
+                    .await
+            }
+            Err(error) => Err(error),
+        } {
             tracing::warn!(node = %req.node_name, error = %err, "join rejected: invalid bootstrap token");
             return JoinResponse::Rejected {
                 reason: err.to_string(),
@@ -476,19 +517,31 @@ impl ReplicationService {
         self.handle_authenticated_join(req).await
     }
 
+    pub(crate) async fn validate_controlplane_bootstrap_token(
+        &self,
+        token: &str,
+    ) -> Result<(), klights_leader_api::BootstrapTokenValidationError> {
+        let request = klights_leader_api::BootstrapTokenValidationRequest::try_new(
+            token,
+            klights_leader_api::BootstrapTokenScope::Controlplane,
+        )?;
+        self.bootstrap_tokens
+            .validate_bootstrap_token(request)
+            .await
+    }
+
     /// Handle a join request already authenticated by another mechanism.
     pub async fn handle_authenticated_join(&self, req: JoinRequest) -> JoinResponse {
         // Read cluster metadata for the response
-        let metadata =
-            match crate::bootstrap::cluster_meta::read_cluster_metadata(self.db.as_ref()).await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("join rejected: failed to read metadata: {}", e);
-                    return JoinResponse::Rejected {
-                        reason: "leader metadata error".into(),
-                    };
-                }
-            };
+        let metadata = match self.metadata.read_cluster_metadata().await {
+            Ok(observation) => observation.into_parts().0,
+            Err(e) => {
+                tracing::warn!("join rejected: failed to read metadata: {}", e);
+                return JoinResponse::Rejected {
+                    reason: "leader metadata error".into(),
+                };
+            }
+        };
 
         tracing::info!(
             node = %req.node_name,
@@ -506,8 +559,9 @@ impl ReplicationService {
 
     /// Handle a metadata request.
     pub async fn handle_metadata(&self) -> MetadataResponse {
-        match crate::bootstrap::cluster_meta::read_cluster_metadata(self.db.as_ref()).await {
-            Ok(m) => {
+        match self.metadata.read_cluster_metadata().await {
+            Ok(observation) => {
+                let m = observation.into_parts().0;
                 let mut metadata = MetadataResponse::from(m);
                 // T3: `current_log_apply_index` always returns 0.
                 // The raft `last_applied` is the authoritative index.
@@ -612,11 +666,17 @@ impl ReplicationService {
         self.current_rv.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn register_follower(
+    pub(crate) async fn register_follower<M>(
         &self,
-        metadata: DataplanePeerMetadata,
-    ) -> (mpsc::Receiver<FollowerControlMessage>, u64) {
-        let node_name = metadata.node_name.clone();
+        metadata: M,
+    ) -> (mpsc::Receiver<FollowerControlMessage>, u64)
+    where
+        M: crate::control_plane::client::IntoFocusedDataplane,
+    {
+        let metadata = metadata
+            .into_focused_dataplane()
+            .expect("validated follower dataplane metadata converts losslessly");
+        let node_name = metadata.node_name().to_string();
         let session_id = self.next_follower_session.fetch_add(1, Ordering::Relaxed);
         let (control_tx, control_rx) = mpsc::channel(FOLLOWER_CONTROL_QUEUE_CAPACITY);
         self.followers.write().await.insert(
@@ -1309,12 +1369,20 @@ impl ReplicationService {
             .map(|state| {
                 let lag = current_rv.saturating_sub(state.applied_rv).max(0);
                 FollowerStatus {
-                    node_name: state.metadata.node_name.clone(),
+                    node_name: state.metadata.node_name().to_string(),
                     applied_rv: state.applied_rv,
                     lag,
-                    mode: state.metadata.mode.as_str().to_string(),
-                    encryption: state.metadata.encryption.as_str().to_string(),
-                    public_key: state.metadata.public_key.as_ref().map(ToString::to_string),
+                    mode: match state.metadata.mode() {
+                        klights_leader_api::NetworkNodeMode::Root => "root",
+                        klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+                    }
+                    .to_string(),
+                    encryption: match state.metadata.encryption() {
+                        klights_leader_api::DataplaneEncryption::WireGuard => "enabled",
+                        klights_leader_api::DataplaneEncryption::Direct => "disabled",
+                    }
+                    .to_string(),
+                    public_key: state.metadata.public_key().map(str::to_string),
                 }
             })
             .collect();
@@ -1330,14 +1398,14 @@ impl ReplicationService {
 impl NodeExec for ReplicationService {
     fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecFuture<'_, NodeExecSyncResult> {
         Box::pin(async move {
-            let request_id = crate::datastore::command::new_command_id().to_string();
+            let request_id = crate::replication::new_command_id().to_string();
             self.request_node_exec_sync(request_id, request).await
         })
     }
 
     fn open_exec(&self, request: NodeExecRequest) -> NodeExecFuture<'_, Box<dyn NodeExecSession>> {
         Box::pin(async move {
-            let request_id = crate::datastore::command::new_command_id().to_string();
+            let request_id = crate::replication::new_command_id().to_string();
             let session = self.open_node_exec_stream(request_id, request).await?;
             Ok(Box::new(session) as Box<dyn NodeExecSession>)
         })
@@ -1347,7 +1415,7 @@ impl NodeExec for ReplicationService {
 impl NodeLog for ReplicationService {
     fn read_logs(&self, request: NodeLogRequest) -> NodeLogFuture<'_, NodeLogResult> {
         Box::pin(async move {
-            let request_id = crate::datastore::command::new_command_id().to_string();
+            let request_id = crate::replication::new_command_id().to_string();
             self.request_node_log(request_id, request).await
         })
     }
@@ -1357,7 +1425,7 @@ impl NodeLog for ReplicationService {
         request: NodeLogRequest,
     ) -> NodeLogFuture<'_, Box<dyn BoundedByteStream<Frame = NodeLogEvent>>> {
         Box::pin(async move {
-            let request_id = crate::datastore::command::new_command_id().to_string();
+            let request_id = crate::replication::new_command_id().to_string();
             let stream = self.open_node_log_stream(request_id, request).await?;
             Ok(Box::new(stream) as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
         })
@@ -1370,7 +1438,7 @@ impl NodeMetrics for ReplicationService {
         request: NodeMetricsRequest,
     ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
         Box::pin(async move {
-            let request_id = crate::datastore::command::new_command_id().to_string();
+            let request_id = crate::replication::new_command_id().to_string();
             self.request_node_metrics(request_id, request).await
         })
     }
@@ -1705,7 +1773,7 @@ mod tests {
     async fn handle_join_accepts_valid_token() {
         let service = test_service().await;
         let token = crate::bootstrap::bootstrap_token::ensure_default_bootstrap_token(
-            service.db.as_ref(),
+            service.db.as_deref().expect("test datastore"),
             std::time::Duration::from_secs(3600),
         )
         .await
@@ -1761,7 +1829,7 @@ mod tests {
     async fn handle_join_rejects_controlplane_token_for_worker_join() {
         let service = test_service().await;
         create_scoped_token_for_test(
-            service.db.as_ref(),
+            service.db.as_deref().expect("test datastore"),
             "abcdef.0123456789abcdef",
             crate::bootstrap::bootstrap_token::BootstrapTokenScope::Controlplane,
         )
@@ -1809,7 +1877,7 @@ mod tests {
     async fn handle_join_rejects_expired_bootstrap_token() {
         let service = test_service().await;
         crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_with_ttl_for_test(
-            service.db.as_ref(),
+            service.db.as_deref().expect("test datastore"),
             crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker,
             "abcdef.0123456789abcdef",
             std::time::Duration::from_secs(0),

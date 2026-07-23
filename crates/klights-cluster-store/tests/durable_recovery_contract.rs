@@ -1,6 +1,6 @@
 use klights_cluster_core::{
-    ClusterMembership, ClusterMetadata, LogApplyCommit, ResourceVersionAssignment,
-    WatchReplayPosition,
+    ClusterMembership, ClusterMetadata, LogApplyCommit, OutboxStreamWatermark,
+    ResourceVersionAssignment, WatchReplayPosition,
 };
 use klights_cluster_store::{
     AllocatorStateError, AllocatorStateFuture, AuthoritativeSnapshot, AuthoritativeSnapshotCapture,
@@ -8,10 +8,35 @@ use klights_cluster_store::{
     ClusterMetadataStoreError, DurableAllocatorRead, DurableAllocatorState, DurableReplayFloor,
     DurableReplayTarget, DurableWatchHistoryRead, DurableWatchScope, DurableWatchTarget,
     MAX_SNAPSHOT_CAPTURE_PAGE, MAX_WATCH_HISTORY_PAGE, PersistedClusterMetadata,
-    SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCaptureSink, SnapshotMembership,
-    SnapshotPersistenceError, SnapshotPersistenceFuture, WatchHistoryError, WatchHistoryFuture,
+    SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCaptureRequest, SnapshotCaptureSession,
+    SnapshotMembership, SnapshotOutboxWatermarkCursor, SnapshotPersistenceError,
+    SnapshotPersistenceFuture, SnapshotReplayFloorCursor, WatchHistoryError, WatchHistoryFuture,
     WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
 };
+
+#[test]
+fn snapshot_session_api_is_demand_driven_bounded_and_object_safe() {
+    use klights_cluster_store::{
+        SnapshotCaptureRequest, SnapshotCaptureSession, SnapshotPageLimit,
+    };
+
+    let limit = SnapshotPageLimit::try_new(512).expect("maximum page is valid");
+    assert_eq!(limit.get(), 512);
+    assert!(SnapshotPageLimit::try_new(0).is_err());
+    assert!(SnapshotPageLimit::try_new(513).is_err());
+    let request = SnapshotCaptureRequest::try_new(limit, std::time::Duration::from_secs(30))
+        .expect("bounded capture request");
+    assert_eq!(request.page_limit(), limit);
+
+    fn assert_session_object_safe(_: &dyn SnapshotCaptureSession) {}
+    let _ = assert_session_object_safe;
+}
+
+#[test]
+fn cluster_metadata_keys_are_owned_by_the_cluster_store_contract() {
+    assert_eq!(klights_cluster_store::CLUSTER_ID_META_KEY, "cluster_id");
+    assert_eq!(klights_cluster_store::LEADER_EPOCH_META_KEY, "leader_epoch");
+}
 
 struct FakeRecoveryStore;
 
@@ -64,21 +89,14 @@ impl AuthoritativeSnapshotPersistence for FakeRecoveryStore {
 }
 
 impl AuthoritativeSnapshotCapture for FakeRecoveryStore {
-    fn capture_authoritative_snapshot<'a>(
-        &'a self,
-        _sink: &'a mut dyn SnapshotCaptureSink,
-    ) -> SnapshotPersistenceFuture<'a, SnapshotCaptureHeader> {
+    fn begin_capture(
+        &self,
+        _request: SnapshotCaptureRequest,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
         Box::pin(async {
-            SnapshotCaptureHeader::try_new(
-                Some(ResourceVersionAssignment::CommittedApplyV1),
-                WatchReplayPosition {
-                    resource_version: 17,
-                    event_id: 23,
-                    resource_version_filter_through_event_id: 0,
-                },
-                metadata(17),
-                SnapshotMembership::AuthoritativeAbsent,
-            )
+            Err(SnapshotPersistenceError::UnsupportedMode {
+                message: "fake store does not capture snapshots".to_string(),
+            })
         })
     }
 }
@@ -129,6 +147,33 @@ fn recovery_capabilities_are_distinct_and_object_safe() {
     assert_snapshot_object_safe(&store);
     assert_capture_object_safe(&store);
     assert_metadata_object_safe(&store);
+}
+
+#[test]
+fn snapshot_page_cursors_are_lossless_exclusive_continuations() {
+    let watermark = OutboxStreamWatermark {
+        client_id: "worker-a".to_string(),
+        stream_id: 7,
+        stream_seq: 19,
+    };
+    let watermark_cursor = SnapshotOutboxWatermarkCursor::from_watermark(&watermark).unwrap();
+    assert_eq!(watermark_cursor.client_id(), "worker-a");
+    assert_eq!(watermark_cursor.stream_id(), 7);
+    assert!(SnapshotOutboxWatermarkCursor::try_new("", 7).is_err());
+    assert!(SnapshotOutboxWatermarkCursor::try_new("worker\0a", 7).is_err());
+    assert!(SnapshotOutboxWatermarkCursor::try_new("worker-a", 0).is_err());
+
+    let floor = DurableReplayFloor::namespaced("v1", "ConfigMap", "default", 11, 13, true).unwrap();
+    let floor_cursor = SnapshotReplayFloorCursor::from_floor(&floor);
+    assert_eq!(floor_cursor.target(), floor.target());
+    assert!(
+        SnapshotReplayFloorCursor::try_new(DurableReplayTarget::Namespaced {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: "*".to_string(),
+        })
+        .is_err()
+    );
 }
 
 #[test]

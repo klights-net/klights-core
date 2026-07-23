@@ -16,6 +16,7 @@ use klights_supervisor::TaskSupervisor;
 pub struct RedbAccessor {
     db: Mutex<Option<Arc<Database>>>,
     supervisor: Arc<TaskSupervisor>,
+    snapshot_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl RedbAccessor {
@@ -23,6 +24,7 @@ impl RedbAccessor {
         Self {
             db: Mutex::new(Some(db)),
             supervisor,
+            snapshot_fence: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -43,12 +45,27 @@ impl RedbAccessor {
             .ok_or_else(|| anyhow!("redb datastore closed"))
     }
 
+    pub(super) fn supervisor(&self) -> Arc<TaskSupervisor> {
+        self.supervisor.clone()
+    }
+
+    pub(super) async fn acquire_snapshot_exclusive(
+        &self,
+    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.snapshot_fence.clone().write_owned().await
+    }
+
+    pub(super) async fn acquire_snapshot_mutation(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.snapshot_fence.clone().read_owned().await
+    }
+
     /// Run a synchronous redb closure on the DB-category blocking pool.
     pub async fn call<T, F>(&self, label: &str, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&::redb::Database) -> Result<T> + Send + 'static,
     {
+        let mutation_fence = self.acquire_snapshot_mutation().await;
         let db = self
             .db
             .lock()
@@ -58,7 +75,10 @@ impl RedbAccessor {
             .clone();
         let label_owned = label.to_string();
         self.supervisor
-            .run_db_blocking(label_owned, "redb", move || f(&db))
+            .run_db_blocking(label_owned, "redb", move || {
+                let _mutation_fence = mutation_fence;
+                f(&db)
+            })
             .await
             .map_err(|e| anyhow!("supervisor error: {e}"))?
     }

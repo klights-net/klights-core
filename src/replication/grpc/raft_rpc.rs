@@ -66,9 +66,72 @@ pub enum ControlplaneJoinOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteNodeMode {
+    Root,
+    Rootless,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteNodeHostFacts {
+    pub cpu_count: u32,
+    pub memory_ki: u64,
+    pub architecture: String,
+    pub operating_system: String,
+    pub os_image: String,
+    pub kernel_version: String,
+    pub container_runtime_version: String,
+    pub kubelet_version: String,
+    pub git_commit: String,
+}
+
+impl RemoteNodeHostFacts {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.cpu_count > 0,
+            "node registration cpu_count must be positive"
+        );
+        anyhow::ensure!(
+            self.memory_ki > 0,
+            "node registration memory_ki must be positive"
+        );
+        for (field, value, limit) in [
+            ("architecture", self.architecture.as_str(), 63),
+            ("operating_system", self.operating_system.as_str(), 63),
+            ("os_image", self.os_image.as_str(), 256),
+            ("kernel_version", self.kernel_version.as_str(), 256),
+            (
+                "container_runtime_version",
+                self.container_runtime_version.as_str(),
+                256,
+            ),
+            ("kubelet_version", self.kubelet_version.as_str(), 256),
+            ("git_commit", self.git_commit.as_str(), 128),
+        ] {
+            anyhow::ensure!(
+                !value.trim().is_empty() && value.trim() == value && value.len() <= limit,
+                "node registration {field} must be non-empty canonical text of at most {limit} bytes"
+            );
+        }
+        anyhow::ensure!(
+            self.operating_system == "linux",
+            "node registration operating_system must be 'linux'"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteNodeRegistrationSnapshot {
-    pub node_mode: crate::controllers::annotations::NodePeerMode,
-    pub host: crate::kubelet::node::NodeRegistrationHostFacts,
+    pub node_mode: RemoteNodeMode,
+    pub host: RemoteNodeHostFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlplaneJoinRegistration {
+    pub node_name: String,
+    pub node_internal_ip: String,
+    pub as_learner: bool,
+    pub snapshot: RemoteNodeRegistrationSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

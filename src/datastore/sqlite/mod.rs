@@ -26,6 +26,9 @@ mod rv_helpers;
 mod schema;
 pub(crate) mod scope;
 mod selector_index;
+mod snapshot_capture;
+#[cfg(test)]
+pub(crate) use snapshot_capture::install_snapshot_capture_page_pause;
 #[cfg(test)]
 pub mod test_support;
 #[cfg(test)]
@@ -111,6 +114,7 @@ pub struct Datastore {
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
+    snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
     #[cfg(test)]
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -310,8 +314,9 @@ impl Datastore {
         status_stamp: Option<i64>,
         terminal_error: Option<&crate::kubelet::outbox::OutboxApplyError>,
     ) {
-        use crate::datastore::command::{StorageResponse, encode_response_protobuf};
         use crate::log_apply::{ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation};
+        use crate::storage_wire_codec::encode_response_protobuf;
+        use klights_cluster_core::StorageResponse;
 
         let response = terminal_error.map_or_else(
             || StorageResponse::Ack {
@@ -1467,6 +1472,49 @@ impl Datastore {
         .map_err(|e| anyhow!("list outbox stream watermarks failed: {e}"))
     }
 
+    pub async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow!(
+                "outbox-watermark page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let after = after.map(|cursor| (cursor.client_id().to_string(), cursor.stream_id()));
+        let limit = i64::try_from(limit.get())?;
+        self.read_db_call("db_outbox_stream_watermarks_list_paged", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT client_id, stream_id, last_seq FROM outbox_stream_watermarks
+                 WHERE ?1 IS NULL
+                    OR client_id > ?1
+                    OR (client_id = ?1 AND stream_id > ?2)
+                 ORDER BY client_id ASC, stream_id ASC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![
+                    after.as_ref().map(|cursor| cursor.0.as_str()),
+                    after.as_ref().map(|cursor| cursor.1),
+                    limit,
+                ],
+                |row| {
+                    Ok(crate::log_apply::OutboxStreamWatermark {
+                        client_id: row.get(0)?,
+                        stream_id: row.get(1)?,
+                        stream_seq: row.get(2)?,
+                    })
+                },
+            )?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .map_err(|e| anyhow!("list paged outbox stream watermarks failed: {e}"))
+    }
+
     pub async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
         self.read_db_call("db_applied_outbox_list_all", move |conn| {
             let rows = conn
@@ -2454,8 +2502,8 @@ impl Datastore {
         operation: &str,
         authoring_node: &str,
     ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
-        use crate::datastore::command::StorageResponse;
-        use crate::datastore::command::encode_response_protobuf;
+        use crate::storage_wire_codec::encode_response_protobuf;
+        use klights_cluster_core::StorageResponse;
 
         let (commit, _provisional_rv) = Self::build_log_apply_commit_in_tx_from_command(
             tx,
@@ -3019,7 +3067,7 @@ impl Datastore {
         if record.result_proto.is_empty() {
             return Ok(None);
         }
-        match crate::datastore::command::decode_response_protobuf(&record.result_proto) {
+        match crate::storage_wire_codec::decode_response_protobuf(&record.result_proto) {
             Ok(crate::datastore::command::StorageResponse::Error { message }) => Ok(Some(message)),
             Ok(_) => Ok(None),
             Err(err) => Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
@@ -3224,6 +3272,7 @@ impl Datastore {
         executor: DbExecutor,
         read_executor: DbExecutor,
         node_local: crate::datastore::node_local::SqliteNodeLocalDb,
+        snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
     ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
         let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
@@ -3236,6 +3285,7 @@ impl Datastore {
             pod_endpoint_tx,
             pod_slot_admission_tx,
             snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            snapshot_factory,
             #[cfg(test)]
             fail_next_watch_position_observation: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
@@ -3269,6 +3319,9 @@ impl Datastore {
     }
 
     async fn from_executor(executor: DbExecutor) -> Result<Self> {
+        let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
+            snapshot_capture::SqliteSnapshotFactory::new(opts, executor.task_supervisor())
+        });
         let read_executor = executor.read_lane_clone();
         let node_local = Self::open_node_local_sqlite(
             None,
@@ -3277,7 +3330,7 @@ impl Datastore {
             "sqlite:node-local-memory",
         )
         .await?;
-        Self::from_executors(executor, read_executor, node_local).await
+        Self::from_executors(executor, read_executor, node_local, snapshot_factory).await
     }
 
     /// Production constructor — open a persistent on-disk database.
@@ -3312,7 +3365,7 @@ impl Datastore {
             })?;
         let read_opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
         let read_executor = DbExecutor::open_read_only_with_opts(
-            read_opts,
+            read_opts.clone(),
             supervisor.clone(),
             "sqlite:cluster-read",
         )
@@ -3324,6 +3377,8 @@ impl Datastore {
                 e
             )
         })?;
+        let snapshot_factory =
+            snapshot_capture::SqliteSnapshotFactory::new(read_opts, supervisor.clone());
         let node_local = Self::open_node_local_sqlite(
             Some(node_db_path),
             supervisor,
@@ -3338,7 +3393,8 @@ impl Datastore {
                 e
             )
         })?;
-        let ds = Self::from_executors(executor, read_executor, node_local).await?;
+        let ds = Self::from_executors(executor, read_executor, node_local, Some(snapshot_factory))
+            .await?;
 
         // Log DB size at startup for operator triage (DSB-05).
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -3382,11 +3438,14 @@ impl Datastore {
         ));
         let executor =
             DbExecutor::open_in_memory(supervisor.clone(), "sqlite:memory:cluster").await?;
+        let snapshot_factory = executor
+            .snapshot_open_opts()
+            .map(|opts| snapshot_capture::SqliteSnapshotFactory::new(opts, supervisor.clone()));
         let read_executor = executor.read_lane_clone();
         let node_local =
             Self::open_node_local_sqlite(None, supervisor, None, "sqlite:node-local-memory")
                 .await?;
-        Self::from_executors(executor, read_executor, node_local).await
+        Self::from_executors(executor, read_executor, node_local, snapshot_factory).await
     }
 
     /// Shared production + test constructor when an externally-created
@@ -3532,6 +3591,37 @@ impl DatastoreBackend for Datastore {
         Ok(Some(crate::datastore::backend::SnapshotMutationFence::new(
             self.snapshot_fence.clone().read_owned().await,
         )))
+    }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        let factory = self
+            .snapshot_factory
+            .as_ref()
+            .ok_or_else(|| anyhow!("pinned SQLite capture requires a snapshot-only disk lane"))?;
+        let fence = crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self)
+            .await?
+            .expect("SQLite provides a snapshot fence");
+        let prepared = factory.open(request).await?;
+        prepared.pin(fence, None).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        let factory = self
+            .snapshot_factory
+            .as_ref()
+            .ok_or_else(|| anyhow!("pinned SQLite capture requires a snapshot-only disk lane"))?;
+        let fence = crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self)
+            .await?
+            .expect("SQLite provides a snapshot fence");
+        let prepared = factory.open(request).await?;
+        prepared.pin(fence, Some(anchor)).await
     }
 
     #[cfg(test)]
@@ -4213,6 +4303,14 @@ impl DatastoreBackend for Datastore {
         Datastore::list_watch_replay_floors(self).await
     }
 
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
+        Datastore::list_watch_replay_floors_paged(self, after, limit).await
+    }
+
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
         Datastore::list_deleted_watch_events_since(self, since_rv).await
     }
@@ -4471,6 +4569,14 @@ impl DatastoreBackend for Datastore {
         &self,
     ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
         Datastore::list_outbox_stream_watermarks(self).await
+    }
+
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        Datastore::list_outbox_stream_watermarks_paged(self, after, limit).await
     }
 
     async fn get_applied_outbox(

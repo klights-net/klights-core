@@ -9,8 +9,7 @@
 //! across the cluster.
 //!
 //! Snapshot APIs are wired via `snapshot::SqliteRaftSnapshotBuilder`,
-//! which streams from `replication::snapshot` so leader build and follower
-//! install share one source of truth for "what makes up a cluster snapshot".
+//! which consumes the authoritative cluster-store snapshot session.
 //! `install_snapshot` replays the bundled `LogApplyCommit` entries through
 //! `apply_log_apply_commit` and `get_current_snapshot` rebuilds the snapshot
 //! when openraft asks for an outbound transfer.
@@ -18,41 +17,44 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use klights_node_store::{OpaqueRaftBytes, RaftAppliedStateDurability, RaftAppliedStateWrite};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
     AnyError, EntryPayload, LogId, Snapshot, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership,
 };
 
-use crate::datastore::DatastoreBackend;
-use crate::datastore::node_local::SqliteNodeLocalDb;
 use crate::datastore::raft::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
 use crate::datastore::raft::types::{NodeId, StorageCommandResult, TypeConfig};
-
-const META_KEY_LAST_APPLIED: &str = "last_applied";
-const META_KEY_LAST_MEMBERSHIP: &str = "last_membership";
-#[cfg(test)]
-const META_KEY_CURRENT_SNAPSHOT: &str = "current_snapshot";
+use crate::datastore::{BackendLifecycleStore, DatastoreBackend, DurableRecoveryStore};
 
 #[derive(Clone)]
 pub struct SqliteRaftStateMachine {
     backend: Arc<dyn DatastoreBackend>,
-    node_local: Arc<SqliteNodeLocalDb>,
+    recovery: Arc<dyn DurableRecoveryStore>,
+    lifecycle: Arc<dyn BackendLifecycleStore>,
+    applied_state: Arc<dyn RaftAppliedStateDurability>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl SqliteRaftStateMachine {
     pub fn new(
         backend: Arc<dyn DatastoreBackend>,
-        node_local: Arc<SqliteNodeLocalDb>,
-        // T1.3: authoring_node is no longer carried by the state machine
-        // because the apply path decodes `LogApplyCommit` directly and
-        // calls `backend.apply_log_apply_commit`. Kept in the signature
-        // so existing call sites compile unchanged; the value is unused.
-        _authoring_node: String,
+        applied_state: Arc<dyn RaftAppliedStateDurability>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
+        let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+            backend.clone(),
+        ));
+        let lifecycle = Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+            backend.clone(),
+        ));
         Self {
             backend,
-            node_local,
+            recovery,
+            lifecycle,
+            applied_state,
+            supervisor,
         }
     }
 }
@@ -76,47 +78,55 @@ fn apply_err(log_id: LogId<NodeId>, e: impl std::fmt::Display) -> StorageError<N
 }
 
 impl SqliteRaftStateMachine {
+    async fn load_applied_state(
+        &self,
+    ) -> Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, openraft::BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
+        let (last, membership) = self
+            .applied_state
+            .load_applied_state()
+            .await
+            .map_err(ioerr_read)?
+            .into_parts();
+        let last = last
+            .map(|bytes| serde_json::from_slice(bytes.as_slice()))
+            .transpose()
+            .map_err(ioerr_read)?
+            .flatten();
+        let membership = membership
+            .map(|bytes| serde_json::from_slice(bytes.as_slice()))
+            .transpose()
+            .map_err(ioerr_read)?
+            .unwrap_or_default();
+        Ok((last, membership))
+    }
+
     async fn read_last_applied(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        match self
-            .node_local
-            .raft_meta_get(META_KEY_LAST_APPLIED)
-            .await
-            .map_err(ioerr_read)?
-        {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).map_err(ioerr_read)?),
-            None => Ok(None),
-        }
+        Ok(self.load_applied_state().await?.0)
     }
 
-    async fn write_last_applied(&self, id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let bytes = serde_json::to_vec(&Some(id)).map_err(ioerr_write)?;
-        self.node_local
-            .raft_meta_set(META_KEY_LAST_APPLIED, bytes)
-            .await
-            .map_err(ioerr_write)
-    }
-
-    async fn read_membership(
+    async fn write_applied_state(
         &self,
-    ) -> Result<StoredMembership<NodeId, openraft::BasicNode>, StorageError<NodeId>> {
-        match self
-            .node_local
-            .raft_meta_get(META_KEY_LAST_MEMBERSHIP)
-            .await
-            .map_err(ioerr_read)?
-        {
-            Some(bytes) => Ok(serde_json::from_slice(&bytes).map_err(ioerr_read)?),
-            None => Ok(StoredMembership::default()),
-        }
-    }
-
-    async fn write_membership(
-        &self,
-        m: &StoredMembership<NodeId, openraft::BasicNode>,
+        id: Option<LogId<NodeId>>,
+        membership: Option<&StoredMembership<NodeId, openraft::BasicNode>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let bytes = serde_json::to_vec(m).map_err(ioerr_write)?;
-        self.node_local
-            .raft_meta_set(META_KEY_LAST_MEMBERSHIP, bytes)
+        let last = id
+            .map(|value| serde_json::to_vec(&Some(value)))
+            .transpose()
+            .map_err(ioerr_write)?
+            .map(OpaqueRaftBytes::new);
+        let membership = membership
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(ioerr_write)?
+            .map(OpaqueRaftBytes::new);
+        self.applied_state
+            .store_applied_state(RaftAppliedStateWrite::new(last, membership))
             .await
             .map_err(ioerr_write)
     }
@@ -141,9 +151,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         ),
         StorageError<NodeId>,
     > {
-        let last = self.read_last_applied().await?;
-        let m = self.read_membership().await?;
-        Ok((last, m))
+        self.load_applied_state().await
     }
 
     async fn apply<I>(
@@ -155,7 +163,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         I::IntoIter: Send,
     {
         let _snapshot_mutation = self
-            .backend
+            .lifecycle
             .acquire_snapshot_mutation_fence()
             .await
             .map_err(ioerr_write)?;
@@ -181,13 +189,15 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                 ));
             }
             last_applied_term = Some(log_id.leader_id.term);
+            let membership_entry = matches!(&entry.payload, EntryPayload::Membership(_));
             match entry.payload {
                 EntryPayload::Blank => {
                     out.push(StorageCommandResult::default());
                 }
                 EntryPayload::Membership(m) => {
                     let stored = StoredMembership::new(Some(log_id), m);
-                    self.write_membership(&stored).await?;
+                    self.write_applied_state(Some(log_id), Some(&stored))
+                        .await?;
                     out.push(StorageCommandResult::default());
                 }
                 EntryPayload::Normal(payload) => {
@@ -214,15 +224,18 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                     out.push(result);
                 }
             }
-            self.write_last_applied(log_id).await?;
+            if !membership_entry {
+                self.write_applied_state(Some(log_id), None).await?;
+            }
         }
         Ok(out)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         SqliteRaftSnapshotBuilder {
-            backend: self.backend.clone(),
-            node_local: self.node_local.clone(),
+            recovery: self.recovery.clone(),
+            applied_state: self.applied_state.clone(),
+            supervisor: self.supervisor.clone(),
         }
     }
 
@@ -238,9 +251,18 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let data = RaftSnapshotData::deserialize_from_bytes(&bytes).map_err(ioerr_write)?;
+        let data = self
+            .supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "raft-snapshot-json-zstd-decode",
+                move || RaftSnapshotData::deserialize_from_bytes(&bytes),
+            )
+            .await
+            .map_err(ioerr_write)?
+            .map_err(ioerr_write)?;
         let _snapshot_mutation = self
-            .backend
+            .lifecycle
             .acquire_snapshot_mutation_fence()
             .await
             .map_err(ioerr_write)?;
@@ -263,12 +285,10 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         .map_err(|e| StorageError::IO {
             source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
         })?;
-        if let Some(id) = meta.last_log_id {
-            self.write_last_applied(id).await?;
-        }
         let stored =
             StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
-        self.write_membership(&stored).await?;
+        self.write_applied_state(meta.last_log_id, Some(&stored))
+            .await?;
         Ok(())
     }
 
@@ -282,6 +302,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::datastore::sqlite::{DbExecutor, opener};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::storage::RaftSnapshotBuilder;
@@ -307,7 +328,7 @@ mod tests {
         );
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        SqliteRaftStateMachine::new(backend, node_local, "test-node".into())
+        SqliteRaftStateMachine::new(backend, node_local, supervisor)
     }
 
     #[tokio::test]
@@ -400,7 +421,21 @@ mod tests {
         let node_local = Arc::new(
             SqliteNodeLocalDb::from_executor(node_executor).expect("create node-local db"),
         );
-        SqliteRaftStateMachine::new(backend, node_local, "snap-test".into())
+        SqliteRaftStateMachine::new(backend, node_local, supervisor)
+    }
+
+    async fn seed_snapshot_identity(backend: &dyn DatastoreBackend) {
+        backend
+            .set_klights_meta(
+                klights_cluster_store::CLUSTER_ID_META_KEY,
+                "state-machine-snapshot-cluster",
+            )
+            .await
+            .unwrap();
+        backend
+            .set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -408,6 +443,32 @@ mod tests {
         // Populate a "leader" backend with one namespace + one Pod.
         let backend_src: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        let leader_membership = klights_cluster_core::ClusterMembership {
+            cluster_id: "leader-snapshot-cluster".into(),
+            voters: vec!["cp-leader".into()],
+            term: 7,
+            leader_hint: Some("cp-leader".into()),
+        };
+        backend_src
+            .replace_replicated_resource_state(
+                Vec::new(),
+                0,
+                Some(0),
+                Some(Vec::new()),
+                Some(crate::datastore::ReplicatedSnapshotMetadata {
+                    cluster_id: "leader-snapshot-cluster".into(),
+                    leader_epoch: 7,
+                    membership: crate::datastore::ReplicatedMembershipState::Present(
+                        leader_membership.clone(),
+                    ),
+                    resource_version_assignment_mode: Some(
+                        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+                    ),
+                    snapshot_assignment_mode: None,
+                }),
+            )
+            .await
+            .expect("seed leader cluster identity");
         backend_src
             .create_namespace(
                 "snap-ns",
@@ -449,6 +510,31 @@ mod tests {
         // Install on a fresh "follower" backend that starts empty.
         let backend_dst: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        backend_dst
+            .replace_replicated_resource_state(
+                Vec::new(),
+                0,
+                Some(0),
+                Some(Vec::new()),
+                Some(crate::datastore::ReplicatedSnapshotMetadata {
+                    cluster_id: "divergent-snapshot-cluster".into(),
+                    leader_epoch: 99,
+                    membership: crate::datastore::ReplicatedMembershipState::Present(
+                        klights_cluster_core::ClusterMembership {
+                            cluster_id: "divergent-snapshot-cluster".into(),
+                            voters: vec!["stale-cp".into()],
+                            term: 99,
+                            leader_hint: Some("stale-cp".into()),
+                        },
+                    ),
+                    resource_version_assignment_mode: Some(
+                        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+                    ),
+                    snapshot_assignment_mode: None,
+                }),
+            )
+            .await
+            .expect("seed divergent follower cluster identity");
         let mut sm_dst = build_sm_with_backend(backend_dst.clone()).await;
         sm_dst
             .install_snapshot(&snapshot.meta, Box::new(Cursor::new(snapshot_bytes)))
@@ -466,6 +552,20 @@ mod tests {
             .await
             .unwrap();
         assert!(pod.is_some(), "pod must be replayed into dst backend");
+        let restored_metadata = backend_dst
+            .read_cluster_metadata_observation()
+            .await
+            .expect("read restored cluster identity");
+        assert_eq!(
+            restored_metadata.metadata.cluster_id,
+            "leader-snapshot-cluster"
+        );
+        assert_eq!(restored_metadata.metadata.leader_epoch, 7);
+        assert_eq!(
+            restored_metadata.membership,
+            crate::datastore::ReplicatedMembershipState::Present(leader_membership),
+            "streaming Raft envelope must preserve authoritative membership presence and value"
+        );
 
         // last_applied must move forward on the destination, and the
         // current snapshot must be retrievable for outbound transfer.
@@ -483,6 +583,7 @@ mod tests {
     async fn install_snapshot_restores_empty_watch_history_allocator_exactly() {
         let backend_src: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_snapshot_identity(backend_src.as_ref()).await;
         backend_src
             .create_resource(
                 "v1",
@@ -550,7 +651,8 @@ mod tests {
     async fn snapshot_fence_excludes_post_anchor_resource_and_watch_event() {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
         let backend = crate::datastore::test_support::in_memory().await;
-        let entries = (1..=crate::replication::snapshot::SNAPSHOT_EMIT_PAGE_SIZE as i64)
+        seed_snapshot_identity(&backend).await;
+        let entries = (1..=crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE as i64)
             .map(|event_id| {
                 crate::log_apply::LogApplyCommit::put_watch_event(
                     crate::log_apply::LogApplyWatchEventRow {
@@ -582,7 +684,7 @@ mod tests {
         let backend: Arc<dyn DatastoreBackend> = Arc::new(backend);
         let mut state_machine = build_sm_with_backend(backend).await;
         let mut builder = state_machine.get_snapshot_builder().await;
-        let pause = crate::replication::snapshot::install_snapshot_watch_page_pause();
+        let pause = crate::datastore::sqlite::install_snapshot_capture_page_pause();
         let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
             .await
@@ -672,6 +774,7 @@ mod tests {
         let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
         let source_backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_snapshot_identity(source_backend.as_ref()).await;
         let mut source_sm = build_sm_with_backend(source_backend).await;
         let replacement = source_sm
             .get_snapshot_builder()
@@ -681,7 +784,8 @@ mod tests {
             .unwrap();
 
         let destination = crate::datastore::test_support::in_memory().await;
-        let entries = (1..=crate::replication::snapshot::SNAPSHOT_EMIT_PAGE_SIZE as i64)
+        seed_snapshot_identity(&destination).await;
+        let entries = (1..=crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE as i64)
             .map(|event_id| {
                 crate::log_apply::LogApplyCommit::put_watch_event(
                     crate::log_apply::LogApplyWatchEventRow {
@@ -704,7 +808,7 @@ mod tests {
         let destination: Arc<dyn DatastoreBackend> = Arc::new(destination);
         let mut destination_sm = build_sm_with_backend(destination).await;
         let mut builder = destination_sm.get_snapshot_builder().await;
-        let pause = crate::replication::snapshot::install_snapshot_watch_page_pause();
+        let pause = crate::datastore::sqlite::install_snapshot_capture_page_pause();
         let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
         tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
             .await
@@ -729,6 +833,7 @@ mod tests {
     async fn install_snapshot_replaces_divergent_watch_replay_floors() {
         let backend_src: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_snapshot_identity(backend_src.as_ref()).await;
         for index in 0..5 {
             backend_src
                 .create_resource(
@@ -827,6 +932,7 @@ mod tests {
         // Leader: namespace snap-ns + ConfigMap `live`.
         let backend_src: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_snapshot_identity(backend_src.as_ref()).await;
         backend_src
             .create_namespace(
                 "snap-ns",
@@ -951,6 +1057,7 @@ mod tests {
     async fn snapshot_round_trip_preserves_resources_and_rv_counter() {
         let backend_src: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_snapshot_identity(backend_src.as_ref()).await;
         backend_src
             .create_namespace(
                 "snap-rich",
@@ -1069,6 +1176,7 @@ mod tests {
     async fn build_snapshot_current_rv_not_behind_commits_applied_during_build() {
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_snapshot_identity(backend.as_ref()).await;
         backend
             .create_namespace(
                 "race-ns",
@@ -1111,6 +1219,13 @@ mod tests {
         let bg = backend.clone();
         let race = tokio::spawn(async move {
             for i in 0..60u32 {
+                let _snapshot_mutation =
+                    crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(
+                        bg.as_ref(),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("SQLite supplies a snapshot mutation fence");
                 let _ = bg
                     .create_resource(
                         "v1",
@@ -1179,16 +1294,6 @@ mod tests {
         assert!(
             !first_payload.is_empty(),
             "generated snapshot should be non-empty"
-        );
-
-        let cached = sm
-            .node_local
-            .raft_meta_get(META_KEY_CURRENT_SNAPSHOT)
-            .await
-            .expect("node-local read should work");
-        assert!(
-            cached.is_none(),
-            "current snapshots are rebuildable and must not be cached as full blobs in node-local storage"
         );
 
         let second = sm

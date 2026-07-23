@@ -25,6 +25,46 @@ use klights_watch::WatchTopic;
 
 use super::RedbDatastore;
 
+fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Vec<u8>> {
+    if client_id.is_empty() || client_id.contains('\0') || stream_id <= 0 {
+        return Err(anyhow!(
+            "outbox watermark requires a non-empty NUL-free client ID and positive stream ID"
+        ));
+    }
+    let mut key = Vec::with_capacity(client_id.len() + 9);
+    key.extend_from_slice(client_id.as_bytes());
+    key.push(0);
+    key.extend_from_slice(&(stream_id as u64).to_be_bytes());
+    Ok(key)
+}
+
+pub(super) fn decode_outbox_watermark_key(
+    key: &[u8],
+    stream_seq: i64,
+) -> Result<crate::log_apply::OutboxStreamWatermark> {
+    if key.len() < 10 || key[key.len() - 9] != 0 {
+        return Err(anyhow!("corrupt redb outbox-watermark key"));
+    }
+    let client_id = std::str::from_utf8(&key[..key.len() - 9])
+        .map_err(|error| anyhow!("corrupt redb outbox-watermark client ID: {error}"))?
+        .to_string();
+    let stream_id = u64::from_be_bytes(
+        key[key.len() - 8..]
+            .try_into()
+            .expect("watermark key suffix is eight bytes"),
+    );
+    let stream_id =
+        i64::try_from(stream_id).map_err(|_| anyhow!("redb outbox stream ID exceeds i64"))?;
+    if stream_seq <= 0 {
+        return Err(anyhow!("corrupt redb outbox stream sequence {stream_seq}"));
+    }
+    Ok(crate::log_apply::OutboxStreamWatermark {
+        client_id,
+        stream_id,
+        stream_seq,
+    })
+}
+
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
@@ -129,6 +169,39 @@ impl DatastoreBackend for RedbDatastore {
                 })
             })
             .await
+    }
+
+    async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
+        Ok(Some(
+            crate::datastore::backend::SnapshotExclusiveFence::new(
+                self.accessor.acquire_snapshot_exclusive().await,
+            ),
+        ))
+    }
+
+    async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
+        Ok(Some(crate::datastore::backend::SnapshotMutationFence::new(
+            self.accessor.acquire_snapshot_mutation().await,
+        )))
+    }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        self.begin_redb_snapshot(request, None).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        self.begin_redb_snapshot(request, Some(anchor)).await
     }
 
     fn close(&self) {
@@ -709,6 +782,16 @@ impl DatastoreBackend for RedbDatastore {
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
         self.watch_store.list_watch_replay_floors().await
     }
+
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>> {
+        self.watch_store
+            .list_watch_replay_floors_paged(after, limit)
+            .await
+    }
     async fn list_deleted_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
         self.watch_store.watch_list_deleted_since(s).await
     }
@@ -894,6 +977,70 @@ impl DatastoreBackend for RedbDatastore {
             })
             .await
     }
+
+    async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        self.accessor
+            .call("redb_outbox_stream_watermarks_list_all", |db| {
+                let read = db.begin_read()?;
+                let table = read.open_table(tables::OUTBOX_STREAM_WATERMARKS)?;
+                let mut rows = Vec::new();
+                for entry in table.iter()? {
+                    let (key, value) = entry?;
+                    rows.push(decode_outbox_watermark_key(key.value(), value.value())?);
+                }
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow::anyhow!(
+                "outbox-watermark page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let after = after
+            .map(|cursor| outbox_watermark_key(cursor.client_id(), cursor.stream_id()))
+            .transpose()?;
+        let limit = limit.get();
+        self.accessor
+            .call("redb_outbox_stream_watermarks_list_paged", move |db| {
+                let read = db.begin_read()?;
+                let table = read.open_table(tables::OUTBOX_STREAM_WATERMARKS)?;
+                let mut rows = Vec::with_capacity(limit);
+                if let Some(after) = after.as_ref() {
+                    for entry in table.range(after.as_slice()..)? {
+                        let (key, value) = entry?;
+                        if key.value() <= after.as_slice() {
+                            continue;
+                        }
+                        rows.push(decode_outbox_watermark_key(key.value(), value.value())?);
+                        if rows.len() == limit {
+                            break;
+                        }
+                    }
+                } else {
+                    for entry in table.iter()? {
+                        let (key, value) = entry?;
+                        rows.push(decode_outbox_watermark_key(key.value(), value.value())?);
+                        if rows.len() == limit {
+                            break;
+                        }
+                    }
+                }
+                Ok(rows)
+            })
+            .await
+    }
+
     async fn pod_endpoint_get_by_pod_ip(&self, ip: Ipv4Addr) -> Result<Option<PodEndpointRow>> {
         self.network.pod_endpoint_get_by_pod_ip(ip).await
     }
@@ -1028,6 +1175,63 @@ impl DatastoreBackend for RedbDatastore {
                 rows.sort_by(|a: &AppliedOutboxRecord, b| {
                     a.idempotency_key.cmp(&b.idempotency_key)
                 });
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>> {
+        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow::anyhow!(
+                "applied-outbox page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let after_key = after_key.map(str::to_owned);
+        let limit = limit.get();
+        self.accessor
+            .call("redb_list_applied_outbox_paged", move |db| {
+                let read_txn = db
+                    .begin_read()
+                    .map_err(|error| anyhow::anyhow!("redb read: {error}"))?;
+                let table = read_txn
+                    .open_table(APPLIED_OUTBOX)
+                    .map_err(|error| anyhow::anyhow!("redb open applied_outbox table: {error}"))?;
+                let mut rows = Vec::with_capacity(limit);
+                if let Some(after_key) = after_key.as_deref() {
+                    for row in table
+                        .range(after_key..)
+                        .map_err(|error| anyhow::anyhow!("redb applied_outbox range: {error}"))?
+                    {
+                        let (key, value) = row
+                            .map_err(|error| anyhow::anyhow!("redb applied_outbox row: {error}"))?;
+                        if key.value() <= after_key {
+                            continue;
+                        }
+                        rows.push(serde_json::from_slice(value.value())?);
+                        if rows.len() == limit {
+                            break;
+                        }
+                    }
+                } else {
+                    for row in table
+                        .iter()
+                        .map_err(|error| anyhow::anyhow!("redb applied_outbox iter: {error}"))?
+                    {
+                        let (_, value) = row
+                            .map_err(|error| anyhow::anyhow!("redb applied_outbox row: {error}"))?;
+                        rows.push(serde_json::from_slice(value.value())?);
+                        if rows.len() == limit {
+                            break;
+                        }
+                    }
+                }
                 Ok(rows)
             })
             .await
@@ -1386,6 +1590,14 @@ impl crate::datastore::WatchHistoryStore for RedbDatastore {
 
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
         crate::datastore::DatastoreBackend::list_watch_replay_floors(self).await
+    }
+
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<WatchReplayFloor>> {
+        crate::datastore::DatastoreBackend::list_watch_replay_floors_paged(self, after, limit).await
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
@@ -1864,6 +2076,24 @@ impl crate::datastore::DurableRecoveryStore for RedbDatastore {
     ) -> Result<crate::datastore::ClusterMetadataObservation> {
         crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
+    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
+            self, request, anchor,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -2206,6 +2436,15 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         crate::datastore::DatastoreBackend::list_outbox_stream_watermarks(self).await
     }
 
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        crate::datastore::DatastoreBackend::list_outbox_stream_watermarks_paged(self, after, limit)
+            .await
+    }
+
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -2365,5 +2604,62 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
         crate::datastore::DatastoreBackend::gc_applied_outbox(self, now_ms, ttl_ms).await
+    }
+}
+
+#[cfg(test)]
+mod snapshot_paging_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn watermark_keyset_pages_are_bounded_complete_and_exclusive() {
+        let store = RedbDatastore::new_in_memory().await.unwrap();
+        let db = store.accessor.db().unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut watermarks = write.open_table(tables::OUTBOX_STREAM_WATERMARKS).unwrap();
+            for index in 0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+                let client_id = format!("worker-{index:04}");
+                let key = outbox_watermark_key(&client_id, 1).unwrap();
+                watermarks.insert(key.as_slice(), index as i64 + 1).unwrap();
+            }
+        }
+        write.commit().unwrap();
+
+        let page_limit =
+            std::num::NonZeroUsize::new(klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE).unwrap();
+        let mut after = None;
+        let mut delivered = Vec::new();
+        let mut page_lengths = Vec::new();
+        loop {
+            let page = store
+                .list_outbox_stream_watermarks_paged(after.as_ref(), page_limit)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            page_lengths.push(page.len());
+            delivered.extend(page.iter().map(|row| row.client_id.clone()));
+            after = Some(
+                klights_cluster_store::SnapshotOutboxWatermarkCursor::from_watermark(
+                    page.last().unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            page_lengths,
+            vec![klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE, 1]
+        );
+        assert_eq!(
+            delivered.len(),
+            klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1
+        );
+        assert!(delivered.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            store.list_outbox_stream_watermarks().await.unwrap().len(),
+            delivered.len()
+        );
     }
 }

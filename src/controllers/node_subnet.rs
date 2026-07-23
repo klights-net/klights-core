@@ -1719,8 +1719,8 @@ mod tests {
     async fn follower_peer_node_event_does_not_write_cluster_state() {
         use crate::datastore::DatastoreBackend;
         use crate::datastore::command::StorageCommand;
+        use crate::datastore::sequenced::{RaftProposal, SequencedDatastore};
         use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
-        use crate::replication::sequenced_datastore::{RaftProposal, SequencedDatastore};
         use std::sync::Arc;
 
         struct FollowerProposer;

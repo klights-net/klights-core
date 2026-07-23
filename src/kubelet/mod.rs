@@ -26,6 +26,7 @@ pub mod pod_field_ref;
 pub mod pod_fs;
 pub mod pod_hosts;
 pub mod pod_manager;
+pub(crate) mod remote_runtime;
 // pub mod pod_owner_reconcile; // removed — events flow top-down only
 pub mod pod_api;
 pub mod pod_repository;

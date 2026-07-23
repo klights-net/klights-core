@@ -3032,6 +3032,14 @@ pub trait LeaderNetworkTopologyQuery: Send + Sync {
     ) -> NetworkTopologyFuture<'_, NodeDataplaneResult>;
 }
 
+/// Focused leader-owned mutation for a node's validated dataplane registration.
+/// The adapter is responsible for persisting the record and projecting any
+/// derived routing metadata onto the Node object atomically with normal leader
+/// command semantics.
+pub trait LeaderNetworkTopologyCommand: Send + Sync {
+    fn register_node_dataplane(&self, metadata: NetworkDataplane) -> NetworkTopologyFuture<'_, ()>;
+}
+
 fn validate_found_payload(
     kind: &'static str,
     found: bool,
@@ -3499,6 +3507,126 @@ pub type OutboxDeliveryFuture<'a> =
 
 pub trait LeaderOutboxDelivery: Send + Sync {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedOutboxDeliveryRequest {
+    authenticated_node: String,
+    delivery: OutboxDeliveryRequest,
+}
+
+impl AuthenticatedOutboxDeliveryRequest {
+    pub fn try_new(
+        authenticated_node: impl Into<String>,
+        delivery: OutboxDeliveryRequest,
+    ) -> Result<Self, OutboxDeliveryError> {
+        let authenticated_node = authenticated_node.into();
+        require_delivery_nonempty(&authenticated_node, "delivery.authenticated_node")?;
+        Ok(Self {
+            authenticated_node,
+            delivery,
+        })
+    }
+
+    pub fn into_parts(self) -> (String, OutboxDeliveryRequest) {
+        (self.authenticated_node, self.delivery)
+    }
+}
+
+pub trait LeaderAuthenticatedOutboxDelivery: Send + Sync {
+    fn deliver_authenticated_outbox(
+        &self,
+        request: AuthenticatedOutboxDeliveryRequest,
+    ) -> OutboxDeliveryFuture<'_>;
+}
+
+/// Bootstrap identity class admitted by the leader.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BootstrapTokenScope {
+    Worker,
+    Controlplane,
+}
+
+/// Exact token and admission scope presented to the leader validator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BootstrapTokenValidationRequest {
+    token: String,
+    scope: BootstrapTokenScope,
+}
+
+impl BootstrapTokenValidationRequest {
+    pub fn try_new(
+        token: impl Into<String>,
+        scope: BootstrapTokenScope,
+    ) -> Result<Self, BootstrapTokenValidationError> {
+        let token = token.into();
+        if token.is_empty() {
+            return Err(BootstrapTokenValidationError::invalid(
+                "bootstrap_token.token",
+                "must not be empty",
+            ));
+        }
+        Ok(Self { token, scope })
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub const fn scope(&self) -> BootstrapTokenScope {
+        self.scope
+    }
+
+    pub fn into_parts(self) -> (String, BootstrapTokenScope) {
+        (self.token, self.scope)
+    }
+}
+
+/// Validation failure returned without exposing datastore or Secret types.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BootstrapTokenValidationError {
+    InvalidRequest {
+        field: &'static str,
+        message: String,
+    },
+    Rejected(String),
+}
+
+impl BootstrapTokenValidationError {
+    pub fn invalid(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            field,
+            message: message.into(),
+        }
+    }
+
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::Rejected(message.into())
+    }
+}
+
+impl fmt::Display for BootstrapTokenValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::Rejected(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapTokenValidationError {}
+
+pub type BootstrapTokenValidationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), BootstrapTokenValidationError>> + Send + 'a>>;
+
+pub trait BootstrapTokenValidation: Send + Sync {
+    fn validate_bootstrap_token(
+        &self,
+        request: BootstrapTokenValidationRequest,
+    ) -> BootstrapTokenValidationFuture<'_>;
 }
 
 fn require_delivery_nonempty(value: &str, field: &'static str) -> Result<(), OutboxDeliveryError> {

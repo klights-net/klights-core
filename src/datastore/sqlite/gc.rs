@@ -774,6 +774,68 @@ impl Datastore {
             .await?)
     }
 
+    pub async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
+        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
+            return Err(anyhow::anyhow!(
+                "watch replay-floor page limit {} exceeds {}",
+                limit,
+                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
+            ));
+        }
+        let after = after.map(|cursor| match cursor.target() {
+            klights_cluster_store::DurableReplayTarget::All => {
+                ("*".to_string(), "*".to_string(), "*".to_string())
+            }
+            klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
+                (api_version.clone(), kind.clone(), "#cluster".to_string())
+            }
+            klights_cluster_store::DurableReplayTarget::Namespaced {
+                api_version,
+                kind,
+                namespace,
+            } => (api_version.clone(), kind.clone(), namespace.clone()),
+        });
+        let limit = i64::try_from(limit.get())?;
+        Ok(self
+            .read_db_call("list_watch_replay_floors_paged", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id,
+                         floor_position_exact
+                     FROM watch_replay_floors
+                     WHERE ?1 IS NULL
+                        OR api_version > ?1
+                        OR (api_version = ?1 AND kind > ?2)
+                        OR (api_version = ?1 AND kind = ?2 AND namespace_key > ?3)
+                     ORDER BY api_version, kind, namespace_key
+                     LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![
+                        after.as_ref().map(|cursor| cursor.0.as_str()),
+                        after.as_ref().map(|cursor| cursor.1.as_str()),
+                        after.as_ref().map(|cursor| cursor.2.as_str()),
+                        limit,
+                    ],
+                    |row| {
+                        Ok(crate::datastore::WatchReplayFloor {
+                            api_version: row.get(0)?,
+                            kind: row.get(1)?,
+                            namespace_key: row.get(2)?,
+                            floor_resource_version: row.get(3)?,
+                            floor_event_id: row.get(4)?,
+                            position_is_exact: row.get(5)?,
+                        })
+                    },
+                )?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?)
+    }
+
     pub async fn list_deleted_watch_events_since(
         &self,
         since_rv: i64,

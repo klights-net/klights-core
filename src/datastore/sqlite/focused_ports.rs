@@ -313,6 +313,14 @@ impl crate::datastore::WatchHistoryStore for Datastore {
         crate::datastore::DatastoreBackend::list_watch_replay_floors(self).await
     }
 
+    async fn list_watch_replay_floors_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<Vec<crate::datastore::WatchReplayFloor>> {
+        crate::datastore::DatastoreBackend::list_watch_replay_floors_paged(self, after, limit).await
+    }
+
     async fn list_deleted_watch_events_since(
         &self,
         since_rv: i64,
@@ -749,6 +757,24 @@ impl crate::datastore::DurableRecoveryStore for Datastore {
     ) -> anyhow::Result<crate::datastore::ClusterMetadataObservation> {
         crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
+
+    async fn begin_pinned_snapshot_capture(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+    ) -> anyhow::Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
+    }
+
+    async fn begin_pinned_snapshot_capture_with_anchor(
+        &self,
+        request: klights_cluster_store::SnapshotCaptureRequest,
+        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
+    ) -> anyhow::Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
+            self, request, anchor,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -1092,6 +1118,15 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         &self,
     ) -> anyhow::Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
         crate::datastore::DatastoreBackend::list_outbox_stream_watermarks(self).await
+    }
+
+    async fn list_outbox_stream_watermarks_paged(
+        &self,
+        after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        crate::datastore::DatastoreBackend::list_outbox_stream_watermarks_paged(self, after, limit)
+            .await
     }
 
     async fn get_applied_outbox(

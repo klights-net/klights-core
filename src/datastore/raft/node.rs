@@ -15,11 +15,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{BasicNode, Config, Raft};
 
 use crate::datastore::DatastoreBackend;
-use crate::datastore::node_local::SqliteNodeLocalDb;
 use openraft::network::RaftNetworkFactory;
 
 use crate::datastore::raft::log_storage::SqliteRaftLogStorage;
@@ -147,13 +147,17 @@ impl RaftNode {
         node_id: NodeId,
         node_name: String,
         cluster_backend: Arc<dyn DatastoreBackend>,
-        node_local: Arc<SqliteNodeLocalDb>,
+        log_durability: Arc<dyn RaftLogDurability>,
+        applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Self> {
         Self::start_with_network(
             node_id,
             node_name,
             cluster_backend,
-            node_local,
+            log_durability,
+            applied_state_durability,
+            supervisor,
             StubRaftNetwork,
         )
         .await
@@ -166,7 +170,9 @@ impl RaftNode {
         node_id: NodeId,
         node_name: String,
         cluster_backend: Arc<dyn DatastoreBackend>,
-        node_local: Arc<SqliteNodeLocalDb>,
+        log_durability: Arc<dyn RaftLogDurability>,
+        applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         network: N,
     ) -> Result<Self>
     where
@@ -233,9 +239,12 @@ impl RaftNode {
             .validate()
             .context("openraft Config validate")?,
         );
-        let log_store = SqliteRaftLogStorage::new(node_local.clone());
-        let state_machine =
-            SqliteRaftStateMachine::new(cluster_backend.clone(), node_local, node_name.clone());
+        let log_store = SqliteRaftLogStorage::new(log_durability, supervisor.clone());
+        let state_machine = SqliteRaftStateMachine::new(
+            cluster_backend.clone(),
+            applied_state_durability,
+            supervisor,
+        );
         let raft = Raft::new(node_id, config, network, log_store, state_machine)
             .await
             .context("Raft::new")?;
@@ -681,7 +690,7 @@ fn local_commit_materialization_allowed(
 /// leader, voter follower, and learner — is the only caller of
 /// `apply_commit_in_tx` after raft commits the entry.
 #[async_trait]
-impl crate::replication::sequenced_datastore::RaftProposal for RaftNode {
+impl crate::datastore::sequenced::RaftProposal for RaftNode {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
@@ -1056,7 +1065,28 @@ impl RaftNodeJoinHandler {
             Some(joiner_ip),
         );
         let (node_mode, host) = match node_registration {
-            Some(registration) => (registration.node_mode, registration.host),
+            Some(registration) => {
+                let node_mode = match registration.node_mode {
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root => {
+                        crate::controllers::annotations::NodePeerMode::Root
+                    }
+                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless => {
+                        crate::controllers::annotations::NodePeerMode::Rootless
+                    }
+                };
+                let host = NodeRegistrationHostFacts {
+                    cpu_count: registration.host.cpu_count,
+                    memory_ki: registration.host.memory_ki,
+                    architecture: registration.host.architecture,
+                    operating_system: registration.host.operating_system,
+                    os_image: registration.host.os_image,
+                    kernel_version: registration.host.kernel_version,
+                    container_runtime_version: registration.host.container_runtime_version,
+                    kubelet_version: registration.host.kubelet_version,
+                    git_commit: registration.host.git_commit,
+                };
+                (node_mode, host)
+            }
             None => {
                 let existing = self
                     .db
@@ -1310,6 +1340,7 @@ mod tests {
     // and the test runtime is single-threaded, so the lint is not a concern.
     #![allow(clippy::await_holding_lock)]
     use super::*;
+    use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::datastore::sqlite::{DbExecutor, opener};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -1526,9 +1557,16 @@ mod tests {
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let backend_for_caller = backend.clone();
-        let raft_node = RaftNode::start(node_id, format!("n{node_id}"), backend, node_local)
-            .await
-            .expect("RaftNode::start");
+        let raft_node = RaftNode::start(
+            node_id,
+            format!("n{node_id}"),
+            backend,
+            node_local.clone(),
+            node_local,
+            supervisor,
+        )
+        .await
+        .expect("RaftNode::start");
         (raft_node, backend_for_caller)
     }
 
@@ -1632,7 +1670,7 @@ mod tests {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let exec = DbExecutor::open_with_opts(
                 opener::OpenOpts::node_in_memory(),
-                supervisor,
+                supervisor.clone(),
                 "sqlite:raft-cluster-test",
             )
             .await
@@ -1642,10 +1680,17 @@ mod tests {
             let backend: Arc<dyn DatastoreBackend> =
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
-            let n =
-                RaftNode::start_with_network(id, format!("n{id}"), backend, node_local, factory)
-                    .await
-                    .expect("RaftNode::start_with_network");
+            let n = RaftNode::start_with_network(
+                id,
+                format!("n{id}"),
+                backend,
+                node_local.clone(),
+                node_local,
+                supervisor,
+                factory,
+            )
+            .await
+            .expect("RaftNode::start_with_network");
             registry.register(id, n.raft.clone());
             nodes.push(n);
         }
@@ -1725,7 +1770,7 @@ mod tests {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let exec = DbExecutor::open_with_opts(
                 opener::OpenOpts::node_in_memory(),
-                supervisor,
+                supervisor.clone(),
                 "sqlite:raft-forward-test",
             )
             .await
@@ -1736,11 +1781,18 @@ mod tests {
                 Arc::new(crate::datastore::test_support::in_memory().await);
             let factory = LoopbackRaftNetworkFactory::new(registry.clone());
             let mock = Arc::new(CapturingForwarder::default());
-            let n =
-                RaftNode::start_with_network(id, format!("n{id}"), backend, node_local, factory)
-                    .await
-                    .expect("RaftNode::start_with_network")
-                    .with_forwarder(mock.clone());
+            let n = RaftNode::start_with_network(
+                id,
+                format!("n{id}"),
+                backend,
+                node_local.clone(),
+                node_local,
+                supervisor,
+                factory,
+            )
+            .await
+            .expect("RaftNode::start_with_network")
+            .with_forwarder(mock.clone());
             registry.register(id, n.raft.clone());
             nodes.push(n);
             mocks.push(mock);
@@ -1798,7 +1850,7 @@ mod tests {
     #[tokio::test]
     async fn follower_raft_proposer_refuses_before_local_commit_materialization() {
         use crate::datastore::raft::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
@@ -1807,7 +1859,7 @@ mod tests {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let exec = DbExecutor::open_with_opts(
                 opener::OpenOpts::node_in_memory(),
-                supervisor,
+                supervisor.clone(),
                 "sqlite:raft-follower-no-local-commit-test",
             )
             .await
@@ -1821,7 +1873,9 @@ mod tests {
                 id,
                 format!("n{id}"),
                 backend.clone(),
+                node_local.clone(),
                 node_local,
+                supervisor,
                 factory,
             )
             .await
@@ -1913,12 +1967,12 @@ mod tests {
 
     #[tokio::test]
     async fn raft_proposer_cleans_placeholder_when_materialized_commit_is_rejected() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = DbExecutor::open_with_opts(
             opener::OpenOpts::node_in_memory(),
-            supervisor,
+            supervisor.clone(),
             "sqlite:raft-rejected-materialized-commit-test",
         )
         .await
@@ -1927,9 +1981,16 @@ mod tests {
             Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let node = RaftNode::start(10, "n10".to_string(), backend.clone(), node_local)
-            .await
-            .expect("RaftNode::start");
+        let node = RaftNode::start(
+            10,
+            "n10".to_string(),
+            backend.clone(),
+            node_local.clone(),
+            node_local,
+            supervisor,
+        )
+        .await
+        .expect("RaftNode::start");
         node.bootstrap_single_voter("https://localhost:7679".to_string())
             .await
             .expect("bootstrap single voter");
@@ -2038,7 +2099,7 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = DbExecutor::open_with_opts(
             opener::OpenOpts::node_in_memory(),
-            supervisor,
+            supervisor.clone(),
             "sqlite:raft-voter-test",
         )
         .await
@@ -2048,9 +2109,17 @@ mod tests {
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let factory = LoopbackRaftNetworkFactory::new(registry.clone());
-        let node = RaftNode::start_with_network(id, format!("n{id}"), backend, node_local, factory)
-            .await
-            .expect("start node");
+        let node = RaftNode::start_with_network(
+            id,
+            format!("n{id}"),
+            backend,
+            node_local.clone(),
+            node_local,
+            supervisor,
+            factory,
+        )
+        .await
+        .expect("start node");
         registry.register(id, node.raft.clone());
         node
     }
@@ -2099,7 +2168,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())
@@ -2161,7 +2230,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_node_propose_command_does_not_create_applied_outbox_placeholder() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(92).await;
         node.bootstrap_single_voter("https://10.99.0.92:7679".into())
@@ -2216,7 +2285,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_create_resource_rejects_duplicate_name() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(91).await;
         node.bootstrap_single_voter("https://10.99.0.91:7679".into())
@@ -2419,8 +2488,8 @@ mod tests {
             node_internal_ip: node_internal_ip.map(str::to_string),
             node_registration: Some(
                 crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
-                    node_mode: crate::controllers::annotations::NodePeerMode::Root,
-                    host: crate::kubelet::node::NodeRegistrationHostFacts {
+                    node_mode: crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
+                    host: crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
                         cpu_count: 4,
                         memory_ki: 8 * 1024 * 1024,
                         architecture: "test-arch".to_string(),
@@ -2885,7 +2954,7 @@ mod tests {
         let sup1 = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec1 = DbExecutor::open_with_opts(
             opener::OpenOpts::node_in_memory(),
-            sup1,
+            sup1.clone(),
             "sqlite:raft-demote-test-l",
         )
         .await
@@ -2894,10 +2963,17 @@ mod tests {
         let be1: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let leader_network = LoopbackRaftNetworkFactory::new(registry.clone());
-        let leader =
-            RaftNode::start_with_network(leader_id, "n70".into(), be1, nl1, leader_network)
-                .await
-                .unwrap();
+        let leader = RaftNode::start_with_network(
+            leader_id,
+            "n70".into(),
+            be1,
+            nl1.clone(),
+            nl1,
+            sup1,
+            leader_network,
+        )
+        .await
+        .unwrap();
         registry.register(leader_id, leader.raft.clone());
         leader
             .bootstrap_single_voter("https://10.99.0.70:7679".into())
@@ -2908,7 +2984,7 @@ mod tests {
         let sup2 = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec2 = DbExecutor::open_with_opts(
             opener::OpenOpts::node_in_memory(),
-            sup2,
+            sup2.clone(),
             "sqlite:raft-demote-test-v",
         )
         .await
@@ -2917,10 +2993,17 @@ mod tests {
         let be2: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
         let voter_network = LoopbackRaftNetworkFactory::new(registry.clone());
-        let voter_node =
-            RaftNode::start_with_network(voter_id, "n80".into(), be2, nl2, voter_network)
-                .await
-                .unwrap();
+        let voter_node = RaftNode::start_with_network(
+            voter_id,
+            "n80".into(),
+            be2,
+            nl2.clone(),
+            nl2,
+            sup2,
+            voter_network,
+        )
+        .await
+        .unwrap();
         registry.register(voter_id, voter_node.raft.clone());
 
         wait_for_leader(&leader, std::time::Duration::from_secs(10))
@@ -3017,7 +3100,7 @@ mod tests {
     /// would make this test fail (rv would advance during the timeout window).
     #[tokio::test]
     async fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(70).await;
         node.bootstrap_single_voter("https://10.99.0.70:7679".into())
@@ -3070,7 +3153,7 @@ mod tests {
     /// an RV backlog ahead of raft progress.
     #[tokio::test]
     async fn raft_pod_status_outbox_waits_for_flow_control_without_reserving_rv() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(75).await;
         node.bootstrap_single_voter("https://10.99.0.75:7679".into())
@@ -3127,8 +3210,8 @@ mod tests {
 
     #[tokio::test]
     async fn raft_critical_outbox_uses_reserved_permit_when_general_gate_is_saturated() {
+        use crate::datastore::sequenced::RaftProposal;
         use crate::kubelet::outbox::payload::OutboxOperation;
-        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(76).await;
         node.bootstrap_single_voter("https://10.99.0.76:7679".into())
@@ -3227,7 +3310,7 @@ mod tests {
     /// not the smaller payload-entries value.
     #[tokio::test]
     async fn at_most_max_inflight_raft_proposals_are_in_flight() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(71).await;
         node.bootstrap_single_voter("https://10.99.0.71:7679".into())
@@ -3283,7 +3366,7 @@ mod tests {
     /// RAII guard handles this naturally on every error-return path.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_materialization_failure() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, backend) = fresh_node(72).await;
         node.bootstrap_single_voter("https://10.99.0.72:7679".into())
@@ -3370,7 +3453,7 @@ mod tests {
     /// can proceed.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_terminal_success() {
-        use crate::replication::sequenced_datastore::RaftProposal;
+        use crate::datastore::sequenced::RaftProposal;
 
         let (node, _backend) = fresh_node(74).await;
         node.bootstrap_single_voter("https://10.99.0.74:7679".into())

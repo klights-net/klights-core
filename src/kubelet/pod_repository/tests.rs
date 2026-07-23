@@ -2467,7 +2467,7 @@ impl StatusRacingRaftProposal {
 }
 
 #[async_trait::async_trait]
-impl crate::replication::sequenced_datastore::RaftProposal for StatusRacingRaftProposal {
+impl crate::datastore::sequenced::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
@@ -2524,8 +2524,9 @@ async fn build_raft_repo_with_status_race_on_delete(
         pod_name: pod_name.to_string(),
         bumps: bumps.clone(),
     });
-    let sequenced =
-        Arc::new(crate::replication::sequenced_datastore::SequencedDatastore::new(inner, proposal));
+    let sequenced = Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
+        inner, proposal,
+    ));
     let db: crate::datastore::DatastoreHandle = sequenced;
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
@@ -12823,17 +12824,13 @@ impl DeleteCasRacingRaftProposal {
                 .unwrap_or(0),
             authoring_node: "delete-cas-race-leader".to_string(),
         };
-        crate::replication::sequenced_datastore::apply_command_to_backend(
-            self.inner.as_ref(),
-            command,
-            meta,
-        )
-        .await
+        crate::datastore::sequenced::apply_command_to_backend(self.inner.as_ref(), command, meta)
+            .await
     }
 }
 
 #[async_trait::async_trait]
-impl crate::replication::sequenced_datastore::RaftProposal for DeleteCasRacingRaftProposal {
+impl crate::datastore::sequenced::RaftProposal for DeleteCasRacingRaftProposal {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
@@ -12887,8 +12884,9 @@ async fn build_store_with_delete_cas_race(
         set_node_name,
         raced: raced.clone(),
     });
-    let sequenced =
-        Arc::new(crate::replication::sequenced_datastore::SequencedDatastore::new(inner, proposal));
+    let sequenced = Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
+        inner, proposal,
+    ));
     let db: crate::datastore::DatastoreHandle = sequenced;
     (PodStore::new(db.clone()), db, raced)
 }

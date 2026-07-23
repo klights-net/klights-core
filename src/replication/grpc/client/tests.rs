@@ -10,7 +10,6 @@ mod cases {
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
     use crate::replication::grpc::client::{
         ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, LocalNodeLogRuntime,
         ReplicationGrpcClient,
@@ -41,8 +40,8 @@ mod cases {
             public_key: None,
             endpoint: "127.0.0.1".to_string(),
             port: None,
-            mode: DataplaneMode::Root,
-            encryption: DataplaneEncryption::Disabled,
+            mode: klights_leader_api::NetworkNodeMode::Root,
+            encryption: klights_leader_api::DataplaneEncryption::Direct,
         }
     }
 
@@ -2143,6 +2142,19 @@ mod cases {
                 Some(7679),
             )
             .await;
+        let controlplane_registration =
+            crate::replication::grpc::raft_rpc::ControlplaneJoinRegistration {
+                node_name: controlplane_registration.node_name.clone(),
+                node_internal_ip: controlplane_registration
+                    .addresses
+                    .internal_ip()
+                    .to_string(),
+                as_learner: false,
+                snapshot:
+                    crate::replication::grpc::client::RegistrationSnapshotView::remote_snapshot(
+                        &controlplane_registration,
+                    ),
+            };
         assert_bounded!(
             "join_as_controlplane_rpc",
             client.join_as_controlplane_rpc(2, "https://127.0.0.1:1", &controlplane_registration,)
@@ -2512,7 +2524,7 @@ mod cases {
             .await
             .unwrap();
         let handler = LocalNodeLogRuntime::new_with_pod_event_store(
-            runtime_ns.clone(),
+            crate::paths::pod_logs_root_path(&runtime_ns),
             supervisor.clone(),
             crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),

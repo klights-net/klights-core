@@ -21,14 +21,17 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(test)]
+use klights_cluster_core::CommandMeta;
+use klights_cluster_core::StorageCommand;
+use klights_leader_api::{OutboxDeliveryError, OutboxDeliveryResult};
 use std::sync::Arc;
 
 use crate::datastore::backend::DatastoreBackend;
 #[cfg(test)]
-use crate::datastore::command::CommandMeta;
-use crate::datastore::command::StorageCommand;
+use crate::datastore::types::ReplicatedCreateOptions;
 #[cfg(test)]
-use crate::datastore::types::{ReplicatedCreateOptions, ResourcePatchRequest};
+use klights_cluster_core::ResourcePatchRequest;
 
 mod backend_impl;
 
@@ -73,10 +76,7 @@ pub(crate) trait RaftProposal: Send + Sync {
         command: StorageCommand,
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    >;
+    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError>;
 
     async fn propose_outbox_command_effect(
         &self,
@@ -85,10 +85,7 @@ pub(crate) trait RaftProposal: Send + Sync {
         command: StorageCommand,
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        crate::datastore::CommittedOutboxApply,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
+    ) -> std::result::Result<crate::datastore::CommittedOutboxApply, OutboxDeliveryError> {
         let result = self
             .propose_outbox_command(
                 idempotency_key,
@@ -98,10 +95,7 @@ pub(crate) trait RaftProposal: Send + Sync {
                 watermark,
             )
             .await?;
-        let resource_effect = if matches!(
-            result,
-            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
-        ) {
+        let resource_effect = if matches!(result, OutboxDeliveryResult::Applied { .. }) {
             crate::datastore::ResourceMutationEffect::Changed
         } else {
             crate::datastore::ResourceMutationEffect::Unchanged
@@ -498,14 +492,14 @@ where
         }
         StorageCommand::EnsureClusterMetadata { cluster_id } => {
             let existing = backend
-                .get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
+                .get_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY)
                 .await?;
             if existing.is_none() {
                 backend
-                    .set_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID, &cluster_id)
+                    .set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, &cluster_id)
                     .await?;
                 backend
-                    .set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "0")
+                    .set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "0")
                     .await?;
             }
             // If cluster_id already exists, this is idempotent: do not
@@ -561,5 +555,5 @@ impl DatastoreApplier for SequencedDatastore {
 // methods sequence through the immutable proposal capability; committed apply
 // bypasses public admission and writes replicated data to the passive backend.
 #[cfg(test)]
-#[path = "sequenced_datastore/tests.rs"]
+#[path = "sequenced/tests.rs"]
 mod tests;

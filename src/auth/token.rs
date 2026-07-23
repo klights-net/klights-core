@@ -78,32 +78,34 @@ pub async fn read_service_account_signing_key_supervised(
     containerd_ns: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<String> {
-    async fn read_key(
-        path: std::path::PathBuf,
-        task_supervisor: &klights_supervisor::TaskSupervisor,
-        label: &'static str,
-    ) -> Result<String> {
-        let key = path.to_string_lossy().into_owned();
-        let pem = task_supervisor
-            .run_blocking_file_keyed(label, key, move || crate::utils::read_utf8_file(path))
-            .await??;
-        Ok(pem)
-    }
-
     let signing_key_path = crate::paths::service_account_signing_key_path(containerd_ns);
-    let pem = read_key(
-        signing_key_path.clone(),
-        task_supervisor,
-        "sa_signer_read_key",
-    )
-    .await
-    .with_context(|| {
+    read_service_account_signing_key_path_supervised(&signing_key_path, task_supervisor).await
+}
+
+pub(crate) async fn read_service_account_signing_key_path_supervised(
+    signing_key_path: &Path,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+) -> Result<String> {
+    let signing_key_path = signing_key_path.to_path_buf();
+    let key = signing_key_path.to_string_lossy().into_owned();
+    let path_for_read = signing_key_path.clone();
+    let pem = task_supervisor
+        .run_blocking_file_keyed("sa_signer_read_key", key, move || {
+            crate::utils::read_utf8_file(path_for_read)
+        })
+        .await?
+        .with_context(|| {
+            format!(
+                "Failed to read ServiceAccount signing key {}",
+                signing_key_path.display()
+            )
+        })?;
+    validate_signing_key(&signing_key_path, pem).with_context(|| {
         format!(
             "Failed to read ServiceAccount signing key {}",
             signing_key_path.display()
         )
-    })?;
-    validate_signing_key(&signing_key_path, pem)
+    })
 }
 
 pub async fn persist_service_account_signing_key(
