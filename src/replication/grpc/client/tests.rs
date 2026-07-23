@@ -32,7 +32,7 @@ mod cases {
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_util::sync::CancellationToken;
 
-    use crate::leader_tls_policy::LeaderTlsVerification;
+    use crate::leader_tls_policy::ResolvedLeaderTlsVerification;
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -519,35 +519,53 @@ mod cases {
         }
     }
 
-    #[test]
-    fn tls_verification_policy_prefers_configured_ca_over_skip_ca() {
-        let ca_path = PathBuf::from("/tmp/leader-ca.crt");
+    async fn resolve_grpc_tls_verification(
+        config: &GrpcClientConfig,
+    ) -> ResolvedLeaderTlsVerification {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let resolved = config
+            .leader_tls_verification(supervisor.as_ref())
+            .await
+            .unwrap();
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+        resolved
+    }
+
+    #[tokio::test]
+    async fn tls_verification_policy_prefers_configured_ca_over_skip_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("leader-ca.crt");
+        let ca_pem = b"configured-public-ca";
+        std::fs::write(&ca_path, ca_pem).unwrap();
         let config = grpc_config_for_tls(Some(ca_path.clone()), true);
 
         assert_eq!(
-            config.leader_tls_verification(),
-            LeaderTlsVerification::CaFile(ca_path)
+            resolve_grpc_tls_verification(&config).await,
+            ResolvedLeaderTlsVerification::CaPem(ca_pem.to_vec())
         );
     }
 
-    #[test]
-    fn tls_verification_policy_uses_configured_ca_without_skip_ca() {
-        let ca_path = PathBuf::from("/tmp/leader-ca.crt");
+    #[tokio::test]
+    async fn tls_verification_policy_uses_configured_ca_without_skip_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("leader-ca.crt");
+        let ca_pem = b"configured-public-ca";
+        std::fs::write(&ca_path, ca_pem).unwrap();
         let config = grpc_config_for_tls(Some(ca_path.clone()), false);
 
         assert_eq!(
-            config.leader_tls_verification(),
-            LeaderTlsVerification::CaFile(ca_path)
+            resolve_grpc_tls_verification(&config).await,
+            ResolvedLeaderTlsVerification::CaPem(ca_pem.to_vec())
         );
     }
 
-    #[test]
-    fn tls_verification_policy_uses_system_roots_without_ca_or_skip_ca() {
+    #[tokio::test]
+    async fn tls_verification_policy_uses_system_roots_without_ca_or_skip_ca() {
         let config = grpc_config_for_tls(None, false);
 
         assert_eq!(
-            config.leader_tls_verification(),
-            LeaderTlsVerification::SystemRoots
+            resolve_grpc_tls_verification(&config).await,
+            ResolvedLeaderTlsVerification::SystemRoots
         );
     }
 

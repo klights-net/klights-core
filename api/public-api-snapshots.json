@@ -3,10 +3,10 @@
   "packages": {
     "klights": {
       "count": 42385,
-      "sha256": "711d12251bad1a3fee3a775adde541545d291fe36924d561db6738ad9ca0929a",
+      "sha256": "9299503fcac3c811f32495e7ecd41b249b04ad1f2df30bcaa483bc2669308de5",
       "source": {
-        "count": 492547,
-        "sha256": "3a760703d53a2c4d152c2f97721df3857387d724a0849c2883b2935e9e7e19b7"
+        "count": 492790,
+        "sha256": "4af8ab1f59abdc5852294d5580fffdc009cdc389f4f6068d24372bb696799012"
       }
     },
     "klights-apiserver": {

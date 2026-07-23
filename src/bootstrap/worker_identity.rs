@@ -10,7 +10,7 @@ use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 
-use crate::leader_tls_policy::{LeaderTlsVerification, LeaderTlsVerificationPolicy};
+use crate::leader_tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
 
 const WORKER_CREDENTIAL_RENEW_BEFORE_SECONDS: i64 = 3600;
 
@@ -504,25 +504,20 @@ impl HttpCsrBootstrapClient {
         skip_ca: bool,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-        match LeaderTlsVerificationPolicy::new(ca_cert_path, skip_ca).verification() {
-            LeaderTlsVerification::CaFile(path) => {
-                let path_for_task = path.clone();
-                let ca_pem = supervisor
-                    .run_blocking_file_keyed(
-                        "worker_csr_bootstrap_ca_cert",
-                        path.to_string_lossy().to_string(),
-                        move || std::fs::read(path_for_task),
-                    )
-                    .await
-                    .context("failed to read leader CA certificate")?
-                    .context("failed to read leader CA certificate")?;
-                builder = builder.add_root_certificate(
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        match LeaderTlsVerificationPolicy::new(ca_cert_path, skip_ca)
+            .resolve(supervisor.as_ref())
+            .await?
+        {
+            ResolvedLeaderTlsVerification::CaPem(ca_pem) => {
+                builder = builder.tls_built_in_root_certs(false).add_root_certificate(
                     reqwest::Certificate::from_pem(&ca_pem)
                         .context("failed to parse leader CA certificate")?,
                 );
             }
-            LeaderTlsVerification::SkipCa => {
+            ResolvedLeaderTlsVerification::SkipCa => {
                 // Fail closed: insecure (CA-unverified) bootstrap is only ever
                 // permitted when authenticated by a bootstrap token. Without one
                 // there is nothing tying this connection to the real cluster.
@@ -538,7 +533,7 @@ impl HttpCsrBootstrapClient {
                 );
                 builder = builder.danger_accept_invalid_certs(true);
             }
-            LeaderTlsVerification::SystemRoots => {}
+            ResolvedLeaderTlsVerification::SystemRoots => {}
         }
 
         Ok(Self {
@@ -1228,6 +1223,169 @@ mod tests {
             "unexpected error: {err}"
         );
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
+    }
+
+    fn generate_csr_bootstrap_tls_identity() -> (String, String, String) {
+        let (ca_cert, ca_key, ca_cert_pem, _) = crate::auth::generate_ca_full().unwrap();
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "klights-server");
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        (ca_cert_pem, server_cert.pem(), server_key.serialize_pem())
+    }
+
+    async fn start_csr_bootstrap_tls_server(
+        cert_pem: String,
+        key_pem: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let Ok(mut tls) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = tls.read(&mut request).await;
+            let body = br#"{"metadata":{"name":"worker-csr-test"}}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            tls.write_all(response.as_bytes()).await.unwrap();
+        });
+        (endpoint, server)
+    }
+
+    async fn submit_test_csr_to_explicit_ca_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_pem, server_cert_pem, server_key_pem) = generate_csr_bootstrap_tls_identity();
+        let ca_path = dir.path().join("leader-ca.crt");
+        std::fs::write(&ca_path, ca_pem).unwrap();
+        let (endpoint, server) =
+            start_csr_bootstrap_tls_server(server_cert_pem, server_key_pem).await;
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let client = HttpCsrBootstrapClient::new(
+            endpoint,
+            "abcdef.0123456789abcdef".to_string(),
+            Some(ca_path),
+            false,
+            supervisor.clone(),
+        )
+        .await
+        .unwrap();
+
+        let csr_name = client
+            .submit_csr(
+                b"test-csr",
+                "kubernetes.io/kube-apiserver-client-kubelet",
+                &["client auth".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(csr_name, "worker-csr-test");
+        server.await.unwrap();
+        let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
+    }
+
+    fn assert_isolated_test_passed(
+        output: std::process::Output,
+        test_name: &str,
+        failure_message: &str,
+    ) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected_result = format!("test {test_name} ... ok");
+        assert!(
+            output.status.success() && stdout.contains(&expected_result),
+            "{failure_message}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_csr_client_explicit_ca_ignores_same_subject_system_root() {
+        const CHILD_MARKER: &str = "KLIGHTS_CSR_CA_ISOLATION_CHILD";
+        const TEST_NAME: &str = "bootstrap::worker_identity::tests::http_csr_client_explicit_ca_ignores_same_subject_system_root";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            submit_test_csr_to_explicit_ca_server().await;
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, stale_ca_pem, _) = crate::auth::generate_ca_full().unwrap();
+        let stale_ca_path = dir.path().join("stale-system-ca.crt");
+        let empty_ca_dir = dir.path().join("empty-ca-dir");
+        std::fs::write(&stale_ca_path, stale_ca_pem).unwrap();
+        std::fs::create_dir(&empty_ca_dir).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env("SSL_CERT_FILE", &stale_ca_path)
+            .env("SSL_CERT_DIR", &empty_ca_dir)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .output()
+            .unwrap();
+
+        assert_isolated_test_passed(
+            output,
+            TEST_NAME,
+            "explicit leader CA was shadowed by a same-subject system root",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_csr_client_connects_directly_despite_proxy_environment() {
+        const CHILD_MARKER: &str = "KLIGHTS_CSR_NO_PROXY_CHILD";
+        const TEST_NAME: &str = "bootstrap::worker_identity::tests::http_csr_client_connects_directly_despite_proxy_environment";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            submit_test_csr_to_explicit_ca_server().await;
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("all_proxy", "http://127.0.0.1:9")
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .unwrap();
+
+        assert_isolated_test_passed(
+            output,
+            TEST_NAME,
+            "internal leader bootstrap must not use proxy environment variables",
+        );
     }
 
     #[tokio::test]

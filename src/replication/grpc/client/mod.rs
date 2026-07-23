@@ -45,7 +45,7 @@ use crate::control_plane::client::{
     ResourceCommandResult, ResourceEvent, WatchRequest, WatchStream,
 };
 use crate::datastore::Resource;
-use crate::leader_tls_policy::{LeaderTlsVerification, LeaderTlsVerificationPolicy};
+use crate::leader_tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
 use crate::metrics::NodeMetricsSampler;
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
@@ -853,8 +853,13 @@ pub(crate) fn node_registration_to_proto(
 }
 
 impl GrpcClientConfig {
-    fn leader_tls_verification(&self) -> LeaderTlsVerification {
-        LeaderTlsVerificationPolicy::new(self.ca_cert_path.clone(), self.skip_ca).verification()
+    async fn leader_tls_verification(
+        &self,
+        supervisor: &TaskSupervisor,
+    ) -> Result<ResolvedLeaderTlsVerification> {
+        LeaderTlsVerificationPolicy::new(self.ca_cert_path.clone(), self.skip_ca)
+            .resolve(supervisor)
+            .await
     }
 }
 
@@ -2599,8 +2604,13 @@ impl ReplicationGrpcClient {
                 tls = tls.identity(identity);
             }
 
-            match self.config.leader_tls_verification() {
-                LeaderTlsVerification::SkipCa => {
+            match self
+                .config
+                .leader_tls_verification(self.supervisor.as_ref())
+                .await
+                .context("read gRPC CA certificate")?
+            {
+                ResolvedLeaderTlsVerification::SkipCa => {
                     tracing::warn!(
                         leader_endpoint = %endpoint,
                         "skipping TLS CA verification for leader bootstrap connection"
@@ -2608,12 +2618,11 @@ impl ReplicationGrpcClient {
                     builder =
                         builder.tls_config_with_verifier(tls, SkipCaServerCertVerifier::new())?;
                 }
-                LeaderTlsVerification::CaFile(path) => {
-                    let ca_pem = read_ca_pem(path, self.supervisor.as_ref()).await?;
+                ResolvedLeaderTlsVerification::CaPem(ca_pem) => {
                     tls = tls.ca_certificate(Certificate::from_pem(ca_pem));
                     builder = builder.tls_config(tls)?;
                 }
-                LeaderTlsVerification::SystemRoots => {
+                ResolvedLeaderTlsVerification::SystemRoots => {
                     tls = tls.with_enabled_roots();
                     builder = builder.tls_config(tls)?;
                 }
@@ -4015,18 +4024,6 @@ fn is_transport_status(status: &tonic::Status) -> bool {
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled
     )
-}
-
-async fn read_ca_pem(path: PathBuf, supervisor: &TaskSupervisor) -> Result<Vec<u8>> {
-    use std::fs as blocking_fs;
-
-    let key = path.display().to_string();
-    supervisor
-        .run_blocking_file_keyed("grpc_client_read_ca_pem", key, move || {
-            blocking_fs::read(path)
-        })
-        .await?
-        .context("read gRPC CA certificate")
 }
 
 /// bug-grpc: DRY constructor applying the policy's message-size limits to
