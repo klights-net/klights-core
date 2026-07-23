@@ -21,7 +21,7 @@ use klights_supervisor::TaskSupervisor;
 /// configuration. Variant-specific fields prevent persistence from receiving
 /// unused root configuration or discovering a backend, mode, key, or path.
 #[derive(Debug, Clone, Copy)]
-pub enum PassiveStoreOpenRequest<'a> {
+pub(crate) enum PassiveStoreOpenRequest<'a> {
     SqliteInMemory,
     SqlitePersistent {
         cluster_db_path: &'a Path,
@@ -38,7 +38,7 @@ pub enum PassiveStoreOpenRequest<'a> {
 ///
 /// Every variant returns the concrete backend behind a `DatastoreHandle`; this
 /// dispatch never reads ambient configuration or installs replication behavior.
-pub async fn open(
+pub(crate) async fn open(
     request: PassiveStoreOpenRequest<'_>,
     supervisor: Arc<TaskSupervisor>,
 ) -> Result<DatastoreHandle> {

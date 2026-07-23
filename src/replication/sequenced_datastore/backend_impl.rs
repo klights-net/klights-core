@@ -37,6 +37,13 @@ fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
         .or_insert_with(|| Value::from(grace_seconds));
 }
 
+fn reject_application_committed_apply<T>(operation: &'static str) -> Result<T> {
+    Err(anyhow::anyhow!(
+        "sequenced datastore rejects application-side committed apply `{operation}`; \
+         this operation is reserved for the private passive Raft state-machine backend"
+    ))
+}
+
 #[async_trait]
 impl DatastoreBackend for SequencedDatastore {
     async fn read_durable_allocator_observation(
@@ -87,41 +94,34 @@ impl DatastoreBackend for SequencedDatastore {
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
-        current_rv: i64,
-        watch_event_high_water: Option<i64>,
-        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
-        metadata: Option<ReplicatedSnapshotMetadata>,
+        _entries: Vec<crate::log_apply::LogApplyCommit>,
+        _current_rv: i64,
+        _watch_event_high_water: Option<i64>,
+        _watch_replay_floors: Option<Vec<WatchReplayFloor>>,
+        _metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        self.passive
-            .replace_replicated_resource_state(
-                entries,
-                current_rv,
-                watch_event_high_water,
-                watch_replay_floors,
-                metadata,
-            )
-            .await
+        reject_application_committed_apply("replace_replicated_resource_state")
     }
 
-    async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
-        self.passive.apply_log_apply_commit(commit).await
+    async fn apply_log_apply_commit(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<()> {
+        reject_application_committed_apply("apply_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        _commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        self.passive.apply_raft_log_apply_commit(commit).await
+        reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        _commit: crate::log_apply::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        self.passive
-            .apply_raft_log_apply_commit_outcome(commit)
-            .await
+        reject_application_committed_apply("apply_raft_log_apply_commit_outcome")
     }
 
     async fn create_resource(
@@ -2101,39 +2101,34 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
-        current_rv: i64,
-        watch_event_high_water: Option<i64>,
-        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
-        metadata: Option<ReplicatedSnapshotMetadata>,
+        _entries: Vec<crate::log_apply::LogApplyCommit>,
+        _current_rv: i64,
+        _watch_event_high_water: Option<i64>,
+        _watch_replay_floors: Option<Vec<WatchReplayFloor>>,
+        _metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::replace_replicated_resource_state(
-            self,
-            entries,
-            current_rv,
-            watch_event_high_water,
-            watch_replay_floors,
-            metadata,
-        )
-        .await
+        reject_application_committed_apply("replace_replicated_resource_state")
     }
 
-    async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_log_apply_commit(self, commit).await
+    async fn apply_log_apply_commit(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<()> {
+        reject_application_committed_apply("apply_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        _commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
+        reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        _commit: crate::log_apply::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_outcome(self, commit).await
+        reject_application_committed_apply("apply_raft_log_apply_commit_outcome")
     }
 
     async fn current_log_apply_index(&self) -> Result<i64> {

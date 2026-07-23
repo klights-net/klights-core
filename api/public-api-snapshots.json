@@ -2,11 +2,11 @@
   "format": "rustdoc-json-reachable-api-v2",
   "packages": {
     "klights": {
-      "count": 42452,
-      "sha256": "446f4b7c5b76c2c942b8f9de2ee61a0fbab1d0e594c87cb41cf8de5be1a16245",
+      "count": 42385,
+      "sha256": "711d12251bad1a3fee3a775adde541545d291fe36924d561db6738ad9ca0929a",
       "source": {
-        "count": 492434,
-        "sha256": "aa081d2122af476f364fa2f65a5bfb6d9d0141ea22f1cf23f536f1bdc4be319b"
+        "count": 492547,
+        "sha256": "3a760703d53a2c4d152c2f97721df3857387d724a0849c2883b2935e9e7e19b7"
       }
     },
     "klights-apiserver": {

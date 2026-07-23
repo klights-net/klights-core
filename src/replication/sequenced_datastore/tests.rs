@@ -139,6 +139,124 @@ mod cases {
         }
     }
 
+    fn assert_application_apply_rejected(error: anyhow::Error, operation: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains("sequenced datastore rejects application-side committed apply"),
+            "unexpected {operation} rejection: {message}"
+        );
+        assert!(
+            message.contains(operation),
+            "{operation} rejection must name the denied operation: {message}"
+        );
+        assert!(
+            message.contains("private passive Raft state-machine backend"),
+            "{operation} rejection must identify the privileged owner: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequenced_facade_rejects_committed_apply_through_both_trait_views() {
+        let passive: crate::datastore::backend::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let ds = SequencedDatastore::new(passive.clone(), Arc::new(PanicProposal));
+
+        assert_application_apply_rejected(
+            DatastoreBackend::replace_replicated_resource_state(
+                &ds,
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("application facade must reject snapshot replacement"),
+            "replace_replicated_resource_state",
+        );
+        assert_application_apply_rejected(
+            DatastoreBackend::apply_log_apply_commit(
+                &ds,
+                crate::log_apply::LogApplyCommit::new(1, Vec::new()),
+            )
+            .await
+            .expect_err("application facade must reject legacy committed apply"),
+            "apply_log_apply_commit",
+        );
+        assert_application_apply_rejected(
+            DatastoreBackend::apply_raft_log_apply_commit(
+                &ds,
+                crate::log_apply::LogApplyCommit::new(2, Vec::new()),
+            )
+            .await
+            .expect_err("application facade must reject Raft committed apply"),
+            "apply_raft_log_apply_commit",
+        );
+        assert_application_apply_rejected(
+            DatastoreBackend::apply_raft_log_apply_commit_outcome(
+                &ds,
+                crate::log_apply::LogApplyCommit::new(3, Vec::new()),
+            )
+            .await
+            .expect_err("application facade must reject Raft committed apply outcomes"),
+            "apply_raft_log_apply_commit_outcome",
+        );
+
+        assert_application_apply_rejected(
+            crate::datastore::ReplicationStore::replace_replicated_resource_state(
+                &ds,
+                Vec::new(),
+                0,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("replication compatibility facade must reject snapshot replacement"),
+            "replace_replicated_resource_state",
+        );
+        assert_application_apply_rejected(
+            crate::datastore::ReplicationStore::apply_log_apply_commit(
+                &ds,
+                crate::log_apply::LogApplyCommit::new(4, Vec::new()),
+            )
+            .await
+            .expect_err("replication compatibility facade must reject legacy committed apply"),
+            "apply_log_apply_commit",
+        );
+        assert_application_apply_rejected(
+            crate::datastore::ReplicationStore::apply_raft_log_apply_commit(
+                &ds,
+                crate::log_apply::LogApplyCommit::new(5, Vec::new()),
+            )
+            .await
+            .expect_err("replication compatibility facade must reject Raft committed apply"),
+            "apply_raft_log_apply_commit",
+        );
+        assert_application_apply_rejected(
+            crate::datastore::ReplicationStore::apply_raft_log_apply_commit_outcome(
+                &ds,
+                crate::log_apply::LogApplyCommit::new(6, Vec::new()),
+            )
+            .await
+            .expect_err(
+                "replication compatibility facade must reject Raft committed apply outcomes",
+            ),
+            "apply_raft_log_apply_commit_outcome",
+        );
+
+        assert_eq!(
+            passive.get_current_resource_version().await.unwrap(),
+            0,
+            "denied application-side apply must not mutate passive storage"
+        );
+        assert_eq!(
+            passive.current_log_apply_index().await.unwrap(),
+            0,
+            "denied application-side apply must not advance passive apply state"
+        );
+    }
+
     /// DSB-HA-02: SingleNode (Raft N=1) exercises the replicated path
     /// through the raft proposer.
     #[tokio::test]

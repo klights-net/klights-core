@@ -18,7 +18,7 @@ pub mod raft;
 pub mod redb;
 pub(crate) mod replay_retention;
 pub mod resource_version_assignment;
-pub mod selector;
+pub(crate) mod selector;
 pub mod snapshot;
 pub mod sqlite;
 pub mod stale_apply_policy;
