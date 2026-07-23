@@ -1,12 +1,10 @@
 //! Mode marker for service routing.
 
-use crate::bootstrap::NodeMode;
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ServiceRoutingMode;
 
 impl ServiceRoutingMode {
-    pub fn new(_node_mode: NodeMode) -> Self {
+    pub fn new() -> Self {
         Self
     }
 
@@ -14,6 +12,6 @@ impl ServiceRoutingMode {
     /// behavior.
     #[cfg(test)]
     pub fn default_root_for_test() -> Self {
-        Self::new(NodeMode::Root)
+        Self::new()
     }
 }

@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod handle;
+pub(crate) mod network_adapter;
 pub mod redb;
 pub mod selector;
 pub mod sqlite;
@@ -11,8 +12,9 @@ pub use sqlite::SqliteNodeLocalDb;
 #[cfg(test)]
 pub use types::DeadLetterTestInsert;
 pub use types::{
-    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow,
-    PodStatusCheckpoint, ProbeStateRow, ReplicationCheckpoint,
+    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
+    PodNetworkAssignmentRow, PodNetworkReservationError, PodRuntimeRow, PodStatusCheckpoint,
+    ProbeStateRow, ReplicationCheckpoint,
 };
 
 #[cfg(test)]

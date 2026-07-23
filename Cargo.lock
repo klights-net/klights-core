@@ -2030,6 +2030,7 @@ dependencies = [
  "klights-leader-api",
  "klights-network-api",
  "klights-node-api",
+ "klights-node-store",
  "klights-pod-api",
  "klights-reconcile-api",
  "klights-supervisor",

@@ -35,8 +35,10 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default();
     let node_mode =
         NodeMode::detect(cli.rootless).context("failed to detect klights operating mode")?;
-    let network_cleanup =
-        networking::NetworkCleanup::from_config(&node_mode, &config, file_process.clone());
+    let network_cleanup = networking::NetworkCleanup::from_config(
+        &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config)?,
+        file_process.clone(),
+    );
     let cleanup_node_local =
         match open_cleanup_node_local(config.as_ref(), cleanup_task_supervisor.clone()).await {
             Ok(node_local) => Some(node_local),
@@ -100,7 +102,7 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
             }
             return cleanup_directories_and_network(
                 &network_cleanup,
-                cleanup_node_local.as_deref(),
+                cleanup_node_local.as_ref(),
                 &containerd_state_dir,
                 namespace,
                 &cleanup_task_supervisor,
@@ -167,7 +169,7 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
     // Clean up networking and directories.
     cleanup_directories_and_network(
         &network_cleanup,
-        cleanup_node_local.as_deref(),
+        cleanup_node_local.as_ref(),
         &containerd_state_dir,
         namespace,
         &cleanup_task_supervisor,
@@ -321,15 +323,18 @@ async fn open_cleanup_node_local(
 
 async fn cleanup_directories_and_network(
     network_cleanup: &networking::NetworkCleanup,
-    node_local: Option<&dyn crate::datastore::node_local::NodeLocalBackend>,
+    node_local: Option<&crate::datastore::node_local::NodeLocalHandle>,
     containerd_state_dir: &str,
     namespace: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     file_process: &klights_supervisor::FileProcessExecutor,
 ) -> anyhow::Result<()> {
     if let Some(node_local) = node_local
+        && let cache = crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
+            node_local.clone(),
+        )
         && let Err(e) = network_cleanup
-            .cleanup_recorded_pod_networks(node_local)
+            .cleanup_recorded_pod_networks(cache.as_ref())
             .await
     {
         tracing::warn!("Failed to cleanup recorded pod networks: {}", e);

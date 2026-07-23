@@ -1,6 +1,7 @@
 pub mod boot;
 pub mod cleanup;
 pub mod cni;
+pub mod config;
 pub mod dataplane_health;
 pub mod device_state;
 pub(crate) mod hostport_resource;
@@ -45,10 +46,11 @@ mod contract_conformance_tests {
 pub mod wireguard;
 
 use anyhow::Context;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub use boot::NetworkBoot;
 pub use cleanup::NetworkCleanup;
+pub use config::{NetworkBootConfig, NetworkCleanupConfig, NetworkMode};
 pub use plane::NetworkPlane;
 pub use pod_endpoint_resolver::SqlitePodEndpointResolver;
 pub use rootless_plane::RootlessNetworkPlane;
@@ -62,14 +64,6 @@ pub fn pod_link_mtu_for_encryption(encryption: wireguard::DataplaneEncryption) -
         wireguard::DataplaneEncryption::Enabled => wireguard::WIREGUARD_MTU,
         wireguard::DataplaneEncryption::Disabled => POD_OVERLAY_MTU,
     }
-}
-
-static POD_NETWORK_EVENTS: OnceLock<pod_network_events::PodNetworkEvents> = OnceLock::new();
-
-pub fn global_pod_network_events() -> pod_network_events::PodNetworkEvents {
-    POD_NETWORK_EVENTS
-        .get_or_init(pod_network_events::PodNetworkEvents::new)
-        .clone()
 }
 
 /// App-owned parent struct holding one Arc per narrow networking trait.

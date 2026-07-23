@@ -7,7 +7,8 @@ use std::task::{Context, Poll, Waker};
 use klights_node_store::{
     CacheNetworkError, CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey,
     PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodIpamStore, PodNetworkAllocation,
-    PodNetworkAllocationRequest, PodNetworkCache, PodNetworkEndpoint, PodUidKey, SandboxKey,
+    PodNetworkAllocationRequest, PodNetworkAssignmentSnapshot, PodNetworkCache, PodNetworkEndpoint,
+    PodUidKey, SandboxKey,
 };
 use klights_types::PodIdentity;
 
@@ -21,9 +22,24 @@ impl PodNetworkCache for EmptyCacheNetworkStore {
         Box::pin(async { Ok(None) })
     }
 
+    fn get_network_for_pod(
+        &self,
+        _pod: PodIdentity,
+    ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn get_network_for_sandbox(
         &self,
         _sandbox_id: SandboxKey,
+    ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn get_network_for_assignment(
+        &self,
+        _sandbox_id: SandboxKey,
+        _pod: PodIdentity,
     ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>> {
         Box::pin(async { Ok(None) })
     }
@@ -32,7 +48,16 @@ impl PodNetworkCache for EmptyCacheNetworkStore {
         Box::pin(async { Ok(()) })
     }
 
-    fn list_network_sandbox_ids(&self) -> CacheNetworkFuture<'_, Vec<String>> {
+    fn delete_network_if_matches(
+        &self,
+        _request: PodNetworkAllocationRequest,
+    ) -> CacheNetworkFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn list_network_assignments(
+        &self,
+    ) -> CacheNetworkFuture<'_, Vec<PodNetworkAssignmentSnapshot>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -204,6 +229,68 @@ fn allocation_request_rejects_invalid_identity_link_and_subnet_without_normalizi
             Err(CacheNetworkError::InvalidInput { field: actual, .. }) if actual == field
         ));
     }
+}
+
+#[test]
+fn assignment_snapshot_preserves_exact_cas_identity_and_confines_legacy_zero_subnet() {
+    let pod = PodIdentity::new("default", "pod-a", "uid-a");
+    let base = u32::from(Ipv4Addr::new(10, 42, 7, 0));
+    let request = PodNetworkAllocationRequest::try_new(
+        "sandbox-a",
+        pod.clone(),
+        base,
+        256,
+        "veth-a",
+        "/run/netns/a",
+    )
+    .unwrap();
+    let allocation =
+        PodNetworkAllocation::try_new("10.42.7.2", base + 2).expect("valid allocation");
+    let snapshot =
+        PodNetworkAssignmentSnapshot::try_new(request.clone(), allocation.clone()).unwrap();
+    assert_eq!(snapshot.request(), &request);
+    assert_eq!(snapshot.allocation(), &allocation);
+
+    let legacy = PodNetworkAllocationRequest::try_from_persisted(
+        "sandbox-legacy",
+        pod,
+        0,
+        0,
+        "veth-legacy",
+        "/run/netns/legacy",
+    )
+    .unwrap();
+    let legacy_allocation =
+        PodNetworkAllocation::try_new("10.42.7.2", base + 2).expect("valid persisted IP");
+    assert!(
+        PodNetworkAssignmentSnapshot::try_new(legacy, legacy_allocation).is_ok(),
+        "legacy 0/0 rows must remain representable for exact conditional cleanup"
+    );
+
+    assert!(matches!(
+        PodNetworkAllocationRequest::try_from_persisted(
+            "sandbox-invalid",
+            PodIdentity::new("default", "pod", "uid"),
+            base,
+            0,
+            "veth",
+            "/run/netns/pod",
+        ),
+        Err(CacheNetworkError::InvalidInput {
+            field: "subnet_size",
+            ..
+        })
+    ));
+    assert!(matches!(
+        PodNetworkAssignmentSnapshot::try_new(
+            request,
+            PodNetworkAllocation::try_new("10.42.8.2", base + 258).unwrap(),
+        ),
+        Err(CacheNetworkError::InvalidInput {
+            field: "allocation.ip_int",
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -353,7 +353,10 @@ mod tests {
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,
-                network_events: crate::networking::global_pod_network_events(),
+                pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
+                    db.clone(),
+                ),
+                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode,
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),

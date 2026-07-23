@@ -493,7 +493,8 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
             supervisor,
             side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),
-            network_events: crate::networking::global_pod_network_events(),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(db.clone()),
+            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode:
                 crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
             outbox: None,
@@ -1071,11 +1072,12 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-            db: handle,
+            db: handle.clone(),
             supervisor,
             side_effects,
             metrics,
-            network_events: crate::networking::global_pod_network_events(),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(handle),
+            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode:
                 crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
             outbox: None,
@@ -10277,7 +10279,8 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             supervisor: supervisor.clone(),
             side_effects: std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),
-            network_events: crate::networking::global_pod_network_events(),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(db.clone()),
+            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode:
                 crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
             outbox: None,

@@ -13,8 +13,7 @@ pub use std::ffi::{CStr, CString};
 pub use std::net::Ipv4Addr;
 pub use tokio_util::sync::CancellationToken;
 
-pub use crate::control_plane::client::LeaderApiClient;
-pub use crate::datastore::DatastoreBackend;
 pub use crate::networking::netfilter::JhashExpr;
 pub use crate::networking::netfilter::{Batch, Netfilter};
 pub use crate::networking::{ClusterCidr, PodSubnet};
+pub use klights_leader_api::{LeaderResourceQuery, LeaderWatch};

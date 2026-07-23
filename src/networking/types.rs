@@ -6,8 +6,6 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-
 /// Inclusive range of host ports a rootless node uses to expose pods.
 /// Phase 2 reconcilers allocate ports from this window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,19 +123,6 @@ impl fmt::Display for PodSubnet {
     }
 }
 
-impl ToSql for PodSubnet {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.to_string()))
-    }
-}
-
-impl FromSql for PodSubnet {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        let s = value.as_str()?;
-        PodSubnet::parse(s).map_err(|e| FromSqlError::Other(Box::new(ParseError(e))))
-    }
-}
-
 /// The cluster-wide CIDR (e.g., "10.244.0.0/16").
 ///
 /// Used for per-node subnet allocation and routing.
@@ -205,7 +190,7 @@ pub struct BridgeName(String);
 impl BridgeName {
     /// Strict parse: rejects names longer than IFNAMSIZ-1 (15 chars).
     /// Used for spec compliance — production code uses
-    /// [`BridgeName::parse_truncating`] from `KlightsConfig::from_env`.
+    /// [`BridgeName::parse_truncating`] at the bootstrap configuration edge.
     pub fn parse(name: &str) -> Result<Self, String> {
         let trimmed = name.trim();
         validate_bridge_chars(trimmed)?;
@@ -220,7 +205,7 @@ impl BridgeName {
 
     /// Tolerant parse for env-config: keeps the LAST 15 chars to preserve
     /// suffix uniqueness (e.g. `klights-developer-1` vs `-2`). Used by
-    /// `KlightsConfig::from_env`.
+    /// bootstrap configuration parsing.
     pub fn parse_truncating(name: &str) -> Result<Self, String> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -359,15 +344,6 @@ fn validate_bridge_chars(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct ParseError(String);
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for ParseError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,17 +396,6 @@ mod tests {
         assert!(PodSubnet::parse("not-cidr").is_err());
         assert!(PodSubnet::parse("10.43.0.0").is_err());
         assert!(PodSubnet::parse("10.43.0.0/abc").is_err());
-    }
-
-    #[test]
-    fn pod_subnet_to_sql_round_trip() {
-        let s = PodSubnet::parse("10.43.0.0/24").unwrap();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (s TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (?)", rusqlite::params![s])
-            .unwrap();
-        let got: PodSubnet = conn.query_row("SELECT s FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(s, got);
     }
 
     // ClusterCidr -------------------------------------------------------

@@ -164,6 +164,126 @@ impl PodNetwork {
     }
 }
 
+/// Exact identity of one CNI-assigned pod-network cache row.
+///
+/// This identity is intentionally stronger than a namespace/name pair:
+/// same-name replacement Pods and reused runtime sandbox names must never
+/// share a row-visibility notification.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PodNetworkAssignmentKey {
+    sandbox_id: SandboxId,
+    pod: PodIdentity,
+}
+
+impl PodNetworkAssignmentKey {
+    pub fn try_new(
+        sandbox_id: impl Into<String>,
+        namespace: impl Into<String>,
+        pod_name: impl Into<String>,
+        pod_uid: impl Into<String>,
+    ) -> Result<Self, PodNetworkAssignmentEventError> {
+        let sandbox_id = sandbox_id.into();
+        let namespace = namespace.into();
+        let pod_name = pod_name.into();
+        let pod_uid = pod_uid.into();
+        require_assignment_nonempty(&sandbox_id, "assignment.sandbox_id")?;
+        require_assignment_nonempty(&namespace, "assignment.pod.namespace")?;
+        require_assignment_nonempty(&pod_name, "assignment.pod.name")?;
+        require_assignment_nonempty(&pod_uid, "assignment.pod.uid")?;
+        Ok(Self {
+            sandbox_id: SandboxId(sandbox_id),
+            pod: PodIdentity::new(&namespace, &pod_name, &pod_uid),
+        })
+    }
+
+    pub const fn sandbox_id(&self) -> &SandboxId {
+        &self.sandbox_id
+    }
+
+    pub const fn pod(&self) -> &PodIdentity {
+        &self.pod
+    }
+}
+
+fn require_assignment_nonempty(
+    value: &str,
+    field: &'static str,
+) -> Result<(), PodNetworkAssignmentEventError> {
+    if value.trim().is_empty() {
+        Err(PodNetworkAssignmentEventError::invalid(
+            field,
+            "must not be empty",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Typed failures at the in-process assignment-rendezvous boundary.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodNetworkAssignmentEventError {
+    InvalidRequest {
+        field: &'static str,
+        message: String,
+    },
+    Closed,
+    Cancelled,
+}
+
+impl PodNetworkAssignmentEventError {
+    fn invalid(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            field,
+            message: message.into(),
+        }
+    }
+
+    pub const fn closed() -> Self {
+        Self::Closed
+    }
+
+    pub const fn cancelled() -> Self {
+        Self::Cancelled
+    }
+}
+
+impl fmt::Display for PodNetworkAssignmentEventError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::Closed => formatter.write_str("pod network assignment event bus is closed"),
+            Self::Cancelled => formatter.write_str("pod network assignment wait was cancelled"),
+        }
+    }
+}
+
+impl Error for PodNetworkAssignmentEventError {}
+
+/// Heap-erased future for one coalesced assignment hint.
+pub type PodNetworkAssignmentWaitFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), PodNetworkAssignmentEventError>> + Send + 'a>>;
+
+/// RAII registration for one exact assignment key.
+pub trait PodNetworkAssignmentSubscription: Send {
+    fn wait(&mut self) -> PodNetworkAssignmentWaitFuture<'_>;
+}
+
+/// Non-blocking, infallible producer view used after durable CNI persistence.
+pub trait PodNetworkAssignmentPublisher: Send + Sync + 'static {
+    fn publish_assignment(&self, key: &PodNetworkAssignmentKey);
+}
+
+/// Synchronous registration view used before the authoritative node-cache read.
+pub trait PodNetworkAssignmentWaiter: Send + Sync + 'static {
+    fn subscribe(
+        &self,
+        key: PodNetworkAssignmentKey,
+    ) -> Result<Box<dyn PodNetworkAssignmentSubscription>, PodNetworkAssignmentEventError>;
+}
+
 /// Typed failure categories for the runtime datapath boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DatapathError {

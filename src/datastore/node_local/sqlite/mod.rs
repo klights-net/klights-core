@@ -1708,13 +1708,132 @@ impl SqliteNodeLocalDb {
         &self,
         request: PodNetworkAllocationRequest<'_>,
     ) -> Result<(String, u32)> {
+        self.reserve_network_assignment(request)
+            .await
+            .map_err(anyhow::Error::new)
+    }
+
+    pub async fn reserve_network_assignment(
+        &self,
+        request: PodNetworkAllocationRequest<'_>,
+    ) -> std::result::Result<(String, u32), super::PodNetworkReservationError> {
         let request = request.into_owned();
+        let subnet_base_int = request.subnet_base_int;
+        let subnet_size = request.subnet_size;
+        let sandbox_id = request.sandbox_id.clone();
         let now = now_ms();
-        self.db_call("node_local:reserve_ip_network", move |conn| {
-            reserve_ip_and_insert_network_in_conn(conn, request.as_borrowed(), now)
+        let outcome = self
+            .db_call("node_local:reserve_ip_network", move |conn| {
+                reserve_ip_and_insert_network_in_conn(conn, request.as_borrowed(), now)
+            })
+            .await
+            .map_err(|error| super::PodNetworkReservationError::Persistence {
+                message: format!("pod network reserve failed: {error}"),
+            })?;
+        match outcome {
+            PodNetworkReservationOutcome::Reserved(ip_addr, ip_int) => Ok((ip_addr, ip_int)),
+            PodNetworkReservationOutcome::IdentityConflict => {
+                Err(super::PodNetworkReservationError::IdentityConflict { sandbox_id })
+            }
+            PodNetworkReservationOutcome::AddressExhausted => {
+                Err(super::PodNetworkReservationError::AddressExhausted {
+                    subnet_base_int,
+                    subnet_size,
+                })
+            }
+        }
+    }
+
+    pub async fn get_network_assignment_for_uid(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<super::PodNetworkAssignmentRow>> {
+        let pod_uid = pod_uid.to_string();
+        self.db_call("node_local:get_network_assignment_uid", move |conn| {
+            conn.query_row(
+                "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
+                        ip_addr, ip_int, veth_host, netns_path \
+                   FROM pod_networks WHERE pod_uid = ?1 ORDER BY created_ms DESC LIMIT 1",
+                [pod_uid],
+                row_to_pod_network_assignment,
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
         })
         .await
-        .map_err(|e| anyhow!("pod network reserve failed: {e}"))
+        .map_err(|error| anyhow!("pod network assignment get uid failed: {error}"))
+    }
+
+    pub async fn get_network_assignment_for_pod(
+        &self,
+        pod: klights_types::PodIdentity,
+    ) -> Result<Option<super::PodNetworkAssignmentRow>> {
+        self.db_call("node_local:get_network_assignment_pod", move |conn| {
+            conn.query_row(
+                "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
+                        ip_addr, ip_int, veth_host, netns_path \
+                   FROM pod_networks \
+                  WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3 \
+                  ORDER BY created_ms DESC LIMIT 1",
+                rusqlite::params![pod.namespace, pod.name, pod.uid],
+                row_to_pod_network_assignment,
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow!("pod network assignment get pod failed: {error}"))
+    }
+
+    pub async fn get_network_assignment_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<super::PodNetworkAssignmentRow>> {
+        let sandbox_id = sandbox_id.to_string();
+        self.db_call("node_local:get_network_assignment_sandbox", move |conn| {
+            conn.query_row(
+                "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
+                            ip_addr, ip_int, veth_host, netns_path \
+                       FROM pod_networks WHERE sandbox_id = ?1",
+                [sandbox_id],
+                row_to_pod_network_assignment,
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow!("pod network assignment get sandbox failed: {error}"))
+    }
+
+    pub async fn delete_network_assignment_if_matches(
+        &self,
+        request: PodNetworkAllocationRequest<'_>,
+    ) -> Result<bool> {
+        let request = request.into_owned();
+        self.db_call(
+            "node_local:delete_network_assignment_if_matches",
+            move |conn| {
+                let deleted = conn.execute(
+                    "DELETE FROM pod_networks \
+                      WHERE sandbox_id = ?1 AND namespace = ?2 AND pod_name = ?3 AND pod_uid = ?4 \
+                        AND subnet_base_int = ?5 AND subnet_size = ?6 \
+                        AND veth_host = ?7 AND netns_path = ?8",
+                    rusqlite::params![
+                        request.sandbox_id,
+                        request.namespace,
+                        request.pod_name,
+                        request.pod_uid,
+                        i64::from(request.subnet_base_int),
+                        i64::from(request.subnet_size),
+                        request.veth_host,
+                        request.netns_path,
+                    ],
+                )?;
+                Ok(deleted == 1)
+            },
+        )
+        .await
+        .map_err(|error| anyhow!("pod network assignment conditional delete failed: {error}"))
     }
 
     pub async fn get_network_for_uid(&self, pod_uid: &str) -> Result<Option<PodNetworkEndpoint>> {
@@ -1769,6 +1888,22 @@ impl SqliteNodeLocalDb {
             let rows = conn
                 .prepare("SELECT sandbox_id FROM pod_networks ORDER BY sandbox_id")?
                 .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow!("pod network list failed: {e}"))
+    }
+
+    pub async fn list_network_assignments(&self) -> Result<Vec<super::PodNetworkAssignmentRow>> {
+        self.db_call("node_local:list_network_assignments", move |conn| {
+            let rows = conn
+                .prepare(
+                    "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
+                            ip_addr, ip_int, veth_host, netns_path \
+                       FROM pod_networks ORDER BY sandbox_id",
+                )?
+                .query_map([], row_to_pod_network_assignment)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -2030,11 +2165,18 @@ impl SqliteNodeLocalDb {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum PodNetworkReservationOutcome {
+    Reserved(String, u32),
+    IdentityConflict,
+    AddressExhausted,
+}
+
 fn reserve_ip_and_insert_network_in_conn(
     conn: &rusqlite::Connection,
     request: PodNetworkAllocationRequest<'_>,
     now_ms: i64,
-) -> tokio_rusqlite::Result<(String, u32)> {
+) -> tokio_rusqlite::Result<PodNetworkReservationOutcome> {
     if request.subnet.size < 4 {
         return Err(tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2042,15 +2184,84 @@ fn reserve_ip_and_insert_network_in_conn(
         ))));
     }
 
-    if let Some((existing_ip, existing_ip_int)) = conn
+    if let Some(existing) = conn
         .query_row(
-            "SELECT ip_addr, ip_int FROM pod_networks WHERE sandbox_id = ?1",
+            "SELECT namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
+                    ip_addr, ip_int, veth_host, netns_path \
+               FROM pod_networks WHERE sandbox_id = ?1",
             [request.sandbox_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u32,
+                    row.get::<_, i64>(4)? as u32,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)? as u32,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
         )
         .optional()?
     {
-        return Ok((existing_ip, existing_ip_int));
+        let exact_identity = existing.0 == request.pod.namespace
+            && existing.1 == request.pod.name
+            && existing.2 == request.pod.uid
+            && existing.7 == request.link.veth_host
+            && existing.8 == request.link.netns_path;
+        let exact_subnet =
+            existing.3 == request.subnet.base_int && existing.4 == request.subnet.size;
+        if exact_identity && exact_subnet {
+            return Ok(PodNetworkReservationOutcome::Reserved(
+                existing.5, existing.6,
+            ));
+        }
+
+        let usable_start = request.subnet.base_int + 2;
+        let usable_end = request.subnet.base_int + request.subnet.size - 2;
+        let legacy_subnet = existing.3 == 0 && existing.4 == 0;
+        let stored_ip_matches = existing
+            .5
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| u32::from(ip) == existing.6);
+        if exact_identity
+            && legacy_subnet
+            && stored_ip_matches
+            && existing.6 >= usable_start
+            && existing.6 <= usable_end
+        {
+            let adopted = conn.execute(
+                "UPDATE pod_networks \
+                    SET subnet_base_int = ?1, subnet_size = ?2 \
+                  WHERE sandbox_id = ?3 AND namespace = ?4 AND pod_name = ?5 AND pod_uid = ?6 \
+                    AND subnet_base_int = 0 AND subnet_size = 0 \
+                    AND ip_addr = ?7 AND ip_int = ?8 AND veth_host = ?9 AND netns_path = ?10 \
+                    AND ip_int >= ?11 AND ip_int <= ?12",
+                rusqlite::params![
+                    i64::from(request.subnet.base_int),
+                    i64::from(request.subnet.size),
+                    request.sandbox_id,
+                    request.pod.namespace,
+                    request.pod.name,
+                    request.pod.uid,
+                    existing.5,
+                    i64::from(existing.6),
+                    request.link.veth_host,
+                    request.link.netns_path,
+                    i64::from(usable_start),
+                    i64::from(usable_end),
+                ],
+            )?;
+            if adopted == 1 {
+                return Ok(PodNetworkReservationOutcome::Reserved(
+                    existing.5, existing.6,
+                ));
+            }
+        }
+
+        return Ok(PodNetworkReservationOutcome::IdentityConflict);
     }
 
     let start = request.subnet.base_int + 2;
@@ -2078,14 +2289,17 @@ fn reserve_ip_and_insert_network_in_conn(
         let ip_addr = crate::utils::ip_u32_to_string(candidate);
         let inserted = conn.execute(
             "INSERT INTO pod_networks \
-             (sandbox_id, namespace, pod_name, pod_uid, ip_addr, ip_int, veth_host, netns_path, created_ms) \
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             (sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
+              ip_addr, ip_int, veth_host, netns_path, created_ms) \
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
              ON CONFLICT(ip_int) DO NOTHING",
             rusqlite::params![
                 request.sandbox_id,
                 request.pod.namespace,
                 request.pod.name,
                 request.pod.uid,
+                i64::from(request.subnet.base_int),
+                i64::from(request.subnet.size),
                 ip_addr,
                 candidate as i64,
                 request.link.veth_host,
@@ -2094,14 +2308,31 @@ fn reserve_ip_and_insert_network_in_conn(
             ],
         )?;
         if inserted > 0 {
-            return Ok((crate::utils::ip_u32_to_string(candidate), candidate));
+            return Ok(PodNetworkReservationOutcome::Reserved(
+                crate::utils::ip_u32_to_string(candidate),
+                candidate,
+            ));
         }
     }
 
-    Err(tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
-        std::io::ErrorKind::AddrNotAvailable,
-        "no free IPs in pod subnet",
-    ))))
+    Ok(PodNetworkReservationOutcome::AddressExhausted)
+}
+
+fn row_to_pod_network_assignment(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<super::PodNetworkAssignmentRow> {
+    Ok(super::PodNetworkAssignmentRow {
+        sandbox_id: row.get(0)?,
+        namespace: row.get(1)?,
+        pod_name: row.get(2)?,
+        pod_uid: row.get(3)?,
+        subnet_base_int: row.get::<_, i64>(4)? as u32,
+        subnet_size: row.get::<_, i64>(5)? as u32,
+        ip_addr: row.get(6)?,
+        ip_int: row.get::<_, i64>(7)? as u32,
+        veth_host: row.get(8)?,
+        netns_path: row.get(9)?,
+    })
 }
 
 fn row_to_pod_network_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodNetworkEndpoint> {
@@ -2206,4 +2437,205 @@ fn row_to_runtime_observation_checkpoint(
         generation: row.get::<_, i64>(2)? as u64,
         updated_ms: row.get(3)?,
     })
+}
+
+#[cfg(test)]
+mod pod_network_reservation_tests {
+    use super::*;
+
+    fn legacy_connection() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE pod_networks (
+                    sandbox_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    pod_name TEXT NOT NULL,
+                    pod_uid TEXT NOT NULL,
+                    subnet_base_int INTEGER NOT NULL,
+                    subnet_size INTEGER NOT NULL,
+                    ip_addr TEXT NOT NULL,
+                    ip_int INTEGER NOT NULL UNIQUE,
+                    veth_host TEXT NOT NULL,
+                    netns_path TEXT NOT NULL,
+                    created_ms INTEGER NOT NULL
+                );
+                INSERT INTO pod_networks VALUES (
+                    'sandbox-legacy', 'default', 'pod-legacy', 'uid-legacy',
+                    0, 0, '10.42.89.2', 170547458, 'veth-legacy',
+                    '/run/netns/legacy', 1
+                );
+                ",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn fresh_schema_legacy_insert_uses_zero_sentinel_and_exact_adoption() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        schema::init_schema_in_conn(&mut connection).unwrap();
+        let base = u32::from(std::net::Ipv4Addr::new(10, 42, 89, 0));
+        connection
+            .execute(
+                "INSERT INTO pod_networks \
+                 (sandbox_id, namespace, pod_name, pod_uid, ip_addr, ip_int, \
+                  veth_host, netns_path, created_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    "sandbox-legacy",
+                    "default",
+                    "pod-legacy",
+                    "uid-legacy",
+                    "10.42.89.2",
+                    i64::from(base + 2),
+                    "veth-legacy",
+                    "/run/netns/legacy",
+                    1_i64,
+                ],
+            )
+            .unwrap();
+
+        let sentinel: (u32, u32) = connection
+            .query_row(
+                "SELECT subnet_base_int, subnet_size FROM pod_networks",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
+            )
+            .unwrap();
+        assert_eq!(sentinel, (0, 0));
+
+        let outcome = reserve_ip_and_insert_network_in_conn(
+            &connection,
+            PodNetworkAllocationRequest::new(
+                "sandbox-legacy",
+                crate::datastore::PodNetworkAllocationPod::new(
+                    "default",
+                    "pod-legacy",
+                    "uid-legacy",
+                ),
+                crate::datastore::PodNetworkAllocationSubnet::new(base, 256),
+                crate::datastore::PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            PodNetworkReservationOutcome::Reserved("10.42.89.2".to_string(), base + 2)
+        );
+
+        let adopted: (u32, u32) = connection
+            .query_row(
+                "SELECT subnet_base_int, subnet_size FROM pod_networks",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
+            )
+            .unwrap();
+        assert_eq!(adopted, (base, 256));
+    }
+
+    #[test]
+    fn legacy_subnet_adoption_rejects_every_identity_or_usable_range_mismatch() {
+        let base = u32::from(std::net::Ipv4Addr::new(10, 42, 89, 0));
+        let mismatches = [
+            (
+                "other",
+                "pod-legacy",
+                "uid-legacy",
+                base,
+                "veth-legacy",
+                "/run/netns/legacy",
+            ),
+            (
+                "default",
+                "other",
+                "uid-legacy",
+                base,
+                "veth-legacy",
+                "/run/netns/legacy",
+            ),
+            (
+                "default",
+                "pod-legacy",
+                "other",
+                base,
+                "veth-legacy",
+                "/run/netns/legacy",
+            ),
+            (
+                "default",
+                "pod-legacy",
+                "uid-legacy",
+                base,
+                "veth-other",
+                "/run/netns/legacy",
+            ),
+            (
+                "default",
+                "pod-legacy",
+                "uid-legacy",
+                base,
+                "veth-legacy",
+                "/run/netns/other",
+            ),
+            (
+                "default",
+                "pod-legacy",
+                "uid-legacy",
+                u32::from(std::net::Ipv4Addr::new(10, 42, 90, 0)),
+                "veth-legacy",
+                "/run/netns/legacy",
+            ),
+        ];
+
+        for (namespace, name, uid, requested_base, veth, netns) in mismatches {
+            let connection = legacy_connection();
+            let outcome = reserve_ip_and_insert_network_in_conn(
+                &connection,
+                PodNetworkAllocationRequest::new(
+                    "sandbox-legacy",
+                    crate::datastore::PodNetworkAllocationPod::new(namespace, name, uid),
+                    crate::datastore::PodNetworkAllocationSubnet::new(requested_base, 256),
+                    crate::datastore::PodNetworkAllocationLink::new(veth, netns),
+                ),
+                2,
+            )
+            .unwrap();
+            assert_eq!(outcome, PodNetworkReservationOutcome::IdentityConflict);
+            let subnet: (u32, u32) = connection
+                .query_row(
+                    "SELECT subnet_base_int, subnet_size FROM pod_networks",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
+                )
+                .unwrap();
+            assert_eq!(subnet, (0, 0), "mismatch must not backfill legacy row");
+        }
+
+        let connection = legacy_connection();
+        connection
+            .execute(
+                "UPDATE pod_networks SET ip_addr = '192.0.2.2' WHERE sandbox_id = 'sandbox-legacy'",
+                [],
+            )
+            .unwrap();
+        let outcome = reserve_ip_and_insert_network_in_conn(
+            &connection,
+            PodNetworkAllocationRequest::new(
+                "sandbox-legacy",
+                crate::datastore::PodNetworkAllocationPod::new(
+                    "default",
+                    "pod-legacy",
+                    "uid-legacy",
+                ),
+                crate::datastore::PodNetworkAllocationSubnet::new(base, 256),
+                crate::datastore::PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(outcome, PodNetworkReservationOutcome::IdentityConflict);
+    }
 }

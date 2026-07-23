@@ -513,8 +513,7 @@ mod tests {
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
             network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &node_mode,
-                &config,
+                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
                 file_process,
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -570,8 +569,7 @@ mod tests {
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
             network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &node_mode,
-                &config,
+                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
                 file_process,
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -694,8 +692,7 @@ mod tests {
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
             network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &node_mode,
-                &config,
+                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
                 file_process,
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -778,8 +775,7 @@ mod tests {
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
             network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &node_mode,
-                &config,
+                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
                 file_process,
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -852,8 +848,7 @@ mod tests {
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
             network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &node_mode,
-                &config,
+                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
                 file_process,
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),

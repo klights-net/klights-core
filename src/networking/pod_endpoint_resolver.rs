@@ -10,28 +10,36 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::control_plane::client::LeaderApiClient;
-use crate::datastore::node_local::NodeLocalHandle;
-use crate::datastore::{PodEndpointEvent, PodEndpointMode};
+use klights_leader_api::LeaderNetworkTopologyQuery;
 use klights_network_api::{
     DirectPodEndpoint, HostPortPodEndpoint, PodEndpoint, PodEndpointError, PodEndpointEventSource,
     PodEndpointEventStream, PodEndpointEventSubscription, PodEndpointFuture, PodEndpointResolver,
     PodEndpointTopology,
+};
+use klights_node_store::{
+    PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodEndpointStoreEvent,
+    PodEndpointStoreEventSource,
 };
 
 /// SQLite-backed resolver — reads from the `pod_endpoints` table
 /// (Task 1) and translates the `PodEndpointEvent` broadcast into the
 /// trait's `EndpointEvent` shape.
 pub struct SqlitePodEndpointResolver {
-    node_local: NodeLocalHandle,
-    cluster_api: Arc<dyn LeaderApiClient>,
+    endpoints: Arc<dyn PodEndpointStore>,
+    endpoint_events: Arc<dyn PodEndpointStoreEventSource>,
+    topology: Arc<dyn LeaderNetworkTopologyQuery>,
 }
 
 impl SqlitePodEndpointResolver {
-    pub fn new(node_local: NodeLocalHandle, cluster_api: Arc<dyn LeaderApiClient>) -> Self {
+    pub fn new(
+        endpoints: Arc<dyn PodEndpointStore>,
+        endpoint_events: Arc<dyn PodEndpointStoreEventSource>,
+        topology: Arc<dyn LeaderNetworkTopologyQuery>,
+    ) -> Self {
         Self {
-            node_local,
-            cluster_api,
+            endpoints,
+            endpoint_events,
+            topology,
         }
     }
 }
@@ -40,20 +48,19 @@ impl PodEndpointResolver for SqlitePodEndpointResolver {
     fn resolve(&self, pod_ip: Ipv4Addr) -> PodEndpointFuture<'_, Option<PodEndpoint>> {
         Box::pin(async move {
             let Some(row) = self
-                .node_local
+                .endpoints
                 .get_endpoint_by_pod_ip(pod_ip)
                 .await
                 .map_err(|error| PodEndpointError::resolve(error.to_string()))?
             else {
                 return Ok(None);
             };
-            match row.mode {
+            match row.mode() {
                 PodEndpointMode::EncryptedDirect => {
-                    let query =
-                        crate::control_plane::client::NodeDataplaneQuery::try_new(&row.node_name)
-                            .map_err(|error| PodEndpointError::resolve(error.to_string()))?;
+                    let query = klights_leader_api::NodeDataplaneQuery::try_new(row.node_name())
+                        .map_err(|error| PodEndpointError::resolve(error.to_string()))?;
                     let Some(metadata) = self
-                        .cluster_api
+                        .topology
                         .get_node_dataplane(query)
                         .await
                         .map_err(|error| PodEndpointError::resolve(error.to_string()))?
@@ -61,26 +68,27 @@ impl PodEndpointResolver for SqlitePodEndpointResolver {
                     else {
                         return Ok(None);
                     };
-                    let endpoint = DirectPodEndpoint::try_new(row.pod_ip, row.node_name)?;
+                    let endpoint =
+                        DirectPodEndpoint::try_new(row.pod_ip(), row.node_name().to_string())?;
                     Ok(Some(match metadata.encryption() {
-                        crate::control_plane::client::DataplaneEncryption::WireGuard => {
+                        klights_leader_api::DataplaneEncryption::WireGuard => {
                             PodEndpoint::EncryptedDirect(endpoint)
                         }
-                        crate::control_plane::client::DataplaneEncryption::Direct => {
+                        klights_leader_api::DataplaneEncryption::Direct => {
                             PodEndpoint::UnencryptedDirect(endpoint)
                         }
                     }))
                 }
                 PodEndpointMode::Hostport => {
-                    if row.host_port_tcp.is_none() && row.host_port_udp.is_none() {
+                    if row.host_port_tcp().is_none() && row.host_port_udp().is_none() {
                         return Ok(None);
                     }
                     Ok(Some(PodEndpoint::HostPort(HostPortPodEndpoint::try_new(
-                        row.pod_ip,
-                        row.node_name,
-                        row.node_ip,
-                        row.host_port_tcp,
-                        row.host_port_udp,
+                        row.pod_ip(),
+                        row.node_name().to_string(),
+                        row.node_ip(),
+                        row.host_port_tcp(),
+                        row.host_port_udp(),
                     )?)))
                 }
             }
@@ -91,55 +99,21 @@ impl PodEndpointResolver for SqlitePodEndpointResolver {
 impl PodEndpointEventSource for SqlitePodEndpointResolver {
     fn subscribe(&self) -> PodEndpointFuture<'_, PodEndpointEventStream> {
         Box::pin(async move {
-            let (rows, rx) = self
-                .node_local
-                .subscribe_pod_endpoints_with_snapshot()
+            let mut events = self
+                .endpoint_events
+                .subscribe_endpoint_events()
                 .await
                 .map_err(|error| PodEndpointError::event_source(error.to_string()))?;
-            let initial = translate_endpoint_snapshot(rows)?;
-            let node_local = self.node_local.clone();
-            let inner = futures::stream::unfold(
-                (Some(initial), Some(rx), node_local),
-                |(initial, receiver, node_local)| async move {
-                    if let Some(snapshot) = initial {
-                        return Some((
-                            Ok(klights_network_api::PodEndpointEvent::Resync(snapshot)),
-                            (None, receiver, node_local),
-                        ));
-                    }
-                    let mut rx = receiver?;
-                    match rx.recv().await {
-                            Ok(event) => match translate_endpoint_event(event) {
-                                Ok(event) => Some((Ok(event), (None, Some(rx), node_local))),
-                                Err(error) => Some((Err(error), (None, None, node_local))),
-                            },
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(lagged_count)) => {
-                                tracing::warn!(
-                                    lagged_count,
-                                    "pod_endpoint_resolver: broadcast Lagged; replacing subscription from an atomic snapshot"
-                                );
-                                match node_local.subscribe_pod_endpoints_with_snapshot().await {
-                                    Ok((rows, fresh_rx)) => match translate_endpoint_snapshot(rows) {
-                                        Ok(snapshot) => Some((
-                                            Ok(klights_network_api::PodEndpointEvent::Resync(
-                                                snapshot,
-                                            )),
-                                            (None, Some(fresh_rx), node_local),
-                                        )),
-                                        Err(error) => {
-                                            Some((Err(error), (None, None, node_local)))
-                                        }
-                                    },
-                                    Err(error) => Some((
-                                        Err(PodEndpointError::event_source(error.to_string())),
-                                        (None, None, node_local),
-                                    )),
-                                }
-                            }
-                    }
-                },
-            )
+            let inner = futures::stream::poll_fn(move |context| {
+                let event = events.as_mut().poll_next(context);
+                event.map(|item| {
+                    item.map(|result| {
+                        result
+                            .map_err(|error| PodEndpointError::event_source(error.to_string()))
+                            .and_then(translate_endpoint_event)
+                    })
+                })
+            })
             .boxed();
             Ok(Box::pin(ResolverEndpointSubscription { inner }) as PodEndpointEventStream)
         })
@@ -167,38 +141,39 @@ impl PodEndpointEventSubscription for ResolverEndpointSubscription {
 }
 
 fn translate_endpoint_snapshot(
-    rows: Vec<crate::datastore::PodEndpointRow>,
+    rows: Vec<PodEndpointRecord>,
 ) -> Result<Vec<PodEndpointTopology>, PodEndpointError> {
     rows.into_iter().map(translate_endpoint_row).collect()
 }
 
-fn translate_endpoint_row(
-    row: crate::datastore::PodEndpointRow,
-) -> Result<PodEndpointTopology, PodEndpointError> {
-    match row.mode {
+fn translate_endpoint_row(row: PodEndpointRecord) -> Result<PodEndpointTopology, PodEndpointError> {
+    match row.mode() {
         PodEndpointMode::EncryptedDirect => Ok(PodEndpointTopology::Direct(
-            DirectPodEndpoint::try_new(row.pod_ip, row.node_name)?,
+            DirectPodEndpoint::try_new(row.pod_ip(), row.node_name().to_string())?,
         )),
         PodEndpointMode::Hostport => {
             Ok(PodEndpointTopology::HostPort(HostPortPodEndpoint::try_new(
-                row.pod_ip,
-                row.node_name,
-                row.node_ip,
-                row.host_port_tcp,
-                row.host_port_udp,
+                row.pod_ip(),
+                row.node_name().to_string(),
+                row.node_ip(),
+                row.host_port_tcp(),
+                row.host_port_udp(),
             )?))
         }
     }
 }
 
 fn translate_endpoint_event(
-    event: PodEndpointEvent,
+    event: PodEndpointStoreEvent,
 ) -> Result<klights_network_api::PodEndpointEvent, PodEndpointError> {
     match event {
-        PodEndpointEvent::Upsert(row) => Ok(klights_network_api::PodEndpointEvent::Upsert(
+        PodEndpointStoreEvent::Resync(rows) => Ok(klights_network_api::PodEndpointEvent::Resync(
+            translate_endpoint_snapshot(rows)?,
+        )),
+        PodEndpointStoreEvent::Upsert(row) => Ok(klights_network_api::PodEndpointEvent::Upsert(
             translate_endpoint_row(row)?,
         )),
-        PodEndpointEvent::Delete { pod_ip, .. } => {
+        PodEndpointStoreEvent::Delete { pod_ip } => {
             Ok(klights_network_api::PodEndpointEvent::Delete(pod_ip))
         }
     }
@@ -208,9 +183,9 @@ fn translate_endpoint_event(
 mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::datastore::PodEndpointRow;
     use crate::datastore::node_local::{NodeLocalHandle, selector};
     use crate::datastore::sqlite::Datastore;
+    use crate::datastore::{PodEndpointMode, PodEndpointRow};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -269,7 +244,12 @@ mod tests {
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         ));
-        let resolver = SqlitePodEndpointResolver::new(node_local.clone(), cluster_api);
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
+                node_local.clone(),
+            );
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+        let resolver = SqlitePodEndpointResolver::new(node_network.clone(), node_network, topology);
         (node_local, cluster_db, resolver)
     }
 
@@ -666,7 +646,13 @@ mod tests {
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         ));
-        let resolver = SqlitePodEndpointResolver::new(Arc::new(node_local.clone()), cluster_api);
+        let node_handle: NodeLocalHandle = Arc::new(node_local.clone());
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
+                node_handle,
+            );
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+        let resolver = SqlitePodEndpointResolver::new(node_network.clone(), node_network, topology);
         let mut failed_stream = resolver.subscribe().await.expect("initial subscription");
         assert!(matches!(
             next_endpoint_event(&mut failed_stream).await,

@@ -296,7 +296,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         node_ip: &node_ip,
         cluster_api: cluster_api.clone(),
         node_local: node_local.clone(),
-        db,
         network_cleanup: &network_cleanup,
         containerd_data_dir: &containerd_data_dir,
         containerd_state_dir: &containerd_state_dir,
@@ -313,6 +312,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let cri_for_api = net.cri_for_api;
     let cni_readiness = net.cni_readiness;
     let dataplane_health = net.dataplane_health;
+    let pod_network_cache = net.pod_network_cache;
+    let assignment_waiter = net.assignment_waiter;
     let controlplane_leader_control_stream_handle =
         start_controlplane_leader_control_stream_if_needed(
             &cli.role,
@@ -341,6 +342,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         cluster_api: cluster_api.clone(),
         remote_api_client: remote_api_client.clone(),
         _node_local: node_local.clone(),
+        pod_network_cache,
+        assignment_waiter,
         replication_service_for_router: replication_service_for_router.clone(),
         outbox_runtime: outbox_runtime.clone(),
         control_plane_lease_client: control_plane_lease_client.clone(),

@@ -12,16 +12,42 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::bootstrap::NodeMode;
+#[async_trait::async_trait]
+trait NetworkCommandRunner: Send + Sync {
+    async fn run_network_output(
+        &self,
+        category: klights_supervisor::TaskCategory,
+        name: &'static str,
+        program: &str,
+        args: &[&str],
+    ) -> Result<std::process::Output>;
+}
+
+#[async_trait::async_trait]
+impl NetworkCommandRunner for klights_supervisor::FileProcessExecutor {
+    async fn run_network_output(
+        &self,
+        category: klights_supervisor::TaskCategory,
+        name: &'static str,
+        program: &str,
+        args: &[&str],
+    ) -> Result<std::process::Output> {
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        self.run_process_output(category, name, command)
+            .await
+            .with_context(|| format!("supervised network process {name} ({program})"))
+    }
+}
 
 async fn run_network_command_with(
-    runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    runner: &dyn NetworkCommandRunner,
     name: &'static str,
     program: &str,
     args: &[&str],
 ) -> Result<std::process::Output> {
     runner
-        .run(
+        .run_network_output(
             klights_supervisor::TaskCategory::Network,
             name,
             program,
@@ -103,24 +129,21 @@ impl NetworkCleanup {
     /// Build cleanup from immutable startup mode/config. Must be called before
     /// network boot so failure paths still have a networking-owned fallback.
     pub fn from_config(
-        mode: &NodeMode,
-        cfg: &crate::KlightsConfig,
+        cfg: &crate::networking::NetworkCleanupConfig,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        match mode {
-            NodeMode::Root => Self::root_with_runtime(
-                cfg.bridge_name.clone(),
-                cfg.wireguard_device.clone(),
-                cfg.containerd_namespace.clone(),
+        match cfg.mode() {
+            crate::networking::NetworkMode::Root => Self::root_with_runtime(
+                cfg.bridge_name(),
+                cfg.wireguard_device(),
+                cfg.nft_table_name(),
                 file_process,
             ),
-            NodeMode::Rootless {
-                rootlesskit_pid, ..
-            } => Self::rootless_with_cni(
-                cfg.bridge_name.clone(),
-                cfg.wireguard_device.clone(),
-                cfg.containerd_namespace.clone(),
-                *rootlesskit_pid != 0,
+            crate::networking::NetworkMode::Rootless => Self::rootless_with_cni(
+                cfg.bridge_name(),
+                cfg.wireguard_device(),
+                cfg.nft_table_name(),
+                cfg.inside_rootlesskit(),
                 file_process,
             ),
         }
@@ -240,46 +263,40 @@ impl NetworkCleanup {
     /// or unmastered `veth*` belongs to this klights instance.
     pub async fn cleanup_recorded_pod_networks(
         &self,
-        node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
+        node_local: &dyn klights_node_store::PodNetworkCache,
     ) -> Result<()> {
-        let sandbox_ids = node_local
-            .list_networks()
+        let assignments = node_local
+            .list_network_assignments()
             .await
             .context("failed to list recorded pod networks")?;
         let mut cleaned = 0u32;
 
-        for sandbox_id in sandbox_ids {
-            let endpoint = match node_local
-                .get_network_for_sandbox(&sandbox_id)
-                .await
-                .with_context(|| format!("failed to read pod network record {sandbox_id}"))?
-            {
-                Some(endpoint) => endpoint,
-                None => continue,
-            };
+        for assignment in assignments {
+            let request = assignment.request().clone();
+            let sandbox_id = request.sandbox_id().to_string();
 
-            if is_recorded_klights_veth_name(&endpoint.veth_host) {
-                self.cleanup_recorded_veth(&sandbox_id, &endpoint.veth_host)
+            if is_recorded_klights_veth_name(request.veth_host()) {
+                self.cleanup_recorded_veth(&sandbox_id, request.veth_host())
                     .await;
             } else {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
-                    veth = %endpoint.veth_host,
+                    veth = %request.veth_host(),
                     "Skipping recorded pod-network veth with unexpected klights naming"
                 );
             }
 
-            if let Some(netns_name) = cni_netns_basename(&endpoint.netns_path) {
+            if let Some(netns_name) = cni_netns_basename(request.netns_path()) {
                 self.cleanup_cni_netns(netns_name).await;
             } else {
                 tracing::debug!(
                     sandbox_id = %sandbox_id,
-                    netns = %endpoint.netns_path,
+                    netns = %request.netns_path(),
                     "Skipping recorded pod-network netns path outside /run/netns/cni-*"
                 );
             }
 
-            match node_local.delete_network_for_sandbox(&sandbox_id).await {
+            match node_local.delete_network_if_matches(request).await {
                 Err(e) => {
                     tracing::warn!(
                         sandbox_id = %sandbox_id,
@@ -287,9 +304,13 @@ impl NetworkCleanup {
                         "Failed to remove stale pod_networks record during cleanup"
                     );
                 }
-                _ => {
+                Ok(true) => {
                     cleaned += 1;
                 }
+                Ok(false) => tracing::debug!(
+                    sandbox_id = %sandbox_id,
+                    "Recorded pod-network identity changed during cleanup; preserving current row"
+                ),
             }
         }
 
@@ -367,7 +388,7 @@ impl NetworkCleanup {
 
     async fn cleanup_bridge_with_runner(
         &self,
-        runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+        runner: &dyn NetworkCommandRunner,
     ) -> Result<CleanupDisposition> {
         let Some(bridge_name) = self.current_namespace_bridge_name() else {
             tracing::debug!("network cleanup: skipping bridge delete outside owned namespace");
@@ -977,7 +998,50 @@ fn cni_netns_basename(raw: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kubelet::file_blocking::process_test_support::{FakeProcessOutputRunner, output};
+    use crate::kubelet::file_blocking::process_test_support::output;
+    use crate::networking::{NetworkCleanupConfig, NetworkMode};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct FakeProcessOutputRunner {
+        results: Mutex<VecDeque<Result<std::process::Output>>>,
+        calls: Mutex<Vec<(String, String, Vec<String>)>>,
+    }
+
+    impl FakeProcessOutputRunner {
+        fn new(results: Vec<Result<std::process::Output>>) -> Self {
+            Self {
+                results: Mutex::new(results.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String, Vec<String>)> {
+            self.calls.lock().expect("fake calls lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NetworkCommandRunner for FakeProcessOutputRunner {
+        async fn run_network_output(
+            &self,
+            _category: klights_supervisor::TaskCategory,
+            name: &'static str,
+            program: &str,
+            args: &[&str],
+        ) -> Result<std::process::Output> {
+            self.calls.lock().expect("fake calls lock").push((
+                name.to_string(),
+                program.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+            ));
+            self.results
+                .lock()
+                .expect("fake results lock")
+                .pop_front()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("fake network runner exhausted")))
+        }
+    }
 
     #[test]
     fn network_cleanup_remains_publicly_debuggable_without_exposing_executor_state() {
@@ -1094,9 +1158,16 @@ mod tests {
         cfg.containerd_namespace = "klights".to_string();
         cfg.wireguard_device = "klights.wg".to_string();
 
+        let focused = NetworkCleanupConfig::try_new(
+            NetworkMode::Root,
+            cfg.bridge_name.clone(),
+            cfg.wireguard_device.clone(),
+            cfg.containerd_namespace.clone(),
+            false,
+        )
+        .unwrap();
         let cleanup = NetworkCleanup::from_config(
-            &NodeMode::Root,
-            &cfg,
+            &focused,
             crate::kubelet::file_blocking::test_file_process_executor(),
         );
 
@@ -1250,12 +1321,16 @@ mod tests {
         cfg.containerd_namespace = "klights".to_string();
         cfg.wireguard_device = "klights.wg".to_string();
 
+        let focused = NetworkCleanupConfig::try_new(
+            NetworkMode::Rootless,
+            cfg.bridge_name.clone(),
+            cfg.wireguard_device.clone(),
+            cfg.containerd_namespace.clone(),
+            true,
+        )
+        .unwrap();
         let cleanup = NetworkCleanup::from_config(
-            &NodeMode::Rootless {
-                rootlesskit_pid: 42,
-                user_netns: std::path::PathBuf::from("/proc/42/ns/net"),
-            },
-            &cfg,
+            &focused,
             crate::kubelet::file_blocking::test_file_process_executor(),
         );
 

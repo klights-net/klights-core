@@ -7,6 +7,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use klights_types::PodIdentity;
 
@@ -184,6 +185,43 @@ impl PodNetworkAllocationRequest {
         })
     }
 
+    /// Reconstructs one durable row. The `0/0` subnet is accepted only for
+    /// rows written before subnet identity columns existed, so cleanup can
+    /// still compare-and-delete that exact legacy identity.
+    pub fn try_from_persisted(
+        sandbox_id: impl Into<String>,
+        pod: PodIdentity,
+        subnet_base_int: u32,
+        subnet_size: u32,
+        veth_host: impl Into<String>,
+        netns_path: impl Into<String>,
+    ) -> Result<Self, CacheNetworkError> {
+        if subnet_base_int != 0 || subnet_size != 0 {
+            return Self::try_new(
+                sandbox_id,
+                pod,
+                subnet_base_int,
+                subnet_size,
+                veth_host,
+                netns_path,
+            );
+        }
+        let sandbox_id = SandboxKey::try_new(sandbox_id)?;
+        let veth_host = veth_host.into();
+        let netns_path = netns_path.into();
+        validate_pod_identity(&pod)?;
+        require_nonempty(&veth_host, "veth_host")?;
+        require_nonempty(&netns_path, "netns_path")?;
+        Ok(Self {
+            sandbox_id,
+            pod,
+            subnet_base_int,
+            subnet_size,
+            veth_host,
+            netns_path,
+        })
+    }
+
     pub fn sandbox_id(&self) -> &str {
         self.sandbox_id.as_str()
     }
@@ -256,6 +294,49 @@ impl PodNetworkAllocation {
 
     pub fn into_parts(self) -> (String, u32) {
         (self.ip_addr, self.ip_int)
+    }
+}
+
+/// Immutable identity and allocation values read from one persisted
+/// `pod_networks` row. Cleanup code must carry this full snapshot into the
+/// compare-and-delete operation instead of deleting by reusable sandbox ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodNetworkAssignmentSnapshot {
+    request: PodNetworkAllocationRequest,
+    allocation: PodNetworkAllocation,
+}
+
+impl PodNetworkAssignmentSnapshot {
+    pub fn try_new(
+        request: PodNetworkAllocationRequest,
+        allocation: PodNetworkAllocation,
+    ) -> Result<Self, CacheNetworkError> {
+        let legacy_subnet = request.subnet_base_int == 0 && request.subnet_size == 0;
+        let outside_usable_range = !legacy_subnet
+            && (allocation.ip_int < request.subnet_base_int + 2
+                || allocation.ip_int > request.subnet_base_int + request.subnet_size - 2);
+        if outside_usable_range {
+            return Err(CacheNetworkError::invalid(
+                "allocation.ip_int",
+                "must be inside the assignment's usable subnet range",
+            ));
+        }
+        Ok(Self {
+            request,
+            allocation,
+        })
+    }
+
+    pub const fn request(&self) -> &PodNetworkAllocationRequest {
+        &self.request
+    }
+
+    pub const fn allocation(&self) -> &PodNetworkAllocation {
+        &self.allocation
+    }
+
+    pub fn into_parts(self) -> (PodNetworkAllocationRequest, PodNetworkAllocation) {
+        (self.request, self.allocation)
     }
 }
 
@@ -528,12 +609,30 @@ pub trait PodNetworkCache: Send + Sync {
         &self,
         pod_uid: PodUidKey,
     ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>>;
+    /// Exact namespace/name/UID lookup used when runtime sandbox identity is absent.
+    fn get_network_for_pod(
+        &self,
+        pod: PodIdentity,
+    ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>>;
     fn get_network_for_sandbox(
         &self,
         sandbox_id: SandboxKey,
     ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>>;
+    /// Returns a row only when sandbox and full Pod identity match exactly.
+    fn get_network_for_assignment(
+        &self,
+        sandbox_id: SandboxKey,
+        pod: PodIdentity,
+    ) -> CacheNetworkFuture<'_, Option<PodNetworkEndpoint>>;
     fn delete_network_for_sandbox(&self, sandbox_id: SandboxKey) -> CacheNetworkFuture<'_, ()>;
-    fn list_network_sandbox_ids(&self) -> CacheNetworkFuture<'_, Vec<String>>;
+    /// Compare-and-delete one exact allocation identity.
+    fn delete_network_if_matches(
+        &self,
+        request: PodNetworkAllocationRequest,
+    ) -> CacheNetworkFuture<'_, bool>;
+    /// Returns immutable full-row snapshots suitable for conditional cleanup.
+    fn list_network_assignments(&self)
+    -> CacheNetworkFuture<'_, Vec<PodNetworkAssignmentSnapshot>>;
 }
 
 /// Atomic pod-IP reservation and allocation-cache insertion capability.
@@ -569,4 +668,25 @@ pub trait PodEndpointStore: Send + Sync {
         &self,
         node_name: NodeKey,
     ) -> CacheNetworkFuture<'_, Vec<PodEndpointRecord>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodEndpointStoreEvent {
+    Resync(Vec<PodEndpointRecord>),
+    Upsert(PodEndpointRecord),
+    Delete { pod_ip: Ipv4Addr },
+}
+
+pub trait PodEndpointStoreEventSubscription: Send + Unpin {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<PodEndpointStoreEvent, CacheNetworkError>>>;
+}
+
+pub type PodEndpointStoreEventStream =
+    Pin<Box<dyn PodEndpointStoreEventSubscription + Send + 'static>>;
+
+pub trait PodEndpointStoreEventSource: Send + Sync {
+    fn subscribe_endpoint_events(&self) -> CacheNetworkFuture<'_, PodEndpointStoreEventStream>;
 }

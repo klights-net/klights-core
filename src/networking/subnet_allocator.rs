@@ -1,36 +1,14 @@
-#[cfg(test)]
-use crate::control_plane::client::focused_node_subnet;
-use crate::control_plane::client::{
-    LeaderApiClient, LeaderNodeSubnetAllocation, NodeSubnetAllocationError,
-    NodeSubnetAllocationFuture, NodeSubnetAllocationRequest, NodeSubnetAllocationResult,
-    legacy_node_subnet,
-};
-use crate::datastore::NodeSubnet;
 use anyhow::{Context, Result};
+use klights_leader_api::{
+    LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, NodeSubnetAllocationError,
+    NodeSubnetAllocationRequest, NodeSubnetQuery,
+};
 use klights_supervisor::TaskSupervisor;
 use std::sync::Arc;
 use std::time::Duration;
 
 const DEFAULT_MAX_ATTEMPTS: usize = 6;
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(5);
-
-#[async_trait::async_trait]
-pub(crate) trait NodeSubnetAllocationStore: Send + Sync {
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
-}
-
-struct LeaderApiNodeSubnetAllocationClient {
-    inner: Arc<dyn LeaderApiClient>,
-}
-
-impl LeaderNodeSubnetAllocation for LeaderApiNodeSubnetAllocationClient {
-    fn allocate_node_subnet(
-        &self,
-        request: NodeSubnetAllocationRequest,
-    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
-        self.inner.allocate_node_subnet(request)
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NodeSubnetAllocationRetryPolicy {
@@ -48,30 +26,35 @@ impl Default for NodeSubnetAllocationRetryPolicy {
 }
 
 pub(crate) struct NodeSubnetAllocator {
-    client: Arc<dyn LeaderNodeSubnetAllocation>,
+    allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+    topology: Arc<dyn LeaderNetworkTopologyQuery>,
     supervisor: Arc<TaskSupervisor>,
     retry: NodeSubnetAllocationRetryPolicy,
 }
 
 impl NodeSubnetAllocator {
     pub(crate) fn new(
-        leader_api: Arc<dyn LeaderApiClient>,
+        allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+        topology: Arc<dyn LeaderNetworkTopologyQuery>,
         supervisor: Arc<TaskSupervisor>,
     ) -> Self {
         Self::with_policy(
-            Arc::new(LeaderApiNodeSubnetAllocationClient { inner: leader_api }),
+            allocation,
+            topology,
             supervisor,
             NodeSubnetAllocationRetryPolicy::default(),
         )
     }
 
     pub(crate) fn with_policy(
-        client: Arc<dyn LeaderNodeSubnetAllocation>,
+        allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+        topology: Arc<dyn LeaderNetworkTopologyQuery>,
         supervisor: Arc<TaskSupervisor>,
         retry: NodeSubnetAllocationRetryPolicy,
     ) -> Self {
         Self {
-            client,
+            allocation,
+            topology,
             supervisor,
             retry,
         }
@@ -82,16 +65,17 @@ impl NodeSubnetAllocator {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<crate::networking::PodSubnet> {
         let max_attempts = self.retry.max_attempts.max(1);
         let mut attempt = 1usize;
 
         loop {
             let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
                 .map_err(anyhow::Error::new)?;
-            match self.client.allocate_node_subnet(request).await {
+            match self.allocation.allocate_node_subnet(request).await {
                 Ok(result) => {
-                    return legacy_node_subnet(result.into_subnet()).map_err(anyhow::Error::new);
+                    return crate::networking::PodSubnet::parse(result.into_subnet().subnet())
+                        .map_err(anyhow::Error::msg);
                 }
                 Err(err) => {
                     if attempt >= max_attempts || !is_retryable_allocation_error(&err) {
@@ -115,26 +99,26 @@ impl NodeSubnetAllocator {
         }
     }
 
-    pub(crate) async fn allocate_or_reuse_existing<S>(
+    pub(crate) async fn allocate_or_reuse_existing(
         &self,
-        store: &S,
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet>
-    where
-        S: NodeSubnetAllocationStore + ?Sized,
-    {
-        match store.get_node_subnet(node_name).await {
-            Ok(Some(subnet)) => {
+    ) -> Result<crate::networking::PodSubnet> {
+        let query = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
+        match self.topology.get_node_subnet(query).await {
+            Ok(result) if result.as_ref().is_some() => {
+                let subnet =
+                    crate::networking::PodSubnet::parse(result.as_ref().expect("checked").subnet())
+                        .map_err(anyhow::Error::msg)?;
                 tracing::info!(
                     node = node_name,
-                    subnet = %subnet.subnet,
+                    subnet = %subnet,
                     "reusing existing local node subnet allocation"
                 );
                 return Ok(subnet);
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(err) => {
                 tracing::warn!(
                     node = node_name,
@@ -163,8 +147,14 @@ fn is_retryable_allocation_error(err: &NodeSubnetAllocationError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::client::focused_node_subnet;
     use crate::datastore::NodeSubnet;
     use crate::networking::{NodeName, PodSubnet};
+    use klights_leader_api::{
+        NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
+        NodeSubnetAllocationFuture, NodeSubnetAllocationResult, NodeSubnetResult, PeerSubnetsQuery,
+        PeerSubnetsResult,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::collections::VecDeque;
     use std::net::Ipv4Addr;
@@ -196,13 +186,13 @@ mod tests {
         }
     }
 
-    struct FakeNodeSubnetStore {
+    struct FakeTopologyClient {
         calls: AtomicUsize,
         row: Mutex<Option<NodeSubnet>>,
         error: Option<&'static str>,
     }
 
-    impl FakeNodeSubnetStore {
+    impl FakeTopologyClient {
         fn new(row: Option<NodeSubnet>) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
@@ -224,14 +214,43 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl NodeSubnetAllocationStore for FakeNodeSubnetStore {
-        async fn get_node_subnet(&self, _node_name: &str) -> anyhow::Result<Option<NodeSubnet>> {
+    impl LeaderNetworkTopologyQuery for FakeTopologyClient {
+        fn get_node_subnet(
+            &self,
+            request: NodeSubnetQuery,
+        ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(error) = self.error {
-                anyhow::bail!("{error}");
-            }
-            Ok(self.row.lock().expect("row lock").clone())
+            let error = self.error;
+            let row = self.row.lock().expect("row lock").clone();
+            Box::pin(async move {
+                if let Some(error) = error {
+                    return Err(NetworkTopologyError::query_failed(error));
+                }
+                let focused = row.map(focused_node_subnet).transpose()?;
+                NodeSubnetResult::try_from_wire(request.node_name(), focused.is_some(), focused)
+            })
+        }
+
+        fn list_peer_subnets(
+            &self,
+            _request: PeerSubnetsQuery,
+        ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+            Box::pin(async {
+                Err(NetworkTopologyError::query_failed(
+                    "unexpected peer subnet query",
+                ))
+            })
+        }
+
+        fn get_node_dataplane(
+            &self,
+            _request: NodeDataplaneQuery,
+        ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+            Box::pin(async {
+                Err(NetworkTopologyError::query_failed(
+                    "unexpected node dataplane query",
+                ))
+            })
         }
     }
 
@@ -273,16 +292,24 @@ mod tests {
         }
     }
 
-    fn test_allocator(client: Arc<dyn LeaderNodeSubnetAllocation>) -> NodeSubnetAllocator {
+    fn test_allocator_with_topology(
+        client: Arc<dyn LeaderNodeSubnetAllocation>,
+        topology: Arc<dyn LeaderNetworkTopologyQuery>,
+    ) -> NodeSubnetAllocator {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         NodeSubnetAllocator::with_policy(
             client,
+            topology,
             supervisor,
             NodeSubnetAllocationRetryPolicy {
                 max_attempts: 3,
                 backoff: Duration::from_millis(1),
             },
         )
+    }
+
+    fn test_allocator(client: Arc<dyn LeaderNodeSubnetAllocation>) -> NodeSubnetAllocator {
+        test_allocator_with_topology(client, Arc::new(FakeTopologyClient::new(None)))
     }
 
     #[tokio::test]
@@ -298,7 +325,7 @@ mod tests {
             .await
             .expect("retryable timeout must be retried");
 
-        assert_eq!(row.node_name.as_str(), "node-a");
+        assert_eq!(row.to_string(), "10.50.1.0/24");
         assert_eq!(client.calls(), 2);
     }
 
@@ -321,15 +348,15 @@ mod tests {
     #[tokio::test]
     async fn reuses_existing_local_subnet_without_leader_rpc() {
         let client = FakeAllocationClient::new(vec![]);
-        let store = FakeNodeSubnetStore::new(Some(subnet_row()));
-        let allocator = test_allocator(client.clone());
+        let store = Arc::new(FakeTopologyClient::new(Some(subnet_row())));
+        let allocator = test_allocator_with_topology(client.clone(), store.clone());
 
         let row = allocator
-            .allocate_or_reuse_existing(&store, "node-a", "10.50.0.0/16", "192.0.2.10")
+            .allocate_or_reuse_existing("node-a", "10.50.0.0/16", "192.0.2.10")
             .await
             .expect("existing local subnet must be reused");
 
-        assert_eq!(row.node_name.as_str(), "node-a");
+        assert_eq!(row.to_string(), "10.50.1.0/24");
         assert_eq!(store.calls(), 1);
         assert_eq!(client.calls(), 0);
     }
@@ -337,11 +364,13 @@ mod tests {
     #[tokio::test]
     async fn local_subnet_read_errors_fail_closed_without_leader_rpc() {
         let client = FakeAllocationClient::new(vec![Outcome::Ok(subnet_row())]);
-        let store = FakeNodeSubnetStore::new_error("node subnet store unavailable");
-        let allocator = test_allocator(client.clone());
+        let store = Arc::new(FakeTopologyClient::new_error(
+            "node subnet store unavailable",
+        ));
+        let allocator = test_allocator_with_topology(client.clone(), store.clone());
 
         let err = allocator
-            .allocate_or_reuse_existing(&store, "node-a", "10.50.0.0/16", "192.0.2.10")
+            .allocate_or_reuse_existing("node-a", "10.50.0.0/16", "192.0.2.10")
             .await
             .expect_err("local subnet read errors must not allocate a second subnet");
 

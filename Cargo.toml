@@ -195,6 +195,7 @@ klights-cluster-store = { workspace = true }
 klights-leader-api = { workspace = true }
 klights-watch = { workspace = true }
 klights-node-api = { workspace = true }
+klights-node-store = { workspace = true }
 klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }
 klights-network-api = { workspace = true }

@@ -240,15 +240,12 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     )
     .await?;
 
-    let db = worker_store.clone();
-
     let net = phases::network::boot(phases::network::NetworkBootArgs {
         config: &config,
         node_mode: &node_mode,
         node_ip: &node_ip,
         cluster_api: cluster_api.clone(),
         node_local: node_local.clone(),
-        db: &*db,
         network_cleanup: &network_cleanup,
         containerd_data_dir: &containerd_data_dir,
         containerd_state_dir: &containerd_state_dir,
@@ -257,6 +254,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         shutdown_token: shutdown_token.clone(),
     })
     .await?;
+    let db = worker_store.clone();
     let network = net.network;
     let services = net.services;
     let cni_rpc_token = net.cni_rpc_token;
@@ -265,6 +263,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let cri_for_api = net.cri_for_api;
     let cni_readiness = net.cni_readiness;
     let dataplane_health = net.dataplane_health;
+    let pod_network_cache = net.pod_network_cache;
+    let assignment_waiter = net.assignment_waiter;
     // A worker is always multinode: start NetworkUnavailable=True until the
     // first successful peer-route sync confirms every Ready peer is reachable.
     dataplane_health.set_peers_pending();
@@ -341,13 +341,16 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     .await
     .context("worker control stream")?;
     let node_subnet_watch_handle = {
-        let dbh = db.clone();
         let node_name = config.node_name.clone();
-        let cluster_cidr = config.cluster_cidr.clone();
         let peering = network.peering().clone();
         let supervisor_for_task = task_supervisor.clone();
         let health_for_peer_watch = dataplane_health.clone();
         let query_for_peer_watch: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            remote_api_client.clone();
+        let topology_for_peer_watch: std::sync::Arc<
+            dyn klights_leader_api::LeaderNetworkTopologyQuery,
+        > = remote_api_client.clone();
+        let watch_for_peer_watch: std::sync::Arc<dyn klights_leader_api::LeaderWatch> =
             remote_api_client.clone();
         let node_status_for_peer_watch: std::sync::Arc<
             dyn klights_leader_api::LeaderNodeSelfStatus,
@@ -362,14 +365,15 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 klights_supervisor::TaskCategory::Background,
                 "worker_node_subnet_peer_watch",
                 async move {
-                    controllers::node_subnet::run_peer_watch_with_components(
-                        dbh,
+                    controllers::node_subnet::run_focused_peer_watch(
+                        topology_for_peer_watch,
+                        query_for_peer_watch,
+                        watch_for_peer_watch,
+                        None,
                         node_name,
-                        cluster_cidr,
                         peering,
                         supervisor_for_task,
                         Some(health_for_peer_watch),
-                        query_for_peer_watch,
                         node_status_for_peer_watch,
                         cancel,
                     )
@@ -406,7 +410,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             supervisor: task_supervisor.clone(),
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
-            network_events: crate::networking::global_pod_network_events(),
+            pod_network_cache,
+            assignment_waiter,
             scheduling_mode:
                 crate::kubelet::pod_repository::api::PodSchedulingMode::DeferredMultiNodeLeader,
             outbox: Some(outbox.clone()),

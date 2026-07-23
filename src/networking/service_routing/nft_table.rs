@@ -7,6 +7,7 @@ use super::prelude::*;
 use super::service_rules::select_authoritative_service_spec;
 use super::*;
 use crate::utils::lock_recover;
+use klights_cluster_core::Resource;
 use klights_leader_api::{ResourceListRequest, ResourceQueryConsistency, ResourceQueryError};
 use nftnl::expr::Expression;
 use nftnl::nftnl_sys as sys;
@@ -252,22 +253,22 @@ fn rule_has_comment(rule: &serde_json::Value, comment: &str) -> bool {
 /// fresh [`ServiceRouteInventory`]. Used by `sync_services_from_api` as the
 /// initial-snapshot path and for recovery after watch compaction.
 pub async fn bootstrap_inventory_from_api(
-    api: &dyn LeaderApiClient,
+    api: &dyn LeaderResourceQuery,
 ) -> Result<super::inventory::ServiceRouteInventory> {
     let services_list = api
         .list_resources(fresh_list_request("v1", "Service")?)
         .await
-        .context("list Services through LeaderApiClient")?;
+        .context("list Services through focused leader query")?;
 
     let endpoints_list = api
         .list_resources(fresh_list_request("v1", "Endpoints")?)
         .await
-        .context("list Endpoints through LeaderApiClient")?;
+        .context("list Endpoints through focused leader query")?;
 
     let endpoint_slices_list = api
         .list_resources(fresh_list_request("discovery.k8s.io/v1", "EndpointSlice")?)
         .await
-        .context("list EndpointSlices through LeaderApiClient")?;
+        .context("list EndpointSlices through focused leader query")?;
 
     let services = services_list.items().iter().filter_map(|r| {
         let ns = r.namespace.clone()?;
@@ -304,26 +305,24 @@ pub async fn bootstrap_inventory_from_api(
     Ok(inv)
 }
 
-pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<ServiceSpec>> {
+pub async fn service_specs_from_api(api: &dyn LeaderResourceQuery) -> Result<Vec<ServiceSpec>> {
     let services_list = api
         .list_resources(fresh_list_request("v1", "Service")?)
         .await
-        .context("list Services through LeaderApiClient")?;
+        .context("list Services through focused leader query")?;
 
     let endpoints_list = api
         .list_resources(fresh_list_request("v1", "Endpoints")?)
         .await
-        .context("list Endpoints through LeaderApiClient")?;
+        .context("list Endpoints through focused leader query")?;
 
     let endpoint_slices_list = api
         .list_resources(fresh_list_request("discovery.k8s.io/v1", "EndpointSlice")?)
         .await
-        .context("list EndpointSlices through LeaderApiClient")?;
+        .context("list EndpointSlices through focused leader query")?;
 
-    let mut endpoints_by_service: std::collections::HashMap<
-        (String, String),
-        &crate::datastore::Resource,
-    > = std::collections::HashMap::with_capacity(endpoints_list.items().len());
+    let mut endpoints_by_service: std::collections::HashMap<(String, String), &Resource> =
+        std::collections::HashMap::with_capacity(endpoints_list.items().len());
     for endpoints in endpoints_list.items() {
         if let Some((namespace, name)) = resource_namespace_name(endpoints) {
             endpoints_by_service.insert((namespace.to_string(), name.to_string()), endpoints);
@@ -332,7 +331,7 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
 
     let mut endpoint_slices_by_service: std::collections::HashMap<
         (String, String),
-        Vec<&crate::datastore::Resource>,
+        Vec<&Resource>,
     > = std::collections::HashMap::new();
     for slice in endpoint_slices_list.items() {
         if let Some((namespace, service_name)) = endpoint_slice_service_key(slice) {
@@ -373,7 +372,7 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
     Ok(specs)
 }
 
-fn resource_namespace_name(resource: &crate::datastore::Resource) -> Option<(&str, &str)> {
+fn resource_namespace_name(resource: &Resource) -> Option<(&str, &str)> {
     let metadata = resource.data.get("metadata");
     let namespace = metadata
         .and_then(|m| m.get("namespace"))
@@ -386,7 +385,7 @@ fn resource_namespace_name(resource: &crate::datastore::Resource) -> Option<(&st
     Some((namespace, name))
 }
 
-fn endpoint_slice_service_key(resource: &crate::datastore::Resource) -> Option<(&str, &str)> {
+fn endpoint_slice_service_key(resource: &Resource) -> Option<(&str, &str)> {
     let namespace = resource_namespace_name(resource)?.0;
     let service_name = resource
         .data
@@ -399,11 +398,11 @@ fn endpoint_slice_service_key(resource: &crate::datastore::Resource) -> Option<(
 
 fn service_spec_from_endpoint_inventory<'a, I>(
     service: &serde_json::Value,
-    endpoints: Option<&crate::datastore::Resource>,
+    endpoints: Option<&Resource>,
     endpoint_slices: I,
 ) -> Option<ServiceSpec>
 where
-    I: IntoIterator<Item = &'a crate::datastore::Resource>,
+    I: IntoIterator<Item = &'a Resource>,
 {
     let slice_refs: Vec<&serde_json::Value> = endpoint_slices
         .into_iter()
@@ -815,90 +814,22 @@ impl KlightsTable {
         Ok(())
     }
 
-    /// Walk the klights datastore, build [`ServiceSpec`] for every
-    /// routable Service, and atomically replace the `services` chain.
-    ///
-    /// Selector-based services use their `v1.Endpoints` object;
-    /// selectorless services fall back to matching `EndpointSlice` by
-    /// `kubernetes.io/service-name=<svc>` label.
-    pub async fn sync_services_from_db(&self, db: &dyn DatastoreBackend) -> Result<usize> {
-        let services_list = db
-            .list_resources(
-                "v1",
-                "Service",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await
-            .context("list Services")?;
-
-        let mut specs: Vec<ServiceSpec> = Vec::with_capacity(services_list.items.len());
-        for svc_resource in &services_list.items {
-            let svc = &svc_resource.data;
-            let metadata = match svc.get("metadata") {
-                Some(m) => m,
-                None => continue,
-            };
-            let svc_name = metadata.get("name").and_then(|n| n.as_str());
-            let namespace = metadata.get("namespace").and_then(|n| n.as_str());
-            let (svc_name, namespace) = match (svc_name, namespace) {
-                (Some(n), Some(ns)) => (n, ns),
-                _ => continue,
-            };
-
-            // EndpointSlices are the kube-proxy routing source for modern
-            // clusters. Prefer a routable slice snapshot so a partial legacy
-            // Endpoints object cannot shadow complete protocol/port data.
-            let endpoints = db
-                .get_resource("v1", "Endpoints", Some(namespace), svc_name)
-                .await
-                .ok()
-                .flatten();
-
-            let label_selector = format!("kubernetes.io/service-name={svc_name}");
-            let slices = db
-                .list_resources(
-                    "discovery.k8s.io/v1",
-                    "EndpointSlice",
-                    Some(namespace),
-                    crate::datastore::ResourceListQuery::new(
-                        Some(&label_selector),
-                        None,
-                        None,
-                        None,
-                    ),
-                )
-                .await
-                .ok();
-            let slice_items = slices
-                .as_ref()
-                .map(|slice_list| slice_list.items.as_slice())
-                .unwrap_or(&[]);
-            if let Some(spec) =
-                service_spec_from_endpoint_inventory(svc, endpoints.as_ref(), slice_items.iter())
-            {
-                specs.push(spec);
-            }
-        }
-
-        let svc_count = specs.len();
-        self.replace_services(&specs).await?;
-        Ok(svc_count)
-    }
-
-    pub async fn sync_network_policies_from_api(&self, api: &dyn LeaderApiClient) -> Result<usize> {
+    pub async fn sync_network_policies_from_api(
+        &self,
+        api: &dyn LeaderResourceQuery,
+    ) -> Result<usize> {
         let policies = api
             .list_resources(fresh_list_request("networking.k8s.io/v1", "NetworkPolicy")?)
             .await
-            .context("list NetworkPolicies through LeaderApiClient")?;
+            .context("list NetworkPolicies through focused leader query")?;
         let pods = api
             .list_resources(fresh_list_request("v1", "Pod")?)
             .await
-            .context("list Pods through LeaderApiClient for NetworkPolicy")?;
+            .context("list Pods through focused leader query for NetworkPolicy")?;
         let namespaces = api
             .list_resources(fresh_list_request("v1", "Namespace")?)
             .await
-            .context("list Namespaces through LeaderApiClient for NetworkPolicy")?;
+            .context("list Namespaces through focused leader query for NetworkPolicy")?;
 
         let policy_values: Vec<serde_json::Value> = policies
             .items()
@@ -922,7 +853,7 @@ impl KlightsTable {
         Ok(isolated)
     }
 
-    pub async fn sync_services_from_api(&self, api: &dyn LeaderApiClient) -> Result<usize> {
+    pub async fn sync_services_from_api(&self, api: &dyn LeaderResourceQuery) -> Result<usize> {
         let inventory = bootstrap_inventory_from_api(api).await?;
         let specs = inventory.to_specs();
         let svc_count = specs.len();

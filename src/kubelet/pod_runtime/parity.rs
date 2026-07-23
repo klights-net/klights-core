@@ -308,11 +308,12 @@ impl ParityFixture {
         let metrics: Arc<crate::side_effects::SideEffectMetrics> =
             crate::side_effects::SideEffectMetrics::new();
         let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
-            db: handle,
+            db: handle.clone(),
             supervisor,
             side_effects,
             metrics,
-            network_events: crate::networking::global_pod_network_events(),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(handle),
+            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode:
                 crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
             outbox: None,

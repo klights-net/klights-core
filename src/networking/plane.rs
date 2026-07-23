@@ -1,4 +1,3 @@
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::networking::dataplane_health::DataplaneHealth;
 use crate::networking::device_state::{self, LinkKind, LinkState};
 use crate::networking::{BridgeName, NodeName, PodSubnet};
@@ -12,7 +11,6 @@ use netlink_packet_route::{
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 type WireGuardPeerStepFuture<'a> =
@@ -118,7 +116,11 @@ fn is_nl_absent_error(err: &rtnetlink::Error) -> bool {
 pub struct NetworkPlane {
     rt: rtnetlink::Handle,
     _rt_conn: klights_supervisor::SupervisedJoinHandle<()>,
-    node_local: NodeLocalHandle,
+    pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pod_ipam: Arc<dyn klights_node_store::PodIpamStore>,
+    pod_runtime: Arc<dyn klights_node_store::PodRuntimeStore>,
+    assignment_publisher: Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
+    sandbox_operations: crate::networking::cni::SandboxOperationLocks,
     bridge: BridgeName,
     pod_subnet: PodSubnet,
     pod_link_mtu: u32,
@@ -137,45 +139,40 @@ impl NetworkPlane {
     /// prepares the local bridge/CNI datapath, and initializes the selected
     /// cross-node dataplane. WireGuard is the default encrypted dataplane;
     /// explicit direct-route mode installs only kernel routes.
-    pub(crate) async fn boot<S>(
-        cfg: &crate::KlightsConfig,
-        stores: crate::networking::boot::NetworkBootStores<'_, S>,
-        node_ip: &str,
+    pub(crate) async fn boot(
+        cfg: &crate::networking::NetworkBootConfig,
+        stores: crate::networking::boot::NetworkBootStores,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Result<Arc<Self>>
-    where
-        S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
-    {
+    ) -> Result<Arc<Self>> {
         let crate::networking::boot::NetworkBootStores {
-            cluster_api,
-            node_subnet_store,
-            node_local,
+            subnet_allocation,
+            topology,
+            pod_network_cache,
+            pod_ipam,
+            pod_runtime,
+            assignment_publisher,
         } = stores;
-        let bridge = BridgeName::parse(&cfg.bridge_name)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("invalid bridge name {}", cfg.bridge_name))?;
-        let my_node = NodeName::parse(&cfg.node_name)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("invalid node name {}", cfg.node_name))?;
-        let host_ip =
-            Ipv4Addr::from_str(node_ip).with_context(|| format!("invalid node ip {}", node_ip))?;
+        let bridge = cfg.bridge().clone();
+        let my_node = cfg.node().clone();
+        let host_ip = cfg.host_ip();
 
         let local_subnet = crate::networking::subnet_allocator::NodeSubnetAllocator::new(
-            cluster_api,
+            subnet_allocation,
+            topology,
             task_supervisor.clone(),
         )
         .allocate_or_reuse_existing(
-            node_subnet_store,
-            &cfg.node_name,
-            &cfg.cluster_cidr,
-            node_ip,
+            cfg.node().as_ref(),
+            &cfg.cluster_cidr().to_string(),
+            &cfg.host_ip().to_string(),
         )
         .await
         .with_context(|| {
             format!(
                 "failed to allocate local node subnet for {} at {}",
-                cfg.node_name, node_ip
+                cfg.node(),
+                cfg.host_ip()
             )
         })?;
 
@@ -199,13 +196,17 @@ impl NetworkPlane {
         let plane = Arc::new(Self {
             rt: handle,
             _rt_conn: rt_conn,
-            node_local,
+            pod_network_cache,
+            pod_ipam,
+            pod_runtime,
+            assignment_publisher,
+            sandbox_operations: crate::networking::cni::SandboxOperationLocks::default(),
             bridge,
-            pod_subnet: local_subnet.subnet,
-            pod_link_mtu: crate::networking::pod_link_mtu_for_encryption(cfg.dataplane_encryption),
+            pod_subnet: local_subnet,
+            pod_link_mtu: crate::networking::pod_link_mtu_for_encryption(cfg.encryption()),
             my_node,
             host_ip,
-            wireguard_device: cfg.wireguard_device.clone(),
+            wireguard_device: cfg.wireguard_device().to_string(),
             bridge_idx: OnceLock::new(),
             wireguard_idx: OnceLock::new(),
             wireguard: OnceLock::new(),
@@ -220,7 +221,7 @@ impl NetworkPlane {
             .await
             .context("boot-time networking validation failed")?;
 
-        if cfg.dataplane_encryption == crate::networking::wireguard::DataplaneEncryption::Enabled
+        if cfg.encryption() == crate::networking::wireguard::DataplaneEncryption::Enabled
             && let Err(err) = plane.ensure_wireguard_enabled(cfg, cancel).await
         {
             plane
@@ -451,21 +452,19 @@ impl NetworkPlane {
 
     async fn ensure_wireguard_enabled(
         &self,
-        cfg: &crate::KlightsConfig,
+        cfg: &crate::networking::NetworkBootConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         self.ensure_wireguard_once().await?;
-        let key_path =
-            crate::paths::etc_dir_path(&cfg.containerd_namespace).join("wireguard-private.key");
         let identity = crate::networking::wireguard::WireGuardIdentity::load_or_create(
-            &key_path,
+            cfg.wireguard_key_path(),
             self.task_supervisor.as_ref(),
         )
         .await?;
         let config = crate::networking::wireguard::WireGuardDeviceConfig::try_new(
             self.wireguard_device.clone(),
             identity.private_key().clone(),
-            cfg.wireguard_port,
+            cfg.wireguard_port(),
         )?;
         let controller = Arc::new(
             crate::networking::wireguard::WireGuardController::open(
@@ -620,12 +619,16 @@ impl NetworkPlane {
     ) -> Result<klights_network_api::PodNetwork> {
         let (sandbox_id, pod, netns_setns_path, netns_record_path, host_network) =
             request.into_parts();
+        let _sandbox_guard = self.sandbox_operations.acquire(sandbox_id.as_str()).await;
         let bridge_idx = self
             .link_index_cached(self.bridge.as_ref(), &self.bridge_idx)
             .await
             .with_context(|| format!("bridge {} not found", self.bridge))?;
         crate::networking::cni::add(crate::networking::cni::CniAddArgs {
-            store: self.node_local.as_ref(),
+            cache: self.pod_network_cache.as_ref(),
+            ipam: self.pod_ipam.as_ref(),
+            runtime: self.pod_runtime.as_ref(),
+            assignment_publisher: self.assignment_publisher.as_ref(),
             handle: &self.rt,
             sandbox_id: sandbox_id.as_str(),
             pod,
@@ -644,9 +647,10 @@ impl NetworkPlane {
     }
 
     async fn cni_del(&self, sandbox_id: &str) -> Result<()> {
+        let _sandbox_guard = self.sandbox_operations.acquire(sandbox_id).await;
         if self
-            .node_local
-            .get_network_for_sandbox(sandbox_id)
+            .pod_network_cache
+            .get_network_for_sandbox(klights_node_store::SandboxKey::try_new(sandbox_id)?)
             .await
             .context("failed to look up root pod network allocation")?
             .is_none()
@@ -661,8 +665,13 @@ impl NetworkPlane {
             .link_index_cached(self.bridge.as_ref(), &self.bridge_idx)
             .await
             .with_context(|| format!("bridge {} not found", self.bridge))?;
-        crate::networking::cni::del(self.node_local.as_ref(), &self.rt, sandbox_id, bridge_idx)
-            .await
+        crate::networking::cni::del(
+            self.pod_network_cache.as_ref(),
+            &self.rt,
+            sandbox_id,
+            bridge_idx,
+        )
+        .await
     }
 
     async fn apply_peer_route(&self, peer: &klights_network_api::PeerRoute) -> Result<()> {
@@ -801,7 +810,8 @@ impl klights_network_api::PeerRouter for NetworkPlane {
 }
 
 // Hybrid peer boot invariants (boot ordering, overlay avoidance,
-// peer-endpoint arms) are enforced by `scripts/check_networking_invariants.sh`,
+// peer-endpoint arms) are enforced by
+// `tests/source_guard_networking_invariants.py`,
 // run as part of `./build.sh`.
 
 #[cfg(test)]
@@ -823,6 +833,10 @@ mod stale_route_tests {
         )
         .await
         .expect("open node-local test store");
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let assignment_bus =
+            Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let (connection, handle, _) = rtnetlink::new_connection().expect("open rtnetlink");
         let cancel = tokio_util::sync::CancellationToken::new();
         let connection_cancel = cancel.clone();
@@ -842,7 +856,11 @@ mod stale_route_tests {
         let plane = NetworkPlane {
             rt: handle,
             _rt_conn: connection,
-            node_local,
+            pod_network_cache: node_network.clone(),
+            pod_ipam: node_network.clone(),
+            pod_runtime: node_network,
+            assignment_publisher: assignment_bus,
+            sandbox_operations: crate::networking::cni::SandboxOperationLocks::default(),
             bridge: BridgeName::parse("missing-cni0").unwrap(),
             pod_subnet: PodSubnet::parse("10.42.1.0/24").unwrap(),
             pod_link_mtu: 1500,

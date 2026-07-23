@@ -22,6 +22,8 @@ pub struct NetworkPhase {
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
     pub dataplane_health: networking::dataplane_health::DataplaneHealth,
+    pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
 }
 
 pub struct NetworkBootArgs<'a> {
@@ -30,7 +32,6 @@ pub struct NetworkBootArgs<'a> {
     pub node_ip: &'a str,
     pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
-    pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub network_cleanup: &'a NetworkCleanup,
     pub containerd_data_dir: &'a str,
     pub containerd_state_dir: &'a str,
@@ -40,20 +41,12 @@ pub struct NetworkBootArgs<'a> {
     pub shutdown_token: CancellationToken,
 }
 
-struct NetworkPhaseNodeSubnetStore<'a> {
-    db: &'a dyn crate::datastore::DatastoreBackend,
-}
-
-#[async_trait::async_trait]
-impl crate::networking::subnet_allocator::NodeSubnetAllocationStore
-    for NetworkPhaseNodeSubnetStore<'_>
-{
-    async fn get_node_subnet(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<crate::datastore::NodeSubnet>> {
-        crate::datastore::DatastoreBackend::get_node_subnet(self.db, node_name).await
-    }
+fn assignment_bus_views() -> (
+    Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
+    Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
+) {
+    let bus = Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
+    (bus.clone(), bus)
 }
 
 pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
@@ -63,7 +56,6 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         node_ip,
         cluster_api,
         node_local,
-        db,
         network_cleanup,
         containerd_data_dir,
         containerd_state_dir,
@@ -73,16 +65,39 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     } = args;
     let (cni_readiness_publisher, cni_readiness) =
         crate::kubelet::cni_readiness::CniReadiness::channel();
-    let node_subnet_store = NetworkPhaseNodeSubnetStore { db };
-    let network_boot = match networking::NetworkBoot::boot(
-        node_mode,
-        config,
-        networking::boot::NetworkBootStores::new(
-            cluster_api.clone(),
-            &node_subnet_store,
-            node_local.clone(),
-        ),
+    let leader_ports =
+        crate::bootstrap::network_adapters::FocusedNetworkLeaderPorts::new(cluster_api.clone());
+    let node_network = crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
+        node_local.clone(),
+    );
+    let (assignment_publisher, assignment_waiter) = assignment_bus_views();
+    let mode = match node_mode {
+        NodeMode::Root => networking::NetworkMode::Root,
+        NodeMode::Rootless { .. } => networking::NetworkMode::Rootless,
+    };
+    let network_config = networking::NetworkBootConfig::try_new(
+        mode,
+        &config.bridge_name,
+        &config.node_name,
+        &config.cluster_cidr,
         node_ip,
+        config.dataplane_encryption,
+        config.wireguard_device.clone(),
+        crate::paths::etc_dir_path(&config.containerd_namespace).join("wireguard-private.key"),
+        config.wireguard_port,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("invalid focused network boot configuration")?;
+    let network_boot = match networking::NetworkBoot::boot(
+        &network_config,
+        networking::boot::NetworkBootStores::new(
+            leader_ports.subnet_allocation(),
+            leader_ports.topology(),
+            node_network.clone(),
+            node_network.clone(),
+            node_network.clone(),
+            assignment_publisher,
+        ),
         shutdown_token.clone(),
         supervisor.clone(),
     )
@@ -101,8 +116,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     };
     {
         let mut applied = std::collections::HashMap::new();
-        if let Err(e) = crate::controllers::node_subnet::sync_peer_routes(
-            db,
+        if let Err(e) = crate::controllers::node_subnet::sync_peer_routes_with_ports(
+            leader_ports.topology().as_ref(),
+            leader_ports.resource_query().as_ref(),
             &config.node_name,
             boot_peering.as_ref(),
             &mut applied,
@@ -120,8 +136,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         .map_err(|e| anyhow::anyhow!("bad service_cidr '{}': {}", config.service_cidr, e))?;
 
     let endpoint_adapter = Arc::new(networking::SqlitePodEndpointResolver::new(
-        node_local.clone(),
-        cluster_api.clone(),
+        node_network.clone(),
+        node_network.clone(),
+        leader_ports.topology(),
     ));
     let endpoint_source: Arc<dyn klights_network_api::PodEndpointEventSource> =
         endpoint_adapter.clone();
@@ -134,12 +151,13 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
             .context("prepare rootless bridge before service-router sysctls")?;
     }
 
-    let srm = networking::service_routing::ServiceRoutingMode::new(node_mode.clone());
+    let srm = networking::service_routing::ServiceRoutingMode::new();
     let services: Arc<dyn klights_network_api::ServiceRouter> =
         networking::service_routing::NftServiceRouter::boot_with_defaults(
             networking::service_routing::NftServiceRouterDefaultBoot::new(
                 networking::service_routing::NftServiceRouterStores::new(
-                    cluster_api.clone(),
+                    leader_ports.resource_query(),
+                    leader_ports.watch(),
                     endpoint_source,
                 ),
                 networking::service_routing::NftServiceRouterTableConfig::new(
@@ -276,5 +294,24 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         cri_for_api,
         cni_readiness,
         dataplane_health: network_boot.health().clone(),
+        pod_network_cache: node_network,
+        assignment_waiter,
     })
+}
+
+#[cfg(test)]
+mod assignment_composition_tests {
+    use klights_network_api::PodNetworkAssignmentKey;
+
+    #[tokio::test]
+    async fn publisher_and_waiter_are_views_of_the_same_instance_bus() {
+        let (publisher, waiter) = super::assignment_bus_views();
+        let key =
+            PodNetworkAssignmentKey::try_new("sandbox-a", "default", "pod-a", "uid-a").unwrap();
+        let mut subscription = waiter.subscribe(key.clone()).unwrap();
+
+        publisher.publish_assignment(&key);
+
+        subscription.wait().await.unwrap();
+    }
 }

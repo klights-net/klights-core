@@ -1036,13 +1036,21 @@ mod integration_tests {
         )
         .await
         .expect("open node-local test db");
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let topology: std::sync::Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> =
+            cluster_api.clone();
         let endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource> =
             std::sync::Arc::new(crate::networking::SqlitePodEndpointResolver::new(
-                node_local,
-                cluster_api.clone(),
+                node_network.clone(),
+                node_network,
+                topology,
             ));
+        let resource_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            cluster_api.clone();
+        let watch: std::sync::Arc<dyn klights_leader_api::LeaderWatch> = cluster_api;
         let rt = NftServiceRouter::boot(NftServiceRouterBoot::new(
-            NftServiceRouterStores::new(cluster_api, endpoint_source),
+            NftServiceRouterStores::new(resource_query, watch, endpoint_source),
             NftServiceRouterTableConfig::new("node-a", "klights-test-shutdown", "klights-test"),
             NftServiceRouterNetworkConfig::new(
                 PodSubnet::parse("10.42.0.0/24").unwrap(),

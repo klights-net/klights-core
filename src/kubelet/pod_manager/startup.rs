@@ -90,7 +90,10 @@ mod tests {
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
                 metrics: crate::side_effects::SideEffectMetrics::new(),
-                network_events: crate::networking::global_pod_network_events(),
+                pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
+                    db_handle.clone(),
+                ),
+                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode:
                     crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
                 outbox: None,

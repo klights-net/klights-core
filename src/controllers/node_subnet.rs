@@ -12,19 +12,25 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use crate::api::AppState;
 use crate::controllers::annotations::{
     HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION, NodePeerMode, parse_node_peer_mode,
 };
+#[cfg(test)]
+use crate::datastore::WatchTarget;
+#[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet, WatchTarget};
+use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet};
 #[cfg(test)]
 use crate::kubelet::outbox::Outbox;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use crate::networking::types::HostPortRange;
-use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
-};
+#[cfg(test)]
+use crate::watch::{EventType, WatchEvent};
+#[cfg(test)]
+use crate::watch::{SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WindowPolicy};
+#[cfg(test)]
 use klights_watch::WatchTopic;
 
 #[cfg(test)]
@@ -175,9 +181,311 @@ pub async fn ensure_local_node_subnet(
     Ok(subnet)
 }
 
+pub type PeerTopologyProjectionFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+/// Leader-only mutation edge that projects Node lifecycle events into the
+/// canonical subnet topology. Workers receive no implementation of this port.
+pub trait PeerTopologyProjection: Send + Sync {
+    fn reconcile_node_event<'a>(
+        &'a self,
+        event: &'a klights_leader_api::ResourceEvent,
+    ) -> PeerTopologyProjectionFuture<'a>;
+}
+
+pub struct DatastorePeerTopologyProjection {
+    db: DatastoreHandle,
+    my_node_name: String,
+    cluster_cidr: String,
+    raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+}
+
+impl DatastorePeerTopologyProjection {
+    pub fn new(
+        db: DatastoreHandle,
+        my_node_name: String,
+        cluster_cidr: String,
+        raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            db,
+            my_node_name,
+            cluster_cidr,
+            raft_leader_proxy,
+        })
+    }
+}
+
+impl PeerTopologyProjection for DatastorePeerTopologyProjection {
+    fn reconcile_node_event<'a>(
+        &'a self,
+        event: &'a klights_leader_api::ResourceEvent,
+    ) -> PeerTopologyProjectionFuture<'a> {
+        Box::pin(async move {
+            let peer_name = event.resource().name.as_str();
+            if peer_name == self.my_node_name {
+                return Ok(());
+            }
+            if self
+                .raft_leader_proxy
+                .as_ref()
+                .is_some_and(|proxy| !proxy.is_leader())
+            {
+                return Ok(());
+            }
+
+            match event.event_type() {
+                klights_leader_api::WatchEventType::Deleted => {
+                    self.db.delete_node_subnet(peer_name).await?;
+                }
+                klights_leader_api::WatchEventType::Added
+                | klights_leader_api::WatchEventType::Modified => {
+                    let node = event.resource().data.as_ref();
+                    if node
+                        .pointer("/metadata/deletionTimestamp")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|timestamp| !timestamp.is_empty())
+                    {
+                        self.db.delete_node_subnet(peer_name).await?;
+                        return Ok(());
+                    }
+                    if let Some(node_ip) = node_dataplane_ip(node) {
+                        self.db
+                            .allocate_node_subnet(peer_name, &self.cluster_cidr, &node_ip)
+                            .await?;
+                        let (mode, hostport_range) = project_node_peer_attributes(node);
+                        self.db
+                            .update_node_peer_attributes(peer_name, mode, hostport_range)
+                            .await?;
+                    }
+                }
+                klights_leader_api::WatchEventType::Bookmark
+                | klights_leader_api::WatchEventType::Error => {}
+            }
+            Ok(())
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sync_focused_peers_and_publish_readiness(
+    topology: &dyn klights_leader_api::LeaderNetworkTopologyQuery,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    my_node_name: &str,
+    peering: &dyn klights_network_api::PeerRouter,
+    applied: &mut HashMap<String, AppliedPeer>,
+    node_status: &dyn klights_leader_api::LeaderNodeSelfStatus,
+    dataplane_health: Option<&DataplaneHealth>,
+    last_readiness: &mut Option<DataplaneHealthStatus>,
+) -> Result<()> {
+    let outcome =
+        sync_peer_routes_with_ports(topology, query, my_node_name, peering, applied).await?;
+    reconcile_local_readiness_with_publisher(
+        query,
+        node_status,
+        my_node_name,
+        dataplane_health,
+        &outcome,
+        last_readiness,
+    )
+    .await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_focused_peer_watch(
+    topology: std::sync::Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+    query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    watch: std::sync::Arc<dyn klights_leader_api::LeaderWatch>,
+    projection: Option<std::sync::Arc<dyn PeerTopologyProjection>>,
+    my_node_name: String,
+    peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    dataplane_health: Option<DataplaneHealth>,
+    node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
+    cancel: CancellationToken,
+) {
+    use futures::StreamExt;
+
+    let mut applied = HashMap::new();
+    let mut last_readiness = None;
+    let mut cursor = klights_leader_api::WatchResumeCursor::default();
+    let mut reconnect_attempt = 0u32;
+    let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel(1);
+    let mut retry = PeerSyncRetryState::default();
+
+    loop {
+        match sync_focused_peers_and_publish_readiness(
+            topology.as_ref(),
+            query.as_ref(),
+            &my_node_name,
+            peering.as_ref(),
+            &mut applied,
+            node_status.as_ref(),
+            dataplane_health.as_ref(),
+            &mut last_readiness,
+        )
+        .await
+        {
+            Ok(()) => retry.succeeded(),
+            Err(error) => {
+                tracing::warn!(error = %error, "focused peer-route sync failed");
+                if let Err(schedule_error) =
+                    retry.schedule(task_supervisor.as_ref(), &retry_tx).await
+                {
+                    tracing::warn!(
+                        error = %schedule_error,
+                        "failed to schedule focused peer-route retry"
+                    );
+                }
+            }
+        }
+
+        let request = match klights_leader_api::WatchRequest::try_new(
+            "v1", "Node", None, None, None, None, None,
+        )
+        .and_then(|request| request.with_resume_cursor(cursor))
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to construct focused Node watch");
+                break;
+            }
+        };
+        let mut stream = match watch.watch_resources(request).await {
+            Ok(stream) => {
+                reconnect_attempt = 0;
+                stream
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to open focused Node watch");
+                if !wait_for_peer_watch_reconnect(
+                    task_supervisor.as_ref(),
+                    &cancel,
+                    reconnect_attempt,
+                )
+                .await
+                {
+                    break;
+                }
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                continue;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                Some(generation) = retry_rx.recv() => {
+                    if !retry.take(generation) {
+                        continue;
+                    }
+                    match sync_focused_peers_and_publish_readiness(
+                        topology.as_ref(),
+                        query.as_ref(),
+                        &my_node_name,
+                        peering.as_ref(),
+                        &mut applied,
+                        node_status.as_ref(),
+                        dataplane_health.as_ref(),
+                        &mut last_readiness,
+                    ).await {
+                        Ok(()) => retry.succeeded(),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "focused peer-route retry failed");
+                            if let Err(schedule_error) =
+                                retry.schedule(task_supervisor.as_ref(), &retry_tx).await
+                            {
+                                tracing::warn!(
+                                    error = %schedule_error,
+                                    "failed to reschedule focused peer-route retry"
+                                );
+                            }
+                        }
+                    }
+                }
+                item = stream.next() => match item {
+                    Some(Ok(event)) => {
+                        if event.event_type() == klights_leader_api::WatchEventType::Error {
+                            break;
+                        }
+                        if event.event_type() != klights_leader_api::WatchEventType::Bookmark {
+                            if let Some(projection) = projection.as_ref()
+                                && let Err(error) = projection.reconcile_node_event(&event).await
+                            {
+                                tracing::warn!(error = %error, "peer topology projection failed");
+                                // Projection is part of applying this durable
+                                // event. Keep the pre-event cursor and reopen
+                                // through the supervised reconnect delay so
+                                // the leader Node projection is replayed.
+                                break;
+                            }
+                            match sync_focused_peers_and_publish_readiness(
+                                topology.as_ref(),
+                                query.as_ref(),
+                                &my_node_name,
+                                peering.as_ref(),
+                                &mut applied,
+                                node_status.as_ref(),
+                                dataplane_health.as_ref(),
+                                &mut last_readiness,
+                            ).await {
+                                Ok(()) => retry.succeeded(),
+                                Err(error) => {
+                                    tracing::warn!(error = %error, "focused peer-route event sync failed");
+                                    if let Err(schedule_error) =
+                                        retry.schedule(task_supervisor.as_ref(), &retry_tx).await
+                                    {
+                                        tracing::warn!(
+                                            error = %schedule_error,
+                                            "failed to schedule focused peer-route event retry"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Err(error) = cursor.advance_after_apply(&event) {
+                            tracing::warn!(error = %error, "focused Node watch cursor rejected event");
+                            break;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(error = %error, "focused Node watch stream failed");
+                        break;
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+        if !wait_for_peer_watch_reconnect(task_supervisor.as_ref(), &cancel, reconnect_attempt)
+            .await
+        {
+            break;
+        }
+        reconnect_attempt = reconnect_attempt.saturating_add(1);
+    }
+}
+
+async fn wait_for_peer_watch_reconnect(
+    supervisor: &klights_supervisor::TaskSupervisor,
+    cancel: &CancellationToken,
+    attempt: u32,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        result = supervisor.sleep(
+            "focused_node_peer_watch_reconnect",
+            crate::utils::watch_reconnect_delay(attempt),
+        ) => result.is_ok(),
+    }
+}
+
 /// Watch Node events and keep peer routes in sync with `node_subnets`.
 ///
 /// Event-driven only: no polling loop. Uses WatchCursor replay to survive lag.
+#[cfg(test)]
 pub async fn run_peer_watch(
     state: std::sync::Arc<AppState>,
     dataplane_health: DataplaneHealth,
@@ -206,6 +514,7 @@ pub async fn run_peer_watch(
     .await;
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_peer_watch_with_components(
     db: DatastoreHandle,
@@ -233,6 +542,7 @@ pub async fn run_peer_watch_with_components(
     .await;
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn sync_peer_routes_and_publish_readiness(
     db: &dyn DatastoreBackend,
@@ -257,6 +567,7 @@ async fn sync_peer_routes_and_publish_readiness(
     Ok(())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_peer_watch_with_components_inner(
     db: DatastoreHandle,
@@ -420,6 +731,7 @@ async fn run_peer_watch_with_components_inner(
     }
 }
 
+#[cfg(test)]
 async fn reconcile_peer_node_event_cluster_state(
     db: &dyn DatastoreBackend,
     my_node_name: &str,
@@ -616,6 +928,151 @@ pub async fn sync_peer_routes(
     Ok(outcome)
 }
 
+/// Reconcile peer routes using only the focused read capabilities needed by
+/// networking composition. This is the bootstrap/worker-safe counterpart to
+/// the legacy datastore-backed controller entry point.
+pub async fn sync_peer_routes_with_ports(
+    topology: &dyn klights_leader_api::LeaderNetworkTopologyQuery,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    my_node_name: &str,
+    network: &dyn klights_network_api::PeerRouter,
+    applied: &mut HashMap<String, AppliedPeer>,
+) -> Result<PeerSyncOutcome> {
+    let request =
+        klights_leader_api::PeerSubnetsQuery::try_new(my_node_name).map_err(anyhow::Error::new)?;
+    let peers = topology
+        .list_peer_subnets(request)
+        .await
+        .map_err(anyhow::Error::new)
+        .context("list peer subnets through focused topology query")?;
+    let desired: HashMap<String, NodeSubnet> = peers
+        .into_vec()
+        .into_iter()
+        .map(crate::control_plane::client::legacy_node_subnet)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::new)?
+        .into_iter()
+        .map(|peer| (peer.node_name.as_str().to_string(), peer))
+        .collect();
+
+    let mut outcome = PeerSyncOutcome {
+        desired_peers: desired.len(),
+        ready_peers: 0,
+        unreachable_ready_peers: 0,
+    };
+
+    for (name, peer) in &desired {
+        let peer_ready = peer_node_is_ready_with_query(query, name).await;
+        if peer_ready {
+            outcome.ready_peers += 1;
+        }
+
+        let dataplane_request =
+            klights_leader_api::NodeDataplaneQuery::try_new(name).map_err(anyhow::Error::new)?;
+        let endpoint = topology
+            .get_node_dataplane(dataplane_request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_option()
+            .map(crate::control_plane::client::legacy_dataplane)
+            .transpose()
+            .map_err(anyhow::Error::new)?
+            .map(|metadata| {
+                crate::networking::wireguard::peer_route_from_metadata(
+                    metadata,
+                    &peer.subnet.to_string(),
+                )
+            })
+            .transpose()?;
+
+        let Some(endpoint) = endpoint else {
+            if let Some(old) = applied.remove(name) {
+                network
+                    .remove_peer_route(&old.endpoint)
+                    .await
+                    .with_context(|| format!("remove peer {name} with missing metadata"))?;
+            }
+            if peer_ready {
+                outcome.unreachable_ready_peers += 1;
+            }
+            continue;
+        };
+
+        let needs_apply = applied.get(name).is_none_or(|old| {
+            let previous = &old.subnet;
+            previous.subnet != peer.subnet
+                || previous.gateway_ip != peer.gateway_ip
+                || previous.node_ip != peer.node_ip
+                || previous.mode != peer.mode
+                || previous.hostport_range != peer.hostport_range
+                || old.endpoint != endpoint
+        });
+        if !needs_apply {
+            continue;
+        }
+        if let Some(old) = applied.remove(name) {
+            network
+                .remove_peer_route(&old.endpoint)
+                .await
+                .with_context(|| format!("replace peer {name}"))?;
+        }
+        network
+            .apply_peer_route(&endpoint)
+            .await
+            .with_context(|| format!("apply peer {name}"))?;
+        applied.insert(
+            name.clone(),
+            AppliedPeer {
+                subnet: peer.clone(),
+                endpoint,
+            },
+        );
+    }
+
+    let stale: Vec<String> = applied
+        .keys()
+        .filter(|name| !desired.contains_key(*name))
+        .cloned()
+        .collect();
+    for name in stale {
+        if let Some(old) = applied.remove(&name) {
+            network
+                .remove_peer_route(&old.endpoint)
+                .await
+                .with_context(|| format!("remove peer {name}"))?;
+        }
+    }
+    Ok(outcome)
+}
+
+async fn peer_node_is_ready_with_query(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_name: &str,
+) -> bool {
+    let request = match klights_leader_api::node_get_request(
+        node_name,
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(node = %node_name, error = %error, "invalid peer Node readiness query");
+            return false;
+        }
+    };
+    match query.get_resource(request).await {
+        Ok(Some(node)) => node_ready_condition_is_true(&node.data),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                node = %node_name,
+                error = %error,
+                "failed to read peer Node readiness through focused query"
+            );
+            false
+        }
+    }
+}
+
 /// Update local dataplane health from a peer-sync outcome and, if the combined
 /// readiness changed, re-publish the node's `Ready`/`NetworkUnavailable`
 /// conditions. No-op when health tracking is disabled (single-node test paths).
@@ -753,6 +1210,7 @@ fn node_ready_condition_is_true(node: &serde_json::Value) -> bool {
         })
 }
 
+#[cfg(test)]
 fn is_node_event(event: &WatchEvent) -> bool {
     if event.event_type == EventType::Bookmark {
         return false;
@@ -839,6 +1297,186 @@ mod tests {
         {
             Box::pin(async { Ok(klights_leader_api::NodeSelfStatusResult::Enqueued) })
         }
+    }
+
+    impl klights_leader_api::LeaderNetworkTopologyQuery for NoopLeaderPorts {
+        fn get_node_subnet(
+            &self,
+            request: klights_leader_api::NodeSubnetQuery,
+        ) -> klights_leader_api::NetworkTopologyFuture<'_, klights_leader_api::NodeSubnetResult>
+        {
+            Box::pin(async move {
+                klights_leader_api::NodeSubnetResult::try_from_wire(
+                    request.node_name(),
+                    false,
+                    None,
+                )
+            })
+        }
+
+        fn list_peer_subnets(
+            &self,
+            request: klights_leader_api::PeerSubnetsQuery,
+        ) -> klights_leader_api::NetworkTopologyFuture<'_, klights_leader_api::PeerSubnetsResult>
+        {
+            Box::pin(async move {
+                klights_leader_api::PeerSubnetsResult::try_new(request.node_name(), Vec::new())
+            })
+        }
+
+        fn get_node_dataplane(
+            &self,
+            request: klights_leader_api::NodeDataplaneQuery,
+        ) -> klights_leader_api::NetworkTopologyFuture<'_, klights_leader_api::NodeDataplaneResult>
+        {
+            Box::pin(async move {
+                klights_leader_api::NodeDataplaneResult::try_from_wire(
+                    request.node_name(),
+                    false,
+                    None,
+                )
+            })
+        }
+    }
+
+    struct ReplayUntilAppliedWatch {
+        event: klights_leader_api::ResourceEvent,
+        requests: std::sync::Mutex<Vec<klights_leader_api::WatchResumeCursor>>,
+    }
+
+    impl klights_leader_api::LeaderWatch for ReplayUntilAppliedWatch {
+        fn watch_resources(
+            &self,
+            request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            Box::pin(async move {
+                let cursor = klights_leader_api::WatchResumeCursor::try_new(
+                    request.start_resource_version(),
+                    request.start_watch_replay_position(),
+                )?;
+                self.requests.lock().unwrap().push(cursor);
+                let events = if cursor == klights_leader_api::WatchResumeCursor::default() {
+                    vec![Ok(self.event.clone())]
+                } else {
+                    Vec::new()
+                };
+                Ok(Box::pin(futures::stream::iter(events)) as klights_leader_api::WatchStream)
+            })
+        }
+    }
+
+    struct FailProjectionOnce {
+        calls: std::sync::atomic::AtomicUsize,
+        replayed: tokio::sync::Notify,
+    }
+
+    impl super::PeerTopologyProjection for FailProjectionOnce {
+        fn reconcile_node_event<'a>(
+            &'a self,
+            _event: &'a klights_leader_api::ResourceEvent,
+        ) -> super::PeerTopologyProjectionFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    anyhow::bail!("injected projection failure");
+                }
+                self.replayed.notify_waiters();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn focused_watch_replays_event_when_topology_projection_fails() {
+        let position = klights_cluster_core::WatchReplayPosition {
+            resource_version: 41,
+            event_id: 73,
+            resource_version_filter_through_event_id: 0,
+        };
+        let resource = crate::datastore::Resource::try_from_data(Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "node-b",
+                "uid": "uid-node-b",
+                "resourceVersion": "41"
+            }
+        })))
+        .unwrap();
+        let event = klights_leader_api::ResourceEvent::try_new(
+            klights_leader_api::WatchEventType::Added,
+            resource,
+            Some(position),
+        )
+        .unwrap();
+        let watch = Arc::new(ReplayUntilAppliedWatch {
+            event,
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let projection = Arc::new(FailProjectionOnce {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            replayed: tokio::sync::Notify::new(),
+        });
+        let router = Arc::new(MockNetworkProvider::new());
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let cancel = CancellationToken::new();
+        let handle = {
+            let topology = Arc::new(NoopLeaderPorts);
+            let query = Arc::new(NoopLeaderPorts);
+            let node_status = Arc::new(NoopLeaderPorts);
+            let watch = watch.clone();
+            let projection = projection.clone();
+            let router = router.clone();
+            let task_supervisor = supervisor.clone();
+            let task_cancel = cancel.clone();
+            supervisor
+                .spawn_async(
+                    klights_supervisor::TaskCategory::Network,
+                    "focused_projection_replay_test",
+                    async move {
+                        super::run_focused_peer_watch(
+                            topology,
+                            query,
+                            watch,
+                            Some(projection),
+                            "node-a".to_string(),
+                            router,
+                            task_supervisor,
+                            None,
+                            node_status,
+                            task_cancel,
+                        )
+                        .await;
+                    },
+                )
+                .await
+                .unwrap()
+        };
+
+        let replayed =
+            tokio::time::timeout(Duration::from_secs(2), projection.replayed.notified()).await;
+        cancel.cancel();
+        handle.join().await.unwrap();
+        let report = supervisor.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.remaining_active, 0);
+
+        replayed.expect(
+            "projection failure must retain/replay the Node event instead of advancing its cursor",
+        );
+        assert_eq!(
+            projection.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the same durable event must be projected again"
+        );
+        let requests = watch.requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        assert_eq!(
+            requests[1],
+            klights_leader_api::WatchResumeCursor::default(),
+            "projection failure must reconnect from the pre-event cursor"
+        );
     }
 
     async fn seed_peer(

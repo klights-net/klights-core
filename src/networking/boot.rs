@@ -11,34 +11,34 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::bootstrap::NodeMode;
-use crate::control_plane::client::LeaderApiClient;
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::networking::dataplane_health::DataplaneHealth;
 use crate::networking::{NetworkPlane, PodSubnet, RootlessNetworkPlane};
 
-pub(crate) struct NetworkBootStores<'a, S>
-where
-    S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
-{
-    pub(crate) cluster_api: Arc<dyn LeaderApiClient>,
-    pub(crate) node_subnet_store: &'a S,
-    pub(crate) node_local: NodeLocalHandle,
+pub(crate) struct NetworkBootStores {
+    pub(crate) subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    pub(crate) topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+    pub(crate) pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub(crate) pod_ipam: Arc<dyn klights_node_store::PodIpamStore>,
+    pub(crate) pod_runtime: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pub(crate) assignment_publisher: Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
 }
 
-impl<'a, S> NetworkBootStores<'a, S>
-where
-    S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
-{
+impl NetworkBootStores {
     pub(crate) fn new(
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_subnet_store: &'a S,
-        node_local: NodeLocalHandle,
+        subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+        topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+        pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+        pod_ipam: Arc<dyn klights_node_store::PodIpamStore>,
+        pod_runtime: Arc<dyn klights_node_store::PodRuntimeStore>,
+        assignment_publisher: Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
     ) -> Self {
         Self {
-            cluster_api,
-            node_subnet_store,
-            node_local,
+            subnet_allocation,
+            topology,
+            pod_network_cache,
+            pod_ipam,
+            pod_runtime,
+            assignment_publisher,
         }
     }
 }
@@ -49,28 +49,21 @@ pub enum NetworkBoot {
 }
 
 impl NetworkBoot {
-    /// Dispatch on `NodeMode` and run the matching boot path.
-    pub(crate) async fn boot<S>(
-        node_mode: &NodeMode,
-        cfg: &crate::KlightsConfig,
-        stores: NetworkBootStores<'_, S>,
-        node_ip: &str,
+    /// Dispatch on the validated focused network mode and run its boot path.
+    pub(crate) async fn boot(
+        cfg: &crate::networking::NetworkBootConfig,
+        stores: NetworkBootStores,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Result<Self>
-    where
-        S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
-    {
-        match node_mode {
-            NodeMode::Root => {
-                let plane =
-                    NetworkPlane::boot(cfg, stores, node_ip, cancel, task_supervisor).await?;
+    ) -> Result<Self> {
+        match cfg.mode() {
+            crate::networking::NetworkMode::Root => {
+                let plane = NetworkPlane::boot(cfg, stores, cancel, task_supervisor).await?;
                 Ok(Self::Root(plane))
             }
-            NodeMode::Rootless { .. } => {
+            crate::networking::NetworkMode::Rootless => {
                 let plane =
-                    RootlessNetworkPlane::boot(cfg, stores, node_ip, cancel, task_supervisor)
-                        .await?;
+                    RootlessNetworkPlane::boot(cfg, stores, cancel, task_supervisor).await?;
                 Ok(Self::Rootless(plane))
             }
         }
@@ -98,7 +91,7 @@ impl NetworkBoot {
     pub fn local_pod_subnet(&self) -> PodSubnet {
         match self {
             Self::Root(plane) => plane.local_pod_subnet(),
-            Self::Rootless(plane) => plane.local_subnet().subnet,
+            Self::Rootless(plane) => *plane.local_subnet(),
         }
     }
 
@@ -115,7 +108,6 @@ impl NetworkBoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::NodeMode;
 
     fn rootless_test_config(node_name: &str) -> crate::KlightsConfig {
         let ns = "klights";
@@ -191,20 +183,6 @@ mod tests {
         ))
     }
 
-    struct TestNodeSubnetStore {
-        db: crate::datastore::sqlite::Datastore,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::networking::subnet_allocator::NodeSubnetAllocationStore for TestNodeSubnetStore {
-        async fn get_node_subnet(
-            &self,
-            node_name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::NodeSubnet>> {
-            self.db.get_node_subnet(node_name).await
-        }
-    }
-
     #[tokio::test]
     async fn network_boot_dispatches_rootless_mode_to_rootless_plane() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -213,23 +191,38 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let assignment_bus =
+            Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
-        let user_netns = std::path::PathBuf::from("/proc/self/ns/user");
-        let mode = NodeMode::Rootless {
-            user_netns,
-            rootlesskit_pid: 0,
-        };
+        let cluster_api = cluster_api_for_test(db.clone(), &cfg.node_name);
+        let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
+            cluster_api.clone();
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+        let focused = crate::networking::NetworkBootConfig::try_new(
+            crate::networking::NetworkMode::Rootless,
+            &cfg.bridge_name,
+            &cfg.node_name,
+            &cfg.cluster_cidr,
+            "192.168.1.6",
+            cfg.dataplane_encryption,
+            cfg.wireguard_device.clone(),
+            "/tmp/klights-test-wireguard.key",
+            cfg.wireguard_port,
+        )
+        .expect("focused test config");
 
         let boot = NetworkBoot::boot(
-            &mode,
-            &cfg,
+            &focused,
             NetworkBootStores::new(
-                cluster_api_for_test(db.clone(), &cfg.node_name),
-                &node_subnet_store,
-                node_local,
+                subnet_allocation,
+                topology,
+                node_network.clone(),
+                node_network.clone(),
+                node_network,
+                assignment_bus,
             ),
-            "192.168.1.6",
             cancel,
             supervisor,
         )

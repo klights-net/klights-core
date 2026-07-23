@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::kubelet::pod_repository::api::PodSchedulingMode;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -26,7 +27,9 @@ use crate::control_plane::client::{
     LeaderApiClient, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
     legacy_list_response,
 };
-use crate::datastore::{DatastoreHandle, Resource, ResourceList};
+#[cfg(test)]
+use crate::datastore::DatastoreHandle;
+use crate::datastore::{Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
@@ -35,6 +38,133 @@ use crate::watch::WatchEvent;
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_supervisor::TaskSupervisor;
 use klights_types::ResourceKey;
+
+#[cfg(test)]
+struct TestDatastorePodNetworkCache {
+    db: DatastoreHandle,
+}
+
+#[cfg(test)]
+pub(crate) fn test_pod_network_cache(
+    db: DatastoreHandle,
+) -> Arc<dyn klights_node_store::PodNetworkCache> {
+    Arc::new(TestDatastorePodNetworkCache { db })
+}
+
+#[cfg(test)]
+pub(crate) fn test_assignment_bus()
+-> Arc<crate::networking::pod_network_events::PodNetworkAssignmentBus> {
+    Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new())
+}
+
+#[cfg(test)]
+impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
+    fn get_network_for_uid(
+        &self,
+        pod_uid: klights_node_store::PodUidKey,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async move {
+            self.db
+                .get_pod_network_for_pod("", "", pod_uid.as_str())
+                .await
+                .map_err(|error| {
+                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
+                })?
+                .map(test_network_endpoint)
+                .transpose()
+        })
+    }
+
+    fn get_network_for_pod(
+        &self,
+        pod: klights_types::PodIdentity,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async move {
+            self.db
+                .get_pod_network_for_pod(&pod.namespace, &pod.name, &pod.uid)
+                .await
+                .map_err(|error| {
+                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
+                })?
+                .map(test_network_endpoint)
+                .transpose()
+        })
+    }
+
+    fn get_network_for_sandbox(
+        &self,
+        sandbox_id: klights_node_store::SandboxKey,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        Box::pin(async move {
+            self.db
+                .get_pod_network(sandbox_id.as_str())
+                .await
+                .map_err(|error| {
+                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
+                })?
+                .map(test_network_endpoint)
+                .transpose()
+        })
+    }
+
+    fn get_network_for_assignment(
+        &self,
+        sandbox_id: klights_node_store::SandboxKey,
+        _pod: klights_types::PodIdentity,
+    ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
+    {
+        self.get_network_for_sandbox(sandbox_id)
+    }
+
+    fn delete_network_for_sandbox(
+        &self,
+        sandbox_id: klights_node_store::SandboxKey,
+    ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
+        Box::pin(async move {
+            self.db
+                .delete_pod_network(sandbox_id.as_str())
+                .await
+                .map_err(|error| {
+                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
+                })
+        })
+    }
+
+    fn delete_network_if_matches(
+        &self,
+        request: klights_node_store::PodNetworkAllocationRequest,
+    ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
+        Box::pin(async move {
+            self.db
+                .delete_pod_network(request.sandbox_id())
+                .await
+                .map_err(|error| {
+                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
+                })?;
+            Ok(true)
+        })
+    }
+
+    fn list_network_assignments(
+        &self,
+    ) -> klights_node_store::CacheNetworkFuture<
+        '_,
+        Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
+    > {
+        Box::pin(async { unreachable!("test-only cache does not drive network cleanup") })
+    }
+}
+
+#[cfg(test)]
+fn test_network_endpoint(
+    row: crate::datastore::PodNetworkEndpoint,
+) -> Result<klights_node_store::PodNetworkEndpoint, klights_node_store::CacheNetworkError> {
+    klights_node_store::PodNetworkEndpoint::try_new(row.ip_addr, row.veth_host, row.netns_path)
+        .map_err(|error| klights_node_store::CacheNetworkError::corrupt_data(error.to_string()))
+}
 
 pub mod api;
 pub mod background;
@@ -574,6 +704,7 @@ fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str
 }
 
 impl PodRepository {
+    #[cfg(test)]
     pub fn new(
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
@@ -597,6 +728,7 @@ impl PodRepository {
         self.outbox.as_deref()
     }
 
+    #[cfg(test)]
     pub fn new_with_scheduling_mode(
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
@@ -614,6 +746,7 @@ impl PodRepository {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_scheduling_mode_and_outbox(
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
@@ -622,17 +755,21 @@ impl PodRepository {
         scheduling_mode: PodSchedulingMode,
         outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     ) -> Self {
+        let network_cache = test_pod_network_cache(db.clone());
+        let assignment_bus = test_assignment_bus();
         Self::new_with_network_events(
             db,
             supervisor,
             side_effects,
             metrics,
-            crate::networking::global_pod_network_events(),
+            network_cache,
+            assignment_bus,
             scheduling_mode,
             outbox,
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_scheduling_mode_outbox_and_cluster_api(
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
@@ -642,24 +779,29 @@ impl PodRepository {
         outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
         cluster_api: Arc<dyn LeaderApiClient>,
     ) -> Self {
+        let pod_network_cache = test_pod_network_cache(db.clone());
+        let assignment_waiter = test_assignment_bus();
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
             supervisor,
             side_effects,
             metrics,
-            network_events: crate::networking::global_pod_network_events(),
+            pod_network_cache,
+            assignment_waiter,
             scheduling_mode,
             outbox,
             cluster_api: Some(cluster_api),
         })
     }
 
+    #[cfg(test)]
     pub fn new_with_network_events(
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
-        network_events: crate::networking::pod_network_events::PodNetworkEvents,
+        pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+        assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
         scheduling_mode: PodSchedulingMode,
         outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     ) -> Self {
@@ -668,13 +810,15 @@ impl PodRepository {
             supervisor,
             side_effects,
             metrics,
-            network_events,
+            pod_network_cache,
+            assignment_waiter,
             scheduling_mode,
             outbox,
             cluster_api: None,
         })
     }
 
+    #[cfg(test)]
     fn new_with_network_events_and_cluster_api(config: PodRepositoryBuildConfig) -> Self {
         let parts = Self::build_parts(config);
         // Ordinary constructors retain lazy queue startup on first enqueue.
@@ -706,7 +850,8 @@ impl PodRepository {
             supervisor,
             side_effects,
             metrics,
-            network_events,
+            pod_network_cache,
+            assignment_waiter,
             scheduling_mode: _scheduling_mode,
             outbox,
             cluster_api,
@@ -764,7 +909,8 @@ impl PodRepository {
             status_only,
             side_effects.controller_dispatcher_slot(),
         );
-        let network_svc = PodNetworkService::new(db, supervisor.clone(), network_events);
+        let network_svc =
+            PodNetworkService::new(pod_network_cache, supervisor.clone(), assignment_waiter);
         let watch = PodWatchService::new(store.clone());
         let gc_pod_delete_sink: Arc<dyn GcPodDeleteSink> = api.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));

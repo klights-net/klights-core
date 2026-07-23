@@ -317,9 +317,53 @@ impl PodEndpointEventSource for ReferenceEventSource {
     }
 }
 
+fn assert_assignment_publisher_object_safe(_: &dyn PodNetworkAssignmentPublisher) {}
+fn assert_assignment_waiter_object_safe(_: &dyn PodNetworkAssignmentWaiter) {}
+fn assert_assignment_subscription_object_safe(_: &dyn PodNetworkAssignmentSubscription) {}
+
 /// Run the dependency-free reference suite used by contract and adapter tests.
 #[allow(clippy::too_many_lines)]
 pub fn run_reference_suite() {
+    for (sandbox_id, namespace, pod_name, pod_uid, field) in [
+        ("", "default", "pod-a", "uid-a", "assignment.sandbox_id"),
+        (
+            "sandbox-a",
+            "",
+            "pod-a",
+            "uid-a",
+            "assignment.pod.namespace",
+        ),
+        ("sandbox-a", "default", "", "uid-a", "assignment.pod.name"),
+        ("sandbox-a", "default", "pod-a", "", "assignment.pod.uid"),
+    ] {
+        assert!(matches!(
+            PodNetworkAssignmentKey::try_new(sandbox_id, namespace, pod_name, pod_uid),
+            Err(PodNetworkAssignmentEventError::InvalidRequest {
+                field: actual,
+                ..
+            }) if actual == field
+        ));
+    }
+    let assignment_key =
+        PodNetworkAssignmentKey::try_new("sandbox/raw", "ns/raw", "pod/raw", "uid/raw").unwrap();
+    assert_eq!(assignment_key.sandbox_id().as_str(), "sandbox/raw");
+    assert_eq!(
+        assignment_key.pod(),
+        &PodIdentity::new("ns/raw", "pod/raw", "uid/raw")
+    );
+    assert_eq!(
+        PodNetworkAssignmentEventError::closed().to_string(),
+        "pod network assignment event bus is closed"
+    );
+    assert_eq!(
+        PodNetworkAssignmentEventError::cancelled().to_string(),
+        "pod network assignment wait was cancelled"
+    );
+    let _: Option<&dyn std::error::Error> = PodNetworkAssignmentEventError::closed().source();
+    let _ = assert_assignment_publisher_object_safe;
+    let _ = assert_assignment_waiter_object_safe;
+    let _ = assert_assignment_subscription_object_safe;
+
     let sandbox = SandboxId::try_new("sandbox-a").unwrap();
     let add = CniAddRequest::try_new(
         "sandbox-a",

@@ -56,6 +56,8 @@ pub struct BootstrapRunArgs<'a> {
     pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     pub _node_local: crate::datastore::node_local::handle::NodeLocalHandle,
+    pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
     pub replication_service_for_router: Option<Arc<crate::replication::ReplicationService>>,
     pub outbox_runtime: Arc<crate::kubelet::outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
@@ -157,6 +159,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         cluster_api,
         remote_api_client,
         _node_local,
+        pod_network_cache,
+        assignment_waiter,
         replication_service_for_router,
         outbox_runtime,
         node_lease_tracker,
@@ -335,7 +339,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         supervisor: supervisor.clone(),
         side_effects: side_effects.clone(),
         metrics: metrics.clone(),
-        network_events: crate::networking::global_pod_network_events(),
+        pod_network_cache: pod_network_cache.clone(),
+        assignment_waiter: assignment_waiter.clone(),
         scheduling_mode,
         outbox: Some(outbox_runtime.clone()),
         cluster_api: Some(cluster_api.clone()),
@@ -412,7 +417,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
                 metrics: metrics.clone(),
-                network_events: crate::networking::global_pod_network_events(),
+                pod_network_cache: pod_network_cache.clone(),
+                assignment_waiter: assignment_waiter.clone(),
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(cluster_api.clone()),
@@ -979,12 +985,45 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let state = watcher_state.clone();
         let cancel = shutdown_token.clone();
         let health = dataplane_health.clone();
+        let leader_ports = crate::bootstrap::network_adapters::FocusedNetworkLeaderPorts::new(
+            state.cluster_api.clone(),
+        );
+        let topology = leader_ports.topology();
+        let query = leader_ports.resource_query();
+        let watch = leader_ports.watch();
+        let projection = crate::controllers::node_subnet::DatastorePeerTopologyProjection::new(
+            state.db.clone(),
+            state.config.node_name.clone(),
+            state.config.cluster_cidr.clone(),
+            state.is_raft_leader_rx.clone(),
+        );
+        let node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
+            Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+                state.config.node_name.clone(),
+                query.clone(),
+                state.outbox.clone(),
+            ));
+        let node_name = state.config.node_name.clone();
+        let peering = state.network.peering().clone();
+        let peer_supervisor = supervisor.clone();
         supervisor
             .spawn_async(
                 klights_supervisor::TaskCategory::Background,
                 "runtime_node_subnet_peer_watch",
                 async move {
-                    controllers::node_subnet::run_peer_watch(state, health, cancel).await;
+                    controllers::node_subnet::run_focused_peer_watch(
+                        topology,
+                        query,
+                        watch,
+                        Some(projection),
+                        node_name,
+                        peering,
+                        peer_supervisor,
+                        Some(health),
+                        node_status,
+                        cancel,
+                    )
+                    .await;
                 },
             )
             .await

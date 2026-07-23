@@ -329,14 +329,16 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let network_events = crate::networking::global_pod_network_events();
+    let pod_network_cache = super::test_pod_network_cache(db.clone());
+    let assignment_waiter = super::test_assignment_bus();
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
         supervisor,
         side_effects,
         metrics,
-        network_events,
+        pod_network_cache,
+        assignment_waiter,
         scheduling_mode: super::api::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
@@ -355,14 +357,16 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let network_events = crate::networking::global_pod_network_events();
+    let pod_network_cache = super::test_pod_network_cache(db.clone());
+    let assignment_waiter = super::test_assignment_bus();
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
         supervisor,
         side_effects,
         metrics,
-        network_events,
+        pod_network_cache,
+        assignment_waiter,
         scheduling_mode: super::api::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
@@ -391,14 +395,16 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let network_events = crate::networking::global_pod_network_events();
+    let pod_network_cache = super::test_pod_network_cache(db.clone());
+    let assignment_waiter = super::test_assignment_bus();
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
         supervisor,
         side_effects,
         metrics,
-        network_events,
+        pod_network_cache,
+        assignment_waiter,
         scheduling_mode: super::api::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
@@ -6545,24 +6551,113 @@ async fn read_pod_network_assignment_returns_assigned_ip() {
 
 #[tokio::test]
 async fn read_pod_network_assignment_falls_back_to_pod_identity() {
-    use super::PodNetworkReader;
-    let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = fixture_side_effects();
-    let repo = super::PodRepository::new(db, supervisor, side_effects, metrics);
+    struct UidFallbackCache;
 
-    ds.record_pod_network(
-        "cni-container-id",
-        &PodIdentity::new("default", "p-net", "uid-1"),
-        "10.42.0.43",
-        0x0a2a_002b,
-        "vethXYZ",
-        "/var/run/netns/cni-1",
-    )
-    .await
-    .unwrap();
-    let assignment = repo
+    impl klights_node_store::PodNetworkCache for UidFallbackCache {
+        fn get_network_for_uid(
+            &self,
+            pod_uid: klights_node_store::PodUidKey,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async move {
+                assert_eq!(pod_uid.as_str(), "uid-1");
+                Ok(Some(
+                    klights_node_store::PodNetworkEndpoint::try_new(
+                        "10.42.0.43",
+                        "vethXYZ",
+                        "/var/run/netns/cni-1",
+                    )
+                    .unwrap(),
+                ))
+            })
+        }
+
+        fn get_network_for_pod(
+            &self,
+            pod: klights_types::PodIdentity,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async move {
+                assert_eq!(
+                    pod,
+                    klights_types::PodIdentity::new("default", "p-net", "uid-1")
+                );
+                Ok(Some(
+                    klights_node_store::PodNetworkEndpoint::try_new(
+                        "10.42.0.43",
+                        "vethXYZ",
+                        "/var/run/netns/cni-1",
+                    )
+                    .unwrap(),
+                ))
+            })
+        }
+
+        fn get_network_for_sandbox(
+            &self,
+            sandbox_id: klights_node_store::SandboxKey,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async move {
+                assert_eq!(sandbox_id.as_str(), "runtime-sandbox-id");
+                Ok(None)
+            })
+        }
+
+        fn get_network_for_assignment(
+            &self,
+            sandbox_id: klights_node_store::SandboxKey,
+            pod: klights_types::PodIdentity,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async move {
+                assert_eq!(sandbox_id.as_str(), "runtime-sandbox-id");
+                assert_eq!(
+                    pod,
+                    klights_types::PodIdentity::new("default", "p-net", "uid-1")
+                );
+                Ok(None)
+            })
+        }
+
+        fn delete_network_for_sandbox(
+            &self,
+            _sandbox_id: klights_node_store::SandboxKey,
+        ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
+            Box::pin(async { unreachable!("read-only consumer") })
+        }
+
+        fn delete_network_if_matches(
+            &self,
+            _request: klights_node_store::PodNetworkAllocationRequest,
+        ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
+            Box::pin(async { unreachable!("read-only consumer") })
+        }
+
+        fn list_network_assignments(
+            &self,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
+        > {
+            Box::pin(async { unreachable!("read-only consumer") })
+        }
+    }
+
+    let service = super::network::PodNetworkService::new(
+        std::sync::Arc::new(UidFallbackCache),
+        fixture_supervisor(),
+        super::test_assignment_bus(),
+    );
+    let assignment = service
         .read_pod_network_assignment("runtime-sandbox-id", "default", "p-net", "uid-1", false)
         .await
         .unwrap();
@@ -6591,24 +6686,29 @@ async fn read_pod_network_assignment_host_network_returns_host_ip_twice_without_
 #[tokio::test]
 async fn read_pod_network_assignment_retries_then_succeeds() {
     use super::PodNetworkReader;
-    use crate::networking::pod_network_events::{PodNetworkEvents, PodNetworkKey};
+    use crate::networking::pod_network_events::PodNetworkAssignmentBus;
+    use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
     let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let events = PodNetworkEvents::new();
+    let events = std::sync::Arc::new(PodNetworkAssignmentBus::new());
+    let mut registered = events.registration_observer_for_test();
     let repo = std::sync::Arc::new(super::PodRepository::new_with_network_events(
-        db,
+        db.clone(),
         supervisor,
         side_effects,
         metrics,
+        super::test_pod_network_cache(db),
         events.clone(),
         super::api::PodSchedulingMode::InlineSingleNode,
         None,
     ));
 
-    let key = PodNetworkKey::new("sandbox-net-late", "default", "p-net-late", "uid-late");
+    let key =
+        PodNetworkAssignmentKey::try_new("sandbox-net-late", "default", "p-net-late", "uid-late")
+            .unwrap();
     let repo_clone = repo.clone();
     let read_handle = tokio::spawn(async move {
         repo_clone
@@ -6622,7 +6722,7 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
             .await
     });
 
-    wait_for_pod_network_subscriber(&events, &key).await;
+    registered.changed().await.unwrap();
     ds.record_pod_network(
         "sandbox-net-late",
         &PodIdentity::new("default", "p-net-late", "uid-late"),
@@ -6633,38 +6733,167 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     )
     .await
     .unwrap();
-    events.publish_assignment(&key).await;
+    events.publish_assignment(&key);
 
     let assignment = read_handle.await.unwrap().unwrap();
     assert_eq!(assignment.pod_ip, "10.42.0.99");
 }
 
 #[tokio::test]
+async fn read_pod_network_assignment_retains_publish_inside_first_lookup_gap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
+
+    struct PublishInsideLookupCache {
+        bus: std::sync::Arc<crate::networking::pod_network_events::PodNetworkAssignmentBus>,
+        key: PodNetworkAssignmentKey,
+        sandbox_reads: AtomicUsize,
+    }
+
+    impl klights_node_store::PodNetworkCache for PublishInsideLookupCache {
+        fn get_network_for_uid(
+            &self,
+            _pod_uid: klights_node_store::PodUidKey,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn get_network_for_pod(
+            &self,
+            _pod: klights_types::PodIdentity,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn get_network_for_sandbox(
+            &self,
+            _sandbox_id: klights_node_store::SandboxKey,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async move {
+                if self.sandbox_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.bus.publish_assignment(&self.key);
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        klights_node_store::PodNetworkEndpoint::try_new(
+                            "10.42.0.101",
+                            "veth-gap",
+                            "/run/netns/gap",
+                        )
+                        .unwrap(),
+                    ))
+                }
+            })
+        }
+
+        fn get_network_for_assignment(
+            &self,
+            _sandbox_id: klights_node_store::SandboxKey,
+            _pod: klights_types::PodIdentity,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Option<klights_node_store::PodNetworkEndpoint>,
+        > {
+            Box::pin(async move {
+                if self.sandbox_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.bus.publish_assignment(&self.key);
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        klights_node_store::PodNetworkEndpoint::try_new(
+                            "10.42.0.101",
+                            "veth-gap",
+                            "/run/netns/gap",
+                        )
+                        .unwrap(),
+                    ))
+                }
+            })
+        }
+
+        fn delete_network_for_sandbox(
+            &self,
+            _sandbox_id: klights_node_store::SandboxKey,
+        ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
+            Box::pin(async { unreachable!("read-only consumer") })
+        }
+
+        fn delete_network_if_matches(
+            &self,
+            _request: klights_node_store::PodNetworkAllocationRequest,
+        ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
+            Box::pin(async { unreachable!("read-only consumer") })
+        }
+
+        fn list_network_assignments(
+            &self,
+        ) -> klights_node_store::CacheNetworkFuture<
+            '_,
+            Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
+        > {
+            Box::pin(async { unreachable!("read-only consumer") })
+        }
+    }
+
+    let key =
+        PodNetworkAssignmentKey::try_new("sandbox-gap", "default", "pod-gap", "uid-gap").unwrap();
+    let bus = super::test_assignment_bus();
+    let cache = std::sync::Arc::new(PublishInsideLookupCache {
+        bus: bus.clone(),
+        key,
+        sandbox_reads: AtomicUsize::new(0),
+    });
+    let service = super::network::PodNetworkService::new(cache.clone(), fixture_supervisor(), bus);
+
+    let assignment = service
+        .read_pod_network_assignment("sandbox-gap", "default", "pod-gap", "uid-gap", false)
+        .await
+        .unwrap();
+
+    assert_eq!(assignment.pod_ip, "10.42.0.101");
+    assert_eq!(cache.sandbox_reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     use super::PodNetworkReader;
-    use crate::networking::pod_network_events::{PodNetworkEvents, PodNetworkKey};
+    use crate::networking::pod_network_events::PodNetworkAssignmentBus;
+    use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
     let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let events = PodNetworkEvents::new();
+    let events = std::sync::Arc::new(PodNetworkAssignmentBus::new());
+    let mut registered = events.registration_observer_for_test();
     let repo = std::sync::Arc::new(super::PodRepository::new_with_network_events(
-        db,
+        db.clone(),
         supervisor,
         side_effects,
         metrics,
+        super::test_pod_network_cache(db),
         events.clone(),
         super::api::PodSchedulingMode::InlineSingleNode,
         None,
     ));
 
-    let key = PodNetworkKey::new(
+    let key = PodNetworkAssignmentKey::try_new(
         "sandbox-net-backlogged",
         "default",
         "p-net-backlogged",
         "uid-backlogged",
-    );
+    )
+    .unwrap();
     let repo_clone = repo.clone();
     let read_handle = tokio::spawn(async move {
         repo_clone
@@ -6678,7 +6907,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
             .await
     });
 
-    wait_for_pod_network_subscriber(&events, &key).await;
+    registered.changed().await.unwrap();
     // Full conformance can queue DB work around RunPodSandbox; the reader must
     // stay parked on the event rather than burning retry sleeps.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -6692,7 +6921,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     )
     .await
     .unwrap();
-    events.publish_assignment(&key).await;
+    events.publish_assignment(&key);
 
     let assignment = read_handle.await.unwrap().unwrap();
     assert_eq!(assignment.pod_ip, "10.42.0.100");
@@ -6721,22 +6950,6 @@ async fn read_pod_network_assignment_exhausts_retries_returns_error() {
     assert!(
         msg.contains("nonexistent-sandbox") && msg.contains("timed out"),
         "expected assignment wait timeout message, got {msg:?}"
-    );
-}
-
-async fn wait_for_pod_network_subscriber(
-    events: &crate::networking::pod_network_events::PodNetworkEvents,
-    key: &crate::networking::pod_network_events::PodNetworkKey,
-) {
-    for _ in 0..100 {
-        if events.has_subscriber_for_test(key).await {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        events.has_subscriber_for_test(key).await,
-        "reader must subscribe before waiting for CNI assignment"
     );
 }
 

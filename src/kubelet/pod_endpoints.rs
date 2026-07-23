@@ -147,7 +147,8 @@ mod tests {
 
     #[test]
     fn no_kubelet_production_caller_of_reconcile_endpoints_for_pod() {
-        // R4: invariant now enforced by check_kubelet_invariants.sh + check_networking_invariants.sh
+        // R4: invariant now enforced by check_kubelet_invariants.sh plus the
+        // pytest-owned networking source guard.
     }
 
     #[tokio::test]

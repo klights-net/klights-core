@@ -1,7 +1,6 @@
 //! `PodNetworkService` — read-side only wrapper around the CRI/CNI-assigned
-//! pod IP. Holds `DatastoreHandle` (strictly to call `db.get_pod_network(...)`,
-//! a non-Pod-kind table read) and `Arc<TaskSupervisor>` (for the bounded
-//! event wait that covers the RunPodSandbox/row-visibility race).
+//! pod IP. Holds only the focused node cache and assignment waiter plus the
+//! app-owned supervisor for the bounded RunPodSandbox/row-visibility wait.
 //!
 //! Does NOT call `cni_add` / `cni_del`. Teardown stays in
 //! `src/networking/cni.rs` because that single call preserves the
@@ -12,10 +11,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_manager::get_cached_host_ip;
 use crate::kubelet::pod_startup_error::PodStartupErrorKind;
-use crate::networking::pod_network_events::{PodNetworkEvents, PodNetworkKey};
+use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentWaiter};
+use klights_node_store::{PodNetworkCache, SandboxKey};
 use klights_supervisor::TaskSupervisor;
 
 use super::types::PodNetworkAssignment;
@@ -25,21 +24,21 @@ use super::types::PodNetworkAssignment;
 const ASSIGNMENT_WAIT: Duration = Duration::from_secs(30);
 
 pub(super) struct PodNetworkService {
-    db: DatastoreHandle,
+    cache: Arc<dyn PodNetworkCache>,
     supervisor: Arc<TaskSupervisor>,
-    network_events: PodNetworkEvents,
+    assignment_waiter: Arc<dyn PodNetworkAssignmentWaiter>,
 }
 
 impl PodNetworkService {
     pub(super) fn new(
-        db: DatastoreHandle,
+        cache: Arc<dyn PodNetworkCache>,
         supervisor: Arc<TaskSupervisor>,
-        network_events: PodNetworkEvents,
+        assignment_waiter: Arc<dyn PodNetworkAssignmentWaiter>,
     ) -> Self {
         Self {
-            db,
+            cache,
             supervisor,
-            network_events,
+            assignment_waiter,
         }
     }
 
@@ -68,32 +67,40 @@ impl PodNetworkService {
             });
         }
 
-        let key = PodNetworkKey::new(sandbox_id, namespace, pod_name, pod_uid);
-        let notify = self.network_events.subscribe(&key).await;
+        let key = PodNetworkAssignmentKey::try_new(sandbox_id, namespace, pod_name, pod_uid)
+            .map_err(anyhow::Error::new)?;
+        let mut subscription = self
+            .assignment_waiter
+            .subscribe(key)
+            .map_err(anyhow::Error::new)?;
 
         if let Some(assignment) = self
             .lookup_assignment(sandbox_id, namespace, pod_name, pod_uid, &host_ip)
             .await?
         {
-            self.network_events.remove(&key).await;
             return Ok(assignment);
         }
-        let timed_out = self
+        let wait_result = self
             .supervisor
             .timeout(
                 "pod_network_assignment_wait",
                 ASSIGNMENT_WAIT,
-                notify.notified(),
+                subscription.wait(),
             )
-            .await?
-            .is_err();
-        if timed_out {
-            self.network_events.remove(&key).await;
-            return Err(anyhow::Error::new(PodStartupErrorKind::NetworkAssignmentTimedOut).context(
-                format!(
-                    "pod network assignment wait timed out for sandbox {sandbox_id} or pod {namespace}/{pod_name} uid {pod_uid}"
-                ),
-            ));
+            .await?;
+        match wait_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "pod network assignment bus closed for sandbox {sandbox_id} or pod {namespace}/{pod_name} uid {pod_uid}"
+                )));
+            }
+            Err(_) => {
+                return Err(anyhow::Error::new(PodStartupErrorKind::NetworkAssignmentTimedOut)
+                    .context(format!(
+                        "pod network assignment wait timed out for sandbox {sandbox_id} or pod {namespace}/{pod_name} uid {pod_uid}"
+                    )));
+            }
         }
 
         let assignment = self
@@ -104,7 +111,6 @@ impl PodNetworkService {
                     "pod network assignment notification arrived without row for sandbox {sandbox_id} or pod {namespace}/{pod_name} uid {pod_uid}"
                 )
             })?;
-        self.network_events.remove(&key).await;
         Ok(assignment)
     }
 
@@ -116,22 +122,20 @@ impl PodNetworkService {
         pod_uid: &str,
         host_ip: &str,
     ) -> Result<Option<PodNetworkAssignment>> {
-        if let Some(row) = self.db.get_pod_network(sandbox_id).await? {
-            return Ok(Some(PodNetworkAssignment {
-                pod_ip: row.ip_addr,
-                host_ip: host_ip.to_string(),
-            }));
-        }
-        if pod_uid.is_empty() {
-            return Ok(None);
-        }
+        let pod = klights_types::PodIdentity::new(namespace, pod_name, pod_uid);
         if let Some(row) = self
-            .db
-            .get_pod_network_for_pod(namespace, pod_name, pod_uid)
+            .cache
+            .get_network_for_assignment(SandboxKey::try_new(sandbox_id)?, pod.clone())
             .await?
         {
             return Ok(Some(PodNetworkAssignment {
-                pod_ip: row.ip_addr,
+                pod_ip: row.ip_addr().to_string(),
+                host_ip: host_ip.to_string(),
+            }));
+        }
+        if let Some(row) = self.cache.get_network_for_pod(pod).await? {
+            return Ok(Some(PodNetworkAssignment {
+                pod_ip: row.ip_addr().to_string(),
                 host_ip: host_ip.to_string(),
             }));
         }

@@ -10,8 +10,9 @@ use crate::datastore::{
 use klights_types::PodIdentity;
 
 use super::{
-    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow,
-    PodStatusCheckpoint, ProbeStateRow, ReplicationCheckpoint, SqliteNodeLocalDb,
+    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
+    PodNetworkAssignmentRow, PodNetworkReservationError, PodRuntimeRow, PodStatusCheckpoint,
+    ProbeStateRow, ReplicationCheckpoint, SqliteNodeLocalDb,
 };
 
 #[async_trait]
@@ -131,11 +132,32 @@ pub trait NodeLocalBackend: Send + Sync {
         &self,
         request: PodNetworkAllocationRequest<'_>,
     ) -> Result<(String, u32)>;
+    async fn reserve_network_assignment(
+        &self,
+        request: PodNetworkAllocationRequest<'_>,
+    ) -> std::result::Result<(String, u32), PodNetworkReservationError>;
+    async fn get_network_assignment_for_uid(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<PodNetworkAssignmentRow>>;
+    async fn get_network_assignment_for_pod(
+        &self,
+        pod: PodIdentity,
+    ) -> Result<Option<PodNetworkAssignmentRow>>;
+    async fn get_network_assignment_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<PodNetworkAssignmentRow>>;
+    async fn delete_network_assignment_if_matches(
+        &self,
+        request: PodNetworkAllocationRequest<'_>,
+    ) -> Result<bool>;
     async fn get_network_for_uid(&self, pod_uid: &str) -> Result<Option<PodNetworkEndpoint>>;
     async fn get_network_for_sandbox(&self, sandbox_id: &str)
     -> Result<Option<PodNetworkEndpoint>>;
     async fn delete_network_for_sandbox(&self, sandbox_id: &str) -> Result<()>;
     async fn list_networks(&self) -> Result<Vec<String>>;
+    async fn list_network_assignments(&self) -> Result<Vec<PodNetworkAssignmentRow>>;
 
     async fn upsert_endpoint(&self, row: PodEndpointRow) -> Result<()>;
     async fn delete_endpoint_for_uid(&self, pod_uid: &str) -> Result<()>;
@@ -436,6 +458,41 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         SqliteNodeLocalDb::reserve_ip_and_insert_network(self, request).await
     }
 
+    async fn reserve_network_assignment(
+        &self,
+        request: PodNetworkAllocationRequest<'_>,
+    ) -> std::result::Result<(String, u32), PodNetworkReservationError> {
+        SqliteNodeLocalDb::reserve_network_assignment(self, request).await
+    }
+
+    async fn get_network_assignment_for_uid(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<PodNetworkAssignmentRow>> {
+        SqliteNodeLocalDb::get_network_assignment_for_uid(self, pod_uid).await
+    }
+
+    async fn get_network_assignment_for_pod(
+        &self,
+        pod: PodIdentity,
+    ) -> Result<Option<PodNetworkAssignmentRow>> {
+        SqliteNodeLocalDb::get_network_assignment_for_pod(self, pod).await
+    }
+
+    async fn get_network_assignment_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<PodNetworkAssignmentRow>> {
+        SqliteNodeLocalDb::get_network_assignment_for_sandbox(self, sandbox_id).await
+    }
+
+    async fn delete_network_assignment_if_matches(
+        &self,
+        request: PodNetworkAllocationRequest<'_>,
+    ) -> Result<bool> {
+        SqliteNodeLocalDb::delete_network_assignment_if_matches(self, request).await
+    }
+
     async fn get_network_for_uid(&self, pod_uid: &str) -> Result<Option<PodNetworkEndpoint>> {
         SqliteNodeLocalDb::get_network_for_uid(self, pod_uid).await
     }
@@ -453,6 +510,10 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
 
     async fn list_networks(&self) -> Result<Vec<String>> {
         SqliteNodeLocalDb::list_networks(self).await
+    }
+
+    async fn list_network_assignments(&self) -> Result<Vec<PodNetworkAssignmentRow>> {
+        SqliteNodeLocalDb::list_network_assignments(self).await
     }
 
     async fn upsert_endpoint(&self, row: PodEndpointRow) -> Result<()> {

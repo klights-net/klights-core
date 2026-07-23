@@ -111,6 +111,8 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
             namespace  TEXT NOT NULL,
             pod_name   TEXT NOT NULL,
             pod_uid    TEXT NOT NULL,
+            subnet_base_int INTEGER NOT NULL DEFAULT 0,
+            subnet_size INTEGER NOT NULL DEFAULT 0,
             ip_addr    TEXT NOT NULL,
             ip_int     INTEGER NOT NULL UNIQUE,
             veth_host  TEXT NOT NULL,
@@ -225,7 +227,29 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
     migrate_outbox_operation_classification(conn)?;
     migrate_outbox_dead_letter_stream_fields(conn)?;
     repair_legacy_outbox_stream_identity(conn)?;
+    migrate_pod_network_identity_fields(conn)?;
     migrate_pod_endpoint_encrypted_direct_mode(conn)
+}
+
+fn migrate_pod_network_identity_fields(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(pod_networks)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+    };
+    if !columns.contains("subnet_base_int") {
+        conn.execute(
+            "ALTER TABLE pod_networks ADD COLUMN subnet_base_int INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.contains("subnet_size") {
+        conn.execute(
+            "ALTER TABLE pod_networks ADD COLUMN subnet_size INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn repair_legacy_outbox_stream_identity(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {

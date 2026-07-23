@@ -6,8 +6,10 @@ mod runtime_work;
 
 pub use cache_network::{
     CacheNetworkError, CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey,
-    PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodIpamStore, PodNetworkAllocation,
-    PodNetworkAllocationRequest, PodNetworkCache, PodNetworkEndpoint, PodUidKey, SandboxKey,
+    PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodEndpointStoreEvent,
+    PodEndpointStoreEventSource, PodEndpointStoreEventStream, PodEndpointStoreEventSubscription,
+    PodIpamStore, PodNetworkAllocation, PodNetworkAllocationRequest, PodNetworkAssignmentSnapshot,
+    PodNetworkCache, PodNetworkEndpoint, PodUidKey, SandboxKey,
 };
 
 pub use delivery::{

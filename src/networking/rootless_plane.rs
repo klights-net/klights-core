@@ -13,24 +13,22 @@
 
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
-use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
-use crate::datastore::NodeSubnet;
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::networking::dataplane_health::DataplaneHealth;
-use crate::networking::{BridgeName, NodeName};
+use crate::networking::{BridgeName, NodeName, PodSubnet};
 
 pub struct RootlessNetworkPlane {
-    /// Shared datastore handle for any future rootless reconciler that needs
-    /// it. Phase 2 grows hostport range publication and peer-state queries off
-    /// this handle.
-    node_local: NodeLocalHandle,
+    pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pod_ipam: Arc<dyn klights_node_store::PodIpamStore>,
+    pod_runtime: Arc<dyn klights_node_store::PodRuntimeStore>,
+    assignment_publisher: Arc<dyn klights_network_api::PodNetworkAssignmentPublisher>,
+    sandbox_operations: crate::networking::cni::SandboxOperationLocks,
     rt: rtnetlink::Handle,
     _rt_conn: klights_supervisor::SupervisedJoinHandle<()>,
     /// Resolved local pod subnet allocated through the same IPAM path that
     /// root mode uses, so cluster-wide /24 layout matches across modes.
-    local_subnet: NodeSubnet,
+    local_subnet: PodSubnet,
     bridge: BridgeName,
     pod_link_mtu: u32,
     bridge_idx: OnceLock<u32>,
@@ -49,29 +47,23 @@ impl RootlessNetworkPlane {
     /// host-network mutation. The bridge is created
     /// lazily on the first non-hostNetwork CNI ADD so unit tests and idle
     /// rootless starts do not require netlink mutations until pods need them.
-    pub(crate) async fn boot<S>(
-        cfg: &crate::KlightsConfig,
-        stores: crate::networking::boot::NetworkBootStores<'_, S>,
-        node_ip: &str,
+    pub(crate) async fn boot(
+        cfg: &crate::networking::NetworkBootConfig,
+        stores: crate::networking::boot::NetworkBootStores,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Result<Arc<Self>>
-    where
-        S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
-    {
+    ) -> Result<Arc<Self>> {
         let crate::networking::boot::NetworkBootStores {
-            cluster_api,
-            node_subnet_store,
-            node_local,
+            subnet_allocation,
+            topology,
+            pod_network_cache,
+            pod_ipam,
+            pod_runtime,
+            assignment_publisher,
         } = stores;
-        let bridge = BridgeName::parse(&cfg.bridge_name)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("invalid rootless bridge name {}", cfg.bridge_name))?;
-        let my_node = NodeName::parse(&cfg.node_name)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("invalid rootless node name {}", cfg.node_name))?;
-        let host_ip = Ipv4Addr::from_str(node_ip)
-            .with_context(|| format!("invalid rootless node ip {}", node_ip))?;
+        let bridge = cfg.bridge().clone();
+        let my_node = cfg.node().clone();
+        let host_ip = cfg.host_ip();
         let (conn, handle, _) = rtnetlink::new_connection()
             .context("failed to open rtnetlink for rootless network plane")?;
         let rt_cancel = cancel.clone();
@@ -89,39 +81,44 @@ impl RootlessNetworkPlane {
             .await
             .context("failed to spawn rootless network plane rtnetlink connection task")?;
         let local_subnet = crate::networking::subnet_allocator::NodeSubnetAllocator::new(
-            cluster_api,
+            subnet_allocation,
+            topology,
             task_supervisor.clone(),
         )
         .allocate_or_reuse_existing(
-            node_subnet_store,
-            &cfg.node_name,
-            &cfg.cluster_cidr,
-            node_ip,
+            cfg.node().as_ref(),
+            &cfg.cluster_cidr().to_string(),
+            &cfg.host_ip().to_string(),
         )
         .await
         .with_context(|| {
             format!(
                 "failed to allocate local rootless node subnet for {} at {}",
-                cfg.node_name, node_ip
+                cfg.node(),
+                cfg.host_ip()
             )
         })?;
         let plane = Arc::new(Self {
-            node_local,
+            pod_network_cache,
+            pod_ipam,
+            pod_runtime,
+            assignment_publisher,
+            sandbox_operations: crate::networking::cni::SandboxOperationLocks::default(),
             rt: handle,
             _rt_conn: rt_conn,
             local_subnet,
             bridge,
-            pod_link_mtu: crate::networking::pod_link_mtu_for_encryption(cfg.dataplane_encryption),
+            pod_link_mtu: crate::networking::pod_link_mtu_for_encryption(cfg.encryption()),
             bridge_idx: OnceLock::new(),
             my_node,
             host_ip,
-            wireguard_device: cfg.wireguard_device.clone(),
+            wireguard_device: cfg.wireguard_device().to_string(),
             wireguard_idx: OnceLock::new(),
             wireguard: OnceLock::new(),
             health: DataplaneHealth::new_healthy(),
             task_supervisor: task_supervisor.clone(),
         });
-        if cfg.dataplane_encryption == crate::networking::wireguard::DataplaneEncryption::Enabled
+        if cfg.encryption() == crate::networking::wireguard::DataplaneEncryption::Enabled
             && let Err(err) = plane.ensure_wireguard_enabled(cfg, cancel).await
         {
             plane
@@ -136,7 +133,7 @@ impl RootlessNetworkPlane {
     }
 
     /// Local pod subnet record allocated at boot.
-    pub fn local_subnet(&self) -> &NodeSubnet {
+    pub fn local_subnet(&self) -> &PodSubnet {
         &self.local_subnet
     }
 
@@ -199,8 +196,8 @@ impl RootlessNetworkPlane {
                 .address()
                 .add(
                     idx,
-                    IpAddr::V4(self.local_subnet.subnet.bridge_ip()),
-                    self.local_subnet.subnet.prefix(),
+                    IpAddr::V4(self.local_subnet.bridge_ip()),
+                    self.local_subnet.prefix(),
                 )
                 .execute()
                 .await,
@@ -288,21 +285,19 @@ impl RootlessNetworkPlane {
 
     async fn ensure_wireguard_enabled(
         &self,
-        cfg: &crate::KlightsConfig,
+        cfg: &crate::networking::NetworkBootConfig,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         self.ensure_wireguard_once().await?;
-        let key_path =
-            crate::paths::etc_dir_path(&cfg.containerd_namespace).join("wireguard-private.key");
         let identity = crate::networking::wireguard::WireGuardIdentity::load_or_create(
-            &key_path,
+            cfg.wireguard_key_path(),
             self.task_supervisor.as_ref(),
         )
         .await?;
         let config = crate::networking::wireguard::WireGuardDeviceConfig::try_new(
             self.wireguard_device.clone(),
             identity.private_key().clone(),
-            cfg.wireguard_port,
+            cfg.wireguard_port(),
         )?;
         let controller = Arc::new(
             crate::networking::wireguard::WireGuardController::open(
@@ -318,7 +313,7 @@ impl RootlessNetworkPlane {
         // host edge. If /proc/net/udp doesn't show the port as bound,
         // other nodes cannot reach this rootless node's encrypted dataplane.
         crate::networking::rootless::pasta::verify_wireguard_udp_port(
-            cfg.wireguard_port,
+            cfg.wireguard_port(),
             self.task_supervisor.as_ref(),
         )
         .await?;
@@ -340,6 +335,7 @@ impl klights_network_api::Datapath for RootlessNetworkPlane {
                     self.host_ip,
                 )));
             }
+            let _sandbox_guard = self.sandbox_operations.acquire(sandbox_id.as_str()).await;
 
             let bridge_idx = self
                 .ensure_bridge_once()
@@ -347,7 +343,10 @@ impl klights_network_api::Datapath for RootlessNetworkPlane {
                 .with_context(|| format!("rootless bridge {} not ready", self.bridge))
                 .map_err(|error| klights_network_api::DatapathError::setup(error.to_string()))?;
             crate::networking::cni::add(crate::networking::cni::CniAddArgs {
-                store: self.node_local.as_ref(),
+                cache: self.pod_network_cache.as_ref(),
+                ipam: self.pod_ipam.as_ref(),
+                runtime: self.pod_runtime.as_ref(),
+                assignment_publisher: self.assignment_publisher.as_ref(),
                 handle: &self.rt,
                 sandbox_id: sandbox_id.as_str(),
                 pod,
@@ -355,7 +354,7 @@ impl klights_network_api::Datapath for RootlessNetworkPlane {
                 bridge_idx,
                 netns_setns_path: netns_setns_path.as_str(),
                 netns_record_path: netns_record_path.as_str(),
-                pod_subnet: &self.local_subnet.subnet,
+                pod_subnet: &self.local_subnet,
                 pod_link_mtu: self.pod_link_mtu,
                 host_network,
                 host_ip: &self.host_ip.to_string(),
@@ -372,9 +371,14 @@ impl klights_network_api::Datapath for RootlessNetworkPlane {
         sandbox_id: &'a klights_network_api::SandboxId,
     ) -> klights_network_api::DatapathFuture<'a, ()> {
         Box::pin(async move {
+            let _sandbox_guard = self.sandbox_operations.acquire(sandbox_id.as_str()).await;
             if self
-                .node_local
-                .get_network_for_sandbox(sandbox_id.as_str())
+                .pod_network_cache
+                .get_network_for_sandbox(
+                    klights_node_store::SandboxKey::try_new(sandbox_id.as_str()).map_err(
+                        |error| klights_network_api::DatapathError::teardown(error.to_string()),
+                    )?,
+                )
                 .await
                 .context("failed to look up rootless pod network allocation")
                 .map_err(|error| klights_network_api::DatapathError::teardown(error.to_string()))?
@@ -393,7 +397,7 @@ impl klights_network_api::Datapath for RootlessNetworkPlane {
                 .with_context(|| format!("rootless bridge {} not ready", self.bridge))
                 .map_err(|error| klights_network_api::DatapathError::teardown(error.to_string()))?;
             crate::networking::cni::del(
-                self.node_local.as_ref(),
+                self.pod_network_cache.as_ref(),
                 &self.rt,
                 sandbox_id.as_str(),
                 bridge_idx,
@@ -408,7 +412,7 @@ impl klights_network_api::Datapath for RootlessNetworkPlane {
     }
 
     fn pod_gateway_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
-        Box::pin(async move { Ok(IpAddr::V4(self.local_subnet.subnet.bridge_ip())) })
+        Box::pin(async move { Ok(IpAddr::V4(self.local_subnet.bridge_ip())) })
     }
 
     fn shutdown(&self) -> klights_network_api::DatapathFuture<'_, ()> {
@@ -448,7 +452,7 @@ impl klights_network_api::PeerRouter for RootlessNetworkPlane {
                                     &self.rt,
                                     idx,
                                     route,
-                                    self.local_subnet.subnet.bridge_ip(),
+                                    self.local_subnet.bridge_ip(),
                                 ))
                             },
                             || {
@@ -456,7 +460,7 @@ impl klights_network_api::PeerRouter for RootlessNetworkPlane {
                                     &self.rt,
                                     idx,
                                     route,
-                                    self.local_subnet.subnet.bridge_ip(),
+                                    self.local_subnet.bridge_ip(),
                                 ))
                             },
                             || Box::pin(controller.remove_peer(route)),
@@ -491,7 +495,7 @@ impl klights_network_api::PeerRouter for RootlessNetworkPlane {
                             &self.rt,
                             idx,
                             route,
-                            self.local_subnet.subnet.bridge_ip(),
+                            self.local_subnet.bridge_ip(),
                         )
                         .await?;
                         if let Some(controller) = self.wireguard.get() {
@@ -517,6 +521,7 @@ impl klights_network_api::PeerRouter for RootlessNetworkPlane {
 mod tests {
     use super::*;
     use crate::bootstrap::config::KlightsConfig;
+    use crate::networking::NetworkBootConfig;
 
     fn rootless_test_config(node_name: &str) -> KlightsConfig {
         let ns = "klights";
@@ -592,18 +597,19 @@ mod tests {
         ))
     }
 
-    struct TestNodeSubnetStore {
-        db: crate::datastore::sqlite::Datastore,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::networking::subnet_allocator::NodeSubnetAllocationStore for TestNodeSubnetStore {
-        async fn get_node_subnet(
-            &self,
-            node_name: &str,
-        ) -> anyhow::Result<Option<crate::datastore::NodeSubnet>> {
-            self.db.get_node_subnet(node_name).await
-        }
+    fn focused_test_config(cfg: &KlightsConfig, node_ip: &str) -> NetworkBootConfig {
+        NetworkBootConfig::try_new(
+            crate::networking::NetworkMode::Rootless,
+            &cfg.bridge_name,
+            &cfg.node_name,
+            &cfg.cluster_cidr,
+            node_ip,
+            cfg.dataplane_encryption,
+            cfg.wireguard_device.clone(),
+            "/tmp/klights-rootless-plane-test.key",
+            cfg.wireguard_port,
+        )
+        .expect("focused rootless test config")
     }
 
     #[tokio::test]
@@ -615,16 +621,26 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let assignment_bus =
+            Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
+        let cluster_api = cluster_api_for_test(db.clone(), &cfg.node_name);
+        let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
+            cluster_api.clone();
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+        let focused = focused_test_config(&cfg, "192.168.1.5");
         let plane = RootlessNetworkPlane::boot(
-            &cfg,
+            &focused,
             crate::networking::boot::NetworkBootStores::new(
-                cluster_api_for_test(db.clone(), &cfg.node_name),
-                &node_subnet_store,
-                node_local,
+                subnet_allocation,
+                topology,
+                node_network.clone(),
+                node_network.clone(),
+                node_network,
+                assignment_bus,
             ),
-            "192.168.1.5",
             cancel,
             supervisor,
         )
@@ -637,7 +653,7 @@ mod tests {
             .await
             .expect("get_node_subnet must succeed")
             .expect("rootless boot must record a node_subnets row");
-        assert_eq!(plane.local_subnet().subnet, row.subnet);
+        assert_eq!(*plane.local_subnet(), row.subnet);
 
         assert_eq!(row.node_name.as_str(), cfg.node_name);
     }
@@ -652,16 +668,26 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let assignment_bus =
+            Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
+        let cluster_api = cluster_api_for_test(db.clone(), &cfg.node_name);
+        let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
+            cluster_api.clone();
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+        let focused = focused_test_config(&cfg, "192.168.77.9");
         let plane = RootlessNetworkPlane::boot(
-            &cfg,
+            &focused,
             crate::networking::boot::NetworkBootStores::new(
-                cluster_api_for_test(db.clone(), &cfg.node_name),
-                &node_subnet_store,
-                node_local,
+                subnet_allocation,
+                topology,
+                node_network.clone(),
+                node_network.clone(),
+                node_network,
+                assignment_bus,
             ),
-            "192.168.77.9",
             cancel,
             supervisor,
         )
@@ -709,16 +735,26 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
+        let node_network =
+            crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(node_local);
+        let assignment_bus =
+            Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new());
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
+        let cluster_api = cluster_api_for_test(db.clone(), &cfg.node_name);
+        let subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation> =
+            cluster_api.clone();
+        let topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery> = cluster_api;
+        let focused = focused_test_config(&cfg, "192.168.1.5");
         let plane = RootlessNetworkPlane::boot(
-            &cfg,
+            &focused,
             crate::networking::boot::NetworkBootStores::new(
-                cluster_api_for_test(db.clone(), &cfg.node_name),
-                &node_subnet_store,
-                node_local,
+                subnet_allocation,
+                topology,
+                node_network.clone(),
+                node_network.clone(),
+                node_network,
+                assignment_bus,
             ),
-            "192.168.1.5",
             cancel,
             supervisor,
         )
