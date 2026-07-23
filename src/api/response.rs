@@ -9,53 +9,11 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-const JSON_MEDIA_TYPE: &str = "application/json";
-const PROTOBUF_MEDIA_TYPE: &str = "application/vnd.kubernetes.protobuf";
+use klights_kube_protobuf::{AcceptValue, ResponseFormat};
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum UnaryResponseFormat {
-    Json,
-    Protobuf,
-}
-
-/// A parsed Accept media range, representation-independent.
-///
-/// Each server-supported representation derives its effective quality from
-/// its most-specific matching range, so a wildcard is evaluated for every
-/// representation rather than being encoded as a JSON-specific candidate.
-#[derive(Clone, Copy)]
-struct AcceptRange {
-    media: AcceptMedia,
-    q: u16,
-    order: usize,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AcceptMedia {
-    /// `application/json`
-    ExactJson,
-    /// `application/vnd.kubernetes.protobuf`
-    ExactProtobuf,
-    /// `application/*`
-    ApplicationWildcard,
-    /// `*/*`
-    Any,
-}
-
-impl AcceptMedia {
-    /// Specificity with which this range matches the given representation, or
-    /// `None` when it does not match. Exact media type beats `application/*`
-    /// beats `*/*`.
-    fn specificity_for(self, format: UnaryResponseFormat) -> Option<u8> {
-        match (self, format) {
-            (AcceptMedia::ExactJson, UnaryResponseFormat::Json) => Some(2),
-            (AcceptMedia::ExactProtobuf, UnaryResponseFormat::Protobuf) => Some(2),
-            (AcceptMedia::ApplicationWildcard, _) => Some(1),
-            (AcceptMedia::Any, _) => Some(0),
-            _ => None,
-        }
-    }
-}
+#[cfg(test)]
+const PROTOBUF_MEDIA_TYPE: &str = klights_kube_protobuf::PROTOBUF_MEDIA_TYPE;
+type UnaryResponseFormat = ResponseFormat;
 
 pub fn prefers_protobuf(headers: &HeaderMap) -> bool {
     negotiate_unary_response_format(headers, true)
@@ -78,155 +36,15 @@ fn negotiate_unary_response_format(
     headers: &HeaderMap,
     protobuf_supported: bool,
 ) -> Result<UnaryResponseFormat, String> {
-    let mut ranges: Vec<AcceptRange> = Vec::new();
-    let mut order = 0usize;
-    let mut saw_accept = false;
-    for accept in headers.get_all("accept") {
-        let Ok(accept) = accept.to_str() else {
-            continue;
-        };
-        for raw_part in accept.split(',') {
-            let part = raw_part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            saw_accept = true;
-            if let Some(range) = parse_unary_accept_part(part, order) {
-                ranges.push(range);
-            }
-            order += 1;
-        }
-    }
-
-    // For each server-supported representation, derive the effective quality
-    // from its most-specific matching range. A representation whose
-    // controlling quality is zero (an explicit exclusion) is removed; that
-    // exclusion overrides a less-specific wildcard for this representation
-    // while leaving the other representation acceptable.
-    let supported_formats = [UnaryResponseFormat::Json]
-        .into_iter()
-        .chain(protobuf_supported.then_some(UnaryResponseFormat::Protobuf));
-    let mut candidates: Vec<(u16, usize, u8, UnaryResponseFormat)> = Vec::new();
-    for format in supported_formats {
-        let Some((q, controlling_order)) = effective_quality(format, &ranges) else {
-            continue;
-        };
-        if q == 0 {
-            continue;
-        }
-        // Server preference is the final tie-break only: JSON (0) before
-        // protobuf (1).
-        let preference = match format {
-            UnaryResponseFormat::Json => 0,
-            UnaryResponseFormat::Protobuf => 1,
-        };
-        candidates.push((q, controlling_order, preference, format));
-    }
-
-    if candidates.is_empty() {
-        return if saw_accept {
-            Err("no acceptable response media type is supported".to_string())
-        } else {
-            Ok(UnaryResponseFormat::Json)
-        };
-    }
-    // Choose by highest quality, then earliest client order, then server
-    // preference (lower is preferred).
-    candidates
-        .sort_by_key(|(q, order, preference, _)| (std::cmp::Reverse(*q), *order, *preference));
-    Ok(candidates[0].3)
-}
-
-/// Compute the effective `(quality, order)` for a representation from its
-/// controlling range: the most-specific matching range, tie-broken by higher
-/// quality then earlier client order.
-fn effective_quality(format: UnaryResponseFormat, ranges: &[AcceptRange]) -> Option<(u16, usize)> {
-    let mut best: Option<(u8, u16, std::cmp::Reverse<usize>)> = None;
-    for range in ranges {
-        let Some(specificity) = range.media.specificity_for(format) else {
-            continue;
-        };
-        let candidate = (specificity, range.q, std::cmp::Reverse(range.order));
-        match best {
-            None => best = Some(candidate),
-            Some(current) if candidate > current => best = Some(candidate),
-            _ => {}
-        }
-    }
-    best.map(|(_, q, std::cmp::Reverse(order))| (q, order))
-}
-
-fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptRange> {
-    let mut segments = part.split(';');
-    let media_type = segments.next()?.trim().to_ascii_lowercase();
-    let mut q = 1000u16;
-    let mut well_formed_params = true;
-
-    for segment in segments {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        // A parameter without `=` is a malformed range; reject the whole range
-        // rather than silently tolerating or excluding it.
-        let Some((name, value)) = segment.split_once('=') else {
-            well_formed_params = false;
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("q") {
-            q = parse_accept_q(value.trim());
-        }
-    }
-    if !well_formed_params {
-        return None;
-    }
-
-    // Do NOT discard q=0: it is an explicit exclusion that may override a
-    // less-specific wildcard for one representation. Do NOT map application/*
-    // or */* to JSON: a wildcard must be evaluated for every representation.
-    let media = match media_type.as_str() {
-        PROTOBUF_MEDIA_TYPE => AcceptMedia::ExactProtobuf,
-        JSON_MEDIA_TYPE => AcceptMedia::ExactJson,
-        "application/*" => AcceptMedia::ApplicationWildcard,
-        "*/*" => AcceptMedia::Any,
-        _ => return None,
-    };
-
-    Some(AcceptRange { media, q, order })
-}
-
-fn parse_accept_q(value: &str) -> u16 {
-    let value = value.trim_matches('"').trim();
-    if value == "1" {
-        return 1000;
-    }
-    if let Some(fraction) = value.strip_prefix("1.") {
-        return if fraction.len() <= 3 && fraction.bytes().all(|byte| byte == b'0') {
-            1000
-        } else {
-            0
-        };
-    }
-    if value == "0" {
-        return 0;
-    }
-    let Some(fraction) = value.strip_prefix("0.") else {
-        return 0;
-    };
-
-    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-        return 0;
-    }
-    let mut q = 0u16;
-    for (idx, byte) in fraction.bytes().enumerate() {
-        let place = match idx {
-            0 => 100,
-            1 => 10,
-            _ => 1,
-        };
-        q += u16::from(byte - b'0') * place;
-    }
-    q
+    klights_kube_protobuf::negotiate_unary_response(
+        headers.get_all("accept").into_iter().map(|value| {
+            value
+                .to_str()
+                .map_or(AcceptValue::Invalid, AcceptValue::Text)
+        }),
+        protobuf_supported,
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub fn wants_table_format(headers: &HeaderMap) -> Result<bool, AppError> {

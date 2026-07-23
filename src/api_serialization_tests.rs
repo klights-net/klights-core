@@ -406,7 +406,7 @@ fn json_to_protobuf_bytes(value: &Value) -> anyhow::Result<Vec<u8>> {
 fn decode_resource(bytes: &[u8], format: &str) -> anyhow::Result<Value> {
     match format {
         "json" => Ok(serde_json::from_slice(bytes)?),
-        "protobuf" => crate::protobuf::decode_protobuf(bytes),
+        "protobuf" => Ok(crate::protobuf::decode_protobuf(bytes)?),
         _ => anyhow::bail!("Unknown format: {}", format),
     }
 }

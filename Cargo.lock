@@ -2150,8 +2150,17 @@ dependencies = [
 name = "klights-kube-protobuf"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "k8s-openapi",
  "k8s-pb",
+ "klights-cluster-core",
  "prost",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
 ]
 
 [[package]]

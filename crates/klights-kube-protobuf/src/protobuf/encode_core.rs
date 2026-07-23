@@ -16,45 +16,51 @@ where
 /// Encode JSON resource to protobuf bytes for a specific kind.
 /// Converts JSON → k8s-openapi type → k8s-pb type → protobuf bytes.
 /// Returns protobuf-encoded bytes (NOT wrapped in Unknown envelope).
-pub(crate) fn encode_protobuf_resource(kind: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
+pub fn encode_protobuf_resource(kind: &str, value: &Value) -> Result<Vec<u8>, crate::CodecError> {
     let api_version = value
         .get("apiVersion")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let registry = global_oo_registry();
     if !registry.handles(api_version, kind) {
-        anyhow::bail!("Unknown kind for protobuf encoding: {api_version}/{kind}");
+        return Err(crate::CodecError::UnsupportedResource {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+        });
     }
     // Tolerate null/missing condition `lastTransitionTime` (Go metav1.Time{}
     // zero value) for both single resources and list items so valid K8s
     // condition shapes do not yield HTTP 500 on protobuf responses. No clone
     // when nothing needs sanitizing.
     let value = sanitize_conditions_for_encode(value);
-    registry.encode(api_version, kind, &value)
+    registry
+        .encode(api_version, kind, &value)
+        .map_err(crate::CodecError::encode)
 }
 
-pub(crate) fn supports_protobuf_resource(api_version: &str, kind: &str) -> bool {
+pub fn supports_protobuf_resource(api_version: &str, kind: &str) -> bool {
     global_oo_registry().handles(api_version, kind)
 }
 
-pub(crate) fn supports_raw_json_protobuf_resource(api_version: &str, kind: &str) -> bool {
+pub fn supports_raw_json_protobuf_resource(api_version: &str, kind: &str) -> bool {
     global_oo_registry().handles_raw_json_encoding(api_version, kind)
 }
 
-#[cfg(test)]
-pub(crate) fn encode_protobuf_resource_from_json_bytes(
+pub fn encode_protobuf_resource_from_json_bytes(
     api_version: &str,
     kind: &str,
     data: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    global_oo_registry().encode_json_slice(api_version, kind, data)
+) -> Result<Vec<u8>, crate::CodecError> {
+    global_oo_registry()
+        .encode_json_slice(api_version, kind, data)
+        .map_err(crate::CodecError::encode)
 }
 
-pub(crate) fn wrap_protobuf_resource_envelope(
+pub fn wrap_protobuf_resource_envelope(
     api_version: &str,
     kind: &str,
     raw: Vec<u8>,
-) -> anyhow::Result<Vec<u8>> {
+) -> Result<Vec<u8>, crate::CodecError> {
     use prost::Message;
 
     let unknown = Unknown {
@@ -70,7 +76,9 @@ pub(crate) fn wrap_protobuf_resource_envelope(
     let body_len = unknown.encoded_len();
     let mut buf = Vec::with_capacity(4 + body_len);
     buf.extend_from_slice(&[0x6b, 0x38, 0x73, 0x00]);
-    unknown.encode(&mut buf)?;
+    unknown
+        .encode(&mut buf)
+        .map_err(crate::CodecError::framing)?;
     Ok(buf)
 }
 
@@ -83,18 +91,18 @@ pub fn normalize_event_microtime_fields(value: &mut Value) {
 ///
 /// All resource types (including lists) are wrapped in an Unknown envelope with the "k8s\0" magic
 /// prefix. This is the K8s protobuf wire format expected by the Go client for all response types.
-pub fn encode_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
+pub fn encode_protobuf(value: &Value) -> Result<Vec<u8>, crate::CodecError> {
     // Extract apiVersion and kind from JSON
     let api_version = value
         .get("apiVersion")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing apiVersion in JSON"))?
+        .ok_or(crate::CodecError::MissingApiVersion)?
         .to_string();
 
     let kind = value
         .get("kind")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing kind in JSON"))?
+        .ok_or(crate::CodecError::MissingKind)?
         .to_string();
 
     // Encode to a concrete protobuf type. If unsupported, return an error so the
@@ -117,7 +125,7 @@ pub fn encode_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
 /// Encode a `metav1.Status` JSON Value into its protobuf wire bytes (the inner
 /// `raw` of the Unknown envelope). Used for error responses negotiated to
 /// `application/vnd.kubernetes.protobuf`.
-pub(crate) fn encode_status_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
+pub fn encode_status_protobuf(value: &Value) -> Result<Vec<u8>, crate::CodecError> {
     use k8s_pb::apimachinery::pkg::apis::meta::v1 as metav1;
     use prost::Message;
 

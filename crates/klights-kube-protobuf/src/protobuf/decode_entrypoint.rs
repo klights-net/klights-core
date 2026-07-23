@@ -246,7 +246,11 @@ pub struct TypeMeta {
     pub kind: String,
 }
 
-pub fn decode_protobuf(data: &[u8]) -> anyhow::Result<Value> {
+pub fn decode_protobuf(data: &[u8]) -> Result<Value, crate::CodecError> {
+    decode_protobuf_inner(data).map_err(crate::CodecError::decode)
+}
+
+fn decode_protobuf_inner(data: &[u8]) -> anyhow::Result<Value> {
     use prost::Message;
 
     // Check if data starts with "k8s\0" magic prefix (Unknown envelope)

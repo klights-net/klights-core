@@ -19,14 +19,12 @@ use crate::watch::{RawSignalWatchCursor, WatchCursorError, WatchDeliveryScope};
 use crate::watch::{event_key as watch_event_key, resource_key as resource_to_seen_key};
 use axum::body::Body;
 use axum::http::HeaderMap;
-use k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent as PbWatchEvent;
-use k8s_pb::apimachinery::pkg::runtime::RawExtension;
+use klights_kube_protobuf::{AcceptValue, ResponseFormat};
 #[cfg(test)]
 use klights_types::LabelSelector;
 #[cfg(test)]
 use klights_watch::WatchSignalReceiver;
 use klights_watch::WatchTopic;
-use prost::Message;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,183 +51,23 @@ impl WatchStreamFormat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AcceptedWatchMedia {
-    Json,
-    Protobuf,
-    ApplicationWildcard,
-    Any,
-    Unsupported,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AcceptedWatchFormat {
-    media: AcceptedWatchMedia,
-    quality_millis: u16,
-    order: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CandidateWatchFormat {
-    format: WatchStreamFormat,
-    quality_millis: u16,
-    order: usize,
-    preference: usize,
-}
-
 pub fn negotiate_watch_stream_format(
     headers: &HeaderMap,
     protobuf_supported: bool,
 ) -> Result<WatchStreamFormat, AppError> {
-    if headers.get("accept").is_none() {
-        return Ok(WatchStreamFormat::Json);
-    }
-    let mut accepted = Vec::new();
-    let mut order = 0usize;
-    for accept in headers.get_all("accept") {
-        let Ok(accept) = accept.to_str() else {
-            continue;
-        };
-        for part in accept.split(',') {
-            let mut segments = part.split(';').map(str::trim);
-            let media = segments.next().unwrap_or_default().to_ascii_lowercase();
-            if media.is_empty() {
-                continue;
-            }
-            let mut quality_millis = 1000;
-            let mut valid_stream_parameter = true;
-            for parameter in segments {
-                let parameter = parameter.trim();
-                if parameter.is_empty() {
-                    continue;
-                }
-                let Some((name, value)) = parameter.split_once('=') else {
-                    valid_stream_parameter = false;
-                    continue;
-                };
-                let name = name.trim();
-                if name.eq_ignore_ascii_case("q") {
-                    quality_millis = parse_accept_quality_millis(value);
-                } else if name.eq_ignore_ascii_case("stream")
-                    && !value.trim().eq_ignore_ascii_case("watch")
-                {
-                    valid_stream_parameter = false;
-                }
-            }
-            let media = match media.as_str() {
-                "application/json" if valid_stream_parameter => AcceptedWatchMedia::Json,
-                "application/vnd.kubernetes.protobuf" if valid_stream_parameter => {
-                    AcceptedWatchMedia::Protobuf
-                }
-                "application/*" if valid_stream_parameter => {
-                    AcceptedWatchMedia::ApplicationWildcard
-                }
-                "*/*" if valid_stream_parameter => AcceptedWatchMedia::Any,
-                _ => AcceptedWatchMedia::Unsupported,
-            };
-            accepted.push(AcceptedWatchFormat {
-                media,
-                quality_millis,
-                order,
-            });
-            order += 1;
-        }
-    }
-
-    let mut candidates = Vec::new();
-    if let Some((quality_millis, order)) =
-        best_watch_accept_match(WatchStreamFormat::Json, &accepted)
-        && quality_millis > 0
-    {
-        candidates.push(CandidateWatchFormat {
-            format: WatchStreamFormat::Json,
-            quality_millis,
-            order,
-            preference: 0,
-        });
-    }
-    if protobuf_supported
-        && let Some((quality_millis, order)) =
-            best_watch_accept_match(WatchStreamFormat::Protobuf, &accepted)
-        && quality_millis > 0
-    {
-        candidates.push(CandidateWatchFormat {
-            format: WatchStreamFormat::Protobuf,
-            quality_millis,
-            order,
-            preference: 1,
-        });
-    }
-    candidates.sort_by_key(|candidate| {
-        (
-            std::cmp::Reverse(candidate.quality_millis),
-            candidate.order,
-            candidate.preference,
-        )
-    });
-    if let Some(candidate) = candidates.first() {
-        return Ok(candidate.format);
-    }
-    Err(AppError::NotAcceptable(
-        "no supported watch stream media type requested".to_string(),
-    ))
-}
-
-fn best_watch_accept_match(
-    format: WatchStreamFormat,
-    accepted: &[AcceptedWatchFormat],
-) -> Option<(u16, usize)> {
-    accepted
-        .iter()
-        .filter_map(|accepted| {
-            let specificity = match (format, accepted.media) {
-                (WatchStreamFormat::Json, AcceptedWatchMedia::Json)
-                | (WatchStreamFormat::Protobuf, AcceptedWatchMedia::Protobuf) => 2,
-                (_, AcceptedWatchMedia::ApplicationWildcard) => 1,
-                (_, AcceptedWatchMedia::Any) => 0,
-                _ => return None,
-            };
-            Some((
-                specificity,
-                accepted.quality_millis,
-                std::cmp::Reverse(accepted.order),
-            ))
-        })
-        .max()
-        .map(|(_specificity, quality_millis, std::cmp::Reverse(order))| (quality_millis, order))
-}
-
-fn parse_accept_quality_millis(value: &str) -> u16 {
-    let value = value.trim();
-    if value == "1" {
-        return 1000;
-    }
-    if let Some(fraction) = value.strip_prefix("1.") {
-        return if fraction.len() <= 3 && fraction.bytes().all(|byte| byte == b'0') {
-            1000
-        } else {
-            0
-        };
-    }
-    if value == "0" {
-        return 0;
-    }
-    let Some(fraction) = value.strip_prefix("0.") else {
-        return 0;
-    };
-    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
-        return 0;
-    }
-    let mut millis = 0u16;
-    for (idx, byte) in fraction.bytes().enumerate() {
-        let place = match idx {
-            0 => 100,
-            1 => 10,
-            _ => 1,
-        };
-        millis += u16::from(byte - b'0') * place;
-    }
-    millis
+    let format = klights_kube_protobuf::negotiate_watch_response(
+        headers.get_all("accept").into_iter().map(|value| {
+            value
+                .to_str()
+                .map_or(AcceptValue::Invalid, AcceptValue::Text)
+        }),
+        protobuf_supported,
+    )
+    .map_err(|error| AppError::NotAcceptable(error.to_string()))?;
+    Ok(match format {
+        ResponseFormat::Json => WatchStreamFormat::Json,
+        ResponseFormat::Protobuf => WatchStreamFormat::Protobuf,
+    })
 }
 
 pub fn protobuf_watch_supported_for_request(
@@ -390,11 +228,10 @@ pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Re
         let raw = crate::protobuf::encode_protobuf_resource(object_kind, &event.object)?;
         crate::protobuf::wrap_protobuf_resource_envelope(api_version, object_kind, raw)?
     };
-    let pb_event = PbWatchEvent {
-        r#type: Some(event.event_type.to_string()),
-        object: Some(RawExtension { raw: Some(raw) }),
-    };
-    Ok(encode_k8s_watch_event_frame(&pb_event))
+    Ok(klights_kube_protobuf::encode_watch_event_frame(
+        &event.event_type.to_string(),
+        raw,
+    ))
 }
 
 #[cfg(test)]
@@ -406,26 +243,10 @@ pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<
     )?;
     let raw =
         crate::protobuf::wrap_protobuf_resource_envelope(&event.api_version, &event.kind, raw)?;
-    let pb_event = PbWatchEvent {
-        r#type: Some(event.event_type.to_string()),
-        object: Some(RawExtension { raw: Some(raw) }),
-    };
-    Ok(encode_k8s_watch_event_frame(&pb_event))
-}
-
-/// Encode a protobuf WatchEvent into a length-prefixed
-/// Kubernetes stream frame.
-///
-/// Kubernetes protobuf stream readers use a raw serializer for the outer
-/// stream object, so the length prefix is followed directly by the encoded
-/// `WatchEvent`. The embedded `WatchEvent.object.raw` remains a normal
-/// `k8s\0` resource envelope for Kubernetes' object decoder.
-fn encode_k8s_watch_event_frame(pb_event: &PbWatchEvent) -> Vec<u8> {
-    let event_bytes = pb_event.encode_to_vec();
-    let mut frame = Vec::with_capacity(4 + event_bytes.len());
-    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
-    frame.extend(event_bytes);
-    frame
+    Ok(klights_kube_protobuf::encode_watch_event_frame(
+        &event.event_type.to_string(),
+        raw,
+    ))
 }
 
 #[cfg(test)]
