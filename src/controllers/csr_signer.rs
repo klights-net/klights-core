@@ -302,14 +302,14 @@ mod tests {
     async fn raft_handle() -> crate::datastore::backend::DatastoreHandle {
         use crate::datastore::backend::DatastoreHandle;
         use crate::datastore::command::StorageCommand;
-        use crate::datastore::replicated::{RaftProposer, ReplicatedDatastore, ReplicationMode};
+        use crate::replication::sequenced_datastore::{RaftProposal, SequencedDatastore};
 
         struct InlineProposer {
             inner: DatastoreHandle,
         }
 
         #[async_trait]
-        impl RaftProposer for InlineProposer {
+        impl RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
@@ -368,13 +368,7 @@ mod tests {
         }
 
         let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "test-node".to_string(),
-            },
-        );
-        ds.set_raft_proposer(Arc::new(InlineProposer { inner }));
+        let ds = SequencedDatastore::new(inner.clone(), Arc::new(InlineProposer { inner }));
         Arc::new(ds)
     }
 

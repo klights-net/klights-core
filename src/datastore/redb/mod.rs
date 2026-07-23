@@ -1,6 +1,6 @@
 //! `RedbDatastore` — redb backend composed from focused domain stores.
 //!
-//! Production uses `ReplicatedDatastore`; `RedbDatastore` implements
+//! Production composes `SequencedDatastore` above this passive backend; `RedbDatastore` implements
 //! `DatastoreBackend` by delegating to composed stores. Legacy local
 //! `StorageCommand` apply support is test-only cleanup debt.
 

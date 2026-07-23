@@ -29,10 +29,10 @@ use crate::datastore::cluster_store_adapter::{
     DatastoreClusterResourceRead, DatastoreDurableAllocatorRead, DatastoreDurableWatchHistory,
 };
 use crate::datastore::command::StorageCommand;
-use crate::datastore::replicated::WriteRejection;
 use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
 use crate::kubelet::outbox::OutboxApplyError;
 use crate::kubelet::pod_repository::store::PodStore;
+use crate::replication::sequenced_datastore::WriteRejection;
 
 #[cfg(test)]
 use crate::control_plane::client::{ResourceQueryConsistency, pod_get_request};

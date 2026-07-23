@@ -191,19 +191,6 @@ pub trait DatastoreBackend: Send + Sync {
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
 
-    /// Late-bind a `RaftProposer` so mutating methods can route writes
-    /// through openraft consensus when this backend is a
-    /// `ReplicatedDatastore` in `ReplicationMode::Raft`. Default impl is a
-    /// no-op so non-replicated backends (sqlite, redb) ignore it; only
-    /// `ReplicatedDatastore` actually stores the handle. The RaftNode is
-    /// constructed after the datastore handle, so this attach happens
-    /// once at boot in `bootstrap::phases::datastore::open_leader`.
-    fn attach_raft_proposer(
-        &self,
-        _proposer: std::sync::Arc<dyn crate::datastore::replicated::RaftProposer>,
-    ) {
-    }
-
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
 
     #[cfg(test)]
@@ -226,7 +213,7 @@ pub trait DatastoreBackend: Send + Sync {
         command: StorageCommand,
         meta: CommandMeta,
     ) -> Result<()> {
-        crate::datastore::replicated::apply_command_to_backend(self, command, meta).await
+        crate::replication::sequenced_datastore::apply_command_to_backend(self, command, meta).await
     }
 
     /// Atomically replace Kubernetes resource tables from a full leader snapshot.
@@ -2033,10 +2020,6 @@ pub trait BackendLifecycleStore: Send + Sync {
     async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>>;
     async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>>;
     fn close(&self);
-    fn attach_raft_proposer(
-        &self,
-        _proposer: std::sync::Arc<dyn crate::datastore::replicated::RaftProposer>,
-    );
 }
 
 /// Test-only watch bus controls.

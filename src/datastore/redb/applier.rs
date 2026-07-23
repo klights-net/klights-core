@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use crate::controllers::annotations::NodePeerMode;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{CommandMeta, StorageCommand};
-use crate::datastore::replicated::DatastoreApplier;
 use crate::networking::types::HostPortRange;
+use crate::replication::sequenced_datastore::DatastoreApplier;
 
 use super::RedbDatastore;
 

@@ -12,7 +12,9 @@ use crate::KlightsConfig;
 use crate::bootstrap::NodeRole;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
-use crate::datastore::replicated::RaftProposer;
+use crate::datastore::backend_kind::BackendKind;
+use crate::datastore::selector::PassiveStoreOpenRequest;
+use crate::replication::sequenced_datastore::RaftProposal;
 use klights_supervisor::TaskSupervisor;
 
 pub struct OpenLeaderArgs<'a> {
@@ -71,6 +73,21 @@ struct RemoteForwarderParts {
     lease_client: Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
 }
 
+fn passive_store_open_request(config: &KlightsConfig) -> PassiveStoreOpenRequest<'_> {
+    match (config.datastore_backend, config.in_memory) {
+        (BackendKind::Sqlite, true) => PassiveStoreOpenRequest::SqliteInMemory,
+        (BackendKind::Sqlite, false) => PassiveStoreOpenRequest::SqlitePersistent {
+            cluster_db_path: &config.cluster_db_path,
+            node_db_path: &config.node_db_path,
+            db_key_file: config.db_key_file.as_deref(),
+        },
+        (BackendKind::Redb, true) => PassiveStoreOpenRequest::RedbInMemory,
+        (BackendKind::Redb, false) => PassiveStoreOpenRequest::RedbPersistent {
+            cluster_db_path: &config.cluster_db_path,
+        },
+    }
+}
+
 /// Leader datastore wiring: local DB + replication + outbox + node admin.
 pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let OpenLeaderArgs {
@@ -86,14 +103,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     } = args;
     use crate::bootstrap::init::predicates::uses_leader_runtime;
 
-    let replication_observer = crate::datastore::replicated::ReplicationObserver::new();
-    let db_handle = crate::datastore::selector::open_raft_cluster(
-        config,
-        supervisor.clone(),
-        Some(replication_observer.clone()),
-    )
-    .await
-    .context("Failed to open datastore")?;
+    let passive_backend =
+        crate::datastore::selector::open(passive_store_open_request(config), supervisor.clone())
+            .await
+            .context("Failed to open datastore")?;
 
     // T1.6: joining controlplanes get their initial cluster.db
     // contents from raft (install_snapshot or AppendEntries from index 0
@@ -109,34 +122,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let is_joining_controlplane = role.is_controlplane_join();
 
     let node_lease_tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
-    // T6 step 4: LocalApiClient now consumes the real `is_leader_rx`
-    // from runtime.rs. The bootstrap shape watcher in `bootstrap.rs`
-    // refreshes the value from `Raft::metrics()` on every membership /
-    // leadership change. Step 1's inner gate uses this to refuse non-
-    // leader writes (defense in depth alongside the switching proxy
-    // below).
-    let local_api_client = Arc::new(
-        crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
-            db_handle.clone(),
-            config.node_name.clone(),
-            config.containerd_namespace.clone(),
-            node_lease_tracker.clone(),
-            is_leader_rx.clone(),
-            klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
-        ),
-    );
-    // T6 step 4: every leader-class boot's `cluster_api` is the
-    // switching proxy from step 3 — never a bare LocalApiClient. The
-    // proxy dispatches application reads/watches to the elected leader
-    // target, and writes to local only when this node is the elected
-    // leader.
-    //
-    // T6 step 4b: control-plane members build a real gRPC forwarder
-    // using `RemoteApiClient` so follower writes reach the elected
-    // leader's API server. Joining nodes seed it from `--leader`;
-    // seed controlplanes initialize it to their own advertised endpoint
-    // and the raft-shape watcher updates it to the current leader
-    // address on every metrics change.
+    // T6 step 4b: prepare the remote arm independently of local persistence.
+    // The switching proxy itself is constructed only after the immutable
+    // sequenced facade exists.
     let controlplane_remote_identity =
         controlplane_remote_client_identity_for_role(config, role, supervisor.clone()).await?;
     let remote_parts = build_remote_forwarder(
@@ -147,28 +135,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         local_dataplane.clone(),
         grpc_transport_policy.clone(),
     );
-    let leader_proxy = Arc::new(
-        crate::control_plane::client::leader_proxy::LeaderProxyApiClient::new(
-            local_api_client.clone(),
-            remote_parts.forwarder,
-            is_leader_rx.clone(),
-        )
-        .with_resource_command_targets(
-            local_api_client.clone(),
-            remote_parts.resource_commands.clone(),
-        )
-        .with_outbox_delivery_targets(local_api_client.clone(), remote_parts.outbox_deliveries)
-        .with_node_lease_renewal_targets(
-            local_api_client.clone(),
-            remote_parts.node_lease_renewals,
-        ),
-    );
-    let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> = leader_proxy.clone();
-    let outbox_delivery_client: Arc<dyn klights_leader_api::LeaderOutboxDelivery> =
-        leader_proxy.clone();
-    let node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal> =
-        leader_proxy.clone();
-
     // For joining controlplanes, cluster metadata is delivered by the
     // replication layer (raft install_snapshot/apply path in raft mode, or
     // follower replay path in legacy deployments); seed local cluster.db
@@ -179,22 +145,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // single-voter bootstrap completes. The direct ensure_cluster_metadata
     // and write_cluster_membership calls have been moved below to the raft
     // seed-init block so every cluster.db mutation is raft-backed.
-
-    let replication_service = if uses_leader_runtime(role) {
-        let service = Arc::new(crate::replication::ReplicationService::new(
-            db_handle.clone(),
-            supervisor.clone(),
-        ));
-        let svc = service.clone();
-        replication_observer
-            .set(Arc::new(move |command, meta| {
-                svc.notify_entry(crate::replication::protocol::ReplicationEntry { command, meta });
-            }))
-            .await;
-        Some(service)
-    } else {
-        None
-    };
 
     let node_local_db_path: Option<&std::path::Path> = if config.in_memory {
         None
@@ -221,10 +171,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // add_voter (driven by JoinAsControlplane in Step E) folds them in.
     // T2 step 1: raft is always on. Every leader-class boot constructs
     // a RaftNode. Single-node deployments run a single-voter raft cluster
-    // (quorum = 1). Workers use SingleNode and route writes through the
-    // outbox/leader proxy.
+    // (quorum = 1). Workers do not enter this composition path and route
+    // writes through the outbox/leader proxy.
     let member_feature_probe;
-    let raft_node = match (role, node_local_sqlite.as_ref()) {
+    let (raft_node, db_handle, local_api_client, leader_proxy, cluster_api) = match (
+        role,
+        node_local_sqlite.as_ref(),
+    ) {
         (r, Some(sqlite)) if uses_leader_runtime(r) => {
             let node_id =
                 crate::datastore::raft::types::raft_node_id_for_node_name(&config.node_name);
@@ -296,22 +249,63 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 crate::datastore::raft::node::RaftNode::start_with_network(
                     node_id,
                     config.node_name.clone(),
-                    db_handle.clone(),
+                    passive_backend.clone(),
                     sqlite.clone(),
                     raft_network,
                 )
                 .await
                 .context("Failed to start RaftNode for leader-class boot")?,
             );
+            let proposal: Arc<dyn crate::replication::sequenced_datastore::RaftProposal> =
+                raft.clone();
+            let db_handle: DatastoreHandle = Arc::new(
+                crate::replication::sequenced_datastore::SequencedDatastore::new(
+                    passive_backend.clone(),
+                    proposal,
+                ),
+            );
+            // The local command client is built only from the fully constructed
+            // sequenced facade. It never receives the passive backend used by
+            // Raft proposal materialization and committed apply.
+            let local_api_client = Arc::new(
+                crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+                    db_handle.clone(),
+                    config.node_name.clone(),
+                    config.containerd_namespace.clone(),
+                    node_lease_tracker.clone(),
+                    is_leader_rx.clone(),
+                    klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
+                ),
+            );
+            let leader_proxy = Arc::new(
+                crate::control_plane::client::leader_proxy::LeaderProxyApiClient::new(
+                    local_api_client.clone(),
+                    remote_parts.forwarder.clone(),
+                    is_leader_rx.clone(),
+                )
+                .with_resource_command_targets(
+                    local_api_client.clone(),
+                    remote_parts.resource_commands.clone(),
+                )
+                .with_outbox_delivery_targets(
+                    local_api_client.clone(),
+                    remote_parts.outbox_deliveries.clone(),
+                )
+                .with_node_lease_renewal_targets(
+                    local_api_client.clone(),
+                    remote_parts.node_lease_renewals.clone(),
+                ),
+            );
+            let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> =
+                leader_proxy.clone();
             // Seed branch: no --leader on Controlplane (or any
             // seed Leader boot) bootstraps as the sole voter.
             // Joining controlplane (--leader non-empty) skips this and
             // waits for the seed's add_voter to fold it in.
             //
-            // T6 step 4: bind the RaftNode into the cluster datastore
-            // wrapper on EVERY leader-class boot (seed + joiners), not
-            // just the seed. Three layers of protection make a follower
-            // proposer call structurally safe:
+            // T6 step 4: the immutable Raft proposal capability is present on
+            // every leader-class boot (seed + joiners). Three layers of
+            // protection make a follower proposal structurally safe:
             //   1. cluster_api dispatches non-leader writes to the
             //      switching proxy's remote arm (step 3), never to local.
             //   2. LocalApiClient's inner gate (step 1) refuses local
@@ -320,13 +314,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             //      non-leader (defense-in-depth bug), openraft's
             //      `client_write` returns ForwardToLeader and refuses.
             //
-            // With the proposer always bound, promotion is a pure state
+            // With the capability immutable, promotion is a pure state
             // flip — the moment the shape watcher sets `is_leader=true`,
             // the same instance starts accepting writes through the
             // raft path with no re-wiring. This is what the design doc
             // calls "always wired, gated by leadership state".
-            let raft_proposer: Arc<dyn crate::datastore::replicated::RaftProposer> = raft.clone();
-            db_handle.attach_raft_proposer(raft_proposer);
             if !is_join {
                 raft.bootstrap_single_voter(advertise_addr.clone())
                     .await
@@ -439,10 +431,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     crate::bootstrap::credential_store::SupervisedBootstrapCredentialStore::new(
                         join_supervisor.clone(),
                     );
-                // Capture handles the join task needs to attach the
-                // RaftProposer to the datastore wrapper on success.
-                let join_raft = raft.clone();
-                let join_db_handle = db_handle.clone();
                 let join_cluster_api = cluster_api.clone();
                 let join_resource_commands = leader_proxy.clone();
                 supervisor
@@ -555,7 +543,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                                 "controlplane_join_task: failed to refresh Node git-commit annotation"
                                             );
                                         }
-                                        let _ = (join_raft, join_db_handle);
                                         return;
                                     }
                                     Ok(crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::RedirectToLeader {
@@ -609,13 +596,29 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     .await
                     .context("Failed to spawn controlplane_join_task")?;
             }
-            Some(raft)
+            (
+                Some(raft),
+                db_handle,
+                local_api_client,
+                leader_proxy,
+                cluster_api,
+            )
         }
         _ => {
-            member_feature_probe = None;
-            None
+            anyhow::bail!(
+                "leader datastore composition requires a leader runtime and SQLite node-local Raft storage"
+            );
         }
     };
+
+    let outbox_delivery_client: Arc<dyn klights_leader_api::LeaderOutboxDelivery> =
+        leader_proxy.clone();
+    let node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal> =
+        leader_proxy.clone();
+    let replication_service = Some(Arc::new(crate::replication::ReplicationService::new(
+        db_handle.clone(),
+        supervisor.clone(),
+    )));
 
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -953,6 +956,51 @@ async fn controlplane_join_client_identity_for_token(
 #[cfg(test)]
 mod tests {
     use crate::bootstrap::node_role::{LeaderBootstrap, LeaderPeer, NodeRole};
+    use crate::datastore::backend_kind::BackendKind;
+    use crate::datastore::selector::PassiveStoreOpenRequest;
+
+    #[test]
+    fn passive_store_open_request_maps_all_root_config_combinations() {
+        for (backend, in_memory) in [
+            (BackendKind::Sqlite, true),
+            (BackendKind::Sqlite, false),
+            (BackendKind::Redb, true),
+            (BackendKind::Redb, false),
+        ] {
+            let mut config = crate::KlightsConfig::test_default();
+            config.datastore_backend = backend;
+            config.in_memory = in_memory;
+            config.db_key_file = Some("/keys/cluster.key".into());
+
+            match (
+                backend,
+                in_memory,
+                super::passive_store_open_request(&config),
+            ) {
+                (BackendKind::Sqlite, true, PassiveStoreOpenRequest::SqliteInMemory)
+                | (BackendKind::Redb, true, PassiveStoreOpenRequest::RedbInMemory) => {}
+                (
+                    BackendKind::Sqlite,
+                    false,
+                    PassiveStoreOpenRequest::SqlitePersistent {
+                        cluster_db_path,
+                        node_db_path,
+                        db_key_file,
+                    },
+                ) => {
+                    assert_eq!(cluster_db_path, config.cluster_db_path);
+                    assert_eq!(node_db_path, config.node_db_path);
+                    assert_eq!(db_key_file, config.db_key_file.as_deref());
+                }
+                (
+                    BackendKind::Redb,
+                    false,
+                    PassiveStoreOpenRequest::RedbPersistent { cluster_db_path },
+                ) => assert_eq!(cluster_db_path, config.cluster_db_path),
+                combination => panic!("incorrect passive-store request: {combination:?}"),
+            }
+        }
+    }
 
     #[test]
     fn seed_initializes_single_local_voter() {

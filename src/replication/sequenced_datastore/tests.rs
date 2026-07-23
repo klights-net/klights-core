@@ -1,4 +1,4 @@
-//! ReplicatedDatastore tests — extracted from replicated.rs.
+//! Immutable replication-owned datastore sequencing tests.
 
 mod cases {
     // Test assertions briefly lock a mock proposer's recorded-call log to
@@ -14,12 +14,10 @@ mod cases {
     use serde_json::{Value, json};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// T7.2: Create a ReplicatedDatastore in Raft mode with an inline
-    /// proposer that applies commands directly to the inner backend.
-    /// Every cluster.db write now requires a proposer — even SingleNode
-    /// (N=1 raft) because the node can promote when CPs join.
+    /// Create a completely constructed sequencer with an inline proposal
+    /// capability that applies commands to the passive backend.
     async fn make_ds_with_inline_proposer() -> (
-        ReplicatedDatastore,
+        SequencedDatastore,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
         use crate::datastore::backend::DatastoreHandle;
@@ -30,7 +28,7 @@ mod cases {
         }
 
         #[async_trait]
-        impl super::super::RaftProposer for InlineProposer {
+        impl super::super::RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
@@ -111,14 +109,34 @@ mod cases {
             inner: inner.clone(),
             calls: calls.clone(),
         });
-        let ds = ReplicatedDatastore::new(
-            inner,
-            ReplicationMode::Raft {
-                node_name: "test-node".into(),
-            },
-        );
-        ds.set_raft_proposer(proposer);
+        let ds = SequencedDatastore::new(inner, proposer);
         (ds, calls)
+    }
+
+    struct PanicProposal;
+
+    #[async_trait]
+    impl super::super::RaftProposal for PanicProposal {
+        async fn propose_command(
+            &self,
+            _command: StorageCommand,
+        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            panic!("this operation must not submit a raft proposal")
+        }
+
+        async fn propose_outbox_command(
+            &self,
+            _idempotency_key: &str,
+            _operation: &str,
+            _command: StorageCommand,
+            _authoring_node: &str,
+            _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        ) -> std::result::Result<
+            crate::kubelet::outbox::OutboxApplyResult,
+            crate::kubelet::outbox::OutboxApplyError,
+        > {
+            panic!("this operation must not submit an outbox proposal")
+        }
     }
 
     /// DSB-HA-02: SingleNode (Raft N=1) exercises the replicated path
@@ -288,7 +306,7 @@ mod cases {
             Some(30),
             "response should include deletion grace"
         );
-        let current_rv = ds.inner.get_current_resource_version().await.unwrap();
+        let current_rv = ds.passive.get_current_resource_version().await.unwrap();
         assert_eq!(
             deleted.resource_version, current_rv,
             "tombstone delete response must carry the committed RV"
@@ -391,12 +409,7 @@ mod cases {
         )
         .await
         .expect("activate V1 for zero-RV raft template");
-        let ds = ReplicatedDatastore::new(
-            inner,
-            ReplicationMode::Raft {
-                node_name: "test-node".into(),
-            },
-        );
+        let ds = inner;
         let commit = crate::log_apply::LogApplyCommit::new(
             0,
             vec![crate::log_apply::LogApplyMutation::PutResource(
@@ -429,7 +442,7 @@ mod cases {
         let result = ds
             .apply_raft_log_apply_commit(commit)
             .await
-            .expect("replicated wrapper must use raft terminal-conflict apply path");
+            .expect("passive backend must use raft terminal-conflict apply path");
         assert_eq!(result.applied_rv, None);
         assert!(
             result
@@ -515,12 +528,7 @@ mod cases {
     async fn no_op_watch_events_gc_does_not_allocate_local_raft_rv() {
         let inner: crate::datastore::backend::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "leader".into(),
-            },
-        );
+        let ds = SequencedDatastore::new(inner.clone(), Arc::new(PanicProposal));
         let before = inner.get_current_resource_version().await.unwrap();
 
         let removed = ds.gc_watch_events(100_000, 5_000).await.unwrap();
@@ -530,34 +538,6 @@ mod cases {
             inner.get_current_resource_version().await.unwrap(),
             before,
             "no-op watch-events GC must not create leader-local raft metadata RV drift"
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_mode_advance_resource_version_requires_proposer_without_local_rv_change() {
-        let inner: crate::datastore::backend::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "leader".into(),
-            },
-        );
-        let before = inner.get_current_resource_version().await.unwrap();
-
-        let err = ds
-            .advance_resource_version_after(before)
-            .await
-            .expect_err("raft-mode RV advances must go through the raft proposer");
-
-        assert!(
-            err.to_string().contains("raft proposer not attached"),
-            "unexpected error: {err:#}"
-        );
-        assert_eq!(
-            inner.get_current_resource_version().await.unwrap(),
-            before,
-            "rejected raft-mode RV advance must not mutate leader-local metadata"
         );
     }
 
@@ -591,24 +571,7 @@ mod cases {
     async fn raft_mode_pod_slot_admissions_remain_node_local() {
         let inner: crate::datastore::backend::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let observer = ReplicationObserver::new();
-        let observed_for_callback = observed.clone();
-        observer
-            .set(Arc::new(move |command, _meta| {
-                observed_for_callback
-                    .lock()
-                    .unwrap()
-                    .push(command.variant_name().to_string());
-            }))
-            .await;
-        let ds = ReplicatedDatastore::with_observer(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "leader".into(),
-            },
-            Some(observer),
-        );
+        let ds = SequencedDatastore::new(inner.clone(), Arc::new(PanicProposal));
         let before = inner.get_current_resource_version().await.unwrap();
 
         let admitted = ds
@@ -630,10 +593,6 @@ mod cases {
             inner.get_current_resource_version().await.unwrap(),
             before,
             "node-local pod slot mutations must not allocate cluster resourceVersion"
-        );
-        assert!(
-            observed.lock().unwrap().is_empty(),
-            "node-local pod slot mutations must not emit cluster replication commands"
         );
     }
 
@@ -686,12 +645,7 @@ mod cases {
     async fn no_op_applied_outbox_gc_does_not_allocate_local_raft_rv() {
         let inner: crate::datastore::backend::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "leader".into(),
-            },
-        );
+        let ds = SequencedDatastore::new(inner.clone(), Arc::new(PanicProposal));
         let before = inner.get_current_resource_version().await.unwrap();
 
         let now_ms = SystemTime::now()
@@ -2214,7 +2168,7 @@ mod cases {
         assert!(r.is_none());
     }
 
-    /// P3-11c4: in Raft mode with a RaftProposer attached, `create_resource`
+    /// P3-11c4: in Raft mode with a RaftProposal attached, `create_resource`
     /// must route the StorageCommand through the proposer instead of
     /// hitting the inner backend directly. The inline proposer in this
     /// test records each call and then applies the command synchronously
@@ -2229,7 +2183,7 @@ mod cases {
         }
 
         #[async_trait]
-        impl super::super::RaftProposer for InlineProposer {
+        impl super::super::RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
@@ -2287,19 +2241,13 @@ mod cases {
             }
         }
 
-        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
         let proposer = Arc::new(InlineProposer {
-            inner: inner.clone(),
+            inner: Arc::new(crate::datastore::test_support::in_memory().await),
             calls: Default::default(),
         });
-        let proposer_dyn: Arc<dyn super::super::RaftProposer> = proposer.clone();
-        ds.set_raft_proposer(proposer_dyn);
+        let inner = proposer.inner.clone();
+        let proposer_dyn: Arc<dyn super::super::RaftProposal> = proposer.clone();
+        let ds = SequencedDatastore::new(inner.clone(), proposer_dyn);
 
         let res = ds
             .create_resource(
@@ -2338,7 +2286,7 @@ mod cases {
         }
 
         #[async_trait]
-        impl super::super::RaftProposer for RecordingProposer {
+        impl super::super::RaftProposal for RecordingProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
@@ -2362,18 +2310,11 @@ mod cases {
             }
         }
 
-        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-        let db = ReplicatedDatastore::new(
-            inner,
-            ReplicationMode::Raft {
-                node_name: "cp1".to_string(),
-            },
-        );
         let proposer = Arc::new(RecordingProposer {
             calls: Default::default(),
         });
-        db.set_raft_proposer(proposer.clone());
-
+        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = SequencedDatastore::new(inner, proposer.clone());
         db.apply_resource_batch(vec![
             ResourceBatchOperation::Put {
                 api_version: "v1".to_string(),
@@ -2417,85 +2358,6 @@ mod cases {
         ));
     }
 
-    /// T7.2: without a raft proposer attached, writes must return a
-    /// typed error and must not mutate local cluster.db.
-    #[tokio::test]
-    async fn raft_mode_without_proposer_create_resource_returns_error() {
-        let inner = Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
-        let err = ds
-            .create_resource(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "no-proposer",
-                json!({"metadata": {"name": "no-proposer"}}),
-            )
-            .await
-            .expect_err("create_resource without proposer must fail");
-        assert!(
-            err.to_string().contains("proposer") || err.to_string().contains("Raft"),
-            "expected missing-proposer error, got: {err}"
-        );
-        assert!(
-            inner
-                .get_resource("v1", "ConfigMap", Some("default"), "no-proposer")
-                .await
-                .unwrap()
-                .is_none(),
-            "inner backend must not be mutated without proposer"
-        );
-    }
-
-    /// T7.2: delete without proposer also returns error.
-    #[tokio::test]
-    async fn raft_mode_without_proposer_delete_resource_returns_error() {
-        let inner = Arc::new(crate::datastore::test_support::in_memory().await);
-        inner
-            .create_resource(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "to-delete",
-                json!({"metadata": {"name": "to-delete"}}),
-            )
-            .await
-            .unwrap();
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
-        let err = ds
-            .delete_resource_with_preconditions_observed_rv(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "to-delete",
-                ResourcePreconditions::default(),
-            )
-            .await
-            .expect_err("delete without proposer must fail");
-        assert!(
-            err.to_string().contains("proposer") || err.to_string().contains("Raft"),
-            "expected missing-proposer error, got: {err}"
-        );
-        assert!(
-            inner
-                .get_resource("v1", "ConfigMap", Some("default"), "to-delete")
-                .await
-                .unwrap()
-                .is_some(),
-            "inner backend must not be mutated without proposer"
-        );
-    }
-
     #[tokio::test]
     async fn raft_mode_apply_outbox_transactionally_routes_via_proposer() {
         use crate::datastore::backend::DatastoreHandle;
@@ -2506,7 +2368,7 @@ mod cases {
         }
 
         #[async_trait]
-        impl super::super::RaftProposer for InlineProposer {
+        impl super::super::RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 _command: StorageCommand,
@@ -2545,18 +2407,12 @@ mod cases {
             }
         }
 
-        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
         let proposer = Arc::new(InlineProposer {
-            inner: inner.clone(),
+            inner: Arc::new(crate::datastore::test_support::in_memory().await),
             calls: Default::default(),
         });
-        ds.set_raft_proposer(proposer.clone());
+        let inner = proposer.inner.clone();
+        let ds = SequencedDatastore::new(inner.clone(), proposer.clone());
 
         let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
             StorageCommand::CreateResource {
@@ -2599,52 +2455,6 @@ mod cases {
         );
     }
 
-    /// T7.2: without a raft proposer, outbox apply must return a
-    /// Retryable error and must not mutate local cluster.db.
-    #[tokio::test]
-    async fn raft_mode_without_proposer_apply_outbox_returns_retryable_error() {
-        let inner = Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
-
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
-            StorageCommand::CreateResource {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                name: "no-proposer-outbox".into(),
-                data: json!({"metadata": {"name": "no-proposer-outbox"}}),
-            },
-        )
-        .encode_protobuf()
-        .unwrap();
-
-        let err = ds
-            .apply_outbox_transactionally(
-                "no-proposer-key",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
-                &payload,
-                "worker-1",
-            )
-            .await
-            .expect_err("outbox without proposer must fail");
-        assert!(
-            matches!(err, crate::kubelet::outbox::OutboxApplyError::Retryable(_)),
-            "expected Retryable error, got: {err:?}"
-        );
-        assert!(
-            inner
-                .get_resource("v1", "ConfigMap", Some("default"), "no-proposer-outbox")
-                .await
-                .unwrap()
-                .is_none(),
-            "inner backend must not be mutated without proposer"
-        );
-    }
     /// P3-11c4: delete_resource_with_preconditions_observed_rv must route
     /// the DeleteResource command through raft, then surface the cluster's
     /// current resource version (read back after the apply path advances).
@@ -2658,7 +2468,7 @@ mod cases {
         }
 
         #[async_trait]
-        impl super::super::RaftProposer for InlineProposer {
+        impl super::super::RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
@@ -2728,18 +2538,12 @@ mod cases {
             .await
             .unwrap();
 
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
         let proposer = Arc::new(InlineProposer {
             inner: inner.clone(),
             calls: Default::default(),
         });
-        let proposer_dyn: Arc<dyn super::super::RaftProposer> = proposer.clone();
-        ds.set_raft_proposer(proposer_dyn);
+        let proposer_dyn: Arc<dyn super::super::RaftProposal> = proposer.clone();
+        let ds = SequencedDatastore::new(inner.clone(), proposer_dyn);
 
         let rv = ds
             .delete_resource_with_preconditions_observed_rv(
@@ -2972,7 +2776,7 @@ mod cases {
         use crate::datastore::command::{
             COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
         };
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let meta = CommandMeta {
@@ -3045,23 +2849,17 @@ mod cases {
 
     // ── T7.3: follower proposer rejects before local mutation ──
 
-    /// Helper: creates a ReplicatedDatastore in Raft mode with a
+    /// Helper: creates a SequencedDatastore in Raft mode with a
     /// proposer that always rejects (simulating a non-leader node).
     async fn make_ds_with_follower_proposer() -> (
-        ReplicatedDatastore,
+        SequencedDatastore,
         std::sync::Arc<dyn crate::datastore::DatastoreBackend>,
     ) {
         let inner: std::sync::Arc<dyn crate::datastore::DatastoreBackend> =
             std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "follower-1".into(),
-            },
-        );
         struct FollowerProposer;
         #[async_trait]
-        impl super::super::RaftProposer for FollowerProposer {
+        impl super::super::RaftProposal for FollowerProposer {
             async fn propose_command(
                 &self,
                 _command: crate::datastore::command::StorageCommand,
@@ -3086,7 +2884,7 @@ mod cases {
                 ))
             }
         }
-        ds.set_raft_proposer(std::sync::Arc::new(FollowerProposer));
+        let ds = SequencedDatastore::new(inner.clone(), std::sync::Arc::new(FollowerProposer));
         (ds, inner)
     }
 
@@ -3261,32 +3059,6 @@ mod cases {
 
     // ── T7.1 gap: set_klights_meta must route through raft proposer ──
 
-    /// Without a raft proposer, set_klights_meta must return an error
-    /// and must not mutate the inner backend. This proves the metadata
-    /// write cannot be a local-only escape hatch.
-    #[tokio::test]
-    async fn set_klights_meta_without_proposer_returns_error_no_local_mutation() {
-        let inner = Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = ReplicatedDatastore::new(
-            inner.clone(),
-            ReplicationMode::Raft {
-                node_name: "n1".into(),
-            },
-        );
-        let err = ds
-            .set_klights_meta("voters", r#"["mn-leader"]"#)
-            .await
-            .expect_err("set_klights_meta without proposer must fail");
-        assert!(
-            err.to_string().contains("proposer"),
-            "expected missing-proposer error, got: {err}"
-        );
-        assert!(
-            inner.get_klights_meta("voters").await.unwrap().is_none(),
-            "inner backend must not be mutated without proposer"
-        );
-    }
-
     /// With an inline proposer, set_klights_meta must route through raft
     /// and the value must be visible after apply.
     #[tokio::test]
@@ -3337,7 +3109,7 @@ mod cases {
     /// `DisruptionTarget` condition is not dropped on the floor.
     #[tokio::test]
     async fn replicated_update_resource_preserves_disruption_target_over_newer_kubelet_status() {
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         // Victim is already Running on the node with the four kubelet-rebuilt
@@ -3489,7 +3261,7 @@ mod cases {
     /// waits for Running time out on a pod that kubelet never admits.
     #[tokio::test]
     async fn replicated_scheduler_bind_overwrites_pod_scheduled_pending_condition() {
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
@@ -3619,7 +3391,7 @@ mod cases {
     /// DisruptionTarget.
     #[tokio::test]
     async fn leader_direct_status_apply_preserves_disruption_target_without_outbox_stamp() {
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         // Post-preemption victim: terminating with the four kubelet-rebuilt
@@ -3722,7 +3494,7 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_stale_status_preserves_live_job_status_scalars() {
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
@@ -3828,7 +3600,7 @@ mod cases {
     async fn apply_replicated_stale_status_case(
         case: ReplicatedStaleStatusCase,
     ) -> crate::datastore::Resource {
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
@@ -4188,7 +3960,7 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_fresh_service_status_replaces_load_balancer_and_preserves_conditions() {
-        use crate::datastore::replicated::apply_command_to_backend;
+        use crate::replication::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db

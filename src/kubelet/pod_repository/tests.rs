@@ -2355,14 +2355,14 @@ async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
     repo
 }
 
-struct StatusRacingRaftProposer {
+struct StatusRacingRaftProposal {
     inner: crate::datastore::DatastoreHandle,
     namespace: String,
     pod_name: String,
     bumps: Arc<AtomicUsize>,
 }
 
-impl StatusRacingRaftProposer {
+impl StatusRacingRaftProposal {
     async fn bump_status_before_delete_mark(
         &self,
         command: &crate::datastore::command::StorageCommand,
@@ -2461,7 +2461,7 @@ impl StatusRacingRaftProposer {
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::replicated::RaftProposer for StatusRacingRaftProposer {
+impl crate::replication::sequenced_datastore::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
@@ -2511,20 +2511,16 @@ async fn build_raft_repo_with_status_race_on_delete(
 ) -> (super::PodRepository, Arc<AtomicUsize>) {
     let inner: crate::datastore::DatastoreHandle =
         Arc::new(crate::datastore::test_support::in_memory().await);
-    let replicated = Arc::new(crate::datastore::replicated::ReplicatedDatastore::new(
-        inner.clone(),
-        crate::datastore::replicated::ReplicationMode::Raft {
-            node_name: "status-race-leader".to_string(),
-        },
-    ));
     let bumps = Arc::new(AtomicUsize::new(0));
-    replicated.set_raft_proposer(Arc::new(StatusRacingRaftProposer {
-        inner,
+    let proposal = Arc::new(StatusRacingRaftProposal {
+        inner: inner.clone(),
         namespace: "default".to_string(),
         pod_name: pod_name.to_string(),
         bumps: bumps.clone(),
-    }));
-    let db: crate::datastore::DatastoreHandle = replicated;
+    });
+    let sequenced =
+        Arc::new(crate::replication::sequenced_datastore::SequencedDatastore::new(inner, proposal));
+    let db: crate::datastore::DatastoreHandle = sequenced;
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -12513,7 +12509,7 @@ async fn deferred_delete_preserves_same_name_replacement() {
 /// resourceVersion via a status write. In both cases the observed-RV CAS
 /// inside `delete_unscheduled_with_uid` must reject the delete and defer
 /// to actor-owned finalization.
-struct DeleteCasRacingRaftProposer {
+struct DeleteCasRacingRaftProposal {
     inner: crate::datastore::DatastoreHandle,
     namespace: String,
     pod_name: String,
@@ -12521,7 +12517,7 @@ struct DeleteCasRacingRaftProposer {
     raced: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl DeleteCasRacingRaftProposer {
+impl DeleteCasRacingRaftProposal {
     /// Mutate the target Pod just before the DeleteResource command is
     /// applied, advancing its resourceVersion so the observed-RV CAS
     /// precondition becomes stale.
@@ -12614,13 +12610,17 @@ impl DeleteCasRacingRaftProposer {
                 .unwrap_or(0),
             authoring_node: "delete-cas-race-leader".to_string(),
         };
-        crate::datastore::replicated::apply_command_to_backend(self.inner.as_ref(), command, meta)
-            .await
+        crate::replication::sequenced_datastore::apply_command_to_backend(
+            self.inner.as_ref(),
+            command,
+            meta,
+        )
+        .await
     }
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::replicated::RaftProposer for DeleteCasRacingRaftProposer {
+impl crate::replication::sequenced_datastore::RaftProposal for DeleteCasRacingRaftProposal {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
@@ -12653,7 +12653,7 @@ impl crate::datastore::replicated::RaftProposer for DeleteCasRacingRaftProposer 
     }
 }
 
-/// Build a `PodStore` backed by a `ReplicatedDatastore` whose raft
+/// Build a `PodStore` backed by a `SequencedDatastore` whose raft
 /// proposer mutates the target Pod just before the CAS delete fires,
 /// simulating a concurrent scheduler bind or status write.
 async fn build_store_with_delete_cas_race(
@@ -12666,21 +12666,17 @@ async fn build_store_with_delete_cas_race(
 ) {
     let inner: crate::datastore::DatastoreHandle =
         Arc::new(crate::datastore::test_support::in_memory().await);
-    let replicated = Arc::new(crate::datastore::replicated::ReplicatedDatastore::new(
-        inner.clone(),
-        crate::datastore::replicated::ReplicationMode::Raft {
-            node_name: "delete-cas-race-leader".to_string(),
-        },
-    ));
     let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    replicated.set_raft_proposer(Arc::new(DeleteCasRacingRaftProposer {
+    let proposal = Arc::new(DeleteCasRacingRaftProposal {
         inner: inner.clone(),
         namespace: "default".to_string(),
         pod_name: pod_name.to_string(),
         set_node_name,
         raced: raced.clone(),
-    }));
-    let db: crate::datastore::DatastoreHandle = replicated;
+    });
+    let sequenced =
+        Arc::new(crate::replication::sequenced_datastore::SequencedDatastore::new(inner, proposal));
+    let db: crate::datastore::DatastoreHandle = sequenced;
     (PodStore::new(db.clone()), db, raced)
 }
 

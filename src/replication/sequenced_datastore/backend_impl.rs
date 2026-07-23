@@ -1,4 +1,4 @@
-//! `DatastoreBackend` impl for `ReplicatedDatastore` — extracted from replicated.rs.
+//! `DatastoreBackend` compatibility impl for `SequencedDatastore`.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use crate::datastore::errors::DatastoreError;
 use crate::datastore::types::*;
 use klights_watch::WatchTopic;
 
-use super::ReplicatedDatastore;
+use super::SequencedDatastore;
 #[cfg(test)]
 use super::apply_command_to_backend;
 
@@ -38,37 +38,33 @@ fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
 }
 
 #[async_trait]
-impl DatastoreBackend for ReplicatedDatastore {
+impl DatastoreBackend for SequencedDatastore {
     async fn read_durable_allocator_observation(
         &self,
     ) -> Result<crate::datastore::DurableAllocatorObservation> {
-        self.inner.read_durable_allocator_observation().await
+        self.passive.read_durable_allocator_observation().await
     }
 
     async fn read_cluster_metadata_observation(
         &self,
     ) -> Result<crate::datastore::ClusterMetadataObservation> {
-        self.inner.read_cluster_metadata_observation().await
+        self.passive.read_cluster_metadata_observation().await
     }
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
-        self.inner.acquire_snapshot_exclusive_fence().await
+        self.passive.acquire_snapshot_exclusive_fence().await
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
-        self.inner.acquire_snapshot_mutation_fence().await
-    }
-
-    fn attach_raft_proposer(&self, proposer: std::sync::Arc<dyn super::RaftProposer>) {
-        self.set_raft_proposer(proposer);
+        self.passive.acquire_snapshot_mutation_fence().await
     }
 
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         if true {
-            self.inner.subscribe_watch_signals(topic)
+            self.passive.subscribe_watch_signals(topic)
         } else {
             klights_watch::WatchSignalReceiver::closed()
         }
@@ -76,17 +72,17 @@ impl DatastoreBackend for ReplicatedDatastore {
 
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
-        self.inner.subscribe_watch(topic)
+        self.passive.subscribe_watch(topic)
     }
 
     #[cfg(test)]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
-        self.inner.subscribe_watch_many(topics)
+        self.passive.subscribe_watch_many(topics)
     }
 
     #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
-        self.inner.broadcast_watch_event(pending);
+        self.passive.broadcast_watch_event(pending);
     }
 
     async fn replace_replicated_resource_state(
@@ -97,7 +93,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         watch_replay_floors: Option<Vec<WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .replace_replicated_resource_state(
                 entries,
                 current_rv,
@@ -109,21 +105,23 @@ impl DatastoreBackend for ReplicatedDatastore {
     }
 
     async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
-        self.inner.apply_log_apply_commit(commit).await
+        self.passive.apply_log_apply_commit(commit).await
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        self.inner.apply_raft_log_apply_commit(commit).await
+        self.passive.apply_raft_log_apply_commit(commit).await
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        self.inner.apply_raft_log_apply_commit_outcome(commit).await
+        self.passive
+            .apply_raft_log_apply_commit_outcome(commit)
+            .await
     }
 
     async fn create_resource(
@@ -134,11 +132,10 @@ impl DatastoreBackend for ReplicatedDatastore {
         name: &str,
         mut data: Value,
     ) -> Result<Resource> {
-        let proposer = self.require_raft_proposer()?;
         if api_version == "v1"
             && kind == "Pod"
             && crate::datastore::pod_serviceaccount::should_inject_serviceaccount_volume(
-                self.inner.as_ref(),
+                self.passive.as_ref(),
                 &data,
                 namespace,
             )
@@ -153,9 +150,9 @@ impl DatastoreBackend for ReplicatedDatastore {
             name: name.to_string(),
             data,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -171,7 +168,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        self.inner
+        self.passive
             .get_resource(api_version, kind, namespace, name)
             .await
     }
@@ -182,7 +179,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         namespace: Option<&str>,
         query: ResourceListQuery<'_>,
     ) -> Result<ResourceList> {
-        self.inner
+        self.passive
             .list_resources(api_version, kind, namespace, query)
             .await
     }
@@ -195,7 +192,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        self.inner
+        self.passive
             .list_resources_page(
                 api_version,
                 kind,
@@ -211,7 +208,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         targets: &[WatchTarget],
         label_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        self.inner
+        self.passive
             .list_resources_for_watch_targets(targets, label_selector)
             .await
     }
@@ -221,7 +218,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         kind: String,
         namespaced: bool,
     ) -> Result<Vec<(Option<String>, String)>> {
-        self.inner
+        self.passive
             .list_resource_keys_for_scope(api_version, kind, namespaced)
             .await
     }
@@ -238,7 +235,6 @@ impl DatastoreBackend for ReplicatedDatastore {
             uid: None,
             resource_version: Some(expected_rv),
         };
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -248,9 +244,9 @@ impl DatastoreBackend for ReplicatedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -269,7 +265,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         let expected_rv = preconditions.resource_version.unwrap_or(0);
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -279,9 +274,9 @@ impl DatastoreBackend for ReplicatedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -300,7 +295,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
         let expected_rv = preconditions.resource_version.unwrap_or(0);
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -310,9 +304,9 @@ impl DatastoreBackend for ReplicatedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -326,9 +320,8 @@ impl DatastoreBackend for ReplicatedDatastore {
         if operations.is_empty() {
             return Ok(());
         }
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::ApplyResourceBatch { operations };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         Ok(())
     }
 
@@ -341,7 +334,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         status: Value,
         expected_rv: Option<i64>,
     ) -> Result<Resource> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::UpdateStatus {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -355,9 +347,9 @@ impl DatastoreBackend for ReplicatedDatastore {
             },
             observed_status_stamp: None,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -375,7 +367,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         status: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        let proposer = self.require_raft_proposer()?;
         let expected_rv = preconditions.resource_version;
         let command = StorageCommand::UpdateStatus {
             api_version: api_version.to_string(),
@@ -387,9 +378,9 @@ impl DatastoreBackend for ReplicatedDatastore {
             preconditions,
             observed_status_stamp: None,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -409,7 +400,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         grace_seconds: i64,
     ) -> Result<Option<Resource>> {
         let Some(current) = self
-            .inner
+            .passive
             .get_resource(api_version, kind, namespace, name)
             .await?
         else {
@@ -437,8 +428,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         }
 
         ensure_mark_delete_timestamps(&mut current_data, grace_seconds);
-
-        let proposer = self.require_raft_proposer()?;
         let expected_rv = preconditions.resource_version.unwrap_or(0);
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),
@@ -449,8 +438,8 @@ impl DatastoreBackend for ReplicatedDatastore {
             expected_rv,
             preconditions,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        self.inner
+        self.propose_command(command).await?;
+        self.passive
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
@@ -504,7 +493,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         name: &str,
         preconditions: ResourcePreconditions,
     ) -> Result<i64> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::DeleteResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -512,8 +500,12 @@ impl DatastoreBackend for ReplicatedDatastore {
             name: name.to_string(),
             preconditions,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        Ok(self.inner.get_current_resource_version().await.unwrap_or(0))
+        self.propose_command(command).await?;
+        Ok(self
+            .passive
+            .get_current_resource_version()
+            .await
+            .unwrap_or(0))
     }
 
     async fn delete_resource_without_watch_with_tombstone(
@@ -525,7 +517,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         preconditions: ResourcePreconditions,
         grace_seconds: i64,
     ) -> Result<Resource> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::DeleteResourceWithTombstone {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -534,7 +525,7 @@ impl DatastoreBackend for ReplicatedDatastore {
             preconditions,
             grace_seconds,
         };
-        let applied = self.propose_command_via_raft(&proposer, command).await?;
+        let applied = self.propose_command(command).await?;
         match applied.applied_mutation {
             Some(crate::datastore::raft::types::AppliedMutation::Resource(resource)) => {
                 Ok(resource)
@@ -546,28 +537,27 @@ impl DatastoreBackend for ReplicatedDatastore {
     }
 
     async fn get_current_resource_version(&self) -> Result<i64> {
-        self.inner.get_current_resource_version().await
+        self.passive.get_current_resource_version().await
     }
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::CreateNamespace {
             name: name.to_string(),
             data: data.clone(),
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        self.inner.get_namespace(name).await?.ok_or_else(|| {
+        self.propose_command(command).await?;
+        self.passive.get_namespace(name).await?.ok_or_else(|| {
             anyhow::anyhow!("raft-routed create_namespace: row missing after commit for {name}")
         })
     }
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        self.inner.get_namespace(name).await
+        self.passive.get_namespace(name).await
     }
     async fn list_namespaces(
         &self,
         label_selector: Option<&str>,
         field_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        self.inner
+        self.passive
             .list_namespaces(label_selector, field_selector)
             .await
     }
@@ -577,7 +567,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        self.inner
+        self.passive
             .list_namespaces_page(label_selector, field_selector, page)
             .await
     }
@@ -587,23 +577,21 @@ impl DatastoreBackend for ReplicatedDatastore {
         data: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::UpdateNamespace {
             name: name.to_string(),
             data: data.clone(),
             expected_rv,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        self.inner.get_namespace(name).await?.ok_or_else(|| {
+        self.propose_command(command).await?;
+        self.passive.get_namespace(name).await?.ok_or_else(|| {
             anyhow::anyhow!("raft-routed update_namespace: row missing after commit for {name}")
         })
     }
     async fn delete_namespace_contents(&self, name: &str) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::DeleteNamespaceContents {
             name: name.to_string(),
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         Ok(())
     }
     async fn delete_namespace(&self, name: &str) -> Result<()> {
@@ -611,12 +599,11 @@ impl DatastoreBackend for ReplicatedDatastore {
     }
 
     async fn delete_namespace_observed_rv(&self, name: &str) -> Result<i64> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::DeleteNamespace {
             name: name.to_string(),
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        self.inner.get_current_resource_version().await
+        self.propose_command(command).await?;
+        self.passive.get_current_resource_version().await
     }
     async fn pod_workqueue_enqueue(
         &self,
@@ -627,18 +614,18 @@ impl DatastoreBackend for ReplicatedDatastore {
         min_delay_ms: i64,
         last_error: Option<&str>,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .pod_workqueue_enqueue(kind, pod, payload, attempt_count, min_delay_ms, last_error)
             .await
     }
     async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        self.inner.pod_workqueue_peek_next_due().await
+        self.passive.pod_workqueue_peek_next_due().await
     }
     async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        self.inner.pod_workqueue_claim_due(now_ms).await
+        self.passive.pod_workqueue_claim_due(now_ms).await
     }
     async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        self.inner.pod_workqueue_complete(id).await
+        self.passive.pod_workqueue_complete(id).await
     }
     async fn pod_workqueue_record_failure(
         &self,
@@ -646,12 +633,12 @@ impl DatastoreBackend for ReplicatedDatastore {
         min_delay_ms: i64,
         error: &str,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .pod_workqueue_record_failure(row, min_delay_ms, error)
             .await
     }
     async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        self.inner.pod_workqueue_dead_letter(id, error).await
+        self.passive.pod_workqueue_dead_letter(id, error).await
     }
     async fn record_sandbox(
         &self,
@@ -660,12 +647,12 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         sandbox_id: &str,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .record_sandbox(namespace, pod_name, pod_uid, sandbox_id)
             .await
     }
     async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        self.inner.get_sandbox(namespace, pod_name).await
+        self.passive.get_sandbox(namespace, pod_name).await
     }
     async fn get_sandbox_for_uid(
         &self,
@@ -673,12 +660,12 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<Option<String>> {
-        self.inner
+        self.passive
             .get_sandbox_for_uid(namespace, pod_name, pod_uid)
             .await
     }
     async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
-        self.inner.delete_sandbox(namespace, pod_name).await
+        self.passive.delete_sandbox(namespace, pod_name).await
     }
     async fn delete_sandbox_for_uid(
         &self,
@@ -687,19 +674,21 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         sandbox_id: &str,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .delete_sandbox_for_uid(namespace, pod_name, pod_uid, sandbox_id)
             .await
     }
     async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
-        self.inner.delete_pod_network(sandbox_id).await
+        self.passive.delete_pod_network(sandbox_id).await
     }
     async fn find_owned_resources(
         &self,
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        self.inner.find_owned_resources(owner_uid, namespace).await
+        self.passive
+            .find_owned_resources(owner_uid, namespace)
+            .await
     }
     async fn list_resources_by_owner_uid(
         &self,
@@ -708,7 +697,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         namespace: Option<&str>,
         owner_uid: &str,
     ) -> Result<Vec<Resource>> {
-        self.inner
+        self.passive
             .list_resources_by_owner_uid(api_version, kind, namespace, owner_uid)
             .await
     }
@@ -719,7 +708,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         owner_kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        self.inner
+        self.passive
             .find_owned_by_name_kind_empty_uid(owner_api_version, owner_name, owner_kind, namespace)
             .await
     }
@@ -729,12 +718,12 @@ impl DatastoreBackend for ReplicatedDatastore {
         kind: &str,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.inner
+        self.passive
             .list_cluster_resources_modified_since(api_version, kind, since_rv)
             .await
     }
     async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
-        self.inner.list_cluster_resources().await
+        self.passive.list_cluster_resources().await
     }
     async fn list_resources_modified_since(
         &self,
@@ -743,34 +732,34 @@ impl DatastoreBackend for ReplicatedDatastore {
         namespace: Option<&str>,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.inner
+        self.passive
             .list_resources_modified_since(api_version, kind, namespace, since_rv)
             .await
     }
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        let proposer = self.require_raft_proposer()?;
-        let before_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
+        let before_rv = self
+            .passive
+            .get_current_resource_version()
+            .await
+            .unwrap_or(0);
         let new_rv = before_rv.saturating_add(1).max(min_rv.saturating_add(1));
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::AdvanceResourceVersion { min_rv, new_rv },
-        )
-        .await?;
+        self.propose_command(StorageCommand::AdvanceResourceVersion { min_rv, new_rv })
+            .await?;
         Ok(self
-            .inner
+            .passive
             .get_current_resource_version()
             .await
             .unwrap_or(new_rv))
     }
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.inner.list_namespace_resources(namespace).await
+        self.passive.list_namespace_resources(namespace).await
     }
     async fn list_namespace_resources_of_kind(
         &self,
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        self.inner
+        self.passive
             .list_namespace_resources_of_kind(namespace, kind)
             .await
     }
@@ -779,19 +768,21 @@ impl DatastoreBackend for ReplicatedDatastore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        self.inner
+        self.passive
             .list_namespace_resources_excluding_kind(namespace, kind)
             .await
     }
     async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
-        self.inner.count_namespace_resources(namespace).await
+        self.passive.count_namespace_resources(namespace).await
     }
     async fn list_watch_events_since(
         &self,
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.inner.list_watch_events_since(targets, since_rv).await
+        self.passive
+            .list_watch_events_since(targets, since_rv)
+            .await
     }
 
     async fn list_watch_events_since_checked(
@@ -799,7 +790,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<WatchReplayRead> {
-        self.inner
+        self.passive
             .list_watch_events_since_checked(targets, since_rv)
             .await
     }
@@ -810,7 +801,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead> {
-        self.inner
+        self.passive
             .list_watch_events_since_checked_bounded(targets, since_rv, limit)
             .await
     }
@@ -821,13 +812,13 @@ impl DatastoreBackend for ReplicatedDatastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        self.inner
+        self.passive
             .list_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
     }
 
     async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        self.inner.current_watch_replay_position().await
+        self.passive.current_watch_replay_position().await
     }
 
     async fn snapshot_resources_at_position(
@@ -837,7 +828,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         field_selector: Option<&str>,
         position: WatchReplayPosition,
     ) -> Result<SnapshotAtRv> {
-        self.inner
+        self.passive
             .snapshot_resources_at_position(targets, label_selector, field_selector, position)
             .await
     }
@@ -848,7 +839,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<RawWatchEvent>> {
-        self.inner
+        self.passive
             .list_raw_watch_events_since_checked_bounded(targets, since_rv, limit)
             .await
     }
@@ -859,17 +850,17 @@ impl DatastoreBackend for ReplicatedDatastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
-        self.inner
+        self.passive
             .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
     }
 
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
-        self.inner.earliest_watch_event_rv().await
+        self.passive.earliest_watch_event_rv().await
     }
 
     async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        self.inner.list_all_watch_events_since(since_rv).await
+        self.passive.list_all_watch_events_since(since_rv).await
     }
 
     async fn list_all_watch_events_since_paged(
@@ -879,7 +870,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.inner
+        self.passive
             .list_all_watch_events_since_paged(since_rv, after_resource_version, after_id, limit)
             .await
     }
@@ -890,17 +881,17 @@ impl DatastoreBackend for ReplicatedDatastore {
         through_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.inner
+        self.passive
             .list_all_watch_events_after_id_bounded(after_id, through_id, limit)
             .await
     }
 
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
-        self.inner.list_watch_replay_floors().await
+        self.passive.list_watch_replay_floors().await
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        self.inner.list_deleted_watch_events_since(since_rv).await
+        self.passive.list_deleted_watch_events_since(since_rv).await
     }
 
     async fn allocate_node_subnet(
@@ -909,21 +900,20 @@ impl DatastoreBackend for ReplicatedDatastore {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<NodeSubnet> {
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::AllocateNodeSubnet {
-                node_name: node_name.to_string(),
-                subnet: cluster_cidr.to_string(),
-                node_ip: node_ip.to_string(),
-            },
-        )
-        .await?;
-        self.inner.get_node_subnet(node_name).await?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "raft-routed allocate_node_subnet: row missing after commit for {node_name}"
-            )
+        self.propose_command(StorageCommand::AllocateNodeSubnet {
+            node_name: node_name.to_string(),
+            subnet: cluster_cidr.to_string(),
+            node_ip: node_ip.to_string(),
         })
+        .await?;
+        self.passive
+            .get_node_subnet(node_name)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "raft-routed allocate_node_subnet: row missing after commit for {node_name}"
+                )
+            })
     }
     async fn update_node_peer_attributes(
         &self,
@@ -936,15 +926,11 @@ impl DatastoreBackend for ReplicatedDatastore {
             crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
         }
         .to_string();
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::UpdateNodePeerAttributes {
-                node_name: node_name.to_string(),
-                mode: mode_value,
-                hostport_range: hostport_range.map(|range| range.to_string()),
-            },
-        )
+        self.propose_command(StorageCommand::UpdateNodePeerAttributes {
+            node_name: node_name.to_string(),
+            mode: mode_value,
+            hostport_range: hostport_range.map(|range| range.to_string()),
+        })
         .await?;
         Ok(())
     }
@@ -960,8 +946,7 @@ impl DatastoreBackend for ReplicatedDatastore {
             endpoint: metadata.endpoint.to_string(),
             port: metadata.port,
         };
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         Ok(())
     }
 
@@ -969,23 +954,19 @@ impl DatastoreBackend for ReplicatedDatastore {
         &self,
         node_name: &str,
     ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-        self.inner.get_node_dataplane(node_name).await
+        self.passive.get_node_dataplane(node_name).await
     }
 
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.inner.get_node_subnet(node_name).await
+        self.passive.get_node_subnet(node_name).await
     }
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.inner.list_peer_subnets(my_node_name).await
+        self.passive.list_peer_subnets(my_node_name).await
     }
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::DeleteNodeSubnet {
-                node_name: node_name.to_string(),
-            },
-        )
+        self.propose_command(StorageCommand::DeleteNodeSubnet {
+            node_name: node_name.to_string(),
+        })
         .await?;
         Ok(())
     }
@@ -998,17 +979,13 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::MovePodToCleanupIntent {
-                node_name: node_name.to_string(),
-                namespace: namespace.to_string(),
-                pod_name: pod_name.to_string(),
-                pod_uid: pod_uid.to_string(),
-                reason: reason.to_string(),
-            },
-        )
+        self.propose_command(StorageCommand::MovePodToCleanupIntent {
+            node_name: node_name.to_string(),
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            reason: reason.to_string(),
+        })
         .await?;
         Ok(())
     }
@@ -1017,7 +994,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         &self,
         node_name: &str,
     ) -> Result<Vec<PodCleanupIntent>> {
-        self.inner
+        self.passive
             .list_pod_cleanup_intents_for_node(node_name)
             .await
     }
@@ -1030,29 +1007,21 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::DeletePodCleanupIntent {
-                node_name: node_name.to_string(),
-                namespace: namespace.to_string(),
-                pod_name: pod_name.to_string(),
-                pod_uid: pod_uid.to_string(),
-                reason: reason.to_string(),
-            },
-        )
+        self.propose_command(StorageCommand::DeletePodCleanupIntent {
+            node_name: node_name.to_string(),
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            reason: reason.to_string(),
+        })
         .await?;
         Ok(())
     }
 
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::DeletePodCleanupIntentsForNode {
-                node_name: node_name.to_string(),
-            },
-        )
+        self.propose_command(StorageCommand::DeletePodCleanupIntentsForNode {
+            node_name: node_name.to_string(),
+        })
         .await?;
         Ok(())
     }
@@ -1064,7 +1033,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<PodSlotAdmissionResult> {
-        self.inner
+        self.passive
             .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
             .await
     }
@@ -1076,7 +1045,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
             .await
     }
@@ -1088,14 +1057,14 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<()> {
-        self.inner
+        self.passive
             .pod_slot_clear_if_uid(namespace, pod_name, pod_uid, node_name)
             .await
     }
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
         if true {
-            self.inner.subscribe_pod_slot_admissions()
+            self.passive.subscribe_pod_slot_admissions()
         } else {
             let (_tx, rx) = broadcast::channel(1);
             rx
@@ -1110,7 +1079,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         patch_kind: PatchKind,
         patch: Value,
     ) -> Result<Option<Resource>> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::PatchResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -1121,8 +1089,8 @@ impl DatastoreBackend for ReplicatedDatastore {
             preconditions: ResourcePreconditions::default(),
             strict_resource_version: false,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        self.inner
+        self.propose_command(command).await?;
+        self.passive
             .get_resource(api_version, kind, namespace, name)
             .await
     }
@@ -1140,7 +1108,6 @@ impl DatastoreBackend for ReplicatedDatastore {
             preconditions,
             strict_resource_version,
         } = request;
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::PatchResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
@@ -1151,13 +1118,13 @@ impl DatastoreBackend for ReplicatedDatastore {
             preconditions: preconditions.clone(),
             strict_resource_version,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        self.inner
+        self.propose_command(command).await?;
+        self.passive
             .get_resource(api_version, kind, namespace, name)
             .await
     }
     async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
-        self.inner.get_pod_network(sandbox_id).await
+        self.passive.get_pod_network(sandbox_id).await
     }
     async fn get_pod_network_for_pod(
         &self,
@@ -1165,7 +1132,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<Option<PodNetworkEndpoint>> {
-        self.inner
+        self.passive
             .get_pod_network_for_pod(namespace, pod_name, pod_uid)
             .await
     }
@@ -1178,7 +1145,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         veth_host: &str,
         netns_path: &str,
     ) -> Result<(String, u32)> {
-        self.inner
+        self.passive
             .ipam_allocate_and_record_pod_network(
                 sandbox_id,
                 pod,
@@ -1190,46 +1157,42 @@ impl DatastoreBackend for ReplicatedDatastore {
             .await
     }
     async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
-        self.inner.list_sandboxes().await
+        self.passive.list_sandboxes().await
     }
     async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        self.inner.list_pod_network_sandbox_ids().await
+        self.passive.list_pod_network_sandbox_ids().await
     }
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        self.inner
+        self.passive
             .watch_events_gc_prunable_count(max_rows, batch_cap)
             .await
     }
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         let prunable = self
-            .inner
+            .passive
             .watch_events_gc_prunable_count(max_rows, batch_cap)
             .await?;
         if prunable == 0 {
             return Ok(0);
         }
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::GcWatchEvents {
-                max_rows,
-                batch_cap,
-            },
-        )
+        self.propose_command(StorageCommand::GcWatchEvents {
+            max_rows,
+            batch_cap,
+        })
         .await?;
         Ok(prunable)
     }
     async fn pod_endpoint_get_by_pod_ip(&self, pod_ip: Ipv4Addr) -> Result<Option<PodEndpointRow>> {
-        self.inner.pod_endpoint_get_by_pod_ip(pod_ip).await
+        self.passive.pod_endpoint_get_by_pod_ip(pod_ip).await
     }
 
     async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
-        self.inner.pod_endpoint_list_all().await
+        self.passive.pod_endpoint_list_all().await
     }
 
     fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
         if true {
-            self.inner.subscribe_pod_endpoints()
+            self.passive.subscribe_pod_endpoints()
         } else {
             let (_tx, rx) = broadcast::channel(1);
             rx
@@ -1237,38 +1200,37 @@ impl DatastoreBackend for ReplicatedDatastore {
     }
 
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        self.inner.get_klights_meta(key).await
+        self.passive.get_klights_meta(key).await
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::SetKlightsMeta {
             key: key.to_string(),
             value: value.to_string(),
         };
-        self.propose_command_via_raft(&proposer, command).await?;
+        self.propose_command(command).await?;
         Ok(())
     }
 
     async fn list_outbox_stream_watermarks(
         &self,
     ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
-        self.inner.list_outbox_stream_watermarks().await
+        self.passive.list_outbox_stream_watermarks().await
     }
 
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
     ) -> Result<Option<AppliedOutboxRecord>> {
-        self.inner.get_applied_outbox(idempotency_key).await
+        self.passive.get_applied_outbox(idempotency_key).await
     }
 
     async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
-        self.inner.insert_applied_outbox(record).await
+        self.passive.insert_applied_outbox(record).await
     }
 
     async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
-        self.inner.list_applied_outbox().await
+        self.passive.list_applied_outbox().await
     }
 
     async fn delete_uncommitted_applied_outbox_placeholder(
@@ -1276,7 +1238,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         idempotency_key: &str,
         reserved_rv: i64,
     ) -> Result<bool> {
-        self.inner
+        self.passive
             .delete_uncommitted_applied_outbox_placeholder(idempotency_key, reserved_rv)
             .await
     }
@@ -1307,10 +1269,7 @@ impl DatastoreBackend for ReplicatedDatastore {
                 })?;
             return Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 });
         }
-        let proposer = self
-            .require_raft_proposer()
-            .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
-        proposer
+        self.proposal
             .propose_outbox_command(idempotency_key, operation, command, authoring_node, None)
             .await
     }
@@ -1338,10 +1297,7 @@ impl DatastoreBackend for ReplicatedDatastore {
                 })?;
             return Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 });
         }
-        let proposer = self
-            .require_raft_proposer()
-            .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
-        proposer
+        self.proposal
             .propose_outbox_command(
                 idempotency_key,
                 operation,
@@ -1379,10 +1335,7 @@ impl DatastoreBackend for ReplicatedDatastore {
                 crate::datastore::PodEndpointEffect::NotApplicable,
             ));
         }
-        let proposer = self
-            .require_raft_proposer()
-            .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
-        proposer
+        self.proposal
             .propose_outbox_command_effect(
                 idempotency_key,
                 operation,
@@ -1399,7 +1352,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         operation: &str,
         authoring_node: &str,
     ) -> Result<crate::log_apply::LogApplyCommit> {
-        self.inner
+        self.passive
             .build_log_apply_commit_for_command(command, operation, authoring_node)
             .await
     }
@@ -1414,7 +1367,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         crate::datastore::sqlite::BuildOutboxOutcome,
         crate::kubelet::outbox::OutboxApplyError,
     > {
-        self.inner
+        self.passive
             .build_log_apply_commit_for_outbox(idempotency_key, operation, payload, authoring_node)
             .await
     }
@@ -1430,7 +1383,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         crate::datastore::sqlite::BuildOutboxOutcome,
         crate::kubelet::outbox::OutboxApplyError,
     > {
-        self.inner
+        self.passive
             .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
                 operation,
@@ -1444,15 +1397,13 @@ impl DatastoreBackend for ReplicatedDatastore {
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
         let cutoff_ms = now_ms.saturating_sub(ttl_ms);
         let prunable = self
-            .inner
+            .passive
             .applied_outbox_gc_prunable_count(cutoff_ms)
             .await?;
         if prunable == 0 {
             return Ok(0);
         }
-
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(&proposer, StorageCommand::GcAppliedOutbox { cutoff_ms })
+        self.propose_command(StorageCommand::GcAppliedOutbox { cutoff_ms })
             .await?;
         Ok(prunable)
     }
@@ -1464,16 +1415,16 @@ impl DatastoreBackend for ReplicatedDatastore {
         command: StorageCommand,
         meta: CommandMeta,
     ) -> Result<()> {
-        apply_command_to_backend(self.inner.as_ref(), command, meta).await
+        apply_command_to_backend(self.passive.as_ref(), command, meta).await
     }
 
     async fn current_log_apply_index(&self) -> Result<i64> {
-        self.inner.current_log_apply_index().await
+        self.passive.current_log_apply_index().await
     }
 }
 
 #[async_trait]
-impl crate::datastore::ResourceStore for ReplicatedDatastore {
+impl crate::datastore::ResourceStore for SequencedDatastore {
     async fn create_resource(
         &self,
         api_version: &str,
@@ -1584,14 +1535,14 @@ impl crate::datastore::ResourceStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::CurrentResourceVersionStore for ReplicatedDatastore {
+impl crate::datastore::CurrentResourceVersionStore for SequencedDatastore {
     async fn get_current_resource_version(&self) -> Result<i64> {
         crate::datastore::DatastoreBackend::get_current_resource_version(self).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::ResourceListStore for ReplicatedDatastore {
+impl crate::datastore::ResourceListStore for SequencedDatastore {
     async fn list_resources_page(
         &self,
         api_version: &str,
@@ -1630,7 +1581,7 @@ impl crate::datastore::ResourceListStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::NamespaceStore for ReplicatedDatastore {
+impl crate::datastore::NamespaceStore for SequencedDatastore {
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource> {
         crate::datastore::DatastoreBackend::create_namespace(self, name, data).await
     }
@@ -1691,7 +1642,7 @@ impl crate::datastore::NamespaceStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::WatchHistoryStore for ReplicatedDatastore {
+impl crate::datastore::WatchHistoryStore for SequencedDatastore {
     async fn list_cluster_resources_modified_since(
         &self,
         api_version: &str,
@@ -1770,7 +1721,7 @@ impl crate::datastore::WatchHistoryStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::NamespaceContentStore for ReplicatedDatastore {
+impl crate::datastore::NamespaceContentStore for SequencedDatastore {
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
         crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await
     }
@@ -1801,7 +1752,7 @@ impl crate::datastore::NamespaceContentStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::OwnershipStore for ReplicatedDatastore {
+impl crate::datastore::OwnershipStore for SequencedDatastore {
     async fn find_owned_resources(
         &self,
         owner_uid: &str,
@@ -1846,7 +1797,7 @@ impl crate::datastore::OwnershipStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::StatusStore for ReplicatedDatastore {
+impl crate::datastore::StatusStore for SequencedDatastore {
     async fn update_status_only(
         &self,
         api_version: &str,
@@ -1891,7 +1842,7 @@ impl crate::datastore::StatusStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::MetaStore for ReplicatedDatastore {
+impl crate::datastore::MetaStore for SequencedDatastore {
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
         crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
     }
@@ -1902,7 +1853,7 @@ impl crate::datastore::MetaStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::NetworkStore for ReplicatedDatastore {
+impl crate::datastore::NetworkStore for SequencedDatastore {
     async fn record_sandbox(
         &self,
         namespace: &str,
@@ -1950,7 +1901,7 @@ impl crate::datastore::NetworkStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::NetworkMetadataStore for ReplicatedDatastore {
+impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
     async fn get_sandbox_for_uid(
         &self,
         namespace: &str,
@@ -2083,7 +2034,7 @@ impl crate::datastore::NetworkMetadataStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::PodWorkqueueStore for ReplicatedDatastore {
+impl crate::datastore::PodWorkqueueStore for SequencedDatastore {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -2138,7 +2089,7 @@ impl crate::datastore::PodWorkqueueStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::ReplicationStore for ReplicatedDatastore {
+impl crate::datastore::ReplicationStore for SequencedDatastore {
     #[cfg(test)]
     async fn apply_replicated_command(
         &self,
@@ -2213,7 +2164,7 @@ impl crate::datastore::ReplicationStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::DurableRecoveryStore for ReplicatedDatastore {
+impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
     async fn read_durable_allocator_observation(
         &self,
     ) -> Result<crate::datastore::DurableAllocatorObservation> {
@@ -2228,7 +2179,7 @@ impl crate::datastore::DurableRecoveryStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::BackendLifecycleStore for ReplicatedDatastore {
+impl crate::datastore::BackendLifecycleStore for SequencedDatastore {
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
@@ -2244,14 +2195,10 @@ impl crate::datastore::BackendLifecycleStore for ReplicatedDatastore {
     fn close(&self) {
         crate::datastore::DatastoreBackend::close(self);
     }
-
-    fn attach_raft_proposer(&self, proposer: std::sync::Arc<dyn super::RaftProposer>) {
-        crate::datastore::DatastoreBackend::attach_raft_proposer(self, proposer);
-    }
 }
 
 #[cfg(test)]
-impl crate::datastore::TestWatchStore for ReplicatedDatastore {
+impl crate::datastore::TestWatchStore for SequencedDatastore {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
     }
@@ -2262,7 +2209,7 @@ impl crate::datastore::TestWatchStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::ClusterResourceQueryStore for ReplicatedDatastore {
+impl crate::datastore::ClusterResourceQueryStore for SequencedDatastore {
     async fn list_resources(
         &self,
         api_version: &str,
@@ -2299,7 +2246,7 @@ impl crate::datastore::ClusterResourceQueryStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::LeaderResourceMutationStore for ReplicatedDatastore {
+impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
     async fn update_main_resource_with_preconditions(
         &self,
         api_version: &str,
@@ -2428,7 +2375,7 @@ impl crate::datastore::LeaderResourceMutationStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::WatchMaintenanceStore for ReplicatedDatastore {
+impl crate::datastore::WatchMaintenanceStore for SequencedDatastore {
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -2474,7 +2421,7 @@ impl crate::datastore::WatchMaintenanceStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::PodCleanupStore for ReplicatedDatastore {
+impl crate::datastore::PodCleanupStore for SequencedDatastore {
     async fn move_pod_to_cleanup_intent(
         &self,
         node_name: &str,
@@ -2560,7 +2507,7 @@ impl crate::datastore::PodCleanupStore for ReplicatedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::AppliedOutboxStore for ReplicatedDatastore {
+impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
         crate::datastore::DatastoreBackend::applied_outbox_gc_prunable_count(self, cutoff_ms).await
     }

@@ -1081,14 +1081,14 @@ mod tests {
     async fn follower_peer_node_event_does_not_write_cluster_state() {
         use crate::datastore::DatastoreBackend;
         use crate::datastore::command::StorageCommand;
-        use crate::datastore::replicated::{RaftProposer, ReplicatedDatastore, ReplicationMode};
         use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+        use crate::replication::sequenced_datastore::{RaftProposal, SequencedDatastore};
         use std::sync::Arc;
 
         struct FollowerProposer;
 
         #[async_trait::async_trait]
-        impl RaftProposer for FollowerProposer {
+        impl RaftProposal for FollowerProposer {
             async fn propose_command(
                 &self,
                 _command: StorageCommand,
@@ -1110,13 +1110,7 @@ mod tests {
 
         let inner: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let db = ReplicatedDatastore::new(
-            inner,
-            ReplicationMode::Raft {
-                node_name: "mn-controlplane2".to_string(),
-            },
-        );
-        db.set_raft_proposer(Arc::new(FollowerProposer));
+        let db = SequencedDatastore::new(inner, Arc::new(FollowerProposer));
         let event = crate::watch::WatchEvent::added(json!({
             "apiVersion": "v1",
             "kind": "Node",

@@ -2030,7 +2030,7 @@ async fn redb_delete_resource_with_tombstone_command_stamps_and_watches_deleted_
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::datastore::replicated::DatastoreApplier;
+    use crate::replication::sequenced_datastore::DatastoreApplier;
 
     let db = redb_db().await;
     let created = db

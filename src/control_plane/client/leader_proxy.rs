@@ -225,18 +225,27 @@ impl LeaderResourceCommand for LeaderProxyApiClient {
         &self,
         request: ResourceCommandRequest,
     ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
-        let target = self
-            .focused_targets
-            .as_ref()
-            .and_then(|targets| targets.resource_commands.target(self.is_leader()));
-        match target {
-            Some(target) => target.submit_resource_command(request),
-            None => Box::pin(async {
-                Err(ResourceCommandError::retryable(
+        let mut leadership_rx = self.is_leader_rx.clone();
+        let generation_is_leader = *leadership_rx.borrow_and_update();
+        let target = self.focused_targets.as_ref().and_then(|targets| {
+            targets
+                .resource_commands
+                .target(generation_is_leader)
+                .cloned()
+        });
+        Box::pin(async move {
+            if leadership_rx.has_changed().unwrap_or(true) {
+                return Err(ResourceCommandError::retryable(
+                    "leadership changed before resource-command dispatch",
+                ));
+            }
+            match target {
+                Some(target) => target.submit_resource_command(request).await,
+                None => Err(ResourceCommandError::retryable(
                     "leader proxy resource-command target is not wired",
-                ))
-            }),
-        }
+                )),
+            }
+        })
     }
 }
 
@@ -946,6 +955,38 @@ mod tests {
             .await
             .expect("remote command");
         assert_eq!(local.submit_resource_command.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.submit_resource_command.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn resource_command_refuses_stale_leadership_generation_before_target_invocation() {
+        let local = RecordingApiClient::new("local");
+        let remote = RecordingApiClient::new("remote");
+        let (proxy, tx) = make_proxy(local.clone(), remote.clone(), true);
+
+        let stale =
+            LeaderResourceCommand::submit_resource_command(&proxy, config_map_create_request());
+        tx.send(false).expect("demote before polling command");
+
+        let error = stale
+            .await
+            .expect_err("stale leadership generation must fail closed before dispatch");
+        assert!(matches!(error, ResourceCommandError::Retryable { .. }));
+        assert_eq!(
+            local.submit_resource_command.load(Ordering::Relaxed),
+            0,
+            "a target selected under the stale leader generation must not be invoked"
+        );
+        assert_eq!(
+            remote.submit_resource_command.load(Ordering::Relaxed),
+            0,
+            "generation failure must not silently switch targets inside one command"
+        );
+
+        LeaderResourceCommand::submit_resource_command(&proxy, config_map_create_request())
+            .await
+            .expect("fresh follower generation forwards to the current leader");
+        assert_eq!(local.submit_resource_command.load(Ordering::Relaxed), 0);
         assert_eq!(remote.submit_resource_command.load(Ordering::Relaxed), 1);
     }
 

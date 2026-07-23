@@ -93,8 +93,8 @@ pub enum SnapshotRestoreError {
 /// restore into an empty database and resume applying commands from the
 /// snapshot's `last_applied_rv`.
 ///
-/// Backends that do not implement this trait are rejected at startup
-/// when `ReplicationMode::Raft` is requested.
+/// Backends that do not implement this trait are rejected when composed with
+/// the Raft sequencing layer at startup.
 #[async_trait]
 pub trait DatastoreSnapshotter: Send + Sync {
     /// Backend kind identifier string (e.g. "redb", "sqlite").

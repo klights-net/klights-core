@@ -1,9 +1,9 @@
-//! Role-aware ReplicatedDatastore wrapper (DSB-HA-02).
+//! Replication-owned immutable datastore sequencing facade.
 //!
-//! In production, every `DatastoreHandle` is a `ReplicatedDatastore`.
-//! `DatastoreBackend` is the public runtime contract, satisfied by
-//! `ReplicatedDatastore`; legacy local `StorageCommand` apply support is
-//! test-only cleanup debt.
+//! Normal application consumers receive this compatibility facade while Raft
+//! proposal materialization, snapshotting, and committed state-machine apply
+//! retain the passive backend. The proposal capability is immutable and
+//! complete at construction, so there is no late-bound or fallback write path.
 //!
 //! ## Architecture
 //!
@@ -11,30 +11,32 @@
 //! API/controller write
 //!         │
 //!         ▼
-//! ReplicatedDatastore (implements DatastoreBackend)
+//! SequencedDatastore (implements DatastoreBackend)
 //!         │
-//!         ├── SingleNode/Raft: require_raft_proposer → propose through raft
+//!         ├── immutable RaftProposal → propose through raft
 //!         │
 //!         ▼
-//! Datastore (inherent methods — actual SQL execution)
+//! passive DatastoreBackend (reads + committed persistence)
 //! ```
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::command::{CommandMeta, StorageCommand};
+#[cfg(test)]
+use crate::datastore::command::CommandMeta;
+use crate::datastore::command::StorageCommand;
 #[cfg(test)]
 use crate::datastore::types::{ReplicatedCreateOptions, ResourcePatchRequest};
 
 mod backend_impl;
 
 // ---------------------------------------------------------------------------
-// RaftProposer — late-bound binding from ReplicatedDatastore to RaftNode.
+// RaftProposal — replication-private capability from the sequencer to RaftNode.
 //
-// P3-11c4: in Raft mode, the wrapper's mutation methods route every
-// StorageCommand through `RaftProposer::propose_command`. The proposer
+// The facade's mutation methods route every StorageCommand through
+// `RaftProposal::propose_command`. The proposal capability
 // encodes the command as an `OutboxPayload` and submits it to openraft's
 // `client_write`. openraft replicates it to peers and then drives the
 // state machine's apply, which calls the backend raft log-apply surface to
@@ -45,12 +47,11 @@ mod backend_impl;
 // applied it. Concrete impl lives in `crate::datastore::raft::node`.
 // ---------------------------------------------------------------------------
 
-/// Late-bound handle to the cluster's Raft consensus engine. The wrapper's
-/// mutation methods use this in `ReplicationMode::Raft` to route writes
-/// through `Raft::client_write` instead of touching the inner backend
-/// directly.
+/// Immutable, replication-private handle to the cluster's Raft consensus
+/// engine. This is deliberately not a second public leader command contract;
+/// application command admission remains in `klights-leader-api`.
 #[async_trait]
-pub trait RaftProposer: Send + Sync {
+pub(crate) trait RaftProposal: Send + Sync {
     /// Submit a `StorageCommand` for replication and apply. Returns once
     /// openraft has committed the entry and the state machine has applied
     /// it to the local backend. Non-leader voters refuse before local
@@ -114,45 +115,13 @@ pub trait RaftProposer: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// ReplicationMode
-// ---------------------------------------------------------------------------
-
-/// Cluster replication mode for the `ReplicatedDatastore` wrapper.
-///
-/// T7.2/T7.7: `LeaderFollower` removed. Every cluster.db write goes
-/// through raft — `Raft` for leader-class boots, `SingleNode` (N=1
-/// raft) for workers that can promote when CPs join.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReplicationMode {
-    SingleNode { node_name: String },
-    Raft { node_name: String },
-}
-
-impl ReplicationMode {
-    pub fn node_name(&self) -> &str {
-        match self {
-            ReplicationMode::SingleNode { node_name } => node_name,
-            ReplicationMode::Raft { node_name } => node_name,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // WriteRejection
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum WriteRejection {
+pub(crate) enum WriteRejection {
     #[error("this node is a follower and does not accept writes; redirect to leader")]
     FollowerWrite,
-    #[error("write rejected: {0}")]
-    Other(String),
-}
-
-impl WriteRejection {
-    pub fn status_code(&self) -> u16 {
-        503
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,88 +144,25 @@ pub trait DatastoreApplier: Send + Sync {
 // generic storage-forward shim. Workers now route writes through outbox
 // -> ApplyOutbox via the LeaderApiClient surface.
 
-pub type ReplicationObserverFn = Arc<dyn Fn(StorageCommand, CommandMeta) + Send + Sync>;
-
-#[derive(Clone, Default)]
-pub struct ReplicationObserver {
-    inner: Arc<tokio::sync::RwLock<Option<ReplicationObserverFn>>>,
-}
-
-impl ReplicationObserver {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub async fn set(&self, observer: ReplicationObserverFn) {
-        *self.inner.write().await = Some(observer);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// ReplicatedDatastore
+// SequencedDatastore
 // ---------------------------------------------------------------------------
 
-pub struct ReplicatedDatastore {
-    inner: Arc<dyn DatastoreBackend>,
-    raft_proposer: OnceLock<Arc<dyn RaftProposer>>,
+pub(crate) struct SequencedDatastore {
+    passive: Arc<dyn DatastoreBackend>,
+    proposal: Arc<dyn RaftProposal>,
 }
 
-/// T7.2: Typed error when a ReplicatedDatastore write is attempted
-/// without an attached RaftProposer. Every cluster.db write must go
-/// through raft — even single-node deployments run N=1 raft and can
-/// promote when additional control planes join.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum RaftWriteError {
-    #[error(
-        "raft proposer not attached; cluster.db write rejected — leader must bind proposer before accepting writes"
-    )]
-    MissingProposer,
-}
-
-impl ReplicatedDatastore {
-    pub fn new(inner: Arc<dyn DatastoreBackend>, mode: ReplicationMode) -> Self {
-        Self::with_observer(inner, mode, None)
+impl SequencedDatastore {
+    pub(crate) fn new(passive: Arc<dyn DatastoreBackend>, proposal: Arc<dyn RaftProposal>) -> Self {
+        Self { passive, proposal }
     }
 
-    pub fn with_observer(
-        inner: Arc<dyn DatastoreBackend>,
-        _mode: ReplicationMode,
-        _observer: Option<ReplicationObserver>,
-    ) -> Self {
-        Self {
-            inner,
-            raft_proposer: OnceLock::new(),
-        }
-    }
-
-    /// Late-bind the RaftProposer that the Raft-mode mutation arms route
-    /// writes through. Idempotent: a second call with a different proposer
-    /// is a silent no-op (the first wins). Must be invoked once after the
-    /// RaftNode is constructed in the bootstrap path.
-    pub fn set_raft_proposer(&self, proposer: Arc<dyn RaftProposer>) {
-        let _ = self.raft_proposer.set(proposer);
-    }
-
-    /// T7.2: Require a raft proposer for every cluster.db write. Every
-    /// replication mode (including SingleNode, which is N=1 raft) routes
-    /// writes through the proposer. A single node can promote to a
-    /// multi-voter cluster when additional control planes join.
-    pub(crate) fn require_raft_proposer(&self) -> Result<Arc<dyn RaftProposer>> {
-        self.raft_proposer
-            .get()
-            .cloned()
-            .ok_or_else(|| anyhow!(RaftWriteError::MissingProposer))
-    }
-
-    /// Encode `command` as an `OutboxPayload` protobuf and submit through
-    /// the installed RaftProposer. Returns when openraft has committed the
-    /// entry and the state machine has applied it.
-    pub(crate) async fn propose_command_via_raft(
+    async fn propose_command(
         &self,
-        proposer: &Arc<dyn RaftProposer>,
         command: StorageCommand,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        proposer.propose_command(command).await
+        self.proposal.propose_command(command).await
     }
 }
 
@@ -645,15 +551,15 @@ where
 
 #[cfg(test)]
 #[async_trait]
-impl DatastoreApplier for ReplicatedDatastore {
+impl DatastoreApplier for SequencedDatastore {
     async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()> {
-        apply_command_to_backend(self.inner.as_ref(), cmd, meta).await
+        apply_command_to_backend(self.passive.as_ref(), cmd, meta).await
     }
 }
 
-// Delegate every DatastoreBackend method to self.inner.
-// Public reads and writes check replication mode first. Replication apply
-// bypasses public admission and writes leader data to the local backend.
+// Delegate every DatastoreBackend method to self.passive. Public mutation
+// methods sequence through the immutable proposal capability; committed apply
+// bypasses public admission and writes replicated data to the passive backend.
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "sequenced_datastore/tests.rs"]
 mod tests;

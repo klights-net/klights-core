@@ -13,6 +13,7 @@
 pub mod apply;
 pub mod grpc;
 pub mod protocol;
+pub(crate) mod sequenced_datastore;
 pub mod service;
 pub mod snapshot;
 pub mod snapshot_commit_channel_sink;

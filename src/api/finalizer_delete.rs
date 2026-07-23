@@ -697,7 +697,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::datastore::replicated::RaftProposer for OrphanFinalizerReinjectingProposer {
+    impl crate::replication::sequenced_datastore::RaftProposal for OrphanFinalizerReinjectingProposer {
         async fn propose_command(
             &self,
             command: StorageCommand,
@@ -740,17 +740,14 @@ mod tests {
     async fn orphan_delete_retries_when_raft_race_reintroduces_internal_orphan_finalizer() {
         let inner: crate::datastore::backend::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        let db = crate::datastore::replicated::ReplicatedDatastore::new(
-            inner.clone(),
-            crate::datastore::replicated::ReplicationMode::Raft {
-                node_name: "test-node".to_string(),
-            },
-        );
         let proposer = Arc::new(OrphanFinalizerReinjectingProposer {
-            inner,
+            inner: inner.clone(),
             reinjected: AtomicBool::new(false),
         });
-        db.set_raft_proposer(proposer.clone());
+        let db = crate::replication::sequenced_datastore::SequencedDatastore::new(
+            inner,
+            proposer.clone(),
+        );
 
         db.create_namespace(
             "orphan-raft-race",

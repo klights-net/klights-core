@@ -669,11 +669,11 @@ fn local_commit_materialization_allowed(
     current_leader: Option<NodeId>,
     voter_ids: &BTreeSet<NodeId>,
 ) -> bool {
-    current_leader == Some(node_id)
+    (current_leader == Some(node_id) && voter_ids.contains(&node_id))
         || (current_leader.is_none() && voter_ids.len() == 1 && voter_ids.contains(&node_id))
 }
 
-/// `RaftProposer` impl that lets `ReplicatedDatastore::Raft` mutations
+/// Replication-private proposal capability used by the sequencing facade to
 /// build a `LogApplyCommit` on the leader and submit the encoded commit
 /// through openraft's `client_write`. Generic `propose_command` uses the
 /// ledger-free command builder; worker outbox writes use the separate
@@ -681,7 +681,7 @@ fn local_commit_materialization_allowed(
 /// leader, voter follower, and learner — is the only caller of
 /// `apply_commit_in_tx` after raft commits the entry.
 #[async_trait]
-impl crate::datastore::replicated::RaftProposer for RaftNode {
+impl crate::replication::sequenced_datastore::RaftProposal for RaftNode {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
@@ -1798,7 +1798,7 @@ mod tests {
     #[tokio::test]
     async fn follower_raft_proposer_refuses_before_local_commit_materialization() {
         use crate::datastore::raft::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
@@ -1913,7 +1913,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_proposer_cleans_placeholder_when_materialized_commit_is_rejected() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = DbExecutor::open_with_opts(
@@ -2011,6 +2011,16 @@ mod tests {
     }
 
     #[test]
+    fn local_commit_materialization_rejects_self_leader_metric_when_self_is_not_voter() {
+        let voter_ids = std::collections::BTreeSet::from([20]);
+
+        assert!(
+            !super::local_commit_materialization_allowed(10, Some(10), &voter_ids),
+            "learner/replica must not materialize proposals even if metrics are inconsistent"
+        );
+    }
+
+    #[test]
     fn local_commit_materialization_rejects_known_other_leader() {
         let voter_ids = std::collections::BTreeSet::from([10, 20]);
 
@@ -2089,7 +2099,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())
@@ -2151,7 +2161,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_node_propose_command_does_not_create_applied_outbox_placeholder() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(92).await;
         node.bootstrap_single_voter("https://10.99.0.92:7679".into())
@@ -2206,7 +2216,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_create_resource_rejects_duplicate_name() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(91).await;
         node.bootstrap_single_voter("https://10.99.0.91:7679".into())
@@ -3007,7 +3017,7 @@ mod tests {
     /// would make this test fail (rv would advance during the timeout window).
     #[tokio::test]
     async fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(70).await;
         node.bootstrap_single_voter("https://10.99.0.70:7679".into())
@@ -3060,7 +3070,7 @@ mod tests {
     /// an RV backlog ahead of raft progress.
     #[tokio::test]
     async fn raft_pod_status_outbox_waits_for_flow_control_without_reserving_rv() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(75).await;
         node.bootstrap_single_voter("https://10.99.0.75:7679".into())
@@ -3117,8 +3127,8 @@ mod tests {
 
     #[tokio::test]
     async fn raft_critical_outbox_uses_reserved_permit_when_general_gate_is_saturated() {
-        use crate::datastore::replicated::RaftProposer;
         use crate::kubelet::outbox::payload::OutboxOperation;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(76).await;
         node.bootstrap_single_voter("https://10.99.0.76:7679".into())
@@ -3217,7 +3227,7 @@ mod tests {
     /// not the smaller payload-entries value.
     #[tokio::test]
     async fn at_most_max_inflight_raft_proposals_are_in_flight() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(71).await;
         node.bootstrap_single_voter("https://10.99.0.71:7679".into())
@@ -3273,7 +3283,7 @@ mod tests {
     /// RAII guard handles this naturally on every error-return path.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_materialization_failure() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, backend) = fresh_node(72).await;
         node.bootstrap_single_voter("https://10.99.0.72:7679".into())
@@ -3360,7 +3370,7 @@ mod tests {
     /// can proceed.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_terminal_success() {
-        use crate::datastore::replicated::RaftProposer;
+        use crate::replication::sequenced_datastore::RaftProposal;
 
         let (node, _backend) = fresh_node(74).await;
         node.bootstrap_single_voter("https://10.99.0.74:7679".into())

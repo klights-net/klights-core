@@ -1883,13 +1883,6 @@ impl crate::datastore::BackendLifecycleStore for RedbDatastore {
     fn close(&self) {
         crate::datastore::DatastoreBackend::close(self);
     }
-
-    fn attach_raft_proposer(
-        &self,
-        proposer: std::sync::Arc<dyn crate::datastore::replicated::RaftProposer>,
-    ) {
-        crate::datastore::DatastoreBackend::attach_raft_proposer(self, proposer);
-    }
 }
 
 #[cfg(test)]

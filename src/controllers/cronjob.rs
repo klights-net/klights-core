@@ -582,7 +582,8 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    async fn make_raft_cronjob_datastore() -> crate::datastore::replicated::ReplicatedDatastore {
+    async fn make_raft_cronjob_datastore()
+    -> crate::replication::sequenced_datastore::SequencedDatastore {
         use crate::datastore::backend::DatastoreHandle;
         use crate::datastore::command::StorageCommand;
         use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
@@ -592,7 +593,7 @@ mod tests {
         }
 
         #[async_trait]
-        impl crate::datastore::replicated::RaftProposer for InlineProposer {
+        impl crate::replication::sequenced_datastore::RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
@@ -649,14 +650,10 @@ mod tests {
 
         let inner = crate::datastore::test_support::in_memory().await;
         let handle: DatastoreHandle = Arc::new(inner);
-        let ds = crate::datastore::replicated::ReplicatedDatastore::new(
+        crate::replication::sequenced_datastore::SequencedDatastore::new(
             handle.clone(),
-            crate::datastore::replicated::ReplicationMode::Raft {
-                node_name: "cronjob-test-node".to_string(),
-            },
-        );
-        ds.set_raft_proposer(Arc::new(InlineProposer { inner: handle }));
-        ds
+            Arc::new(InlineProposer { inner: handle }),
+        )
     }
 
     #[tokio::test]

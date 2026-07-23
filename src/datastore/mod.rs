@@ -7,9 +7,6 @@
 pub mod backend;
 pub mod backend_kind;
 pub(crate) mod cluster_store_adapter;
-// DSB-HA-01 ships the types and codecs; DSB-HA-02 (ReplicatedDatastore)
-// will be the first production consumer.  Suppress dead-code warnings until
-// then.
 pub mod command;
 pub mod diagnostics;
 pub mod domain;
@@ -20,7 +17,6 @@ pub(crate) mod position_membership;
 pub mod raft;
 pub mod redb;
 pub(crate) mod replay_retention;
-pub mod replicated;
 pub mod resource_version_assignment;
 pub mod selector;
 pub mod snapshot;
