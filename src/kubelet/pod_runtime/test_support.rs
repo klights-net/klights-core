@@ -2541,12 +2541,6 @@ pub struct PodDeletionFinalizerHarness {
         std::sync::Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
 }
 
-/// Harness for `PodApiFacade` tests (Task 6).
-pub struct PodApiFacadeHarness {
-    pub repo: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
-    pub api: std::sync::Arc<crate::kubelet::pod_api::PodApiFacade>,
-}
-
 #[test]
 fn pod_runtime_test_fixtures_compile() {
     let _ = pod_json("a", "b", "c", "d");

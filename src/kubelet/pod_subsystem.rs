@@ -699,8 +699,6 @@ mod tests {
         // Composition root
         let _ = std::any::type_name::<crate::kubelet::pod_subsystem::PodSubsystem>();
         let _ = std::any::type_name::<crate::kubelet::pod_subsystem::PodSubsystemConfig>();
-        // API facade
-        let _ = std::any::type_name::<crate::kubelet::pod_api::PodApiFacade>();
         // Lifecycle service
         let _ = std::any::type_name::<crate::kubelet::pod_lifecycle_service::PodLifecycleService>();
         // Runtime service port

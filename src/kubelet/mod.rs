@@ -28,8 +28,6 @@ pub mod pod_fs;
 pub mod pod_hosts;
 pub mod pod_manager;
 // pub mod pod_owner_reconcile; // removed — events flow top-down only
-#[cfg(test)]
-pub mod pod_api;
 pub mod pod_repository;
 pub mod pod_resources;
 #[cfg(test)]
