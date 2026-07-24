@@ -5903,6 +5903,11 @@ mod tests {
 
         for (error, expected_code, expected_message) in [
             (
+                Error::NotLeader,
+                tonic::Code::FailedPrecondition,
+                "not raft leader",
+            ),
+            (
                 Error::Unauthorized,
                 tonic::Code::PermissionDenied,
                 "projected token issuance requires the node identity bound to the Pod",

@@ -38,6 +38,85 @@ use crate::kubelet::outbox::OutboxApplyError;
 use crate::kubelet::pod_repository::store::PodStore;
 
 #[cfg(test)]
+type ProjectedTokenAsyncBoundary = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ProjectedTokenIssueTestProbe {
+    async_boundary: ProjectedTokenAsyncBoundary,
+    sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+struct ProjectedTokenIssueTestRegistration {
+    namespace: String,
+    sign_attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ProjectedTokenIssueTestRegistration {
+    fn sign_attempts(&self) -> usize {
+        self.sign_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProjectedTokenIssueTestRegistration {
+    fn drop(&mut self) {
+        projected_token_issue_test_probes()
+            .lock()
+            .expect("projected-token test probe lock")
+            .remove(&self.namespace);
+    }
+}
+
+#[cfg(test)]
+fn projected_token_issue_test_probes()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, ProjectedTokenIssueTestProbe>> {
+    static PROBES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ProjectedTokenIssueTestProbe>>,
+    > = std::sync::OnceLock::new();
+    PROBES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_projected_token_issue_test_probe(
+    namespace: String,
+    async_boundary: ProjectedTokenAsyncBoundary,
+) -> ProjectedTokenIssueTestRegistration {
+    let sign_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replaced = projected_token_issue_test_probes()
+        .lock()
+        .expect("projected-token test probe lock")
+        .insert(
+            namespace.clone(),
+            ProjectedTokenIssueTestProbe {
+                async_boundary,
+                sign_attempts: sign_attempts.clone(),
+            },
+        );
+    assert!(replaced.is_none(), "projected-token test namespace reused");
+    ProjectedTokenIssueTestRegistration {
+        namespace,
+        sign_attempts,
+    }
+}
+
+#[cfg(test)]
+fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIssueTestProbe> {
+    projected_token_issue_test_probes()
+        .lock()
+        .expect("projected-token test probe lock")
+        .get(namespace)
+        .cloned()
+}
+
+#[cfg(test)]
 use crate::control_plane::client::{ResourceQueryConsistency, pod_get_request};
 
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
@@ -126,11 +205,23 @@ impl LeadershipGenerationFence {
     }
 
     fn ensure_unchanged(&self) -> Result<(), ProjectedServiceAccountTokenError> {
-        if self.receiver.has_changed().unwrap_or(true) || !*self.receiver.borrow() {
+        let current = self.receiver.borrow();
+        if !*current || self.receiver.has_changed().unwrap_or(true) {
             Err(ProjectedServiceAccountTokenError::NotLeader)
         } else {
             Ok(())
         }
+    }
+
+    fn sign_if_unchanged<T>(
+        &self,
+        sign: impl FnOnce() -> T,
+    ) -> Result<T, ProjectedServiceAccountTokenError> {
+        let current = self.receiver.borrow();
+        if !*current || self.receiver.has_changed().unwrap_or(true) {
+            return Err(ProjectedServiceAccountTokenError::NotLeader);
+        }
+        Ok(sign())
     }
 }
 
@@ -141,12 +232,16 @@ impl LocalApiClient {
     ) -> ProjectedServiceAccountTokenFuture<'_> {
         Box::pin(async move {
             let leadership = LeadershipGenerationFence::sample(self.is_leader_rx.clone())?;
+            #[cfg(test)]
+            if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
+                (probe.async_boundary)().await;
+            }
             let signing_key_pem = crate::auth::read_service_account_signing_key_async(
                 &self.file_process,
                 &self.containerd_namespace,
             )
-            .await
-            .map_err(|error| {
+            .await;
+            let signing_key_pem = signing_key_pem.map_err(|error| {
                 ProjectedServiceAccountTokenError::signing_failed(format!(
                     "ServiceAccount signing key for {} is unavailable: {error}",
                     self.containerd_namespace
@@ -163,10 +258,20 @@ impl LocalApiClient {
             .await;
             leadership.ensure_unchanged()?;
             let claims = claims?;
-            crate::control_plane::service_account_tokens::sign_authorized_projected_service_account_token(
-                &signing_key_pem,
-                claims,
-            )
+            leadership.sign_if_unchanged(|| {
+                #[cfg(test)]
+                if let Some(probe) =
+                    projected_token_issue_test_probe(&self.containerd_namespace)
+                {
+                    probe
+                        .sign_attempts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::control_plane::service_account_tokens::sign_authorized_projected_service_account_token(
+                    &signing_key_pem,
+                    claims,
+                )
+            })?
         })
     }
 
@@ -2325,6 +2430,50 @@ mod inner_gate_tests {
     }
 
     #[test]
+    fn projected_token_signing_fence_blocks_demotion_until_signing_finishes() {
+        let (leadership_tx, leadership_rx) = watch::channel(true);
+        let _leadership_keepalive = leadership_rx.clone();
+        let fence = LeadershipGenerationFence::sample(leadership_rx).expect("initial leader");
+        let (signing_entered_tx, signing_entered_rx) = std::sync::mpsc::channel();
+        let (release_signing_tx, release_signing_rx) = std::sync::mpsc::channel();
+        let signing = std::thread::spawn(move || {
+            fence.sign_if_unchanged(|| {
+                signing_entered_tx.send(()).unwrap();
+                release_signing_rx.recv().unwrap();
+                "signed"
+            })
+        });
+        signing_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("signing operation did not enter its fenced section");
+
+        let (transition_started_tx, transition_started_rx) = std::sync::mpsc::channel();
+        let (transition_done_tx, transition_done_rx) = std::sync::mpsc::channel();
+        let transition = std::thread::spawn(move || {
+            transition_started_tx.send(()).unwrap();
+            leadership_tx.send(false).unwrap();
+            leadership_tx.send(true).unwrap();
+            transition_done_tx.send(()).unwrap();
+        });
+        transition_started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("leadership transition did not start");
+        assert!(
+            transition_done_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "demotion must not linearize while synchronous signing holds the fence"
+        );
+
+        release_signing_tx.send(()).unwrap();
+        assert_eq!(signing.join().unwrap(), Ok("signed"));
+        transition_done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("leadership transition did not finish after signing released the fence");
+        transition.join().unwrap();
+    }
+
+    #[test]
     fn projected_token_leadership_fence_accepts_only_stable_generation() {
         let (_tx, rx) = watch::channel(true);
         let fence = LeadershipGenerationFence::sample(rx).expect("initial leader");
@@ -2335,6 +2484,90 @@ mod inner_gate_tests {
             LeadershipGenerationFence::sample(rx),
             Err(ProjectedServiceAccountTokenError::NotLeader)
         ));
+    }
+
+    #[tokio::test]
+    async fn projected_token_full_issuance_rejects_demotion_and_aba_before_signing() {
+        for transitions in [&[false][..], &[false, true][..]] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let reader = {
+                let entered = entered.clone();
+                let release = release.clone();
+                Arc::new(move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    let future: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send + 'static>,
+                    > = Box::pin(async move {
+                        entered.notify_one();
+                        release.notified().await;
+                    });
+                    future
+                })
+            };
+            let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+            let (leadership_tx, leadership_rx) = watch::channel(true);
+            let data_root = tempfile::tempdir().unwrap();
+            let namespace = data_root.path().to_str().unwrap().to_string();
+            crate::utils::create_dir_all(crate::paths::etc_dir_path(&namespace)).unwrap();
+            crate::utils::write_file(
+                crate::paths::service_account_signing_key_path(&namespace),
+                "unused-test-signing-key",
+            )
+            .unwrap();
+            let sign_probe = install_projected_token_issue_test_probe(namespace.clone(), reader);
+            let client = Arc::new(
+                LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+                    db,
+                    "node-a".to_string(),
+                    namespace,
+                    Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+                    leadership_rx,
+                    crate::kubelet::file_blocking::test_file_process_executor(),
+                ),
+            );
+            let request = ProjectedServiceAccountTokenRequest::try_new(
+                "default",
+                "default",
+                vec!["api".to_string()],
+                3_600,
+                "pod-a",
+                "pod-uid-a",
+                "node-a",
+                Some("node-uid-a".to_string()),
+            )
+            .unwrap();
+            let issue = {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .issue_projected_token_after_transport_auth(request)
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                .await
+                .expect("signing-key reader did not enter its async boundary");
+            for state in transitions {
+                leadership_tx.send(*state).unwrap();
+            }
+            release.notify_one();
+
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), issue)
+                    .await
+                    .expect("issuance did not finish after releasing signing-key reader")
+                    .unwrap(),
+                Err(ProjectedServiceAccountTokenError::NotLeader),
+                "full issuance must reject leadership transition {transitions:?}"
+            );
+            assert_eq!(
+                sign_probe.sign_attempts(),
+                0,
+                "synchronous signing must not be invoked after {transitions:?}"
+            );
+        }
     }
 
     async fn seed_projected_token_adapter_resources(db: &dyn DatastoreBackend) {

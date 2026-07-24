@@ -41,6 +41,10 @@ mod cases {
 
         for (status, expected) in [
             (
+                tonic::Status::failed_precondition("not raft leader"),
+                Error::NotLeader,
+            ),
+            (
                 tonic::Status::permission_denied("wrong caller node"),
                 Error::Unauthorized,
             ),
