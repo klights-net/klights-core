@@ -103,6 +103,10 @@ pub struct ReplicatedSnapshotMetadata {
     /// Snapshot-only mode metadata. `None` preserves callers that restore
     /// cluster identity without carrying the RV-assignment envelope.
     pub resource_version_assignment_mode: Option<crate::log_apply::ResourceVersionAssignment>,
+    /// Exact command-codec activation proof captured with the authoritative
+    /// snapshot. `None` is fail-closed and removes any destination-local
+    /// marker; only `Some(3)` may reopen proposal capability after restore.
+    pub command_codec_activation_version: Option<u32>,
     /// Retains whether a Raft snapshot omitted the assignment-mode field.
     /// Older non-Raft callers may continue to use the explicit legacy field.
     pub snapshot_assignment_mode:

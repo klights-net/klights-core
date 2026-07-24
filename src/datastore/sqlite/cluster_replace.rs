@@ -150,6 +150,30 @@ fn replace_resource_state_in_conn(
             ],
         )?;
     }
+    if let Some(metadata) = metadata.as_ref() {
+        match metadata.command_codec_activation_version {
+            Some(3) => {
+                tx.execute(
+                    queries::UPSERT_KLIGHTS_META,
+                    rusqlite::params![
+                        crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION,
+                        "3"
+                    ],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM _klights_meta WHERE key = ?1",
+                    [crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION],
+                )?;
+            }
+            Some(other) => {
+                return Err(other_error(format!(
+                    "snapshot command codec activation version must be exact v3, got {other}"
+                )));
+            }
+        }
+    }
     tx.execute(queries::REPLACE_STATE_DELETE_WATCH_EVENTS, [])?;
     tx.execute("DELETE FROM watch_replay_floors", [])?;
     // Snapshot replacement is authoritative. Reset the local allocator before
@@ -603,20 +627,33 @@ pub(crate) fn apply_commit_in_tx_for_raft(
         && !is_uncommitted_outbox_placeholder(&existing)
     {
         let result = storage_result_from_applied_outbox(&existing)?;
-        let outcome = committed_outcome_from_storage_result(
+        if result.error_message.is_some() {
+            let outcome = committed_outcome_from_storage_result(
+                result,
+                false,
+                klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
+            )?;
+            return RaftLogApplyOutcome::try_new(
+                outcome,
+                Vec::new(),
+                pod_endpoint_effect(
+                    pod_target.as_ref(),
+                    pod_before.as_ref(),
+                    pod_before.as_ref(),
+                ),
+            );
+        }
+        let resource_version = result.applied_rv.ok_or_else(|| {
+            other_error("duplicate applied_outbox row has no applied resourceVersion")
+        })?;
+        return Ok(RaftLogApplyOutcome {
             result,
-            false,
-            klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
-        )?;
-        return RaftLogApplyOutcome::try_new(
-            outcome,
-            Vec::new(),
-            pod_endpoint_effect(
-                pod_target.as_ref(),
-                pod_before.as_ref(),
-                pod_before.as_ref(),
-            ),
-        );
+            committed_outcome: klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                resource_version,
+                reason: klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
+            },
+            pending: Vec::new(),
+        });
     }
 
     // A duplicate watermark has already been applied. Do not allocate a V1
@@ -703,6 +740,42 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     tx.execute("SAVEPOINT raft_apply_attempt", [])?;
     match apply_commit_in_tx_returning_rv_and_mutation(tx, commit, resource_precondition_mode) {
         Ok((rv, pending, applied_mutation)) => {
+            if let (
+                Some(template),
+                Some(crate::datastore::raft::types::AppliedMutation::Resource(resource)),
+            ) = (outbox_template.as_ref(), applied_mutation.as_ref())
+                && template.operation
+                    == crate::kubelet::outbox::payload::OutboxOperation::PodMetadata.as_str()
+                && resource.api_version == "v1"
+                && resource.kind == "Pod"
+            {
+                let result_proto = crate::storage_wire_codec::encode_response_protobuf(
+                    &crate::datastore::command::StorageResponse::Resource {
+                        resource_version: resource.resource_version,
+                        data: (*resource.data).clone(),
+                    },
+                )
+                .map_err(|error| {
+                    other_error(format!(
+                        "failed to encode durable actor-finalization receipt: {error}"
+                    ))
+                })?;
+                tx.execute(
+                    queries::APPLIED_OUTBOX_UPDATE_RESULT,
+                    rusqlite::params![
+                        &template.idempotency_key,
+                        &template.subject_key,
+                        rv,
+                        result_proto,
+                        template.status_stamp
+                    ],
+                )?;
+                if tx.changes() != 1 {
+                    return Err(other_error(
+                        "committed actor-finalization receipt had no applied_outbox ledger row",
+                    ));
+                }
+            }
             tx.execute("RELEASE raft_apply_attempt", [])?;
             let after_position = WatchReplayPosition {
                 resource_version: Datastore::current_resource_version_in_tx(tx)?,
@@ -905,7 +978,7 @@ pub(crate) fn apply_commit_in_tx_returning_rv(
     Ok((applied_rv, pending))
 }
 
-fn apply_commit_in_tx_returning_rv_and_mutation(
+pub(crate) fn apply_commit_in_tx_returning_rv_and_mutation(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     resource_precondition_mode: ResourcePreconditionMode,
@@ -1017,6 +1090,16 @@ fn applied_mutation_from_stamped_commit(
     }) else {
         return Ok(None);
     };
+    let source_resource_version = deleted_key
+        .precondition_resource_version
+        .unwrap_or(watch_row.resource_version);
+    let mut data = watch_row.data.clone();
+    if let Some(metadata) = data
+        .pointer_mut("/metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        metadata.remove("resourceVersion");
+    }
     Ok(Some(
         crate::datastore::raft::types::AppliedMutation::Resource(Resource {
             id: 0,
@@ -1025,8 +1108,8 @@ fn applied_mutation_from_stamped_commit(
             namespace: watch_row.namespace.clone(),
             name: watch_row.name.clone(),
             uid: Resource::uid_from_data(&watch_row.data),
-            resource_version: watch_row.resource_version,
-            data: std::sync::Arc::new(watch_row.data.clone()),
+            resource_version: source_resource_version,
+            data: std::sync::Arc::new(data),
         }),
     ))
 }
@@ -1220,6 +1303,23 @@ fn storage_result_from_applied_outbox(
                 error_message: Some(message),
                 public_resource_changed: false,
                 applied_mutation: None,
+                pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
+            })
+        }
+        Ok(crate::datastore::command::StorageResponse::Resource {
+            resource_version,
+            data,
+        }) => {
+            let mut resource = crate::datastore::Resource::try_from_data(std::sync::Arc::new(data))
+                .map_err(|error| other_error(error.to_string()))?;
+            resource.resource_version = resource_version;
+            Ok(crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: row.applied_rv,
+                error_message: None,
+                public_resource_changed: false,
+                applied_mutation: Some(crate::datastore::raft::types::AppliedMutation::Resource(
+                    resource,
+                )),
                 pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
             })
         }
@@ -1546,6 +1646,7 @@ mod tests {
                 leader_epoch: 0,
                 membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
                 resource_version_assignment_mode: Some(ResourceVersionAssignment::CommittedApplyV1),
+                command_codec_activation_version: None,
                 snapshot_assignment_mode: None,
             }),
         )
@@ -1688,6 +1789,7 @@ mod tests {
                     leader_epoch: 0,
                     membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
                     resource_version_assignment_mode: None,
+                    command_codec_activation_version: None,
                     snapshot_assignment_mode: Some(
                         crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot,
                     ),
@@ -1774,6 +1876,7 @@ mod tests {
                     resource_version_assignment_mode: Some(
                         ResourceVersionAssignment::LegacyLeaderAssigned,
                     ),
+                    command_codec_activation_version: None,
                     snapshot_assignment_mode: None,
                 }),
             )

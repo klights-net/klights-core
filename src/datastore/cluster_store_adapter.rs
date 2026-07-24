@@ -661,6 +661,7 @@ impl DatastoreAuthoritativeSnapshotPersistence {
                         .map_or(0, |metadata| metadata.leader_epoch),
                     membership,
                     resource_version_assignment_mode: None,
+                    command_codec_activation_version: data.command_codec_activation_version,
                     snapshot_assignment_mode: Some(data.resource_version_assignment_mode),
                 }),
             )
@@ -737,6 +738,7 @@ impl AuthoritativeSnapshotPersistence for DatastoreAuthoritativeSnapshotPersiste
                             }
                         },
                         resource_version_assignment_mode: resource_version_assignment,
+                        command_codec_activation_version: None,
                         snapshot_assignment_mode,
                     }),
                 )
@@ -1083,6 +1085,7 @@ mod tests {
         };
         let header = SnapshotCaptureHeader::try_new(
             Some(ResourceVersionAssignment::LegacyLeaderAssigned),
+            None,
             WatchReplayPosition {
                 resource_version: 600,
                 event_id: 0,
@@ -1140,6 +1143,7 @@ mod tests {
                     resource_version_assignment_mode: Some(
                         ResourceVersionAssignment::CommittedApplyV1,
                     ),
+                    command_codec_activation_version: None,
                     snapshot_assignment_mode: None,
                 }),
             )
@@ -1156,6 +1160,7 @@ mod tests {
                     crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
                         ResourceVersionAssignment::CommittedApplyV1,
                     ),
+                command_codec_activation_version: None,
                 watch_event_high_water: Some(0),
                 watch_replay_floors: Some(Vec::new()),
                 cluster_metadata: Some(ClusterMetadata {
@@ -2023,6 +2028,7 @@ mod tests {
                 resource_version_assignment_mode: Some(
                     ResourceVersionAssignment::LegacyLeaderAssigned,
                 ),
+                command_codec_activation_version: None,
                 snapshot_assignment_mode: None,
             }),
         )
@@ -2834,6 +2840,7 @@ mod tests {
                 resource_version_assignment_mode: Some(
                     ResourceVersionAssignment::LegacyLeaderAssigned,
                 ),
+                command_codec_activation_version: None,
                 snapshot_assignment_mode: None,
             }),
         )
@@ -3089,6 +3096,7 @@ mod tests {
                     resource_version_assignment_mode: Some(
                         ResourceVersionAssignment::CommittedApplyV1,
                     ),
+                    command_codec_activation_version: None,
                     snapshot_assignment_mode: None,
                 }),
             )

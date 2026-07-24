@@ -84,6 +84,13 @@ pub fn validate_join_metadata(
     validate_join_metadata_with_endpoint(join, None)
 }
 
+fn require_worker_command_codec_v3(
+    join: &generated::JoinRequest,
+) -> std::result::Result<(), Status> {
+    crate::replication::protocol::require_command_codec_v3(join.supported_features, "worker")
+        .map_err(Status::failed_precondition)
+}
+
 fn observed_or_advertised_dataplane_endpoint(
     endpoint_override: Option<IpAddr>,
     advertised_endpoint: &str,
@@ -844,6 +851,7 @@ fn apply_outbox_error_response(
         other => other,
     };
     let error_type = match &error {
+        klights_leader_api::OutboxDeliveryError::CodecIncompatible { .. } => "CodecIncompatible",
         klights_leader_api::OutboxDeliveryError::Retryable(_) => "Retryable",
         klights_leader_api::OutboxDeliveryError::NotFound(_) => "NotFound",
         klights_leader_api::OutboxDeliveryError::UidMismatch { .. } => "UidMismatch",
@@ -1197,6 +1205,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 ));
             }
         };
+        require_worker_command_codec_v3(&join)?;
 
         let dataplane =
             validate_join_metadata_with_endpoint(&join, remote_addr.map(|addr| addr.ip()))
@@ -1630,8 +1639,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_controlplane_node_auth(&request, "resource command submissions")
             .await?;
         self.require_raft_leader()?;
-        let request = resource_command_request_from_proto(request.into_inner())
-            .map_err(resource_command_status)?;
+        let request = request.into_inner();
+        if !klights_cluster_core::supports_command_codec_version(request.codec_version) {
+            return Err(Status::failed_precondition(format!(
+                "resource command codec {} is incompatible with required codec {}",
+                request.codec_version,
+                klights_cluster_core::COMMAND_CODEC_VERSION
+            )));
+        }
+        let request =
+            resource_command_request_from_proto(request).map_err(resource_command_status)?;
         let result = self
             .ports
             .resource_command
@@ -1946,7 +1963,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let delivery_operation =
             klights_leader_api::OutboxDeliveryOperation::try_from_wire_name(&req.operation)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let delivery_request = klights_leader_api::OutboxDeliveryRequest::try_new(
+        let delivery_request = klights_leader_api::OutboxDeliveryRequest::try_new_versioned(
+            req.codec_version,
             req.idempotency_key,
             delivery_operation,
             std::sync::Arc::<[u8]>::from(req.payload_proto),
@@ -2218,7 +2236,13 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::RaftAppendEntriesRequest>,
     ) -> std::result::Result<Response<generated::RaftAppendEntriesResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
-        let payload = request.into_inner().payload;
+        let request = request.into_inner();
+        crate::replication::protocol::require_command_codec_v3(
+            request.supported_features,
+            "Raft append-entries peer",
+        )
+        .map_err(Status::failed_precondition)?;
+        let payload = request.payload;
         Ok(Response::new(generated::RaftAppendEntriesResponse {
             result: Some(
                 match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
@@ -2238,7 +2262,13 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::RaftVoteRequest>,
     ) -> std::result::Result<Response<generated::RaftVoteResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
-        let payload = request.into_inner().payload;
+        let request = request.into_inner();
+        crate::replication::protocol::require_command_codec_v3(
+            request.supported_features,
+            "Raft vote peer",
+        )
+        .map_err(Status::failed_precondition)?;
+        let payload = request.payload;
         Ok(Response::new(generated::RaftVoteResponse {
             result: Some(
                 match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| r.vote(payload.clone()))
@@ -2256,7 +2286,13 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::RaftInstallSnapshotRequest>,
     ) -> std::result::Result<Response<generated::RaftInstallSnapshotResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
-        let payload = request.into_inner().payload;
+        let request = request.into_inner();
+        crate::replication::protocol::require_command_codec_v3(
+            request.supported_features,
+            "Raft snapshot peer",
+        )
+        .map_err(Status::failed_precondition)?;
+        let payload = request.payload;
         Ok(Response::new(generated::RaftInstallSnapshotResponse {
             result: Some(
                 match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
@@ -3306,7 +3342,7 @@ mod tests {
     };
     use crate::replication::grpc::{
         generated::{self, JoinRequest, JoinRole, MetadataRequest, SnapshotRequest},
-        server::validate_join_metadata,
+        server::{require_worker_command_codec_v3, validate_join_metadata},
     };
 
     #[test]
@@ -3615,6 +3651,7 @@ mod tests {
             dataplane_port: 51_820,
             dataplane_mode: "root".to_string(),
             dataplane_encryption: "enabled".to_string(),
+            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
         }
     }
 
@@ -4004,6 +4041,7 @@ mod tests {
             client_id: "client".to_string(),
             stream_id: 1,
             stream_seq: 1,
+            codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
         });
         let result = client.apply_outbox(oversized).await;
         assert!(
@@ -4021,6 +4059,7 @@ mod tests {
             client_id: "client".to_string(),
             stream_id: 1,
             stream_seq: 1,
+            codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
         });
         if let Err(status) = client.apply_outbox(small).await {
             assert_ne!(
@@ -5100,6 +5139,7 @@ mod tests {
         let status = grpc
             .raft_append_entries(tonic::Request::new(generated::RaftAppendEntriesRequest {
                 payload: vec![],
+                supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
             }))
             .await
             .expect_err("unauthenticated raft RPC must be rejected");
@@ -5113,6 +5153,7 @@ mod tests {
             .submit_resource_command(request_with_node_client_cert(
                 generated::SubmitResourceCommandRequest {
                     command_protobuf: Vec::new(),
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-a",
             ))
@@ -5129,11 +5170,28 @@ mod tests {
             .submit_resource_command(request_with_controlplane_client_cert(
                 generated::SubmitResourceCommandRequest {
                     command_protobuf: Vec::new(),
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "cp2",
             ))
             .await
             .expect_err("follower must reject before decoding or mutating");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn submit_resource_command_rejects_pre_v3_controlplane_before_decode() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .submit_resource_command(request_with_controlplane_client_cert(
+                generated::SubmitResourceCommandRequest {
+                    command_protobuf: Vec::new(),
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION - 1,
+                },
+                "old-controlplane",
+            ))
+            .await
+            .expect_err("a pre-v3 control plane must fail before command decoding");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
@@ -5152,6 +5210,7 @@ mod tests {
                 generated::SubmitResourceCommandRequest {
                     command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
                         .expect("encode command"),
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "cp1",
             ))
@@ -5179,6 +5238,7 @@ mod tests {
                 generated::SubmitResourceCommandRequest {
                     command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
                         .expect("encode command"),
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "cp1",
             ))
@@ -5207,7 +5267,10 @@ mod tests {
 
         let status = grpc
             .raft_append_entries(request_with_join_token(
-                generated::RaftAppendEntriesRequest { payload: vec![] },
+                generated::RaftAppendEntriesRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                },
                 &token,
             ))
             .await
@@ -5221,6 +5284,7 @@ mod tests {
         let status = grpc
             .raft_vote(tonic::Request::new(generated::RaftVoteRequest {
                 payload: vec![],
+                supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
             }))
             .await
             .expect_err("unauthenticated raft vote must be rejected");
@@ -5238,12 +5302,31 @@ mod tests {
         let grpc = raft_test_server().await;
         let resp = grpc
             .raft_append_entries(request_with_controlplane_client_cert(
-                generated::RaftAppendEntriesRequest { payload: vec![] },
+                generated::RaftAppendEntriesRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                },
                 "controlplane-2",
             ))
             .await
             .expect("system:controlplanes node cert must authorize the raft peer");
         assert!(resp.into_inner().result.is_some());
+    }
+
+    #[tokio::test]
+    async fn raft_append_entries_rejects_authenticated_pre_v3_member_before_dispatch() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .raft_append_entries(request_with_controlplane_client_cert(
+                generated::RaftAppendEntriesRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::COMMITTED_APPLY_RV_V1,
+                },
+                "old-controlplane",
+            ))
+            .await
+            .expect_err("an authenticated pre-v3 member must not dispatch consensus commands");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -5257,7 +5340,10 @@ mod tests {
         let grpc = raft_test_server().await;
         let resp = grpc
             .raft_install_snapshot(request_with_controlplane_client_cert(
-                generated::RaftInstallSnapshotRequest { payload: vec![] },
+                generated::RaftInstallSnapshotRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                },
                 "controlplane-3",
             ))
             .await
@@ -5276,7 +5362,10 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_vote(request_with_node_client_cert(
-                generated::RaftVoteRequest { payload: vec![] },
+                generated::RaftVoteRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                },
                 "worker-1",
             ))
             .await
@@ -5289,7 +5378,10 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_append_entries(request_with_node_client_cert(
-                generated::RaftAppendEntriesRequest { payload: vec![] },
+                generated::RaftAppendEntriesRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                },
                 "worker-1",
             ))
             .await
@@ -5302,7 +5394,10 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_install_snapshot(request_with_admin_cert(
-                generated::RaftInstallSnapshotRequest { payload: vec![] },
+                generated::RaftInstallSnapshotRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                },
             ))
             .await
             .expect_err("admin cert must not authenticate the raft peer");
@@ -5415,6 +5510,7 @@ mod tests {
                     client_id: "worker-1".to_string(),
                     stream_id: 1,
                     stream_seq: 1,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-1",
             ))
@@ -5465,6 +5561,7 @@ mod tests {
                 client_id: "worker-1".to_string(),
                 stream_id: 1,
                 stream_seq: 2,
+                codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
             },
             "worker-1",
         ))
@@ -5483,6 +5580,7 @@ mod tests {
                     client_id: "worker-1".to_string(),
                     stream_id: 1,
                     stream_seq: 3,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-1",
             ))
@@ -5508,6 +5606,7 @@ mod tests {
                 client_id: "worker-1".to_string(),
                 stream_id: 1,
                 stream_seq: 4,
+                codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
             },
             "worker-1",
         ))
@@ -5562,6 +5661,7 @@ mod tests {
                     client_id: "worker-1".to_string(),
                     stream_id: 1,
                     stream_seq: 1,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-1",
             ))
@@ -5654,6 +5754,7 @@ mod tests {
                     client_id: "mn-controlplane2".to_string(),
                     stream_id: 1,
                     stream_seq: 1,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "mn-controlplane2",
             ))
@@ -5709,6 +5810,7 @@ mod tests {
                     client_id: String::new(),
                     stream_id: 0,
                     stream_seq: 0,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-1",
             ))
@@ -5991,6 +6093,7 @@ mod tests {
                     client_id: "client".to_string(),
                     stream_id: 1,
                     stream_seq: 1,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-1",
             ))
@@ -6013,6 +6116,18 @@ mod tests {
         let mut rootless = valid_join();
         rootless.dataplane_mode = "rootless".to_string();
         assert!(validate_join_metadata(&rootless).is_ok());
+    }
+
+    #[test]
+    fn worker_handshake_rejects_pre_v3_before_join_admission() {
+        let current = valid_join();
+        require_worker_command_codec_v3(&current).expect("v3 worker is admitted");
+
+        let mut old_worker = current;
+        old_worker.supported_features = crate::replication::protocol::COMMITTED_APPLY_RV_V1;
+        let status = require_worker_command_codec_v3(&old_worker)
+            .expect_err("a pre-v3 worker must fail the stream handshake");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
     #[test]
@@ -7256,6 +7371,7 @@ mod tests {
                     client_id: "client".to_string(),
                     stream_id: 1,
                     stream_seq: 1,
+                    codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "worker-1",
             ))

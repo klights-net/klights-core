@@ -48,16 +48,13 @@ fn pod_status_command(namespace: &str, name: &str, uid: &str) -> StorageCommand 
 }
 
 fn pod_delete_command(namespace: &str, name: &str, uid: &str) -> StorageCommand {
-    StorageCommand::DeleteResource {
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        namespace: Some(namespace.to_string()),
-        name: name.to_string(),
-        preconditions: ResourcePreconditions {
-            uid: Some(uid.to_string()),
-            resource_version: None,
-        },
-    }
+    crate::bound_pod_finalization_command::author(
+        namespace.to_string(),
+        name.to_string(),
+        uid.to_string(),
+        "worker-a".to_string(),
+        1,
+    )
 }
 
 fn event_create_command(namespace: &str, name: &str, uid: &str) -> StorageCommand {

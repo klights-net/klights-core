@@ -35,13 +35,29 @@ pub struct SqliteRaftStateMachine {
     lifecycle: Arc<dyn BackendLifecycleStore>,
     applied_state: Arc<dyn RaftAppliedStateDurability>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
 }
 
 impl SqliteRaftStateMachine {
+    #[cfg(test)]
     pub fn new(
         backend: Arc<dyn DatastoreBackend>,
         applied_state: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
+        Self::new_with_command_codec_activation(
+            backend,
+            applied_state,
+            supervisor,
+            Arc::new(super::node::CommandCodecV3Activation::inactive_for_state_machine_test()),
+        )
+    }
+
+    pub(crate) fn new_with_command_codec_activation(
+        backend: Arc<dyn DatastoreBackend>,
+        applied_state: Arc<dyn RaftAppliedStateDurability>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
     ) -> Self {
         let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
             backend.clone(),
@@ -55,8 +71,19 @@ impl SqliteRaftStateMachine {
             lifecycle,
             applied_state,
             supervisor,
+            command_codec_v3_activation,
         }
     }
+}
+
+fn commit_activates_command_codec_v3(commit: &crate::log_apply::LogApplyCommit) -> bool {
+    commit.mutations.iter().any(|mutation| {
+        matches!(
+            mutation,
+            crate::log_apply::LogApplyMutation::PutKlightsMeta { key, value }
+                if key == super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION && value == "3"
+        )
+    })
 }
 
 fn ioerr_read(e: impl std::fmt::Display) -> StorageError<NodeId> {
@@ -210,6 +237,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                     // byte-identical across the cluster.
                     let commit = crate::log_apply::decode_commit_protobuf(payload.as_slice())
                         .map_err(|e| apply_err(log_id, e))?;
+                    let activates_command_codec_v3 = commit_activates_command_codec_v3(&commit);
                     let port =
                         crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
                             self.backend.clone(),
@@ -221,6 +249,21 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                         )
                         .await
                         .map_err(|e| apply_err(log_id, e))?;
+                    if activates_command_codec_v3 {
+                        let persisted = self
+                            .backend
+                            .get_klights_meta(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+                            .await
+                            .map_err(|error| apply_err(log_id, error))?;
+                        if persisted.as_deref() != Some("3") {
+                            return Err(apply_err(
+                                log_id,
+                                "exact-v3 activation mutation did not persist its marker",
+                            ));
+                        }
+                        self.command_codec_v3_activation
+                            .mark_command_codec_v3_activated();
+                    }
                     out.push(result);
                 }
             }
@@ -285,6 +328,25 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         .map_err(|e| StorageError::IO {
             source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
         })?;
+        match self
+            .backend
+            .get_klights_meta(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .await
+            .map_err(ioerr_read)?
+            .as_deref()
+        {
+            Some("3") => self
+                .command_codec_v3_activation
+                .mark_command_codec_v3_activated(),
+            None => self
+                .command_codec_v3_activation
+                .clear_command_codec_v3_activation(),
+            Some(other) => {
+                return Err(ioerr_read(format!(
+                    "snapshot restored unsupported command codec activation version {other:?}"
+                )));
+            }
+        }
         let stored =
             StoredMembership::new(meta.last_log_id, meta.last_membership.membership().clone());
         self.write_applied_state(meta.last_log_id, Some(&stored))
@@ -464,6 +526,7 @@ mod tests {
                     resource_version_assignment_mode: Some(
                         crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
                     ),
+                    command_codec_activation_version: Some(3),
                     snapshot_assignment_mode: None,
                 }),
             )
@@ -530,6 +593,7 @@ mod tests {
                     resource_version_assignment_mode: Some(
                         crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
                     ),
+                    command_codec_activation_version: None,
                     snapshot_assignment_mode: None,
                 }),
             )
@@ -540,6 +604,20 @@ mod tests {
             .install_snapshot(&snapshot.meta, Box::new(Cursor::new(snapshot_bytes)))
             .await
             .expect("install snapshot");
+        assert_eq!(
+            backend_dst
+                .get_klights_meta(
+                    crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION,
+                )
+                .await
+                .expect("read restored codec activation marker")
+                .as_deref(),
+            Some("3")
+        );
+        assert!(
+            sm_dst.command_codec_v3_activation.is_activated(),
+            "snapshot install must atomically restore the persisted marker and reopen the shared gate"
+        );
 
         // Verify the dst backend now carries the same namespace + pod.
         let namespaces = backend_dst.list_namespaces(None, None).await.unwrap();

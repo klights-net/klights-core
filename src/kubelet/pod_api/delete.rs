@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crate::api::{AppError, DeleteOptions};
-use crate::kubelet::pod_repository::api::PodApiService;
 use crate::kubelet::pod_repository::types::PodApiDeleteOutcome;
+use crate::pod_api_service::PodApiService;
 
 pub struct PodApiDeleteService {
     api: Arc<PodApiService>,

@@ -1,5 +1,9 @@
 use super::*;
 use crate::api::AdmissionContextRequest;
+pub use crate::kubelet::cri_exec::{
+    AttachRequest, ExecRequest, ExecStreamOptions, attach_with_created_state_retry,
+    exec_sync_with_created_state_retry, exec_with_created_state_retry,
+};
 use klights_node_api::{
     ExecStreamOptions as NodeExecStreamOptions, NodeExec, NodeExecRequest, NodeExecTarget,
 };
@@ -29,31 +33,12 @@ pub fn exec_exit_status(exit_code: i32) -> serde_json::Value {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ExecStreamOptions {
-    pub stdin: bool,
-    pub stdout: bool,
-    pub stderr: bool,
-    pub tty: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct ExecTarget {
     pub namespace: String,
     pub pod_name: String,
     pub container_id: String,
     pub command: Vec<String>,
-}
-
-pub struct ExecRequest<'a> {
-    pub container_id: &'a str,
-    pub command: &'a [String],
-    pub stream_options: ExecStreamOptions,
-}
-
-pub struct AttachRequest<'a> {
-    pub container_id: &'a str,
-    pub stream_options: ExecStreamOptions,
 }
 
 struct LocalPodExecSpdyStreamRequest {
@@ -1040,194 +1025,6 @@ pub fn extract_container_id(
         .to_string();
 
     Ok(container_id)
-}
-
-pub async fn exec_sync_with_created_state_retry(
-    cri_client: &mut crate::kubelet::cri::CriClient,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    container_id: &str,
-    command: &[String],
-    timeout_seconds: i64,
-) -> anyhow::Result<k8s_cri::v1::ExecSyncResponse> {
-    use std::time::Duration;
-
-    let first = cri_client
-        .exec_sync(container_id, command, timeout_seconds)
-        .await;
-    if first
-        .as_ref()
-        .err()
-        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
-        != Some(true)
-    {
-        return first;
-    }
-
-    let _ = task_supervisor
-        .sleep(
-            "exec_sync_retry_created_state_250ms",
-            Duration::from_millis(250),
-        )
-        .await;
-    let second = cri_client
-        .exec_sync(container_id, command, timeout_seconds)
-        .await;
-    if second
-        .as_ref()
-        .err()
-        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
-        != Some(true)
-    {
-        return second;
-    }
-
-    let _ = task_supervisor
-        .sleep(
-            "exec_sync_retry_created_state_500ms",
-            Duration::from_millis(500),
-        )
-        .await;
-    cri_client
-        .exec_sync(container_id, command, timeout_seconds)
-        .await
-}
-
-pub async fn exec_with_created_state_retry(
-    cri_client: &mut crate::kubelet::cri::CriClient,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    request: ExecRequest<'_>,
-) -> anyhow::Result<k8s_cri::v1::ExecResponse> {
-    use std::time::Duration;
-
-    let ExecRequest {
-        container_id,
-        command,
-        stream_options,
-    } = request;
-    let first = cri_client
-        .exec(
-            container_id,
-            command,
-            stream_options.tty,
-            stream_options.stdin,
-            stream_options.stdout,
-            stream_options.stderr,
-        )
-        .await;
-    if first
-        .as_ref()
-        .err()
-        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
-        != Some(true)
-    {
-        return first;
-    }
-
-    let _ = task_supervisor
-        .sleep("exec_retry_created_state_250ms", Duration::from_millis(250))
-        .await;
-    let second = cri_client
-        .exec(
-            container_id,
-            command,
-            stream_options.tty,
-            stream_options.stdin,
-            stream_options.stdout,
-            stream_options.stderr,
-        )
-        .await;
-    if second
-        .as_ref()
-        .err()
-        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
-        != Some(true)
-    {
-        return second;
-    }
-
-    let _ = task_supervisor
-        .sleep("exec_retry_created_state_500ms", Duration::from_millis(500))
-        .await;
-    cri_client
-        .exec(
-            container_id,
-            command,
-            stream_options.tty,
-            stream_options.stdin,
-            stream_options.stdout,
-            stream_options.stderr,
-        )
-        .await
-}
-
-pub async fn attach_with_created_state_retry(
-    cri_client: &mut crate::kubelet::cri::CriClient,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    request: AttachRequest<'_>,
-) -> anyhow::Result<k8s_cri::v1::AttachResponse> {
-    use std::time::Duration;
-
-    let AttachRequest {
-        container_id,
-        stream_options,
-    } = request;
-    let first = cri_client
-        .attach(
-            container_id,
-            stream_options.tty,
-            stream_options.stdin,
-            stream_options.stdout,
-            stream_options.stderr,
-        )
-        .await;
-    if first
-        .as_ref()
-        .err()
-        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
-        != Some(true)
-    {
-        return first;
-    }
-
-    let _ = task_supervisor
-        .sleep(
-            "attach_retry_created_state_250ms",
-            Duration::from_millis(250),
-        )
-        .await;
-    let second = cri_client
-        .attach(
-            container_id,
-            stream_options.tty,
-            stream_options.stdin,
-            stream_options.stdout,
-            stream_options.stderr,
-        )
-        .await;
-    if second
-        .as_ref()
-        .err()
-        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
-        != Some(true)
-    {
-        return second;
-    }
-
-    let _ = task_supervisor
-        .sleep(
-            "attach_retry_created_state_500ms",
-            Duration::from_millis(500),
-        )
-        .await;
-    cri_client
-        .attach(
-            container_id,
-            stream_options.tty,
-            stream_options.stdin,
-            stream_options.stdout,
-            stream_options.stderr,
-        )
-        .await
 }
 
 // Handle WebSocket connection for exec (GET upgrade path - currently unused, kept for future use)

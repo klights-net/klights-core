@@ -90,11 +90,15 @@ pub enum UnscheduledPodDeletionOutcome {
     /// The requested UID is gone, including when its row was already absent or
     /// the namespace/name slot now belongs to a replacement UID.
     Removed,
-    /// The Pod was bound, was not terminating, or changed after observation.
-    /// Only lifecycle actor finalization may remove the surviving row.
+    /// The Pod is bound. Only lifecycle actor finalization may remove the
+    /// surviving row.
     DeferToActor,
     /// The Pod still has finalizers and must remain until they clear.
     FinalizersPending,
+    /// The row changed after the worker's eligibility observation. Retry from
+    /// a fresh read before deciding whether the Pod is still unscheduled or
+    /// must be handed to its lifecycle actor.
+    Retry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +185,12 @@ pub enum BoundPodFinalizationOutcome {
     Accepted,
     /// The namespace/name slot no longer contains the requested UID.
     IdentityChanged,
+    /// A finalizer appeared or remained on the matching Pod.
+    FinalizersPending,
+    /// The matching row is not currently eligible or changed during the
+    /// observed-resourceVersion delete CAS. The actor must retry from a fresh
+    /// lifecycle observation.
+    Retry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +252,101 @@ pub trait PodMarkTerminating: Send + Sync {
         &self,
         request: PodMarkTerminatingRequest,
     ) -> PodRepositoryFuture<'_, Resource>;
+}
+
+/// Transport-neutral Kubernetes Pod deletion policy.
+///
+/// HTTP decoding owns the conversion from `metav1.DeleteOptions`; repository
+/// contracts carry this value so kubelet code does not depend on API-server
+/// request or error types.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PodDeleteOptions {
+    propagation_policy: Option<String>,
+    orphan_dependents: Option<bool>,
+    grace_period_seconds: Option<i64>,
+    preconditions: PodDeletePreconditions,
+}
+
+impl PodDeleteOptions {
+    pub fn new(
+        propagation_policy: Option<String>,
+        orphan_dependents: Option<bool>,
+        grace_period_seconds: Option<i64>,
+        preconditions: PodDeletePreconditions,
+    ) -> Self {
+        Self {
+            propagation_policy,
+            orphan_dependents,
+            grace_period_seconds,
+            preconditions,
+        }
+    }
+
+    pub fn with_uid_precondition(uid: impl Into<String>) -> Self {
+        Self {
+            preconditions: PodDeletePreconditions::new(Some(uid.into()), None),
+            ..Self::default()
+        }
+    }
+
+    pub fn propagation_policy(&self) -> Option<&str> {
+        self.propagation_policy.as_deref()
+    }
+
+    pub fn orphan_dependents(&self) -> Option<bool> {
+        self.orphan_dependents
+    }
+
+    pub fn grace_period_seconds(&self) -> Option<i64> {
+        self.grace_period_seconds
+    }
+
+    pub fn preconditions(&self) -> &PodDeletePreconditions {
+        &self.preconditions
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<String>,
+        Option<bool>,
+        Option<i64>,
+        PodDeletePreconditions,
+    ) {
+        (
+            self.propagation_policy,
+            self.orphan_dependents,
+            self.grace_period_seconds,
+            self.preconditions,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PodDeletePreconditions {
+    uid: Option<String>,
+    resource_version: Option<String>,
+}
+
+impl PodDeletePreconditions {
+    pub fn new(uid: Option<String>, resource_version: Option<String>) -> Self {
+        Self {
+            uid,
+            resource_version,
+        }
+    }
+
+    pub fn uid(&self) -> Option<&str> {
+        self.uid.as_deref()
+    }
+
+    pub fn resource_version(&self) -> Option<&str> {
+        self.resource_version.as_deref()
+    }
+
+    pub fn into_parts(self) -> (Option<String>, Option<String>) {
+        (self.uid, self.resource_version)
+    }
 }
 
 pub trait PodLifecycleWakeup: Send + Sync {
@@ -763,6 +868,9 @@ pub enum PodRepositoryError {
         expected: String,
         actual: String,
     },
+    AlreadyExists {
+        message: String,
+    },
     Conflict {
         message: String,
     },
@@ -813,6 +921,12 @@ impl PodRepositoryError {
         }
     }
 
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self::AlreadyExists {
+            message: message.into(),
+        }
+    }
+
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::Unavailable {
             message: message.into(),
@@ -858,6 +972,9 @@ impl fmt::Display for PodRepositoryError {
                     formatter,
                     "Pod UID mismatch: expected {expected}, found {actual}"
                 )
+            }
+            Self::AlreadyExists { message } => {
+                write!(formatter, "Pod already exists: {message}")
             }
             Self::Conflict { message } => write!(formatter, "Pod conflict: {message}"),
             Self::Forbidden { message } => write!(formatter, "Pod operation forbidden: {message}"),

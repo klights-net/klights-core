@@ -1,6 +1,6 @@
 //! Pod-status side-effect dispatch shared by every outbox apply path.
 //!
-//! Every successful UpdateStatus or DeleteResource apply for a `v1/Pod` must
+//! Every successful Pod status update or actor-owned finalization must
 //! enqueue workload-owner, Job, and Service reconcile keys through focused
 //! leader-side reconciliation sinks. Without this the leader's controllers
 //! never see the change — Endpoints/EndpointSlices stay empty, Deployment /
@@ -35,7 +35,12 @@ pub async fn handle_applied_pod_side_effects(
     resource: Option<&ForwardedResource>,
     pod_endpoint_effect: crate::datastore::PodEndpointEffect,
     db: &dyn DatastoreBackend,
-) {
+) -> Result<(), String> {
+    // The actor delete is already committed at this point. Its dependent
+    // cascade is the one mandatory delivery in this group: absence or a
+    // transient failure must keep the worker's durable outbox item pending so
+    // an idempotent replay can use the persisted exact delete receipt.
+    cascade_dependents_after_actor_pod_delete(gc_pod_delete_sink, command, resource, db).await?;
     enqueue_pod_status_side_effects_with_endpoint_change(
         controller_sink,
         service_sink,
@@ -47,6 +52,7 @@ pub async fn handle_applied_pod_side_effects(
     .await;
     finalize_foreground_owners_after_pod_delete(gc_pod_delete_sink, command, resource, db).await;
     reconcile_namespace_after_pod_delete(command, resource, db).await;
+    Ok(())
 }
 
 async fn enqueue_pod_status_side_effects_with_endpoint_change(
@@ -90,7 +96,8 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
             StorageCommand::UpdateStatus { api_version, kind, .. }
                 | StorageCommand::DeleteResource { api_version, kind, .. }
             if api_version == "v1" && kind == "Pod"
-        );
+        )
+        || matches!(command, StorageCommand::FinalizeBoundPod { .. });
     if !is_pod_status_delete_or_endpoint_patch {
         return;
     }
@@ -108,8 +115,10 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
     let service_keys = if service_sink.is_some()
         && (is_endpoint_relevant_patch
             || is_endpoint_relevant_status
-            || matches!(command, StorageCommand::DeleteResource { .. }))
-    {
+            || matches!(
+                command,
+                StorageCommand::DeleteResource { .. } | StorageCommand::FinalizeBoundPod { .. }
+            )) {
         match crate::side_effects::service_pod::service_reconcile_keys_for_pod(
             &resource.data,
             db,
@@ -200,11 +209,12 @@ async fn finalize_foreground_owners_after_pod_delete(
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
 ) {
-    if !matches!(
+    let is_pod_delete = matches!(
         command,
         StorageCommand::DeleteResource { api_version, kind, .. }
             if api_version == "v1" && kind == "Pod"
-    ) {
+    ) || matches!(command, StorageCommand::FinalizeBoundPod { .. });
+    if !is_pod_delete {
         return;
     }
 
@@ -233,32 +243,77 @@ async fn finalize_foreground_owners_after_pod_delete(
     }
 }
 
+async fn cascade_dependents_after_actor_pod_delete(
+    gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
+    command: &StorageCommand,
+    resource: Option<&ForwardedResource>,
+    db: &dyn DatastoreBackend,
+) -> Result<(), String> {
+    if !matches!(command, StorageCommand::FinalizeBoundPod { .. }) {
+        return Ok(());
+    }
+    let resource = resource.ok_or_else(|| {
+        "committed bound Pod finalization is missing its durable delete receipt".to_string()
+    })?;
+    let gc_pod_delete_sink = gc_pod_delete_sink.ok_or_else(|| {
+        "committed bound Pod finalization has no dependent-cascade sink".to_string()
+    })?;
+    let namespace = resource.namespace.clone().or_else(|| {
+        resource
+            .data
+            .pointer("/metadata/namespace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    });
+    let uid = resource
+        .data
+        .pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if uid.is_empty() {
+        return Err("committed bound Pod finalization receipt has no metadata.uid".to_string());
+    }
+    crate::controllers::gc::cascade_delete_with_uid(
+        db,
+        uid,
+        &resource.api_version,
+        &resource.name,
+        &resource.kind,
+        namespace,
+        gc_pod_delete_sink,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "leader committed Pod delete dependent cascade failed for {}/{} uid {}: {error}",
+            resource.namespace.as_deref().unwrap_or(""),
+            resource.name,
+            uid
+        )
+    })
+}
+
 async fn reconcile_namespace_after_pod_delete(
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
 ) {
-    let StorageCommand::DeleteResource {
-        api_version,
-        kind,
-        namespace,
-        ..
-    } = command
-    else {
-        return;
-    };
-    if api_version != "v1" || kind != "Pod" {
-        return;
+    let namespace = match command {
+        StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            namespace,
+            ..
+        } if api_version == "v1" && kind == "Pod" => namespace.as_deref(),
+        StorageCommand::FinalizeBoundPod { namespace, .. } => Some(namespace.as_str()),
+        _ => return,
     }
-
-    let namespace = namespace
-        .as_deref()
-        .or_else(|| {
-            resource
-                .and_then(|resource| resource.data.pointer("/metadata/namespace"))
-                .and_then(|value| value.as_str())
-        })
-        .unwrap_or("default");
+    .or_else(|| {
+        resource
+            .and_then(|resource| resource.data.pointer("/metadata/namespace"))
+            .and_then(|value| value.as_str())
+    })
+    .unwrap_or("default");
     if namespace.is_empty() {
         return;
     }
@@ -313,13 +368,60 @@ async fn pdb_reconcile_keys_for_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::controller_dispatcher::ControllerDispatcher;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
     use crate::replication::protocol::ForwardedResource;
+    use klights_types::PodIdentity;
     use serde_json::json;
+
+    #[derive(Default)]
+    struct RecordingPodDeleteSink {
+        requests: Mutex<Vec<PodIdentity>>,
+    }
+
+    impl GcPodDeleteSink for RecordingPodDeleteSink {
+        fn request_gc_pod_delete(
+            &self,
+            request: klights_reconcile_api::GcPodDeleteRequest,
+        ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(request.into_identity());
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOncePodDeleteSink {
+        failed: AtomicBool,
+        attempts: AtomicUsize,
+        successful: Mutex<Vec<PodIdentity>>,
+    }
+
+    impl GcPodDeleteSink for FailOncePodDeleteSink {
+        fn request_gc_pod_delete(
+            &self,
+            request: klights_reconcile_api::GcPodDeleteRequest,
+        ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::Relaxed);
+                if !self.failed.swap(true, Ordering::Relaxed) {
+                    return Err(klights_reconcile_api::GcPodDeleteError::unavailable(
+                        "transient leader-side delete failure",
+                    ));
+                }
+                self.successful
+                    .lock()
+                    .unwrap()
+                    .push(request.into_identity());
+                Ok(())
+            })
+        }
+    }
 
     #[tokio::test]
     async fn outbox_pod_status_enqueues_pdb_reconcile_for_namespace() {
@@ -395,6 +497,188 @@ mod tests {
                     && key.name() == "pdb-ready"
             }),
             "outbox Pod status applies must enqueue matching PDB reconciliation"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_actor_delete_receipt_cascades_pod_dependents_exactly_once() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "child",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "child",
+                    "uid": "child-uid",
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "owner",
+                        "uid": "owner-uid"
+                    }]
+                },
+                "spec": {"nodeName": "worker-b"}
+            }),
+        )
+        .await
+        .unwrap();
+        let command = StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "owner".to_string(),
+            pod_uid: "owner-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: 7,
+        };
+        let receipt = ForwardedResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "owner".to_string(),
+            resource_version: 8,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "owner",
+                    "uid": "owner-uid"
+                },
+                "spec": {"nodeName": "worker-a"}
+            }),
+        };
+        let sink = RecordingPodDeleteSink::default();
+
+        let missing_sink = handle_applied_pod_side_effects(
+            None,
+            None,
+            None,
+            &command,
+            Some(&receipt),
+            crate::datastore::PodEndpointEffect::NotApplicable,
+            &db,
+        )
+        .await
+        .expect_err("a committed finalize command must have a cascade sink");
+        assert!(missing_sink.contains("no dependent-cascade sink"));
+
+        handle_applied_pod_side_effects(
+            None,
+            None,
+            Some(&sink),
+            &command,
+            Some(&receipt),
+            crate::datastore::PodEndpointEffect::NotApplicable,
+            &db,
+        )
+        .await
+        .unwrap();
+        let missing_receipt = handle_applied_pod_side_effects(
+            None,
+            None,
+            Some(&sink),
+            &command,
+            None,
+            crate::datastore::PodEndpointEffect::NotApplicable,
+            &db,
+        )
+        .await
+        .expect_err("a surfaced committed finalize command must retain its receipt");
+        assert!(missing_receipt.contains("durable delete receipt"));
+
+        let requests = sink.requests.lock().unwrap();
+        assert_eq!(
+            requests.as_slice(),
+            &[PodIdentity::new("default", "child", "child-uid")]
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_actor_delete_cascade_retries_after_transient_sink_failure() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "child",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "child",
+                    "uid": "child-uid",
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "name": "owner",
+                        "uid": "owner-uid"
+                    }]
+                },
+                "spec": {"nodeName": "worker-b"}
+            }),
+        )
+        .await
+        .unwrap();
+        let command = StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "owner".to_string(),
+            pod_uid: "owner-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: 7,
+        };
+        let receipt = ForwardedResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "owner".to_string(),
+            resource_version: 8,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "owner",
+                    "uid": "owner-uid"
+                },
+                "spec": {"nodeName": "worker-a"}
+            }),
+        };
+        let sink = FailOncePodDeleteSink::default();
+
+        let first = handle_applied_pod_side_effects(
+            None,
+            None,
+            Some(&sink),
+            &command,
+            Some(&receipt),
+            crate::datastore::PodEndpointEffect::NotApplicable,
+            &db,
+        )
+        .await
+        .expect_err("transient cascade failure must keep the durable outbox pending");
+        assert!(first.contains("transient leader-side delete failure"));
+
+        handle_applied_pod_side_effects(
+            None,
+            None,
+            Some(&sink),
+            &command,
+            Some(&receipt),
+            crate::datastore::PodEndpointEffect::NotApplicable,
+            &db,
+        )
+        .await
+        .expect("replayed committed receipt should complete the cascade");
+
+        assert_eq!(sink.attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            sink.successful.lock().unwrap().as_slice(),
+            &[PodIdentity::new("default", "child", "child-uid")]
         );
     }
 
@@ -589,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbox_ready_pod_status_keeps_service_endpoint_reconcile_queued() {
+    async fn outbox_pod_status_and_actor_finalization_keep_service_reconcile_queued() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "v1",
@@ -612,23 +896,7 @@ mod tests {
         )
         .await
         .expect("create service");
-        let dispatcher = Arc::new(ControllerDispatcher::default());
         let service_key = ReconcileKey::namespaced("v1", "Service", "default", "web");
-        dispatcher.enqueue_reconcile_key(service_key.clone()).await;
-
-        let command = StorageCommand::UpdateStatus {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some("default".to_string()),
-            name: "web-pod".to_string(),
-            status: json!({"phase": "Running"}),
-            expected_rv: None,
-            preconditions: ResourcePreconditions {
-                uid: Some("pod-web-uid".to_string()),
-                resource_version: None,
-            },
-            observed_status_stamp: None,
-        };
         let resource = ForwardedResource {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -660,26 +928,60 @@ mod tests {
             }),
         };
 
-        enqueue_pod_status_side_effects_with_endpoint_change(
-            Some(dispatcher.as_ref()),
-            Some(dispatcher.as_ref()),
-            &command,
-            Some(&resource),
-            crate::datastore::PodEndpointEffect::Changed,
-            &db,
-        )
-        .await;
+        let cases = [
+            (
+                "status",
+                StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "web-pod".to_string(),
+                    status: json!({"phase": "Running"}),
+                    expected_rv: None,
+                    preconditions: ResourcePreconditions {
+                        uid: Some("pod-web-uid".to_string()),
+                        resource_version: None,
+                    },
+                    observed_status_stamp: None,
+                },
+                crate::datastore::PodEndpointEffect::Changed,
+            ),
+            (
+                "actor finalization",
+                StorageCommand::FinalizeBoundPod {
+                    namespace: "default".to_string(),
+                    name: "web-pod".to_string(),
+                    pod_uid: "pod-web-uid".to_string(),
+                    node_name: "worker-a".to_string(),
+                    observed_resource_version: 1,
+                },
+                crate::datastore::PodEndpointEffect::NotApplicable,
+            ),
+        ];
 
-        assert_eq!(
-            dispatcher
-                .queued_reconcile_keys_for_test()
-                .await
-                .iter()
-                .filter(|key| *key == &service_key)
-                .count(),
-            1,
-            "worker-applied pod readiness must leave one fresh Service endpoint key queued"
-        );
+        for (case, command, endpoint_effect) in cases {
+            let dispatcher = Arc::new(ControllerDispatcher::default());
+            enqueue_pod_status_side_effects_with_endpoint_change(
+                Some(dispatcher.as_ref()),
+                Some(dispatcher.as_ref()),
+                &command,
+                Some(&resource),
+                endpoint_effect,
+                &db,
+            )
+            .await;
+
+            assert_eq!(
+                dispatcher
+                    .queued_reconcile_keys_for_test()
+                    .await
+                    .iter()
+                    .filter(|key| *key == &service_key)
+                    .count(),
+                1,
+                "{case} must leave one fresh Service endpoint key queued"
+            );
+        }
     }
 
     #[tokio::test]

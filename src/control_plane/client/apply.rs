@@ -196,14 +196,34 @@ pub async fn reject_pod_uid_mismatch(
 }
 
 /// Bind a structurally valid PodMetadata delivery to the authenticated
-/// worker's live Pod. The trusted node may update only its assigned Pod and
-/// may finalize deletion only after the actor-observed terminal conditions
-/// already required by the lifecycle path are present.
+/// worker's live Pod. Opaque actor finalization is authenticated structurally
+/// here, then bound to live UID/node/eligibility atomically by materialization.
 pub(crate) async fn authorize_live_pod_metadata_command(
     db: &dyn DatastoreBackend,
     command: &StorageCommand,
     authenticated_node: &str,
 ) -> std::result::Result<(), klights_leader_api::OutboxDeliveryError> {
+    if let StorageCommand::FinalizeBoundPod {
+        namespace,
+        name,
+        pod_uid,
+        node_name,
+        observed_resource_version,
+    } = command
+    {
+        if namespace.is_empty()
+            || name.is_empty()
+            || pod_uid.is_empty()
+            || *observed_resource_version <= 0
+            || node_name != authenticated_node
+        {
+            return Err(klights_leader_api::OutboxDeliveryError::conflict(
+                "bound Pod finalization carries invalid actor observation",
+            ));
+        }
+        return Ok(());
+    }
+
     let Some((namespace, name, preconditions)) = pod_target(command) else {
         return Err(klights_leader_api::OutboxDeliveryError::conflict(
             "PodMetadata delivery must target one namespaced v1/Pod",
@@ -240,36 +260,6 @@ pub(crate) async fn authorize_live_pod_metadata_command(
         return Err(klights_leader_api::OutboxDeliveryError::conflict(format!(
             "PodMetadata delivery for {namespace}/{name} is restricted to its assigned node"
         )));
-    }
-
-    if matches!(command, StorageCommand::DeleteResource { .. }) {
-        let has_finalizers = live
-            .data
-            .pointer("/metadata/finalizers")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|finalizers| !finalizers.is_empty());
-        if has_finalizers {
-            return Err(klights_leader_api::OutboxDeliveryError::conflict(format!(
-                "PodMetadata actor finalization for {namespace}/{name} is blocked by finalizers"
-            )));
-        }
-
-        let terminating = live.data.pointer("/metadata/deletionTimestamp").is_some()
-            || (live
-                .data
-                .pointer("/status/phase")
-                .and_then(serde_json::Value::as_str)
-                == Some("Failed")
-                && live
-                    .data
-                    .pointer("/status/reason")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("NodeLost"));
-        if !terminating {
-            return Err(klights_leader_api::OutboxDeliveryError::conflict(format!(
-                "PodMetadata actor finalization requires terminating Pod {namespace}/{name}"
-            )));
-        }
     }
 
     Ok(())
@@ -348,6 +338,7 @@ fn node_scoped_outbox_target(command: &StorageCommand) -> Option<&str> {
         StorageCommand::AllocateNodeSubnet { node_name, .. }
         | StorageCommand::UpdateNodePeerAttributes { node_name, .. }
         | StorageCommand::UpdateNodeDataplane { node_name, .. }
+        | StorageCommand::FinalizeBoundPod { node_name, .. }
         | StorageCommand::DeleteNodeSubnet { node_name } => Some(node_name),
 
         _ => None,
@@ -430,6 +421,19 @@ fn is_uid_bound_pod_status(command: &StorageCommand) -> bool {
 
 fn is_uid_bound_pod_metadata(command: &StorageCommand) -> bool {
     match command {
+        StorageCommand::FinalizeBoundPod {
+            namespace,
+            name,
+            pod_uid,
+            node_name,
+            observed_resource_version,
+        } => {
+            !namespace.is_empty()
+                && !name.is_empty()
+                && !pod_uid.is_empty()
+                && !node_name.is_empty()
+                && *observed_resource_version > 0
+        }
         StorageCommand::PatchResource {
             api_version,
             kind,
@@ -453,23 +457,6 @@ fn is_uid_bound_pod_metadata(command: &StorageCommand) -> bool {
                     preconditions.resource_version,
                     *strict_resource_version,
                 )
-        }
-        StorageCommand::DeleteResource {
-            api_version,
-            kind,
-            namespace: Some(namespace),
-            name,
-            preconditions,
-        } => {
-            api_version == "v1"
-                && kind == "Pod"
-                && !namespace.is_empty()
-                && !name.is_empty()
-                && preconditions
-                    .uid
-                    .as_deref()
-                    .is_some_and(|uid| !uid.is_empty())
-                && preconditions.resource_version.is_none()
         }
         _ => false,
     }
@@ -700,19 +687,19 @@ mod delivery_authorization_tests {
                 .expect("UID-bound Pod status is authorized");
         }
 
-        let pod_delete = StorageCommand::DeleteResource {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some("default".to_string()),
+        let pod_delete = StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
             name: "web".to_string(),
-            preconditions: ResourcePreconditions::uid("pod-uid"),
+            pod_uid: "pod-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: 7,
         };
         authorize_outbox_command(
             OutboxDeliveryOperation::PodMetadata,
             &pod_delete,
             "worker-a",
         )
-        .expect("actor-originated UID-bound Pod deletion remains deliverable");
+        .expect("opaque actor-originated bound Pod finalization remains deliverable");
 
         let pod_update = StorageCommand::PatchResource {
             api_version: "v1".to_string(),
@@ -884,139 +871,47 @@ mod delivery_authorization_tests {
     }
 
     #[tokio::test]
-    async fn pod_metadata_live_authorization_is_uid_node_and_finalizer_bound() {
+    async fn pod_metadata_finalization_authorization_is_structural_and_node_bound() {
         let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        for (name, uid, node_name, terminating, finalizers, phase, reason) in [
-            (
-                "ready",
-                "uid-ready",
-                "worker-a",
-                true,
-                json!([]),
-                "Running",
-                "",
-            ),
-            (
-                "held",
-                "uid-held",
-                "worker-a",
-                true,
-                json!(["example.com/hold"]),
-                "Running",
-                "",
-            ),
-            (
-                "live",
-                "uid-live",
-                "worker-a",
-                false,
-                json!([]),
-                "Running",
-                "",
-            ),
-            (
-                "replacement",
-                "uid-replacement",
-                "worker-b",
-                true,
-                json!([]),
-                "Running",
-                "",
-            ),
-            (
-                "node-lost",
-                "uid-node-lost",
-                "worker-a",
-                false,
-                json!([]),
-                "Failed",
-                "NodeLost",
-            ),
-        ] {
-            let mut metadata = json!({
-                "namespace": "default",
-                "name": name,
-                "uid": uid,
-                "finalizers": finalizers,
-            });
-            if terminating {
-                metadata["deletionTimestamp"] = json!("2026-07-18T00:00:00Z");
-                metadata["deletionGracePeriodSeconds"] = json!(0);
+        let finalize = |namespace: &str, name: &str, uid: &str, node_name: &str| {
+            StorageCommand::FinalizeBoundPod {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                pod_uid: uid.to_string(),
+                node_name: node_name.to_string(),
+                observed_resource_version: 7,
             }
-            db.create_resource(
-                "v1",
-                "Pod",
-                Some("default"),
-                name,
-                json!({
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "metadata": metadata,
-                    "spec": {"nodeName": node_name, "containers": []},
-                    "status": {"phase": phase, "reason": reason},
-                }),
-            )
-            .await
-            .expect("seed live Pod");
-        }
-
-        let delete = |name: &str, uid: &str| StorageCommand::DeleteResource {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some("default".to_string()),
-            name: name.to_string(),
-            preconditions: ResourcePreconditions::uid(uid),
         };
 
-        authorize_live_pod_metadata_command(db.as_ref(), &delete("ready", "uid-ready"), "worker-a")
-            .await
-            .expect("the actor may finalize its terminating, finalizer-free Pod");
         authorize_live_pod_metadata_command(
             db.as_ref(),
-            &delete("node-lost", "uid-node-lost"),
+            &finalize("default", "ready", "uid-ready", "worker-a"),
             "worker-a",
         )
         .await
-        .expect("the actor preserves the existing NodeLost terminal finalization path");
+        .expect("structurally valid actor finalization must remain opaque at authorization");
 
-        for (command, author, expected, reason) in [
+        for (command, reason) in [
             (
-                delete("ready", "stale-uid"),
-                "worker-a",
-                "uid mismatch",
-                "stale actor UID",
+                finalize("", "ready", "uid-ready", "worker-a"),
+                "empty namespace",
             ),
             (
-                delete("replacement", "uid-replacement"),
-                "worker-a",
-                "assigned node",
-                "different assigned node",
+                finalize("default", "", "uid-ready", "worker-a"),
+                "empty name",
             ),
+            (finalize("default", "ready", "", "worker-a"), "empty UID"),
             (
-                delete("held", "uid-held"),
-                "worker-a",
-                "finalizers",
-                "held finalizer",
-            ),
-            (
-                delete("live", "uid-live"),
-                "worker-a",
-                "terminating",
-                "non-terminating live Pod",
-            ),
-            (
-                delete("absent", "uid-absent"),
-                "worker-a",
-                "not found",
-                "absent Pod",
+                finalize("default", "ready", "uid-ready", "worker-b"),
+                "different actor node",
             ),
         ] {
-            let error = authorize_live_pod_metadata_command(db.as_ref(), &command, author)
+            let error = authorize_live_pod_metadata_command(db.as_ref(), &command, "worker-a")
                 .await
                 .expect_err(reason);
             assert!(
-                error.to_string().to_ascii_lowercase().contains(expected),
-                "{reason} returned unexpected error: {error}"
+                error.to_string().contains("invalid actor observation"),
+                "{reason} returned unexpected error: {error}",
             );
         }
     }
@@ -1120,6 +1015,22 @@ mod delivery_authorization_tests {
                 "{reason} must be terminally rejected"
             );
         }
+    }
+
+    #[test]
+    fn finalize_bound_pod_subject_is_uid_scoped() {
+        let command = StorageCommand::FinalizeBoundPod {
+            namespace: "team-a".to_string(),
+            name: "web-0".to_string(),
+            pod_uid: "uid-web-0".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: 41,
+        };
+
+        assert_eq!(
+            subject_key_for_command(&command),
+            "v1/Pod/team-a/web-0/uid-web-0"
+        );
     }
 }
 
@@ -1280,6 +1191,12 @@ pub fn subject_key_for_command(command: &StorageCommand) -> String {
         | StorageCommand::DeleteNamespaceContents { name } => {
             resource_key_parts("v1", "Namespace", None, name, None)
         }
+        StorageCommand::FinalizeBoundPod {
+            namespace,
+            name,
+            pod_uid,
+            ..
+        } => resource_key_parts("v1", "Pod", Some(namespace), name, Some(pod_uid)),
         other => other.variant_name().to_string(),
     }
 }

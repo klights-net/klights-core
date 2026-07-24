@@ -7,39 +7,16 @@
 //! drift.
 
 use crate::bootstrap::NodeMode;
+pub use klights_network_api::{
+    DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION, DATAPLANE_MODE_ANNOTATION,
+    DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION, DEFAULT_HOSTPORT_RANGE,
+    GIT_COMMIT_ANNOTATION, GRPC_PORT_ANNOTATION, HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION,
+    NodePeerMode,
+};
 use thiserror::Error;
-
-pub const NODE_MODE_ANNOTATION: &str = "klights.io/mode";
-pub const HOSTPORT_RANGE_ANNOTATION: &str = "klights.io/hostport-range";
-pub const DATAPLANE_ENDPOINT_ANNOTATION: &str = "klights.io/dataplane-endpoint";
-pub const DATAPLANE_PORT_ANNOTATION: &str = "klights.io/dataplane-port";
-pub const DATAPLANE_MODE_ANNOTATION: &str = "klights.io/dataplane-mode";
-pub const DATAPLANE_ENCRYPTION_ANNOTATION: &str = "klights.io/dataplane-encryption";
-pub const DATAPLANE_PUBLIC_KEY_ANNOTATION: &str = "klights.io/dataplane-public-key";
-/// Short git commit hash (first 8 chars of HEAD) of the klights binary
-/// running on the node. Surfaced as the wide-only `COMMIT` column of
-/// `kubectl get nodes -o wide` so multinode clusters can spot version skew
-/// even when peers report the same `kubeletVersion`.
-pub const GIT_COMMIT_ANNOTATION: &str = "klights.io/git-commit";
-/// gRPC/API server TLS port published by controlplane nodes so workers
-/// can discover all controlplane endpoints from Node watch events.
-pub const GRPC_PORT_ANNOTATION: &str = "klights.io/grpc-port";
 
 const NODE_MODE_ROOT: &str = "root";
 const NODE_MODE_ROOTLESS: &str = "rootless";
-
-/// Default rootless host-port graft range. Honors the conventional Kubernetes
-/// NodePort range until F2-04 ships per-node range configuration.
-pub const DEFAULT_HOSTPORT_RANGE: &str = "30000-32767";
-
-/// Mode dimension as projected through Node annotations. Cluster-side; not the
-/// same type as the runtime `bootstrap::NodeMode` (which carries rootlesskit
-/// process identifiers and is local to the running process).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NodePeerMode {
-    Root,
-    Rootless,
-}
 
 // F2-04 consumes `parse_node_peer_mode` + `AnnotationError` for the peer-mode
 // projection in `controllers/node_subnet.rs`. Until that task lands, the

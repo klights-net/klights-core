@@ -19,6 +19,7 @@ pub(crate) fn resource_command_request_to_proto(
 ) -> Result<generated::SubmitResourceCommandRequest> {
     Ok(generated::SubmitResourceCommandRequest {
         command_protobuf: encode_command_protobuf(request.command())?,
+        codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
     })
 }
 

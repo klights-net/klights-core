@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::kubelet::pod_repository::PodRepository;
-use crate::kubelet::pod_repository::api::{PodApiService, PodApiServiceDependencies};
+use crate::pod_api_service::{PodApiService, PodApiServiceDependencies};
 
 mod create;
 mod delete;

@@ -1092,6 +1092,7 @@ impl SnapshotReplayFloorCursor {
 #[derive(Clone, Debug)]
 pub struct SnapshotCaptureHeader {
     resource_version_assignment: Option<ResourceVersionAssignment>,
+    command_codec_activation_version: Option<u32>,
     position: WatchReplayPosition,
     metadata: ClusterMetadata,
     membership: SnapshotMembership,
@@ -1100,10 +1101,16 @@ pub struct SnapshotCaptureHeader {
 impl SnapshotCaptureHeader {
     pub fn try_new(
         resource_version_assignment: Option<ResourceVersionAssignment>,
+        command_codec_activation_version: Option<u32>,
         position: WatchReplayPosition,
         metadata: ClusterMetadata,
         membership: SnapshotMembership,
     ) -> Result<Self, SnapshotPersistenceError> {
+        if command_codec_activation_version.is_some_and(|version| version != 3) {
+            return Err(SnapshotPersistenceError::invalid(
+                "snapshot command codec activation version must be exact v3",
+            ));
+        }
         validate_replay_position(position, true).map_err(SnapshotPersistenceError::invalid)?;
         validate_snapshot_metadata(&metadata, &membership)?;
         if metadata.current_rv != position.resource_version {
@@ -1113,6 +1120,7 @@ impl SnapshotCaptureHeader {
         }
         Ok(Self {
             resource_version_assignment,
+            command_codec_activation_version,
             position,
             metadata,
             membership,
@@ -1120,6 +1128,9 @@ impl SnapshotCaptureHeader {
     }
     pub const fn resource_version_assignment(&self) -> Option<ResourceVersionAssignment> {
         self.resource_version_assignment
+    }
+    pub const fn command_codec_activation_version(&self) -> Option<u32> {
+        self.command_codec_activation_version
     }
     pub const fn position(&self) -> WatchReplayPosition {
         self.position

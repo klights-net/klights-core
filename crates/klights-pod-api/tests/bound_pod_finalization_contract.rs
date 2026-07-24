@@ -101,3 +101,20 @@ fn bound_finalization_delivers_only_the_validated_identity() {
         )]
     );
 }
+
+#[test]
+fn bound_finalization_outcomes_keep_terminal_and_retry_dispositions_distinct() {
+    let outcomes = [
+        BoundPodFinalizationOutcome::Removed,
+        BoundPodFinalizationOutcome::Accepted,
+        BoundPodFinalizationOutcome::IdentityChanged,
+        BoundPodFinalizationOutcome::FinalizersPending,
+        BoundPodFinalizationOutcome::Retry,
+    ];
+    for (index, outcome) in outcomes.iter().enumerate() {
+        assert!(
+            outcomes[index + 1..].iter().all(|other| other != outcome),
+            "bound finalization disposition must remain unambiguous: {outcome:?}"
+        );
+    }
+}

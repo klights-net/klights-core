@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use crate::api::AppError;
-use crate::kubelet::pod_repository::api::PodApiService;
 use crate::kubelet::pod_repository::types::{PodApiCreateRequest, PodApiCreateResult};
+use crate::pod_api_service::PodApiService;
 
 pub struct PodApiCreateService {
     api: Arc<PodApiService>,

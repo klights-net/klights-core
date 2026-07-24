@@ -1164,7 +1164,7 @@ async fn test_delete_deployment_cascade_deletes_replicaset_and_pods() {
         "my-deploy",
         "Deployment",
         Some("default".to_string()),
-        &crate::controllers::gc::NoOpGcPodDeleteSink,
+        __pod_repo.as_ref(),
     )
     .await
     .unwrap();
@@ -1200,6 +1200,15 @@ async fn test_delete_deployment_cascade_deletes_replicaset_and_pods() {
         pod_list_after.items.len(),
         2,
         "Pod children must NOT be hard-deleted by GC cascade — they are actor-deleted"
+    );
+    assert!(
+        pod_list_after.items.iter().all(|pod| {
+            pod.data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|timestamp| !timestamp.is_empty())
+        }),
+        "GC cascade must issue UID-bound actor delete marks for every Pod child"
     );
 }
 
@@ -1332,7 +1341,7 @@ async fn test_delete_collection_deployment_cascade_deletes_replicaset_and_pods()
         "my-deploy",
         "Deployment",
         Some("default".to_string()),
-        &crate::controllers::gc::NoOpGcPodDeleteSink,
+        __pod_repo.as_ref(),
     )
     .await
     .unwrap();
@@ -1368,5 +1377,14 @@ async fn test_delete_collection_deployment_cascade_deletes_replicaset_and_pods()
         pods_after.items.len(),
         1,
         "Pod children must NOT be hard-deleted by GC cascade — they are actor-deleted"
+    );
+    assert!(
+        pods_after.items.iter().all(|pod| {
+            pod.data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|timestamp| !timestamp.is_empty())
+        }),
+        "delete_collection cascade must issue a UID-bound actor delete mark"
     );
 }

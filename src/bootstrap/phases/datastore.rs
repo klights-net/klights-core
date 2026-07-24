@@ -304,6 +304,19 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 .await
                 .context("Failed to start RaftNode for leader-class boot")?,
             );
+            if let Err(error) = raft
+                .verify_startup_command_codec_v3(
+                    member_feature_probe
+                        .as_deref()
+                        .expect("leader-class Raft startup always wires a member feature probe"),
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "leader-class startup is codec-preactivation; command proposals remain gated while Raft RPC admission starts"
+                );
+            }
             let proposal: Arc<dyn crate::datastore::sequenced::RaftProposal> = raft.clone();
             let db_handle: DatastoreHandle =
                 Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
@@ -372,6 +385,19 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 wait_for_seed_raft_local_commit_ready(raft.as_ref(), supervisor.as_ref())
                     .await
                     .context("Failed waiting for solo raft seed commit readiness")?;
+                if let Err(error) = raft
+                    .activate_command_codec_v3(
+                        member_feature_probe.as_deref().expect(
+                            "leader-class Raft startup always wires a member feature probe",
+                        ),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "exact-v3 activation is not ready; restored cluster command proposals remain gated"
+                    );
+                }
                 tracing::info!(
                     node_id,
                     node = %config.node_name,
@@ -382,7 +408,18 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 // T7.1: route seed bootstrap metadata through raft after
                 // the N=1 voter is initialized. Every cluster.db mutation
                 // from this point forward is raft-backed.
-                if !is_joining_controlplane && uses_leader_runtime(role) {
+                //
+                // A restored pre-activation cluster may deliberately have its
+                // proposal gate closed while peer Raft RPC endpoints come up.
+                // Its seed metadata already exists, so retrying these writes
+                // here would turn the fail-closed gate into a cold-start
+                // deadlock before the replication server can start.
+                let needs_seed_metadata = db_handle
+                    .get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
+                    .await
+                    .context("Failed to inspect restored cluster identity")?
+                    .is_none();
+                if !is_joining_controlplane && uses_leader_runtime(role) && needs_seed_metadata {
                     let cluster_id = uuid::Uuid::new_v4().to_string();
                     raft.propose_command(
                         crate::datastore::command::StorageCommand::EnsureClusterMetadata {
@@ -415,6 +452,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         .await
                         .context("Failed to create bootstrap tokens")?;
                     tracing::info!("T7.1: bootstrap tokens created via raft-backed datastore");
+                } else if !needs_seed_metadata {
+                    tracing::info!(
+                        "T7.1: restored cluster identity found; skipping first-boot seed writes"
+                    );
                 }
             } else if let crate::bootstrap::NodeRole::Controlplane {
                 leader_endpoints,

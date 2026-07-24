@@ -540,8 +540,26 @@ impl DatastoreBackend for SequencedDatastore {
             grace_seconds,
         };
         let applied = self.propose_command(command).await?;
+        let committed_rv = applied.applied_rv.ok_or_else(|| {
+            anyhow::anyhow!(
+                "raft-routed delete_resource_without_watch_with_tombstone: committed resourceVersion missing for {api_version}/{kind}/{name}"
+            )
+        })?;
         match applied.applied_mutation {
-            Some(crate::datastore::raft::types::AppliedMutation::Resource(resource)) => {
+            Some(crate::datastore::raft::types::AppliedMutation::Resource(mut resource)) => {
+                let Some(metadata) = std::sync::Arc::make_mut(&mut resource.data)
+                    .pointer_mut("/metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                else {
+                    return Err(anyhow::anyhow!(
+                        "raft-routed delete_resource_without_watch_with_tombstone: committed tombstone result missing metadata for {api_version}/{kind}/{name}"
+                    ));
+                };
+                resource.resource_version = committed_rv;
+                metadata.insert(
+                    "resourceVersion".to_string(),
+                    serde_json::Value::String(committed_rv.to_string()),
+                );
                 Ok(resource)
             }
             None => Err(anyhow::anyhow!(

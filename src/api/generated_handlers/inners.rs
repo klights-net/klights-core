@@ -726,6 +726,11 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
             // Generated Pod create delegates to PodApiWriter which owns Pod
             // admission/defaulting/persistence.
             let namespace = ns.unwrap();
+            let resource_name = body
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let result = self
                 .state
                 .pod_repository
@@ -736,7 +741,10 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
                     dry_run: is_dry_run,
                     run_admission: true,
                 })
-                .await?;
+                .await
+                .map_err(|error| {
+                    AppError::from(error).with_resource_context("v1", "Pod", &resource_name)
+                })?;
             return match result.resource {
                 Some(resource) => Ok(WriteResult::Persisted(resource)),
                 None => Ok(WriteResult::DryRun(result.body)),

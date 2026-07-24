@@ -159,10 +159,17 @@ enum NamespacePreflight {
 /// otherwise silently drop the event BEFORE it is durably enqueued. The leader
 /// re-validates the namespace when it applies the EventCreate outbox entry, so
 /// proceeding is safe and strictly better than dropping.
-fn classify_namespace_preflight(result: Result<(), crate::api::AppError>) -> NamespacePreflight {
+fn classify_namespace_preflight(
+    result: anyhow::Result<crate::namespace_admission::NamespaceCreateEligibility>,
+) -> NamespacePreflight {
     match result {
-        Ok(()) => NamespacePreflight::Proceed,
-        Err(crate::api::AppError::Forbidden(_)) => NamespacePreflight::SkipTerminating,
+        Ok(crate::namespace_admission::NamespaceCreateEligibility::Allowed) => {
+            NamespacePreflight::Proceed
+        }
+        Ok(
+            crate::namespace_admission::NamespaceCreateEligibility::Missing
+            | crate::namespace_admission::NamespaceCreateEligibility::Terminating,
+        ) => NamespacePreflight::SkipTerminating,
         Err(_) => NamespacePreflight::Proceed,
     }
 }
@@ -195,10 +202,8 @@ async fn emit_pod_event_impl(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Pod missing metadata.uid"))?;
 
-    let preflight = crate::api::reject_if_namespace_missing_or_terminating(ds, namespace).await;
-    if let Err(err) = &preflight
-        && !matches!(err, crate::api::AppError::Forbidden(_))
-    {
+    let preflight = crate::namespace_admission::create_eligibility(ds, namespace).await;
+    if let Err(err) = &preflight {
         // Fail open: do not drop the event on a transport/DB error. The leader
         // re-validates the namespace when it applies the EventCreate.
         tracing::warn!(
@@ -343,28 +348,22 @@ mod tests {
     fn namespace_preflight_fails_open_on_transport_error() {
         // Present namespace -> emit.
         assert_eq!(
-            classify_namespace_preflight(Ok(())),
+            classify_namespace_preflight(Ok(
+                crate::namespace_admission::NamespaceCreateEligibility::Allowed
+            )),
             NamespacePreflight::Proceed
         );
         // Definitive missing/terminating -> suppress.
         assert_eq!(
-            classify_namespace_preflight(Err(crate::api::AppError::Forbidden(
-                "namespace foo is being terminated".into()
-            ))),
+            classify_namespace_preflight(Ok(
+                crate::namespace_admission::NamespaceCreateEligibility::Terminating
+            )),
             NamespacePreflight::SkipTerminating
         );
         // Transport / DB error must FAIL OPEN (proceed) so a leader blip never
         // silently drops a pod event before it is durably enqueued.
         assert_eq!(
-            classify_namespace_preflight(Err(crate::api::AppError::Internal(
-                "connection reset by peer".into()
-            ))),
-            NamespacePreflight::Proceed
-        );
-        assert_eq!(
-            classify_namespace_preflight(Err(crate::api::AppError::ServiceUnavailable(
-                "leader not ready".into()
-            ))),
+            classify_namespace_preflight(Err(anyhow::anyhow!("connection reset by peer"))),
             NamespacePreflight::Proceed
         );
     }

@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_pod_api::PodRepositoryError;
 use serde_json::{Value, json};
 
-use crate::api::{AppError, DeleteOptions};
 use crate::datastore::{Resource, ResourcePreconditions};
 use crate::side_effects::SideEffectMetrics;
 use klights_supervisor::TaskSupervisor;
@@ -16,9 +16,9 @@ use super::workqueue::PodWorkqueue;
 const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
 
 #[derive(Debug)]
-pub(super) struct PodDeleteMarkOutcome {
+pub(crate) struct PodDeleteMarkOutcome {
     pub updated: Resource,
-    pub previous: Value,
+    pub previous: Resource,
     pub uid: String,
 }
 
@@ -182,12 +182,13 @@ impl PodDeleteCoordinator {
         }
     }
 
-    pub(super) fn dry_run_delete_body(
+    pub(crate) fn dry_run_delete_body(
         &self,
         resource: &Resource,
-        options: &DeleteOptions,
+        requested_grace_period_seconds: Option<i64>,
     ) -> Value {
-        let grace_period_seconds = pod_delete_grace_period_seconds(&resource.data, options);
+        let grace_period_seconds =
+            pod_delete_grace_period_seconds(&resource.data, requested_grace_period_seconds);
         let mut data = pod_data_with_deletion_metadata(&resource.data, grace_period_seconds);
         if let Some(obj) = data.as_object_mut()
             && let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
@@ -200,7 +201,7 @@ impl PodDeleteCoordinator {
         data
     }
 
-    pub(super) async fn enqueue_actor_finalize_if_ready(
+    pub(crate) async fn enqueue_actor_finalize_if_ready(
         &self,
         ns: &str,
         name: &str,
@@ -242,14 +243,14 @@ impl PodDeleteCoordinator {
         }
     }
 
-    pub(super) async fn mark_and_queue_api_delete(
+    pub(crate) async fn mark_and_queue_api_delete(
         &self,
         ns: &str,
         name: &str,
-        options: &DeleteOptions,
+        requested_grace_period_seconds: Option<i64>,
         delete_preconditions: &ResourcePreconditions,
         initial_resource: Resource,
-    ) -> Result<PodDeleteMarkOutcome, AppError> {
+    ) -> Result<PodDeleteMarkOutcome, PodRepositoryError> {
         let mut current = initial_resource;
         let mut attempt = 0u32;
 
@@ -259,11 +260,13 @@ impl PodDeleteCoordinator {
             } else {
                 self.store
                     .get(ns, name)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?
+                    .await
+                    .map_err(|error| map_store_error(error, ns, name))?
+                    .ok_or_else(|| PodRepositoryError::not_found(ns, name))?
             };
             ensure_resource_preconditions_match(&delete_base, delete_preconditions)?;
-            let grace_period_seconds = pod_delete_grace_period_seconds(&delete_base.data, options);
+            let grace_period_seconds =
+                pod_delete_grace_period_seconds(&delete_base.data, requested_grace_period_seconds);
             let data = pod_data_with_deletion_metadata(&delete_base.data, grace_period_seconds);
             let mark_result = if delete_preconditions.resource_version.is_some() {
                 self.store
@@ -283,11 +286,7 @@ impl PodDeleteCoordinator {
 
             match mark_result {
                 Ok(updated) => {
-                    break (
-                        updated,
-                        std::sync::Arc::unwrap_or_clone(delete_base.data),
-                        grace_period_seconds,
-                    );
+                    break (updated, delete_base, grace_period_seconds);
                 }
                 Err(e)
                     if crate::datastore::errors::is_conflict_error(&e)
@@ -303,12 +302,13 @@ impl PodDeleteCoordinator {
                     current = self
                         .store
                         .get(ns, name)
-                        .await?
-                        .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
+                        .await
+                        .map_err(|error| map_store_error(error, ns, name))?
+                        .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
                     attempt += 1;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(error) => return Err(map_store_error(error, ns, name)),
             }
         };
 
@@ -340,7 +340,7 @@ impl PodDeleteCoordinator {
                 error = %e,
                 "failed to enqueue pod deferred delete"
             );
-            return Err(AppError::Internal(format!(
+            return Err(PodRepositoryError::internal(format!(
                 "failed to enqueue pod deferred delete for {ns}/{name} uid {uid}: {e:#}"
             )));
         }
@@ -352,7 +352,7 @@ impl PodDeleteCoordinator {
         })
     }
 
-    pub(super) async fn enqueue_marked_pod_retry(
+    pub(crate) async fn enqueue_marked_pod_retry(
         &self,
         ns: String,
         name: String,
@@ -408,8 +408,41 @@ impl PodDeleteCoordinator {
 fn ensure_resource_preconditions_match(
     resource: &Resource,
     preconditions: &ResourcePreconditions,
-) -> Result<(), AppError> {
-    crate::api::mutation::delete::ensure_delete_preconditions_match(resource, preconditions)
+) -> Result<(), PodRepositoryError> {
+    if let Some(expected_uid) = preconditions.uid.as_deref()
+        && resource.uid != expected_uid
+    {
+        return Err(PodRepositoryError::conflict("UID precondition failed"));
+    }
+
+    if let Some(expected_rv) = preconditions.resource_version
+        && resource.resource_version != expected_rv
+    {
+        return Err(PodRepositoryError::conflict(format!(
+            "resourceVersion precondition failed: expected {expected_rv} got {}",
+            resource.resource_version
+        )));
+    }
+
+    Ok(())
+}
+
+fn map_store_error(error: anyhow::Error, namespace: &str, name: &str) -> PodRepositoryError {
+    if error
+        .downcast_ref::<crate::datastore::errors::DatastoreError>()
+        .is_some_and(crate::datastore::errors::DatastoreError::is_conflict)
+    {
+        return PodRepositoryError::conflict(error.to_string());
+    }
+
+    let message = error.to_string();
+    if message.contains("409 Conflict") {
+        PodRepositoryError::conflict(message)
+    } else if message.contains("not found") {
+        PodRepositoryError::not_found(namespace, name)
+    } else {
+        PodRepositoryError::internal(message)
+    }
 }
 
 pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> Value {
@@ -438,9 +471,11 @@ pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds
     data
 }
 
-pub(super) fn pod_delete_grace_period_seconds(data: &Value, options: &DeleteOptions) -> i64 {
-    options
-        ._grace_period_seconds
+pub(super) fn pod_delete_grace_period_seconds(
+    data: &Value,
+    requested_grace_period_seconds: Option<i64>,
+) -> i64 {
+    requested_grace_period_seconds
         .or_else(|| {
             data.pointer("/spec/terminationGracePeriodSeconds")
                 .and_then(|value| value.as_i64())
@@ -569,6 +604,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delete_precondition_errors_preserve_uid_and_resource_version_conflicts() {
+        let resource = pod_resource();
+        let cases = [
+            (
+                ResourcePreconditions {
+                    uid: Some("other-uid".to_string()),
+                    resource_version: None,
+                },
+                "UID precondition failed",
+            ),
+            (
+                ResourcePreconditions {
+                    uid: None,
+                    resource_version: Some(8),
+                },
+                "resourceVersion precondition failed: expected 8 got 7",
+            ),
+        ];
+
+        for (preconditions, expected_message) in cases {
+            let error = ensure_resource_preconditions_match(&resource, &preconditions)
+                .expect_err("mismatched Pod delete precondition must conflict");
+            assert_eq!(
+                error,
+                PodRepositoryError::conflict(expected_message),
+                "precondition {preconditions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_grace_policy_prefers_request_then_spec_then_default_and_clamps_zero() {
+        let mut pod = (*pod_resource().data).clone();
+        let cases = [(Some(5), 5), (Some(-1), 0), (None, 0)];
+        for (requested, expected) in cases {
+            assert_eq!(
+                pod_delete_grace_period_seconds(&pod, requested),
+                expected,
+                "requested grace {requested:?}"
+            );
+        }
+
+        pod.pointer_mut("/spec/terminationGracePeriodSeconds")
+            .expect("fixture termination grace")
+            .take();
+        assert_eq!(pod_delete_grace_period_seconds(&pod, None), 30);
+    }
+
+    #[test]
+    fn store_errors_keep_kubernetes_conflict_not_found_and_internal_categories() {
+        let cases = [
+            (
+                anyhow::Error::new(crate::datastore::errors::DatastoreError::conflict(
+                    "stale resource version",
+                )),
+                PodRepositoryError::conflict("stale resource version (409 Conflict)"),
+            ),
+            (
+                anyhow::anyhow!("Pod row not found"),
+                PodRepositoryError::not_found("default", "pod-a"),
+            ),
+            (
+                anyhow::anyhow!("node-local store unavailable"),
+                PodRepositoryError::internal("node-local store unavailable"),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(map_store_error(error, "default", "pod-a"), expected);
+        }
+    }
+
     #[tokio::test]
     async fn api_delete_mark_returns_error_when_durable_retry_enqueue_fails() {
         let store = Arc::new(FakeDeleteStore::new(pod_resource()));
@@ -587,14 +695,14 @@ mod tests {
             .mark_and_queue_api_delete(
                 "default",
                 "pod-a",
-                &DeleteOptions::default(),
+                None,
                 &ResourcePreconditions::default(),
                 pod_resource(),
             )
             .await
             .expect_err("enqueue failure must fail the API delete");
 
-        assert!(matches!(err, AppError::Internal(_)));
+        assert!(matches!(err, PodRepositoryError::Internal { .. }));
         assert_eq!(queue.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             metrics

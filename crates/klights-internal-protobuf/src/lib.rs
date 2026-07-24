@@ -220,6 +220,7 @@ mod tests {
                 dataplane_port: 51_820,
                 dataplane_mode: "root".to_string(),
                 dataplane_encryption: "enabled".to_string(),
+                supported_features: 3,
             })),
         };
         let follower_ack = FollowerMessage {

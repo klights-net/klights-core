@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 /// Derive the kubernetes service ClusterIP from the service CIDR.
 /// Returns the first usable IP (network + 1), e.g. "10.43.128.0/17" -> "10.43.128.1".
 pub fn derive_kubernetes_service_ip(service_cidr: &str) -> String {
-    crate::utils::derive_first_ip(service_cidr)
+    crate::service_ips::kubernetes_service_ip(service_cidr)
 }
 
 /// Bootstrap the default ServiceCIDR object expected by conformance tests.

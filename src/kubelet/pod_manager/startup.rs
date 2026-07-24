@@ -95,7 +95,7 @@ mod tests {
                 ),
                 assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode:
-                    crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
+                    crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
             },

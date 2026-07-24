@@ -6,8 +6,8 @@ use std::sync::Arc;
 use crate::api::AppError;
 use crate::datastore::Resource;
 use crate::kubelet::pod_repository::PodStatusPatchType;
-use crate::kubelet::pod_repository::api::PodApiService;
 use crate::kubelet::pod_repository::types::PodApiUpdateOutcome;
+use crate::pod_api_service::PodApiService;
 
 pub struct PodApiUpdateService {
     api: Arc<PodApiService>,

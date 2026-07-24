@@ -47,6 +47,27 @@ fn request_owns_payload_and_requires_complete_durable_identity() {
     assert_eq!(request.client_id(), "outbox-client-a");
     assert_eq!(request.stream_id(), 73);
     assert_eq!(request.stream_sequence(), 9);
+    assert_eq!(
+        request.codec_version(),
+        klights_cluster_core::COMMAND_CODEC_VERSION
+    );
+
+    for advertised in [
+        klights_cluster_core::COMMAND_CODEC_VERSION - 1,
+        klights_cluster_core::COMMAND_CODEC_VERSION + 1,
+    ] {
+        let incompatible_peer = OutboxDeliveryRequest::try_new_versioned(
+            advertised,
+            "worker-a:pod-status:uid-a:40",
+            OutboxDeliveryOperation::PodStatus,
+            Arc::clone(&payload),
+            "outbox-client-a",
+            73,
+            8,
+        )
+        .expect("transport request preserves the sender codec for exact-version admission");
+        assert_eq!(incompatible_peer.codec_version(), advertised);
+    }
 
     for (field, result) in [
         (
@@ -198,6 +219,17 @@ fn results_preserve_applied_and_already_applied_optional_rv_semantics() {
 
 #[test]
 fn terminal_and_retryable_delivery_failures_are_typed() {
+    let codec = OutboxDeliveryError::codec_incompatible(
+        klights_cluster_core::COMMAND_CODEC_VERSION + 1,
+        klights_cluster_core::COMMAND_CODEC_VERSION,
+    );
+    assert!(codec.is_retryable());
+    assert!(!codec.is_terminal());
+    assert!(
+        codec.to_string().contains("incompatible"),
+        "a future peer may handle this retryable rejection by explicitly reconnecting in v3 mode"
+    );
+
     let cases = [
         (OutboxDeliveryError::not_leader(), true, false),
         (

@@ -112,8 +112,23 @@ pub async fn propose_outbox_on_backend_with_watermark(
 
     let watermark_present = watermark.is_some();
     let uid_bound_pod_target = is_uid_bound_pod_command(&decoded.command);
-    let mut resource_before = resource_before_apply(db, &decoded.command).await?;
-    let (result, resource_effect, pod_endpoint_effect) = match db
+    let durable_actor_finalization = operation == OutboxOperation::PodMetadata
+        && (matches!(decoded.command, StorageCommand::FinalizeBoundPod { .. })
+            || matches!(
+                &decoded.command,
+                StorageCommand::DeleteResource {
+                    api_version,
+                    kind,
+                    namespace: Some(_),
+                    preconditions,
+                    ..
+                } if api_version == "v1"
+                    && kind == "Pod"
+                    && preconditions.uid.as_deref().is_some_and(|uid| !uid.is_empty())
+                    && preconditions.resource_version.is_none()
+            ));
+    let resource_before = resource_before_apply(db, &decoded.command).await?;
+    let (result, resource_effect, pod_endpoint_effect, committed_resource) = match db
         .apply_outbox_transactionally_with_watermark_effect(
             idempotency_key,
             operation.as_str(),
@@ -149,7 +164,6 @@ pub async fn propose_outbox_on_backend_with_watermark(
     // AlreadyApplied returns the stored resource). The log_apply
     // follower ensures proper state ordering so these no longer
     // need to be silently swallowed.
-    let resource_before_present = resource_before.is_some();
     let pod_patch_is_explicitly_irrelevant = matches!(
         &decoded.command,
         StorageCommand::PatchResource {
@@ -161,8 +175,18 @@ pub async fn propose_outbox_on_backend_with_watermark(
             && kind == "Pod"
             && !pod_patch_touches_endpoint_metadata(patch)
     );
-    let resource = if resource_changed && !pod_patch_is_explicitly_irrelevant {
-        resource_after_apply(db, &decoded.command, &mut resource_before).await?
+    let resource = if matches!(
+        decoded.command,
+        StorageCommand::DeleteResource { .. } | StorageCommand::FinalizeBoundPod { .. }
+    ) {
+        committed_resource.map(crate::replication::protocol::ForwardedResource::from)
+    } else if matches!(
+        decoded.command,
+        StorageCommand::DeleteResourceWithTombstone { .. }
+    ) {
+        resource_before.clone()
+    } else if resource_changed && !pod_patch_is_explicitly_irrelevant {
+        resource_after_apply(db, &decoded.command).await?
     } else {
         None
     };
@@ -170,11 +194,11 @@ pub async fn propose_outbox_on_backend_with_watermark(
         &decoded.command,
         resource_before.as_ref(),
         resource.as_ref(),
-        resource_before_present,
         resource_changed,
     );
     let newly_applied = matches!(result, OutboxApplyResult::Applied { .. });
-    let suppress_side_effect = !newly_applied
+    let replayable_actor_cascade = durable_actor_finalization && resource.is_some();
+    let suppress_side_effect = (!newly_applied && !replayable_actor_cascade)
         || (watermark_present && uid_bound_pod_target && resource.is_none())
         || pod_resource_effect == Some(false);
     let resource = if pod_resource_effect == Some(false) {
@@ -182,7 +206,30 @@ pub async fn propose_outbox_on_backend_with_watermark(
     } else {
         resource
     };
-    let command = (!suppress_side_effect).then_some(decoded.command);
+    let effect_command = if durable_actor_finalization
+        && matches!(decoded.command, StorageCommand::DeleteResource { .. })
+    {
+        resource.as_ref().map_or(decoded.command, |resource| {
+            crate::bound_pod_finalization_command::author(
+                resource
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string()),
+                resource.name.clone(),
+                resource
+                    .data
+                    .pointer("/metadata/uid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                authoring_node.to_string(),
+                resource.resource_version,
+            )
+        })
+    } else {
+        decoded.command
+    };
+    let command = (!suppress_side_effect).then_some(effect_command);
     Ok(RaftOutboxApply {
         result,
         resource,
@@ -192,6 +239,20 @@ pub async fn propose_outbox_on_backend_with_watermark(
 }
 
 fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
+    if let StorageCommand::FinalizeBoundPod {
+        namespace,
+        name,
+        pod_uid,
+        node_name,
+        observed_resource_version,
+    } = command
+    {
+        return !namespace.is_empty()
+            && !name.is_empty()
+            && !pod_uid.is_empty()
+            && !node_name.is_empty()
+            && *observed_resource_version > 0;
+    }
     let (api_version, kind, preconditions) = match command {
         StorageCommand::UpdateStatus {
             api_version,
@@ -254,14 +315,8 @@ async fn resource_before_apply(
     command: &StorageCommand,
 ) -> std::result::Result<Option<ForwardedResource>, OutboxApplyError> {
     match command {
-        StorageCommand::DeleteResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            ..
-        }
-        | StorageCommand::DeleteResourceWithTombstone {
+        StorageCommand::DeleteResource { .. } => Ok(None),
+        StorageCommand::DeleteResourceWithTombstone {
             api_version,
             kind,
             namespace,
@@ -272,6 +327,7 @@ async fn resource_before_apply(
             .await
             .map(|resource| resource.map(ForwardedResource::from))
             .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
+        StorageCommand::FinalizeBoundPod { .. } => Ok(None),
         StorageCommand::PatchResource {
             api_version,
             kind,
@@ -292,7 +348,6 @@ async fn resource_before_apply(
 async fn resource_after_apply(
     db: &dyn DatastoreBackend,
     command: &StorageCommand,
-    resource_before: &mut Option<ForwardedResource>,
 ) -> std::result::Result<Option<ForwardedResource>, OutboxApplyError> {
     match command {
         StorageCommand::CreateResource {
@@ -327,8 +382,6 @@ async fn resource_after_apply(
             .await
             .map(|resource| resource.map(ForwardedResource::from))
             .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
-        StorageCommand::DeleteResource { .. }
-        | StorageCommand::DeleteResourceWithTombstone { .. } => Ok(resource_before.take()),
         _ => Ok(None),
     }
 }
@@ -337,7 +390,6 @@ fn pod_side_effect_resource_changed(
     command: &StorageCommand,
     resource_before: Option<&ForwardedResource>,
     resource_after: Option<&ForwardedResource>,
-    before_present: bool,
     resource_changed: bool,
 ) -> Option<bool> {
     match command {
@@ -346,7 +398,8 @@ fn pod_side_effect_resource_changed(
         } if api_version == "v1" && kind == "Pod" => Some(resource_changed),
         StorageCommand::DeleteResource {
             api_version, kind, ..
-        } if api_version == "v1" && kind == "Pod" => Some(before_present),
+        } if api_version == "v1" && kind == "Pod" => Some(resource_after.is_some()),
+        StorageCommand::FinalizeBoundPod { .. } => Some(resource_after.is_some()),
         StorageCommand::PatchResource {
             api_version,
             kind,
@@ -478,6 +531,190 @@ mod tests {
         .unwrap();
         assert!(no_op.resource.is_none());
         assert!(no_op.command.is_none());
+    }
+
+    #[tokio::test]
+    async fn actor_finalization_persists_exact_receipt_for_durable_cascade_replay() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let create_bound_terminating_pod = |name: &'static str, uid: &'static str, finalizers| {
+            db.create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                name,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": name,
+                        "uid": uid,
+                        "deletionTimestamp": "2026-07-24T00:00:00Z",
+                        "finalizers": finalizers
+                    },
+                    "spec": {"nodeName": "worker-a"}
+                }),
+            )
+        };
+        create_bound_terminating_pod("blocked", "blocked-uid", json!(["hold.example/finalizer"]))
+            .await
+            .unwrap();
+        let eligible = create_bound_terminating_pod("eligible", "eligible-uid", json!([]))
+            .await
+            .unwrap();
+        let eligible_before = ForwardedResource::from(eligible);
+
+        let finalize =
+            |id: &'static str, name: &'static str, uid: &'static str, observed_resource_version| {
+                propose_outbox_on_backend(
+                    &db,
+                    id,
+                    OutboxOperation::PodMetadata,
+                    outbox_payload(StorageCommand::FinalizeBoundPod {
+                        namespace: "default".to_string(),
+                        name: name.to_string(),
+                        pod_uid: uid.to_string(),
+                        node_name: "worker-a".to_string(),
+                        observed_resource_version,
+                    }),
+                    "worker-a",
+                )
+            };
+
+        let blocked_rv = db
+            .get_resource("v1", "Pod", Some("default"), "blocked")
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version;
+        let blocked = finalize("blocked-finalize", "blocked", "blocked-uid", blocked_rv)
+            .await
+            .unwrap();
+        assert!(blocked.command.is_none());
+        assert!(blocked.resource.is_none());
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "blocked")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let deleted = finalize(
+            "eligible-finalize",
+            "eligible",
+            "eligible-uid",
+            eligible_before.resource_version,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            deleted.command,
+            Some(StorageCommand::FinalizeBoundPod { .. })
+        ));
+        assert_eq!(deleted.resource.as_ref(), Some(&eligible_before));
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "eligible")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let duplicate = finalize(
+            "eligible-finalize",
+            "eligible",
+            "eligible-uid",
+            eligible_before.resource_version,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            duplicate.result,
+            OutboxApplyResult::AlreadyApplied { .. }
+        ));
+        assert!(
+            matches!(
+                duplicate.command,
+                Some(StorageCommand::FinalizeBoundPod { .. })
+            ),
+            "a committed actor delete must remain replayable until its durable \
+             dependent cascade has been delivered"
+        );
+        assert_eq!(
+            duplicate.resource.as_ref(),
+            Some(&eligible_before),
+            "replay must use the exact transactional pre-delete Pod, not a \
+             detached read after the row is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_finalization_rejects_same_uid_newer_resource_generation() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let observed = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "generation-race",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "generation-race",
+                        "uid": "stable-uid",
+                        "deletionTimestamp": "2026-07-24T00:00:00Z"
+                    },
+                    "spec": {"nodeName": "worker-a"}
+                }),
+            )
+            .await
+            .unwrap();
+        let mut newer = (*observed.data).clone();
+        newer["metadata"]["annotations"] = json!({"race.example/generation": "newer"});
+        let newer = db
+            .update_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "generation-race",
+                newer,
+                observed.resource_version,
+            )
+            .await
+            .unwrap();
+
+        let stale = propose_outbox_on_backend(
+            &db,
+            "stale-generation-finalize",
+            OutboxOperation::PodMetadata,
+            outbox_payload(StorageCommand::FinalizeBoundPod {
+                namespace: "default".to_string(),
+                name: "generation-race".to_string(),
+                pod_uid: "stable-uid".to_string(),
+                node_name: "worker-a".to_string(),
+                observed_resource_version: observed.resource_version,
+            }),
+            "worker-a",
+        )
+        .await
+        .unwrap();
+
+        assert!(stale.command.is_none());
+        assert!(stale.resource.is_none());
+        let surviving = db
+            .get_resource("v1", "Pod", Some("default"), "generation-race")
+            .await
+            .unwrap()
+            .expect("same-UID newer generation must survive stale actor finalization");
+        assert_eq!(surviving.resource_version, newer.resource_version);
+        assert_eq!(
+            surviving
+                .data
+                .pointer("/metadata/annotations/race.example~1generation")
+                .and_then(serde_json::Value::as_str),
+            Some("newer")
+        );
     }
 
     #[tokio::test]

@@ -14,30 +14,29 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use crate::kubelet::pod_repository::api::PodSchedulingMode;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 #[cfg(test)]
 use tokio::sync::broadcast;
 
-use crate::api::{AppError, DeleteOptions};
 use crate::control_plane::client::{
     LeaderApiClient, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
     legacy_list_response,
 };
-#[cfg(test)]
 use crate::datastore::DatastoreHandle;
 use crate::datastore::{Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
-use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
+use crate::side_effects::SideEffectMetrics;
+#[cfg(test)]
+use crate::side_effects::SideEffectRegistry;
 #[cfg(test)]
 use crate::watch::WatchEvent;
+use klights_pod_api::{PodDeleteOptions, PodRepositoryError};
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_supervisor::TaskSupervisor;
-use klights_types::ResourceKey;
+use klights_types::{PodIdentity, ResourceKey};
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
@@ -166,7 +165,6 @@ fn test_network_endpoint(
         .map_err(|error| klights_node_store::CacheNetworkError::corrupt_data(error.to_string()))
 }
 
-pub mod api;
 pub mod background;
 pub mod delete_coordinator;
 pub mod facade;
@@ -176,7 +174,6 @@ pub(crate) mod ordinary_access;
 pub mod state_only_writer;
 pub mod status;
 pub(crate) mod store;
-pub mod subresource;
 pub mod types;
 pub mod watch;
 pub mod workqueue;
@@ -184,24 +181,144 @@ pub mod workqueue;
 #[cfg(test)]
 mod tests;
 
-pub use api::PodRepositoryBuildConfig;
+#[cfg(test)]
+pub(crate) use crate::pod_repository_composition::{PodRepositoryBuildConfig, PodSchedulingMode};
 pub use types::{
     PodApiCreateRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiUpdateOutcome,
     PodNetworkAssignment, PodStatusPatchType, PodStatusUpdate, RuntimeReconcileStatus,
     content_type_to_patch_type,
 };
 
-use api::{PodApiService, PodApiServiceDependencies};
 use background::PodRepositoryBackground;
 use delete_coordinator::PodDeleteCoordinator;
+use klights_reconcile_api::{PodGcReconcileSink, PodPdbReconcileSink};
 use network::PodNetworkService;
 use objects::PodObjectService;
-use state_only_writer::StatusOnlyWriterService;
+use state_only_writer::{StateOnlyWriter, StatusOnlyWriterService};
 use status::PodStatusService;
 use store::PodStore;
-use subresource::PodSubresourceService;
 use watch::PodWatchService;
 use workqueue::PodWorkqueue;
+
+#[async_trait]
+pub(crate) trait PodApiPort: Send + Sync {
+    async fn create(
+        &self,
+        request: PodApiCreateRequest,
+    ) -> std::result::Result<PodApiCreateResult, PodRepositoryError>;
+    async fn update(
+        &self,
+        ns: &str,
+        name: &str,
+        body: Value,
+        current: Resource,
+        dry_run: bool,
+    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError>;
+    async fn patch(
+        &self,
+        ns: &str,
+        name: &str,
+        patch: Value,
+        patch_type: PodStatusPatchType,
+        dry_run: bool,
+    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError>;
+    async fn delete(
+        &self,
+        ns: &str,
+        name: &str,
+        options: PodDeleteOptions,
+        dry_run: bool,
+    ) -> std::result::Result<PodApiDeleteOutcome, PodRepositoryError>;
+    async fn delete_collection(
+        &self,
+        ns: &str,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        dry_run: bool,
+    ) -> std::result::Result<(), PodRepositoryError>;
+    async fn mark_terminating(
+        &self,
+        target: &klights_pod_api::PodMutationTarget,
+    ) -> std::result::Result<Resource, PodRepositoryError>;
+    async fn schedule_pending(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> std::result::Result<Option<Resource>, PodRepositoryError>;
+    async fn bind(
+        &self,
+        namespace: &str,
+        name: &str,
+        binding: Value,
+        dry_run: bool,
+    ) -> std::result::Result<(), PodRepositoryError>;
+    async fn schedule_all(self: Arc<Self>) -> std::result::Result<(), PodRepositoryError>;
+}
+
+#[async_trait]
+pub(crate) trait PodSubresourcePort: Send + Sync {
+    async fn replace_status(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: Option<&str>,
+        status: Value,
+        expected_rv: i64,
+    ) -> Result<Resource>;
+    async fn patch_status(
+        &self,
+        ns: &str,
+        name: &str,
+        patch: Value,
+        patch_type: PodStatusPatchType,
+        expected_rv: i64,
+    ) -> Result<Resource>;
+    async fn update_ephemeral_containers(
+        &self,
+        ns: &str,
+        name: &str,
+        containers: Vec<Value>,
+        expected_rv: i64,
+    ) -> Result<Resource>;
+}
+
+pub(crate) struct PodRepositoryAdapterDependencies {
+    pub store: Arc<PodStore>,
+    pub status_only: Arc<dyn StateOnlyWriter>,
+    pub supervisor: Arc<TaskSupervisor>,
+    pub delete_coordinator: Arc<PodDeleteCoordinator>,
+}
+
+pub(crate) struct PodRepositoryRuntimeDependencies {
+    pub supervisor: Arc<TaskSupervisor>,
+    pub metrics: Arc<SideEffectMetrics>,
+}
+
+pub(crate) struct PodRepositoryNetworkDependencies {
+    pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
+}
+
+pub(crate) struct PodRepositoryDeliveryDependencies {
+    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    pub cluster_api: Option<Arc<dyn LeaderApiClient>>,
+}
+
+pub(crate) struct PodRepositoryAdapters {
+    pub api: Arc<dyn PodApiPort>,
+    pub subresource: Arc<dyn PodSubresourcePort>,
+    pub gc_delete: Arc<dyn GcPodDeleteSink>,
+    pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
+    pub pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
+    pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
+    pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
+    #[cfg(test)]
+    pub api_for_test: Arc<crate::pod_api_service::PodApiService>,
+}
+
+pub(crate) trait PodRepositoryAdapterFactory: Send + Sync {
+    fn build(&self, dependencies: PodRepositoryAdapterDependencies) -> PodRepositoryAdapters;
+}
 
 #[async_trait]
 pub trait PodReader: Send + Sync {
@@ -535,7 +652,7 @@ pub trait PodApiWriter: Send + Sync {
     async fn api_create_pod(
         &self,
         request: PodApiCreateRequest,
-    ) -> std::result::Result<PodApiCreateResult, AppError>;
+    ) -> std::result::Result<PodApiCreateResult, PodRepositoryError>;
 
     async fn api_update_pod(
         &self,
@@ -544,7 +661,7 @@ pub trait PodApiWriter: Send + Sync {
         body: Value,
         current: Resource,
         dry_run: bool,
-    ) -> std::result::Result<PodApiUpdateOutcome, AppError>;
+    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError>;
 
     async fn api_patch_pod(
         &self,
@@ -553,15 +670,17 @@ pub trait PodApiWriter: Send + Sync {
         patch: Value,
         patch_type: PodStatusPatchType,
         dry_run: bool,
-    ) -> std::result::Result<PodApiUpdateOutcome, AppError>;
+    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError>;
 
-    async fn api_delete_pod(
+    async fn api_delete_pod<O>(
         &self,
         ns: &str,
         name: &str,
-        options: DeleteOptions,
+        options: O,
         dry_run: bool,
-    ) -> std::result::Result<PodApiDeleteOutcome, AppError>;
+    ) -> std::result::Result<PodApiDeleteOutcome, PodRepositoryError>
+    where
+        O: Into<PodDeleteOptions> + Send;
 
     async fn api_delete_collection_pods(
         &self,
@@ -569,7 +688,7 @@ pub trait PodApiWriter: Send + Sync {
         label_selector: Option<&str>,
         field_selector: Option<&str>,
         dry_run: bool,
-    ) -> std::result::Result<(), AppError>;
+    ) -> std::result::Result<(), PodRepositoryError>;
 }
 
 /// Eight-trait pod persistence repository. Constructed once at process
@@ -579,27 +698,33 @@ pub struct PodRepository {
     store: Arc<PodStore>,
     status: PodStatusService,
     objects: PodObjectService,
-    subresource: PodSubresourceService,
+    subresource: Arc<dyn PodSubresourcePort>,
     network_svc: PodNetworkService,
     _watch: PodWatchService,
-    api: Arc<PodApiService>,
+    api: Arc<dyn PodApiPort>,
+    gc_delete: Arc<dyn GcPodDeleteSink>,
     workqueue: Arc<PodWorkqueue>,
-    side_effects: Arc<SideEffectRegistry>,
-    metrics: Arc<SideEffectMetrics>,
+    namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
+    mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     supervisor: Arc<TaskSupervisor>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
     #[cfg(test)]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
+    #[cfg(test)]
+    api_for_test: Arc<crate::pod_api_service::PodApiService>,
 }
 
 #[derive(Clone)]
 struct PodDeletionFinalizerDependencies {
     store: Arc<PodStore>,
     gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+    gc_reconcile: Arc<dyn PodGcReconcileSink>,
+    pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
+    namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
-    side_effects: Arc<SideEffectRegistry>,
+    mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<SideEffectMetrics>,
     supervisor: Arc<TaskSupervisor>,
     deferred_runtime: status::DeferredRuntimeReducerHandle,
@@ -630,13 +755,18 @@ fn compose_pod_deletion_finalizer(
 ) -> Arc<dyn PodDeletionFinalizer> {
     let runtime_deletion_finalizer =
         crate::kubelet::pod_runtime::deletion_finalizer::compose_real_pod_deletion_finalizer(
-            dependencies.store,
-            dependencies.gc_pod_delete_sink,
-            dependencies.cluster_api,
-            dependencies.outbox,
-            dependencies.side_effects,
-            dependencies.metrics,
-            dependencies.supervisor,
+            crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizerDependencies {
+                store: dependencies.store,
+                gc_pod_delete_sink: dependencies.gc_pod_delete_sink,
+                gc_reconcile: dependencies.gc_reconcile,
+                pdb_reconcile: dependencies.pdb_reconcile,
+                namespace_termination: dependencies.namespace_termination,
+                cluster_api: dependencies.cluster_api,
+                outbox: dependencies.outbox,
+                mutation_reconcile: dependencies.mutation_reconcile,
+                metrics: dependencies.metrics,
+                supervisor: dependencies.supervisor,
+            },
         );
     Arc::new(DeferredRuntimeCleanupFinalizer::new(
         runtime_deletion_finalizer,
@@ -685,7 +815,12 @@ impl std::fmt::Display for PodUidMismatch {
 
 impl std::error::Error for PodUidMismatch {}
 
-fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str) -> Result<()> {
+pub(crate) fn ensure_pod_uid_matches(
+    data: &Value,
+    expected_uid: &str,
+    ns: &str,
+    name: &str,
+) -> Result<()> {
     let live_uid = data
         .pointer("/metadata/uid")
         .and_then(|v| v.as_str())
@@ -828,34 +963,31 @@ impl PodRepository {
     /// Build `PodRepository` and its deferred-startup services without
     /// calling `workqueue.start()`. The returned `PodRepositoryBackground`
     /// must be started after lifecycle wiring is complete (Task 4.2).
+    #[cfg(test)]
     pub fn build_parts(config: PodRepositoryBuildConfig) -> facade::PodRepositoryParts {
-        Self::build_parts_with_leader_unscheduled_deletion(config, None)
+        crate::pod_repository_composition::build_pod_repository_parts(config, None)
     }
 
-    /// Root leader/API composition only: build the single deferred-delete
-    /// workqueue that owns the never-bound Pod observed-RV CAS capability.
-    pub(crate) fn build_leader_parts(
-        config: PodRepositoryBuildConfig,
-        leadership: tokio::sync::watch::Receiver<bool>,
-    ) -> facade::PodRepositoryParts {
-        Self::build_parts_with_leader_unscheduled_deletion(config, Some(leadership))
-    }
-
-    fn build_parts_with_leader_unscheduled_deletion(
-        config: PodRepositoryBuildConfig,
+    pub(crate) fn build_parts_with_adapters(
+        db: DatastoreHandle,
+        runtime: PodRepositoryRuntimeDependencies,
+        network: PodRepositoryNetworkDependencies,
+        delivery: PodRepositoryDeliveryDependencies,
         leadership: Option<tokio::sync::watch::Receiver<bool>>,
+        adapter_factory: Arc<dyn PodRepositoryAdapterFactory>,
     ) -> facade::PodRepositoryParts {
-        let PodRepositoryBuildConfig {
-            db,
+        let PodRepositoryRuntimeDependencies {
             supervisor,
-            side_effects,
             metrics,
+        } = runtime;
+        let PodRepositoryNetworkDependencies {
             pod_network_cache,
             assignment_waiter,
-            scheduling_mode: _scheduling_mode,
+        } = network;
+        let PodRepositoryDeliveryDependencies {
             outbox,
             cluster_api,
-        } = config;
+        } = delivery;
         let store = Arc::new(PodStore::new(db.clone()));
         let workqueue = if let Some(leadership) = leadership {
             PodWorkqueue::new_leader(
@@ -880,47 +1012,48 @@ impl PodRepository {
             metrics.clone(),
         ));
         let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
-        let api = Arc::new(PodApiService::new(PodApiServiceDependencies {
+        let adapters = adapter_factory.build(PodRepositoryAdapterDependencies {
             store: store.clone(),
             status_only: status_only.clone(),
-            db: db.clone(),
             supervisor: supervisor.clone(),
             delete_coordinator,
-            side_effects: side_effects.clone(),
-            metrics: metrics.clone(),
-            outbox: outbox.clone(),
-        }));
+        });
+        workqueue.set_namespace_termination_sink(adapters.namespace_termination.clone());
+        let api = adapters.api;
+        let gc_reconcile = adapters.gc_reconcile;
+        let pdb_reconcile = adapters.pdb_reconcile;
+        let namespace_termination = adapters.namespace_termination;
+        let mutation_reconcile = adapters.mutation_reconcile;
         let status = PodStatusService::new(
             store.clone(),
             status_only.clone(),
-            side_effects.controller_dispatcher_slot(),
+            mutation_reconcile.clone(),
             outbox.clone(),
             cluster_api.clone(),
         );
         let objects = PodObjectService::new(
             store.clone(),
             api.clone(),
-            side_effects.controller_dispatcher_slot(),
+            mutation_reconcile.clone(),
             outbox.clone(),
             cluster_api.clone(),
         );
-        let subresource = PodSubresourceService::new(
-            store.clone(),
-            status_only,
-            side_effects.controller_dispatcher_slot(),
-        );
+        let subresource = adapters.subresource;
         let network_svc =
             PodNetworkService::new(pod_network_cache, supervisor.clone(), assignment_waiter);
         let watch = PodWatchService::new(store.clone());
-        let gc_pod_delete_sink: Arc<dyn GcPodDeleteSink> = api.clone();
+        let gc_pod_delete_sink = adapters.gc_delete.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
 
         let deletion_finalizer_dependencies = PodDeletionFinalizerDependencies {
             store: store.clone(),
             gc_pod_delete_sink,
+            gc_reconcile,
+            pdb_reconcile,
+            namespace_termination: namespace_termination.clone(),
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
-            side_effects: side_effects.clone(),
+            mutation_reconcile: mutation_reconcile.clone(),
             metrics: metrics.clone(),
             supervisor: supervisor.clone(),
             deferred_runtime: status.deferred_runtime_handle(),
@@ -937,14 +1070,17 @@ impl PodRepository {
             network_svc,
             _watch: watch,
             api,
+            gc_delete: adapters.gc_delete,
             workqueue: workqueue.clone(),
-            side_effects,
-            metrics,
+            namespace_termination: namespace_termination.clone(),
+            mutation_reconcile,
             supervisor,
             outbox,
             cluster_api,
             #[cfg(test)]
             deletion_finalizer,
+            #[cfg(test)]
+            api_for_test: adapters.api_for_test,
         };
         let background = PodRepositoryBackground::new(workqueue);
         facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)
@@ -1012,8 +1148,7 @@ impl PodRepository {
     /// is visible on the admin diagnostics API and participates in
     /// graceful shutdown.
     async fn spawn_post_write_maintenance(&self, namespace: &str) {
-        let db = self.store.db().clone();
-        let metrics = self.metrics.clone();
+        let namespace_termination = self.namespace_termination.clone();
         let ns = namespace.to_string();
         let _ = self
             .supervisor
@@ -1021,12 +1156,14 @@ impl PodRepository {
                 klights_supervisor::TaskCategory::Background,
                 format!("post_write_maintenance/{ns}"),
                 async move {
-                    if let Err(err) = crate::api::reconcile_namespace_termination(
-                        db.as_ref(),
-                        &ns,
-                        metrics.as_ref(),
-                    )
-                    .await
+                    if let Err(err) = namespace_termination
+                        .reconcile_namespace_termination(
+                            klights_reconcile_api::NamespaceTerminationRequest {
+                                namespace: ns.clone(),
+                                expected_uid: None,
+                            },
+                        )
+                        .await
                     {
                         tracing::warn!(
                             namespace = %ns,
@@ -1048,15 +1185,16 @@ impl PodRepository {
         let resource = result.resource;
         if result.changed {
             if result.endpoint_state_changed {
-                crate::side_effects::run_named_hook_logged(
-                    &self.side_effects,
-                    &resource.data,
-                    self.store.db().as_ref(),
-                    &self.metrics,
-                    "pdb_reconcile",
-                    context,
-                )
-                .await;
+                let _ = self
+                    .mutation_reconcile
+                    .reconcile_pod_mutation(
+                        klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                            pod: resource.clone(),
+                            named_hook: Some("pdb_reconcile"),
+                            context,
+                        },
+                    )
+                    .await;
             }
             self.spawn_post_write_maintenance(namespace).await;
         }
@@ -1069,7 +1207,7 @@ impl PodRepository {
         name: &str,
     ) -> Result<Option<Resource>> {
         self.api
-            .schedule_pending_pod(namespace, name)
+            .schedule_pending(namespace, name)
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
@@ -1080,22 +1218,27 @@ impl PodRepository {
         name: &str,
         binding: serde_json::Value,
         dry_run: bool,
-    ) -> Result<(), crate::api::AppError> {
+    ) -> Result<()> {
         self.api
-            .bind_pod_from_api(namespace, name, binding, dry_run)
+            .bind(namespace, name, binding, dry_run)
             .await
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
         self.api
-            .schedule_all_unbound_pods()
+            .clone()
+            .schedule_all()
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
     #[cfg(test)]
-    fn set_scheduler_bind_gate_for_test(&self, gate: Arc<api::SchedulerBindGateForTest>) {
-        self.api.set_scheduler_bind_gate_for_test(gate);
+    fn set_scheduler_bind_gate_for_test(
+        &self,
+        gate: Arc<crate::pod_api_service::SchedulerBindGateForTest>,
+    ) {
+        self.api_for_test.set_scheduler_bind_gate_for_test(gate);
     }
 
     /// Enqueue the owning Job for asynchronous reconciliation after a pod
@@ -1109,36 +1252,13 @@ impl PodRepository {
     /// No-op when the pod has no Job owner or when the controller dispatcher
     /// is not yet bound.
     pub async fn enqueue_job_reconcile_for_pod(&self, pod: &Value) {
-        let Some(owners) = pod
-            .pointer("/metadata/ownerReferences")
-            .and_then(|arr| arr.as_array())
-        else {
-            return;
-        };
-
-        let Some(owner) = owners
-            .iter()
-            .find(|r| r.get("kind").and_then(|k| k.as_str()) == Some("Job"))
-        else {
-            return;
-        };
-
-        let Some(job_name) = owner.get("name").and_then(|n| n.as_str()) else {
-            return;
-        };
-        let Some(namespace) = pod.pointer("/metadata/namespace").and_then(|n| n.as_str()) else {
-            return;
-        };
-
-        let dispatcher = self.side_effects.controller_dispatcher_slot();
-        let Some(dispatcher) = dispatcher.get() else {
-            return;
-        };
-
-        if let Err(err) = dispatcher
-            .enqueue_reconcile_batch(vec![klights_reconcile_api::ReconcileKey::namespaced(
-                "batch/v1", "Job", namespace, job_name,
-            )])
+        if let Err(err) = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::EnqueueJobOwner {
+                    pod: Resource::from_data_lossy(Arc::new(pod.clone())),
+                },
+            )
             .await
         {
             tracing::warn!(error = %err, "failed to enqueue Job reconcile for terminal Pod");
@@ -1540,23 +1660,27 @@ impl PodObjectWriter for PodRepository {
         Ok(created)
     }
     async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
-        let outcome = self
-            .api
-            .api_delete_pod(ns, name, DeleteOptions::default(), false)
+        let Some(current) = self.store.get(ns, name).await? else {
+            return Ok(());
+        };
+        self.gc_delete
+            .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
+                ns,
+                name,
+                &current.uid,
+            )))
             .await
-            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
-
-        if let PodApiDeleteOutcome::GracefulSet(resource) = outcome {
-            crate::side_effects::run_hooks_logged(
-                &self.side_effects,
-                &resource.data,
-                self.store.db().as_ref(),
-                &self.metrics,
-                "pod_object_mark_terminating",
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let _ = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                    pod: current,
+                    named_hook: None,
+                    context: "pod_object_mark_terminating",
+                },
             )
             .await;
-        }
-
         Ok(())
     }
     async fn update_pod_owner_references(
@@ -1626,16 +1750,18 @@ impl PodSubresourceWriter for PodRepository {
     ) -> Result<Resource> {
         let updated = self
             .subresource
-            .replace_status_from_api(ns, name, status, expected_rv)
+            .replace_status(ns, name, None, status, expected_rv)
             .await?;
-        crate::side_effects::run_hooks_logged(
-            &self.side_effects,
-            &updated.data,
-            self.store.db().as_ref(),
-            &self.metrics,
-            "pod_status_subresource_replace",
-        )
-        .await;
+        let _ = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                    pod: updated.clone(),
+                    named_hook: None,
+                    context: "pod_status_subresource_replace",
+                },
+            )
+            .await;
         Ok(updated)
     }
     async fn replace_status_from_api_for_uid(
@@ -1648,16 +1774,18 @@ impl PodSubresourceWriter for PodRepository {
     ) -> Result<Resource> {
         let updated = self
             .subresource
-            .replace_status_from_api_for_uid(ns, name, pod_uid, status, expected_rv)
+            .replace_status(ns, name, Some(pod_uid), status, expected_rv)
             .await?;
-        crate::side_effects::run_hooks_logged(
-            &self.side_effects,
-            &updated.data,
-            self.store.db().as_ref(),
-            &self.metrics,
-            "pod_status_subresource_replace",
-        )
-        .await;
+        let _ = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                    pod: updated.clone(),
+                    named_hook: None,
+                    context: "pod_status_subresource_replace",
+                },
+            )
+            .await;
         Ok(updated)
     }
     async fn patch_status_from_api(
@@ -1670,16 +1798,18 @@ impl PodSubresourceWriter for PodRepository {
     ) -> Result<Resource> {
         let updated = self
             .subresource
-            .patch_status_from_api(ns, name, patch, patch_type, expected_rv)
+            .patch_status(ns, name, patch, patch_type, expected_rv)
             .await?;
-        crate::side_effects::run_hooks_logged(
-            &self.side_effects,
-            &updated.data,
-            self.store.db().as_ref(),
-            &self.metrics,
-            "pod_status_subresource_patch",
-        )
-        .await;
+        let _ = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                    pod: updated.clone(),
+                    named_hook: None,
+                    context: "pod_status_subresource_patch",
+                },
+            )
+            .await;
         Ok(updated)
     }
     async fn update_ephemeral_containers(
@@ -1724,8 +1854,8 @@ impl PodApiWriter for PodRepository {
     async fn api_create_pod(
         &self,
         request: PodApiCreateRequest,
-    ) -> std::result::Result<PodApiCreateResult, AppError> {
-        self.api.api_create_pod(request).await
+    ) -> std::result::Result<PodApiCreateResult, PodRepositoryError> {
+        self.api.create(request).await
     }
     async fn api_update_pod(
         &self,
@@ -1734,10 +1864,8 @@ impl PodApiWriter for PodRepository {
         body: Value,
         current: Resource,
         dry_run: bool,
-    ) -> std::result::Result<PodApiUpdateOutcome, AppError> {
-        self.api
-            .api_update_pod(ns, name, body, current, dry_run)
-            .await
+    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
+        self.api.update(ns, name, body, current, dry_run).await
     }
     async fn api_patch_pod(
         &self,
@@ -1746,19 +1874,20 @@ impl PodApiWriter for PodRepository {
         patch: Value,
         patch_type: PodStatusPatchType,
         dry_run: bool,
-    ) -> std::result::Result<PodApiUpdateOutcome, AppError> {
-        self.api
-            .api_patch_pod(ns, name, patch, patch_type, dry_run)
-            .await
+    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
+        self.api.patch(ns, name, patch, patch_type, dry_run).await
     }
-    async fn api_delete_pod(
+    async fn api_delete_pod<O>(
         &self,
         ns: &str,
         name: &str,
-        options: DeleteOptions,
+        options: O,
         dry_run: bool,
-    ) -> std::result::Result<PodApiDeleteOutcome, AppError> {
-        self.api.api_delete_pod(ns, name, options, dry_run).await
+    ) -> std::result::Result<PodApiDeleteOutcome, PodRepositoryError>
+    where
+        O: Into<PodDeleteOptions> + Send,
+    {
+        self.api.delete(ns, name, options.into(), dry_run).await
     }
     async fn api_delete_collection_pods(
         &self,
@@ -1766,9 +1895,9 @@ impl PodApiWriter for PodRepository {
         label_selector: Option<&str>,
         field_selector: Option<&str>,
         dry_run: bool,
-    ) -> std::result::Result<(), AppError> {
+    ) -> std::result::Result<(), PodRepositoryError> {
         self.api
-            .api_delete_collection_pods(ns, label_selector, field_selector, dry_run)
+            .delete_collection(ns, label_selector, field_selector, dry_run)
             .await
     }
 }
@@ -1778,6 +1907,6 @@ impl GcPodDeleteSink for PodRepository {
         &self,
         request: GcPodDeleteRequest,
     ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
-        self.api.request_gc_pod_delete(request)
+        self.gc_delete.request_gc_pod_delete(request)
     }
 }

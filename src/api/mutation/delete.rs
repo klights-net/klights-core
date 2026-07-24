@@ -2,27 +2,14 @@ use async_trait::async_trait;
 
 use crate::api::AppError;
 use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+use crate::resource_preconditions;
 
 pub fn ensure_delete_preconditions_match(
     resource: &Resource,
     preconditions: &ResourcePreconditions,
 ) -> Result<(), AppError> {
-    if let Some(expected_uid) = preconditions.uid.as_deref()
-        && resource.uid != expected_uid
-    {
-        return Err(AppError::Conflict("UID precondition failed".to_string()));
-    }
-
-    if let Some(expected_rv) = preconditions.resource_version
-        && resource.resource_version != expected_rv
-    {
-        return Err(AppError::Conflict(format!(
-            "resourceVersion precondition failed: expected {expected_rv} got {}",
-            resource.resource_version
-        )));
-    }
-
-    Ok(())
+    resource_preconditions::ensure_delete_preconditions_match(resource, preconditions)
+        .map_err(AppError::from)
 }
 
 #[derive(Debug)]

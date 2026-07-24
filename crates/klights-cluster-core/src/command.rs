@@ -17,8 +17,9 @@
 //! * **Representation-neutral.** Serde preserves the stable JSON shape, while
 //!   generated protobuf conversion remains in the replication boundary that
 //!   can see both canonical owners.
-//! * **`#[non_exhaustive]`** on the serde enums so future variants don't
-//!   break decode in rolling-upgrade scenarios.
+//! * **Fail-closed codec admission.** `#[non_exhaustive]` lets Rust callers
+//!   compile against future variants, but a process accepts wire commands
+//!   only when their metadata advertises this binary's exact codec version.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,10 +31,20 @@ use crate::resource::{PatchKind, ResourceBatchOperation, ResourcePreconditions};
 
 /// Codec version embedded in every `CommandMeta`.
 ///
-/// Bumped **only** when a backward-incompatible change is made to the
-/// command or response serialization.  Rolling upgrades must handle
-/// `COMMAND_CODEC_VERSION - 1` at minimum.
-pub const COMMAND_CODEC_VERSION: u32 = 2;
+/// Bumped **only** when a backward-incompatible change is made to the command
+/// or response serialization. Nodes with any other codec version must be
+/// rejected during startup/join and again at command admission.
+pub const COMMAND_CODEC_VERSION: u32 = 3;
+
+/// Whether this binary can decode and apply a command/snapshot codec.
+///
+/// Compatibility is deliberately exact. In particular, codec v2 is not
+/// normalized into codec v3 because that could let an older actor-delete
+/// command acquire newer semantics after it has already crossed a durable
+/// ordering boundary.
+pub const fn supports_command_codec_version(codec_version: u32) -> bool {
+    codec_version == COMMAND_CODEC_VERSION
+}
 
 // ---------------------------------------------------------------------------
 // CommandId
@@ -127,6 +138,22 @@ pub enum StorageCommand {
         namespace: Option<String>,
         name: String,
         preconditions: ResourcePreconditions,
+    },
+
+    /// Actor-authorized removal of one bound, terminating Pod.
+    ///
+    /// This intentionally is not expressible as generic resource deletion:
+    /// apply must atomically revalidate the exact UID, node binding, terminal
+    /// deletion state, and absence of finalizers.
+    FinalizeBoundPod {
+        namespace: String,
+        name: String,
+        pod_uid: String,
+        node_name: String,
+        /// Leader-fresh Pod generation observed by the lifecycle actor before
+        /// enqueueing finalization. Apply must revalidate this exact RV with
+        /// the UID and node binding before removing the row.
+        observed_resource_version: i64,
     },
 
     /// Delete a K8s resource and persist an explicit tombstone
@@ -327,6 +354,7 @@ impl StorageCommand {
             StorageCommand::CreateResource { .. } => "CreateResource",
             StorageCommand::UpdateResource { .. } => "UpdateResource",
             StorageCommand::DeleteResource { .. } => "DeleteResource",
+            StorageCommand::FinalizeBoundPod { .. } => "FinalizeBoundPod",
             StorageCommand::DeleteResourceWithTombstone { .. } => "DeleteResourceWithTombstone",
             StorageCommand::PatchResource { .. } => "PatchResource",
             StorageCommand::UpdateStatus { .. } => "UpdateStatus",
@@ -659,7 +687,20 @@ mod tests {
 
     #[test]
     fn command_identity_and_codec_version_contract_is_owned_here() {
-        assert_eq!(COMMAND_CODEC_VERSION, 2);
+        assert_eq!(
+            COMMAND_CODEC_VERSION, 3,
+            "FinalizeBoundPod is a new command-authoring contract and must not \
+             masquerade as the previous codec"
+        );
+        assert!(supports_command_codec_version(COMMAND_CODEC_VERSION));
+        assert!(
+            !supports_command_codec_version(COMMAND_CODEC_VERSION - 1),
+            "codec v2 must be rejected rather than normalized or replayed"
+        );
+        assert!(
+            !supports_command_codec_version(COMMAND_CODEC_VERSION + 1),
+            "a binary must not accept commands authored by an unknown future codec"
+        );
         let command_id = CommandId("test-123".to_string());
         assert_eq!(command_id.to_string(), "test-123");
     }

@@ -131,12 +131,12 @@ async fn activate_committed_apply_rv_v1_if_possible(
     let Some(probe) = probe else {
         return false;
     };
-    match raft.activate_committed_apply_rv_v1(probe.as_ref()).await {
+    match raft.activate_command_codec_v3(probe.as_ref()).await {
         Ok(()) => true,
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "raft_shape_role_label_watcher: failed to activate committed-apply resource-version V1"
+                "raft_shape_role_label_watcher: failed to activate exact-v3 command codec and committed-apply resource-version V1"
             );
             false
         }
@@ -312,9 +312,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
 
     let scheduling_mode = if has_leader_election {
-        crate::kubelet::pod_repository::api::PodSchedulingMode::DeferredMultiNodeLeader
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
     } else {
-        crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode
     };
     let runtime_node_role = if kubelet_uses_worker_store_adapter || !has_leader_election {
         RuntimeNodeRole::Worker
@@ -334,7 +334,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_build_config = crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+    let pod_repository_build_config = crate::pod_repository_composition::PodRepositoryBuildConfig {
         db: kubelet_db_handle.clone(),
         supervisor: supervisor.clone(),
         side_effects: side_effects.clone(),
@@ -346,11 +346,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         cluster_api: Some(cluster_api.clone()),
     };
     let pod_repository_parts = if kubelet_uses_worker_store_adapter {
-        crate::kubelet::pod_repository::PodRepository::build_parts(pod_repository_build_config)
-    } else {
-        crate::kubelet::pod_repository::PodRepository::build_leader_parts(
+        crate::pod_repository_composition::build_pod_repository_parts(
             pod_repository_build_config,
-            is_leader_rx.clone(),
+            None,
+        )
+    } else {
+        crate::pod_repository_composition::build_pod_repository_parts(
+            pod_repository_build_config,
+            Some(is_leader_rx.clone()),
         )
     };
     let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
@@ -411,8 +414,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
     }
     let api_pod_repository = if kubelet_uses_worker_store_adapter {
-        let parts = crate::kubelet::pod_repository::PodRepository::build_leader_parts(
-            crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+        let parts = crate::pod_repository_composition::build_pod_repository_parts(
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
@@ -423,7 +426,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(cluster_api.clone()),
             },
-            is_leader_rx.clone(),
+            Some(is_leader_rx.clone()),
         );
         let repo = Arc::new(parts.repository);
         repo.set_pod_lifecycle_router_for_node(

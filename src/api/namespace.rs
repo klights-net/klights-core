@@ -499,12 +499,9 @@ pub async fn patch_namespace(
 
 /// System namespaces that upstream forbids deleting. Mirrors the
 /// `NamespaceLifecycle` admission plugin's protected set.
-const PROTECTED_NAMESPACES: [&str; 4] =
-    ["default", "kube-system", "kube-public", "kube-node-lease"];
-
 /// Returns true when `name` is a system namespace that may not be deleted.
 pub fn is_protected_namespace(name: &str) -> bool {
-    PROTECTED_NAMESPACES.contains(&name)
+    crate::namespace_admission::is_protected(name)
 }
 
 pub async fn delete_namespace(

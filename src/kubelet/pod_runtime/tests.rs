@@ -495,8 +495,7 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
             metrics: crate::side_effects::SideEffectMetrics::new(),
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(db.clone()),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode:
-                crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
+            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
         },
@@ -1078,8 +1077,7 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
             metrics,
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(handle),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode:
-                crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
+            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
         },
@@ -10281,8 +10279,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             metrics: crate::side_effects::SideEffectMetrics::new(),
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(db.clone()),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode:
-                crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
+            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
         },

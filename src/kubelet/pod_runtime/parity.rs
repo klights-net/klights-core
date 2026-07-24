@@ -314,8 +314,7 @@ impl ParityFixture {
             metrics,
             pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(handle),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
-            scheduling_mode:
-                crate::kubelet::pod_repository::api::PodSchedulingMode::InlineSingleNode,
+            scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
         });

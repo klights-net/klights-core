@@ -641,6 +641,12 @@ mod cases {
                 .contains_key(crate::replication::grpc::JOIN_TOKEN_METADATA_KEY)
         );
         assert_eq!(client.join_request().token, "");
+        assert!(
+            crate::replication::protocol::supports_command_codec_v3(
+                client.join_request().supported_features
+            ),
+            "every worker stream handshake must advertise codec v3"
+        );
     }
 
     #[tokio::test]

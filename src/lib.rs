@@ -20,16 +20,24 @@ pub mod leader_election;
 pub(crate) mod leader_tls_policy;
 pub mod log_apply;
 pub mod metrics;
+mod namespace_admission;
 pub mod networking;
 pub mod node_admin;
 pub mod node_heartbeat;
 pub mod node_lease_tracker;
 pub mod paths;
 pub mod pidfile;
+pub(crate) mod pod_api_service;
 pub(crate) mod pod_endpoint_state;
+pub(crate) mod pod_readiness;
+pub(crate) mod pod_reconcile_adapter;
+pub(crate) mod pod_repository_composition;
+pub(crate) mod pod_subresource_service;
 pub mod portforward;
 pub mod replication;
+mod resource_preconditions;
 pub mod scheduler;
+mod service_ips;
 pub mod shutdown;
 pub mod side_effects;
 pub mod spdy;
@@ -50,6 +58,7 @@ mod cronjob_event_driven_scheduler_tests;
 // as part of `./build.sh`.
 
 mod bootstrap;
+mod bound_pod_finalization_command;
 
 #[cfg(test)]
 mod deployment_replicaset_error_test;

@@ -314,6 +314,10 @@ fn read_header(
     })
     .transpose()?
     .unwrap_or(ResourceVersionAssignment::LegacyLeaderAssigned);
+    let command_codec_activation_version =
+        get(crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)?
+            .map(|raw| raw.parse::<u32>().map_err(corrupt))
+            .transpose()?;
     let membership = match (
         get(klights_cluster_store::RAFT_VOTERS_META_KEY)?,
         get(klights_cluster_store::RAFT_TERM_META_KEY)?,
@@ -330,6 +334,7 @@ fn read_header(
     };
     SnapshotCaptureHeader::try_new(
         Some(assignment),
+        command_codec_activation_version,
         WatchReplayPosition {
             resource_version: current_rv,
             event_id,

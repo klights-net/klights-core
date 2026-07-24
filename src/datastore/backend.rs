@@ -54,6 +54,7 @@ pub struct CommittedOutboxApply {
     result: crate::kubelet::outbox::OutboxApplyResult,
     resource_effect: ResourceMutationEffect,
     pod_endpoint_effect: PodEndpointEffect,
+    committed_resource: Option<crate::datastore::Resource>,
 }
 
 impl CommittedOutboxApply {
@@ -66,7 +67,16 @@ impl CommittedOutboxApply {
             result,
             resource_effect,
             pod_endpoint_effect,
+            committed_resource: None,
         }
+    }
+
+    pub(crate) fn with_committed_resource(
+        mut self,
+        resource: Option<crate::datastore::Resource>,
+    ) -> Self {
+        self.committed_resource = resource;
+        self
     }
 
     pub(crate) fn into_parts(
@@ -75,8 +85,14 @@ impl CommittedOutboxApply {
         crate::kubelet::outbox::OutboxApplyResult,
         ResourceMutationEffect,
         PodEndpointEffect,
+        Option<crate::datastore::Resource>,
     ) {
-        (self.result, self.resource_effect, self.pod_endpoint_effect)
+        (
+            self.result,
+            self.resource_effect,
+            self.pod_endpoint_effect,
+            self.committed_resource,
+        )
     }
 }
 

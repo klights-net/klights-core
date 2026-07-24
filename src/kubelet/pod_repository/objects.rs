@@ -2,7 +2,7 @@
 //! (`create_controller_pod`, `delete_pod`, `update_pod_owner_references`,
 //! `record_sandbox_id`).
 //!
-//! Holds `Arc<PodStore>` and a sibling `Arc<PodApiService>` (so that
+//! Holds `Arc<PodStore>` and a sibling Pod API capability (so that
 //! `create_controller_pod` can delegate to the full admission pipeline).
 //! Implementations land in Tasks 6 and 14.
 
@@ -16,17 +16,17 @@ use crate::datastore::command::StorageCommand;
 use crate::datastore::{Resource, ResourcePreconditions};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
-use crate::side_effects::ControllerDispatcherSlot;
+use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
-use super::api::PodApiService;
+use super::PodApiPort;
 use super::store::PodStore;
 
 const SANDBOX_ID_ANNOTATION: &str = "klights.dev/sandbox-id";
 
 pub(super) struct PodObjectService {
     store: Arc<PodStore>,
-    api: Arc<PodApiService>,
-    controller_dispatcher: ControllerDispatcherSlot,
+    api: Arc<dyn PodApiPort>,
+    mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
 }
@@ -34,15 +34,15 @@ pub(super) struct PodObjectService {
 impl PodObjectService {
     pub(super) fn new(
         store: Arc<PodStore>,
-        api: Arc<PodApiService>,
-        controller_dispatcher: ControllerDispatcherSlot,
+        api: Arc<dyn PodApiPort>,
+        mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderApiClient>>,
     ) -> Self {
         Self {
             store,
             api,
-            controller_dispatcher,
+            mutation_reconcile,
             outbox,
             cluster_api,
         }
@@ -100,7 +100,7 @@ impl PodObjectService {
     ) -> Result<Resource> {
         let result = self
             .api
-            .api_create_pod(super::types::PodApiCreateRequest {
+            .create(super::types::PodApiCreateRequest {
                 namespace: ns.to_string(),
                 name: name.to_string(),
                 body: pod,
@@ -309,13 +309,13 @@ impl PodObjectService {
         }
 
         let updated = self.store.update(ns, name, body, cas_rv).await?;
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
-            &previous,
-            &updated.data,
-            self.store.db().as_ref(),
-            &self.controller_dispatcher,
-        )
-        .await
+        if let Err(err) = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(PodMutationReconcileRequest::ServicesAfterUpdate {
+                previous: Resource::from_data_lossy(std::sync::Arc::new(previous)),
+                updated: updated.clone(),
+            })
+            .await
         {
             tracing::debug!(
                 target: "klights::kubelet::pod_repository::objects",

@@ -13,6 +13,26 @@ use std::task::{Context as TaskContext, Poll};
 
 use klights_types::PodIdentity;
 
+/// Stable Node-annotation keys shared by node publishers and network/control
+/// plane consumers.
+pub const NODE_MODE_ANNOTATION: &str = "klights.io/mode";
+pub const HOSTPORT_RANGE_ANNOTATION: &str = "klights.io/hostport-range";
+pub const DATAPLANE_ENDPOINT_ANNOTATION: &str = "klights.io/dataplane-endpoint";
+pub const DATAPLANE_PORT_ANNOTATION: &str = "klights.io/dataplane-port";
+pub const DATAPLANE_MODE_ANNOTATION: &str = "klights.io/dataplane-mode";
+pub const DATAPLANE_ENCRYPTION_ANNOTATION: &str = "klights.io/dataplane-encryption";
+pub const DATAPLANE_PUBLIC_KEY_ANNOTATION: &str = "klights.io/dataplane-public-key";
+pub const GIT_COMMIT_ANNOTATION: &str = "klights.io/git-commit";
+pub const GRPC_PORT_ANNOTATION: &str = "klights.io/grpc-port";
+pub const DEFAULT_HOSTPORT_RANGE: &str = "30000-32767";
+
+/// Mode dimension projected through Node annotations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodePeerMode {
+    Root,
+    Rootless,
+}
+
 /// Object-safe future used by one complete datapath operation.
 ///
 /// Datapath calls are coarse sandbox lifecycle operations, so dynamic dispatch

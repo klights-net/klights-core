@@ -1072,7 +1072,8 @@ async fn test_delete_namespace_enters_terminating_before_final_removal() {
             json!({
                 "apiVersion":"v1",
                 "kind":"Pod",
-                "metadata":{"name":"pod-a","namespace":"ns-delete-order"}
+                "metadata":{"name":"pod-a","namespace":"ns-delete-order"},
+                "spec":{"nodeName":"worker-a","containers":[]}
             }),
         )
         .await
@@ -1172,7 +1173,8 @@ async fn test_namespace_termination_preserves_pod_until_actor_finalizes() {
             json!({
                 "apiVersion":"v1",
                 "kind":"Pod",
-                "metadata":{"name":"pod-a","namespace":"ns-actor-owned-delete","uid":"pod-a-uid"}
+                "metadata":{"name":"pod-a","namespace":"ns-actor-owned-delete","uid":"pod-a-uid"},
+                "spec":{"nodeName":"worker-a","containers":[]}
             }),
         )
         .await
@@ -1291,7 +1293,10 @@ async fn test_namespace_delete_pod_finalizer_blocks_non_pod_deletion_until_clear
                     "namespace":"ns-order-pod-finalizer",
                     "finalizers":["example.com/hold"]
                 },
-                "spec":{"containers":[{"name":"hold","image":"busybox"}]}
+                "spec":{
+                    "nodeName":"worker-a",
+                    "containers":[{"name":"hold","image":"busybox"}]
+                }
             }),
         )
         .await

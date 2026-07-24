@@ -173,6 +173,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // T2 step 5: register all known leader endpoints so the reconnect
     // loop can cycle through them after a stream failure.
     follower_grpc_client.set_all_leader_endpoints(all_leader_endpoints.clone());
+    follower_grpc_client
+        .require_command_codec_v3()
+        .await
+        .context("worker startup rejected incompatible leader command codec")?;
     let remote_api_client = std::sync::Arc::new(
         crate::control_plane::client::remote::RemoteApiClient::from_grpc(
             follower_grpc_client.clone(),
@@ -404,8 +408,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+    let pod_repository_parts = crate::pod_repository_composition::build_pod_repository_parts(
+        crate::pod_repository_composition::PodRepositoryBuildConfig {
             db: db.clone(),
             supervisor: task_supervisor.clone(),
             side_effects: side_effects.clone(),
@@ -413,10 +417,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             pod_network_cache,
             assignment_waiter,
             scheduling_mode:
-                crate::kubelet::pod_repository::api::PodSchedulingMode::DeferredMultiNodeLeader,
+                crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             outbox: Some(outbox.clone()),
             cluster_api: Some(cluster_api.clone()),
         },
+        None,
     );
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {

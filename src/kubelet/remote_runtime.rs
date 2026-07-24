@@ -53,7 +53,7 @@ impl NodeExecRuntime for CriNodeExecRuntime {
             let (target, command, timeout_seconds) = request.into_parts();
             let result = {
                 let mut cri = self.cri.lock().await;
-                crate::api_pod_subresources::exec_sync_with_created_state_retry(
+                crate::kubelet::cri_exec::exec_sync_with_created_state_retry(
                     &mut cri,
                     self.task_supervisor.as_ref(),
                     target.container_id(),
@@ -171,12 +171,12 @@ async fn run_cri_node_exec_stream(
     let streaming_url = {
         let mut cri_client = cri.lock().await;
         if attach {
-            crate::api_pod_subresources::attach_with_created_state_retry(
+            crate::kubelet::cri_exec::attach_with_created_state_retry(
                 &mut cri_client,
                 task_supervisor.as_ref(),
-                crate::api_pod_subresources::AttachRequest {
+                crate::kubelet::cri_exec::AttachRequest {
                     container_id: target.container_id(),
-                    stream_options: crate::api_pod_subresources::ExecStreamOptions {
+                    stream_options: crate::kubelet::cri_exec::ExecStreamOptions {
                         tty: options.tty(),
                         stdin: options.stdin(),
                         stdout: options.stdout(),
@@ -187,13 +187,13 @@ async fn run_cri_node_exec_stream(
             .await?
             .url
         } else {
-            crate::api_pod_subresources::exec_with_created_state_retry(
+            crate::kubelet::cri_exec::exec_with_created_state_retry(
                 &mut cri_client,
                 task_supervisor.as_ref(),
-                crate::api_pod_subresources::ExecRequest {
+                crate::kubelet::cri_exec::ExecRequest {
                     container_id: target.container_id(),
                     command: &command,
-                    stream_options: crate::api_pod_subresources::ExecStreamOptions {
+                    stream_options: crate::kubelet::cri_exec::ExecStreamOptions {
                         tty: options.tty(),
                         stdin: options.stdin(),
                         stdout: options.stdout(),

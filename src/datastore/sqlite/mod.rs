@@ -125,13 +125,16 @@ struct AtomicOutboxMutation {
     applied_rv: Option<i64>,
     result_proto: Vec<u8>,
     pending: Option<PendingWatchEvent>,
+    committed_resource: Option<crate::datastore::Resource>,
 }
 
 enum OutboxTxnOutcome {
     Applied {
         applied_rv: i64,
         pending: Option<PendingWatchEvent>,
+        resource_changed: bool,
         pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+        committed_resource: Option<crate::datastore::Resource>,
     },
     AlreadyApplied(Option<AppliedOutboxRecord>),
 }
@@ -156,7 +159,12 @@ pub enum BuildOutboxOutcome {
     LeaseRenewShortcircuit,
     /// The idempotency key is already recorded as applied; the leader
     /// returns the cached `applied_rv` (if any) without proposing.
-    AlreadyApplied { applied_rv: Option<i64> },
+    AlreadyApplied {
+        applied_rv: Option<i64>,
+        /// Exact transactional pre-delete receipt retained for durable
+        /// actor-finalization cascade replay.
+        committed_resource: Option<crate::datastore::Resource>,
+    },
 }
 
 enum BuildOutboxTxnOutcome {
@@ -305,6 +313,31 @@ impl Datastore {
         Ok(mode.unwrap_or(crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned))
     }
 
+    fn outbox_materialization_resource_version_hint_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        assignment_mode: crate::log_apply::ResourceVersionAssignment,
+    ) -> tokio_rusqlite::Result<Option<i64>> {
+        Ok(
+            (assignment_mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1)
+                .then(|| Self::current_resource_version_in_tx(tx))
+                .transpose()
+                .map(|current| current.map(|rv| rv.saturating_add(1)))?,
+        )
+    }
+
+    fn normalize_ledger_only_outbox_commit_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        commit: &mut crate::log_apply::LogApplyCommit,
+        rv: &mut i64,
+    ) -> tokio_rusqlite::Result<bool> {
+        let ledger_only = commit.mutations.is_empty();
+        if ledger_only {
+            *rv = Self::current_resource_version_in_tx(tx)?;
+            commit.resource_version = *rv;
+        }
+        Ok(ledger_only)
+    }
+
     fn append_applied_outbox_ledger_mutation(
         commit: &mut crate::log_apply::LogApplyCommit,
         idempotency_key: String,
@@ -343,6 +376,19 @@ impl Datastore {
         );
     }
 
+    fn is_bound_pod_finalization_delivery(
+        command: &crate::datastore::command::StorageCommand,
+        operation: &str,
+    ) -> bool {
+        use crate::datastore::command::StorageCommand;
+        use crate::kubelet::outbox::payload::OutboxOperation;
+
+        if operation != OutboxOperation::PodMetadata.as_str() {
+            return false;
+        }
+        matches!(command, StorageCommand::FinalizeBoundPod { .. })
+    }
+
     fn build_log_apply_commit_in_tx_from_command(
         tx: &rusqlite::Transaction<'_>,
         command: crate::datastore::command::StorageCommand,
@@ -372,6 +418,7 @@ impl Datastore {
 
         let rv = match resource_version_hint {
             Some(rv) => rv,
+            None if matches!(&command, StorageCommand::FinalizeBoundPod { .. }) => 0,
             None => Self::next_resource_version_in_tx(tx)?,
         };
 
@@ -815,7 +862,7 @@ impl Datastore {
                                     namespace,
                                     name,
                                     uid: live_uid,
-                                    precondition_resource_version: preconditions.resource_version,
+                                    precondition_resource_version: Some(live_rv),
                                 }),
                             ));
                         }
@@ -831,7 +878,7 @@ impl Datastore {
                 name,
                 preconditions,
             } => {
-                let (current_rv, current_uid, _data_bytes) = Self::resource_row_for_update_in_tx(
+                let (current_rv, current_uid, data_bytes) = Self::resource_row_for_update_in_tx(
                     tx,
                     &api_version,
                     &kind,
@@ -840,18 +887,148 @@ impl Datastore {
                 )?;
                 validate_resource_preconditions(&preconditions, Some(&current_uid), current_rv)
                     .map_err(Self::sqlite_conversion_error)?;
+                let data: Value =
+                    serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
+                let watch_event_row = LogApplyWatchEventRow {
+                    event_id: None,
+                    api_version: api_version.clone(),
+                    kind: kind.clone(),
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    resource_version: rv,
+                    event_type: "DELETED".to_string(),
+                    data: hydrate_watch_event_data(
+                        data,
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        rv,
+                    ),
+                };
                 LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![ClusterMutation::Resource(ResourceMutation::DeleteResource(
-                        LogApplyResourceKey {
-                            api_version,
-                            kind,
-                            namespace,
-                            name,
-                            uid: current_uid,
-                            precondition_resource_version: preconditions.resource_version,
-                        },
-                    ))],
+                    vec![
+                        ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(
+                            watch_event_row,
+                        )),
+                        ClusterMutation::Resource(ResourceMutation::DeleteResource(
+                            LogApplyResourceKey {
+                                api_version,
+                                kind,
+                                namespace,
+                                name,
+                                uid: current_uid,
+                                precondition_resource_version: Some(current_rv),
+                            },
+                        )),
+                    ],
+                )
+            }
+            StorageCommand::FinalizeBoundPod {
+                namespace,
+                name,
+                pod_uid,
+                node_name,
+                observed_resource_version,
+            } => {
+                let Some((current_rv, current_uid, data_bytes)) =
+                    Self::resource_row_optional_for_update_in_tx(
+                        tx,
+                        "v1",
+                        "Pod",
+                        Some(namespace.as_str()),
+                        &name,
+                    )?
+                else {
+                    let current_public_rv = Self::current_resource_version_in_tx(tx)?;
+                    return Ok((
+                        LogApplyCommit::new(current_public_rv, Vec::new()),
+                        current_public_rv,
+                    ));
+                };
+                if current_uid != pod_uid || current_rv != observed_resource_version {
+                    let current_public_rv = Self::current_resource_version_in_tx(tx)?;
+                    return Ok((
+                        LogApplyCommit::new(current_public_rv, Vec::new()),
+                        current_public_rv,
+                    ));
+                }
+                let data: Value =
+                    serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
+                let assigned_node = data
+                    .pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let has_finalizers = data
+                    .pointer("/metadata/finalizers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|finalizers| !finalizers.is_empty());
+                let terminating = data
+                    .pointer("/metadata/deletionTimestamp")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+                    || (data.pointer("/status/phase").and_then(Value::as_str) == Some("Failed")
+                        && data.pointer("/status/reason").and_then(Value::as_str)
+                            == Some("NodeLost"));
+                if assigned_node != Some(node_name.as_str()) || has_finalizers || !terminating {
+                    let current_public_rv = Self::current_resource_version_in_tx(tx)?;
+                    return Ok((
+                        LogApplyCommit::new(current_public_rv, Vec::new()),
+                        current_public_rv,
+                    ));
+                }
+                let finalize_rv = if rv > 0 {
+                    rv
+                } else {
+                    let current_rv = Self::current_resource_version_in_tx(tx)?;
+                    let pending_reserved_rv = tx.query_row(
+                        "SELECT COALESCE(MAX(reserved_rv), 0) FROM applied_outbox \
+                         WHERE reserved_rv IS NOT NULL",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?;
+                    let next_rv = current_rv.max(pending_reserved_rv).saturating_add(1);
+                    tx.execute(
+                        queries::METADATA_SET_RV,
+                        rusqlite::params![next_rv.to_string()],
+                    )?;
+                    next_rv
+                };
+                let watch_event_row = LogApplyWatchEventRow {
+                    event_id: None,
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some(namespace.clone()),
+                    name: name.clone(),
+                    resource_version: finalize_rv,
+                    event_type: "DELETED".to_string(),
+                    data: hydrate_watch_event_data(
+                        data,
+                        "v1",
+                        "Pod",
+                        Some(namespace.as_str()),
+                        &name,
+                        finalize_rv,
+                    ),
+                };
+                LogApplyCommit::from_cluster_mutations(
+                    finalize_rv,
+                    vec![
+                        ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(
+                            watch_event_row,
+                        )),
+                        ClusterMutation::Resource(ResourceMutation::DeleteResource(
+                            LogApplyResourceKey {
+                                api_version: "v1".to_string(),
+                                kind: "Pod".to_string(),
+                                namespace: Some(namespace),
+                                name,
+                                uid: current_uid,
+                                precondition_resource_version: Some(current_rv),
+                            },
+                        )),
+                    ],
                 )
             }
             StorageCommand::DeleteResourceWithTombstone {
@@ -918,7 +1095,7 @@ impl Datastore {
                     namespace,
                     name,
                     uid: current_uid,
-                    precondition_resource_version: preconditions.resource_version,
+                    precondition_resource_version: Some(current_rv),
                 };
                 LogApplyCommit::from_cluster_mutations(
                     rv,
@@ -1202,30 +1379,18 @@ impl Datastore {
                     .as_millis() as i64;
                 LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![
-                        ClusterMutation::PodCleanup(PodCleanupMutation::PutPodCleanupIntent(
-                            LogApplyPodCleanupIntentRow {
-                                node_name,
-                                namespace: namespace.clone(),
-                                pod_name: pod_name.clone(),
-                                pod_uid: pod_uid.clone(),
-                                reason,
-                                resource_version: rv,
-                                created_at_ms,
-                                pod_data,
-                            },
-                        )),
-                        ClusterMutation::Resource(ResourceMutation::DeleteResource(
-                            LogApplyResourceKey {
-                                api_version: "v1".to_string(),
-                                kind: "Pod".to_string(),
-                                namespace: Some(namespace),
-                                name: pod_name,
-                                uid: live_uid,
-                                precondition_resource_version: None,
-                            },
-                        )),
-                    ],
+                    vec![ClusterMutation::PodCleanup(
+                        PodCleanupMutation::PutPodCleanupIntent(LogApplyPodCleanupIntentRow {
+                            node_name,
+                            namespace,
+                            pod_name,
+                            pod_uid,
+                            reason,
+                            resource_version: rv,
+                            created_at_ms,
+                            pod_data,
+                        }),
+                    )],
                 )
             }
 
@@ -1372,7 +1537,8 @@ impl Datastore {
             }
         };
 
-        Ok((commit, rv))
+        let effective_rv = commit.resource_version;
+        Ok((commit, effective_rv))
     }
 
     pub async fn db_call<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
@@ -1794,11 +1960,8 @@ impl Datastore {
         self.db_call("db_build_log_apply_commit_for_command", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let assignment_mode = Self::resource_version_assignment_mode_in_tx(&tx)?;
-            let resource_version_hint = (assignment_mode
-                == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1)
-                .then(|| Self::current_resource_version_in_tx(&tx))
-                .transpose()?
-                .map(|current| current.saturating_add(1));
+            let resource_version_hint =
+                Self::outbox_materialization_resource_version_hint_in_tx(&tx, assignment_mode)?;
             let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                 &tx,
                 command,
@@ -1878,18 +2041,17 @@ impl Datastore {
                 // the command materialization. Committed apply assigns the
                 // durable resourceVersion after Raft commits the template.
                 // Legacy retains its exact reservation path through `None`.
-                let resource_version_hint = (assignment_mode
-                    == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1)
-                    .then(|| Self::current_resource_version_in_tx(&tx))
-                    .transpose()?
-                    .map(|current| current.saturating_add(1));
-                let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
+                let resource_version_hint =
+                    Self::outbox_materialization_resource_version_hint_in_tx(&tx, assignment_mode)?;
+                let (mut commit, mut rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
                     decoded.command,
                     &claim_operation,
                     &authoring_node_owned,
                     resource_version_hint,
                 )?;
+                let ledger_only =
+                    Self::normalize_ledger_only_outbox_commit_in_tx(&tx, &mut commit, &mut rv)?;
 
                 // The state-machine apply records the final idempotency
                 // outcome. No proposal-time cluster DB claim is created;
@@ -1912,7 +2074,7 @@ impl Datastore {
                         &subject_key,
                         &claim_operation,
                         now,
-                        Some(rv),
+                        (!ledger_only).then_some(rv),
                     )?;
                 }
 
@@ -1950,8 +2112,10 @@ impl Datastore {
                         message,
                     ));
                 }
+                let committed_resource = Self::cached_outbox_committed_resource(record.as_ref())?;
                 Ok(BuildOutboxOutcome::AlreadyApplied {
-                    applied_rv: record.and_then(|r| r.applied_rv),
+                    applied_rv: record.as_ref().and_then(|r| r.applied_rv),
+                    committed_resource,
                 })
             }
         }
@@ -2012,11 +2176,11 @@ impl Datastore {
                 // This candidate is only used to validate/materialize the
                 // command. V1 never reserves metadata during proposal build;
                 // Legacy retains its existing metadata reservation behavior.
-                let resource_version_hint = (assignment_mode
-                    == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1)
-                    .then(|| Self::current_resource_version_in_tx(&tx))
-                    .transpose()?
-                    .map(|current| current.saturating_add(1));
+                let resource_version_hint =
+                    Self::outbox_materialization_resource_version_hint_in_tx(
+                        &tx,
+                        assignment_mode,
+                    )?;
                 if let Some(ref watermark) = watermark_for_tx {
                     let last_seq: Option<i64> = tx
                         .query_row(
@@ -2155,7 +2319,7 @@ impl Datastore {
                         terminal_error: None,
                     });
                 }
-                let (mut commit, rv) = match Self::build_log_apply_commit_in_tx_from_command(
+                let (mut commit, mut rv) = match Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
                     decoded.command,
                     &claim_operation,
@@ -2205,6 +2369,8 @@ impl Datastore {
                     }
                     Err(error) => return Err(error),
                 };
+                let ledger_only =
+                    Self::normalize_ledger_only_outbox_commit_in_tx(&tx, &mut commit, &mut rv)?;
                 commit.outbox_watermark = watermark_for_tx;
                 Self::append_applied_outbox_ledger_mutation(
                     &mut commit,
@@ -2224,7 +2390,7 @@ impl Datastore {
                         &subject_key,
                         &claim_operation,
                         now,
-                        Some(rv),
+                        (!ledger_only).then_some(rv),
                     )?;
                 }
                 let commit = if assignment_mode
@@ -2255,8 +2421,10 @@ impl Datastore {
                 terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
+                let committed_resource = Self::cached_outbox_committed_resource(record.as_ref())?;
                 Ok(BuildOutboxOutcome::AlreadyApplied {
-                    applied_rv: record.and_then(|r| r.applied_rv),
+                    applied_rv: record.as_ref().and_then(|r| r.applied_rv),
+                    committed_resource,
                 })
             }
         }
@@ -2450,8 +2618,10 @@ impl Datastore {
                 tx.commit()?;
                 Ok(OutboxTxnOutcome::Applied {
                     applied_rv: mutation.applied_rv.unwrap_or(0),
+                    resource_changed: mutation.pending.is_some(),
                     pending: mutation.pending,
                     pod_endpoint_effect,
+                    committed_resource: mutation.committed_resource,
                 })
             })
             .await
@@ -2461,32 +2631,40 @@ impl Datastore {
             OutboxTxnOutcome::Applied {
                 applied_rv,
                 pending,
+                resource_changed,
                 pod_endpoint_effect,
+                committed_resource,
             } => {
                 if let Some(pending) = pending {
                     self.publish_watch_event(pending);
                 }
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     OutboxApplyResult::Applied { applied_rv },
-                    crate::datastore::ResourceMutationEffect::Changed,
+                    if resource_changed {
+                        crate::datastore::ResourceMutationEffect::Changed
+                    } else {
+                        crate::datastore::ResourceMutationEffect::Unchanged
+                    },
                     pod_endpoint_effect,
-                ))
+                )
+                .with_committed_resource(committed_resource))
             }
             OutboxTxnOutcome::AlreadyApplied(record) => {
                 if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
                     return Err(OutboxApplyError::ConflictTerminal(message));
                 }
+                let committed_resource = Self::cached_outbox_committed_resource(record.as_ref())?;
+                let applied_rv = record.as_ref().and_then(|record| record.applied_rv);
                 Ok(crate::datastore::CommittedOutboxApply::new(
-                    OutboxApplyResult::AlreadyApplied {
-                        applied_rv: record.and_then(|record| record.applied_rv),
-                    },
+                    OutboxApplyResult::AlreadyApplied { applied_rv },
                     crate::datastore::ResourceMutationEffect::Unchanged,
                     if is_pod_status {
                         crate::datastore::PodEndpointEffect::Unchanged
                     } else {
                         crate::datastore::PodEndpointEffect::NotApplicable
                     },
-                ))
+                )
+                .with_committed_resource(committed_resource))
             }
         }
     }
@@ -2505,6 +2683,7 @@ impl Datastore {
         use crate::storage_wire_codec::encode_response_protobuf;
         use klights_cluster_core::StorageResponse;
 
+        let durable_actor_cascade = Self::is_bound_pod_finalization_delivery(&command, operation);
         let (commit, _provisional_rv) = Self::build_log_apply_commit_in_tx_from_command(
             tx,
             command,
@@ -2513,22 +2692,38 @@ impl Datastore {
             None,
         )?;
 
-        let (applied_rv, pending) =
-            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv(
+        let (applied_rv, pending, applied_mutation) =
+            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv_and_mutation(
                 tx,
                 commit,
                 crate::datastore::sqlite::cluster_state_apply::ResourcePreconditionMode::LegacyFollowerReplay,
             )?;
 
         let pending_event = pending.into_iter().next();
-        let result_proto = encode_response_protobuf(&StorageResponse::Ack {
-            resource_version: applied_rv,
-        })
-        .unwrap_or_default();
+        let committed_resource = applied_mutation.map(|mutation| match mutation {
+            crate::datastore::raft::types::AppliedMutation::Resource(resource) => resource,
+        });
+        let response = if durable_actor_cascade {
+            committed_resource.as_ref().map_or(
+                StorageResponse::Ack {
+                    resource_version: applied_rv,
+                },
+                |resource| StorageResponse::Resource {
+                    resource_version: resource.resource_version,
+                    data: (*resource.data).clone(),
+                },
+            )
+        } else {
+            StorageResponse::Ack {
+                resource_version: applied_rv,
+            }
+        };
+        let result_proto = encode_response_protobuf(&response).unwrap_or_default();
         Ok(AtomicOutboxMutation {
             applied_rv: Some(applied_rv),
             result_proto,
             pending: pending_event,
+            committed_resource,
         })
     }
 
@@ -2884,6 +3079,15 @@ impl Datastore {
                         .apply_raft_log_apply_commit(commit)
                         .await
                         .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
+                    let committed_resource =
+                        result
+                            .applied_mutation
+                            .as_ref()
+                            .map(|mutation| match mutation {
+                                crate::datastore::raft::types::AppliedMutation::Resource(
+                                    resource,
+                                ) => resource.clone(),
+                            });
                     return Ok(crate::datastore::CommittedOutboxApply::new(
                         OutboxApplyResult::Applied { applied_rv },
                         if result.public_resource_changed {
@@ -2892,7 +3096,8 @@ impl Datastore {
                             crate::datastore::ResourceMutationEffect::Unchanged
                         },
                         result.pod_endpoint_effect,
-                    ));
+                    )
+                    .with_committed_resource(committed_resource));
                 }
                 let result = self
                     .apply_raft_log_apply_commit(commit)
@@ -2904,6 +3109,15 @@ impl Datastore {
                 if let Some(message) = result.error_message {
                     return Err(OutboxApplyError::ConflictTerminal(message));
                 }
+                let committed_resource =
+                    result
+                        .applied_mutation
+                        .as_ref()
+                        .map(|mutation| match mutation {
+                            crate::datastore::raft::types::AppliedMutation::Resource(resource) => {
+                                resource.clone()
+                            }
+                        });
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     OutboxApplyResult::Applied {
                         applied_rv: result.applied_rv.unwrap_or(applied_rv),
@@ -2914,15 +3128,18 @@ impl Datastore {
                         crate::datastore::ResourceMutationEffect::Unchanged
                     },
                     result.pod_endpoint_effect,
-                ))
+                )
+                .with_committed_resource(committed_resource))
             }
-            BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
-                Ok(crate::datastore::CommittedOutboxApply::new(
-                    OutboxApplyResult::AlreadyApplied { applied_rv },
-                    crate::datastore::ResourceMutationEffect::Unchanged,
-                    crate::datastore::PodEndpointEffect::Unchanged,
-                ))
-            }
+            BuildOutboxOutcome::AlreadyApplied {
+                applied_rv,
+                committed_resource,
+            } => Ok(crate::datastore::CommittedOutboxApply::new(
+                OutboxApplyResult::AlreadyApplied { applied_rv },
+                crate::datastore::ResourceMutationEffect::Unchanged,
+                crate::datastore::PodEndpointEffect::Unchanged,
+            )
+            .with_committed_resource(committed_resource)),
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     OutboxApplyResult::Applied { applied_rv: 0 },
@@ -3072,6 +3289,38 @@ impl Datastore {
             Ok(_) => Ok(None),
             Err(err) => Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
                 format!("decode cached applied_outbox response: {err}"),
+            )),
+        }
+    }
+
+    fn cached_outbox_committed_resource(
+        record: Option<&AppliedOutboxRecord>,
+    ) -> std::result::Result<
+        Option<crate::datastore::Resource>,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        match crate::storage_wire_codec::decode_response_protobuf(&record.result_proto) {
+            Ok(crate::datastore::command::StorageResponse::Resource {
+                resource_version,
+                data,
+            }) => {
+                let mut resource = crate::datastore::Resource::try_from_data(std::sync::Arc::new(
+                    data,
+                ))
+                .map_err(|error| {
+                    crate::kubelet::outbox::OutboxApplyError::Retryable(format!(
+                        "decode cached applied_outbox resource identity: {error}"
+                    ))
+                })?;
+                resource.resource_version = resource_version;
+                Ok(Some(resource))
+            }
+            Ok(_) => Ok(None),
+            Err(error) => Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+                format!("decode cached applied_outbox response: {error}"),
             )),
         }
     }

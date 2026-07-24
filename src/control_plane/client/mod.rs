@@ -680,20 +680,22 @@ mod tests {
         )
     }
 
-    fn pod_delete_payload(name: &str, uid: &str) -> Bytes {
-        pod_delete_payload_for("default", name, uid)
+    fn pod_delete_payload(name: &str, uid: &str, observed_resource_version: i64) -> Bytes {
+        pod_delete_payload_for("default", name, uid, observed_resource_version)
     }
 
-    fn pod_delete_payload_for(namespace: &str, name: &str, uid: &str) -> Bytes {
-        let command = StorageCommand::DeleteResource {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some(namespace.to_string()),
+    fn pod_delete_payload_for(
+        namespace: &str,
+        name: &str,
+        uid: &str,
+        observed_resource_version: i64,
+    ) -> Bytes {
+        let command = StorageCommand::FinalizeBoundPod {
+            namespace: namespace.to_string(),
             name: name.to_string(),
-            preconditions: ResourcePreconditions {
-                uid: Some(uid.to_string()),
-                resource_version: None,
-            },
+            pod_uid: uid.to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version,
         };
         Bytes::from(
             OutboxPayload::from_command(command)
@@ -1009,12 +1011,13 @@ mod tests {
         )
         .await
         .expect("create non-pod content");
-        db.create_resource(
-            "v1",
-            "Pod",
-            Some("worker-finalize-ns"),
-            "worker-pod",
-            serde_json::json!({
+        let observed_pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("worker-finalize-ns"),
+                "worker-pod",
+                serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {
@@ -1029,21 +1032,35 @@ mod tests {
                     "containers": [{"name": "app", "image": "nginx"}]
                 },
                 "status": {"phase": "Running"}
-            }),
-        )
-        .await
-        .expect("create terminating pod");
+                }),
+            )
+            .await
+            .expect("create terminating pod");
 
         let client = LocalApiClient::new(
             Arc::new(db.clone()),
             "worker-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
+        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
+            Arc::new(crate::controllers::service::ServiceIpam::new(
+                "10.43.128.0/17",
+            )),
+        ));
+        dispatcher
+            .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
+            .await;
+        client.set_controller_dispatcher(dispatcher);
         let applied = client
             .deliver_test_outbox(
                 "worker-pod-actor-finalize-delete",
                 OutboxOperation::PodMetadata,
-                pod_delete_payload_for("worker-finalize-ns", "worker-pod", "worker-pod-uid"),
+                pod_delete_payload_for(
+                    "worker-finalize-ns",
+                    "worker-pod",
+                    "worker-pod-uid",
+                    observed_pod.resource_version,
+                ),
                 "client",
                 1,
                 1,
@@ -1091,12 +1108,13 @@ mod tests {
         )
         .await
         .expect("create foreground owner");
-        db.create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "foreground-child",
-            serde_json::json!({
+        let observed_child = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "foreground-child",
+                serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {
@@ -1116,10 +1134,10 @@ mod tests {
                 },
                 "spec": {"nodeName": "worker-a", "containers": [{"name": "app", "image": "nginx"}]},
                 "status": {"phase": "Running"}
-            }),
-        )
-        .await
-        .expect("create foreground child");
+                }),
+            )
+            .await
+            .expect("create foreground child");
 
         let client = LocalApiClient::new(
             Arc::new(db.clone()),
@@ -1140,7 +1158,11 @@ mod tests {
             .deliver_test_outbox(
                 "foreground-child-actor-finalize-delete",
                 OutboxOperation::PodMetadata,
-                pod_delete_payload("foreground-child", "foreground-child-uid"),
+                pod_delete_payload(
+                    "foreground-child",
+                    "foreground-child-uid",
+                    observed_child.resource_version,
+                ),
                 "client",
                 1,
                 1,

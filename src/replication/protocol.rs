@@ -70,7 +70,26 @@ pub struct MetadataResponse {
 }
 
 pub const COMMITTED_APPLY_RV_V1: u64 = 1 << 0;
-pub const LOCAL_SUPPORTED_FEATURES: u64 = COMMITTED_APPLY_RV_V1;
+/// Member authors and accepts the exact codec-v3 command contract.
+pub const COMMAND_CODEC_V3: u64 = 1 << 1;
+pub const LOCAL_SUPPORTED_FEATURES: u64 = COMMITTED_APPLY_RV_V1 | COMMAND_CODEC_V3;
+
+pub const fn supports_command_codec_v3(supported_features: u64) -> bool {
+    supported_features & COMMAND_CODEC_V3 != 0
+}
+
+pub fn require_command_codec_v3(
+    supported_features: u64,
+    peer: &str,
+) -> std::result::Result<(), String> {
+    if supports_command_codec_v3(supported_features) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{peer} does not advertise the required COMMAND_CODEC_V3 capability"
+        ))
+    }
+}
 
 impl From<ClusterMetadata> for MetadataResponse {
     fn from(m: ClusterMetadata) -> Self {
@@ -433,12 +452,12 @@ mod tests {
         assert_eq!(resp.leader_epoch, 5);
         assert_eq!(resp.current_rv, 100);
         assert_eq!(resp.current_log_index, 0);
-        assert_eq!(resp.supported_features, COMMITTED_APPLY_RV_V1);
+        assert_eq!(resp.supported_features, LOCAL_SUPPORTED_FEATURES);
         assert_eq!(
             serde_json::from_str::<MetadataResponse>(&serde_json::to_string(&resp).unwrap())
                 .unwrap()
                 .supported_features,
-            COMMITTED_APPLY_RV_V1
+            LOCAL_SUPPORTED_FEATURES
         );
         assert_eq!(
             serde_json::from_str::<MetadataResponse>(
@@ -448,6 +467,13 @@ mod tests {
             .supported_features,
             0
         );
+    }
+
+    #[test]
+    fn command_codec_v3_capability_is_an_exact_fail_closed_admission_bit() {
+        assert!(require_command_codec_v3(LOCAL_SUPPORTED_FEATURES, "v3").is_ok());
+        assert!(require_command_codec_v3(COMMITTED_APPLY_RV_V1, "v2").is_err());
+        assert!(require_command_codec_v3(0, "legacy").is_err());
     }
 
     #[test]

@@ -366,6 +366,7 @@ fn recovery_values_reject_inexact_or_internally_inconsistent_state() {
 
     let invalid_capture = SnapshotCaptureHeader::try_new(
         Some(ResourceVersionAssignment::CommittedApplyV1),
+        None,
         WatchReplayPosition {
             resource_version: 1,
             event_id: 1,
@@ -385,6 +386,35 @@ fn recovery_values_reject_inexact_or_internally_inconsistent_state() {
     );
     assert!(matches!(
         invalid_capture,
+        Err(SnapshotPersistenceError::InvalidSnapshot { .. })
+    ));
+}
+
+#[test]
+fn snapshot_capture_header_preserves_only_exact_v3_activation_proof() {
+    let position = WatchReplayPosition {
+        resource_version: 7,
+        event_id: 9,
+        resource_version_filter_through_event_id: 0,
+    };
+    let header = SnapshotCaptureHeader::try_new(
+        Some(ResourceVersionAssignment::CommittedApplyV1),
+        Some(3),
+        position,
+        metadata(7),
+        SnapshotMembership::AuthoritativeAbsent,
+    )
+    .expect("exact-v3 activation proof");
+    assert_eq!(header.command_codec_activation_version(), Some(3));
+
+    assert!(matches!(
+        SnapshotCaptureHeader::try_new(
+            Some(ResourceVersionAssignment::CommittedApplyV1),
+            Some(2),
+            position,
+            metadata(7),
+            SnapshotMembership::AuthoritativeAbsent,
+        ),
         Err(SnapshotPersistenceError::InvalidSnapshot { .. })
     ));
 }

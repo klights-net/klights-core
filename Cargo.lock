@@ -2221,6 +2221,7 @@ dependencies = [
 name = "klights-reconcile-api"
 version = "0.0.0"
 dependencies = [
+ "klights-cluster-core",
  "klights-types",
 ]
 

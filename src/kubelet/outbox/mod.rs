@@ -1362,22 +1362,7 @@ fn actor_owned_pod_delete_needs_dead_letter(row: &OutboxRow, err: &OutboxApplyEr
     let Ok(payload) = OutboxPayload::decode_protobuf(&row.payload_proto) else {
         return false;
     };
-    match payload.command {
-        StorageCommand::DeleteResource {
-            api_version,
-            kind,
-            preconditions,
-            ..
-        } => {
-            api_version == "v1"
-                && kind == "Pod"
-                && preconditions
-                    .uid
-                    .as_deref()
-                    .is_some_and(|uid| !uid.trim().is_empty())
-        }
-        _ => false,
-    }
+    matches!(payload.command, StorageCommand::FinalizeBoundPod { .. })
 }
 
 fn now_ms() -> i64 {
@@ -2746,16 +2731,17 @@ mod tests {
             .await
             .expect("create pod");
 
-        let mut terminating = std::sync::Arc::unwrap_or_clone(created.data);
-        terminating["metadata"]["deletionTimestamp"] = serde_json::json!("2026-05-24T18:00:00Z");
-        terminating["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(0);
-        cluster_db
+        let mut terminating_data = std::sync::Arc::unwrap_or_clone(created.data);
+        terminating_data["metadata"]["deletionTimestamp"] =
+            serde_json::json!("2026-05-24T18:00:00Z");
+        terminating_data["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(0);
+        let terminating = cluster_db
             .update_resource(
                 "v1",
                 "Pod",
                 Some("default"),
                 "deadline-web",
-                terminating,
+                terminating_data,
                 created.resource_version,
             )
             .await
@@ -2814,15 +2800,12 @@ mod tests {
                     Some("uid-deadline-web".to_string()),
                 ),
                 "uid-deadline-web",
-                StorageCommand::DeleteResource {
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some("default".to_string()),
+                StorageCommand::FinalizeBoundPod {
+                    namespace: "default".to_string(),
                     name: "deadline-web".to_string(),
-                    preconditions: ResourcePreconditions {
-                        uid: Some("uid-deadline-web".to_string()),
-                        resource_version: None,
-                    },
+                    pod_uid: "uid-deadline-web".to_string(),
+                    node_name: "worker-a".to_string(),
+                    observed_resource_version: terminating.resource_version,
                 },
                 1_001,
             ))

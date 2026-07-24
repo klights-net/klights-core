@@ -10,17 +10,7 @@ const COREDNS_KUBECONFIG_PATH_ANNOTATION: &str = "klights.dev/kubeconfig-path";
 /// Derive the DNS service ClusterIP from the service CIDR.
 /// Returns network address + 10 (e.g., "10.43.128.0/17" -> "10.43.128.10").
 pub fn derive_dns_service_ip(service_cidr: &str) -> String {
-    let parts: Vec<&str> = service_cidr.split('/').collect();
-    let network_addr = parts[0];
-    let octets: Vec<&str> = network_addr.split('.').collect();
-    let last_octet: u8 = octets[3].parse().unwrap();
-    format!(
-        "{}.{}.{}.{}",
-        octets[0],
-        octets[1],
-        octets[2],
-        last_octet + 10
-    )
+    crate::service_ips::dns_service_ip(service_cidr)
 }
 
 /// Bootstrap CoreDNS resources on startup: ConfigMap, Deployment, and Service.

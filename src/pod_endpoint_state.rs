@@ -34,6 +34,10 @@ pub(crate) fn pod_endpoint_state(pod: &Value) -> PodEndpointState<'_, Value> {
     )
 }
 
+pub(crate) fn pod_endpoint_state_changed(previous: &Value, updated: &Value) -> bool {
+    pod_endpoint_state(previous).differs_from(&pod_endpoint_state(updated))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

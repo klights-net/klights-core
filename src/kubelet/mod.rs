@@ -4,6 +4,7 @@ pub mod containerd_manager;
 pub mod context;
 pub mod cri;
 pub mod cri_events;
+pub(crate) mod cri_exec;
 pub mod events;
 pub mod file_blocking;
 pub mod lifecycle;
@@ -26,8 +27,8 @@ pub mod pod_field_ref;
 pub mod pod_fs;
 pub mod pod_hosts;
 pub mod pod_manager;
-pub(crate) mod remote_runtime;
 // pub mod pod_owner_reconcile; // removed — events flow top-down only
+#[cfg(test)]
 pub mod pod_api;
 pub mod pod_repository;
 pub mod pod_resources;
@@ -51,6 +52,7 @@ pub mod probe_manager;
 pub mod probes;
 pub mod projected_sa_token_refresh;
 pub mod reconciler;
+pub(crate) mod remote_runtime;
 pub mod rootless_runc_wrapper;
 pub mod volume_registry;
 pub mod volume_sources;

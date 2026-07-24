@@ -99,4 +99,12 @@ fn unscheduled_deletion_outcomes_keep_actor_and_finalizer_deferrals_distinct() {
         UnscheduledPodDeletionOutcome::Removed,
         UnscheduledPodDeletionOutcome::DeferToActor
     );
+    assert_ne!(
+        UnscheduledPodDeletionOutcome::Retry,
+        UnscheduledPodDeletionOutcome::DeferToActor
+    );
+    assert_ne!(
+        UnscheduledPodDeletionOutcome::Retry,
+        UnscheduledPodDeletionOutcome::FinalizersPending
+    );
 }

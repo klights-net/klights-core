@@ -1541,6 +1541,107 @@ async fn mutation_create_defaults_are_persisted_for_json_and_protobuf_pod_paths(
 }
 
 #[tokio::test]
+async fn duplicate_pod_create_preserves_already_exists_for_json_and_protobuf_routes() {
+    struct Case {
+        name: &'static str,
+        content_type: &'static str,
+        accept: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "json",
+            content_type: "application/json",
+            accept: "application/json",
+        },
+        Case {
+            name: "protobuf",
+            content_type: "application/vnd.kubernetes.protobuf",
+            accept: "application/vnd.kubernetes.protobuf",
+        },
+    ];
+
+    for case in cases {
+        let state = build_test_app_state().await;
+        let app = crate::api::build_router(state);
+        let pod_name = format!("duplicate-{}-pod", case.name);
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            }
+        });
+        let body = if case.content_type == "application/json" {
+            serde_json::to_vec(&pod).unwrap()
+        } else {
+            klights_kube_protobuf::encode_protobuf(&pod).unwrap()
+        };
+        let send = || {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/pods")
+                    .header("content-type", case.content_type)
+                    .header("accept", case.accept)
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+        };
+
+        let created = send().await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED, "{}", case.name);
+
+        let duplicate = send().await.unwrap();
+        assert_eq!(
+            duplicate.status(),
+            StatusCode::CONFLICT,
+            "{} duplicate status",
+            case.name
+        );
+        let content_type = duplicate
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+        if content_type.contains("application/vnd.kubernetes.protobuf") {
+            use prost::Message as _;
+
+            assert_eq!(&bytes[..4], b"k8s\0", "{}", case.name);
+            let envelope = klights_kube_protobuf::Unknown::decode(&bytes[4..]).unwrap();
+            let type_meta = envelope.type_meta.expect("protobuf Status type metadata");
+            assert_eq!(type_meta.api_version, "v1");
+            assert_eq!(type_meta.kind, "Status");
+            let status = klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::Status::decode(
+                &*envelope.raw,
+            )
+            .unwrap();
+            assert_eq!(status.status.as_deref(), Some("Failure"));
+            assert_eq!(status.code, Some(409));
+            assert_eq!(status.reason.as_deref(), Some("AlreadyExists"));
+            let details = status.details.expect("protobuf Status.details");
+            assert_eq!(details.kind.as_deref(), Some("Pod"));
+            assert_eq!(details.name.as_deref(), Some(pod_name.as_str()));
+        } else {
+            let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status["apiVersion"], "v1", "{}", case.name);
+            assert_eq!(status["kind"], "Status", "{}", case.name);
+            assert_eq!(status["status"], "Failure", "{}", case.name);
+            assert_eq!(status["code"], 409, "{}", case.name);
+            assert_eq!(status["reason"], "AlreadyExists", "{}", case.name);
+            assert_eq!(status["details"]["kind"], "Pod", "{}", case.name);
+            assert_eq!(status["details"]["name"], pod_name, "{}", case.name);
+        }
+    }
+}
+
+#[tokio::test]
 async fn mutation_update_bumps_generation_only_when_spec_changes_for_generated_and_crd_paths() {
     let state = build_test_app_state().await;
     let app = crate::api::build_router(state);

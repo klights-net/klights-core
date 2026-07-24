@@ -18,8 +18,7 @@ use crate::kubelet::pod_manager::get_cached_host_ip;
 use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
-use crate::side_effects::ControllerDispatcherSlot;
-use klights_reconcile_api::ReconcileKey;
+use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
 use super::state_only_writer::StateOnlyWriter;
 use super::store::PodStore;
@@ -28,7 +27,7 @@ use super::types::{PodStatusUpdate, RuntimeReconcileStatus};
 pub(super) struct PodStatusService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
-    controller_dispatcher: ControllerDispatcherSlot,
+    mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
     deferred_runtime: DeferredRuntimeReducerHandle,
@@ -184,14 +183,14 @@ impl PodStatusService {
     pub(super) fn new(
         store: Arc<PodStore>,
         status_only: Arc<dyn StateOnlyWriter>,
-        controller_dispatcher: ControllerDispatcherSlot,
+        mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderApiClient>>,
     ) -> Self {
         Self {
             store,
             status_only,
-            controller_dispatcher,
+            mutation_reconcile,
             outbox,
             cluster_api,
             deferred_runtime: DeferredRuntimeReducerHandle::default(),
@@ -620,7 +619,7 @@ impl PodStatusService {
                             .await;
                     }
                     let endpoint_state_changed = changed
-                        && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                        && crate::pod_endpoint_state::pod_endpoint_state_changed(
                             &pod,
                             &updated.data,
                         );
@@ -986,7 +985,7 @@ impl PodStatusService {
                         .await;
                     }
                     let endpoint_state_changed = changed
-                        && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                        && crate::pod_endpoint_state::pod_endpoint_state_changed(
                             &pod_resource.data,
                             &updated.data,
                         );
@@ -1222,7 +1221,7 @@ impl PodStatusService {
             &updated,
         );
         let endpoint_state_changed = changed
-            && crate::side_effects::service_pod::pod_endpoint_state_changed(
+            && crate::pod_endpoint_state::pod_endpoint_state_changed(
                 &pod_resource.data,
                 &updated.data,
             );
@@ -1436,7 +1435,7 @@ impl PodStatusService {
                         .await;
                     }
                     let endpoint_state_changed = changed
-                        && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                        && crate::pod_endpoint_state::pod_endpoint_state_changed(
                             &pod_resource.data,
                             &updated.data,
                         );
@@ -1473,111 +1472,20 @@ impl PodStatusService {
         previous: &Value,
         updated: &Value,
     ) {
-        // Always enqueue the direct controller owner for all supported workload
-        // kinds. This ensures status freshness even for kinds that don't gate
-        // creation on readiness (ReplicaSet, DaemonSet, ReplicationController).
-        if let Err(err) = self.enqueue_owner_reconcile_for_pod_status(updated).await {
-            tracing::debug!(
-                target: "klights::pod_status",
-                error = %err,
-                "failed to enqueue owner reconcile after pod status write"
-            );
-        }
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
-            previous,
-            updated,
-            self.store.db().as_ref(),
-            &self.controller_dispatcher,
-        )
-        .await
+        if let Err(err) = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(PodMutationReconcileRequest::StatusChanged {
+                previous: Resource::from_data_lossy(Arc::new(previous.clone())),
+                updated: Resource::from_data_lossy(Arc::new(updated.clone())),
+            })
+            .await
         {
             tracing::debug!(
                 target: "klights::pod_status",
                 error = %err,
-                "failed to enqueue Service reconcile after pod endpoint state changed"
+                "failed to reconcile controllers after pod status change"
             );
         }
-
-        if !pod_owner_reconcile_status_changed(previous, updated) {
-            return;
-        }
-
-        // Deployment rollout depends on RS pod readiness — enqueue the parent
-        // Deployment when the pod's RS owner has a Deployment parent.
-        if let Err(err) = self.enqueue_deployment_rollout_for_pod(updated).await {
-            tracing::debug!(
-                target: "klights::pod_status",
-                error = %err,
-                "failed to enqueue Deployment rollout after pod readiness transition"
-            );
-        }
-    }
-
-    /// Enqueue the direct controller owner for any supported workload kind.
-    /// This covers ReplicaSet, StatefulSet, DaemonSet, Job, and
-    /// ReplicationController — ensuring the owning controller re-reads fresh
-    /// pod state and writes accurate top-down status.
-    async fn enqueue_owner_reconcile_for_pod_status(&self, pod: &Value) -> Result<()> {
-        match pod
-            .pointer("/metadata/ownerReferences")
-            .and_then(|v| v.as_array())
-        {
-            Some(refs) if !refs.is_empty() => {}
-            _ => return Ok(()),
-        }
-
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            return Ok(());
-        };
-
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(|value| value.as_str())
-            .unwrap_or("default");
-        dispatcher
-            .enqueue_reconcile_batch(
-                crate::side_effects::workload_pod::workload_owner_keys_for_pod(pod, namespace),
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    async fn enqueue_deployment_rollout_for_pod(&self, pod: &Value) -> Result<()> {
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            return Ok(());
-        };
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default");
-        let Some(rs_name) = controller_owner_name(pod, "apps/v1", "ReplicaSet") else {
-            return Ok(());
-        };
-        let Some(rs) = self
-            .store
-            .db()
-            .get_resource("apps/v1", "ReplicaSet", Some(namespace), &rs_name)
-            .await?
-        else {
-            return Ok(());
-        };
-        let Some(deployment_name) = controller_owner_name(&rs.data, "apps/v1", "Deployment") else {
-            return Ok(());
-        };
-
-        // Deployment rolling updates have a bounded desired-state dependency on
-        // child availability: once replacement pods become Ready, the owning
-        // Deployment must reconcile once to scale old ReplicaSets down.
-        dispatcher
-            .enqueue_reconcile_batch(vec![ReconcileKey::namespaced(
-                "apps/v1",
-                "Deployment",
-                namespace,
-                &deployment_name,
-            )])
-            .await?;
-        Ok(())
     }
 
     /// Mark a pod Failed because its `activeDeadlineSeconds` elapsed.
@@ -1689,7 +1597,7 @@ impl PodStatusService {
                 .await;
         }
         let endpoint_state_changed = changed
-            && crate::side_effects::service_pod::pod_endpoint_state_changed(
+            && crate::pod_endpoint_state::pod_endpoint_state_changed(
                 &pod_resource.data,
                 &updated.data,
             );
@@ -1758,48 +1666,12 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn pod_ready_for_rollout(pod: &Value) -> bool {
-    crate::controllers::common::is_pod_ready_value(pod)
-}
-
 fn pod_terminal_phase(pod: &Value) -> Option<&str> {
     match pod.pointer("/status/phase").and_then(|v| v.as_str()) {
         Some("Failed") => Some("Failed"),
         Some("Succeeded") => Some("Succeeded"),
         _ => None,
     }
-}
-
-fn pod_owner_reconcile_status_changed(previous: &Value, updated: &Value) -> bool {
-    pod_ready_for_rollout(previous) != pod_ready_for_rollout(updated)
-        || pod_terminal_phase(previous) != pod_terminal_phase(updated)
-}
-
-fn controller_owner_name(resource: &Value, api_version: &str, kind: &str) -> Option<String> {
-    resource
-        .pointer("/metadata/ownerReferences")
-        .and_then(|v| v.as_array())
-        .and_then(|refs| {
-            refs.iter().find_map(|owner| {
-                let is_controller = owner.get("controller").and_then(|v| v.as_bool()) == Some(true);
-                let api_matches = owner
-                    .get("apiVersion")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|value| value == api_version);
-                let kind_matches = owner
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|value| value == kind);
-                if is_controller && api_matches && kind_matches {
-                    owner
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        })
 }
 
 fn build_pod_condition(

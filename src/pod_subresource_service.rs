@@ -8,24 +8,25 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::api::apply_patch;
 use crate::datastore::Resource;
 use crate::side_effects::ControllerDispatcherSlot;
 
-use super::state_only_writer::StateOnlyWriter;
-use super::store::PodStore;
-use super::types::PodStatusPatchType;
+use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
+use crate::kubelet::pod_repository::store::PodStore;
+use crate::kubelet::pod_repository::types::PodStatusPatchType;
 
-pub(super) struct PodSubresourceService {
+pub(crate) struct PodSubresourceService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
     controller_dispatcher: ControllerDispatcherSlot,
 }
 
 impl PodSubresourceService {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: Arc<PodStore>,
         status_only: Arc<dyn StateOnlyWriter>,
         controller_dispatcher: ControllerDispatcherSlot,
@@ -35,31 +36,6 @@ impl PodSubresourceService {
             status_only,
             controller_dispatcher,
         }
-    }
-
-    /// PUT `/api/v1/.../pods/{name}/status` — replace the persisted
-    /// status subtree while preserving all non-status fields.
-    pub(super) async fn replace_status_from_api(
-        &self,
-        ns: &str,
-        name: &str,
-        status: Value,
-        expected_rv: i64,
-    ) -> Result<Resource> {
-        self.replace_status_from_api_checked(ns, name, None, status, expected_rv)
-            .await
-    }
-
-    pub(super) async fn replace_status_from_api_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: &str,
-        status: Value,
-        expected_rv: i64,
-    ) -> Result<Resource> {
-        self.replace_status_from_api_checked(ns, name, Some(pod_uid), status, expected_rv)
-            .await
     }
 
     async fn replace_status_from_api_checked(
@@ -76,7 +52,7 @@ impl PodSubresourceService {
             .await?
             .ok_or_else(|| anyhow!("Pod not found"))?;
         if let Some(uid) = expected_uid {
-            super::ensure_pod_uid_matches(&current.data, uid, ns, name)?;
+            crate::kubelet::pod_repository::ensure_pod_uid_matches(&current.data, uid, ns, name)?;
         }
         if current.resource_version != expected_rv {
             return Err(anyhow!(
@@ -219,6 +195,44 @@ impl PodSubresourceService {
             bump_metadata_generation(&mut body);
         }
         self.store.update(ns, name, body, expected_rv).await
+    }
+}
+
+#[async_trait]
+impl crate::kubelet::pod_repository::PodSubresourcePort for PodSubresourceService {
+    async fn replace_status(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: Option<&str>,
+        status: Value,
+        expected_rv: i64,
+    ) -> Result<Resource> {
+        self.replace_status_from_api_checked(ns, name, pod_uid, status, expected_rv)
+            .await
+    }
+
+    async fn patch_status(
+        &self,
+        ns: &str,
+        name: &str,
+        patch: Value,
+        patch_type: PodStatusPatchType,
+        expected_rv: i64,
+    ) -> Result<Resource> {
+        self.patch_status_from_api(ns, name, patch, patch_type, expected_rv)
+            .await
+    }
+
+    async fn update_ephemeral_containers(
+        &self,
+        ns: &str,
+        name: &str,
+        containers: Vec<Value>,
+        expected_rv: i64,
+    ) -> Result<Resource> {
+        self.update_ephemeral_containers(ns, name, containers, expected_rv)
+            .await
     }
 }
 

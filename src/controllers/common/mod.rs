@@ -283,41 +283,7 @@ pub fn count_ready_pods(pods: &[Resource]) -> usize {
 /// This is the low-level predicate used by `count_ready_pods` and also
 /// useful when callers already hold a `&Value` rather than a `&Resource`.
 pub fn is_pod_ready_value(pod: &Value) -> bool {
-    let status = match pod.get("status") {
-        Some(s) => s,
-        None => return false,
-    };
-
-    if status
-        .get("conditions")
-        .and_then(|c| c.as_array())
-        .map(|conditions| {
-            conditions.iter().any(|c| {
-                c.get("type").and_then(|t| t.as_str()) == Some("Ready")
-                    && c.get("status").and_then(|s| s.as_str()) == Some("True")
-            })
-        })
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // Fallback for pods whose condition writers lag behind container status:
-    // if the pod is Running and every reported container status is ready=true,
-    // treat the pod as ready for controller replica accounting.
-    let is_running = status
-        .get("phase")
-        .and_then(|p| p.as_str())
-        .is_some_and(|p| p == "Running");
-    let all_containers_ready = status
-        .get("containerStatuses")
-        .and_then(|cs| cs.as_array())
-        .filter(|arr| !arr.is_empty())
-        .is_some_and(|arr| {
-            arr.iter()
-                .all(|cs| cs.get("ready").and_then(|r| r.as_bool()).unwrap_or(false))
-        });
-    is_running && all_containers_ready
+    crate::pod_readiness::is_ready(pod)
 }
 
 /// Identifying tuple for a workload controller that owns a child Pod.

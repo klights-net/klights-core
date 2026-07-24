@@ -164,7 +164,7 @@ impl NodeRegistrationHostFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRegistrationSnapshot {
     pub node_name: String,
-    pub node_mode: crate::controllers::annotations::NodePeerMode,
+    pub node_mode: klights_network_api::NodePeerMode,
     pub node_role: crate::bootstrap::NodeRole,
     pub addresses: NodeRegistrationAddresses,
     pub raft_shape: Option<crate::datastore::raft::types::RaftShape>,
@@ -183,9 +183,9 @@ impl NodeRegistrationSnapshot {
         grpc_port: Option<u16>,
     ) -> Self {
         let peer_mode = match node_mode {
-            crate::bootstrap::NodeMode::Root => crate::controllers::annotations::NodePeerMode::Root,
+            crate::bootstrap::NodeMode::Root => klights_network_api::NodePeerMode::Root,
             crate::bootstrap::NodeMode::Rootless { .. } => {
-                crate::controllers::annotations::NodePeerMode::Rootless
+                klights_network_api::NodePeerMode::Rootless
             }
         };
         Self {
@@ -236,23 +236,17 @@ fn validate_node_registration_text(field: &str, value: &str, max_len: usize) -> 
     Ok(())
 }
 
-fn registration_mode_annotation(
-    mode: &crate::controllers::annotations::NodePeerMode,
-) -> &'static str {
+fn registration_mode_annotation(mode: &klights_network_api::NodePeerMode) -> &'static str {
     match mode {
-        crate::controllers::annotations::NodePeerMode::Root => "root",
-        crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
+        klights_network_api::NodePeerMode::Root => "root",
+        klights_network_api::NodePeerMode::Rootless => "rootless",
     }
 }
 
-fn registration_hostport_range(
-    mode: &crate::controllers::annotations::NodePeerMode,
-) -> &'static str {
+fn registration_hostport_range(mode: &klights_network_api::NodePeerMode) -> &'static str {
     match mode {
-        crate::controllers::annotations::NodePeerMode::Root => "",
-        crate::controllers::annotations::NodePeerMode::Rootless => {
-            crate::controllers::annotations::DEFAULT_HOSTPORT_RANGE
-        }
+        klights_network_api::NodePeerMode::Root => "",
+        klights_network_api::NodePeerMode::Rootless => klights_network_api::DEFAULT_HOSTPORT_RANGE,
     }
 }
 
@@ -450,7 +444,7 @@ pub(crate) async fn register_node_snapshot(
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     snapshot: &NodeRegistrationSnapshot,
 ) -> Result<()> {
-    use crate::controllers::annotations::{
+    use klights_network_api::{
         GIT_COMMIT_ANNOTATION, GRPC_PORT_ANNOTATION, HOSTPORT_RANGE_ANNOTATION,
         NODE_MODE_ANNOTATION,
     };

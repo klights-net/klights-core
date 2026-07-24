@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use klights_cluster_core::Resource;
 use klights_pod_api::{
-    PodGetRequest, PodLabel, PodLifecycleFuture, PodLifecycleWakeup, PodLifecycleWakeupRequest,
-    PodListRequest, PodListResult, PodMarkTerminating, PodMarkTerminatingRequest,
-    PodMutationTarget, PodOwnerListRequest, PodOwnerReference, PodQuery, PodRepositoryError,
-    PodRepositoryFuture, PodRoutingError, PodUpdate, PodUpdateRequest,
+    PodDeleteOptions, PodDeletePreconditions, PodGetRequest, PodLabel, PodLifecycleFuture,
+    PodLifecycleWakeup, PodLifecycleWakeupRequest, PodListRequest, PodListResult,
+    PodMarkTerminating, PodMarkTerminatingRequest, PodMutationTarget, PodOwnerListRequest,
+    PodOwnerReference, PodQuery, PodRepositoryError, PodRepositoryFuture, PodRoutingError,
+    PodUpdate, PodUpdateRequest,
 };
 use klights_types::PodIdentity;
 use serde_json::json;
@@ -213,6 +214,25 @@ fn mark_and_wakeup_are_explicit_intents_without_actor_authority() {
     assert_eq!(wake.identity(), &identity);
     assert_eq!(wake.resource_version(), 17);
     assert_eq!(wake.pod().uid, resource.uid);
+}
+
+#[test]
+fn delete_policy_preserves_kubernetes_options_without_http_types() {
+    let options = PodDeleteOptions::new(
+        Some("Foreground".to_string()),
+        Some(false),
+        Some(30),
+        PodDeletePreconditions::new(Some("uid-a".to_string()), Some("17".to_string())),
+    );
+    assert_eq!(options.propagation_policy(), Some("Foreground"));
+    assert_eq!(options.orphan_dependents(), Some(false));
+    assert_eq!(options.grace_period_seconds(), Some(30));
+    assert_eq!(options.preconditions().uid(), Some("uid-a"));
+    assert_eq!(options.preconditions().resource_version(), Some("17"));
+
+    let uid_only = PodDeleteOptions::with_uid_precondition("uid-b");
+    assert_eq!(uid_only.preconditions().uid(), Some("uid-b"));
+    assert_eq!(uid_only.preconditions().resource_version(), None);
 }
 
 #[test]

@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::datastore::command::COMMAND_CODEC_VERSION;
+use crate::datastore::command::{COMMAND_CODEC_VERSION, supports_command_codec_version};
 
 // ---------------------------------------------------------------------------
 // Snapshot envelope types
@@ -125,7 +125,7 @@ pub trait DatastoreSnapshotter: Send + Sync {
                 target_fingerprint: self.schema_fingerprint(),
             });
         }
-        if envelope.codec_version != COMMAND_CODEC_VERSION {
+        if !supports_command_codec_version(envelope.codec_version) {
             return Err(SnapshotRestoreError::CodecVersionMismatch {
                 snapshot_version: envelope.codec_version,
                 target_version: COMMAND_CODEC_VERSION,

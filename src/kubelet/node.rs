@@ -283,7 +283,7 @@ pub async fn refresh_current_git_commit_annotation_via_leader(
 fn current_git_commit_annotation_patch_command(
     node: &crate::datastore::Resource,
 ) -> StorageCommand {
-    use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+    use klights_network_api::GIT_COMMIT_ANNOTATION;
     StorageCommand::PatchResource {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),

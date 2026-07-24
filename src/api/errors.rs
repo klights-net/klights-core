@@ -3,6 +3,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use klights_pod_api::PodRepositoryError;
+
+use crate::resource_preconditions::ResourcePreconditionError;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -36,6 +39,39 @@ pub enum AppError {
         message: String,
         details: serde_json::Value,
     },
+}
+
+impl From<PodRepositoryError> for AppError {
+    fn from(error: PodRepositoryError) -> Self {
+        match error {
+            PodRepositoryError::InvalidRequest { message, .. } => Self::BadRequest(message),
+            PodRepositoryError::NotFound { namespace, name } => {
+                Self::NotFound(format!("Pod {namespace}/{name} not found"))
+            }
+            PodRepositoryError::UidMismatch { expected, actual } => Self::Conflict(format!(
+                "Pod UID mismatch: expected {expected}, found {actual}"
+            )),
+            PodRepositoryError::AlreadyExists { message } => Self::AlreadyExists(message),
+            PodRepositoryError::Conflict { message } => Self::Conflict(message),
+            PodRepositoryError::Forbidden { message } => Self::Forbidden(message),
+            PodRepositoryError::Unprocessable { message } => Self::UnprocessableEntity(message),
+            PodRepositoryError::Internal { message } => Self::InternalError(message),
+            PodRepositoryError::Unavailable { message } => Self::ServiceUnavailable(message),
+            PodRepositoryError::CorruptResponse { message } => Self::InternalError(message),
+            PodRepositoryError::Timeout => {
+                Self::ServiceUnavailable("Pod repository request timed out".to_string())
+            }
+            PodRepositoryError::Cancelled => {
+                Self::ServiceUnavailable("Pod repository request cancelled".to_string())
+            }
+        }
+    }
+}
+
+impl From<ResourcePreconditionError> for AppError {
+    fn from(error: ResourcePreconditionError) -> Self {
+        Self::Conflict(error.to_string())
+    }
 }
 
 /// One `metav1.StatusCause` (`{reason, message, field}`) for `Invalid` errors.

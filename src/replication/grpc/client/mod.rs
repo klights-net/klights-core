@@ -1514,7 +1514,7 @@ impl ReplicationGrpcClient {
         // bug-grpc A2: reimplemented on the generic `unary_call` executor.
         // Idempotency key + response decode stay here; the retry/deadline/
         // failover/lane-heal loop is shared.
-        let (idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
+        let (codec_version, idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
             request.into_parts();
         let operation = operation.as_wire_name().to_string();
         let payload = payload.to_vec();
@@ -1532,6 +1532,7 @@ impl ReplicationGrpcClient {
                         client_id: client_id.clone(),
                         stream_id,
                         stream_seq,
+                        codec_version,
                     };
                     async move { client.apply_outbox(request).await.map(|r| r.into_inner()) }
                 },
@@ -1545,6 +1546,16 @@ impl ReplicationGrpcClient {
             Err(UnaryRpcError::Status(status)) => return Err(outbox_error_from_status(status)),
         };
         decode_apply_outbox_response(response)
+    }
+
+    /// Fail startup before this client can submit commands to an older leader.
+    pub async fn require_command_codec_v3(&self) -> anyhow::Result<()> {
+        let metadata = self.metadata().await?;
+        crate::replication::protocol::require_command_codec_v3(
+            metadata.supported_features,
+            "replication leader",
+        )
+        .map_err(anyhow::Error::msg)
     }
 
     /// P3-11c: opaque envelope dispatch for the three Raft consensus
@@ -1569,7 +1580,11 @@ impl ReplicationGrpcClient {
                 move |mut client| async move {
                     client
                         .raft_append_entries(tonic::Request::new(
-                            generated::RaftAppendEntriesRequest { payload },
+                            generated::RaftAppendEntriesRequest {
+                                payload,
+                                supported_features:
+                                    crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                            },
                         ))
                         .await
                         .map(|r| r.into_inner())
@@ -1593,7 +1608,11 @@ impl ReplicationGrpcClient {
                 ChannelLane::Raft,
                 move |mut client| async move {
                     client
-                        .raft_vote(tonic::Request::new(generated::RaftVoteRequest { payload }))
+                        .raft_vote(tonic::Request::new(generated::RaftVoteRequest {
+                            payload,
+                            supported_features:
+                                crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                        }))
                         .await
                         .map(|r| r.into_inner())
                 },
@@ -1617,7 +1636,11 @@ impl ReplicationGrpcClient {
                 move |mut client| async move {
                     client
                         .raft_install_snapshot(tonic::Request::new(
-                            generated::RaftInstallSnapshotRequest { payload },
+                            generated::RaftInstallSnapshotRequest {
+                                payload,
+                                supported_features:
+                                    crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                            },
                         ))
                         .await
                         .map(|r| r.into_inner())
@@ -2380,6 +2403,7 @@ impl ReplicationGrpcClient {
             dataplane_mode: dataplane_mode_wire(self.config.dataplane.mode).to_string(),
             dataplane_encryption: dataplane_encryption_wire(self.config.dataplane.encryption)
                 .to_string(),
+            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
         }
     }
 
@@ -3486,6 +3510,9 @@ fn decode_apply_outbox_response(
 
 fn outbox_error_from_response(error_type: Option<&str>, message: String) -> OutboxDeliveryError {
     match error_type {
+        Some("CodecIncompatible") => {
+            OutboxDeliveryError::codec_incompatible(0, klights_cluster_core::COMMAND_CODEC_VERSION)
+        }
         Some("NotFound") => OutboxDeliveryError::NotFound(message),
         Some("UidMismatch") => OutboxDeliveryError::UidMismatch {
             expected: "<unknown>".to_string(),

@@ -37,6 +37,12 @@ pub(crate) async fn apply_forwarded_command_with_meta(
     command: StorageCommand,
     meta: CommandMeta,
 ) -> Result<ForwardedApply> {
+    anyhow::ensure!(
+        klights_cluster_core::supports_command_codec_version(meta.codec_version),
+        "replication command codec {} is incompatible with required codec {}",
+        meta.codec_version,
+        klights_cluster_core::COMMAND_CODEC_VERSION
+    );
     if crate::node_lease_tracker::ensure_lease_renew_command(&command, &meta.authoring_node).is_ok()
     {
         return Ok(ForwardedApply::already_applied());

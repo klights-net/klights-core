@@ -1172,8 +1172,14 @@ impl LocalApiClient {
         authoring_node: &str,
     ) -> Result<OutboxDeliveryResult, OutboxDeliveryError> {
         self.check_leader_outbox()?;
-        let (idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
+        let (codec_version, idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
             request.into_parts();
+        if !klights_cluster_core::supports_command_codec_version(codec_version) {
+            return Err(OutboxDeliveryError::codec_incompatible(
+                codec_version,
+                klights_cluster_core::COMMAND_CODEC_VERSION,
+            ));
+        }
         let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
             &client_id, stream_id, stream_seq,
         );
@@ -1266,18 +1272,20 @@ impl LocalApiClient {
             .await?;
         if let Some(command) = outcome.command.as_ref() {
             let controller_dispatcher = self.controller_dispatcher.get();
-            let gc_pod_delete_sink = if matches!(
-                command,
-                StorageCommand::DeleteResource { api_version, kind, .. }
-                    if api_version == "v1" && kind == "Pod"
-            ) {
-                match controller_dispatcher {
-                    Some(dispatcher) => dispatcher.current_pod_repository().await,
-                    None => None,
-                }
-            } else {
-                None
-            };
+            let gc_pod_delete_sink =
+                if matches!(
+                    command,
+                    StorageCommand::DeleteResource { api_version, kind, .. }
+                        if api_version == "v1" && kind == "Pod"
+                ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
+                {
+                    match controller_dispatcher {
+                        Some(dispatcher) => dispatcher.current_pod_repository().await,
+                        None => None,
+                    }
+                } else {
+                    None
+                };
             crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
                 controller_dispatcher.map(|dispatcher| {
                     dispatcher.as_ref() as &dyn klights_reconcile_api::ControllerReconcileSink
@@ -1293,7 +1301,8 @@ impl LocalApiClient {
                 outcome.pod_endpoint_effect,
                 self.db.as_ref(),
             )
-            .await;
+            .await
+            .map_err(crate::kubelet::outbox::OutboxApplyError::Retryable)?;
         }
         Ok(outcome.result)
     }
@@ -1644,6 +1653,71 @@ mod inner_gate_tests {
             )
             .await
             .expect("sequence four applies after malformed terminal decision");
+    }
+
+    #[tokio::test]
+    async fn exact_codec_rejection_precedes_decode_ledger_and_watermark() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let client = LocalApiClient::new(
+            db.clone(),
+            "node-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        let initial_rv = db
+            .get_current_resource_version()
+            .await
+            .expect("read initial RV");
+
+        for advertised in [
+            klights_cluster_core::COMMAND_CODEC_VERSION - 1,
+            klights_cluster_core::COMMAND_CODEC_VERSION + 1,
+        ] {
+            let idempotency_key = format!("incompatible-codec-{advertised}");
+            let error = klights_leader_api::LeaderOutboxDelivery::deliver_outbox(
+                &client,
+                klights_leader_api::OutboxDeliveryRequest::try_new_versioned(
+                    advertised,
+                    idempotency_key.clone(),
+                    klights_leader_api::OutboxDeliveryOperation::PodMetadata,
+                    Arc::<[u8]>::from([0xff, 0x00, 0x81]),
+                    "peer-a",
+                    71,
+                    1,
+                )
+                .expect("transport preserves the advertised codec"),
+            )
+            .await
+            .expect_err("only exact codec v3 is accepted");
+            assert_eq!(
+                error,
+                klights_leader_api::OutboxDeliveryError::codec_incompatible(
+                    advertised,
+                    klights_cluster_core::COMMAND_CODEC_VERSION,
+                )
+            );
+            assert!(error.is_retryable());
+            assert!(
+                db.get_applied_outbox(&idempotency_key)
+                    .await
+                    .expect("read incompatible ledger")
+                    .is_none(),
+                "exact-version rejection must precede ledger insertion"
+            );
+            assert!(
+                db.list_outbox_stream_watermarks()
+                    .await
+                    .expect("read incompatible watermarks")
+                    .is_empty(),
+                "exact-version rejection must precede watermark advancement"
+            );
+            assert_eq!(
+                db.get_current_resource_version()
+                    .await
+                    .expect("read RV after rejection"),
+                initial_rv,
+                "rejected opaque bytes must not mutate cluster state"
+            );
+        }
     }
 
     #[tokio::test]

@@ -8,11 +8,10 @@ use klights_pod_api::{
 };
 use serde_json::{Map, Value};
 
-use crate::api::{AppError, DeleteOptions};
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 
-use super::{PodApiDeleteOutcome, PodObjectWriter, PodReader, PodRepository};
+use super::{PodObjectWriter, PodReader, PodRepository};
 
 impl PodQuery for PodRepository {
     fn get_pod(
@@ -177,29 +176,18 @@ impl PodMarkTerminating for PodRepository {
     ) -> PodRepositoryFuture<'_, crate::datastore::Resource> {
         Box::pin(async move {
             let target = request.into_target();
-            let options = target
-                .uid()
-                .map(DeleteOptions::with_uid_precondition)
-                .unwrap_or_default();
-            let outcome = self
-                .api
-                .api_delete_pod(target.namespace(), target.name(), options, false)
-                .await
-                .map_err(|error| map_api_error(error, target.namespace(), target.name()))?;
-            let PodApiDeleteOutcome::GracefulSet(resource) = outcome else {
-                return Err(PodRepositoryError::corrupt_response(
-                    "persisted graceful mark unexpectedly returned a dry-run body",
-                ));
-            };
+            let resource = self.api.mark_terminating(&target).await?;
 
-            crate::side_effects::run_hooks_logged(
-                &self.side_effects,
-                &resource.data,
-                self.store.db().as_ref(),
-                &self.metrics,
-                "pod_object_mark_terminating",
-            )
-            .await;
+            let _ = self
+                .mutation_reconcile
+                .reconcile_pod_mutation(
+                    klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                        pod: resource.clone(),
+                        named_hook: None,
+                        context: "pod_object_mark_terminating",
+                    },
+                )
+                .await;
             Ok(resource)
         })
     }
@@ -217,32 +205,6 @@ impl PodLifecycleWakeup for PodLifecycleRouter {
             .await
             .map_err(|error| PodRoutingError::unavailable(error.to_string()))
         })
-    }
-}
-
-impl From<PodRepositoryError> for AppError {
-    fn from(error: PodRepositoryError) -> Self {
-        match error {
-            PodRepositoryError::InvalidRequest { message, .. } => Self::BadRequest(message),
-            PodRepositoryError::NotFound { namespace, name } => {
-                Self::NotFound(format!("Pod {namespace}/{name} not found"))
-            }
-            PodRepositoryError::UidMismatch { expected, actual } => Self::Conflict(format!(
-                "Pod UID mismatch: expected {expected}, found {actual}"
-            )),
-            PodRepositoryError::Conflict { message } => Self::Conflict(message),
-            PodRepositoryError::Forbidden { message } => Self::Forbidden(message),
-            PodRepositoryError::Unprocessable { message } => Self::UnprocessableEntity(message),
-            PodRepositoryError::Internal { message } => Self::InternalError(message),
-            PodRepositoryError::Unavailable { message } => Self::ServiceUnavailable(message),
-            PodRepositoryError::CorruptResponse { message } => Self::InternalError(message),
-            PodRepositoryError::Timeout => {
-                Self::ServiceUnavailable("Pod repository request timed out".to_string())
-            }
-            PodRepositoryError::Cancelled => {
-                Self::ServiceUnavailable("Pod repository request cancelled".to_string())
-            }
-        }
     }
 }
 
@@ -264,73 +226,12 @@ fn map_repository_error(error: anyhow::Error, namespace: &str, name: &str) -> Po
     PodRepositoryError::unavailable(error.to_string())
 }
 
-fn map_api_error(error: AppError, namespace: &str, name: &str) -> PodRepositoryError {
-    match error {
-        AppError::NotFound(_) => PodRepositoryError::not_found(namespace, name),
-        AppError::BadRequest(message) => PodRepositoryError::invalid_request("pod", message),
-        AppError::UnprocessableEntity(message) => PodRepositoryError::unprocessable(message),
-        AppError::AlreadyExists(message) | AppError::Conflict(message) => {
-            PodRepositoryError::conflict(message)
-        }
-        AppError::Forbidden(message) => PodRepositoryError::forbidden(message),
-        AppError::ServiceUnavailable(message) => PodRepositoryError::unavailable(message),
-        AppError::InternalError(message) | AppError::Internal(message) => {
-            PodRepositoryError::internal(message)
-        }
-        AppError::Status {
-            reason: "NotFound", ..
-        } => PodRepositoryError::not_found(namespace, name),
-        AppError::Status {
-            reason: "Conflict",
-            message,
-            ..
-        }
-        | AppError::Status {
-            reason: "AlreadyExists",
-            message,
-            ..
-        } => PodRepositoryError::conflict(message),
-        AppError::Status {
-            reason: "Forbidden",
-            message,
-            ..
-        } => PodRepositoryError::forbidden(message),
-        AppError::Status { code, message, .. } if code == axum::http::StatusCode::BAD_REQUEST => {
-            PodRepositoryError::invalid_request("pod", message)
-        }
-        AppError::Status { code, .. } if code == axum::http::StatusCode::NOT_FOUND => {
-            PodRepositoryError::not_found(namespace, name)
-        }
-        AppError::Status { code, message, .. } if code == axum::http::StatusCode::FORBIDDEN => {
-            PodRepositoryError::forbidden(message)
-        }
-        AppError::Status { code, message, .. } if code == axum::http::StatusCode::CONFLICT => {
-            PodRepositoryError::conflict(message)
-        }
-        AppError::Status { code, message, .. }
-            if code == axum::http::StatusCode::UNPROCESSABLE_ENTITY =>
-        {
-            PodRepositoryError::unprocessable(message)
-        }
-        AppError::Status { code, message, .. }
-            if code == axum::http::StatusCode::INTERNAL_SERVER_ERROR =>
-        {
-            PodRepositoryError::internal(message)
-        }
-        AppError::Status { code, message, .. }
-            if code == axum::http::StatusCode::SERVICE_UNAVAILABLE =>
-        {
-            PodRepositoryError::unavailable(message)
-        }
-        other => PodRepositoryError::unavailable(format!("{other:?}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::response::IntoResponse;
 
-    use super::*;
+    use crate::api::AppError;
+    use crate::pod_api_service::map_api_error_to_pod_repository;
 
     #[tokio::test]
     async fn pod_repository_error_round_trips_kubernetes_http_categories() {
@@ -344,7 +245,7 @@ mod tests {
             (AppError::ServiceUnavailable("leader".into()), 503),
         ];
         for (source, expected) in cases {
-            let leaf = map_api_error(source, "default", "web");
+            let leaf = map_api_error_to_pod_repository(source, "default", "web");
             let response = AppError::from(leaf).into_response();
             assert_eq!(response.status().as_u16(), expected);
         }
@@ -358,7 +259,7 @@ mod tests {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
         ] {
-            let leaf = map_api_error(
+            let leaf = map_api_error_to_pod_repository(
                 AppError::Status {
                     code,
                     reason: "TestReason",

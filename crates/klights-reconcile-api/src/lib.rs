@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
+use klights_cluster_core::Resource;
 use klights_types::PodIdentity;
 
 /// Object-safe future used at the coarse component reconciliation boundary.
@@ -296,6 +297,40 @@ pub trait ServiceReconcileSink: Send + Sync {
     ) -> ReconcileSinkFuture<'_>;
 }
 
+/// Root-owned effects emitted after kubelet Pod persistence.
+///
+/// The request contains only canonical resources and semantic intent; concrete
+/// side-effect registries and controller dispatchers remain above kubelet.
+#[derive(Clone, Debug)]
+pub enum PodMutationReconcileRequest {
+    RunHooks {
+        pod: Resource,
+        named_hook: Option<&'static str>,
+        context: &'static str,
+    },
+    ServicesAfterUpdate {
+        previous: Resource,
+        updated: Resource,
+    },
+    ServicesAfterDelete {
+        deleted: Resource,
+    },
+    StatusChanged {
+        previous: Resource,
+        updated: Resource,
+    },
+    EnqueueJobOwner {
+        pod: Resource,
+    },
+}
+
+pub trait PodMutationReconcileSink: Send + Sync {
+    fn reconcile_pod_mutation(
+        &self,
+        request: PodMutationReconcileRequest,
+    ) -> ReconcileSinkFuture<'_>;
+}
+
 /// UID-qualified Pod deletion request emitted by garbage collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GcPodDeleteRequest {
@@ -365,4 +400,86 @@ impl Error for GcPodDeleteError {}
 /// lifecycle actor. This capability does not grant Pod-row hard deletion.
 pub trait GcPodDeleteSink: Send + Sync {
     fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_>;
+}
+
+/// Pod-scoped garbage-collection reconciliation.
+///
+/// This capability may discover and mark dependent Pods through the supplied
+/// UID-qualified delete sink. It never grants direct Pod-row deletion.
+pub trait PodGcReconcileSink: Send + Sync {
+    fn reconcile_owner_references<'a>(
+        &'a self,
+        pod: Resource,
+        pod_delete_sink: &'a dyn GcPodDeleteSink,
+    ) -> ReconcileSinkFuture<'a>;
+
+    fn cascade_delete_dependents<'a>(
+        &'a self,
+        owner: PodIdentity,
+        pod_delete_sink: &'a dyn GcPodDeleteSink,
+    ) -> ReconcileSinkFuture<'a>;
+
+    fn finalize_foreground_owners<'a>(
+        &'a self,
+        deleted_dependent: Resource,
+        pod_delete_sink: &'a dyn GcPodDeleteSink,
+    ) -> ReconcileSinkFuture<'a>;
+}
+
+/// PDB reconciliation triggered after a Pod lifecycle write.
+pub trait PodPdbReconcileSink: Send + Sync {
+    fn reconcile_namespace_pdbs(&self, namespace: String) -> ReconcileSinkFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PvcReconcileOutcome {
+    pub phase: Option<String>,
+    pub volume_name: Option<String>,
+}
+
+pub type PvcReconcileFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PvcReconcileOutcome, ReconcileSinkError>> + Send + 'a>>;
+
+/// Root-owned PVC binding/provisioning capability.
+pub trait PvcReconcileSink: Send + Sync {
+    fn reconcile_pvc(&self, pvc: Resource) -> PvcReconcileFuture<'_>;
+}
+
+/// Pod-to-Service reconciliation boundary.
+///
+/// Implementations preserve selector matching, stale targetRef cleanup, and
+/// endpoint-relevant update gating. Endpoint and EndpointSlice mutations must
+/// not feed work back through this sink.
+pub trait PodServiceReconcileSink: Send + Sync {
+    fn enqueue_after_pod_create(&self, pod: Resource) -> ReconcileSinkFuture<'_>;
+
+    fn enqueue_after_pod_update(
+        &self,
+        previous: Resource,
+        updated: Resource,
+    ) -> ReconcileSinkFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespaceTerminationRequest {
+    pub namespace: String,
+    pub expected_uid: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceTerminationOutcome {
+    Finalized,
+    StillPending,
+}
+
+pub type NamespaceTerminationFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<NamespaceTerminationOutcome, ReconcileSinkError>> + Send + 'a>,
+>;
+
+/// Root-owned namespace finalization capability used by Pod lifecycle paths.
+pub trait NamespaceTerminationSink: Send + Sync {
+    fn reconcile_namespace_termination(
+        &self,
+        request: NamespaceTerminationRequest,
+    ) -> NamespaceTerminationFuture<'_>;
 }

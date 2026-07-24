@@ -14,7 +14,6 @@ use crate::datastore::{
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodWorkqueueEntry, PodWorkqueueKind,
 };
 use crate::storage_wire_codec::decode_command_protobuf;
-use klights_cluster_core::StorageCommand;
 
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
@@ -1545,15 +1544,8 @@ fn is_terminal_pod_delete_outbox_row(operation: &str, payload_proto: &[u8]) -> b
     if operation != "PodMetadata" {
         return false;
     }
-    matches!(
-        decode_command_protobuf(payload_proto),
-        Ok(StorageCommand::DeleteResource {
-            api_version,
-            kind,
-            preconditions,
-            ..
-        }) if api_version == "v1" && kind == "Pod" && preconditions.uid.is_some()
-    )
+    decode_command_protobuf(payload_proto)
+        .is_ok_and(|command| command.variant_name() == "FinalizeBoundPod")
 }
 
 fn row_to_dead_letter(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {

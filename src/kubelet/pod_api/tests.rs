@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use super::PodApiFacade;
-use crate::kubelet::pod_repository::api::PodSchedulingMode;
 use crate::kubelet::pod_repository::delete_coordinator::{
     PodDeleteCoordinator, PodDeleteQueuePort, PodDeleteSleeperPort,
 };
 use crate::kubelet::pod_repository::state_only_writer::StatusOnlyWriterService;
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_repository::{PodApiDeleteOutcome, PodApiUpdateOutcome, PodReader};
+use crate::pod_repository_composition::PodSchedulingMode;
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 use klights_supervisor::TaskSupervisor;
 
@@ -86,18 +86,26 @@ fn fixture_facade(db: crate::datastore::DatastoreHandle) -> PodApiFacade {
         metrics.clone(),
     ));
     let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
+    let pod_reconcile = Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
+        db.clone(),
+        side_effects.controller_dispatcher_slot(),
+        metrics.clone(),
+        side_effects.clone(),
+        store.clone(),
+    ));
 
     PodApiFacade::new(
         repository,
-        crate::kubelet::pod_repository::api::PodApiServiceDependencies {
+        crate::pod_api_service::PodApiServiceDependencies {
             store,
             status_only,
             db,
             supervisor,
             delete_coordinator,
+            gc_reconcile: pod_reconcile.clone(),
+            service_reconcile: pod_reconcile,
             side_effects,
             metrics,
-            outbox: None,
         },
     )
 }

@@ -76,37 +76,14 @@ pub async fn reject_if_namespace_missing_or_terminating(
     db: &dyn DatastoreBackend,
     namespace: &str,
 ) -> Result<(), AppError> {
-    match db.get_namespace(namespace).await? {
-        None => {
-            // The immortal system namespaces (default, kube-system, kube-public,
-            // kube-node-lease) always exist in a running cluster: they are
-            // created at bootstrap and cannot be deleted (T3.9). Treat them as
-            // present even if a row lookup races, so we never spuriously reject
-            // creates into a guaranteed-present namespace. For any other
-            // namespace, a missing row means the namespace does not exist.
-            if crate::api::is_protected_namespace(namespace) {
-                Ok(())
-            } else {
-                Err(AppError::Forbidden(format!(
-                    "namespace {} not found",
-                    namespace
-                )))
-            }
-        }
-        Some(ns) => {
-            let terminating = ns
-                .data
-                .pointer("/metadata/deletionTimestamp")
-                .and_then(|v| v.as_str())
-                .is_some();
-            if terminating {
-                return Err(AppError::Forbidden(format!(
-                    "namespace {} is being terminated",
-                    namespace
-                )));
-            }
-            Ok(())
-        }
+    match crate::namespace_admission::create_eligibility(db, namespace).await? {
+        crate::namespace_admission::NamespaceCreateEligibility::Allowed => Ok(()),
+        crate::namespace_admission::NamespaceCreateEligibility::Missing => Err(
+            AppError::Forbidden(format!("namespace {} not found", namespace)),
+        ),
+        crate::namespace_admission::NamespaceCreateEligibility::Terminating => Err(
+            AppError::Forbidden(format!("namespace {} is being terminated", namespace)),
+        ),
     }
 }
 

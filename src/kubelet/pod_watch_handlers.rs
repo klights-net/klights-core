@@ -1,5 +1,6 @@
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::watch::{EventType, WatchEvent};
+use klights_reconcile_api::PvcReconcileSink;
 
 #[async_trait::async_trait]
 pub trait PersistentVolumeEventHandler: Send + Sync {
@@ -104,8 +105,6 @@ pub async fn handle_pvc_event(
         event_name
     );
 
-    // Inject resourceVersion for reconcile_pvc — needs owned Value for mutation
-    let mut pvc_with_rv = (*event.object).clone();
     if let Ok(Some(pvc_resource)) = db
         .get_resource(
             "v1",
@@ -120,28 +119,13 @@ pub async fn handle_pvc_event(
         )
         .await
     {
-        if let Some(meta) = pvc_with_rv
-            .get_mut("metadata")
-            .and_then(|m| m.as_object_mut())
-        {
-            meta.insert(
-                "resourceVersion".to_string(),
-                serde_json::json!(pvc_resource.resource_version.to_string()),
-            );
-        }
-
-        // Reconcile PVC - bind to matching PV if available
-        match crate::controllers::pvc::reconcile_pvc(file_process, db, &pvc_with_rv).await {
-            Ok(updated_pvc) => {
-                if let Some(phase) = updated_pvc
-                    .pointer("/status/phase")
-                    .and_then(|p| p.as_str())
-                {
+        let reconcile =
+            crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(db, file_process);
+        match reconcile.reconcile_pvc(pvc_resource).await {
+            Ok(outcome) => {
+                if let Some(phase) = outcome.phase.as_deref() {
                     if phase == "Bound" {
-                        let volume_name = updated_pvc
-                            .pointer("/status/volumeName")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        let volume_name = outcome.volume_name.as_deref().unwrap_or("unknown");
                         tracing::info!("PVC {} bound to PV {}", event_name, volume_name);
                     } else {
                         tracing::info!("PVC {} remains Pending (no matching PV found)", event_name);
@@ -193,21 +177,12 @@ pub async fn handle_pv_event(
                     .and_then(|p| p.as_str());
 
                 if phase != Some("Bound") {
-                    // Inject resourceVersion
-                    let mut pvc_with_rv: serde_json::Value = (*pvc_resource.data).clone();
-                    if let Some(meta) = pvc_with_rv
-                        .get_mut("metadata")
-                        .and_then(|m| m.as_object_mut())
-                    {
-                        meta.insert(
-                            "resourceVersion".to_string(),
-                            serde_json::json!(pvc_resource.resource_version.to_string()),
+                    let reconcile =
+                        crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
+                            db,
+                            file_process,
                         );
-                    }
-
-                    if let Err(e) =
-                        crate::controllers::pvc::reconcile_pvc(file_process, db, &pvc_with_rv).await
-                    {
+                    if let Err(e) = reconcile.reconcile_pvc(pvc_resource.clone()).await {
                         let pvc_name = pvc_resource.name.as_str();
                         tracing::warn!(
                             "Failed to reconcile PVC {} after PV creation: {:#}",

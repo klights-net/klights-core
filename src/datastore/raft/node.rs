@@ -27,6 +27,83 @@ use crate::datastore::raft::network::{LeaderForwarder, StubRaftNetwork};
 use crate::datastore::raft::state_machine_impl::SqliteRaftStateMachine;
 use crate::datastore::raft::types::{NodeId, RaftShape, StorageCommandPayload, TypeConfig};
 
+pub(crate) const KEY_COMMAND_CODEC_ACTIVATION_VERSION: &str = "command_codec_activation_version";
+const COMMAND_CODEC_ACTIVATION_VALUE: &str = "3";
+
+/// Process-local mirror of the Raft-committed exact-v3 activation marker.
+///
+/// The startup gate is enabled only by the production bootstrap path. Tests
+/// that exercise Raft mechanics directly remain independent of bootstrap
+/// policy, while every production proposal capability is fail-closed until
+/// the authoritative cluster marker has applied locally.
+pub(crate) struct CommandCodecV3Activation {
+    activated: std::sync::atomic::AtomicBool,
+    startup_gate_enforced: std::sync::atomic::AtomicBool,
+}
+
+impl CommandCodecV3Activation {
+    async fn load(backend: &dyn DatastoreBackend) -> Result<Self> {
+        let value = backend
+            .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .await
+            .context("read command codec activation marker")?;
+        let activated = match value.as_deref() {
+            None => false,
+            Some(COMMAND_CODEC_ACTIVATION_VALUE) => true,
+            Some(other) => {
+                anyhow::bail!(
+                    "unsupported persisted command codec activation version {other:?}; required exact version {COMMAND_CODEC_ACTIVATION_VALUE}"
+                )
+            }
+        };
+        Ok(Self {
+            activated: std::sync::atomic::AtomicBool::new(activated),
+            startup_gate_enforced: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn inactive_for_state_machine_test() -> Self {
+        Self {
+            activated: std::sync::atomic::AtomicBool::new(false),
+            startup_gate_enforced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn enforce_startup_gate(&self) {
+        self.startup_gate_enforced
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn mark_command_codec_v3_activated(&self) {
+        self.activated
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn clear_command_codec_v3_activation(&self) {
+        self.activated
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_activated(&self) -> bool {
+        self.activated.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn ensure_command_codec_v3_activated(&self) -> Result<()> {
+        if !self
+            .startup_gate_enforced
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.is_activated()
+        {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "command proposal capability is unavailable until the Raft-committed exact-v3 codec activation marker applies"
+            )
+        }
+    }
+}
+
 /// One-shot metadata RPC port used by the committed-apply activation
 /// preflight. The caller supplies the existing replication gRPC client; this
 /// keeps Raft membership ownership independent of transport construction.
@@ -90,7 +167,29 @@ async fn verify_committed_apply_rv_v1_members(
                 node_id,
                 message: err.to_string(),
             })?;
-        if metadata.supported_features & crate::replication::protocol::COMMITTED_APPLY_RV_V1 == 0 {
+        if !crate::replication::protocol::supports_command_codec_v3(metadata.supported_features)
+            || metadata.supported_features & crate::replication::protocol::COMMITTED_APPLY_RV_V1
+                == 0
+        {
+            return Err(ResourceVersionV1PreflightError::Unsupported { node_id });
+        }
+    }
+    Ok(())
+}
+
+async fn verify_command_codec_v3_members(
+    members: Vec<(NodeId, String)>,
+    probe: &dyn MemberFeatureProbe,
+) -> std::result::Result<(), ResourceVersionV1PreflightError> {
+    for (node_id, addr) in members {
+        let metadata = probe
+            .metadata_for_member(node_id, &addr)
+            .await
+            .map_err(|err| ResourceVersionV1PreflightError::Unavailable {
+                node_id,
+                message: err.to_string(),
+            })?;
+        if !crate::replication::protocol::supports_command_codec_v3(metadata.supported_features) {
             return Err(ResourceVersionV1PreflightError::Unsupported { node_id });
         }
     }
@@ -134,6 +233,7 @@ pub struct RaftNode {
     /// resourceVersion so the leader cannot build an unacknowledged RV backlog
     /// ahead of raft progress under loss (finding.md flow-control plan).
     pub(crate) flow_control: Arc<crate::datastore::raft::flow_control::RaftCommitFlowControl>,
+    command_codec_v3_activation: Arc<CommandCodecV3Activation>,
 }
 
 impl RaftNode {
@@ -240,10 +340,13 @@ impl RaftNode {
             .context("openraft Config validate")?,
         );
         let log_store = SqliteRaftLogStorage::new(log_durability, supervisor.clone());
-        let state_machine = SqliteRaftStateMachine::new(
+        let command_codec_v3_activation =
+            Arc::new(CommandCodecV3Activation::load(cluster_backend.as_ref()).await?);
+        let state_machine = SqliteRaftStateMachine::new_with_command_codec_activation(
             cluster_backend.clone(),
             applied_state_durability,
             supervisor,
+            command_codec_v3_activation.clone(),
         );
         let raft = Raft::new(node_id, config, network, log_store, state_machine)
             .await
@@ -260,6 +363,7 @@ impl RaftNode {
                     RAFT_MAX_INFLIGHT_PROPOSALS,
                 ),
             ),
+            command_codec_v3_activation,
         })
     }
 
@@ -303,6 +407,8 @@ impl RaftNode {
     /// `LeaderForwarder` was attached via `with_forwarder` the proposal is
     /// transparently re-dispatched to the current leader.
     pub async fn propose(&self, payload: StorageCommandPayload) -> Result<()> {
+        self.command_codec_v3_activation
+            .ensure_command_codec_v3_activated()?;
         match self.raft.client_write(payload.clone()).await {
             Ok(_) => Ok(()),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
@@ -400,9 +506,10 @@ impl RaftNode {
         let members: Vec<(NodeId, String)> = metrics
             .membership_config
             .nodes()
+            .filter(|(node_id, _)| **node_id != self.node_id)
             .map(|(node_id, node)| (*node_id, node.addr.clone()))
             .collect();
-        if members.is_empty() {
+        if metrics.membership_config.nodes().next().is_none() {
             return Err(ResourceVersionV1PreflightError::NotReady(
                 "Raft membership has no voters or learners".to_string(),
             ));
@@ -415,10 +522,37 @@ impl RaftNode {
         })
     }
 
-    /// Commit the cluster-wide V1 mode switch after the caller has proved all
-    /// current members support it. The metadata commit itself remains Legacy
-    /// so every pre-upgrade member can apply the activation entry.
-    pub async fn activate_committed_apply_rv_v1(
+    /// Enable the production proposal gate, then validate restored membership.
+    ///
+    /// A committed exact-v3 activation marker is authoritative and permits
+    /// startup without peer probes. Before activation, an unavailable or old
+    /// restored member returns a diagnostic error but the process may continue
+    /// bringing up its authenticated Raft endpoint: the proposal gate remains
+    /// closed until a leader later proves every current member and commits the
+    /// marker. This avoids a cold-start circular dependency without exposing
+    /// command capability.
+    pub async fn verify_startup_command_codec_v3(
+        &self,
+        probe: &dyn MemberFeatureProbe,
+    ) -> std::result::Result<(), ResourceVersionV1PreflightError> {
+        self.command_codec_v3_activation.enforce_startup_gate();
+        if self.command_codec_v3_activation.is_activated() {
+            return Ok(());
+        }
+        let _membership_guard = self.membership_mutex.lock().await;
+        let metrics = self.raft.metrics().borrow().clone();
+        let members: Vec<(NodeId, String)> = metrics
+            .membership_config
+            .nodes()
+            .filter(|(node_id, _)| **node_id != self.node_id)
+            .map(|(node_id, node)| (*node_id, node.addr.clone()))
+            .collect();
+        verify_command_codec_v3_members(members, probe).await
+    }
+
+    /// Commit the exact-v3 activation marker together with committed-apply V1
+    /// after proving every current voter and learner supports both features.
+    pub async fn activate_command_codec_v3(
         &self,
         probe: &dyn MemberFeatureProbe,
     ) -> std::result::Result<(), ResourceVersionV1ActivationError> {
@@ -432,7 +566,15 @@ impl RaftNode {
             )
             .await
             .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
-        if mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
+        let codec_activated = self
+            .backend
+            .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .await
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?
+            .as_deref()
+            == Some(COMMAND_CODEC_ACTIVATION_VALUE);
+        if mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 && codec_activated
+        {
             return Ok(());
         }
         let _preflight = self.preflight_committed_apply_rv_v1(probe).await?;
@@ -445,7 +587,15 @@ impl RaftNode {
             )
             .await
             .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
-        if mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
+        let codec_activated = self
+            .backend
+            .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .await
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?
+            .as_deref()
+            == Some(COMMAND_CODEC_ACTIVATION_VALUE);
+        if mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 && codec_activated
+        {
             return Ok(());
         }
         let current_rv = self
@@ -453,9 +603,9 @@ impl RaftNode {
             .get_current_resource_version()
             .await
             .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
-        let commit = crate::log_apply::LogApplyCommit::from_cluster_mutations(
-            current_rv.max(1),
-            vec![crate::log_apply::ClusterMutation::ClusterMeta(
+        let mut mutations = Vec::with_capacity(2);
+        if mode != crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
+            mutations.push(crate::log_apply::ClusterMutation::ClusterMeta(
                 crate::log_apply::ClusterMetaMutation::PutKlightsMeta {
                     key: crate::datastore::resource_version_assignment::
                         KEY_RESOURCE_VERSION_ASSIGNMENT_MODE
@@ -464,8 +614,18 @@ impl RaftNode {
                         .as_metadata_value()
                         .to_string(),
                 },
-            )],
-        );
+            ));
+        }
+        if !codec_activated {
+            mutations.push(crate::log_apply::ClusterMutation::ClusterMeta(
+                crate::log_apply::ClusterMetaMutation::PutKlightsMeta {
+                    key: KEY_COMMAND_CODEC_ACTIVATION_VERSION.to_string(),
+                    value: COMMAND_CODEC_ACTIVATION_VALUE.to_string(),
+                },
+            ));
+        }
+        let commit =
+            crate::log_apply::LogApplyCommit::from_cluster_mutations(current_rv.max(1), mutations);
         let bytes = crate::log_apply::encode_commit_protobuf(&commit)
             .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
         let result = self
@@ -476,6 +636,13 @@ impl RaftNode {
             return Err(ResourceVersionV1ActivationError::Apply(error));
         }
         Ok(())
+    }
+
+    pub async fn activate_committed_apply_rv_v1(
+        &self,
+        probe: &dyn MemberFeatureProbe,
+    ) -> std::result::Result<(), ResourceVersionV1ActivationError> {
+        self.activate_command_codec_v3(probe).await
     }
 
     /// T1.5 / T4: add a new node to the cluster as a **learner** —
@@ -695,6 +862,8 @@ impl crate::datastore::sequenced::RaftProposal for RaftNode {
         &self,
         command: crate::datastore::command::StorageCommand,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+        self.command_codec_v3_activation
+            .ensure_command_codec_v3_activated()?;
         self.ensure_local_leader_for_commit_materialization()?;
         let operation = derive_operation_label(&command);
         // Flow-control gate: acquire a permit BEFORE commit materialization. The
@@ -761,6 +930,14 @@ impl crate::datastore::sequenced::RaftProposal for RaftNode {
         crate::kubelet::outbox::OutboxApplyError,
     > {
         use crate::datastore::sqlite::BuildOutboxOutcome;
+        if let Err(err) = self
+            .command_codec_v3_activation
+            .ensure_command_codec_v3_activated()
+        {
+            return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+                err.to_string(),
+            ));
+        }
         if let Err(err) = self.ensure_local_leader_for_commit_materialization() {
             return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
                 err.to_string(),
@@ -835,14 +1012,18 @@ impl crate::datastore::sequenced::RaftProposal for RaftNode {
                     crate::datastore::PodEndpointEffect::NotApplicable,
                 ));
             }
-            BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
+            BuildOutboxOutcome::AlreadyApplied {
+                applied_rv,
+                committed_resource,
+            } => {
                 // The idempotency key already applied, avoid duplicate
                 // proposal and keep the existing RV.
                 return Ok(crate::datastore::CommittedOutboxApply::new(
                     crate::kubelet::outbox::OutboxApplyResult::AlreadyApplied { applied_rv },
                     crate::datastore::ResourceMutationEffect::Unchanged,
                     crate::datastore::PodEndpointEffect::Unchanged,
-                ));
+                )
+                .with_committed_resource(committed_resource));
             }
         };
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit).map_err(|err| {
@@ -867,6 +1048,15 @@ impl crate::datastore::sequenced::RaftProposal for RaftNode {
             crate::datastore::ResourceMutationEffect::Unchanged
         };
         let pod_endpoint_effect = apply_result.pod_endpoint_effect;
+        let committed_resource =
+            apply_result
+                .applied_mutation
+                .as_ref()
+                .map(|mutation| match mutation {
+                    crate::datastore::raft::types::AppliedMutation::Resource(resource) => {
+                        resource.clone()
+                    }
+                });
         if let Some(message) = apply_result.error_message {
             return Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(
                 message,
@@ -880,7 +1070,8 @@ impl crate::datastore::sequenced::RaftProposal for RaftNode {
             crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
             resource_effect,
             pod_endpoint_effect,
-        ))
+        )
+        .with_committed_resource(committed_resource))
     }
 }
 
@@ -1190,6 +1381,12 @@ fn validate_committed_apply_v1_join_feature(
     assignment_mode: crate::log_apply::ResourceVersionAssignment,
     supported_features: u64,
 ) -> std::result::Result<(), String> {
+    if supported_features & crate::replication::protocol::COMMAND_CODEC_V3 == 0 {
+        return Err(
+            "joining voters and learners must advertise the exact COMMAND_CODEC_V3 capability"
+                .to_string(),
+        );
+    }
     if assignment_mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
         && supported_features & crate::replication::protocol::COMMITTED_APPLY_RV_V1 == 0
     {
@@ -1379,8 +1576,14 @@ mod tests {
         ];
         let all_capable = FeatureProbe {
             replies: [
-                (1, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
-                (2, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+                (
+                    1,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
+                (
+                    2,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1391,8 +1594,11 @@ mod tests {
 
         let missing = FeatureProbe {
             replies: [
-                (1, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
-                (2, Ok(0)),
+                (
+                    1,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
+                (2, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
             ]
             .into_iter()
             .collect(),
@@ -1404,7 +1610,10 @@ mod tests {
 
         let unavailable = FeatureProbe {
             replies: [
-                (1, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+                (
+                    1,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
                 (2, Err(anyhow::anyhow!("transport unavailable"))),
             ]
             .into_iter()
@@ -1413,6 +1622,44 @@ mod tests {
         assert!(matches!(
             verify_committed_apply_rv_v1_members(members, &unavailable).await,
             Err(ResourceVersionV1PreflightError::Unavailable { node_id: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn startup_codec_probe_rejects_any_voter_or_learner_without_v3() {
+        let members = vec![
+            (1, "https://voter".to_string()),
+            (2, "https://learner".to_string()),
+        ];
+        let compatible = FeatureProbe {
+            replies: [
+                (
+                    1,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
+                (2, Ok(crate::replication::protocol::COMMAND_CODEC_V3)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        verify_command_codec_v3_members(members.clone(), &compatible)
+            .await
+            .expect("all restored members advertise codec v3");
+
+        let old_learner = FeatureProbe {
+            replies: [
+                (
+                    1,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
+                (2, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert!(matches!(
+            verify_command_codec_v3_members(members, &old_learner).await,
+            Err(ResourceVersionV1PreflightError::Unsupported { node_id: 2 })
         ));
     }
 
@@ -1440,6 +1687,22 @@ mod tests {
             .unwrap(),
             crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
         );
+        assert_eq!(
+            backend
+                .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(COMMAND_CODEC_ACTIVATION_VALUE),
+            "activation proof must be Raft-committed cluster state"
+        );
+        let restored_activation = CommandCodecV3Activation::load(backend.as_ref())
+            .await
+            .expect("restore exact-v3 activation marker");
+        restored_activation.enforce_startup_gate();
+        restored_activation
+            .ensure_command_codec_v3_activated()
+            .expect("persisted activation proof reopens production proposals");
         let rv_after_first = backend.get_current_resource_version().await.unwrap();
         node.activate_committed_apply_rv_v1(&probe).await.unwrap();
         assert_eq!(
@@ -1472,7 +1735,12 @@ mod tests {
         );
         not_leader.shutdown().await.unwrap();
 
-        let (leader, backend) = fresh_node(703).await;
+        use crate::datastore::raft::network::LoopbackRegistry;
+
+        let registry = LoopbackRegistry::new();
+        let leader = fresh_voter_in_registry(703, &registry).await;
+        let incompatible_voter = fresh_voter_in_registry(704, &registry).await;
+        let backend = leader.backend.clone();
         leader
             .bootstrap_single_voter("https://127.0.0.1:7703".to_string())
             .await
@@ -1480,8 +1748,12 @@ mod tests {
         wait_for_leader(&leader, std::time::Duration::from_secs(5))
             .await
             .unwrap();
+        leader
+            .add_voter(704, "https://127.0.0.1:7704".to_string())
+            .await
+            .expect("add incompatible voter to activation preflight membership");
         let missing = FeatureProbe {
-            replies: [(703, Ok(0))].into_iter().collect(),
+            replies: [(704, Ok(0))].into_iter().collect(),
         };
         assert!(matches!(
             leader.activate_committed_apply_rv_v1(&missing).await,
@@ -1498,17 +1770,26 @@ mod tests {
             .unwrap(),
             crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
         );
+        assert_eq!(
+            backend
+                .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+                .await
+                .unwrap(),
+            None,
+            "failed preflight must not persist exact-v3 activation proof"
+        );
         leader.shutdown().await.unwrap();
+        incompatible_voter.shutdown().await.unwrap();
     }
 
     #[test]
-    fn committed_apply_v1_join_feature_gate_allows_legacy_and_rejects_featureless_v1_joiners() {
+    fn member_join_feature_gate_requires_codec_v3_and_committed_apply_when_active() {
         assert!(
             validate_committed_apply_v1_join_feature(
                 crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
                 0
             )
-            .is_ok()
+            .is_err()
         );
         assert!(
             validate_committed_apply_v1_join_feature(
@@ -1521,6 +1802,20 @@ mod tests {
             validate_committed_apply_v1_join_feature(
                 crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
                 crate::replication::protocol::COMMITTED_APPLY_RV_V1
+            )
+            .is_err()
+        );
+        assert!(
+            validate_committed_apply_v1_join_feature(
+                crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                crate::replication::protocol::COMMAND_CODEC_V3
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_committed_apply_v1_join_feature(
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+                crate::replication::protocol::LOCAL_SUPPORTED_FEATURES
             )
             .is_ok()
         );
@@ -1737,6 +2032,107 @@ mod tests {
         );
         for n in nodes {
             n.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn production_startup_gate_with_restored_membership_exposes_no_proposal_capability() {
+        use crate::datastore::sequenced::RaftProposal;
+
+        let (nodes, _registry) = fresh_three_voter_cluster().await;
+        let mut members = std::collections::BTreeMap::new();
+        for node in &nodes {
+            members.insert(
+                node.node_id,
+                BasicNode {
+                    addr: format!("https://localhost:{}", 7679 + node.node_id),
+                },
+            );
+        }
+        nodes[0]
+            .raft
+            .initialize(members)
+            .await
+            .expect("initialize restored membership");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let leader_index = loop {
+            if let Some(index) = nodes
+                .iter()
+                .position(|node| node.raft.metrics().borrow().current_leader == Some(node.node_id))
+            {
+                break index;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restored membership did not elect a leader"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let leader = &nodes[leader_index];
+        let unavailable = FeatureProbe {
+            replies: nodes
+                .iter()
+                .map(|node| (node.node_id, Err(anyhow::anyhow!("peer unavailable"))))
+                .collect(),
+        };
+        assert!(matches!(
+            leader.verify_startup_command_codec_v3(&unavailable).await,
+            Err(ResourceVersionV1PreflightError::Unavailable { .. })
+        ));
+
+        let old_member = FeatureProbe {
+            replies: nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.node_id,
+                        Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1),
+                    )
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            leader.verify_startup_command_codec_v3(&old_member).await,
+            Err(ResourceVersionV1PreflightError::Unsupported { .. })
+        ));
+
+        let rv_before = leader
+            .backend
+            .get_current_resource_version()
+            .await
+            .expect("read pre-proposal RV");
+        let error = leader
+            .propose_command(propose_create_command("startup-gated"))
+            .await
+            .expect_err("startup validation failure must leave proposals unavailable");
+        assert!(
+            error
+                .to_string()
+                .contains("exact-v3 codec activation marker"),
+            "proposal must fail at the activation gate, got: {error}"
+        );
+        assert_eq!(
+            leader
+                .backend
+                .get_current_resource_version()
+                .await
+                .expect("read post-proposal RV"),
+            rv_before,
+            "gated proposal must not materialize or mutate cluster state"
+        );
+        assert!(
+            leader
+                .backend
+                .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+                .await
+                .expect("read activation marker")
+                .is_none(),
+            "failed startup verification must not synthesize activation proof"
+        );
+
+        for node in nodes {
+            node.shutdown().await.unwrap();
         }
     }
 
@@ -3475,6 +3871,79 @@ mod tests {
             node.flow_control.available_permits(),
             node.flow_control.max_in_flight(),
             "permit must be released after successful terminal propose_command"
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raft_outbox_effect_preserves_committed_actor_delete_receipt() {
+        use crate::datastore::sequenced::RaftProposal;
+
+        let (node, backend) = fresh_node(77).await;
+        node.bootstrap_single_voter("https://10.99.0.77:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+        let observed = backend
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "receipt",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "receipt",
+                        "uid": "receipt-uid",
+                        "deletionTimestamp": "2026-07-24T00:00:00Z",
+                        "annotations": {"receipt.example/value": "exact"}
+                    },
+                    "spec": {"nodeName": "worker-a"}
+                }),
+            )
+            .await
+            .expect("create terminating Pod");
+
+        let effect = node
+            .propose_outbox_command_effect(
+                "raft-actor-delete-receipt",
+                crate::kubelet::outbox::payload::OutboxOperation::PodMetadata.as_str(),
+                crate::datastore::command::StorageCommand::FinalizeBoundPod {
+                    namespace: "default".to_string(),
+                    name: "receipt".to_string(),
+                    pod_uid: "receipt-uid".to_string(),
+                    node_name: "worker-a".to_string(),
+                    observed_resource_version: observed.resource_version,
+                },
+                "worker-a",
+                None,
+            )
+            .await
+            .expect("propose actor finalization");
+        let (_, resource_effect, _, receipt) = effect.into_parts();
+        assert_eq!(
+            resource_effect,
+            crate::datastore::ResourceMutationEffect::Changed
+        );
+        let receipt = receipt.expect("committed delete receipt");
+        assert_eq!(receipt.resource_version, observed.resource_version);
+        assert_eq!(
+            receipt
+                .data
+                .pointer("/metadata/annotations/receipt.example~1value")
+                .and_then(serde_json::Value::as_str),
+            Some("exact")
+        );
+        assert!(
+            backend
+                .get_resource("v1", "Pod", Some("default"), "receipt")
+                .await
+                .unwrap()
+                .is_none()
         );
         node.shutdown().await.unwrap();
     }

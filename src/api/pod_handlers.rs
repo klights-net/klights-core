@@ -664,6 +664,11 @@ impl CreateStrategy for PodCreateStrategy<'_> {
         body: Value,
         dry_run: crate::api::mutation::DryRunMode,
     ) -> Result<WriteResult, AppError> {
+        let resource_name = body
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         let result = crate::kubelet::pod_repository::PodApiWriter::api_create_pod(
             self.state.pod_repository.as_ref(),
             crate::kubelet::pod_repository::PodApiCreateRequest {
@@ -674,7 +679,10 @@ impl CreateStrategy for PodCreateStrategy<'_> {
                 run_admission: true,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            AppError::from(error).with_resource_context("v1", "Pod", &resource_name)
+        })?;
         Ok(match result.resource {
             Some(resource) => WriteResult::Persisted(resource),
             None => WriteResult::DryRun(result.body),

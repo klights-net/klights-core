@@ -363,6 +363,10 @@ fn read_header(conn: &rusqlite::Connection) -> rusqlite::Result<SnapshotCaptureH
         })
         .transpose()?
         .unwrap_or(ResourceVersionAssignment::LegacyLeaderAssigned);
+    let command_codec_activation_version =
+        get_meta(crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)?
+            .map(|raw| raw.parse::<u32>().map_err(text_error))
+            .transpose()?;
     let cluster_id = get_meta(klights_cluster_store::CLUSTER_ID_META_KEY)?
         .filter(|value| !value.is_empty())
         .ok_or_else(|| text_error("cluster_id is missing"))?;
@@ -386,6 +390,7 @@ fn read_header(conn: &rusqlite::Connection) -> rusqlite::Result<SnapshotCaptureH
     };
     SnapshotCaptureHeader::try_new(
         Some(assignment),
+        command_codec_activation_version,
         WatchReplayPosition {
             resource_version: current_rv,
             event_id,

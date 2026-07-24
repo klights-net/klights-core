@@ -89,6 +89,7 @@ message JoinRequest {
   string dataplane_mode = 7;
   string dataplane_encryption = 8;
   reserved 9;
+  uint64 supported_features = 10;
 }
 
 // Worker replication stream join role. Control-plane learners join through
@@ -286,6 +287,7 @@ message GetResourceResponse {
 // does not reuse the worker outbox RPC or the reserved stream-forward tags.
 message SubmitResourceCommandRequest {
   bytes command_protobuf = 1;
+  uint32 codec_version = 2;
 }
 
 message SubmitResourceCommandResponse {
@@ -381,6 +383,7 @@ message ApplyOutboxRequest {
   string client_id = 5;
   int64 stream_id = 6;
   int64 stream_seq = 7;
+  uint32 codec_version = 8;
 }
 
 message ApplyOutboxResponse {
@@ -499,6 +502,7 @@ message DeletePodCleanupIntentResponse {}
 message RaftAppendEntriesRequest {
   // Serde-encoded openraft::AppendEntriesRequest<TypeConfig>.
   bytes payload = 1;
+  uint64 supported_features = 2;
 }
 
 message RaftAppendEntriesResponse {
@@ -513,6 +517,7 @@ message RaftAppendEntriesResponse {
 message RaftVoteRequest {
   // Serde-encoded openraft::VoteRequest<NodeId>.
   bytes payload = 1;
+  uint64 supported_features = 2;
 }
 
 message RaftVoteResponse {
@@ -525,6 +530,7 @@ message RaftVoteResponse {
 message RaftInstallSnapshotRequest {
   // Serde-encoded openraft::InstallSnapshotRequest<TypeConfig>.
   bytes payload = 1;
+  uint64 supported_features = 2;
 }
 
 message RaftInstallSnapshotResponse {

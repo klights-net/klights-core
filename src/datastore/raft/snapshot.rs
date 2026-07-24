@@ -52,6 +52,11 @@ pub(crate) struct RaftSnapshotData {
     )]
     pub resource_version_assignment_mode:
         crate::datastore::resource_version_assignment::SnapshotAssignmentMode,
+    /// Exact-v3 activation proof captured from the same immutable backend
+    /// view as the allocator and resource state. Absent legacy snapshots are
+    /// deliberately fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_codec_activation_version: Option<u32>,
     /// Durable watch-log allocator boundary. `None` identifies snapshots
     /// written by peers predating apply-order event IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +223,7 @@ async fn encode_pristine_bootstrap_snapshot(
                         crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
                             crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
                         ),
+                    command_codec_activation_version: None,
                     watch_event_high_water: Some(0),
                     watch_replay_floors: Some(Vec::new()),
                     cluster_metadata: None,
@@ -452,6 +458,8 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
         anyhow::ensure!(
             begun.position() == returned.position()
                 && begun.resource_version_assignment() == returned.resource_version_assignment()
+                && begun.command_codec_activation_version()
+                    == returned.command_codec_activation_version()
                 && begun.metadata() == returned.metadata()
                 && begun.membership() == returned.membership(),
             "snapshot capture returned a different header than it began"
@@ -491,6 +499,8 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
         self.write_json(&position.resource_version)?;
         self.write_bytes(b",\"resource_version_assignment_mode\":")?;
         self.write_json(&assignment)?;
+        self.write_bytes(b",\"command_codec_activation_version\":")?;
+        self.write_json(&header.command_codec_activation_version())?;
         self.write_bytes(b",\"watch_event_high_water\":")?;
         self.write_json(&position.event_id)?;
         self.write_bytes(b",\"cluster_metadata\":")?;
@@ -916,6 +926,7 @@ mod tests {
                 resource_version_assignment_mode: Some(
                     crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
                 ),
+                command_codec_activation_version: None,
                 snapshot_assignment_mode: None,
             }),
         )

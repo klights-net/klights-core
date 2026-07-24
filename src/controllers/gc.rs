@@ -1060,7 +1060,11 @@ async fn cascade_delete_with_uid_inner(
         );
     }
 
-    // Delete each owned resource (which will trigger their own cascade)
+    // Delete each owned resource (which will trigger their own cascade).
+    // Continue the sweep after a child failure so independent dependents still
+    // make progress, but return the first error so durable callers retain
+    // their delivery item and retry the incomplete cascade.
+    let mut first_error = None;
     for resource in owned {
         let current = match db
             .get_resource(
@@ -1149,6 +1153,9 @@ async fn cascade_delete_with_uid_inner(
             Ok(outcome) => outcome,
             Err(e) => {
                 tracing::warn!("Failed to cascade delete resource: {}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
                 continue;
             }
         };
@@ -1161,7 +1168,7 @@ async fn cascade_delete_with_uid_inner(
         // Recursively cascade delete resources owned by this one. Pods are
         // only marked terminating here, but Kubernetes background GC still
         // needs to process their dependents.
-        let _ = Box::pin(cascade_delete_with_uid_inner(
+        if let Err(error) = Box::pin(cascade_delete_with_uid_inner(
             db,
             CascadeDeleteRequest {
                 owner_uid: &child_uid,
@@ -1173,10 +1180,16 @@ async fn cascade_delete_with_uid_inner(
             pod_delete_sink,
             visited,
         ))
-        .await;
+        .await
+        {
+            tracing::warn!("Failed to recursively cascade delete resource: {error}");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
     }
 
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Orphan deletion: remove ownerReferences from children but don't delete them.

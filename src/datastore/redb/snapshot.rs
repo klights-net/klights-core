@@ -487,12 +487,14 @@ mod tests {
 
         let envelope = db.snapshot().await.unwrap();
 
-        let mut bad = envelope.clone();
-        bad.codec_version = 999;
+        for incompatible in [COMMAND_CODEC_VERSION - 1, COMMAND_CODEC_VERSION + 1] {
+            let mut bad = envelope.clone();
+            bad.codec_version = incompatible;
 
-        let err = db2.restore(&bad).await;
-        assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("codec"));
+            let err = db2.restore(&bad).await;
+            assert!(err.is_err());
+            assert!(err.unwrap_err().to_string().contains("codec"));
+        }
     }
 
     #[tokio::test]

@@ -12,4 +12,5 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+klights-cluster-core = { workspace = true }
 klights-types = { workspace = true }

@@ -19,6 +19,7 @@ pub use apply::{
 };
 pub use command::{
     COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta, StorageCommand, StorageResponse,
+    supports_command_codec_version,
 };
 pub use log_apply::{
     ClusterMetaMutation, ClusterMutation, CommittedApplyOutcome, CommittedApplyRejection,

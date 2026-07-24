@@ -153,6 +153,12 @@ pub(super) fn subject_key_for_command(command: &StorageCommand) -> String {
         | StorageCommand::DeleteNamespaceContents { name } => {
             resource_key_parts("v1", "Namespace", None, name, None)
         }
+        StorageCommand::FinalizeBoundPod {
+            namespace,
+            name,
+            pod_uid,
+            ..
+        } => resource_key_parts("v1", "Pod", Some(namespace), name, Some(pod_uid)),
         StorageCommand::ApplyResourceBatch { operations } => match operations.first() {
             Some(ResourceBatchOperation::Put {
                 api_version,
@@ -466,6 +472,21 @@ mod tests {
     fn subject_key_delete_namespace_contents_omits_uid() {
         let cmd = StorageCommand::DeleteNamespaceContents { name: "foo".into() };
         assert_eq!(subject_key_for_command(&cmd), "v1/Namespace/foo");
+    }
+
+    #[test]
+    fn subject_key_finalize_bound_pod_is_uid_scoped() {
+        let cmd = StorageCommand::FinalizeBoundPod {
+            namespace: "team-a".into(),
+            name: "web-0".into(),
+            pod_uid: "uid-web-0".into(),
+            node_name: "worker-a".into(),
+            observed_resource_version: 41,
+        };
+        assert_eq!(
+            subject_key_for_command(&cmd),
+            "v1/Pod/team-a/web-0/uid-web-0"
+        );
     }
 
     #[test]

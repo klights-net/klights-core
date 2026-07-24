@@ -22,7 +22,7 @@ use klights_leader_api::{
 };
 
 use super::state_only_writer::StateOnlyWriter;
-use super::store::{PodStore, UnscheduledPodDeleteOutcome};
+use super::store::{BoundPodDeleteOutcome, PodStore, UnscheduledPodDeleteOutcome};
 use super::{PodReader, PodRepository, PodRepositoryBuildConfig};
 use klights_types::PodIdentity;
 
@@ -34,6 +34,19 @@ fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
 
 fn fixture_side_effects() -> Arc<crate::side_effects::SideEffectRegistry> {
     Arc::new(crate::side_effects::SideEffectRegistry::new())
+}
+
+fn fixture_mutation_reconcile(
+    store: Arc<PodStore>,
+    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+) -> Arc<dyn klights_reconcile_api::PodMutationReconcileSink> {
+    Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
+        store.db().clone(),
+        side_effects.controller_dispatcher_slot(),
+        crate::side_effects::SideEffectMetrics::new(),
+        side_effects,
+        store,
+    ))
 }
 
 async fn fixture_node_local() -> crate::datastore::node_local::NodeLocalHandle {
@@ -271,7 +284,7 @@ impl klights_leader_api::LeaderOutboxDelivery for TestOutboxDelivery {
 }
 
 async fn build_repo_with_scheduling_mode_for_outbox(
-    scheduling_mode: super::api::PodSchedulingMode,
+    scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
 ) -> (
     super::PodRepository,
     crate::datastore::DatastoreHandle,
@@ -339,7 +352,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
         metrics,
         pod_network_cache,
         assignment_waiter,
-        scheduling_mode: super::api::PodSchedulingMode::InlineSingleNode,
+        scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
     });
@@ -367,7 +380,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
         metrics,
         pod_network_cache,
         assignment_waiter,
-        scheduling_mode: super::api::PodSchedulingMode::InlineSingleNode,
+        scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
     });
@@ -405,7 +418,7 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
         metrics,
         pod_network_cache,
         assignment_waiter,
-        scheduling_mode: super::api::PodSchedulingMode::InlineSingleNode,
+        scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
     });
@@ -885,8 +898,17 @@ async fn pod_store_mutating_methods_require_uid_or_create_context() {
     let pod_new = json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"namespace": "default", "name": "uid-audit", "uid": "uid-new"},
-        "spec": {"containers": [{"name": "app", "image": "busybox"}]},
+        "metadata": {
+            "namespace": "default",
+            "name": "uid-audit",
+            "uid": "uid-new",
+            "deletionTimestamp": "2026-07-24T00:00:00Z",
+            "deletionGracePeriodSeconds": 0
+        },
+        "spec": {
+            "nodeName": "worker-a",
+            "containers": [{"name": "app", "image": "busybox"}]
+        },
         "status": {"phase": "Pending"}
     });
     store.create("default", "uid-audit", pod_new).await.unwrap();
@@ -894,11 +916,12 @@ async fn pod_store_mutating_methods_require_uid_or_create_context() {
     let created = store.get("default", "uid-audit").await.unwrap().unwrap();
     assert_eq!(created.uid, "uid-new");
 
-    // delete_with_uid with stale UID must not delete the replacement.
-    let err = store
-        .delete_with_uid("default", "uid-audit", "uid-stale")
-        .await;
-    assert!(err.is_err(), "stale UID delete_with_uid must be rejected");
+    // Actor finalization with a stale UID must not delete the replacement.
+    let outcome = store
+        .finalize_bound_with_uid("default", "uid-audit", "uid-stale")
+        .await
+        .unwrap();
+    assert_eq!(outcome, BoundPodDeleteOutcome::IdentityChanged);
 
     // Replacement Pod must still exist with uid-new.
     let still_there = store
@@ -922,11 +945,12 @@ async fn pod_store_mutating_methods_require_uid_or_create_context() {
         .expect("update with correct current state must succeed");
     assert_eq!(updated.uid, "uid-new");
 
-    // delete_with_uid with correct UID must succeed.
-    store
-        .delete_with_uid("default", "uid-audit", "uid-new")
+    // Bound actor finalization with the correct UID must succeed.
+    let outcome = store
+        .finalize_bound_with_uid("default", "uid-audit", "uid-new")
         .await
         .expect("correct UID delete must succeed");
+    assert_eq!(outcome, BoundPodDeleteOutcome::Removed);
     assert!(
         store.get("default", "uid-audit").await.unwrap().is_none(),
         "Pod must be deleted after correct-UID delete"
@@ -948,7 +972,7 @@ async fn worker_status_enqueue_does_not_bypass_leader_side_effects() {
         supervisor,
         side_effects,
         metrics,
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
     );
     db.create_resource(
@@ -1047,7 +1071,7 @@ async fn kubelet_pod_reader_uses_leader_api_when_configured() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(pod.clone())),
     );
@@ -1120,7 +1144,7 @@ async fn kubelet_pod_reader_uses_fresh_leader_api_for_single_pod_reads() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(stale_pod).with_fresh_pod(fresh_pod)),
     );
@@ -1189,7 +1213,7 @@ async fn runtime_reconcile_reads_pending_status_checkpoint_from_node_db() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(stale_pod)),
     );
@@ -1290,7 +1314,7 @@ async fn get_pod_for_uid_overlays_local_status_checkpoint_for_read_your_own_writ
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(stale_pod)),
     );
@@ -1384,7 +1408,7 @@ async fn outbox_status_reads_current_pod_through_leader_api() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(pod)),
     );
@@ -1462,7 +1486,7 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(pod)),
     );
@@ -1560,7 +1584,7 @@ async fn controller_owner_reference_update_commits_to_leader_store_not_node_outb
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::DeferredMultiNodeLeader,
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
         Some(outbox),
         Arc::new(FakeLeaderApiClient::new(created)),
     );
@@ -1639,7 +1663,7 @@ async fn non_leader_pod_object_writer_without_outbox_retries_later() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(pod)),
     );
@@ -1764,7 +1788,7 @@ async fn non_leader_pod_status_writer_without_outbox_retries_later() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(FakeLeaderApiClient::new(pod)),
     );
@@ -1848,7 +1872,7 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         cluster_api,
     );
@@ -1862,7 +1886,11 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
         .await
         .expect("worker finalization should enqueue a leader delete");
 
-    assert!(finalized);
+    assert!(
+        !finalized,
+        "remote acceptance only durably queues FinalizeBoundPod; the actor must retry \
+         until a committed delete watch makes the row absent"
+    );
     assert!(
         direct_db
             .get_resource("v1", "Pod", Some("default"), "leader-finalize")
@@ -1883,29 +1911,28 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
     )
     .expect("decode delete payload");
     match payload.command {
-        crate::datastore::command::StorageCommand::DeleteResource {
-            api_version,
-            kind,
+        crate::datastore::command::StorageCommand::FinalizeBoundPod {
             namespace,
             name,
-            preconditions,
+            pod_uid,
+            node_name,
+            observed_resource_version,
         } => {
-            assert_eq!(api_version, "v1");
-            assert_eq!(kind, "Pod");
-            assert_eq!(namespace.as_deref(), Some("default"));
+            assert_eq!(namespace, "default");
             assert_eq!(name, "leader-finalize");
-            assert_eq!(
-                preconditions.uid.as_deref(),
-                Some("uid-leader-finalize"),
-                "actor finalization delete must be UID-qualified"
+            assert_eq!(pod_uid, "uid-leader-finalize");
+            assert_eq!(node_name, "worker-1");
+            assert!(
+                observed_resource_version > 0,
+                "actor finalization must carry its leader-fresh Pod generation"
             );
         }
-        other => panic!("expected Pod DeleteResource outbox command, got {other:?}"),
+        other => panic!("expected FinalizeBoundPod outbox command, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn worker_actor_finalization_deletes_node_local_status_checkpoint() {
+async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal() {
     let (_ds, direct_db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     node_db
@@ -1956,7 +1983,7 @@ async fn worker_actor_finalization_deletes_node_local_status_checkpoint() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         cluster_api,
     );
@@ -1968,9 +1995,12 @@ async fn worker_actor_finalization_deletes_node_local_status_checkpoint() {
             "uid-finalize-checkpoint",
         )
         .await
-        .expect("actor finalization should enqueue delete and clear checkpoint");
+        .expect("actor finalization should enqueue delete and remain pending");
 
-    assert!(finalized);
+    assert!(
+        !finalized,
+        "remote acceptance must not complete actor finalization before committed removal"
+    );
     assert!(
         direct_db
             .get_resource("v1", "Pod", Some("default"), "finalize-checkpoint")
@@ -1984,13 +2014,13 @@ async fn worker_actor_finalization_deletes_node_local_status_checkpoint() {
             .get_pod_status_checkpoint("uid-finalize-checkpoint")
             .await
             .expect("read status checkpoint")
-            .is_none(),
-        "actor finalization must remove the UID-scoped node-local status checkpoint"
+            .is_some(),
+        "the UID-scoped checkpoint must remain until committed removal completes the actor"
     );
 }
 
 #[tokio::test]
-async fn worker_actor_finalization_uses_fresh_leader_read_before_refusing_delete() {
+async fn worker_actor_finalization_uses_fresh_leader_read_before_emitting_finalize() {
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::kubelet::outbox::Outbox::new(node_db.clone()));
     let stale_pod = crate::datastore::Resource {
@@ -2034,7 +2064,7 @@ async fn worker_actor_finalization_uses_fresh_leader_read_before_refusing_delete
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         Some(outbox),
         cluster_api,
     );
@@ -2046,16 +2076,150 @@ async fn worker_actor_finalization_uses_fresh_leader_read_before_refusing_delete
             "uid-stale-finalize",
         )
         .await
-        .expect("fresh terminating leader read should allow finalization");
+        .expect("fresh terminating leader read should allow opaque finalization");
 
-    assert!(finalized);
+    assert!(
+        !finalized,
+        "fresh leader observation only queues the exact-RV command; committed removal is still pending"
+    );
     let row = node_db
         .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
         .await
         .expect("claim outbox");
     assert!(
         row.is_some(),
-        "stale cached non-terminating pod must not suppress actor finalization delete"
+        "stale cached non-terminating Pod must not suppress FinalizeBoundPod emission"
+    );
+}
+
+#[tokio::test]
+async fn worker_actor_finalization_retries_after_same_uid_resource_version_noop() {
+    let (cluster_db, cluster_handle) =
+        crate::datastore::test_support::in_memory_with_handle().await;
+    let cluster_store = super::store::PodStore::new(cluster_handle);
+    let created = cluster_store
+        .create(
+            "default",
+            "rv-retry-finalize",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "rv-retry-finalize",
+                    "uid": "uid-rv-retry-finalize",
+                    "deletionTimestamp": "2026-07-24T00:00:00Z",
+                    "deletionGracePeriodSeconds": 0
+                },
+                "spec": {
+                    "nodeName": "worker-1",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await
+        .expect("create terminating Pod");
+    let node_db = fixture_node_local().await;
+    let outbox = Arc::new(crate::kubelet::outbox::Outbox::new(node_db.clone()));
+    let cluster_api = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+        Arc::new(cluster_db.clone()),
+        "worker-1".to_string(),
+        crate::control_plane::client::local::always_leader_watch(),
+    ));
+    let worker_db: crate::datastore::DatastoreHandle = Arc::new(
+        crate::control_plane::client::worker_store::WorkerStoreAdapter::new(
+            cluster_api.clone(),
+            node_db.clone(),
+            "worker-1".to_string(),
+        ),
+    );
+    let repo = PodRepository::new_with_scheduling_mode_outbox_and_cluster_api(
+        worker_db,
+        fixture_supervisor(),
+        fixture_side_effects(),
+        crate::side_effects::SideEffectMetrics::new(),
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+        Some(outbox),
+        cluster_api.clone(),
+    );
+    let dispatcher =
+        crate::kubelet::outbox::OutboxDispatcher::for_tests(node_db.clone(), cluster_api);
+
+    assert!(
+        !repo
+            .finalize_pod_deletion_after_actor_cleanup(
+                "default",
+                "rv-retry-finalize",
+                "uid-rv-retry-finalize",
+            )
+            .await
+            .expect("queue first exact-RV finalization"),
+        "queued finalization must keep the actor pending"
+    );
+
+    let raced = cluster_store
+        .update_status(
+            "default",
+            "rv-retry-finalize",
+            json!({"phase": "Running", "reason": "ConcurrentStatus"}),
+            Some(created.resource_version),
+        )
+        .await
+        .expect("advance same-UID resourceVersion before committed finalization");
+    assert!(raced.resource_version > created.resource_version);
+
+    assert_eq!(
+        dispatcher
+            .dispatch_due_once(i64::MAX / 4)
+            .await
+            .expect("dispatch stale exact-RV finalization"),
+        crate::kubelet::outbox::DispatchOutcome::Dispatched
+    );
+    assert!(
+        cluster_store
+            .get("default", "rv-retry-finalize")
+            .await
+            .expect("read after stale finalization")
+            .is_some(),
+        "same-UID resourceVersion race must make the first committed command a no-op"
+    );
+
+    assert!(
+        !repo
+            .finalize_pod_deletion_after_actor_cleanup(
+                "default",
+                "rv-retry-finalize",
+                "uid-rv-retry-finalize",
+            )
+            .await
+            .expect("scheduled actor retry queues fresh exact-RV finalization"),
+        "fresh retry remains pending until its committed removal is observed"
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch_due_once(i64::MAX / 4)
+            .await
+            .expect("dispatch fresh exact-RV finalization"),
+        crate::kubelet::outbox::DispatchOutcome::Dispatched
+    );
+    assert!(
+        cluster_store
+            .get("default", "rv-retry-finalize")
+            .await
+            .expect("read committed removal")
+            .is_none(),
+        "fresh UID/RV retry must complete actor-owned removal"
+    );
+    assert!(
+        repo.finalize_pod_deletion_after_actor_cleanup(
+            "default",
+            "rv-retry-finalize",
+            "uid-rv-retry-finalize",
+        )
+        .await
+        .expect("delete watch retry observes committed absence"),
+        "only committed absence may complete the actor"
     );
 }
 
@@ -2294,7 +2458,7 @@ async fn delete_unscheduled_refuses_non_terminating_pod() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, UnscheduledPodDeleteOutcome::DeferToActor);
+    assert_eq!(outcome, UnscheduledPodDeleteOutcome::Retry);
     assert!(
         store.get("default", "live1").await.unwrap().is_some(),
         "a non-terminating Pod must never be hard-deleted"
@@ -2538,7 +2702,7 @@ async fn build_raft_repo_with_status_race_on_delete(
 }
 
 async fn build_repo_with_scheduling_mode(
-    scheduling_mode: super::api::PodSchedulingMode,
+    scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
 ) -> super::PodRepository {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -2659,7 +2823,7 @@ async fn cluster_backed_pod_reader_list_pods_uses_fresh_leader_list() {
         fixture_supervisor(),
         fixture_side_effects(),
         crate::side_effects::SideEffectMetrics::new(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
         Arc::new(
             FakeLeaderApiClient::new(pod.clone())
@@ -3061,6 +3225,7 @@ async fn set_pod_status_reconciles_namespace_termination_for_late_pod() {
 
     let mut pod = pending_pod("late-pod");
     pod["metadata"]["namespace"] = json!("term-status");
+    pod["spec"]["nodeName"] = json!("worker-a");
     let created = repo
         .store
         .create("term-status", "late-pod", pod)
@@ -3684,9 +3849,9 @@ async fn set_pod_status_retries_implicit_rv_conflict_after_scheduler_update() {
     });
     let side_effects = fixture_side_effects();
     let status_service = super::status::PodStatusService::new(
-        store,
+        store.clone(),
         status_writer.clone(),
-        side_effects.controller_dispatcher_slot(),
+        fixture_mutation_reconcile(store, side_effects),
         None,
         None,
     );
@@ -4327,6 +4492,7 @@ async fn actor_finalization_clears_deferred_runtime_observation() {
 
     let repo = build_repo().await;
     let mut seed = pending_pod("deferred-runtime-finalized");
+    seed["spec"]["nodeName"] = json!("worker-a");
     seed["metadata"]["deletionTimestamp"] = json!("2026-05-17T00:00:02Z");
     seed["metadata"]["deletionGracePeriodSeconds"] = json!(0);
     seed["status"] = json!({"phase": "Pending"});
@@ -5941,9 +6107,9 @@ async fn set_probe_readiness_retries_unpinned_rv_conflict() {
     });
     let side_effects = fixture_side_effects();
     let status_service = super::status::PodStatusService::new(
-        store,
+        store.clone(),
         status_writer.clone(),
-        side_effects.controller_dispatcher_slot(),
+        fixture_mutation_reconcile(store, side_effects),
         None,
         None,
     );
@@ -5992,9 +6158,9 @@ async fn set_probe_readiness_exhausts_unpinned_conflict_retries() {
     });
     let side_effects = fixture_side_effects();
     let status_service = super::status::PodStatusService::new(
-        store,
+        store.clone(),
         status_writer.clone(),
-        side_effects.controller_dispatcher_slot(),
+        fixture_mutation_reconcile(store, side_effects),
         None,
         None,
     );
@@ -6037,9 +6203,9 @@ async fn set_probe_readiness_pinned_rv_conflict_does_not_retry() {
     });
     let side_effects = fixture_side_effects();
     let status_service = super::status::PodStatusService::new(
-        store,
+        store.clone(),
         status_writer.clone(),
-        side_effects.controller_dispatcher_slot(),
+        fixture_mutation_reconcile(store, side_effects),
         None,
         None,
     );
@@ -6703,7 +6869,7 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
         metrics,
         super::test_pod_network_cache(db),
         events.clone(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
     ));
 
@@ -6884,7 +7050,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
         metrics,
         super::test_pod_network_cache(db),
         events.clone(),
-        super::api::PodSchedulingMode::InlineSingleNode,
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
     ));
 
@@ -7051,9 +7217,10 @@ async fn api_create_pod_inline_mode_leaves_empty_node_name_unbound_until_schedul
 async fn api_create_pod_leader_mode_leaves_pod_unbound_until_scheduler_controller_binds() {
     use super::{PodApiWriter, PodReader};
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     for node_name in ["lead-123456az", "work-654321za"] {
         repo.store
             .db()
@@ -7131,9 +7298,10 @@ async fn api_create_pod_leader_mode_leaves_pod_unbound_until_scheduler_controlle
 async fn leader_scheduler_orders_unbound_pods_by_priority_creation_and_name() {
     use super::PodReader;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -7195,9 +7363,10 @@ async fn leader_scheduler_orders_unbound_pods_by_priority_creation_and_name() {
 async fn leader_scheduler_snapshot_uses_namespace_labels_for_pod_affinity() {
     use super::PodReader;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
 
     repo.store
         .db()
@@ -7310,9 +7479,10 @@ async fn leader_scheduler_snapshot_uses_namespace_labels_for_pod_affinity() {
 async fn leader_scheduler_concurrent_wave_reserves_node_capacity_once() {
     use super::PodReader;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -7367,10 +7537,12 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
     use super::PodReader;
 
     let repo = Arc::new(
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await,
+        build_repo_with_scheduling_mode(
+            crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+        )
+        .await,
     );
-    let gate = Arc::new(super::api::SchedulerBindGateForTest::new());
+    let gate = Arc::new(crate::pod_api_service::SchedulerBindGateForTest::new());
     repo.set_scheduler_bind_gate_for_test(gate.clone());
 
     repo.store
@@ -7394,7 +7566,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
         .await
         .unwrap();
 
-    for idx in 0..super::api::SCHED_BIND_CONCURRENCY {
+    for idx in 0..crate::pod_api_service::SCHED_BIND_CONCURRENCY {
         let name = format!("parallel-{idx}");
         repo.store
             .create("default", &name, pending_pod(&name))
@@ -7408,7 +7580,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        gate.wait_for_entered_at_least(super::api::SCHED_BIND_CONCURRENCY),
+        gate.wait_for_entered_at_least(crate::pod_api_service::SCHED_BIND_CONCURRENCY),
     )
     .await
     .expect("the whole first scheduling wave should reach the bind gate concurrently");
@@ -7426,7 +7598,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
             pod.data.pointer("/spec/nodeName").and_then(|v| v.as_str()) == Some("test-node")
         })
         .count();
-    assert_eq!(bound, super::api::SCHED_BIND_CONCURRENCY);
+    assert_eq!(bound, crate::pod_api_service::SCHED_BIND_CONCURRENCY);
 }
 
 #[tokio::test]
@@ -7435,9 +7607,10 @@ async fn leader_scheduler_binds_node_and_podscheduled_condition_in_one_pod_event
     use crate::datastore::WatchTarget;
     use crate::watch::EventType;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -7567,7 +7740,7 @@ async fn leader_scheduler_marks_unschedulable_pod_and_emits_failed_scheduling_ev
     use super::{PodApiWriter, PodReader};
 
     let (repo, db, node_db) = build_repo_with_scheduling_mode_for_outbox(
-        super::api::PodSchedulingMode::DeferredMultiNodeLeader,
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
     )
     .await;
     repo.store
@@ -7730,9 +7903,10 @@ async fn leader_scheduler_marks_unschedulable_pod_and_emits_failed_scheduling_ev
 async fn leader_scheduler_applies_preemption_victims_for_extended_resource_fit() {
     use super::{PodApiWriter, PodReader};
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -7837,9 +8011,10 @@ async fn leader_scheduler_applies_preemption_victims_for_extended_resource_fit()
 async fn leader_scheduler_marks_finalized_preemption_victim_terminating() {
     use super::{PodApiWriter, PodReader};
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -7950,9 +8125,10 @@ async fn leader_scheduler_marks_finalized_preemption_victim_terminating() {
 async fn preemption_victim_termination_preserves_bound_podscheduled_true() {
     use super::{PodApiWriter, PodReader};
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -8066,9 +8242,10 @@ async fn preemption_victim_termination_preserves_bound_podscheduled_true() {
 async fn api_create_pod_leader_mode_respects_explicit_node_name() {
     use super::PodApiWriter;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -8120,7 +8297,7 @@ async fn scheduler_marks_pod_unschedulable_when_cpu_request_exceeds_allocatable(
     use super::{PodApiWriter, PodReader};
 
     let (repo, db, node_db) = build_repo_with_scheduling_mode_for_outbox(
-        super::api::PodSchedulingMode::DeferredMultiNodeLeader,
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
     )
     .await;
     repo.store
@@ -8845,9 +9022,10 @@ async fn scheduler_preempts_controller_created_priority_class_pods() {
 async fn scheduler_preemption_marks_api_created_priority_class_victim_disruption_target() {
     use super::{PodApiWriter, PodReader};
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -9126,9 +9304,10 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
     use crate::datastore::WatchTarget;
     use crate::watch::EventType;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     repo.store
         .db()
         .create_resource(
@@ -9268,9 +9447,10 @@ async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_g
     use crate::datastore::sqlite::BuildOutboxOutcome;
     use crate::kubelet::outbox::payload::OutboxPayload;
 
-    let repo =
-        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
-            .await;
+    let repo = build_repo_with_scheduling_mode(
+        crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+    )
+    .await;
     let db = repo.store.db().clone();
 
     db.create_resource(
@@ -9644,7 +9824,8 @@ async fn api_create_pod_rejects_restricted_pod_security_violation() {
         .expect_err("restricted namespace must reject privileged pod");
 
     let msg = match err {
-        crate::api::AppError::Forbidden(msg) | crate::api::AppError::BadRequest(msg) => msg,
+        klights_pod_api::PodRepositoryError::Forbidden { message }
+        | klights_pod_api::PodRepositoryError::InvalidRequest { message, .. } => message,
         other => panic!("unexpected error: {other:?}"),
     };
     assert!(
@@ -10401,7 +10582,7 @@ async fn api_patch_pod_merge_patch_against_missing_pod_returns_404() {
         .await
         .expect_err("missing pod under merge patch must 404");
     assert!(
-        matches!(err, crate::api::AppError::NotFound(_)),
+        matches!(err, klights_pod_api::PodRepositoryError::NotFound { .. }),
         "expected NotFound, got {err:?}"
     );
 }
@@ -11337,6 +11518,7 @@ async fn finalize_pod_deletion_after_actor_cleanup_removes_matching_terminating_
     pod["metadata"]["uid"] = json!("uid-terminating");
     pod["metadata"]["deletionTimestamp"] = json!("2026-05-13T00:00:00Z");
     pod["metadata"]["deletionGracePeriodSeconds"] = json!(0);
+    pod["spec"]["nodeName"] = json!("worker-a");
     repo.store
         .create("default", "terminating", pod)
         .await
@@ -11386,6 +11568,7 @@ async fn finalize_pod_deletion_after_actor_cleanup_deletes_ready_foreground_owne
     pod["metadata"]["uid"] = json!("foreground-child-uid");
     pod["metadata"]["deletionTimestamp"] = json!("2026-05-13T00:00:00Z");
     pod["metadata"]["deletionGracePeriodSeconds"] = json!(0);
+    pod["spec"]["nodeName"] = json!("worker-a");
     pod["metadata"]["ownerReferences"] = json!([{
         "apiVersion": "v1",
         "kind": "ReplicationController",
@@ -11806,6 +11989,7 @@ fn make_terminating_pod(name: &str, uid: &str) -> serde_json::Value {
             "deletionGracePeriodSeconds": 0
         },
         "spec": {
+            "nodeName": "worker-a",
             "containers": [{"name": "app", "image": "nginx:latest"}]
         },
         "status": {"phase": "Running"}
@@ -12084,7 +12268,10 @@ async fn deletion_finalizer_reissues_uid_delete_when_same_uid_lacks_delete_mark(
                     "namespace": "default",
                     "uid": "uid-remark-delete"
                 },
-                "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]},
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx:latest"}]
+                },
                 "status": {"phase": "Running"}
             }),
         )
@@ -12149,7 +12336,10 @@ async fn deletion_finalizer_deletes_node_lost_terminal_with_uid_after_actor_clea
                     "namespace": "default",
                     "uid": "uid-node-lost-local-cleanup"
                 },
-                "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]},
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx:latest"}]
+                },
                 "status": {"phase": "Failed", "reason": "NodeLost"}
             }),
         )
@@ -12439,7 +12629,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         },
         crate::api::AppError::Conflict("retry budget exhausted".to_string()),
     ] {
-        let same_uid = super::api::classify_gc_pod_delete_error(
+        let same_uid = crate::pod_api_service::classify_gc_pod_delete_error(
             repo.store.as_ref(),
             &PodIdentity::new("default", "current", "uid-current"),
             conflict,
@@ -12451,7 +12641,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         );
     }
 
-    let replacement = super::api::classify_gc_pod_delete_error(
+    let replacement = crate::pod_api_service::classify_gc_pod_delete_error(
         repo.store.as_ref(),
         &PodIdentity::new("default", "current", "uid-old"),
         crate::api::AppError::Conflict("UID precondition conflict".to_string()),
@@ -12462,7 +12652,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         GcPodDeleteError::IdentityChanged { .. }
     ));
 
-    let absent = super::api::classify_gc_pod_delete_error(
+    let absent = crate::pod_api_service::classify_gc_pod_delete_error(
         repo.store.as_ref(),
         &PodIdentity::new("default", "absent", "uid-old"),
         crate::api::AppError::Conflict("delete conflict".to_string()),
@@ -12637,12 +12827,16 @@ async fn old_uid_operations_do_not_mutate_replacement() {
         assert_replacement_unchanged(&live, &before);
     }
 
-    // --- delete_with_uid ---
+    // --- finalize_bound_with_uid ---
     {
         let name = "delete";
         let before = create_replacement_pod(&repo, ns, name).await;
-        let err = repo.store.delete_with_uid(ns, name, stale_uid).await;
-        assert!(err.is_err(), "stale UID delete_with_uid must be rejected");
+        let outcome = repo
+            .store
+            .finalize_bound_with_uid(ns, name, stale_uid)
+            .await
+            .unwrap();
+        assert_eq!(outcome, BoundPodDeleteOutcome::IdentityChanged);
         let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
         assert_replacement_unchanged(&live, &before);
     }
@@ -12893,20 +13087,16 @@ async fn build_store_with_delete_cas_race(
 
 /// CAS race: a scheduler bind lands between the `spec.nodeName` observation
 /// (empty) and the CAS delete. The observed resourceVersion is now stale, so
-/// the compare-and-swap delete must no-op and defer to actor-owned
-/// finalization. The Pod row must survive with the bound nodeName.
+/// the compare-and-swap delete must no-op and retry from a fresh observation.
+/// The Pod row must survive with the bound nodeName; that fresh observation
+/// will then route it to actor-owned finalization.
 #[tokio::test]
 async fn unscheduled_delete_compare_and_swap_rejects_node_bind_race() {
     let (store, db, raced) = build_store_with_delete_cas_race("bind-race", true).await;
 
-    let created = store
-        .create(
-            "default",
-            "bind-race",
-            make_terminating_pod("bind-race", "uid-bind"),
-        )
-        .await
-        .unwrap();
+    let mut pod = make_terminating_pod("bind-race", "uid-bind");
+    pod["spec"]["nodeName"] = json!("");
+    let created = store.create("default", "bind-race", pod).await.unwrap();
     assert_eq!(created.uid, "uid-bind");
 
     let outcome = store
@@ -12916,8 +13106,8 @@ async fn unscheduled_delete_compare_and_swap_rejects_node_bind_race() {
 
     assert_eq!(
         outcome,
-        UnscheduledPodDeleteOutcome::DeferToActor,
-        "node-bind race must lose the CAS and defer to actor finalization"
+        UnscheduledPodDeleteOutcome::Retry,
+        "node-bind race must lose the CAS and retry from the newly bound observation"
     );
     assert!(
         raced.load(std::sync::atomic::Ordering::SeqCst),
@@ -12939,20 +13129,15 @@ async fn unscheduled_delete_compare_and_swap_rejects_node_bind_race() {
 
 /// CAS race: any concurrent write that advances the resourceVersion after
 /// the empty-`spec.nodeName` observation must cause the compare-and-swap
-/// delete to no-op (DeferToActor). This exercises the CAS on the observed
+/// delete to no-op and retry. This exercises the CAS on the observed
 /// resourceVersion, not only stale-UID rejection.
 #[tokio::test]
 async fn unscheduled_delete_compare_and_swap_rejects_resource_version_race() {
     let (store, db, raced) = build_store_with_delete_cas_race("rv-race", false).await;
 
-    let created = store
-        .create(
-            "default",
-            "rv-race",
-            make_terminating_pod("rv-race", "uid-rv"),
-        )
-        .await
-        .unwrap();
+    let mut pod = make_terminating_pod("rv-race", "uid-rv");
+    pod["spec"]["nodeName"] = json!("");
+    let created = store.create("default", "rv-race", pod).await.unwrap();
     assert_eq!(created.uid, "uid-rv");
 
     let outcome = store
@@ -12962,8 +13147,8 @@ async fn unscheduled_delete_compare_and_swap_rejects_resource_version_race() {
 
     assert_eq!(
         outcome,
-        UnscheduledPodDeleteOutcome::DeferToActor,
-        "resourceVersion race must lose the CAS and defer to actor finalization"
+        UnscheduledPodDeleteOutcome::Retry,
+        "resourceVersion race must lose the CAS and retry from a fresh observation"
     );
     assert!(
         raced.load(std::sync::atomic::Ordering::SeqCst),
@@ -12980,4 +13165,36 @@ async fn unscheduled_delete_compare_and_swap_rejects_resource_version_race() {
         live.resource_version > created.resource_version,
         "the racing status write must have advanced the resourceVersion"
     );
+}
+
+/// Actor finalization also uses the observed resourceVersion from its own
+/// eligibility read. A concurrent status/finalizer/lifecycle write must win
+/// the CAS and preserve the Pod for a fresh actor observation.
+#[tokio::test]
+async fn bound_actor_finalization_compare_and_swap_rejects_resource_version_race() {
+    let (store, db, raced) = build_store_with_delete_cas_race("bound-rv-race", false).await;
+    let mut pod = make_terminating_pod("bound-rv-race", "uid-bound-rv");
+    pod["spec"]["nodeName"] = json!("worker-a");
+    let created = store
+        .create("default", "bound-rv-race", pod)
+        .await
+        .expect("create bound terminating Pod");
+
+    let outcome = store
+        .finalize_bound_with_uid("default", "bound-rv-race", "uid-bound-rv")
+        .await
+        .expect("CAS race is a retry disposition");
+
+    assert_eq!(outcome, BoundPodDeleteOutcome::Retry);
+    assert!(
+        raced.load(std::sync::atomic::Ordering::SeqCst),
+        "test proposer must advance resourceVersion before actor delete CAS"
+    );
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "bound-rv-race")
+        .await
+        .unwrap()
+        .expect("Pod survives lost actor finalization CAS");
+    assert_eq!(live.uid, "uid-bound-rv");
+    assert!(live.resource_version > created.resource_version);
 }

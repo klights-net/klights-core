@@ -114,7 +114,7 @@ pub fn set_node_external_ip_from_dataplane_annotation(node: &mut serde_json::Val
         .and_then(|value| value.as_object())
         .and_then(|annotations| {
             annotations
-                .get(crate::controllers::annotations::DATAPLANE_ENDPOINT_ANNOTATION)
+                .get(klights_network_api::DATAPLANE_ENDPOINT_ANNOTATION)
                 .and_then(|value| value.as_str())
         })
         .map(str::trim)
@@ -157,7 +157,7 @@ pub fn set_node_dataplane_annotations(
     node: &mut serde_json::Value,
     metadata: &crate::networking::wireguard::DataplanePeerMetadata,
 ) -> bool {
-    use crate::controllers::annotations::{
+    use klights_network_api::{
         DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION, DATAPLANE_MODE_ANNOTATION,
         DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION,
     };

@@ -16,10 +16,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::api::{
-    AdmissionContextRequest, AppError, apply_limitrange_defaults_to_pod, apply_patch,
+    AdmissionContextRequest, apply_limitrange_defaults_to_pod, apply_patch,
     apply_pod_runtimeclass_admission, apply_pod_service_account_defaults,
     apply_pod_spec_create_defaults, build_admission_context, check_resource_quota_for_creation,
     check_resource_quota_for_pod_update, compute_qos_class, enforce_limitrange_constraints_for_pod,
@@ -27,29 +28,43 @@ use crate::api::{
     run_admission_for_request, validate_builtin_resource_spec, validate_dns_subdomain,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
 };
-use crate::control_plane::client::LeaderApiClient;
+use crate::api::{AppError, DeleteOptions};
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
+use klights_pod_api::{
+    PodDeleteOptions, PodDeletePreconditions, PodMutationTarget, PodRepositoryError,
+};
 use klights_reconcile_api::{
-    GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
+    GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink, PodGcReconcileSink,
+    PodServiceReconcileSink,
 };
 use klights_supervisor::TaskSupervisor;
 use klights_types::PodIdentity;
 
-use crate::api::DeleteOptions;
-
-use super::delete_coordinator::PodDeleteCoordinator;
-use super::state_only_writer::StateOnlyWriter;
-use super::store::{PodStore, preserve_status_from_current};
-use super::types::{
+use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
+use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
+use crate::kubelet::pod_repository::store::{PodStore, preserve_status_from_current};
+use crate::kubelet::pod_repository::types::{
     PodApiCreateRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiUpdateOutcome,
     PodStatusPatchType,
 };
 
-pub(super) const SCHED_BIND_CONCURRENCY: usize = 8;
+impl From<DeleteOptions> for PodDeleteOptions {
+    fn from(options: DeleteOptions) -> Self {
+        let preconditions = options.preconditions.unwrap_or_default();
+        Self::new(
+            options.propagation_policy,
+            options.orphan_dependents,
+            options._grace_period_seconds,
+            PodDeletePreconditions::new(preconditions.uid, preconditions.resource_version),
+        )
+    }
+}
+
+pub(crate) const SCHED_BIND_CONCURRENCY: usize = 8;
 
 #[cfg(test)]
-pub(super) struct SchedulerBindGateForTest {
+pub(crate) struct SchedulerBindGateForTest {
     entered: std::sync::atomic::AtomicUsize,
     entered_notify: tokio::sync::Notify,
     release_notify: tokio::sync::Notify,
@@ -90,7 +105,8 @@ fn ensure_resource_preconditions_match(
     resource: &Resource,
     preconditions: &ResourcePreconditions,
 ) -> Result<(), AppError> {
-    crate::api::mutation::delete::ensure_delete_preconditions_match(resource, preconditions)
+    crate::resource_preconditions::ensure_delete_preconditions_match(resource, preconditions)
+        .map_err(AppError::from)
 }
 
 async fn apply_pod_service_account_admission(
@@ -154,25 +170,6 @@ struct PodSchedulingDecision {
     preemption_victims: Vec<PreemptionVictim>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PodSchedulingMode {
-    InlineSingleNode,
-    DeferredMultiNodeLeader,
-}
-
-#[derive(Clone)]
-pub struct PodRepositoryBuildConfig {
-    pub db: DatastoreHandle,
-    pub supervisor: Arc<TaskSupervisor>,
-    pub side_effects: Arc<SideEffectRegistry>,
-    pub metrics: Arc<SideEffectMetrics>,
-    pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
-    pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
-    pub scheduling_mode: PodSchedulingMode,
-    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
-    pub cluster_api: Option<Arc<dyn LeaderApiClient>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreemptionVictim {
     namespace: String,
@@ -196,6 +193,8 @@ pub struct PodApiService {
     db: DatastoreHandle,
     supervisor: Arc<TaskSupervisor>,
     delete_coordinator: Arc<PodDeleteCoordinator>,
+    gc_reconcile: Arc<dyn PodGcReconcileSink>,
+    service_reconcile: Arc<dyn PodServiceReconcileSink>,
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
     #[cfg(test)]
@@ -208,9 +207,10 @@ pub struct PodApiServiceDependencies {
     pub db: DatastoreHandle,
     pub supervisor: Arc<TaskSupervisor>,
     pub delete_coordinator: Arc<PodDeleteCoordinator>,
+    pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
+    pub service_reconcile: Arc<dyn PodServiceReconcileSink>,
     pub side_effects: Arc<SideEffectRegistry>,
     pub metrics: Arc<SideEffectMetrics>,
-    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
 }
 
 impl PodApiService {
@@ -221,9 +221,10 @@ impl PodApiService {
             db,
             supervisor,
             delete_coordinator,
+            gc_reconcile,
+            service_reconcile,
             side_effects,
             metrics,
-            outbox: _,
         } = dependencies;
         Self {
             store,
@@ -231,6 +232,8 @@ impl PodApiService {
             db,
             supervisor,
             delete_coordinator,
+            gc_reconcile,
+            service_reconcile,
             side_effects,
             metrics,
             #[cfg(test)]
@@ -448,12 +451,10 @@ impl PodApiService {
             .create(&namespace, &resource_name, body)
             .await
             .map_err(|e| -> AppError { e.into() })?;
-        if let Err(e) = crate::controllers::gc::reconcile_owner_references(
-            self.db.as_ref(),
-            resource.clone(),
-            self as &dyn klights_reconcile_api::GcPodDeleteSink,
-        )
-        .await
+        if let Err(e) = self
+            .gc_reconcile
+            .reconcile_owner_references(resource.clone(), self as &dyn GcPodDeleteSink)
+            .await
         {
             tracing::warn!(
                 namespace = %namespace,
@@ -463,12 +464,10 @@ impl PodApiService {
             );
         }
         let response_body: Value = (*resource.data).clone();
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_create(
-            &resource.data,
-            self.store.db().as_ref(),
-            &self.side_effects.controller_dispatcher_slot(),
-        )
-        .await
+        if let Err(err) = self
+            .service_reconcile
+            .enqueue_after_pod_create(resource.clone())
+            .await
         {
             tracing::debug!(
                 target: "klights::pod_repository::api",
@@ -915,14 +914,10 @@ impl PodApiService {
             .update(ns, name, body, current.resource_version)
             .await
             .map_err(|e| -> AppError { e.into() })?;
-        let previous = std::sync::Arc::unwrap_or_clone(current.data);
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
-            &previous,
-            &resource.data,
-            self.store.db().as_ref(),
-            &self.side_effects.controller_dispatcher_slot(),
-        )
-        .await
+        if let Err(err) = self
+            .service_reconcile
+            .enqueue_after_pod_update(current, resource.clone())
+            .await
         {
             tracing::debug!(
                 target: "klights::pod_repository::api",
@@ -1035,14 +1030,9 @@ impl PodApiService {
                 .await
             {
                 Ok(resource) => {
-                    let previous = std::sync::Arc::unwrap_or_clone(current.data);
-                    if let Err(err) =
-                        crate::side_effects::service_pod::enqueue_services_after_pod_update(
-                            &previous,
-                            &resource.data,
-                            self.store.db().as_ref(),
-                            &self.side_effects.controller_dispatcher_slot(),
-                        )
+                    if let Err(err) = self
+                        .service_reconcile
+                        .enqueue_after_pod_update(current, resource.clone())
                         .await
                     {
                         tracing::debug!(
@@ -1077,6 +1067,30 @@ impl PodApiService {
         unreachable!("PATCH retry loop exhausted without returning");
     }
 
+    /// Pod-domain adapter used by ordinary repository consumers. API
+    /// DeleteOptions and HTTP errors remain inside this API-facing owner.
+    pub(super) async fn mark_pod_terminating_for_repository(
+        &self,
+        target: &PodMutationTarget,
+    ) -> Result<Resource, PodRepositoryError> {
+        let options = target
+            .uid()
+            .map(DeleteOptions::with_uid_precondition)
+            .unwrap_or_default();
+        let outcome = self
+            .api_delete_pod(target.namespace(), target.name(), options, false)
+            .await
+            .map_err(|error| {
+                map_api_error_to_pod_repository(error, target.namespace(), target.name())
+            })?;
+        let PodApiDeleteOutcome::GracefulSet(resource) = outcome else {
+            return Err(PodRepositoryError::corrupt_response(
+                "persisted graceful mark unexpectedly returned a dry-run body",
+            ));
+        };
+        Ok(resource)
+    }
+
     /// Body of the macro's Pod-delete branch. Sets
     /// `metadata.deletionTimestamp` (only if absent) +
     /// `metadata.deletionGracePeriodSeconds` (from `options`, else the Pod
@@ -1093,6 +1107,36 @@ impl PodApiService {
     ) -> Result<PodApiDeleteOutcome, AppError> {
         self.api_delete_pod_inner(ns, name, options, dry_run, true)
             .await
+    }
+
+    pub(crate) async fn repository_delete_pod(
+        &self,
+        ns: &str,
+        name: &str,
+        options: PodDeleteOptions,
+        dry_run: bool,
+    ) -> Result<PodApiDeleteOutcome, PodRepositoryError> {
+        let (propagation_policy, orphan_dependents, grace_period_seconds, preconditions) =
+            options.into_parts();
+        let (uid, resource_version) = preconditions.into_parts();
+        let preconditions = if uid.is_some() || resource_version.is_some() {
+            json!({
+                "uid": uid,
+                "resourceVersion": resource_version,
+            })
+        } else {
+            Value::Null
+        };
+        let options = serde_json::from_value(json!({
+            "propagationPolicy": propagation_policy,
+            "orphanDependents": orphan_dependents,
+            "gracePeriodSeconds": grace_period_seconds,
+            "preconditions": preconditions,
+        }))
+        .map_err(|error| PodRepositoryError::invalid_request("deleteOptions", error.to_string()))?;
+        self.api_delete_pod(ns, name, options, dry_run)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, ns, name))
     }
 
     pub async fn api_delete_pod_for_gc(
@@ -1145,24 +1189,27 @@ impl PodApiService {
         if dry_run {
             return Ok(PodApiDeleteOutcome::DryRun(
                 self.delete_coordinator
-                    .dry_run_delete_body(&resource, &options),
+                    .dry_run_delete_body(&resource, options._grace_period_seconds),
             ));
         }
 
         let delete_outcome = self
             .delete_coordinator
-            .mark_and_queue_api_delete(ns, name, &options, &delete_preconditions, resource)
+            .mark_and_queue_api_delete(
+                ns,
+                name,
+                options._grace_period_seconds,
+                &delete_preconditions,
+                resource,
+            )
             .await?;
         let updated = delete_outcome.updated;
         let previous = delete_outcome.previous;
         let uid = delete_outcome.uid;
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
-            &previous,
-            &updated.data,
-            self.store.db().as_ref(),
-            &self.side_effects.controller_dispatcher_slot(),
-        )
-        .await
+        if let Err(err) = self
+            .service_reconcile
+            .enqueue_after_pod_update(previous, updated.clone())
+            .await
         {
             tracing::debug!(
                 target: "klights::pod_repository::api",
@@ -1175,16 +1222,13 @@ impl PodApiService {
         // conformance test where deleting pod1 must cascade to pod2
         // (owned by pod1) → pod3 (owned by pod2).
         if cascade_dependents
-            && let Err(e) = crate::controllers::gc::cascade_delete_with_uid(
-                self.db.as_ref(),
-                &uid,
-                "v1",
-                name,
-                "Pod",
-                Some(ns.to_string()),
-                self as &dyn klights_reconcile_api::GcPodDeleteSink,
-            )
-            .await
+            && let Err(e) = self
+                .gc_reconcile
+                .cascade_delete_dependents(
+                    PodIdentity::new(ns, name, &uid),
+                    self as &dyn GcPodDeleteSink,
+                )
+                .await
         {
             self.metrics
                 .cascade_delete_failures_total
@@ -1244,16 +1288,13 @@ impl PodApiService {
                 continue;
             }
             if !dry_run
-                && let Err(e) = crate::controllers::gc::cascade_delete_with_uid(
-                    self.db.as_ref(),
-                    &owner_uid,
-                    "v1",
-                    &res_name,
-                    "Pod",
-                    Some(ns.to_string()),
-                    self as &dyn klights_reconcile_api::GcPodDeleteSink,
-                )
-                .await
+                && let Err(e) = self
+                    .gc_reconcile
+                    .cascade_delete_dependents(
+                        PodIdentity::new(ns, &res_name, &owner_uid),
+                        self as &dyn GcPodDeleteSink,
+                    )
+                    .await
             {
                 self.metrics
                     .cascade_delete_failures_total
@@ -2066,6 +2107,168 @@ fn patch_type_to_content_type(p: PodStatusPatchType) -> &'static str {
     }
 }
 
+pub(crate) fn map_api_error_to_pod_repository(
+    error: AppError,
+    namespace: &str,
+    name: &str,
+) -> PodRepositoryError {
+    match error {
+        AppError::NotFound(_) => PodRepositoryError::not_found(namespace, name),
+        AppError::BadRequest(message) => PodRepositoryError::invalid_request("pod", message),
+        AppError::UnprocessableEntity(message) => PodRepositoryError::unprocessable(message),
+        AppError::AlreadyExists(message) => PodRepositoryError::already_exists(message),
+        AppError::Conflict(message) => PodRepositoryError::conflict(message),
+        AppError::Forbidden(message) => PodRepositoryError::forbidden(message),
+        AppError::ServiceUnavailable(message) => PodRepositoryError::unavailable(message),
+        AppError::InternalError(message) | AppError::Internal(message) => {
+            PodRepositoryError::internal(message)
+        }
+        AppError::Status {
+            reason: "NotFound", ..
+        } => PodRepositoryError::not_found(namespace, name),
+        AppError::Status {
+            reason: "AlreadyExists",
+            message,
+            ..
+        } => PodRepositoryError::already_exists(message),
+        AppError::Status {
+            reason: "Conflict",
+            message,
+            ..
+        } => PodRepositoryError::conflict(message),
+        AppError::Status {
+            reason: "Forbidden",
+            message,
+            ..
+        } => PodRepositoryError::forbidden(message),
+        AppError::Status { code, message, .. } if code == axum::http::StatusCode::BAD_REQUEST => {
+            PodRepositoryError::invalid_request("pod", message)
+        }
+        AppError::Status { code, .. } if code == axum::http::StatusCode::NOT_FOUND => {
+            PodRepositoryError::not_found(namespace, name)
+        }
+        AppError::Status { code, message, .. } if code == axum::http::StatusCode::FORBIDDEN => {
+            PodRepositoryError::forbidden(message)
+        }
+        AppError::Status { code, message, .. } if code == axum::http::StatusCode::CONFLICT => {
+            PodRepositoryError::conflict(message)
+        }
+        AppError::Status { code, message, .. }
+            if code == axum::http::StatusCode::UNPROCESSABLE_ENTITY =>
+        {
+            PodRepositoryError::unprocessable(message)
+        }
+        AppError::Status { code, message, .. }
+            if code == axum::http::StatusCode::INTERNAL_SERVER_ERROR =>
+        {
+            PodRepositoryError::internal(message)
+        }
+        AppError::Status { code, message, .. }
+            if code == axum::http::StatusCode::SERVICE_UNAVAILABLE =>
+        {
+            PodRepositoryError::unavailable(message)
+        }
+        other => PodRepositoryError::unavailable(format!("{other:?}")),
+    }
+}
+
+#[async_trait]
+impl crate::kubelet::pod_repository::PodApiPort for PodApiService {
+    async fn create(
+        &self,
+        request: PodApiCreateRequest,
+    ) -> Result<PodApiCreateResult, PodRepositoryError> {
+        let namespace = request.namespace.clone();
+        let name = request.name.clone();
+        self.api_create_pod(request)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, &namespace, &name))
+    }
+
+    async fn update(
+        &self,
+        ns: &str,
+        name: &str,
+        body: Value,
+        current: Resource,
+        dry_run: bool,
+    ) -> Result<PodApiUpdateOutcome, PodRepositoryError> {
+        self.api_update_pod(ns, name, body, current, dry_run)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, ns, name))
+    }
+
+    async fn patch(
+        &self,
+        ns: &str,
+        name: &str,
+        patch: Value,
+        patch_type: PodStatusPatchType,
+        dry_run: bool,
+    ) -> Result<PodApiUpdateOutcome, PodRepositoryError> {
+        self.api_patch_pod(ns, name, patch, patch_type, dry_run)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, ns, name))
+    }
+
+    async fn delete(
+        &self,
+        ns: &str,
+        name: &str,
+        options: PodDeleteOptions,
+        dry_run: bool,
+    ) -> Result<PodApiDeleteOutcome, PodRepositoryError> {
+        self.repository_delete_pod(ns, name, options, dry_run).await
+    }
+
+    async fn delete_collection(
+        &self,
+        ns: &str,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        dry_run: bool,
+    ) -> Result<(), PodRepositoryError> {
+        self.api_delete_collection_pods(ns, label_selector, field_selector, dry_run)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, ns, ""))
+    }
+
+    async fn mark_terminating(
+        &self,
+        target: &PodMutationTarget,
+    ) -> Result<Resource, PodRepositoryError> {
+        self.mark_pod_terminating_for_repository(target).await
+    }
+
+    async fn schedule_pending(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<Resource>, PodRepositoryError> {
+        self.schedule_pending_pod(namespace, name)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, namespace, name))
+    }
+
+    async fn bind(
+        &self,
+        namespace: &str,
+        name: &str,
+        binding: Value,
+        dry_run: bool,
+    ) -> Result<(), PodRepositoryError> {
+        self.bind_pod_from_api(namespace, name, binding, dry_run)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, namespace, name))
+    }
+
+    async fn schedule_all(self: Arc<Self>) -> Result<(), PodRepositoryError> {
+        self.schedule_all_unbound_pods()
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, "", ""))
+    }
+}
+
 impl GcPodDeleteSink for PodApiService {
     fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
         Box::pin(async move {
@@ -2084,7 +2287,7 @@ impl GcPodDeleteSink for PodApiService {
     }
 }
 
-pub(super) async fn classify_gc_pod_delete_error(
+pub(crate) async fn classify_gc_pod_delete_error(
     store: &PodStore,
     identity: &PodIdentity,
     error: AppError,

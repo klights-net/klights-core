@@ -39,6 +39,10 @@ pub(crate) enum StorageCodecError {
     },
     #[error("storage codec domain validation failed: {message}")]
     DomainValidation { message: String },
+    #[error(
+        "unsupported command codec version {actual}; this binary requires exact codec version {required}"
+    )]
+    UnsupportedCodecVersion { actual: u32, required: u32 },
 }
 
 fn missing(field: impl Into<String>) -> StorageCodecError {
@@ -55,6 +59,17 @@ fn invalid(message: impl Into<String>) -> StorageCodecError {
 
 fn unknown(enumeration: &'static str, value: i32) -> StorageCodecError {
     StorageCodecError::UnknownEnum { enumeration, value }
+}
+
+fn validate_meta_codec(meta: &CommandMeta) -> CodecResult<()> {
+    if klights_cluster_core::supports_command_codec_version(meta.codec_version) {
+        Ok(())
+    } else {
+        Err(StorageCodecError::UnsupportedCodecVersion {
+            actual: meta.codec_version,
+            required: klights_cluster_core::COMMAND_CODEC_VERSION,
+        })
+    }
 }
 
 /// Local conversion traits keep the generated-wire boundary explicit without
@@ -122,13 +137,16 @@ pub(crate) fn decode_response_json(bytes: &[u8]) -> CodecResult<StorageResponse>
 /// Encode `CommandMeta` as JSON.
 #[cfg(test)]
 pub(crate) fn encode_meta_json(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
+    validate_meta_codec(meta)?;
     Ok(serde_json::to_vec(meta)?)
 }
 
 /// Decode `CommandMeta` from JSON.
 #[cfg(test)]
 pub(crate) fn decode_meta_json(bytes: &[u8]) -> CodecResult<CommandMeta> {
-    Ok(serde_json::from_slice(bytes)?)
+    let meta = serde_json::from_slice(bytes)?;
+    validate_meta_codec(&meta)?;
+    Ok(meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +183,7 @@ pub(crate) fn decode_response_protobuf(bytes: &[u8]) -> CodecResult<StorageRespo
 
 /// Encode `CommandMeta` as protobuf bytes.
 pub(crate) fn encode_meta_protobuf(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
+    validate_meta_codec(meta)?;
     let proto = ProtoCommandMeta::boundary_from(meta.clone());
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
@@ -174,7 +193,9 @@ pub(crate) fn encode_meta_protobuf(meta: &CommandMeta) -> CodecResult<Vec<u8>> {
 /// Decode `CommandMeta` from protobuf bytes.
 pub(crate) fn decode_meta_protobuf(bytes: &[u8]) -> CodecResult<CommandMeta> {
     let proto: ProtoCommandMeta = prost::Message::decode(bytes)?;
-    Ok(CommandMeta::boundary_from(proto))
+    let meta = CommandMeta::boundary_from(proto);
+    validate_meta_codec(&meta)?;
+    Ok(meta)
 }
 
 /// Encode `CommandError` as protobuf bytes.
@@ -371,6 +392,19 @@ impl BoundaryTryFrom<StorageCommand> for ProtoStorageCommand {
                 namespace,
                 name,
                 preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
+            }),
+            StorageCommand::FinalizeBoundPod {
+                namespace,
+                name,
+                pod_uid,
+                node_name,
+                observed_resource_version,
+            } => proto_storage_command::Command::FinalizeBoundPod(ProtoFinalizeBoundPod {
+                namespace,
+                name,
+                pod_uid,
+                node_name,
+                observed_resource_version,
             }),
             StorageCommand::DeleteResourceWithTombstone {
                 api_version,
@@ -637,6 +671,15 @@ impl BoundaryTryFrom<ProtoStorageCommand> for StorageCommand {
                 name: p.name,
                 preconditions: decode_preconditions(p.preconditions, "DeleteResource")?,
             },
+            proto_storage_command::Command::FinalizeBoundPod(p) => {
+                StorageCommand::FinalizeBoundPod {
+                    namespace: p.namespace,
+                    name: p.name,
+                    pod_uid: p.pod_uid,
+                    node_name: p.node_name,
+                    observed_resource_version: p.observed_resource_version,
+                }
+            }
             proto_storage_command::Command::DeleteResourceWithTombstone(p) => {
                 StorageCommand::DeleteResourceWithTombstone {
                     api_version: p.api_version,
@@ -919,6 +962,7 @@ impl BoundaryTryFrom<ProtoCommandError> for CommandError {
 mod tests {
     use super::*;
     use crate::datastore::command::COMMAND_CODEC_VERSION;
+    use prost::Message;
     use serde_json::json;
 
     #[test]
@@ -1067,6 +1111,16 @@ mod tests {
                     preconditions: uid_preconditions("uid-abc-123"),
                 },
                 "DeleteResource",
+            ),
+            (
+                StorageCommand::FinalizeBoundPod {
+                    namespace: "default".into(),
+                    name: "my-pod".into(),
+                    pod_uid: "uid-abc-123".into(),
+                    node_name: "node-1".into(),
+                    observed_resource_version: 42,
+                },
+                "FinalizeBoundPod",
             ),
             (
                 StorageCommand::DeleteResourceWithTombstone {
@@ -1339,6 +1393,7 @@ mod tests {
             "CreateResource",
             "UpdateResource",
             "DeleteResource",
+            "FinalizeBoundPod",
             "DeleteResourceWithTombstone",
             "PatchResource",
             "UpdateStatus",
@@ -1526,9 +1581,8 @@ mod tests {
     /// Decodes a hand-crafted JSON fixture representing a v1 `CreateResource`
     /// command.  This test proves that a binary built today can decode a
     /// command serialized by a binary from the same codec version.
-    /// When `COMMAND_CODEC_VERSION` is bumped, add a new fixture and
-    /// keep this one (or a copy targeting the old version) to prove
-    /// backward compatibility.
+    /// The enclosing `CommandMeta` exact-version gate decides admission; this
+    /// fixture pins the JSON representation within the current codec.
     #[test]
     fn decode_v1_json_create_resource_fixture() {
         let fixture = r#"{
@@ -1776,6 +1830,23 @@ mod tests {
         let encoded = encode_meta_protobuf(&meta).unwrap();
         let decoded = decode_meta_protobuf(&encoded).unwrap();
         assert_eq!(meta, decoded);
+    }
+
+    #[test]
+    fn command_meta_rejects_non_current_codec_in_json_and_protobuf() {
+        for codec_version in [COMMAND_CODEC_VERSION - 1, COMMAND_CODEC_VERSION + 1] {
+            let mut meta = sample_meta();
+            meta.codec_version = codec_version;
+
+            assert!(encode_meta_json(&meta).is_err());
+            assert!(encode_meta_protobuf(&meta).is_err());
+
+            let json = serde_json::to_vec(&meta).unwrap();
+            assert!(decode_meta_json(&json).is_err());
+
+            let protobuf = ProtoCommandMeta::boundary_from(meta).encode_to_vec();
+            assert!(decode_meta_protobuf(&protobuf).is_err());
+        }
     }
 
     // ---- variant_name coverage ----

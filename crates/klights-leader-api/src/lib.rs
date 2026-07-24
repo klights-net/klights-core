@@ -3280,6 +3280,7 @@ impl OutboxDeliveryOperation {
 /// bind it from their configured or authenticated node identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutboxDeliveryRequest {
+    codec_version: u32,
     idempotency_key: String,
     operation: OutboxDeliveryOperation,
     payload: Arc<[u8]>,
@@ -3290,6 +3291,33 @@ pub struct OutboxDeliveryRequest {
 
 impl OutboxDeliveryRequest {
     pub fn try_new(
+        idempotency_key: impl Into<String>,
+        operation: OutboxDeliveryOperation,
+        payload: Arc<[u8]>,
+        client_id: impl Into<String>,
+        stream_id: i64,
+        stream_sequence: i64,
+    ) -> Result<Self, OutboxDeliveryError> {
+        Self::try_new_versioned(
+            klights_cluster_core::COMMAND_CODEC_VERSION,
+            idempotency_key,
+            operation,
+            payload,
+            client_id,
+            stream_id,
+            stream_sequence,
+        )
+    }
+
+    /// Preserve the sender's codec version for fail-closed leader admission.
+    ///
+    /// This constructor intentionally preserves any advertised version. The
+    /// authenticated delivery boundary returns a retryable exact-version
+    /// rejection before decoding or consuming the durable stream sequence. A
+    /// future peer that also supports v3 may reconnect and explicitly speak
+    /// v3; the current cluster never rewrites the rejected peer's bytes.
+    pub fn try_new_versioned(
+        codec_version: u32,
         idempotency_key: impl Into<String>,
         operation: OutboxDeliveryOperation,
         payload: Arc<[u8]>,
@@ -3320,6 +3348,7 @@ impl OutboxDeliveryRequest {
             ));
         }
         Ok(Self {
+            codec_version,
             idempotency_key,
             operation,
             payload,
@@ -3327,6 +3356,10 @@ impl OutboxDeliveryRequest {
             stream_id,
             stream_sequence,
         })
+    }
+
+    pub const fn codec_version(&self) -> u32 {
+        self.codec_version
     }
 
     pub fn idempotency_key(&self) -> &str {
@@ -3353,8 +3386,19 @@ impl OutboxDeliveryRequest {
         self.stream_sequence
     }
 
-    pub fn into_parts(self) -> (String, OutboxDeliveryOperation, Arc<[u8]>, String, i64, i64) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        u32,
+        String,
+        OutboxDeliveryOperation,
+        Arc<[u8]>,
+        String,
+        i64,
+        i64,
+    ) {
         (
+            self.codec_version,
             self.idempotency_key,
             self.operation,
             self.payload,
@@ -3410,6 +3454,10 @@ pub enum OutboxDeliveryError {
         message: String,
     },
     NotLeader,
+    CodecIncompatible {
+        sender: u32,
+        required: u32,
+    },
     Retryable(String),
     Timeout,
     Cancelled,
@@ -3434,6 +3482,10 @@ impl OutboxDeliveryError {
 
     pub const fn not_leader() -> Self {
         Self::NotLeader
+    }
+
+    pub const fn codec_incompatible(sender: u32, required: u32) -> Self {
+        Self::CodecIncompatible { sender, required }
     }
 
     pub fn unavailable(message: impl Into<String>) -> Self {
@@ -3473,6 +3525,7 @@ impl OutboxDeliveryError {
         matches!(
             self,
             Self::NotLeader
+                | Self::CodecIncompatible { .. }
                 | Self::Retryable(_)
                 | Self::Timeout
                 | Self::Cancelled
@@ -3498,6 +3551,10 @@ impl fmt::Display for OutboxDeliveryError {
                 write!(formatter, "invalid {field}: {message}")
             }
             Self::NotLeader => formatter.write_str("durable delivery requires the current leader"),
+            Self::CodecIncompatible { sender, required } => write!(
+                formatter,
+                "worker command codec {sender} is incompatible with required codec {required}"
+            ),
             Self::Retryable(message)
             | Self::NotFound(message)
             | Self::ConflictTerminal(message)

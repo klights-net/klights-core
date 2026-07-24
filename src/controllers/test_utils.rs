@@ -68,7 +68,7 @@ pub async fn deferred_outbox_pod_repository_for_test(
             supervisor,
             side_effects,
             metrics,
-            crate::kubelet::pod_repository::api::PodSchedulingMode::DeferredMultiNodeLeader,
+            crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
             Some(outbox),
         ),
     )

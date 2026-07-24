@@ -10,7 +10,10 @@ use klights_pod_api::{
     UnscheduledPodDeletionError, UnscheduledPodDeletionFuture, UnscheduledPodDeletionOutcome,
     UnscheduledPodDeletionRequest,
 };
-use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
+use klights_reconcile_api::{
+    GcPodDeleteRequest, GcPodDeleteSink, NamespaceTerminationOutcome, NamespaceTerminationRequest,
+    NamespaceTerminationSink,
+};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
@@ -62,6 +65,7 @@ impl UnscheduledPodDeletion for LeaderDeferredUnscheduledPodDeletion {
                 UnscheduledPodDeleteOutcome::FinalizersPending => {
                     UnscheduledPodDeletionOutcome::FinalizersPending
                 }
+                UnscheduledPodDeleteOutcome::Retry => UnscheduledPodDeletionOutcome::Retry,
             })
         })
     }
@@ -78,6 +82,7 @@ pub(super) struct PodWorkqueue {
     lifecycle_router: std::sync::Mutex<Option<Arc<dyn PodLifecycleWakeup>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
     remote_pod_delete_resignal_sink: std::sync::Mutex<Option<std::sync::Weak<dyn GcPodDeleteSink>>>,
+    namespace_termination: std::sync::Mutex<Option<Arc<dyn NamespaceTerminationSink>>>,
     reconciler_started: AtomicBool,
     /// Set to true when `start()` is called. Enables Task 4.1 tests to
     /// verify that `build_parts` defers startup to `PodRepositoryBackground`.
@@ -134,9 +139,14 @@ impl PodWorkqueue {
             lifecycle_router: std::sync::Mutex::new(None),
             local_node_name: std::sync::Mutex::new(None),
             remote_pod_delete_resignal_sink: std::sync::Mutex::new(None),
+            namespace_termination: std::sync::Mutex::new(None),
             reconciler_started: AtomicBool::new(false),
             start_called: AtomicBool::new(false),
         })
+    }
+
+    pub(super) fn set_namespace_termination_sink(&self, sink: Arc<dyn NamespaceTerminationSink>) {
+        *self.namespace_termination.lock().unwrap() = Some(sink);
     }
 
     pub(super) async fn start(self: &Arc<Self>) -> Result<()> {
@@ -607,13 +617,21 @@ impl PodWorkqueue {
                             );
                         }
                         UnscheduledPodDeletionOutcome::DeferToActor => {
-                            // A bind or any other write raced the observed-RV
-                            // CAS. Re-read so a now-bound Pod is routed only to
-                            // its lifecycle actor.
+                            // The capability observed a bound Pod. Re-read so
+                            // the lifecycle actor receives the current row
+                            // only if the queued UID still owns the slot.
                             match self.store.get(&ns, &name).await? {
                                 Some(fresh) if fresh.uid == uid => fresh,
                                 _ => return Ok(()),
                             }
+                        }
+                        UnscheduledPodDeletionOutcome::Retry => {
+                            anyhow::bail!(
+                                "unscheduled pod {}/{} uid {} changed during delete CAS; retrying from a fresh observation",
+                                ns,
+                                name,
+                                uid
+                            );
                         }
                     }
                 } else {
@@ -832,16 +850,21 @@ impl PodWorkqueue {
         // dead-letters. Each task is short-lived, so the limit-1
         // PodDeleteWorkqueue slot churns naturally and many concurrent
         // namespace deletes serialize without one delete holding the slot.
-        let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome(
-            self.db.as_ref(),
-            &namespace,
-            &uid,
-            &self.metrics,
-        )
-        .await;
+        let sink = self
+            .namespace_termination
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("namespace termination sink is not configured"))?;
+        let outcome = sink
+            .reconcile_namespace_termination(NamespaceTerminationRequest {
+                namespace: namespace.clone(),
+                expected_uid: Some(uid),
+            })
+            .await;
         match outcome {
-            Ok(crate::api::NamespaceTerminationOutcome::Finalized) => Ok(()),
-            Ok(crate::api::NamespaceTerminationOutcome::StillPending) => {
+            Ok(NamespaceTerminationOutcome::Finalized) => Ok(()),
+            Ok(NamespaceTerminationOutcome::StillPending) => {
                 self.enqueue_actor_deletes_for_terminating_namespace_pods(&namespace)
                     .await?;
                 Err(anyhow::anyhow!(
@@ -1366,11 +1389,15 @@ mod tests {
             .await
             .expect("durable workqueue reminder should wake the actor without a live watch event");
 
-        workqueue
+        let outcome = workqueue
             .store
-            .delete_with_uid("default", "watch-dropped", "uid-old")
+            .finalize_bound_with_uid("default", "watch-dropped", "uid-old")
             .await
             .expect("actor-owned UID finalization should remove the row");
+        assert_eq!(
+            outcome,
+            crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Removed
+        );
         workqueue
             .run_pod_delete_full_with_target_node(
                 "default".to_string(),
@@ -2033,11 +2060,15 @@ mod tests {
             .await
             .expect("running worker must consume durable intent and wake its actor");
 
-        workqueue
+        let outcome = workqueue
             .store
-            .delete_with_uid("default", "worker-pod", "uid-old")
+            .finalize_bound_with_uid("default", "worker-pod", "uid-old")
             .await
             .expect("worker actor-owned finalization should remove the row");
+        assert_eq!(
+            outcome,
+            crate::kubelet::pod_repository::store::BoundPodDeleteOutcome::Removed
+        );
         workqueue
             .run_pod_delete_full_with_target_node(
                 "default".to_string(),
@@ -2086,6 +2117,15 @@ mod tests {
     #[tokio::test]
     async fn namespace_termination_enqueues_uid_bound_delete_for_unscheduled_pod() {
         let (workqueue, db) = test_workqueue().await;
+        workqueue.set_namespace_termination_sink(Arc::new(
+            crate::pod_reconcile_adapter::PodReconcileAdapter::new(
+                db.clone(),
+                crate::side_effects::ControllerDispatcherSlot::new(),
+                SideEffectMetrics::new(),
+                Arc::new(crate::side_effects::SideEffectRegistry::new()),
+                workqueue.store.clone(),
+            ),
+        ));
         db.create_namespace(
             "terminating-ns",
             json!({

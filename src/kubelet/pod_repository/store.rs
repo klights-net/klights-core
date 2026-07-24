@@ -35,13 +35,35 @@ pub(super) enum UnscheduledPodDeleteOutcome {
     /// The Pod row was removed (or was already gone / superseded by a
     /// same-name replacement UID).
     Removed,
-    /// The Pod has been picked up by a kubelet (`spec.nodeName` set), a bind
-    /// raced the atomic delete, or the Pod is not actually terminating. Row
-    /// removal must go through actor-owned finalization; the caller must not
-    /// hard-delete.
+    /// The Pod has already been picked up by a kubelet (`spec.nodeName` set).
+    /// Row removal must go through actor-owned finalization.
     DeferToActor,
     /// The Pod still carries finalizers; removal must wait until they clear.
     FinalizersPending,
+    /// The row changed after the leader worker's observation. The worker must
+    /// retry from a fresh read rather than route a possibly-unbound Pod to an
+    /// actor.
+    Retry,
+}
+
+/// Result of the root-private, actor-owned bound-Pod finalization primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundPodDeleteOutcome {
+    Removed,
+    IdentityChanged,
+    FinalizersPending,
+    Retry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActorPodDeleteObservation {
+    Ready {
+        resource_version: i64,
+        node_name: String,
+    },
+    IdentityChanged,
+    FinalizersPending,
+    Retry,
 }
 
 /// True once a Pod has been bound to a node (a kubelet owns its lifecycle).
@@ -49,6 +71,14 @@ fn pod_has_node_assignment(pod: &Value) -> bool {
     pod.pointer("/spec/nodeName")
         .and_then(|node| node.as_str())
         .is_some_and(|node| !node.trim().is_empty())
+}
+
+fn pod_is_terminating_or_node_lost(pod: &Value) -> bool {
+    pod.pointer("/metadata/deletionTimestamp")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty())
+        || (pod.pointer("/status/phase").and_then(Value::as_str) == Some("Failed")
+            && pod.pointer("/status/reason").and_then(Value::as_str) == Some("NodeLost"))
 }
 
 /// A hard-delete that reports the row already vanished concurrently, rather
@@ -94,7 +124,7 @@ impl PodStore {
             .await
     }
 
-    pub(super) async fn list(
+    pub(crate) async fn list(
         &self,
         ns: Option<&str>,
         label_selector: Option<&str>,
@@ -123,14 +153,14 @@ impl PodStore {
             .await
     }
 
-    pub(super) async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
+    pub(crate) async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
         self.mark_sandbox_dirty();
         self.db
             .create_resource(POD_API_VERSION, POD_KIND, Some(ns), name, body)
             .await
     }
 
-    pub(super) async fn update(
+    pub(crate) async fn update(
         &self,
         ns: &str,
         name: &str,
@@ -230,7 +260,7 @@ impl PodStore {
     /// Internal scheduler path: bind `spec.nodeName` and update the
     /// PodScheduled condition in one datastore mutation. Normal Pod API update
     /// paths must use `update()`, which preserves status.
-    pub(super) async fn update_including_status_for_scheduler(
+    pub(crate) async fn update_including_status_for_scheduler(
         &self,
         ns: &str,
         name: &str,
@@ -305,9 +335,34 @@ impl PodStore {
             .await
     }
 
-    pub(crate) async fn delete_with_uid(&self, ns: &str, name: &str, uid: &str) -> Result<()> {
-        self.mark_sandbox_dirty();
-        self.db
+    /// Remove a bound Pod only after revalidating actor-finalization state at
+    /// the datastore boundary.
+    ///
+    /// The observed resourceVersion CAS closes the race between this
+    /// validation read and row removal. Any concurrent bind, finalizer, or
+    /// lifecycle write forces the actor to retry from a fresh observation.
+    pub(crate) async fn finalize_bound_with_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> Result<BoundPodDeleteOutcome> {
+        let observed_resource_version = match self.observe_bound_finalization(ns, name, uid).await?
+        {
+            ActorPodDeleteObservation::Ready {
+                resource_version, ..
+            } => resource_version,
+            ActorPodDeleteObservation::IdentityChanged => {
+                return Ok(BoundPodDeleteOutcome::IdentityChanged);
+            }
+            ActorPodDeleteObservation::FinalizersPending => {
+                return Ok(BoundPodDeleteOutcome::FinalizersPending);
+            }
+            ActorPodDeleteObservation::Retry => return Ok(BoundPodDeleteOutcome::Retry),
+        };
+
+        match self
+            .db
             .delete_resource_with_preconditions(
                 POD_API_VERSION,
                 POD_KIND,
@@ -315,10 +370,69 @@ impl PodStore {
                 name,
                 ResourcePreconditions {
                     uid: Some(uid.to_string()),
-                    resource_version: None,
+                    resource_version: Some(observed_resource_version),
                 },
             )
             .await
+        {
+            Ok(()) => {
+                self.mark_sandbox_dirty();
+                Ok(BoundPodDeleteOutcome::Removed)
+            }
+            Err(error) if crate::datastore::errors::is_conflict_error(&error) => {
+                Ok(BoundPodDeleteOutcome::Retry)
+            }
+            Err(error) if delete_error_means_gone(&error) => {
+                Ok(BoundPodDeleteOutcome::IdentityChanged)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) async fn observe_bound_finalization(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> Result<ActorPodDeleteObservation> {
+        let current = self.get(ns, name).await?;
+        Ok(self.classify_bound_finalization(current.as_ref(), uid))
+    }
+
+    pub(crate) fn classify_bound_finalization(
+        &self,
+        current: Option<&Resource>,
+        uid: &str,
+    ) -> ActorPodDeleteObservation {
+        let Some(current) = current else {
+            return ActorPodDeleteObservation::IdentityChanged;
+        };
+        if current.uid != uid {
+            return ActorPodDeleteObservation::IdentityChanged;
+        }
+        let Some(node_name) = current
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(Value::as_str)
+            .filter(|node| !node.trim().is_empty())
+        else {
+            return ActorPodDeleteObservation::Retry;
+        };
+        if !pod_is_terminating_or_node_lost(&current.data) {
+            return ActorPodDeleteObservation::Retry;
+        }
+        if current
+            .data
+            .pointer("/metadata/finalizers")
+            .and_then(Value::as_array)
+            .is_some_and(|finalizers| !finalizers.is_empty())
+        {
+            return ActorPodDeleteObservation::FinalizersPending;
+        }
+        ActorPodDeleteObservation::Ready {
+            resource_version: current.resource_version,
+            node_name: node_name.to_string(),
+        }
     }
 
     /// HR#11 exception: remove an *unscheduled* Pod row from the leader /
@@ -332,8 +446,9 @@ impl PodStore {
     /// confirming no kubelet has picked the Pod up: the hard delete is gated on
     /// the exact `resourceVersion` observed while `spec.nodeName` was still
     /// empty. If a scheduler bind lands first, the `resourceVersion` changes,
-    /// the compare-and-swap delete no-ops, and the caller must fall back to
-    /// actor-owned finalization (which the bind's watch event already wakes).
+    /// the compare-and-swap delete no-ops, and the caller retries from a fresh
+    /// observation. A newly bound observation then defers to actor-owned
+    /// finalization (which the bind's watch event already wakes).
     ///
     /// Once a kubelet has picked up a Pod (`spec.nodeName` set), only the Pod
     /// lifecycle actor may remove the row — this method refuses
@@ -357,7 +472,7 @@ impl PodStore {
             // The row changed after the deferred worker observed it as
             // unbound. Never acquire a newer RV implicitly: the exact
             // observation supplied by the worker is the delete CAS token.
-            return Ok(UnscheduledPodDeleteOutcome::DeferToActor);
+            return Ok(UnscheduledPodDeleteOutcome::Retry);
         }
         // A kubelet has picked the Pod up — only the actor may remove the row.
         if pod_has_node_assignment(&current.data) {
@@ -371,7 +486,7 @@ impl PodStore {
             .filter(|value| !value.is_empty())
             .is_none()
         {
-            return Ok(UnscheduledPodDeleteOutcome::DeferToActor);
+            return Ok(UnscheduledPodDeleteOutcome::Retry);
         }
         // Respect finalizers exactly like the actor finalizer does.
         if current
@@ -402,9 +517,10 @@ impl PodStore {
         {
             Ok(()) => Ok(UnscheduledPodDeleteOutcome::Removed),
             // CAS lost: the row changed (almost always a scheduler bind setting
-            // spec.nodeName). Defer to actor-owned finalization.
+            // spec.nodeName). Retry from a fresh observation so an RV-only
+            // race is not mistaken for an already-bound Pod.
             Err(err) if crate::datastore::errors::is_conflict_error(&err) => {
-                Ok(UnscheduledPodDeleteOutcome::DeferToActor)
+                Ok(UnscheduledPodDeleteOutcome::Retry)
             }
             // Row vanished concurrently — treat as removed (idempotent).
             Err(err) if delete_error_means_gone(&err) => Ok(UnscheduledPodDeleteOutcome::Removed),
@@ -447,7 +563,7 @@ impl super::PodReader for PodStore {
     }
 }
 
-pub(super) fn preserve_status_from_current(current: &Value, next: &mut Value) {
+pub(crate) fn preserve_status_from_current(current: &Value, next: &mut Value) {
     let Some(next_obj) = next.as_object_mut() else {
         return;
     };

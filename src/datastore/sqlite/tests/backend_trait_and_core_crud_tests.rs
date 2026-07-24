@@ -4577,6 +4577,631 @@ async fn log_apply_replays_pod_cleanup_intents() {
     );
 }
 
+async fn watch_event_count(db: &Datastore) -> i64 {
+    db.db_call("test_watch_event_count", |conn| {
+        Ok(conn.query_row("SELECT COUNT(*) FROM watch_events", [], |row| row.get(0))?)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn legacy_move_pod_to_cleanup_intent_captures_without_deleting_bound_pod() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "bound-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "bound-pod",
+                "uid": "bound-pod-uid"
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    db.move_pod_to_cleanup_intent(
+        "worker-a",
+        "default",
+        "bound-pod",
+        "bound-pod-uid",
+        "NodeLost",
+    )
+    .await
+    .unwrap();
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "bound-pod")
+        .await
+        .unwrap()
+        .expect("legacy cleanup capture must leave actor-owned bound Pod row intact");
+    assert_eq!(
+        live.data
+            .pointer("/metadata/uid")
+            .and_then(|value| value.as_str()),
+        Some("bound-pod-uid")
+    );
+
+    let intents = db
+        .list_pod_cleanup_intents_for_node("worker-a")
+        .await
+        .unwrap();
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].pod_uid, "bound-pod-uid");
+    assert_eq!(intents[0].pod_data["spec"]["nodeName"], "worker-a");
+}
+
+#[tokio::test]
+async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let observed = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "finalizer-race",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "finalizer-race",
+                    "uid": "finalizer-race-uid",
+                    "deletionTimestamp": "2026-07-24T00:00:00Z"
+                },
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "finalizer-race",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "finalizer-race",
+                "uid": "finalizer-race-uid",
+                "deletionTimestamp": "2026-07-24T00:00:00Z",
+                "finalizers": ["example.test/late-finalizer"]
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        }),
+        observed.resource_version,
+    )
+    .await
+    .unwrap();
+
+    let before_apply_rv = db.get_current_resource_version().await.unwrap();
+    let before_apply_watch_count = watch_event_count(&db).await;
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalizer-race".to_string(),
+            pod_uid: "finalizer-race-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: before_apply_rv,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-finalizer-race",
+            "PodMetadata",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .expect("ineligible actor finalization is an acknowledged ledger-only commit")
+    else {
+        panic!("expected a new actor-finalization outbox commit");
+    };
+    assert!(
+        commit.mutations.iter().all(|mutation| matches!(
+            mutation,
+            crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+        )),
+        "late finalizer must produce no Pod delete mutation"
+    );
+    db.apply_raft_log_apply_commit(commit).await.unwrap();
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before_apply_rv,
+        "ineligible actor finalization must not consume a public resourceVersion"
+    );
+    assert_eq!(
+        watch_event_count(&db).await,
+        before_apply_watch_count,
+        "ledger-only actor finalization must not publish a watch event"
+    );
+    assert!(
+        db.get_resource("v1", "Pod", Some("default"), "finalizer-race")
+            .await
+            .unwrap()
+            .is_some(),
+        "failed actor CAS must preserve the bound Pod row"
+    );
+
+    let held = db
+        .get_resource("v1", "Pod", Some("default"), "finalizer-race")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut drained = (*held.data).clone();
+    drained["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("finalizers");
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "finalizer-race",
+        drained,
+        held.resource_version,
+    )
+    .await
+    .unwrap();
+    let after_finalizer_drain_watch_count = watch_event_count(&db).await;
+    assert!(
+        after_finalizer_drain_watch_count > before_apply_watch_count,
+        "finalizer removal must emit the Pod watch update that re-wakes the actor"
+    );
+
+    let before_fresh_finalize_rv = db.get_current_resource_version().await.unwrap();
+    let fresh_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalizer-race".to_string(),
+            pod_uid: "finalizer-race-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: before_fresh_finalize_rv,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: fresh_commit,
+        ..
+    } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-after-finalizer-drain",
+            "PodMetadata",
+            fresh_payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected fresh actor finalization commit");
+    };
+    assert!(fresh_commit.mutations.iter().any(|mutation| matches!(
+        mutation,
+        crate::log_apply::LogApplyMutation::DeleteResource(key)
+            if key.kind == "Pod" && key.uid == "finalizer-race-uid"
+    )));
+    db.apply_raft_log_apply_commit(fresh_commit).await.unwrap();
+    assert!(
+        db.get_current_resource_version().await.unwrap() > before_fresh_finalize_rv,
+        "eligible actor finalization must advance public resourceVersion"
+    );
+    assert!(
+        watch_event_count(&db).await > after_finalizer_drain_watch_count,
+        "eligible actor finalization must publish the Pod DELETED watch event"
+    );
+    assert!(
+        db.get_resource("v1", "Pod", Some("default"), "finalizer-race")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let missing_rv = db.get_current_resource_version().await.unwrap();
+    let missing_watch_count = watch_event_count(&db).await;
+    let missing_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalizer-race".to_string(),
+            pod_uid: "finalizer-race-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: missing_rv,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: missing_commit,
+        ..
+    } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-already-missing",
+            "PodMetadata",
+            missing_payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("missing Pod actor finalization must still reach proposal");
+    };
+    assert!(missing_commit.mutations.iter().all(|mutation| matches!(
+        mutation,
+        crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+    )));
+    db.apply_raft_log_apply_commit(missing_commit)
+        .await
+        .unwrap();
+    assert_eq!(db.get_current_resource_version().await.unwrap(), missing_rv);
+    assert_eq!(watch_event_count(&db).await, missing_watch_count);
+
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "finalizer-race",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "finalizer-race",
+                "uid": "replacement-uid",
+                "deletionTimestamp": "2026-07-24T00:10:00Z"
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let replacement_rv = db.get_current_resource_version().await.unwrap();
+    let replacement_watch_count = watch_event_count(&db).await;
+    let stale_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalizer-race".to_string(),
+            pod_uid: "finalizer-race-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: replacement_rv,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: replacement_commit,
+        ..
+    } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-stale-replacement",
+            "PodMetadata",
+            stale_payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("same-name replacement must still reach ledger-only proposal");
+    };
+    assert!(replacement_commit.mutations.iter().all(|mutation| matches!(
+        mutation,
+        crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+    )));
+    db.apply_raft_log_apply_commit(replacement_commit)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        replacement_rv
+    );
+    assert_eq!(watch_event_count(&db).await, replacement_watch_count);
+    assert_eq!(
+        db.get_resource("v1", "Pod", Some("default"), "finalizer-race")
+            .await
+            .unwrap()
+            .unwrap()
+            .uid,
+        "replacement-uid"
+    );
+
+    let eligible_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalizer-race".to_string(),
+            pod_uid: "replacement-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: replacement_rv,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+    let mut reserved_rvs = Vec::new();
+    for idempotency_key in ["actor-finalize-concurrent-a", "actor-finalize-concurrent-b"] {
+        let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+            commit, applied_rv, ..
+        } = db
+            .build_log_apply_commit_for_outbox(
+                idempotency_key,
+                "PodMetadata",
+                eligible_payload.as_ref(),
+                "worker-a",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("eligible actor finalization must reserve a proposal RV");
+        };
+        assert!(commit.mutations.iter().any(|mutation| matches!(
+            mutation,
+            crate::log_apply::LogApplyMutation::DeleteResource(_)
+        )));
+        assert!(commit.resource_version > 0);
+        assert_eq!(applied_rv, commit.resource_version);
+        let key = idempotency_key.to_string();
+        let placeholder_rv = db
+            .db_call("test_actor_finalize_placeholder_rv", move |conn| {
+                Ok(conn.query_row(
+                    "SELECT reserved_rv FROM applied_outbox WHERE idempotency_key = ?1",
+                    [key],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(placeholder_rv, commit.resource_version);
+        reserved_rvs.push(commit.resource_version);
+    }
+    assert_ne!(
+        reserved_rvs[0], reserved_rvs[1],
+        "concurrent eligible legacy actor-finalization proposals need unique reserved RVs"
+    );
+
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: v1_commit,
+        applied_rv: v1_applied_rv,
+        ..
+    } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-committed-v1",
+            "PodMetadata",
+            eligible_payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("eligible V1 actor finalization must produce a template");
+    };
+    assert_eq!(
+        v1_commit.resource_version_assignment,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+    );
+    assert_eq!(v1_commit.resource_version, 0);
+    assert!(v1_applied_rv > 0);
+    let v1_placeholder_count = db
+        .db_call("test_actor_finalize_v1_placeholder", |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM applied_outbox \
+                 WHERE idempotency_key = 'actor-finalize-committed-v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(v1_placeholder_count, 0);
+}
+
+#[tokio::test]
+async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibility() {
+    struct Case {
+        name: &'static str,
+        assignment: crate::log_apply::ResourceVersionAssignment,
+        eligible: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "legacy-eligible",
+            assignment: crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+            eligible: true,
+        },
+        Case {
+            name: "legacy-noop",
+            assignment: crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+            eligible: false,
+        },
+        Case {
+            name: "v1-eligible",
+            assignment: crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+            eligible: true,
+        },
+        Case {
+            name: "v1-noop",
+            assignment: crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+            eligible: false,
+        },
+    ];
+
+    for case in cases {
+        let db = Datastore::new_in_memory().await.unwrap();
+        if case.assignment == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
+            crate::datastore::DatastoreBackend::set_klights_meta(
+                &db,
+                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+                case.assignment.as_metadata_value(),
+            )
+            .await
+            .unwrap();
+        }
+        let mut pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": case.name,
+                "uid": format!("{}-uid", case.name),
+                "deletionTimestamp": "2026-07-24T01:00:00Z"
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        if !case.eligible {
+            pod["metadata"]["finalizers"] = json!(["example.test/held"]);
+        }
+        db.create_resource("v1", "Pod", Some("default"), case.name, pod)
+            .await
+            .unwrap();
+
+        let before_rv = db.get_current_resource_version().await.unwrap();
+        let before_watch_count = watch_event_count(&db).await;
+        let idempotency_key = format!("watermarked-finalize-{}", case.name);
+        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+            StorageCommand::FinalizeBoundPod {
+                namespace: "default".to_string(),
+                name: case.name.to_string(),
+                pod_uid: format!("{}-uid", case.name),
+                node_name: "worker-a".to_string(),
+                observed_resource_version: before_rv,
+            },
+        )
+        .encode_protobuf()
+        .unwrap();
+        let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+            commit, applied_rv, ..
+        } = db
+            .build_log_apply_commit_for_outbox_with_watermark(
+                &idempotency_key,
+                "PodMetadata",
+                payload.as_ref(),
+                "worker-a",
+                Some(crate::log_apply::OutboxStreamWatermark {
+                    client_id: format!("client-{}", case.name),
+                    stream_id: 1,
+                    stream_seq: 1,
+                }),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("{} must produce a fresh proposal", case.name);
+        };
+
+        assert_eq!(commit.resource_version_assignment, case.assignment);
+        assert!(commit.mutations.iter().any(|mutation| matches!(
+            mutation,
+            crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+        )));
+        assert_eq!(
+            commit.mutations.iter().any(|mutation| matches!(
+                mutation,
+                crate::log_apply::LogApplyMutation::DeleteResource(_)
+            )),
+            case.eligible,
+            "{} delete mutation eligibility mismatch",
+            case.name
+        );
+
+        let key = idempotency_key.clone();
+        let (placeholder_count, reserved_rv) = db
+            .db_call("test_watermarked_finalize_placeholder", move |conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*), MAX(reserved_rv) FROM applied_outbox \
+                     WHERE idempotency_key = ?1",
+                    [key],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+
+        match case.assignment {
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned => {
+                assert!(commit.resource_version > 0);
+                assert_eq!(applied_rv, commit.resource_version);
+                assert_eq!(placeholder_count, 1);
+                assert_eq!(
+                    reserved_rv,
+                    case.eligible.then_some(commit.resource_version),
+                    "{} legacy reservation mismatch",
+                    case.name
+                );
+            }
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 => {
+                assert_eq!(commit.resource_version, 0);
+                assert!(applied_rv > 0);
+                assert_eq!(placeholder_count, 0);
+                assert_eq!(reserved_rv, None);
+            }
+        }
+
+        db.apply_raft_log_apply_commit(commit).await.unwrap();
+        let live = db
+            .get_resource("v1", "Pod", Some("default"), case.name)
+            .await
+            .unwrap();
+        if case.eligible {
+            assert!(live.is_none(), "{} eligible Pod must be removed", case.name);
+            assert!(
+                db.get_current_resource_version().await.unwrap() > before_rv,
+                "{} eligible delete must advance public RV",
+                case.name
+            );
+            assert!(
+                watch_event_count(&db).await > before_watch_count,
+                "{} eligible delete must publish watch",
+                case.name
+            );
+        } else {
+            assert!(live.is_some(), "{} ineligible Pod must remain", case.name);
+            assert_eq!(
+                db.get_current_resource_version().await.unwrap(),
+                before_rv,
+                "{} ledger-only no-op must not advance public RV",
+                case.name
+            );
+            assert_eq!(
+                watch_event_count(&db).await,
+                before_watch_count,
+                "{} ledger-only no-op must not publish watch",
+                case.name
+            );
+        }
+    }
+}
+
 async fn get_klights_meta_rows(
     db: &Datastore,
     key_a: &'static str,
