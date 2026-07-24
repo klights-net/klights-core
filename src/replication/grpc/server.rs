@@ -291,7 +291,7 @@ pub(crate) struct ReplicationServerPorts {
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     watch: Arc<dyn klights_leader_api::LeaderWatch>,
-    projected_token: Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>,
+    projected_token: Arc<dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken>,
     pod_cleanup: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
     node_lease: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     node_subnet: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
@@ -301,12 +301,16 @@ pub(crate) struct ReplicationServerPorts {
 }
 
 impl ReplicationServerPorts {
-    pub(crate) fn from_shared<T>(shared: Arc<T>) -> Self
+    pub(crate) fn from_shared<T>(
+        shared: Arc<T>,
+        projected_token: Arc<
+            dyn klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken,
+        >,
+    ) -> Self
     where
         T: klights_leader_api::LeaderResourceQuery
             + klights_leader_api::LeaderResourceCommand
             + klights_leader_api::LeaderWatch
-            + klights_leader_api::LeaderProjectedServiceAccountToken
             + klights_leader_api::LeaderPodCleanupIntents
             + klights_leader_api::LeaderNodeLeaseRenewal
             + klights_leader_api::LeaderNodeSubnetAllocation
@@ -321,7 +325,7 @@ impl ReplicationServerPorts {
             resource_query: shared.clone(),
             resource_command: shared.clone(),
             watch: shared.clone(),
-            projected_token: shared.clone(),
+            projected_token,
             pod_cleanup: shared.clone(),
             node_lease: shared.clone(),
             node_subnet: shared.clone(),
@@ -494,7 +498,12 @@ impl GrpcReplicationServer {
         if let Some(dispatcher) = controller_dispatcher {
             local.set_controller_dispatcher(dispatcher);
         }
-        let ports = ReplicationServerPorts::from_shared(local);
+        let projected_token = Arc::new(
+            crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(
+                local.clone(),
+            ),
+        );
+        let ports = ReplicationServerPorts::from_shared(local, projected_token);
         let capture = Arc::new(
             crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new_capture(
                 db.clone(),
@@ -778,6 +787,27 @@ fn node_authority_from_identity(identity: &crate::auth::AuthenticatedIdentity) -
             .unwrap_or_default()
             .to_string();
         CallerAuthority::Node(node)
+    } else {
+        CallerAuthority::Unrestricted
+    }
+}
+
+/// Projected token issuance is stricter than general NodeRestriction: every
+/// authenticated node certificate, including a control-plane node certificate,
+/// may mint only for the exact node encoded in its `system:node:<name>` CN.
+fn exact_projected_token_node_authority(
+    identity: &crate::auth::AuthenticatedIdentity,
+) -> CallerAuthority {
+    let is_node = identity.username.starts_with("system:node:")
+        && identity.groups.iter().any(|group| group == "system:nodes");
+    if is_node {
+        CallerAuthority::Node(
+            identity
+                .username
+                .strip_prefix("system:node:")
+                .unwrap_or_default()
+                .to_string(),
+        )
     } else {
         CallerAuthority::Unrestricted
     }
@@ -1865,9 +1895,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::ProjectedServiceAccountTokenRequest>,
     ) -> std::result::Result<Response<generated::ProjectedServiceAccountTokenResponse>, Status>
     {
-        self.require_steady_state_auth(&request).await?;
+        let authenticated_identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        let caller = caller_node_authority(&request);
+        let caller = exact_projected_token_node_authority(&authenticated_identity);
         let req = request.into_inner();
         let token_request =
             crate::control_plane::client::ProjectedServiceAccountTokenRequest::try_new(
@@ -1885,7 +1915,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let token = self
             .ports
             .projected_token
-            .issue_projected_service_account_token(token_request)
+            .issue_authenticated_projected_service_account_token(token_request)
             .await
             .map_err(projected_token_error_to_status)?;
         Ok(Response::new(
@@ -2699,7 +2729,8 @@ fn projected_token_error_to_status(
     match error {
         Error::InvalidRequest { .. } => Status::invalid_argument(message),
         Error::NotLeader => Status::failed_precondition("not raft leader"),
-        Error::Unauthorized | Error::BindingMismatch { .. } => Status::permission_denied(message),
+        Error::Unauthorized => Status::permission_denied(message),
+        Error::BindingMismatch { .. } => Status::aborted(message),
         Error::ServiceAccountNotFound | Error::BoundPodNotFound | Error::BoundNodeNotFound => {
             Status::not_found(message)
         }
@@ -5769,6 +5800,123 @@ mod tests {
             .await
             .expect_err("node-originated issuance requires the exact bound Pod UID");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn projected_token_rpc_does_not_reauthorize_worker_as_leader_local_kubelet() {
+        struct MissingAuthoritativeTokenState;
+
+        impl klights_leader_api::LeaderAuthenticatedProjectedServiceAccountToken
+            for MissingAuthoritativeTokenState
+        {
+            fn issue_authenticated_projected_service_account_token(
+                &self,
+                _request: klights_leader_api::ProjectedServiceAccountTokenRequest,
+            ) -> klights_leader_api::ProjectedServiceAccountTokenFuture<'_> {
+                Box::pin(async {
+                    Err(klights_leader_api::ProjectedServiceAccountTokenError::BoundPodNotFound)
+                })
+            }
+        }
+
+        let mut grpc = raft_test_server().await;
+        grpc.ports.projected_token = Arc::new(MissingAuthoritativeTokenState);
+        let status = grpc
+            .projected_service_account_token(request_with_node_client_cert(
+                generated::ProjectedServiceAccountTokenRequest {
+                    namespace: "default".to_string(),
+                    service_account_name: "default".to_string(),
+                    audiences: vec!["api".to_string()],
+                    expiration_seconds: 3_600,
+                    bound_pod_name: Some("web".to_string()),
+                    bound_pod_uid: Some("pod-uid".to_string()),
+                    bound_node_name: Some("worker-1".to_string()),
+                    bound_node_uid: None,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("unseeded test server cannot issue a token");
+        assert_eq!(
+            status.code(),
+            tonic::Code::NotFound,
+            "authenticated owning worker must reach the post-auth leader issuer: {status}"
+        );
+        assert_eq!(status.message(), "bound Pod was not found");
+    }
+
+    #[tokio::test]
+    async fn projected_token_rpc_rejects_authenticated_worker_claiming_another_node() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .projected_service_account_token(request_with_node_client_cert(
+                generated::ProjectedServiceAccountTokenRequest {
+                    namespace: "default".to_string(),
+                    service_account_name: "default".to_string(),
+                    audiences: vec!["api".to_string()],
+                    expiration_seconds: 3_600,
+                    bound_pod_name: Some("web".to_string()),
+                    bound_pod_uid: Some("pod-uid".to_string()),
+                    bound_node_name: Some("worker-1".to_string()),
+                    bound_node_uid: None,
+                },
+                "worker-2",
+            ))
+            .await
+            .expect_err("worker certificate must not claim another node");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            "node \"worker-2\" may not act for node \"worker-1\""
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_token_rpc_rejects_authenticated_controlplane_claiming_another_node() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .projected_service_account_token(request_with_controlplane_client_cert(
+                generated::ProjectedServiceAccountTokenRequest {
+                    namespace: "default".to_string(),
+                    service_account_name: "default".to_string(),
+                    audiences: vec!["api".to_string()],
+                    expiration_seconds: 3_600,
+                    bound_pod_name: Some("web".to_string()),
+                    bound_pod_uid: Some("pod-uid".to_string()),
+                    bound_node_name: Some("worker-1".to_string()),
+                    bound_node_uid: None,
+                },
+                "controlplane-2",
+            ))
+            .await
+            .expect_err("control-plane node certificate must not claim another node");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            "node \"controlplane-2\" may not act for node \"worker-1\""
+        );
+    }
+
+    #[test]
+    fn projected_token_server_error_mapping_preserves_binding_and_authority_classes() {
+        use klights_leader_api::ProjectedServiceAccountTokenError as Error;
+
+        for (error, expected_code, expected_message) in [
+            (
+                Error::Unauthorized,
+                tonic::Code::PermissionDenied,
+                "projected token issuance requires the node identity bound to the Pod",
+            ),
+            (
+                Error::binding_mismatch("Pod UID changed"),
+                tonic::Code::Aborted,
+                "Pod UID changed",
+            ),
+        ] {
+            let status = super::projected_token_error_to_status(error);
+            assert_eq!(status.code(), expected_code);
+            assert_eq!(status.message(), expected_message);
+        }
     }
 
     #[tokio::test]

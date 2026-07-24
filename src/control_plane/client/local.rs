@@ -8,7 +8,8 @@ use tokio::sync::OnceCell;
 use tokio::sync::watch;
 
 use crate::control_plane::client::{
-    CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness,
+    CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
+    LeaderAuthenticatedProjectedServiceAccountToken, LeaderCacheReadiness,
     LeaderNetworkTopologyCommand, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
     LeaderNodeLifecycleStatus, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
     LeaderProjectedServiceAccountToken, LeaderResourceCommand, LeaderResourceQuery, LeaderWatch,
@@ -107,7 +108,68 @@ pub struct LocalApiClient {
     is_leader_rx: watch::Receiver<bool>,
 }
 
+/// A one-operation leadership generation fence. `watch` versions advance on
+/// every send, so `has_changed` detects both ordinary demotion and a
+/// demote/promote ABA even when the latest boolean is `true` again.
+struct LeadershipGenerationFence {
+    receiver: watch::Receiver<bool>,
+}
+
+impl LeadershipGenerationFence {
+    fn sample(
+        mut receiver: watch::Receiver<bool>,
+    ) -> Result<Self, ProjectedServiceAccountTokenError> {
+        if !*receiver.borrow_and_update() {
+            return Err(ProjectedServiceAccountTokenError::NotLeader);
+        }
+        Ok(Self { receiver })
+    }
+
+    fn ensure_unchanged(&self) -> Result<(), ProjectedServiceAccountTokenError> {
+        if self.receiver.has_changed().unwrap_or(true) || !*self.receiver.borrow() {
+            Err(ProjectedServiceAccountTokenError::NotLeader)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl LocalApiClient {
+    fn issue_projected_token_after_transport_auth(
+        &self,
+        request: ProjectedServiceAccountTokenRequest,
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
+        Box::pin(async move {
+            let leadership = LeadershipGenerationFence::sample(self.is_leader_rx.clone())?;
+            let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+                &self.file_process,
+                &self.containerd_namespace,
+            )
+            .await
+            .map_err(|error| {
+                ProjectedServiceAccountTokenError::signing_failed(format!(
+                    "ServiceAccount signing key for {} is unavailable: {error}",
+                    self.containerd_namespace
+                ))
+            });
+            leadership.ensure_unchanged()?;
+            let signing_key_pem = signing_key_pem?;
+            let claims =
+                crate::control_plane::service_account_tokens::authorize_projected_service_account_token(
+                self.db.as_ref(),
+                self.pod_store.as_ref(),
+                &request,
+            )
+            .await;
+            leadership.ensure_unchanged()?;
+            let claims = claims?;
+            crate::control_plane::service_account_tokens::sign_authorized_projected_service_account_token(
+                &signing_key_pem,
+                claims,
+            )
+        })
+    }
+
     #[cfg(not(test))]
     pub fn new(
         db: DatastoreHandle,
@@ -775,31 +837,35 @@ impl LeaderProjectedServiceAccountToken for LocalApiClient {
         request: ProjectedServiceAccountTokenRequest,
     ) -> ProjectedServiceAccountTokenFuture<'_> {
         Box::pin(async move {
-            if !*self.is_leader_rx.borrow() {
-                return Err(ProjectedServiceAccountTokenError::NotLeader);
-            }
             if request.bound_node_name() != self.authoring_node {
                 return Err(ProjectedServiceAccountTokenError::Unauthorized);
             }
-            let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-                &self.file_process,
-                &self.containerd_namespace,
-            )
-            .await
-            .map_err(|error| {
-                ProjectedServiceAccountTokenError::signing_failed(format!(
-                    "ServiceAccount signing key for {} is unavailable: {error}",
-                    self.containerd_namespace
-                ))
-            })?;
-            crate::control_plane::service_account_tokens::issue_projected_service_account_token(
-                self.db.as_ref(),
-                self.pod_store.as_ref(),
-                &signing_key_pem,
-                &request,
-            )
-            .await
+            self.issue_projected_token_after_transport_auth(request)
+                .await
         })
+    }
+}
+
+/// Narrow adapter mounted only behind the gRPC handler's authenticated-node
+/// check. Keeping this separate prevents local kubelet callers from bypassing
+/// `LocalApiClient`'s `authoring_node` restriction.
+pub(crate) struct AuthenticatedProjectedTokenIssuer {
+    local: Arc<LocalApiClient>,
+}
+
+impl AuthenticatedProjectedTokenIssuer {
+    pub(crate) fn new(local: Arc<LocalApiClient>) -> Self {
+        Self { local }
+    }
+}
+
+impl LeaderAuthenticatedProjectedServiceAccountToken for AuthenticatedProjectedTokenIssuer {
+    fn issue_authenticated_projected_service_account_token(
+        &self,
+        request: ProjectedServiceAccountTokenRequest,
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
+        self.local
+            .issue_projected_token_after_transport_auth(request)
     }
 }
 
@@ -1153,7 +1219,7 @@ mod inner_gate_tests {
     use super::*;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
-    use crate::datastore::{ReplicatedCreateOptions, ResourceListQuery};
+    use crate::datastore::{DatastoreBackend, ReplicatedCreateOptions, ResourceListQuery};
     use crate::kubelet::outbox::OutboxApplyError;
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
     use futures::StreamExt as _;
@@ -2216,6 +2282,197 @@ mod inner_gate_tests {
         drop(rx);
         let rx2 = always_leader_watch();
         assert!(*rx2.borrow(), "always_leader_watch must stay true");
+    }
+
+    #[tokio::test]
+    async fn local_projected_token_capability_remains_self_node_scoped() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let client = LocalApiClient::new(db, "leader-cp1".to_string(), always_leader_watch());
+        let request = ProjectedServiceAccountTokenRequest::try_new(
+            "default",
+            "default",
+            vec!["api".to_string()],
+            3_600,
+            "client",
+            "pod-uid",
+            "mn-worker",
+            None,
+        )
+        .unwrap();
+
+        let error = LeaderProjectedServiceAccountToken::issue_projected_service_account_token(
+            &client, request,
+        )
+        .await
+        .expect_err("local kubelet capability must not mint for another node");
+        assert_eq!(error, ProjectedServiceAccountTokenError::Unauthorized);
+    }
+
+    #[test]
+    fn projected_token_leadership_fence_rejects_demotion_and_aba() {
+        for transitions in [&[false][..], &[false, true][..]] {
+            let (tx, rx) = watch::channel(true);
+            let fence = LeadershipGenerationFence::sample(rx).expect("initial leader");
+            for state in transitions {
+                tx.send(*state).unwrap();
+            }
+            assert_eq!(
+                fence.ensure_unchanged(),
+                Err(ProjectedServiceAccountTokenError::NotLeader),
+                "every leadership generation change must invalidate the operation: {transitions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projected_token_leadership_fence_accepts_only_stable_generation() {
+        let (_tx, rx) = watch::channel(true);
+        let fence = LeadershipGenerationFence::sample(rx).expect("initial leader");
+        assert_eq!(fence.ensure_unchanged(), Ok(()));
+
+        let (_tx, rx) = watch::channel(false);
+        assert!(matches!(
+            LeadershipGenerationFence::sample(rx),
+            Err(ProjectedServiceAccountTokenError::NotLeader)
+        ));
+    }
+
+    async fn seed_projected_token_adapter_resources(db: &dyn DatastoreBackend) {
+        for name in ["default", "other"] {
+            db.create_resource(
+                "v1",
+                "ServiceAccount",
+                Some("default"),
+                name,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ServiceAccount",
+                    "metadata": {"namespace": "default", "name": name, "uid": format!("sa-{name}")}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "node-a",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "node-a", "uid": "node-uid-a"}
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "pod-a",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "pod-a", "uid": "pod-uid-a"},
+                "spec": {"serviceAccountName": "default", "nodeName": "node-a"}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seeded_authenticated_projected_token_adapter() -> (
+        tempfile::TempDir,
+        AuthenticatedProjectedTokenIssuer,
+        ProjectedServiceAccountTokenRequest,
+    ) {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_projected_token_adapter_resources(db.as_ref()).await;
+        let data_root = tempfile::tempdir().unwrap();
+        let namespace = data_root.path().to_str().unwrap().to_string();
+        crate::utils::create_dir_all(crate::paths::etc_dir_path(&namespace)).unwrap();
+        let signing_key = crate::auth::generate_ca_full().unwrap().3;
+        crate::utils::write_file(
+            crate::paths::service_account_signing_key_path(&namespace),
+            &signing_key,
+        )
+        .unwrap();
+        let local = Arc::new(
+            LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+                db,
+                "leader-cp1".to_string(),
+                namespace,
+                Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+                always_leader_watch(),
+                crate::kubelet::file_blocking::test_file_process_executor(),
+            ),
+        );
+        let request = ProjectedServiceAccountTokenRequest::try_new(
+            "default",
+            "default",
+            vec!["api".to_string()],
+            3_600,
+            "pod-a",
+            "pod-uid-a",
+            "node-a",
+            Some("node-uid-a".to_string()),
+        )
+        .unwrap();
+        (
+            data_root,
+            AuthenticatedProjectedTokenIssuer::new(local),
+            request,
+        )
+    }
+
+    #[tokio::test]
+    async fn authenticated_projected_token_adapter_signs_from_seeded_leader_state() {
+        let (_data_root, adapter, request) = seeded_authenticated_projected_token_adapter().await;
+        let token = adapter
+            .issue_authenticated_projected_service_account_token(request)
+            .await
+            .expect("privileged post-auth adapter must sign authoritative bound claims");
+        assert_eq!(token.token().split('.').count(), 3);
+    }
+
+    #[tokio::test]
+    async fn authenticated_projected_token_adapter_preserves_binding_mismatches() {
+        let cases = [
+            (
+                "service account",
+                "other",
+                "pod-uid-a",
+                "node-a",
+                "node-uid-a",
+            ),
+            ("Pod UID", "default", "wrong-pod", "node-a", "node-uid-a"),
+            ("node name", "default", "pod-uid-a", "node-b", "node-uid-a"),
+            ("node UID", "default", "pod-uid-a", "node-a", "wrong-node"),
+        ];
+        for (label, service_account, pod_uid, node_name, node_uid) in cases {
+            let (_data_root, adapter, _) = seeded_authenticated_projected_token_adapter().await;
+            let request = ProjectedServiceAccountTokenRequest::try_new(
+                "default",
+                service_account,
+                vec!["api".to_string()],
+                3_600,
+                "pod-a",
+                pod_uid,
+                node_name,
+                Some(node_uid.to_string()),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    adapter
+                        .issue_authenticated_projected_service_account_token(request)
+                        .await,
+                    Err(ProjectedServiceAccountTokenError::BindingMismatch { .. })
+                ),
+                "{label} mismatch must remain a binding mismatch"
+            );
+        }
     }
 
     /// T6 step 2 (audit): `LocalApiClient`'s embedded `N1Raft` writer is

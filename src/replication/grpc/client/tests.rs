@@ -35,6 +35,29 @@ mod cases {
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[test]
+    fn projected_token_client_error_mapping_preserves_binding_and_authority_classes() {
+        use klights_leader_api::ProjectedServiceAccountTokenError as Error;
+
+        for (status, expected) in [
+            (
+                tonic::Status::permission_denied("wrong caller node"),
+                Error::Unauthorized,
+            ),
+            (
+                tonic::Status::aborted("Pod UID changed"),
+                Error::binding_mismatch("Pod UID changed"),
+            ),
+        ] {
+            assert_eq!(
+                super::super::projected_token_error_from_unary(
+                    super::super::UnaryRpcError::Status(status)
+                ),
+                expected
+            );
+        }
+    }
+
     fn dataplane() -> JoinDataplaneMetadata {
         JoinDataplaneMetadata {
             public_key: None,

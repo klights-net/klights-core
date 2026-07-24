@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use klights_cluster_core::Resource;
 use klights_leader_api::{
-    LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken, PodCleanupIntent,
-    PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
-    PodCleanupIntentListRequest, ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
+    LeaderAuthenticatedProjectedServiceAccountToken, LeaderPodCleanupIntents,
+    LeaderProjectedServiceAccountToken, PodCleanupIntent, PodCleanupIntentAckRequest,
+    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
+    ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
     ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest,
 };
 use serde_json::{Value, json};
@@ -321,6 +322,15 @@ impl LeaderProjectedServiceAccountToken for ObjectSafePodEffects {
     }
 }
 
+impl LeaderAuthenticatedProjectedServiceAccountToken for ObjectSafePodEffects {
+    fn issue_authenticated_projected_service_account_token(
+        &self,
+        _request: ProjectedServiceAccountTokenRequest,
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
+        Box::pin(async { ProjectedServiceAccountToken::try_new("header.claims.signature") })
+    }
+}
+
 impl LeaderPodCleanupIntents for ObjectSafePodEffects {
     fn list_pod_cleanup_intents(
         &self,
@@ -341,6 +351,12 @@ impl LeaderPodCleanupIntents for ObjectSafePodEffects {
 fn pod_effect_capabilities_are_object_safe_and_errors_stay_typed() {
     let token_client: &dyn LeaderProjectedServiceAccountToken = &ObjectSafePodEffects;
     drop(token_client.issue_projected_service_account_token(token_request()));
+    let authenticated_token_client: &dyn LeaderAuthenticatedProjectedServiceAccountToken =
+        &ObjectSafePodEffects;
+    drop(
+        authenticated_token_client
+            .issue_authenticated_projected_service_account_token(token_request()),
+    );
 
     let cleanup_client: &dyn LeaderPodCleanupIntents = &ObjectSafePodEffects;
     drop(

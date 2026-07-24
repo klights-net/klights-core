@@ -3673,6 +3673,9 @@ fn projected_token_error_from_unary(error: UnaryRpcError) -> ProjectedServiceAcc
                 tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
                     ProjectedServiceAccountTokenError::Unauthorized
                 }
+                tonic::Code::Aborted => {
+                    ProjectedServiceAccountTokenError::binding_mismatch(message)
+                }
                 tonic::Code::NotFound
                     if message.to_ascii_lowercase().contains("serviceaccount") =>
                 {

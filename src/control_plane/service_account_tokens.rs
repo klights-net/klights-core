@@ -5,12 +5,24 @@ use crate::control_plane::client::{
 use crate::datastore::{Resource, backend::DatastoreBackend};
 use crate::kubelet::pod_repository::store::PodStore;
 
-pub(crate) async fn issue_projected_service_account_token(
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AuthorizedProjectedServiceAccountTokenClaims {
+    service_account_name: String,
+    namespace: String,
+    audiences: Vec<String>,
+    expiration_seconds: i64,
+    service_account_uid: String,
+    bound_pod_name: String,
+    bound_pod_uid: String,
+    bound_node_name: String,
+    bound_node_uid: String,
+}
+
+pub(crate) async fn authorize_projected_service_account_token(
     db: &dyn DatastoreBackend,
     pod_store: &PodStore,
-    signing_key_pem: &str,
     request: &ProjectedServiceAccountTokenRequest,
-) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
+) -> Result<AuthorizedProjectedServiceAccountTokenClaims, ProjectedServiceAccountTokenError> {
     let service_account = db
         .get_resource(
             "v1",
@@ -29,36 +41,60 @@ pub(crate) async fn issue_projected_service_account_token(
         request.service_account_name(),
         None,
     )?;
-    let service_account_uid = service_account.uid.as_str();
-
     let (bound_pod_name, bound_pod_uid, bound_node_name, bound_node_uid) =
         resolve_bound_pod_and_node(db, pod_store, request).await?;
 
-    let audience_refs: Vec<&str> = request.audiences().iter().map(String::as_str).collect();
-    let expiration_seconds = crate::auth::normalize_service_account_token_expiration_seconds(Some(
-        request.expiration_seconds(),
-    ));
+    Ok(AuthorizedProjectedServiceAccountTokenClaims {
+        service_account_name: request.service_account_name().to_string(),
+        namespace: request.namespace().to_string(),
+        audiences: request.audiences().to_vec(),
+        expiration_seconds: crate::auth::normalize_service_account_token_expiration_seconds(Some(
+            request.expiration_seconds(),
+        )),
+        service_account_uid: service_account.uid,
+        bound_pod_name,
+        bound_pod_uid,
+        bound_node_name,
+        bound_node_uid,
+    })
+}
 
+pub(crate) fn sign_authorized_projected_service_account_token(
+    signing_key_pem: &str,
+    claims: AuthorizedProjectedServiceAccountTokenClaims,
+) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
+    let audience_refs: Vec<&str> = claims.audiences.iter().map(String::as_str).collect();
     let token =
         crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
             ca_key_pem: signing_key_pem,
-            service_account: request.service_account_name(),
-            namespace: request.namespace(),
+            service_account: &claims.service_account_name,
+            namespace: &claims.namespace,
             audiences: &audience_refs,
-            expiration_seconds: Some(expiration_seconds),
+            expiration_seconds: Some(claims.expiration_seconds),
             bound: crate::auth::BoundServiceAccountToken {
-                pod_name: Some(bound_pod_name.as_str()),
-                pod_uid: Some(bound_pod_uid.as_str()),
-                node_name: Some(bound_node_name.as_str()),
-                node_uid: Some(bound_node_uid.as_str()),
+                pod_name: Some(&claims.bound_pod_name),
+                pod_uid: Some(&claims.bound_pod_uid),
+                node_name: Some(&claims.bound_node_name),
+                node_uid: Some(&claims.bound_node_uid),
                 secret_name: None,
                 secret_uid: None,
-                sa_uid: Some(service_account_uid),
+                sa_uid: Some(&claims.service_account_uid),
             },
         })
         .map_err(|error| ProjectedServiceAccountTokenError::signing_failed(error.to_string()))?;
 
     ProjectedServiceAccountToken::try_new(token)
+}
+
+#[cfg(test)]
+async fn issue_projected_service_account_token(
+    db: &dyn DatastoreBackend,
+    pod_store: &PodStore,
+    signing_key_pem: &str,
+    request: &ProjectedServiceAccountTokenRequest,
+) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
+    let claims = authorize_projected_service_account_token(db, pod_store, request).await?;
+    sign_authorized_projected_service_account_token(signing_key_pem, claims)
 }
 
 async fn resolve_bound_pod_and_node(

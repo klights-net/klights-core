@@ -1109,8 +1109,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ));
         #[cfg(not(test))]
         let app = {
+            let authenticated_projected_token = Arc::new(
+                crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(
+                    local_api_client.clone(),
+                ),
+            );
             let grpc_ports = crate::replication::grpc::server::ReplicationServerPorts::from_shared(
                 local_api_client.clone(),
+                authenticated_projected_token,
             );
             let snapshot_capture = Arc::new(
                 crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new_capture(

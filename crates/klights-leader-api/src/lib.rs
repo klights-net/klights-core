@@ -1488,6 +1488,20 @@ pub trait LeaderProjectedServiceAccountToken: Send + Sync {
     ) -> ProjectedServiceAccountTokenFuture<'_>;
 }
 
+/// Leader-local issuer entered only after a transport adapter has authenticated
+/// the caller and constrained it to `request.bound_node_name()`.
+///
+/// This capability deliberately differs from
+/// [`LeaderProjectedServiceAccountToken`], whose callers are kubelets and must
+/// still enforce their own node identity. Implementations must resolve the
+/// bound Pod and Node from authoritative leader state before signing.
+pub trait LeaderAuthenticatedProjectedServiceAccountToken: Send + Sync {
+    fn issue_authenticated_projected_service_account_token(
+        &self,
+        request: ProjectedServiceAccountTokenRequest,
+    ) -> ProjectedServiceAccountTokenFuture<'_>;
+}
+
 /// Failure returned by the exact cleanup-intent list/ack capability.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
