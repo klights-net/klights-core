@@ -21,6 +21,8 @@ pub struct AppState {
     /// semaphore-backed seats for limited priority levels.
     pub api_priority_fairness: std::sync::Arc<crate::api_priority_fairness::ApiPriorityFairness>,
     pub rbac_policy_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
+    pub(crate) bootstrap_token_authenticator:
+        Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
     /// Kubelet-facing cluster-state API. Leader mode uses the in-process
     /// LocalApiClient; remote worker implementations arrive with T4.
     pub cluster_api: std::sync::Arc<dyn LeaderApiClient>,
@@ -98,7 +100,7 @@ pub struct AppState {
     pub oidc_authenticator: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
     /// Optional webhook token authenticator. When configured, validates bearer
     /// tokens by calling an external TokenReview webhook.
-    pub webhook_authenticator: Option<Arc<crate::auth::webhook_auth::WebhookAuth>>,
+    pub webhook_authenticator: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
     /// Cluster CA certificate PEM. Used by the leader to *cryptographically*
     /// re-authenticate a client certificate forwarded by a follower API proxy
     /// (the `x-remote-client-certificate` header): the leaf must carry a valid

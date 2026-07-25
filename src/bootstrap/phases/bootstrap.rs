@@ -143,6 +143,142 @@ async fn activate_committed_apply_rv_v1_if_possible(
     }
 }
 
+async fn read_optional_auth_pem(
+    supervisor: &TaskSupervisor,
+    label: &'static str,
+    description: &'static str,
+    path: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path_buf = std::path::PathBuf::from(path);
+    let key = path_buf.to_string_lossy().into_owned();
+    let pem = supervisor
+        .run_blocking_file_keyed(label, key, move || crate::utils::read_utf8_file(path_buf))
+        .await
+        .with_context(|| format!("failed to join {description} read"))?
+        .with_context(|| format!("failed to read {description} {path}"))?;
+    Ok(Some(pem))
+}
+
+async fn compose_oidc_authenticator(
+    config: &KlightsConfig,
+    supervisor: &TaskSupervisor,
+) -> Result<Option<Arc<dyn crate::auth::oidc::OidcValidator>>> {
+    let Some(issuer_url) = config.oidc_issuer_url.as_ref() else {
+        return Ok(None);
+    };
+    let client_id = config
+        .oidc_client_id
+        .as_deref()
+        .filter(|client_id| !client_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("OIDC client ID is required when OIDC is configured"))?;
+    let ca_bundle = read_optional_auth_pem(
+        supervisor,
+        "oidc_read_ca_bundle",
+        "OIDC CA bundle",
+        config.oidc_ca_bundle.as_deref(),
+    )
+    .await?;
+    let oidc_config = crate::auth::oidc::prepare_oidc_config(Some(crate::auth::oidc::OidcConfig {
+        issuer_url: issuer_url.clone(),
+        client_id: client_id.to_string(),
+        username_claim: config.oidc_username_claim.clone(),
+        username_prefix: None,
+        groups_claim: config.oidc_groups_claim.clone(),
+        groups_prefix: config.oidc_groups_prefix.clone(),
+        ca_bundle,
+        signing_algs: crate::auth::oidc::default_signing_algs(),
+    }))
+    .ok_or_else(|| anyhow::anyhow!("invalid OIDC authenticator configuration"))?;
+    let discovery_ca_bundle = oidc_config.ca_bundle.clone();
+    let crypto = klights_supervisor::CryptoExecutor::from_supervisor(supervisor);
+    let discovery = crypto
+        .run_blocking("oidc-http-discovery-client-construction", move || {
+            crate::auth::oidc::HttpOidcDiscovery::new(discovery_ca_bundle)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("OIDC client construction failed: {error}"))?
+        .map_err(|error| anyhow::anyhow!("invalid OIDC authenticator configuration: {error}"))?;
+    let authenticator: Arc<dyn crate::auth::oidc::OidcValidator> =
+        Arc::new(crate::auth::oidc::JwtOidcValidator::new(
+            oidc_config,
+            Box::new(discovery),
+            Arc::new(supervisor.clone()),
+        ));
+    Ok(Some(authenticator))
+}
+
+async fn compose_webhook_authenticator(
+    config: &KlightsConfig,
+    supervisor: &TaskSupervisor,
+) -> Result<Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>> {
+    let Some(url) = config.webhook_auth_url.as_ref() else {
+        return Ok(None);
+    };
+    let ca_bundle = read_optional_auth_pem(
+        supervisor,
+        "webhook_auth_read_ca_bundle",
+        "webhook auth CA bundle",
+        config.webhook_auth_ca_bundle.as_deref(),
+    )
+    .await?;
+    let client_cert = read_optional_auth_pem(
+        supervisor,
+        "webhook_auth_read_client_cert",
+        "webhook auth client certificate",
+        config.webhook_auth_client_cert.as_deref(),
+    )
+    .await?;
+    let client_key = read_optional_auth_pem(
+        supervisor,
+        "webhook_auth_read_client_key",
+        "webhook auth client key",
+        config.webhook_auth_client_key.as_deref(),
+    )
+    .await?;
+    let webhook_config = crate::auth::webhook_auth::prepare_webhook_auth_config(Some(
+        crate::auth::webhook_auth::WebhookAuthConfig {
+            url: url.clone(),
+            ca_bundle,
+            client_cert,
+            client_key,
+            audiences: config
+                .webhook_auth_audiences
+                .split(',')
+                .map(str::trim)
+                .filter(|audience| !audience.is_empty())
+                .map(str::to_string)
+                .collect(),
+            cache_authorized_ttl_secs: config.webhook_auth_cache_authorized_ttl_secs,
+            cache_unauthorized_ttl_secs: config.webhook_auth_cache_unauthorized_ttl_secs,
+        },
+    ))?;
+    let Some(webhook_config) = webhook_config else {
+        return Ok(None);
+    };
+    let reviewer_config = webhook_config.clone();
+    let crypto = klights_supervisor::CryptoExecutor::from_supervisor(supervisor);
+    let reviewer: Arc<dyn crate::auth::webhook_auth::WebhookTokenReviewer> = Arc::new(
+        crypto
+            .run_blocking("webhook-http-reviewer-client-construction", move || {
+                crate::auth::webhook_auth::HttpWebhookTokenReviewer::new(reviewer_config)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("webhook client construction failed: {error}"))??,
+    );
+    let authenticator: Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator> =
+        Arc::new(crate::auth::webhook_auth::WebhookAuth::new(
+            reviewer,
+            std::time::Duration::from_secs(webhook_config.cache_authorized_ttl_secs),
+            std::time::Duration::from_secs(webhook_config.cache_unauthorized_ttl_secs),
+            webhook_config.audiences,
+            Arc::new(crate::auth::clock::SystemMonotonicClock),
+        ));
+    Ok(Some(authenticator))
+}
+
 pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let BootstrapRunArgs {
         config,
@@ -240,7 +376,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .context("Failed to rebuild NodePort allocator")?;
 
     // Load CA cert/key for CSR signing (supervised file I/O)
-    let csr_signer: Option<std::sync::Arc<dyn crate::auth::csr_signer::CsrSigner>> = {
+    let csr_issuer: Option<std::sync::Arc<dyn crate::controllers::csr_signer::CsrIssuer>> = {
         let ca_cert_path = crate::paths::ca_cert_path(&config.containerd_namespace);
         let ca_key_path = crate::paths::ca_key_path(&config.containerd_namespace);
         let cert_result = supervisor
@@ -264,10 +400,22 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             )
             .await;
         match (cert_result, key_result) {
-            (Ok(Ok(ca_cert)), Ok(Ok(ca_key))) => Some(std::sync::Arc::new(
-                crate::auth::csr_signer::CaCsrSigner::new(ca_cert, ca_key),
-            )
-                as std::sync::Arc<dyn crate::auth::csr_signer::CsrSigner>),
+            (Ok(Ok(ca_cert)), Ok(Ok(ca_key))) => {
+                let signer: std::sync::Arc<dyn crate::auth::csr_signer::CsrSigner> =
+                    std::sync::Arc::new(crate::auth::csr_signer::CaCsrSigner::new(
+                        ca_cert,
+                        ca_key,
+                        std::sync::Arc::new(crate::auth::clock::SystemClock),
+                    ));
+                Some(
+                    std::sync::Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
+                        signer,
+                        std::sync::Arc::new(crate::auth::clock::SystemClock),
+                        supervisor.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::controllers::csr_signer::CsrIssuer>,
+                )
+            }
             _ => {
                 tracing::warn!(
                     "CA cert/key not found at {:?}/{:?}; CSR signing disabled",
@@ -284,7 +432,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             service_ipam.clone(),
             nodeport_alloc.clone(),
             supervisor.clone(),
-            csr_signer,
+            csr_issuer,
         ),
     );
     controller_dispatcher.set_services(services.clone()).await;
@@ -447,16 +595,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         tokio::sync::Mutex::new(crate::kubelet::pod_creation_state::PodStartRetryState::new()),
     );
     side_effects.set_pod_repository(api_pod_repository.clone());
-    let oidc_authenticator =
-        crate::bootstrap::auth_composition::build_oidc_authenticator(config, supervisor.as_ref())
-            .await
-            .context("failed to build OIDC authenticator")?;
-    let webhook_authenticator = crate::bootstrap::auth_composition::build_webhook_authenticator(
-        config,
-        supervisor.as_ref(),
-    )
-    .await
-    .context("failed to build webhook authenticator")?;
+    let oidc_authenticator = compose_oidc_authenticator(config, supervisor.as_ref())
+        .await
+        .context("failed to build OIDC authenticator")?;
+    let webhook_authenticator = compose_webhook_authenticator(config, supervisor.as_ref())
+        .await
+        .context("failed to build webhook authenticator")?;
 
     // P3-11f: leadership watch channels for API proxy gating.
     // The shape watcher updates the senders; AppState holds the
@@ -517,9 +661,28 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         None
     };
 
+    let rbac_policy_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore> =
+        std::sync::Arc::new(
+            crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(std::sync::Arc::new(
+                crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
+                    db_handle.clone(),
+                ),
+            )),
+        );
+    let node_policy_store: std::sync::Arc<dyn crate::auth::node_policy_store::NodePolicyStore> =
+        std::sync::Arc::new(
+            crate::bootstrap::auth_adapters::PodRepositoryNodePolicyStore::new(
+                api_pod_repository.clone(),
+            ),
+        );
     let node_port_forward = crate::portforward::local_node_port_forward(supervisor.clone());
     let watcher_state = Arc::new(api::AppState {
         db: db_handle.clone(),
+        bootstrap_token_authenticator: Arc::new(
+            crate::api::auth_middleware::DatastoreBootstrapTokenAuthenticator::new(
+                db_handle.clone(),
+            ),
+        ),
         cluster_api: cluster_api.clone(),
         crd_registry,
         mode: node_mode.clone(),
@@ -548,20 +711,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         pod_start_retry_state: Some(pod_start_retry_state.clone()),
         is_raft_leader_rx: raft_leader_proxy,
         authorizer: std::sync::Arc::new(
-            crate::auth::authorizer::AuthorizerChain::chain_with_policy_stores(
-                crate::bootstrap::auth_store_adapters::rbac_policy_store(db_handle.clone()),
-                crate::bootstrap::auth_store_adapters::node_policy_store(
-                    api_pod_repository.clone(),
-                ),
+            crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
+                rbac_policy_store.clone(),
+                node_policy_store,
             ),
         ),
         audit_sink: crate::audit::default_audit_sink(),
         api_priority_fairness: std::sync::Arc::new(
             crate::api_priority_fairness::ApiPriorityFairness::new(),
         ),
-        rbac_policy_store: crate::bootstrap::auth_store_adapters::rbac_policy_store(
-            db_handle.clone(),
-        ),
+        rbac_policy_store,
         oidc_authenticator,
         webhook_authenticator,
         cluster_ca_pem: cluster_ca_pem.map(std::sync::Arc::new),
@@ -1113,8 +1272,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 grpc_node_query.clone(),
                 outbox_runtime.clone(),
             ));
-        #[cfg(not(test))]
-        let app = {
+        {
             let authenticated_projected_token = Arc::new(
                 crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(
                     local_api_client.clone(),
@@ -1129,11 +1287,22 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     db_handle.clone(),
                 ),
             );
-            crate::replication::grpc::server::mount_service_full(
+            crate::replication::grpc::server::mount_service_full_production(
                 api::build_router(state_with_cri),
                 rs,
                 grpc_ports,
                 snapshot_capture,
+                Arc::new(
+                    crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
+                        supervisor.clone(),
+                    ),
+                ),
+                Arc::new(
+                    crate::bootstrap::auth_adapters::AuthControlplaneCredentialIssuer::new(
+                        Arc::new(crate::auth::clock::SystemClock),
+                        supervisor.clone(),
+                    ),
+                ),
                 raft_rpc_router,
                 controlplane_join_handler,
                 crate::replication::grpc::ReplicationRuntimeFiles {
@@ -1150,25 +1319,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Some(local_api_client),
                 grpc_transport_policy,
             )
-        };
-        #[cfg(test)]
-        let app = crate::replication::grpc::server::mount_service_full(
-            api::build_router(state_with_cri),
-            rs,
-            db_handle.clone(),
-            Some(dispatcher_for_worker.clone()),
-            Some(node_lease_tracker.clone()),
-            raft_rpc_router,
-            controlplane_join_handler,
-            &config.containerd_namespace,
-            Some(is_leader_rx_for_grpc),
-            Some(config.node_name.clone()),
-            Some(grpc_node_query),
-            Some(grpc_node_status),
-            Some(local_api_client),
-            grpc_transport_policy,
-        );
-        app
+        }
     } else {
         api::build_router(state_with_cri)
     };
@@ -1214,6 +1365,67 @@ mod tests {
     use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
     use crate::replication::protocol::JoinRole;
     use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
+
+    #[tokio::test]
+    async fn oidc_composition_reads_root_configured_ca_bundle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ca_path = temp_dir.path().join("oidc-ca.pem");
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["oidc.example.com".to_string()]).unwrap();
+        std::fs::write(&ca_path, cert.cert.pem()).unwrap();
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let config = crate::KlightsConfig {
+            oidc_issuer_url: Some("https://oidc.example.com".to_string()),
+            oidc_client_id: Some("klights".to_string()),
+            oidc_ca_bundle: Some(ca_path.to_string_lossy().into_owned()),
+            ..crate::KlightsConfig::test_default()
+        };
+
+        assert!(
+            super::compose_oidc_authenticator(&config, &supervisor)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_composition_requires_client_id() {
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let config = crate::KlightsConfig {
+            oidc_issuer_url: Some("https://oidc.example.com".to_string()),
+            oidc_client_id: None,
+            ..crate::KlightsConfig::test_default()
+        };
+
+        let error = match super::compose_oidc_authenticator(&config, &supervisor).await {
+            Ok(_) => panic!("configured OIDC requires a client ID"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("client ID"));
+    }
+
+    #[tokio::test]
+    async fn webhook_composition_reads_root_configured_ca_bundle() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let ca_path = temp_dir.path().join("webhook-ca.pem");
+        let cert = rcgen::generate_simple_self_signed(vec!["auth-webhook.example.com".to_string()])
+            .unwrap();
+        std::fs::write(&ca_path, cert.cert.pem()).unwrap();
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let config = crate::KlightsConfig {
+            webhook_auth_url: Some("https://auth-webhook.example.com/token".to_string()),
+            webhook_auth_ca_bundle: Some(ca_path.to_string_lossy().into_owned()),
+            ..crate::KlightsConfig::test_default()
+        };
+
+        assert!(
+            super::compose_webhook_authenticator(&config, &supervisor)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     fn remote_client_for_informer_start_test(
         supervisor: Arc<TaskSupervisor>,

@@ -1,8 +1,9 @@
-use crate::auth::clock::{Clock, SystemClock};
+use crate::auth::clock::Clock;
 use anyhow::{Context, Result};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use time::Duration;
 
@@ -44,8 +45,9 @@ fn validate_signing_key_io(path: &Path, pem: String) -> io::Result<String> {
     Ok(pem)
 }
 
-pub fn read_service_account_signing_key(signing_key_path: &Path) -> Result<String> {
-    let pem = crate::utils::read_utf8_file(signing_key_path).with_context(|| {
+#[cfg(test)]
+fn read_service_account_signing_key(signing_key_path: &Path) -> Result<String> {
+    let pem = std::fs::read_to_string(signing_key_path).with_context(|| {
         format!(
             "Failed to read ServiceAccount signing key {}",
             signing_key_path.display()
@@ -55,31 +57,33 @@ pub fn read_service_account_signing_key(signing_key_path: &Path) -> Result<Strin
 }
 
 pub async fn read_service_account_signing_key_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
     signing_key_path: &Path,
+    file_process: &klights_supervisor::FileProcessExecutor,
 ) -> io::Result<String> {
-    let pem = crate::utils::read_utf8_file_async(file_process, signing_key_path)
+    let signing_key_path = signing_key_path.to_path_buf();
+    let key = signing_key_path.to_string_lossy().into_owned();
+    let path_for_read = signing_key_path.clone();
+    let pem = file_process
+        .run_blocking_file_keyed("sa_signer_read_key_async", key, move || {
+            std::fs::read_to_string(path_for_read).map_err(anyhow::Error::from)
+        })
         .await
         .map_err(|err| {
+            let kind = err
+                .downcast_ref::<io::Error>()
+                .map_or(io::ErrorKind::Other, io::Error::kind);
             io::Error::new(
-                err.kind(),
+                kind,
                 format!(
                     "Failed to read ServiceAccount signing key {}: {err}",
                     signing_key_path.display()
                 ),
             )
         })?;
-    validate_signing_key_io(signing_key_path, pem)
+    validate_signing_key_io(&signing_key_path, pem)
 }
 
 pub async fn read_service_account_signing_key_supervised(
-    signing_key_path: &Path,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-) -> Result<String> {
-    read_service_account_signing_key_path_supervised(signing_key_path, task_supervisor).await
-}
-
-pub(crate) async fn read_service_account_signing_key_path_supervised(
     signing_key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<String> {
@@ -88,7 +92,7 @@ pub(crate) async fn read_service_account_signing_key_path_supervised(
     let path_for_read = signing_key_path.clone();
     let pem = task_supervisor
         .run_blocking_file_keyed("sa_signer_read_key", key, move || {
-            crate::utils::read_utf8_file(path_for_read)
+            std::fs::read_to_string(path_for_read)
         })
         .await?
         .with_context(|| {
@@ -114,15 +118,18 @@ pub async fn persist_service_account_signing_key(
         anyhow::bail!("ServiceAccount signing key is empty");
     }
 
-    let etc_dir = signing_key_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("ServiceAccount signing key path has no parent"))?
-        .to_path_buf();
+    let etc_dir = signing_key_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ServiceAccount signing key path has no parent: {}",
+            signing_key_path.display()
+        )
+    })?;
+    let etc_dir = etc_dir.to_path_buf();
     let etc_key = etc_dir.to_string_lossy().into_owned();
+    let etc_dir_for_create = etc_dir.clone();
     task_supervisor
-        .run_blocking_file_keyed("sa_signer_create_etc_dir", etc_key, {
-            let etc_dir = etc_dir.clone();
-            move || crate::utils::create_dir_all(etc_dir)
+        .run_blocking_file_keyed("sa_signer_create_etc_dir", etc_key, move || {
+            std::fs::create_dir_all(etc_dir_for_create)
         })
         .await??;
 
@@ -131,10 +138,10 @@ pub async fn persist_service_account_signing_key(
     let contents = pem.to_string();
     task_supervisor
         .run_blocking_file_keyed("sa_signer_write_key", key, move || {
-            crate::utils::write_file(&path, contents)?;
+            std::fs::write(&path, contents)?;
             // The SA signing key mints arbitrary ServiceAccount tokens — restrict
             // to the owner only.
-            crate::utils::set_unix_mode(&path, 0o600)
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         })
         .await??;
     Ok(())
@@ -171,12 +178,18 @@ pub struct SaObjectClaims {
     pub uid: Option<String>,
 }
 
+#[cfg(test)]
 pub fn decode_serviceaccount_token(
     token: &str,
     ca_key_pem: &str,
     requested_audiences: Option<&[String]>,
 ) -> Result<SaTokenClaims, String> {
-    decode_serviceaccount_token_with_clock(token, ca_key_pem, requested_audiences, &SystemClock)
+    decode_serviceaccount_token_with_clock(
+        token,
+        ca_key_pem,
+        requested_audiences,
+        &crate::auth::clock::SystemClock,
+    )
 }
 
 pub fn decode_serviceaccount_token_with_clock(
@@ -338,6 +351,7 @@ pub fn validate_service_account_uid(
 }
 
 /// Generate a ServiceAccount JWT token signed by the cluster CA
+#[cfg(test)]
 pub fn generate_sa_token(
     ca_key_pem: &str,
     service_account: &str,
@@ -356,6 +370,7 @@ pub fn generate_sa_token(
 
 /// Generate a ServiceAccount JWT token signed by the cluster CA, using the real
 /// ServiceAccount UID (not a random one) so UID validation can check it.
+#[cfg(test)]
 pub fn generate_sa_token_with_sa_uid(
     ca_key_pem: &str,
     service_account: &str,
@@ -401,13 +416,21 @@ pub struct ServiceAccountTokenRequest<'a> {
 /// Generate a ServiceAccount JWT token signed by the cluster CA, optionally
 /// embedding a bound pod reference and the real SA UID (used by projected SA
 /// token volumes). When `sa_uid` is `Some`, it overrides the random fallback UID.
+#[cfg(test)]
 pub fn generate_sa_token_with_bound_pod(request: ServiceAccountTokenRequest<'_>) -> Result<String> {
-    generate_sa_token_with_bound_pod_and_clock(request, &SystemClock)
+    generate_sa_token_with_bound_pod_and_clock(request, &crate::auth::clock::SystemClock)
 }
 
 pub fn generate_sa_token_with_bound_pod_and_clock(
     request: ServiceAccountTokenRequest<'_>,
     clock: &dyn Clock,
+) -> Result<String> {
+    generate_sa_token_with_bound_pod_at(request, clock.now())
+}
+
+pub fn generate_sa_token_with_bound_pod_at(
+    request: ServiceAccountTokenRequest<'_>,
+    issued_at: time::OffsetDateTime,
 ) -> Result<String> {
     let ServiceAccountTokenRequest {
         ca_key_pem,
@@ -467,9 +490,8 @@ pub fn generate_sa_token_with_bound_pod_and_clock(
         kubernetes_io: K8sClaim,
     }
 
-    let now = clock.now();
     let expiration_seconds = normalize_service_account_token_expiration_seconds(expiration_seconds);
-    let exp = now + Duration::seconds(expiration_seconds);
+    let exp = issued_at + Duration::seconds(expiration_seconds);
 
     let claims = Claims {
         iss: "https://kubernetes.default.svc.cluster.local".to_string(),
@@ -477,7 +499,7 @@ pub fn generate_sa_token_with_bound_pod_and_clock(
         aud: audiences.iter().map(|s| s.to_string()).collect(),
         jti: uuid::Uuid::new_v4().to_string(),
         exp: exp.unix_timestamp(),
-        iat: now.unix_timestamp(),
+        iat: issued_at.unix_timestamp(),
         kubernetes_io: K8sClaim {
             namespace: namespace.to_string(),
             serviceaccount: K8sServiceAccountRef {
@@ -606,11 +628,9 @@ mod tests {
             crate::paths::service_account_signing_key_path(&namespace),
             "leader-joined-signing-key\n",
         );
+        let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
 
-        let key = read_service_account_signing_key(
-            &crate::paths::service_account_signing_key_path(&namespace),
-        )
-        .unwrap();
+        let key = read_service_account_signing_key(&signing_key_path).unwrap();
 
         assert_eq!(key, "leader-joined-signing-key\n");
     }
@@ -622,11 +642,10 @@ mod tests {
             crate::paths::ca_key_path(&namespace),
             "worker-local-ca-key\n",
         );
+        let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
 
-        let err = read_service_account_signing_key(
-            &crate::paths::service_account_signing_key_path(&namespace),
-        )
-        .expect_err("missing dedicated ServiceAccount signer must not fall back to ca.key");
+        let err = read_service_account_signing_key(&signing_key_path)
+            .expect_err("missing dedicated ServiceAccount signer must not fall back to ca.key");
 
         assert!(
             err.to_string().contains("service-account-signing.key"),
@@ -645,7 +664,7 @@ mod tests {
 
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
-        let async_err = read_service_account_signing_key_async(&file_process, &signing_key_path)
+        let async_err = read_service_account_signing_key_async(&signing_key_path, &file_process)
             .await
             .expect_err("async read must not fall back to ca.key");
         assert_eq!(async_err.kind(), std::io::ErrorKind::NotFound);
@@ -681,7 +700,7 @@ mod tests {
 
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
-        let async_key = read_service_account_signing_key_async(&file_process, &signing_key_path)
+        let async_key = read_service_account_signing_key_async(&signing_key_path, &file_process)
             .await
             .unwrap();
         let supervisor = klights_supervisor::TaskSupervisor::new(

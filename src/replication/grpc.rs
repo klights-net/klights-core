@@ -17,7 +17,6 @@ use prost::Message;
 use tonic::metadata::{MetadataMap, MetadataValue};
 
 mod ca_files;
-#[cfg(not(test))]
 pub(crate) use ca_files::ReplicationRuntimeFiles;
 mod conversions;
 pub(crate) use conversions::{

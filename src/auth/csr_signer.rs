@@ -2,7 +2,8 @@
 //!
 //! Production signs with the cluster client CA. Tests use `RecordingCsrSigner`.
 
-use crate::auth::clock::{Clock, SystemClock};
+use crate::auth::clock::Clock;
+use klights_supervisor::{TaskCategory, TaskSupervisor};
 use std::sync::Arc;
 
 /// A signing request captured by the signer.
@@ -23,7 +24,191 @@ pub struct SignResult {
 
 /// Object-safe CSR signer trait.
 pub trait CsrSigner: Send + Sync {
-    fn sign(&self, request: SignRequest) -> Result<SignResult, String>;
+    fn sign(
+        &self,
+        request: SignRequest,
+    ) -> Result<SignResult, klights_auth::CredentialOperationError>;
+}
+
+/// Auth-owned kubelet CSR policy. Validation, subject construction, TTL
+/// selection, and signing all execute behind one supervised capability.
+pub struct KubeletCredentialPolicy {
+    signer: Arc<dyn CsrSigner>,
+    clock: Arc<dyn Clock>,
+    supervisor: Arc<TaskSupervisor>,
+}
+
+impl KubeletCredentialPolicy {
+    pub fn new(
+        signer: Arc<dyn CsrSigner>,
+        clock: Arc<dyn Clock>,
+        supervisor: Arc<TaskSupervisor>,
+    ) -> Self {
+        Self {
+            signer,
+            clock,
+            supervisor,
+        }
+    }
+
+    pub async fn issue(
+        &self,
+        request: klights_auth::KubeletCertificateRequest,
+    ) -> Result<klights_auth::KubeletCertificateOutcome, klights_auth::CredentialOperationError>
+    {
+        let signer = self.signer.clone();
+        let issued_at = self.clock.now();
+        self.supervisor
+            .run_blocking(
+                TaskCategory::Others,
+                "issue-kubelet-client-certificate",
+                move || {
+                    let validation = crate::auth::csr_policy::validate_kubelet_client_csr_request(
+                        crate::auth::csr_policy::KubeletClientCsrValidationInput {
+                            signer_name: &request.signer_name,
+                            csr_pem: &request.csr_pem,
+                            usages: &request.usages,
+                            username: &request.username,
+                            groups: &request.groups,
+                            expiration_seconds: request.expiration_seconds,
+                        },
+                    );
+                    if !validation.valid {
+                        return Ok(klights_auth::KubeletCertificateOutcome::Rejected {
+                            reason: validation.reason,
+                        });
+                    }
+                    let node_name = validation.node_name.ok_or_else(|| {
+                        klights_auth::CredentialOperationError::internal_failure(
+                            "CSR policy did not resolve a node identity",
+                        )
+                    })?;
+                    let signed = signer.sign(SignRequest {
+                        csr_pem: request.csr_pem,
+                        common_name: format!("system:node:{node_name}"),
+                        organizations: vec!["system:nodes".to_string()],
+                        usages: request.usages,
+                        ttl_seconds: validation.ttl_seconds,
+                    })?;
+                    Ok(klights_auth::KubeletCertificateOutcome::Issued {
+                        node_name,
+                        certificate_pem: signed.certificate_pem,
+                        issued_at_unix_seconds: issued_at.unix_timestamp(),
+                    })
+                },
+            )
+            .await
+            .map_err(|error| {
+                klights_auth::CredentialOperationError::internal_failure(format!(
+                    "supervised kubelet certificate issuance failed: {error}"
+                ))
+            })?
+    }
+}
+
+pub struct PeerCertificatePolicy {
+    supervisor: Arc<TaskSupervisor>,
+}
+
+impl PeerCertificatePolicy {
+    pub fn new(supervisor: Arc<TaskSupervisor>) -> Self {
+        Self { supervisor }
+    }
+
+    pub async fn authenticate(
+        &self,
+        certificate: klights_types::TlsClientCertificate,
+    ) -> Result<klights_auth::PeerCertificateIdentity, klights_auth::AuthenticationError> {
+        self.supervisor
+            .run_blocking(
+                TaskCategory::Others,
+                "authenticate-replication-peer",
+                move || {
+                    crate::auth::user_from_cert(&certificate.0).map(|user| {
+                        klights_auth::PeerCertificateIdentity {
+                            username: user.username,
+                            groups: user.groups,
+                        }
+                    })
+                },
+            )
+            .await
+            .map_err(|error| {
+                klights_auth::AuthenticationError::internal_failure(format!(
+                    "supervised peer authentication failed: {error}"
+                ))
+            })?
+            .map_err(|error| klights_auth::AuthenticationError::unauthenticated(error.to_string()))
+    }
+}
+
+pub struct ControlplaneCredentialPolicy {
+    clock: Arc<dyn Clock>,
+    supervisor: Arc<TaskSupervisor>,
+}
+
+impl ControlplaneCredentialPolicy {
+    pub fn new(clock: Arc<dyn Clock>, supervisor: Arc<TaskSupervisor>) -> Self {
+        Self { clock, supervisor }
+    }
+
+    pub async fn sign_server_csr(
+        &self,
+        ca_cert_pem: String,
+        ca_key_pem: String,
+        csr_pem: Vec<u8>,
+    ) -> Result<String, klights_auth::CredentialOperationError> {
+        let clock = self.clock.clone();
+        self.supervisor
+            .run_blocking(
+                TaskCategory::Others,
+                "issue-controlplane-server-certificate",
+                move || {
+                    CaCsrSigner::new(ca_cert_pem, ca_key_pem, clock)
+                        .sign(SignRequest {
+                            csr_pem,
+                            common_name: "klights-server".to_string(),
+                            organizations: vec![],
+                            usages: vec!["server auth".to_string()],
+                            ttl_seconds: 86_400 * 365 * 10,
+                        })
+                        .map(|result| result.certificate_pem)
+                },
+            )
+            .await
+            .map_err(|error| {
+                klights_auth::CredentialOperationError::internal_failure(format!(
+                    "supervised control-plane certificate issuance failed: {error}"
+                ))
+            })?
+    }
+
+    pub async fn encrypt_key_material(
+        &self,
+        join_token: String,
+        plaintext: Vec<u8>,
+    ) -> Result<(Vec<u8>, Vec<u8>), klights_auth::CredentialOperationError> {
+        self.supervisor
+            .run_blocking(
+                TaskCategory::Others,
+                "encrypt-controlplane-key-material",
+                move || {
+                    crate::auth::ca_transport::encrypt_ca_key(&join_token, &plaintext)
+                        .map(|(ciphertext, nonce)| (ciphertext, nonce.to_vec()))
+                        .map_err(|error| {
+                            klights_auth::CredentialOperationError::internal_failure(
+                                error.to_string(),
+                            )
+                        })
+                },
+            )
+            .await
+            .map_err(|error| {
+                klights_auth::CredentialOperationError::internal_failure(format!(
+                    "supervised control-plane key encryption failed: {error}"
+                ))
+            })?
+    }
 }
 
 /// Recording signer for tests. Records all sign requests and returns
@@ -55,7 +240,10 @@ impl Default for RecordingCsrSigner {
 }
 
 impl CsrSigner for RecordingCsrSigner {
-    fn sign(&self, request: SignRequest) -> Result<SignResult, String> {
+    fn sign(
+        &self,
+        request: SignRequest,
+    ) -> Result<SignResult, klights_auth::CredentialOperationError> {
         self.requests.lock().unwrap().push(request);
         // Return a fake certificate
         Ok(SignResult {
@@ -76,11 +264,7 @@ pub struct CaCsrSigner {
 }
 
 impl CaCsrSigner {
-    pub fn new(ca_cert_pem: String, ca_key_pem: String) -> Self {
-        Self::new_with_clock(ca_cert_pem, ca_key_pem, Arc::new(SystemClock))
-    }
-
-    pub fn new_with_clock(ca_cert_pem: String, ca_key_pem: String, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(ca_cert_pem: String, ca_key_pem: String, clock: Arc<dyn Clock>) -> Self {
         Self {
             ca_cert_pem,
             ca_key_pem,
@@ -90,15 +274,23 @@ impl CaCsrSigner {
 }
 
 impl CsrSigner for CaCsrSigner {
-    fn sign(&self, request: SignRequest) -> Result<SignResult, String> {
+    fn sign(
+        &self,
+        request: SignRequest,
+    ) -> Result<SignResult, klights_auth::CredentialOperationError> {
         use rcgen::{CertificateParams, DnType, KeyPair};
         use time::Duration;
 
         // Parse the CSR to extract the public key
-        let csr_str = std::str::from_utf8(&request.csr_pem)
-            .map_err(|e| format!("CSR is not valid UTF-8: {e}"))?;
-        let csr_params = rcgen::CertificateSigningRequestParams::from_pem(csr_str)
-            .map_err(|e| format!("failed to parse CSR PEM: {e}"))?;
+        let csr_str = std::str::from_utf8(&request.csr_pem).map_err(|e| {
+            klights_auth::CredentialOperationError::rejected(format!("CSR is not valid UTF-8: {e}"))
+        })?;
+        let csr_params =
+            rcgen::CertificateSigningRequestParams::from_pem(csr_str).map_err(|e| {
+                klights_auth::CredentialOperationError::rejected(format!(
+                    "failed to parse CSR PEM: {e}"
+                ))
+            })?;
 
         // Build certificate parameters from the request
         let mut params = CertificateParams::default();
@@ -146,21 +338,33 @@ impl CsrSigner for CaCsrSigner {
         }
 
         // Parse CA key and build CA certificate for signing
-        let ca_key = KeyPair::from_pem(&self.ca_key_pem)
-            .map_err(|e| format!("failed to parse CA key: {e}"))?;
+        let ca_key = KeyPair::from_pem(&self.ca_key_pem).map_err(|e| {
+            klights_auth::CredentialOperationError::dependency_failure(format!(
+                "failed to parse CA key: {e}"
+            ))
+        })?;
 
         // Reconstruct CA CertificateParams from PEM, then self-sign to get a
         // Certificate object suitable for use as an issuer in signed_by.
-        let ca_params = CertificateParams::from_ca_cert_pem(&self.ca_cert_pem)
-            .map_err(|e| format!("failed to parse CA cert: {e}"))?;
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .map_err(|e| format!("failed to reconstruct CA cert: {e}"))?;
+        let ca_params = CertificateParams::from_ca_cert_pem(&self.ca_cert_pem).map_err(|e| {
+            klights_auth::CredentialOperationError::dependency_failure(format!(
+                "failed to parse CA cert: {e}"
+            ))
+        })?;
+        let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| {
+            klights_auth::CredentialOperationError::dependency_failure(format!(
+                "failed to reconstruct CA cert: {e}"
+            ))
+        })?;
 
         // Sign the leaf certificate with the CA
         let cert = params
             .signed_by(&csr_params.public_key, &ca_cert, &ca_key)
-            .map_err(|e| format!("failed to sign certificate: {e}"))?;
+            .map_err(|e| {
+                klights_auth::CredentialOperationError::internal_failure(format!(
+                    "failed to sign certificate: {e}"
+                ))
+            })?;
 
         let cert_pem = cert.pem();
         Ok(SignResult {
@@ -173,6 +377,10 @@ impl CsrSigner for CaCsrSigner {
 mod tests {
     use super::*;
     use x509_parser::prelude::FromDer;
+
+    fn system_clock() -> Arc<dyn Clock> {
+        Arc::new(crate::auth::clock::SystemClock)
+    }
 
     #[test]
     fn recording_signer_captures_request() {
@@ -217,6 +425,48 @@ mod tests {
         assert_eq!(signer.request_count(), 2);
     }
 
+    #[tokio::test]
+    async fn kubelet_issuance_policy_owns_subject_groups_usages_and_ttl() {
+        let signer = Arc::new(RecordingCsrSigner::new());
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
+        let policy = super::KubeletCredentialPolicy::new(
+            signer.clone(),
+            Arc::new(crate::auth::clock::FixedClock {
+                now: time::OffsetDateTime::UNIX_EPOCH,
+            }),
+            supervisor,
+        );
+        let csr_pem = generate_csr_pem("system:node:tokyo", &["system:nodes"]);
+        let outcome = policy
+            .issue(klights_auth::KubeletCertificateRequest {
+                signer_name: "kubernetes.io/kube-apiserver-client-kubelet".into(),
+                csr_pem: csr_pem.clone(),
+                usages: vec!["client auth".into()],
+                username: "system:bootstrap:abcdef".into(),
+                groups: vec![
+                    "system:bootstrappers".into(),
+                    "system:bootstrappers:klights:worker".into(),
+                ],
+                expiration_seconds: Some(600),
+            })
+            .await
+            .expect("policy should run");
+        assert!(matches!(
+            outcome,
+            klights_auth::KubeletCertificateOutcome::Issued { .. }
+        ));
+        assert_eq!(
+            signer.take_requests(),
+            vec![SignRequest {
+                csr_pem,
+                common_name: "system:node:tokyo".into(),
+                organizations: vec!["system:nodes".into()],
+                usages: vec!["client auth".into()],
+                ttl_seconds: 600,
+            }]
+        );
+    }
+
     fn generate_ca() -> (String, String) {
         use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
         let mut params = CertificateParams::default();
@@ -250,7 +500,7 @@ mod tests {
     #[test]
     fn ca_signer_produces_valid_certificate() {
         let (ca_cert, ca_key) = generate_ca();
-        let signer = CaCsrSigner::new(ca_cert, ca_key);
+        let signer = CaCsrSigner::new(ca_cert, ca_key, system_clock());
 
         let csr_pem = generate_csr_pem("system:node:tokyo", &["system:nodes"]);
         let result = signer
@@ -272,7 +522,7 @@ mod tests {
     #[test]
     fn ca_signer_preserves_san_from_csr() {
         let (ca_cert, ca_key) = generate_ca();
-        let signer = CaCsrSigner::new(ca_cert, ca_key);
+        let signer = CaCsrSigner::new(ca_cert, ca_key, system_clock());
 
         // Generate a CSR with SANs (IP + DNS)
         let mut params = rcgen::CertificateParams::default();
@@ -339,7 +589,7 @@ mod tests {
     #[test]
     fn ca_signer_rejects_invalid_csr() {
         let (ca_cert, ca_key) = generate_ca();
-        let signer = CaCsrSigner::new(ca_cert, ca_key);
+        let signer = CaCsrSigner::new(ca_cert, ca_key, system_clock());
 
         let result = signer.sign(SignRequest {
             csr_pem: b"not a valid CSR".to_vec(),
@@ -353,7 +603,11 @@ mod tests {
 
     #[test]
     fn ca_signer_rejects_invalid_ca_key() {
-        let signer = CaCsrSigner::new("not a cert".to_string(), "not a key".to_string());
+        let signer = CaCsrSigner::new(
+            "not a cert".to_string(),
+            "not a key".to_string(),
+            system_clock(),
+        );
         let csr_pem = generate_csr_pem("test", &[]);
         let result = signer.sign(SignRequest {
             csr_pem,
@@ -370,7 +624,7 @@ mod tests {
         let (ca_cert, ca_key) = generate_ca();
         let fixed_now =
             time::OffsetDateTime::from_unix_timestamp(1_704_067_200).expect("valid timestamp");
-        let signer = CaCsrSigner::new_with_clock(
+        let signer = CaCsrSigner::new(
             ca_cert,
             ca_key,
             std::sync::Arc::new(crate::auth::clock::FixedClock { now: fixed_now }),

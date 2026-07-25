@@ -359,7 +359,7 @@ fn extension_apiserver_authentication_configmap(ca_cert_pem: &str) -> serde_json
             "requestheader-client-ca-file": ca_cert_pem,
             "requestheader-allowed-names": format!(
                 "[\"{}\"]",
-                crate::auth::APISERVICE_PROXY_COMMON_NAME
+                klights_types::APISERVICE_PROXY_COMMON_NAME
             ),
             "requestheader-username-headers": "[\"X-Remote-User\"]",
             "requestheader-group-headers": "[\"X-Remote-Group\"]",

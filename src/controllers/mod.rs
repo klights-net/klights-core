@@ -9,6 +9,7 @@ pub mod cronjob_scheduler;
 pub mod csr_signer;
 pub mod daemonset;
 pub mod daemonset_controller;
+pub mod default_rbac_policy;
 pub mod deployment;
 pub mod deployment_controller;
 pub mod endpoints;

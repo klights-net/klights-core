@@ -5,9 +5,9 @@
 //! maintains per-priority-level admission state.
 
 use crate::api::AppError;
+use crate::api::request_info::{ResolvedAuthz, resolve_request_info};
 use crate::auth::AuthenticatedIdentity;
 use crate::auth::request_attributes::AuthorizationRequest;
-use crate::auth::request_info::{ResolvedAuthz, resolve_request_info};
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -80,7 +80,7 @@ impl ApiPriorityFairness {
         path: &str,
         query: Option<&str>,
     ) -> Result<ApfAdmission, axum::response::Response> {
-        let ResolvedAuthz::Authorize(authz) = resolve_request_info(method.as_str(), path, query);
+        let ResolvedAuthz::Authorize(authz) = resolve_request_info(method, path, query);
         let Some(flow_schema) = select_matching_flow_schema(db, identity, &authz).await else {
             return Ok(ApfAdmission::Exempt);
         };

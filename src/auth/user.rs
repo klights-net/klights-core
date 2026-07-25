@@ -213,7 +213,11 @@ mod tests {
 
         let (_, _, ca_cert_pem, ca_key_pem) = super::super::cert::generate_ca_full().unwrap();
         let csr = super::super::kubelet_client_cert::generate_kubelet_client_csr("cp-1").unwrap();
-        let signer = CaCsrSigner::new(ca_cert_pem, ca_key_pem);
+        let signer = CaCsrSigner::new(
+            ca_cert_pem,
+            ca_key_pem,
+            std::sync::Arc::new(crate::auth::clock::SystemClock),
+        );
         let signed = signer
             .sign(SignRequest {
                 csr_pem: csr.csr_pem,

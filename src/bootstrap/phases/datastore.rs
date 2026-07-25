@@ -1115,9 +1115,13 @@ async fn controlplane_join_client_identity_for_token(
         CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
     };
 
-    let store =
-        SupervisedFilesystemWorkerCredentialStore::for_namespace(namespace, node_name, supervisor);
-    match resolve_credential_async(&store).await {
+    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
+        namespace,
+        node_name,
+        supervisor.clone(),
+    );
+    let crypto = klights_supervisor::CryptoExecutor::new(supervisor);
+    match resolve_credential_async(&store, &crypto).await {
         Ok(CredentialSource::ExistingCert(cred)) => Ok(ControlplaneJoinClientIdentity {
             client_cert_pem: Some(cred.certificate_pem),
             client_key_pem: Some(cred.private_key_pem),

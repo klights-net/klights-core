@@ -830,7 +830,7 @@ mod tests {
                 async move {
                     request
                         .extensions_mut()
-                        .insert(crate::auth::TlsClientCertificate(grpc_node_cert));
+                        .insert(klights_types::TlsClientCertificate(grpc_node_cert));
                     next.run(request).await
                 }
             },

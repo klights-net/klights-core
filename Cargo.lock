@@ -2023,6 +2023,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-cri",
  "k8s-openapi",
+ "klights-auth",
  "klights-cluster-core",
  "klights-cluster-store",
  "klights-internal-protobuf",

@@ -273,6 +273,11 @@ async fn test_replicationcontroller_scale_subresource() {
     ));
     let state = crate::api::AppState {
         db: db_handle.clone(),
+        bootstrap_token_authenticator: std::sync::Arc::new(
+            crate::api::auth_middleware::DatastoreBootstrapTokenAuthenticator::new(
+                db_handle.clone(),
+            ),
+        ),
         cluster_api,
         crd_registry: crate::controllers::crd::CrdRegistry::new(),
         mode: crate::bootstrap::NodeMode::Root,

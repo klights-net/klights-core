@@ -183,6 +183,36 @@ pub struct FileProcessExecutor {
     supervisor: Arc<TaskSupervisor>,
 }
 
+/// Narrow, explicitly injected access to CPU-heavy certificate, key, and
+/// token operations.
+#[derive(Clone)]
+pub struct CryptoExecutor {
+    supervisor: Arc<TaskSupervisor>,
+}
+
+impl CryptoExecutor {
+    pub fn new(supervisor: Arc<TaskSupervisor>) -> Self {
+        Self { supervisor }
+    }
+
+    pub fn from_supervisor(supervisor: &TaskSupervisor) -> Self {
+        Self::new(Arc::new(supervisor.clone()))
+    }
+
+    pub async fn run_blocking<T>(
+        &self,
+        name: impl Into<String>,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        self.supervisor
+            .run_blocking(TaskCategory::Others, name, f)
+            .await
+    }
+}
+
 impl FileProcessExecutor {
     pub fn new(supervisor: Arc<TaskSupervisor>) -> Self {
         Self { supervisor }
@@ -190,6 +220,10 @@ impl FileProcessExecutor {
 
     pub fn from_supervisor(supervisor: &TaskSupervisor) -> Self {
         Self::new(Arc::new(supervisor.clone()))
+    }
+
+    pub fn crypto_executor(&self) -> CryptoExecutor {
+        CryptoExecutor::new(self.supervisor.clone())
     }
 
     pub async fn run_blocking_file<T>(

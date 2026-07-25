@@ -74,6 +74,11 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     ));
     crate::api::AppState {
         db: db_handle.clone(),
+        bootstrap_token_authenticator: std::sync::Arc::new(
+            crate::api::auth_middleware::DatastoreBootstrapTokenAuthenticator::new(
+                db_handle.clone(),
+            ),
+        ),
         cluster_api,
         crd_registry: registry,
         mode: crate::bootstrap::NodeMode::Root,

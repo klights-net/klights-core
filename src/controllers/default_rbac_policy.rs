@@ -1,4 +1,4 @@
-//! Kubernetes default RBAC fixtures and bootstrap seeding helper.
+//! Controller-owned Kubernetes default RBAC fixtures and bootstrap policy.
 //!
 //! Phase 3.2 moves default RBAC object definitions into explicit typed
 //! fixtures so bootstrap and reconcile paths share one source of truth.

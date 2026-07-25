@@ -14,33 +14,42 @@ use time::OffsetDateTime;
 
 /// Mock discovery that returns pre-configured metadata and JWKS.
 struct MockOidcDiscovery {
-    metadata: Result<OidcProviderMetadata, String>,
-    jwks: Result<JwkSet, String>,
+    metadata: Result<OidcProviderMetadata, klights_auth::AuthenticationError>,
+    jwks: Result<JwkSet, klights_auth::AuthenticationError>,
 }
 
 impl MockOidcDiscovery {
-    fn new(metadata: Result<OidcProviderMetadata, String>, jwks: Result<JwkSet, String>) -> Self {
+    fn new(
+        metadata: Result<OidcProviderMetadata, klights_auth::AuthenticationError>,
+        jwks: Result<JwkSet, klights_auth::AuthenticationError>,
+    ) -> Self {
         Self { metadata, jwks }
     }
 }
 
 #[async_trait::async_trait]
 impl OidcDiscovery for MockOidcDiscovery {
-    async fn fetch_discovery(&self, _issuer_url: &str) -> Result<OidcProviderMetadata, String> {
+    async fn fetch_discovery(
+        &self,
+        _issuer_url: &str,
+    ) -> Result<OidcProviderMetadata, klights_auth::AuthenticationError> {
         self.metadata.clone()
     }
-    async fn fetch_jwks(&self, _jwks_uri: &str) -> Result<JwkSet, String> {
+    async fn fetch_jwks(
+        &self,
+        _jwks_uri: &str,
+    ) -> Result<JwkSet, klights_auth::AuthenticationError> {
         self.jwks.clone()
     }
 }
 
 /// Mock validator that returns a pre-configured result.
 struct MockOidcValidator {
-    result: Result<OidcClaims, String>,
+    result: Result<OidcClaims, klights_auth::AuthenticationError>,
 }
 
 impl MockOidcValidator {
-    fn new(result: Result<OidcClaims, String>) -> Self {
+    fn new(result: Result<OidcClaims, klights_auth::AuthenticationError>) -> Self {
         Self { result }
     }
 }
@@ -51,8 +60,23 @@ impl OidcValidator for MockOidcValidator {
         &self,
         _token: &str,
         _now: OffsetDateTime,
-    ) -> Result<OidcClaims, String> {
+    ) -> Result<OidcClaims, klights_auth::AuthenticationError> {
         self.result.clone()
+    }
+}
+
+struct DependencyFailingOidcValidator;
+
+#[async_trait::async_trait]
+impl OidcValidator for DependencyFailingOidcValidator {
+    async fn validate_token(
+        &self,
+        _token: &str,
+        _now: OffsetDateTime,
+    ) -> Result<OidcClaims, klights_auth::AuthenticationError> {
+        Err(klights_auth::AuthenticationError::dependency_failure(
+            "OIDC discovery unavailable",
+        ))
     }
 }
 
@@ -123,6 +147,7 @@ fn jwt_validator(metadata: OidcProviderMetadata, jwks: JwkSet) -> JwtOidcValidat
             signing_algs: default_signing_algs(),
         },
         Box::new(MockOidcDiscovery::new(Ok(metadata), Ok(jwks))),
+        Arc::new(klights_supervisor::TaskSupervisor::new(Default::default())),
     )
 }
 
@@ -141,6 +166,25 @@ fn valid_claims() -> serde_json::Value {
 // ─── Unit tests ────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn oidc_dependency_failure_is_not_a_credential_rejection() {
+    let clock = crate::auth::clock::FixedClock {
+        now: OffsetDateTime::UNIX_EPOCH,
+    };
+    let error = try_oidc_auth(
+        Some(&DependencyFailingOidcValidator),
+        "header.payload.signature",
+        &clock,
+    )
+    .await
+    .expect("configured OIDC must return a decision")
+    .expect_err("dependency outage must fail authentication");
+    assert!(matches!(
+        error,
+        klights_auth::AuthenticationError::DependencyFailure { .. }
+    ));
+}
+
+#[tokio::test]
 async fn test_oidc_config_with_empty_issuer_returns_none() {
     let config = Some(OidcConfig {
         issuer_url: String::new(),
@@ -152,7 +196,7 @@ async fn test_oidc_config_with_empty_issuer_returns_none() {
         ca_bundle: None,
         signing_algs: default_signing_algs(),
     });
-    assert!(build_oidc_authenticator(config).is_none());
+    assert!(prepare_oidc_config(config).is_none());
 }
 
 #[tokio::test]
@@ -167,7 +211,7 @@ async fn test_oidc_config_with_empty_client_id_returns_none() {
         ca_bundle: None,
         signing_algs: default_signing_algs(),
     });
-    assert!(build_oidc_authenticator(config).is_none());
+    assert!(prepare_oidc_config(config).is_none());
 }
 
 #[tokio::test]
@@ -182,12 +226,12 @@ async fn test_oidc_config_with_http_issuer_returns_none() {
         ca_bundle: None,
         signing_algs: default_signing_algs(),
     });
-    assert!(build_oidc_authenticator(config).is_none());
+    assert!(prepare_oidc_config(config).is_none());
 }
 
 #[test]
 fn test_oidc_config_none_returns_none() {
-    assert!(build_oidc_authenticator(None).is_none());
+    assert!(prepare_oidc_config(None).is_none());
 }
 
 #[tokio::test]
@@ -196,6 +240,7 @@ async fn test_mock_validator_returns_success() {
         username: "user1".to_string(),
         groups: vec!["admin".to_string()],
         uid: Some("uid-123".to_string()),
+        audiences: vec!["client-id".to_string()],
     }));
     let result = validator
         .validate_token("any-token", OffsetDateTime::now_utc())
@@ -209,12 +254,14 @@ async fn test_mock_validator_returns_success() {
 
 #[tokio::test]
 async fn test_mock_validator_returns_failure() {
-    let validator = MockOidcValidator::new(Err("bad token".to_string()));
+    let validator = MockOidcValidator::new(Err(
+        klights_auth::AuthenticationError::unauthenticated("bad token"),
+    ));
     let result = validator
         .validate_token("bad-token", OffsetDateTime::now_utc())
         .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("bad token"));
+    assert!(result.unwrap_err().to_string().contains("bad token"));
 }
 
 #[tokio::test]
@@ -230,8 +277,12 @@ async fn test_mock_discovery_returns_metadata() {
 
 #[tokio::test]
 async fn test_mock_discovery_returns_error() {
-    let discovery =
-        MockOidcDiscovery::new(Err("unreachable".to_string()), Ok(JwkSet { keys: vec![] }));
+    let discovery = MockOidcDiscovery::new(
+        Err(klights_auth::AuthenticationError::dependency_failure(
+            "unreachable",
+        )),
+        Ok(JwkSet { keys: vec![] }),
+    );
     let result = discovery
         .fetch_discovery("https://keycloak.example.com/realms/master")
         .await;
@@ -244,6 +295,7 @@ fn test_oidc_claims_groups_prefix_applied() {
         username: "user1".to_string(),
         groups: vec!["oidc:admin".to_string(), "oidc:dev".to_string()],
         uid: None,
+        audiences: vec!["client-id".to_string()],
     };
     // Verify the struct carries the prefixed groups
     assert!(claims.groups[0].starts_with("oidc:"));
@@ -254,11 +306,13 @@ fn test_oidc_claims_groups_prefix_applied() {
 async fn test_jwt_oidc_validator_rejects_expired_token_via_mock() {
     // When a mock validator returns an expiration error,
     // the caller should receive that error.
-    let mock = MockOidcValidator::new(Err("token has expired".to_string()));
+    let mock = MockOidcValidator::new(Err(klights_auth::AuthenticationError::unauthenticated(
+        "token has expired",
+    )));
     let now = OffsetDateTime::now_utc();
     let result = mock.validate_token("any-expired-token", now).await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("expired"));
+    assert!(result.unwrap_err().to_string().contains("expired"));
 }
 
 #[test]
@@ -267,6 +321,7 @@ fn test_oidc_claims_empty_groups_is_ok() {
         username: "user1".to_string(),
         groups: vec![],
         uid: None,
+        audiences: vec!["client-id".to_string()],
     };
     assert!(claims.groups.is_empty());
     assert_eq!(claims.username, "user1");
@@ -284,7 +339,7 @@ async fn test_jwt_oidc_validator_rejects_discovery_issuer_mismatch() {
         .await;
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("issuer"));
+    assert!(result.unwrap_err().to_string().contains("issuer"));
 }
 
 #[tokio::test]
@@ -299,7 +354,7 @@ async fn test_jwt_oidc_validator_rejects_http_jwks_uri() {
         .await;
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("https"));
+    assert!(result.unwrap_err().to_string().contains("https"));
 }
 
 #[tokio::test]
@@ -314,7 +369,7 @@ async fn test_jwt_oidc_validator_rejects_not_before_in_future() {
         .await;
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("nbf"));
+    assert!(result.unwrap_err().to_string().contains("nbf"));
 }
 
 #[tokio::test]
@@ -327,7 +382,7 @@ async fn test_jwt_oidc_validator_rejects_non_default_signing_algorithm() {
         .await;
 
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("algorithm"));
+    assert!(result.unwrap_err().to_string().contains("algorithm"));
 }
 
 #[tokio::test]
@@ -346,6 +401,45 @@ async fn test_jwt_oidc_validator_prefixes_non_email_username_claim_by_default() 
     );
 }
 
+#[test]
+fn test_root_composable_oidc_client_accepts_focused_ca_bundle() {
+    let cert = rcgen::generate_simple_self_signed(vec!["oidc.example.com".to_string()]).unwrap();
+    let config = prepare_oidc_config(Some(OidcConfig {
+        issuer_url: "https://oidc.example.com".to_string(),
+        client_id: "klights".to_string(),
+        username_claim: "sub".to_string(),
+        username_prefix: None,
+        groups_claim: "groups".to_string(),
+        groups_prefix: String::new(),
+        ca_bundle: Some(cert.cert.pem()),
+        signing_algs: default_signing_algs(),
+    }))
+    .unwrap();
+    let discovery = HttpOidcDiscovery::new(config.ca_bundle.clone()).unwrap();
+    let _authenticator: Arc<dyn OidcValidator> = Arc::new(JwtOidcValidator::new(
+        config,
+        Box::new(discovery),
+        Arc::new(klights_supervisor::TaskSupervisor::new(Default::default())),
+    ));
+}
+
+#[test]
+fn test_prepare_oidc_config_rejects_missing_client_id() {
+    assert!(
+        prepare_oidc_config(Some(OidcConfig {
+            issuer_url: "https://oidc.example.com".to_string(),
+            client_id: String::new(),
+            username_claim: "sub".to_string(),
+            username_prefix: None,
+            groups_claim: "groups".to_string(),
+            groups_prefix: String::new(),
+            ca_bundle: None,
+            signing_algs: default_signing_algs(),
+        }))
+        .is_none()
+    );
+}
+
 // ─── try_oidc_auth integration tests ──────────────────────────────────────
 
 #[tokio::test]
@@ -353,7 +447,7 @@ async fn test_try_oidc_auth_no_authenticator_returns_none() {
     let clock = crate::auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
-    let result = try_oidc_auth(&None, "some-token", &clock).await;
+    let result = try_oidc_auth(None, "some-token", &clock).await;
     assert!(result.is_none(), "no OIDC authenticator should return None");
 }
 
@@ -363,11 +457,12 @@ async fn test_try_oidc_auth_success_returns_identity() {
         username: "alice".to_string(),
         groups: vec!["dev".to_string()],
         uid: Some("uid-42".to_string()),
+        audiences: vec!["client-id".to_string()],
     })));
     let clock = crate::auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
-    let result = try_oidc_auth(&Some(validator), "valid-oidc-token", &clock).await;
+    let result = try_oidc_auth(Some(validator.as_ref()), "valid-oidc-token", &clock).await;
     assert!(result.is_some());
     let identity = result.unwrap().unwrap();
     assert_eq!(identity.username, "alice");
@@ -382,12 +477,13 @@ async fn test_try_oidc_auth_success_returns_identity() {
 
 #[tokio::test]
 async fn test_try_oidc_auth_failure_returns_error() {
-    let validator: Arc<dyn OidcValidator> =
-        Arc::new(MockOidcValidator::new(Err("invalid signature".to_string())));
+    let validator: Arc<dyn OidcValidator> = Arc::new(MockOidcValidator::new(Err(
+        klights_auth::AuthenticationError::unauthenticated("invalid signature"),
+    )));
     let clock = crate::auth::clock::FixedClock {
         now: OffsetDateTime::UNIX_EPOCH,
     };
-    let result = try_oidc_auth(&Some(validator), "bad-token", &clock).await;
+    let result = try_oidc_auth(Some(validator.as_ref()), "bad-token", &clock).await;
     assert!(result.is_some());
     let err = result.unwrap().unwrap_err();
     // Should be Unauthorized with OIDC error

@@ -12,8 +12,8 @@
 //!
 //! The middleware only depends on `OidcValidator`, so tests inject a mock.
 
-use crate::auth::AuthError;
 use jsonwebtoken::Algorithm;
+use klights_auth::AuthenticationError;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -54,38 +54,38 @@ pub struct OidcClaims {
     pub username: String,
     pub groups: Vec<String>,
     pub uid: Option<String>,
+    /// Token audiences actually validated by this authenticator.
+    pub audiences: Vec<String>,
 }
 
 /// Trait for fetching OIDC provider metadata and JWKS keys.
 /// Production uses HTTP; tests inject a mock.
 #[async_trait::async_trait]
 pub trait OidcDiscovery: Send + Sync {
-    async fn fetch_discovery(&self, issuer_url: &str) -> Result<OidcProviderMetadata, String>;
-    async fn fetch_jwks(&self, jwks_uri: &str) -> Result<JwkSet, String>;
+    async fn fetch_discovery(
+        &self,
+        issuer_url: &str,
+    ) -> Result<OidcProviderMetadata, AuthenticationError>;
+    async fn fetch_jwks(&self, jwks_uri: &str) -> Result<JwkSet, AuthenticationError>;
 }
 
 /// Trait for validating an OIDC JWT and extracting claims.
 /// Production uses JWKS + jsonwebtoken; tests inject a mock.
 #[async_trait::async_trait]
 pub trait OidcValidator: Send + Sync {
-    async fn validate_token(&self, token: &str, now: OffsetDateTime) -> Result<OidcClaims, String>;
+    async fn validate_token(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<OidcClaims, AuthenticationError>;
 }
 
-/// Build an OIDC authenticator from config if OIDC is enabled.
-/// Returns `None` if `config` is `None` or if the config is incomplete.
-pub fn build_oidc_authenticator(config: Option<OidcConfig>) -> Option<Arc<dyn OidcValidator>> {
-    let mut config = config?;
-    if config.issuer_url.is_empty() || config.client_id.is_empty() {
-        return None;
-    }
-    if !is_https_url(&config.issuer_url) {
-        return None;
-    }
-    if config.signing_algs.is_empty() {
-        config.signing_algs = default_signing_algs();
-    }
-    let discovery = HttpOidcDiscovery::new(config.ca_bundle.clone()).ok()?;
-    Some(Arc::new(JwtOidcValidator::new(config, Box::new(discovery))))
+/// Validate and default focused OIDC policy configuration.
+///
+/// Root composition owns concrete discovery-client and validator selection
+/// after this transport-neutral configuration step succeeds.
+pub fn prepare_oidc_config(config: Option<OidcConfig>) -> Option<OidcConfig> {
+    defaulted_config(config?)
 }
 
 pub fn default_signing_algs() -> Vec<Algorithm> {
@@ -256,11 +256,22 @@ fn defaulted_config(mut config: OidcConfig) -> Option<OidcConfig> {
 /// Returns `None` if no OIDC authenticator is configured (caller should try
 /// the next auth method). Returns `Some(Err)` if OIDC was tried and failed.
 pub async fn try_oidc_auth(
-    authenticator: &Option<Arc<dyn OidcValidator>>,
+    authenticator: Option<&dyn OidcValidator>,
     token: &str,
     clock: &dyn crate::auth::clock::Clock,
-) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AuthError>> {
-    let authenticator = authenticator.as_ref()?;
+) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AuthenticationError>> {
+    try_oidc_auth_with_audiences(authenticator, token, clock)
+        .await
+        .map(|result| result.map(|(identity, _audiences)| identity))
+}
+
+async fn try_oidc_auth_with_audiences(
+    authenticator: Option<&dyn OidcValidator>,
+    token: &str,
+    clock: &dyn crate::auth::clock::Clock,
+) -> Option<Result<(crate::auth::identity::AuthenticatedIdentity, Vec<String>), AuthenticationError>>
+{
+    let authenticator = authenticator?;
     let now = clock.now();
     match authenticator.validate_token(token, now).await {
         Ok(claims) => {
@@ -269,12 +280,56 @@ pub async fn try_oidc_auth(
                 claims.groups,
                 claims.uid,
             );
-            Some(Ok(identity))
+            Some(Ok((identity, claims.audiences)))
         }
-        Err(err) => Some(Err(AuthError::unauthenticated(format!(
-            "invalid OIDC token: {err}"
-        )))),
+        Err(error) => Some(Err(match error {
+            AuthenticationError::Unauthenticated { message } => {
+                AuthenticationError::unauthenticated(format!("invalid OIDC token: {message}"))
+            }
+            AuthenticationError::DependencyFailure { message } => {
+                AuthenticationError::dependency_failure(format!(
+                    "OIDC dependency failed: {message}"
+                ))
+            }
+            AuthenticationError::InternalFailure { message } => {
+                AuthenticationError::internal_failure(format!(
+                    "OIDC verification failed internally: {message}"
+                ))
+            }
+        })),
     }
+}
+
+pub async fn try_oidc_auth_for_review(
+    authenticator: Option<&dyn OidcValidator>,
+    token: &str,
+    clock: &dyn crate::auth::clock::Clock,
+    requested_audiences: &[String],
+) -> Option<Result<(crate::auth::identity::AuthenticatedIdentity, Vec<String>), AuthenticationError>>
+{
+    const DEFAULT_API_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
+    let result = try_oidc_auth_with_audiences(authenticator, token, clock).await?;
+    Some(result.and_then(|(identity, _client_id_audiences)| {
+        // OIDC's JWT audience validates the configured client ID. Kubernetes
+        // then wraps the authenticator as audience-agnostic for API audiences.
+        // This API server exposes its default audience independently of that
+        // OIDC client ID.
+        if requested_audiences.is_empty() {
+            return Ok((identity, Vec::new()));
+        }
+        let audiences = requested_audiences
+            .iter()
+            .filter(|audience| audience.as_str() == DEFAULT_API_AUDIENCE)
+            .cloned()
+            .collect::<Vec<_>>();
+        if audiences.is_empty() {
+            Err(AuthenticationError::unauthenticated(
+                "OIDC authenticator audiences do not intersect TokenReview audiences",
+            ))
+        } else {
+            Ok((identity, audiences))
+        }
+    }))
 }
 
 // ─── Production implementations ────────────────────────────────────────────
@@ -294,9 +349,14 @@ impl HttpOidcDiscovery {
 
 #[async_trait::async_trait]
 impl OidcDiscovery for HttpOidcDiscovery {
-    async fn fetch_discovery(&self, issuer_url: &str) -> Result<OidcProviderMetadata, String> {
+    async fn fetch_discovery(
+        &self,
+        issuer_url: &str,
+    ) -> Result<OidcProviderMetadata, AuthenticationError> {
         if !is_https_url(issuer_url) {
-            return Err("OIDC issuer URL must use https".to_string());
+            return Err(AuthenticationError::internal_failure(
+                "OIDC issuer URL must use https",
+            ));
         }
         let url = format!(
             "{}/.well-known/openid-configuration",
@@ -308,30 +368,42 @@ impl OidcDiscovery for HttpOidcDiscovery {
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| format!("OIDC discovery request failed: {e}"))?;
+            .map_err(|e| {
+                AuthenticationError::dependency_failure(format!(
+                    "OIDC discovery request failed: {e}"
+                ))
+            })?;
         if !resp.status().is_success() {
-            return Err(format!("OIDC discovery returned status {}", resp.status()));
+            return Err(AuthenticationError::dependency_failure(format!(
+                "OIDC discovery returned status {}",
+                resp.status()
+            )));
         }
-        resp.json::<OidcProviderMetadata>()
-            .await
-            .map_err(|e| format!("OIDC discovery parse failed: {e}"))
+        resp.json::<OidcProviderMetadata>().await.map_err(|e| {
+            AuthenticationError::dependency_failure(format!("OIDC discovery parse failed: {e}"))
+        })
     }
 
-    async fn fetch_jwks(&self, jwks_uri: &str) -> Result<JwkSet, String> {
-        validate_jwks_uri(jwks_uri)?;
+    async fn fetch_jwks(&self, jwks_uri: &str) -> Result<JwkSet, AuthenticationError> {
+        validate_jwks_uri(jwks_uri).map_err(AuthenticationError::internal_failure)?;
         let resp = self
             .client
             .get(jwks_uri)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|e| format!("OIDC JWKS request failed: {e}"))?;
+            .map_err(|e| {
+                AuthenticationError::dependency_failure(format!("OIDC JWKS request failed: {e}"))
+            })?;
         if !resp.status().is_success() {
-            return Err(format!("OIDC JWKS returned status {}", resp.status()));
+            return Err(AuthenticationError::dependency_failure(format!(
+                "OIDC JWKS returned status {}",
+                resp.status()
+            )));
         }
-        resp.json::<JwkSet>()
-            .await
-            .map_err(|e| format!("OIDC JWKS parse failed: {e}"))
+        resp.json::<JwkSet>().await.map_err(|e| {
+            AuthenticationError::dependency_failure(format!("OIDC JWKS parse failed: {e}"))
+        })
     }
 }
 
@@ -357,10 +429,15 @@ pub struct JwtOidcValidator {
     config: OidcConfig,
     discovery: Box<dyn OidcDiscovery>,
     keys: tokio::sync::RwLock<Option<ResolvedOidcKeys>>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl JwtOidcValidator {
-    pub fn new(config: OidcConfig, discovery: Box<dyn OidcDiscovery>) -> Self {
+    pub fn new(
+        config: OidcConfig,
+        discovery: Box<dyn OidcDiscovery>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
         let config = defaulted_config(config).unwrap_or(OidcConfig {
             issuer_url: String::new(),
             client_id: String::new(),
@@ -375,13 +452,14 @@ impl JwtOidcValidator {
             config,
             discovery,
             keys: tokio::sync::RwLock::new(None),
+            supervisor,
         }
     }
 
     /// Resolve the signing keys from the OIDC provider.
     /// Returns a vec of (kid, decoding_key) pairs.
-    async fn resolve_keys(&self) -> Result<ResolvedOidcKeys, String> {
-        validate_configured_issuer(&self.config)?;
+    async fn resolve_keys(&self) -> Result<ResolvedOidcKeys, AuthenticationError> {
+        validate_configured_issuer(&self.config).map_err(AuthenticationError::internal_failure)?;
         if let Some(keys) = self.keys.read().await.as_ref().cloned() {
             return Ok(keys);
         }
@@ -394,14 +472,32 @@ impl JwtOidcValidator {
             .fetch_discovery(&self.config.issuer_url)
             .await?;
         if metadata.issuer != self.config.issuer_url {
-            return Err(format!(
+            return Err(AuthenticationError::dependency_failure(format!(
                 "OIDC discovery issuer '{}' does not match configured issuer '{}'",
                 metadata.issuer, self.config.issuer_url
-            ));
+            )));
         }
-        validate_jwks_uri(&metadata.jwks_uri)?;
+        validate_jwks_uri(&metadata.jwks_uri).map_err(AuthenticationError::dependency_failure)?;
         let jwks = self.discovery.fetch_jwks(&metadata.jwks_uri).await?;
-        let keys = Arc::new(usable_jwks_keys(&jwks)?);
+        let keys = Arc::new(
+            self.supervisor
+                .run_blocking(
+                    klights_supervisor::TaskCategory::Others,
+                    "resolve-oidc-signing-keys",
+                    move || usable_jwks_keys(&jwks),
+                )
+                .await
+                .map_err(|error| {
+                    AuthenticationError::internal_failure(format!(
+                        "supervised OIDC key parsing failed: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    AuthenticationError::dependency_failure(format!(
+                        "OIDC signing keys are invalid: {error}"
+                    ))
+                })?,
+        );
         *guard = Some(keys.clone());
         Ok(keys)
     }
@@ -409,79 +505,108 @@ impl JwtOidcValidator {
 
 #[async_trait::async_trait]
 impl OidcValidator for JwtOidcValidator {
-    async fn validate_token(&self, token: &str, now: OffsetDateTime) -> Result<OidcClaims, String> {
+    async fn validate_token(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<OidcClaims, AuthenticationError> {
         let keys = self.resolve_keys().await?;
-
-        // Extract the kid from the JWT header to select the right key
-        let header = jsonwebtoken::decode_header(token)
-            .map_err(|e| format!("OIDC token header parse failed: {e}"))?;
-        validate_alg(&self.config, header.alg)?;
-        let target_kid = header.kid.as_deref().unwrap_or("");
-
-        // Try matching key first, then all keys as fallback
-        let mut attempts = Vec::new();
-        for (kid, decoding_key) in keys.iter() {
-            if kid == target_kid || target_kid.is_empty() {
-                attempts.push(decoding_key);
-            }
-        }
-        // Fallback: try all keys if no kid match
-        if attempts.is_empty() {
-            for (_, decoding_key) in keys.iter() {
-                attempts.push(decoding_key);
-            }
-        }
-
-        let mut last_err = String::new();
-        for decoding_key in attempts {
-            let mut validation = jsonwebtoken::Validation::new(self.config.signing_algs[0]);
-            validation.algorithms = self.config.signing_algs.clone();
-            validation.set_issuer(&[&self.config.issuer_url]);
-            validation.set_audience(&[&self.config.client_id]);
-            validation.validate_exp = false;
-            validation.validate_nbf = false;
-            validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-            match jsonwebtoken::decode::<serde_json::Value>(token, decoding_key, &validation) {
-                Ok(token_data) => {
-                    let claims = &token_data.claims;
-                    validate_time_claims(claims, now)?;
-
-                    // Extract username
-                    let raw_username = claims
-                        .get(&self.config.username_claim)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if raw_username.is_empty() {
-                        return Err(format!(
-                            "OIDC token missing username claim '{}'",
-                            self.config.username_claim
-                        ));
-                    }
-                    let username = apply_username_prefix(&self.config, raw_username);
-
-                    // Extract groups
-                    let groups = extract_groups(&self.config, claims);
-
-                    // Extract uid (optional — use `sub` as fallback)
-                    let uid = claims
-                        .get("sub")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-
-                    return Ok(OidcClaims {
-                        username,
-                        groups,
-                        uid,
-                    });
-                }
-                Err(e) => {
-                    last_err = format!("{e}");
-                }
-            }
-        }
-
-        Err(format!(
-            "OIDC token validation failed against all keys: {last_err}"
-        ))
+        let token = token.to_string();
+        let config = self.config.clone();
+        self.supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "verify-oidc-token",
+                move || validate_token_with_keys(&config, keys.as_ref(), &token, now),
+            )
+            .await
+            .map_err(|error| {
+                AuthenticationError::internal_failure(format!(
+                    "supervised OIDC verification failed: {error}"
+                ))
+            })?
+            .map_err(|error| {
+                AuthenticationError::unauthenticated(format!("invalid OIDC token: {error}"))
+            })
     }
+}
+
+fn validate_token_with_keys(
+    config: &OidcConfig,
+    keys: &[(String, jsonwebtoken::DecodingKey)],
+    token: &str,
+    now: OffsetDateTime,
+) -> Result<OidcClaims, String> {
+    // Extract the kid from the JWT header to select the right key
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|e| format!("OIDC token header parse failed: {e}"))?;
+    validate_alg(config, header.alg)?;
+    let target_kid = header.kid.as_deref().unwrap_or("");
+
+    // Try matching key first, then all keys as fallback
+    let mut attempts = Vec::new();
+    for (kid, decoding_key) in keys {
+        if kid == target_kid || target_kid.is_empty() {
+            attempts.push(decoding_key);
+        }
+    }
+    // Fallback: try all keys if no kid match
+    if attempts.is_empty() {
+        for (_, decoding_key) in keys {
+            attempts.push(decoding_key);
+        }
+    }
+
+    let mut last_err = String::new();
+    for decoding_key in attempts {
+        let mut validation = jsonwebtoken::Validation::new(config.signing_algs[0]);
+        validation.algorithms = config.signing_algs.clone();
+        validation.set_issuer(&[&config.issuer_url]);
+        validation.set_audience(&[&config.client_id]);
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        match jsonwebtoken::decode::<serde_json::Value>(token, decoding_key, &validation) {
+            Ok(token_data) => {
+                let claims = &token_data.claims;
+                validate_time_claims(claims, now)?;
+
+                // Extract username
+                let raw_username = claims
+                    .get(&config.username_claim)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if raw_username.is_empty() {
+                    return Err(format!(
+                        "OIDC token missing username claim '{}'",
+                        config.username_claim
+                    ));
+                }
+                let username = apply_username_prefix(config, raw_username);
+
+                // Extract groups
+                let groups = extract_groups(config, claims);
+
+                // Extract uid (optional — use `sub` as fallback)
+                let uid = claims
+                    .get("sub")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                return Ok(OidcClaims {
+                    username,
+                    groups,
+                    uid,
+                    audiences: vec![config.client_id.clone()],
+                });
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+            }
+        }
+    }
+
+    Err(format!(
+        "OIDC token validation failed against all keys: {last_err}"
+    ))
 }

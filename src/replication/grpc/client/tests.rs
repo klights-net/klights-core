@@ -960,7 +960,7 @@ mod cases {
     }
 
     fn mount_test_service_with_node_cert(app: axum::Router, node_name: &str) -> axum::Router {
-        app.layer(axum::Extension(crate::auth::TlsClientCertificate(
+        app.layer(axum::Extension(klights_types::TlsClientCertificate(
             test_node_client_cert_der(node_name),
         )))
     }

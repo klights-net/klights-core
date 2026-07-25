@@ -17,12 +17,98 @@ pub fn decode_protobuf_resource(
         return Ok(json_value);
     }
 
+    if api_version == "v1" && kind == "Status" {
+        return decode_status_protobuf(data);
+    }
+
     let registry = global_oo_registry();
     if registry.handles(api_version, kind) {
         registry.decode(api_version, kind, data)
     } else {
         decode_generic_protobuf(api_version, kind, data)
     }
+}
+
+fn decode_status_protobuf(data: &[u8]) -> anyhow::Result<Value> {
+    use k8s_pb::apimachinery::pkg::apis::meta::v1 as metav1;
+    use prost::Message;
+    use serde_json::{Map, json};
+
+    let status = metav1::Status::decode(data)?;
+    let mut object = Map::from_iter([
+        ("apiVersion".to_string(), json!("v1")),
+        ("kind".to_string(), json!("Status")),
+    ]);
+    if let Some(metadata) = status.metadata.as_ref() {
+        let mut value = Map::new();
+        for (name, field) in [
+            ("selfLink", metadata.self_link.as_ref()),
+            ("resourceVersion", metadata.resource_version.as_ref()),
+            ("continue", metadata.r#continue.as_ref()),
+        ] {
+            if let Some(field) = field {
+                value.insert(name.to_string(), json!(field));
+            }
+        }
+        if let Some(remaining) = metadata.remaining_item_count {
+            value.insert("remainingItemCount".to_string(), json!(remaining));
+        }
+        object.insert("metadata".to_string(), Value::Object(value));
+    }
+    for (name, value) in [
+        ("status", status.status),
+        ("message", status.message),
+        ("reason", status.reason),
+    ] {
+        if let Some(value) = value {
+            object.insert(name.to_string(), json!(value));
+        }
+    }
+    if let Some(details) = status.details {
+        let mut value = Map::new();
+        for (name, field) in [
+            ("name", details.name),
+            ("group", details.group),
+            ("kind", details.kind),
+            ("uid", details.uid),
+        ] {
+            if let Some(field) = field {
+                value.insert(name.to_string(), json!(field));
+            }
+        }
+        if !details.causes.is_empty() {
+            value.insert(
+                "causes".to_string(),
+                Value::Array(
+                    details
+                        .causes
+                        .into_iter()
+                        .map(|cause| {
+                            let mut value = Map::new();
+                            for (name, field) in [
+                                ("reason", cause.reason),
+                                ("message", cause.message),
+                                ("field", cause.field),
+                            ] {
+                                if let Some(field) = field {
+                                    value.insert(name.to_string(), json!(field));
+                                }
+                            }
+                            Value::Object(value)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(seconds) = details.retry_after_seconds {
+            value.insert("retryAfterSeconds".to_string(), json!(seconds));
+        }
+        object.insert("details".to_string(), Value::Object(value));
+    }
+    if let Some(code) = status.code {
+        object.insert("code".to_string(), json!(code));
+    }
+    Ok(Value::Object(object))
 }
 
 /// A generic protobuf message that only decodes ObjectMeta (field 1).

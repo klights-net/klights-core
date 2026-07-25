@@ -2233,12 +2233,17 @@ mod tests {
     async fn create_certificate_signing_request_dispatches_csr_signer() {
         let mut state = crate::api::test_support::build_test_app_state().await;
         let signer = Arc::new(crate::auth::csr_signer::RecordingCsrSigner::new());
+        let issuer = Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
+            signer.clone(),
+            Arc::new(crate::auth::clock::SystemClock),
+            state.task_supervisor.clone(),
+        ));
         let dispatcher = Arc::new(
             crate::controller_dispatcher::ControllerDispatcher::new_with_nodeport(
                 state.service_ipam.clone(),
                 state.nodeport_alloc.clone(),
                 state.task_supervisor.clone(),
-                Some(signer.clone()),
+                Some(issuer),
             ),
         );
         dispatcher

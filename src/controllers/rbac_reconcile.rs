@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use serde_json::{Map, Value};
 
-use crate::auth::default_rbac::{
+use crate::controllers::default_rbac_policy::{
     AUTOUPDATE_ANNOTATION, DefaultRbacObject, RBAC_API_VERSION, default_cluster_role_rules,
     default_rbac_fixtures,
 };

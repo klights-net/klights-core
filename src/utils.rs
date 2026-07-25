@@ -371,11 +371,7 @@ pub fn extract_resource_version_from_object(object: &serde_json::Value) -> i64 {
 /// Returns "0.0.0.0" on an unparseable CIDR (the previous behavior of
 /// `derive_first_ip`-style callers, used for legacy auth/kube-service init).
 pub fn derive_first_ip(cidr: &str) -> String {
-    use crate::networking::ClusterCidr;
-    match ClusterCidr::parse(cidr) {
-        Ok(c) => ip_u32_to_string(c.network() + 1),
-        Err(_) => "0.0.0.0".to_string(),
-    }
+    klights_types::first_usable_ipv4(cidr)
 }
 
 /// Convert a u32 IP address to dotted-quad string (e.g., "10.43.0.2").

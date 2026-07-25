@@ -4,8 +4,12 @@
 //! Kubernetes SubjectAccessReview semantics, and an `AuthorizerChain` that
 //! composes multiple authorizers in order.
 
+use std::sync::Arc;
+
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::node_authorizer::NodeAuthorizer;
+use crate::auth::node_policy_store::NodePolicyStore;
+use crate::auth::rbac_policy_store::RbacPolicyStore;
 use crate::auth::request_attributes::AuthorizationRequest;
 use async_trait::async_trait;
 
@@ -99,17 +103,17 @@ impl AuthorizerChain {
     /// Create the full production chain with RBAC.
     ///
     /// Order: system:masters bypass → bootstrap CSR → RBAC → Node authorizer → deny.
-    pub fn chain_with_policy_stores(
-        rbac_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
-        node_store: std::sync::Arc<dyn crate::auth::node_policy_store::NodePolicyStore>,
+    pub fn default_chain_with_rbac(
+        rbac_policy_store: Arc<dyn RbacPolicyStore>,
+        node_policy_store: Arc<dyn NodePolicyStore>,
     ) -> Self {
         use crate::auth::bootstrap_authorizer::BootstrapCsrAuthorizer;
         use crate::auth::rbac_authorizer::RbacAuthorizer;
         Self::new(vec![
             Box::new(SystemMastersAuthorizer),
             Box::new(BootstrapCsrAuthorizer),
-            Box::new(RbacAuthorizer::new(rbac_store)),
-            Box::new(NodeAuthorizer::new(Some(node_store))),
+            Box::new(RbacAuthorizer::new(rbac_policy_store)),
+            Box::new(NodeAuthorizer::new(Some(node_policy_store))),
             Box::new(DenyAuthorizer),
         ])
     }

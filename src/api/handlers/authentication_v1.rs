@@ -130,17 +130,15 @@ pub fn tokenreview_user_from_identity(
     user
 }
 
-fn unauthenticated_token_review() -> Json<Value> {
-    Json(serde_json::json!({
-        "apiVersion": "authentication.k8s.io/v1",
-        "kind": "TokenReview",
-        "status": {
-            "authenticated": false
-        }
-    }))
+fn token_review_response(mut request: Value, status: Value) -> Value {
+    if request.get("metadata").is_none() {
+        request["metadata"] = serde_json::json!({});
+    }
+    request["status"] = status;
+    request
 }
 
-fn authenticated_token_review(user: Value, audiences: Vec<String>) -> Json<Value> {
+fn authenticated_token_review(request: Value, user: Value, audiences: Vec<String>) -> Value {
     let mut status = serde_json::json!({
         "authenticated": true,
         "user": user,
@@ -148,54 +146,7 @@ fn authenticated_token_review(user: Value, audiences: Vec<String>) -> Json<Value
     if !audiences.is_empty() {
         status["audiences"] = serde_json::json!(audiences);
     }
-    Json(serde_json::json!({
-        "apiVersion": "authentication.k8s.io/v1",
-        "kind": "TokenReview",
-        "status": status
-    }))
-}
-
-async fn authenticate_non_serviceaccount_token_review(
-    state: &AppState,
-    token: &str,
-) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AppError>> {
-    match token.split('.').count() {
-        2 => {
-            match crate::bootstrap::bootstrap_token::validate_bootstrap_token(
-                state.db.as_ref(),
-                token,
-            )
-            .await
-            {
-                Ok(identity) => Some(Ok(crate::auth::identity::AuthenticatedIdentity::bootstrap(
-                    &identity.token_id,
-                    &identity.extra_groups,
-                ))),
-                Err(_) => {
-                    crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
-                        .await
-                        .map(|result| result.map_err(Into::into))
-                }
-            }
-        }
-        3 => {
-            if let Some(result) = crate::auth::oidc::try_oidc_auth(
-                &state.oidc_authenticator,
-                token,
-                &crate::auth::clock::SystemClock,
-            )
-            .await
-            {
-                return Some(result.map_err(Into::into));
-            }
-            crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
-                .await
-                .map(|result| result.map_err(Into::into))
-        }
-        _ => crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
-            .await
-            .map(|result| result.map_err(Into::into)),
-    }
+    token_review_response(request, status)
 }
 
 /// TokenReview — create-only resource, no Table support.
@@ -203,7 +154,7 @@ pub async fn create_token_review(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<crate::api::response::K8sResponse, AppError> {
     if wants_table_format(&headers)? {
         return Err(AppError::NotAcceptable(
             "Table format is not supported for TokenReview".to_string(),
@@ -211,56 +162,57 @@ pub async fn create_token_review(
     }
 
     let req_body = decode_json_or_proto(&body)?;
-    let req: TokenReviewRequest = serde_json::from_value(req_body)
+    let req: TokenReviewRequest = TokenReviewRequest::deserialize(&req_body)
         .map_err(|e| AppError::BadRequest(format!("Invalid TokenReview payload: {}", e)))?;
     let requested_audiences = req.spec.audiences.unwrap_or_default();
     let token = req.spec.token.unwrap_or_default();
 
     if token.is_empty() {
-        return Ok(unauthenticated_token_review());
-    }
-
-    if token.split('.').count() == 3
-        && let Ok(signing_key_pem) = crate::auth::read_service_account_signing_key_supervised(
-            &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
-            state.task_supervisor.as_ref(),
-        )
-        .await
-        && let Ok(claims) = crate::auth::decode_serviceaccount_token(
-            &token,
-            &signing_key_pem,
-            Some(&requested_audiences),
-        )
-    {
-        // Honor SA-UID revocation and bound pod/node invalidation, exactly like
-        // the request auth path — otherwise TokenReview would report a token
-        // from a deleted SA (or bound to a deleted pod) as authenticated.
-        if crate::api::auth_middleware::validate_sa_token_bindings(&state, &claims)
-            .await
-            .is_err()
-        {
-            return Ok(unauthenticated_token_review());
-        }
-
-        let audiences = if requested_audiences.is_empty() {
-            claims.aud.clone()
-        } else {
-            requested_audiences
-                .into_iter()
-                .filter(|aud| claims.aud.iter().any(|claim_aud| claim_aud == aud))
-                .collect()
-        };
-        return Ok(authenticated_token_review(
-            tokenreview_user_from_claims(&claims),
-            audiences,
+        return Err(AppError::BadRequest(
+            "TokenReview spec.token must not be empty".to_string(),
         ));
     }
 
-    match authenticate_non_serviceaccount_token_review(&state, &token).await {
-        Some(Ok(identity)) => Ok(authenticated_token_review(
-            tokenreview_user_from_identity(&identity),
-            requested_audiences,
+    match crate::api::auth_middleware::authenticate_token_for_review(
+        &state,
+        &token,
+        &requested_audiences,
+    )
+    .await
+    {
+        Ok(crate::auth::middleware::ReviewedTokenIdentity::ServiceAccount {
+            claims,
+            audiences,
+        }) => Ok(crate::api::response::K8sResponse::new(
+            authenticated_token_review(req_body, tokenreview_user_from_claims(&claims), audiences),
+            &headers,
         )),
-        Some(Err(_)) | None => Ok(unauthenticated_token_review()),
+        Ok(crate::auth::middleware::ReviewedTokenIdentity::Other {
+            identity,
+            audiences,
+        }) => Ok(crate::api::response::K8sResponse::new(
+            authenticated_token_review(
+                req_body,
+                tokenreview_user_from_identity(&identity),
+                audiences,
+            ),
+            &headers,
+        )),
+        Err(klights_auth::AuthenticationError::Unauthenticated { .. }) => {
+            Ok(crate::api::response::K8sResponse::new(
+                token_review_response(req_body, serde_json::json!({"authenticated": false})),
+                &headers,
+            ))
+        }
+        Err(error) => Ok(crate::api::response::K8sResponse::new(
+            token_review_response(
+                req_body,
+                serde_json::json!({
+                    "authenticated": false,
+                    "error": error.to_string(),
+                }),
+            ),
+            &headers,
+        )),
     }
 }

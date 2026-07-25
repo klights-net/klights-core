@@ -6,7 +6,7 @@ mod task;
 
 pub use category::{TaskCategory, TaskCategoryConfig};
 pub use supervisor::{
-    FileProcessExecutor, ProcessError, ProcessShutdownPolicy, SupervisedChild,
+    CryptoExecutor, FileProcessExecutor, ProcessError, ProcessShutdownPolicy, SupervisedChild,
     SupervisedJoinHandle, TaskSupervisor,
 };
 pub use task::{

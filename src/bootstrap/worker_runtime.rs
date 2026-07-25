@@ -93,7 +93,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             &config.node_name,
             task_supervisor.clone(),
         );
-        match resolve_credential_async(&store).await {
+        let crypto = klights_supervisor::CryptoExecutor::new(task_supervisor.clone());
+        match resolve_credential_async(&store, &crypto).await {
             Ok(CredentialSource::ExistingCert(cred)) => {
                 tracing::info!(
                     node = %config.node_name,
@@ -121,7 +122,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 )
                 .await?;
                 let cred =
-                    bootstrap_with_csr_async_store(&config.node_name, &csr_client, &store).await?;
+                    bootstrap_with_csr_async_store(&config.node_name, &csr_client, &store, &crypto)
+                        .await?;
                 (Some(cred.certificate_pem), Some(cred.private_key_pem))
             }
             Err(e) => {
@@ -146,7 +148,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 )
                 .await?;
                 let cred =
-                    bootstrap_with_csr_async_store(&config.node_name, &csr_client, &store).await?;
+                    bootstrap_with_csr_async_store(&config.node_name, &csr_client, &store, &crypto)
+                        .await?;
                 (Some(cred.certificate_pem), Some(cred.private_key_pem))
             }
         }

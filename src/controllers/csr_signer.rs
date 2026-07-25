@@ -1,38 +1,78 @@
 //! Event-driven CSR signer controller for kubelet TLS bootstrap.
 //!
 //! Watches CSR create/update events and auto-approves + signs valid
-//! kubelet client CSRs. Thin orchestrator over `BootstrapCsrPolicy` and
-//! `CsrSigner` — no policy logic or signing logic inline.
+//! kubelet client CSRs. Certificate policy and signing are supplied through a
+//! focused root adapter — no auth implementation or signing logic is inline.
 //!
-//! Pure OO design: the signer is injected via trait, making the
+//! Pure OO design: the issuer is injected via trait, making the
 //! controller fully unit-testable with a mock signer and in-memory
 //! datastore.
 
-use crate::auth::clock::{Clock, SystemClock};
-use crate::auth::csr_policy::{
-    KubeletClientCsrValidationInput, validate_kubelet_client_csr_request,
-};
-use crate::auth::csr_signer::{CsrSigner, SignRequest};
 use crate::controller::{Context, Controller};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+#[derive(Clone, Debug)]
+pub struct CsrIssuanceRequest {
+    pub signer_name: String,
+    pub csr_pem: Vec<u8>,
+    pub usages: Vec<String>,
+    pub username: String,
+    pub groups: Vec<String>,
+    pub expiration_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IssuedCsr {
+    pub node_name: String,
+    pub certificate_pem: String,
+    pub issued_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, Debug)]
+pub enum CsrIssuanceOutcome {
+    Issued(IssuedCsr),
+    Rejected { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CsrIssuanceError {
+    DependencyFailure { message: String },
+    InternalFailure { message: String },
+}
+
+impl std::fmt::Display for CsrIssuanceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::DependencyFailure { message } | Self::InternalFailure { message } => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for CsrIssuanceError {}
+
+/// Consumer-owned capability joining certificate policy, signing, and time.
+#[async_trait]
+pub trait CsrIssuer: Send + Sync {
+    async fn issue(
+        &self,
+        request: CsrIssuanceRequest,
+    ) -> Result<CsrIssuanceOutcome, CsrIssuanceError>;
+}
+
 /// CSR signer controller that validates and signs kubelet client CSRs.
 ///
-/// The injected `CsrSigner` trait makes signing mockable in tests.
+/// The injected [`CsrIssuer`] keeps auth policy and key material in the root
+/// adapter while retaining a deterministic controller seam.
 pub struct CsrSignerController {
-    signer: Arc<dyn CsrSigner>,
-    clock: Arc<dyn Clock>,
+    issuer: Arc<dyn CsrIssuer>,
 }
 
 impl CsrSignerController {
-    pub fn new(signer: Arc<dyn CsrSigner>) -> Self {
-        Self::new_with_clock(signer, Arc::new(SystemClock))
-    }
-
-    pub fn new_with_clock(signer: Arc<dyn CsrSigner>, clock: Arc<dyn Clock>) -> Self {
-        Self { signer, clock }
+    pub fn new(issuer: Arc<dyn CsrIssuer>) -> Self {
+        Self { issuer }
     }
 }
 
@@ -75,36 +115,23 @@ impl Controller for CsrSignerController {
         let groups = extract_groups(&resource);
         let expiration_seconds = extract_expiration_seconds(&resource);
 
-        // Validate using the pure policy object
-        let validation = validate_kubelet_client_csr_request(KubeletClientCsrValidationInput {
-            signer_name: &signer_name,
-            csr_pem: &csr_pem,
-            usages: &usages,
-            username: &username,
-            groups: &groups,
-            expiration_seconds,
-        });
-        if !validation.valid {
-            tracing::info!("CSR {csr_name} rejected by policy: {}", validation.reason);
-            return Ok(());
-        }
-
-        let node_name = match validation.node_name {
-            Some(n) => n,
-            None => return Ok(()),
-        };
-
-        // Sign via the injected signer (mockable!)
-        let sign_request = SignRequest {
-            csr_pem,
-            common_name: format!("system:node:{node_name}"),
-            organizations: vec!["system:nodes".to_string()],
-            usages,
-            ttl_seconds: validation.ttl_seconds,
-        };
-
-        let result = match self.signer.sign(sign_request) {
-            Ok(r) => r,
+        let issuance = self
+            .issuer
+            .issue(CsrIssuanceRequest {
+                signer_name,
+                csr_pem,
+                usages,
+                username,
+                groups,
+                expiration_seconds,
+            })
+            .await;
+        let issued = match issuance {
+            Ok(CsrIssuanceOutcome::Issued(issued)) => issued,
+            Ok(CsrIssuanceOutcome::Rejected { reason }) => {
+                tracing::info!("CSR {csr_name} rejected by policy: {reason}");
+                return Ok(());
+            }
             Err(err) => {
                 tracing::error!("failed to sign CSR {csr_name}: {err}");
                 return Err(anyhow::anyhow!("signing failed: {err}"));
@@ -117,12 +144,12 @@ impl Controller for CsrSignerController {
             &csr_name,
             &uid,
             resource_version,
-            &result.certificate_pem,
-            self.clock.now(),
+            &issued.certificate_pem,
+            issued.issued_at,
         )
         .await?;
 
-        tracing::info!("CSR {csr_name} signed for node {node_name}");
+        tracing::info!("CSR {csr_name} signed for node {}", issued.node_name);
         Ok(())
     }
 }
@@ -288,10 +315,60 @@ async fn update_csr_with_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::csr_signer::RecordingCsrSigner;
     use async_trait::async_trait;
     use base64::Engine;
     use serde_json::json;
+
+    struct RecordingIssuer {
+        requests: std::sync::Mutex<Vec<CsrIssuanceRequest>>,
+        outcome: CsrIssuanceOutcome,
+    }
+
+    impl RecordingIssuer {
+        fn issuing(at: time::OffsetDateTime) -> Self {
+            Self {
+                requests: Default::default(),
+                outcome: CsrIssuanceOutcome::Issued(IssuedCsr {
+                    node_name: "tokyo".into(),
+                    certificate_pem:
+                        "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n".into(),
+                    issued_at: at,
+                }),
+            }
+        }
+
+        fn rejecting(reason: &str) -> Self {
+            Self {
+                requests: Default::default(),
+                outcome: CsrIssuanceOutcome::Rejected {
+                    reason: reason.into(),
+                },
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+
+        fn take_requests(&self) -> Vec<CsrIssuanceRequest> {
+            std::mem::take(&mut self.requests.lock().unwrap())
+        }
+    }
+
+    #[async_trait]
+    impl CsrIssuer for RecordingIssuer {
+        async fn issue(
+            &self,
+            request: CsrIssuanceRequest,
+        ) -> Result<CsrIssuanceOutcome, CsrIssuanceError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(self.outcome.clone())
+        }
+    }
+
+    fn issuing() -> Arc<RecordingIssuer> {
+        Arc::new(RecordingIssuer::issuing(time::OffsetDateTime::UNIX_EPOCH))
+    }
 
     fn as_handle(
         db: &crate::datastore::sqlite::Datastore,
@@ -461,7 +538,7 @@ mod tests {
             .await
             .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = issuing();
         let controller = CsrSignerController::new(signer.clone());
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
@@ -470,12 +547,11 @@ mod tests {
         // Verify the signer was called
         assert_eq!(signer.request_count(), 1);
         let requests = signer.take_requests();
-        assert_eq!(requests[0].common_name, "system:node:tokyo");
-        assert!(
-            requests[0]
-                .organizations
-                .contains(&"system:nodes".to_string())
+        assert_eq!(
+            requests[0].signer_name,
+            "kubernetes.io/kube-apiserver-client-kubelet"
         );
+        assert_eq!(requests[0].username, "system:bootstrap:abcdef");
 
         // Verify status was updated
         let updated = handle
@@ -507,7 +583,7 @@ mod tests {
             .await
             .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = issuing();
         let controller = CsrSignerController::new(signer.clone());
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
@@ -544,13 +620,10 @@ mod tests {
             .await
             .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
         let fixed_now =
             time::OffsetDateTime::from_unix_timestamp(1_704_067_200).expect("valid timestamp");
-        let controller = CsrSignerController::new_with_clock(
-            signer,
-            Arc::new(crate::auth::clock::FixedClock { now: fixed_now }),
-        );
+        let signer = Arc::new(RecordingIssuer::issuing(fixed_now));
+        let controller = CsrSignerController::new(signer);
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
         controller.reconcile(csr, ctx).await.unwrap();
@@ -575,7 +648,7 @@ mod tests {
             .await
             .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = issuing();
         let controller = CsrSignerController::new(signer.clone());
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
@@ -622,7 +695,7 @@ mod tests {
         .await
         .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = issuing();
         let controller = CsrSignerController::new(signer.clone());
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
@@ -658,14 +731,13 @@ mod tests {
             .await
             .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = Arc::new(RecordingIssuer::rejecting("policy rejected"));
         let controller = CsrSignerController::new(signer.clone());
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
         controller.reconcile(csr, ctx).await.unwrap();
 
-        // Signer should NOT be called for invalid CSR
-        assert_eq!(signer.request_count(), 0);
+        assert_eq!(signer.request_count(), 1);
     }
 
     #[tokio::test]
@@ -680,18 +752,18 @@ mod tests {
             .await
             .unwrap();
 
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = Arc::new(RecordingIssuer::rejecting("wrong signer"));
         let controller = CsrSignerController::new(signer.clone());
         let ctx = Context::new(handle.clone(), "test-node".to_string());
 
         controller.reconcile(csr, ctx).await.unwrap();
 
-        assert_eq!(signer.request_count(), 0);
+        assert_eq!(signer.request_count(), 1);
     }
 
     #[tokio::test]
     async fn controller_name_is_correct() {
-        let signer = Arc::new(RecordingCsrSigner::new());
+        let signer = issuing();
         let controller = CsrSignerController::new(signer);
         assert_eq!(controller.name(), "certificatesigningrequest");
     }

@@ -62,10 +62,11 @@ pub(crate) async fn authorize_projected_service_account_token(
 pub(crate) fn sign_authorized_projected_service_account_token(
     signing_key_pem: &str,
     claims: AuthorizedProjectedServiceAccountTokenClaims,
+    clock: &dyn crate::auth::clock::Clock,
 ) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
     let audience_refs: Vec<&str> = claims.audiences.iter().map(String::as_str).collect();
-    let token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+    let token = crate::auth::generate_sa_token_with_bound_pod_and_clock(
+        crate::auth::ServiceAccountTokenRequest {
             ca_key_pem: signing_key_pem,
             service_account: &claims.service_account_name,
             namespace: &claims.namespace,
@@ -80,8 +81,10 @@ pub(crate) fn sign_authorized_projected_service_account_token(
                 secret_uid: None,
                 sa_uid: Some(&claims.service_account_uid),
             },
-        })
-        .map_err(|error| ProjectedServiceAccountTokenError::signing_failed(error.to_string()))?;
+        },
+        clock,
+    )
+    .map_err(|error| ProjectedServiceAccountTokenError::signing_failed(error.to_string()))?;
 
     ProjectedServiceAccountToken::try_new(token)
 }
@@ -94,7 +97,11 @@ async fn issue_projected_service_account_token(
     request: &ProjectedServiceAccountTokenRequest,
 ) -> Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
     let claims = authorize_projected_service_account_token(db, pod_store, request).await?;
-    sign_authorized_projected_service_account_token(signing_key_pem, claims)
+    sign_authorized_projected_service_account_token(
+        signing_key_pem,
+        claims,
+        &crate::auth::clock::SystemClock,
+    )
 }
 
 async fn resolve_bound_pod_and_node(

@@ -232,7 +232,7 @@ async fn proxy_raw(
     // the mTLS transport identity only.
     let forwarded_client_cert = parts
         .extensions
-        .get::<crate::auth::TlsClientCertificate>()
+        .get::<klights_types::TlsClientCertificate>()
         .cloned();
 
     for (name, value) in &parts.headers {
@@ -336,7 +336,7 @@ fn stamp_delegated_identity_headers(
 /// follower→leader hop in a verifiable, unforgeable way.
 fn stamp_forwarded_client_cert(
     req_builder: reqwest::RequestBuilder,
-    cert: &crate::auth::TlsClientCertificate,
+    cert: &klights_types::TlsClientCertificate,
 ) -> reqwest::RequestBuilder {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&cert.0);
@@ -366,7 +366,7 @@ mod tests {
         let client = reqwest::Client::new();
         let builder = client.get("https://leader.invalid/api/v1/nodes");
         let builder =
-            stamp_forwarded_client_cert(builder, &crate::auth::TlsClientCertificate(der.clone()));
+            stamp_forwarded_client_cert(builder, &klights_types::TlsClientCertificate(der.clone()));
         let req = builder.build().expect("request builds");
         let header = req
             .headers()
@@ -512,8 +512,13 @@ mod tests {
         let (ca_cert, ca_key, ca_pem, _) = crate::auth::generate_ca_full().unwrap();
         let (server_cert_pem, server_key_pem) =
             crate::auth::generate_server_cert(&ca_cert, &ca_key).unwrap();
-        let (proxy_cert_pem, proxy_key_pem) =
-            crate::auth::generate_api_proxy_cert(&ca_cert, &ca_key, "mn-controlplane2").unwrap();
+        let (proxy_cert_pem, proxy_key_pem) = crate::auth::generate_api_proxy_cert(
+            &ca_cert,
+            &ca_key,
+            "mn-controlplane2",
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let identity =
             reqwest::Identity::from_pkcs8_pem(proxy_cert_pem.as_bytes(), proxy_key_pem.as_bytes())
                 .expect("api proxy cert/key should build reqwest client identity");

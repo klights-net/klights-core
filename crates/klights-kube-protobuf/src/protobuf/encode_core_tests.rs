@@ -931,3 +931,46 @@ fn controllerrevision_single_resource_protobuf_roundtrip_preserves_raw_data() {
     assert_eq!(raw_decoded["revision"], 2);
     assert_eq!(raw_decoded["data"], revision["data"]);
 }
+
+#[test]
+fn status_protobuf_roundtrip_preserves_full_json_semantics() {
+    for status in [
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "metadata": {},
+            "status": "Failure",
+            "message": "dependency unavailable",
+            "reason": "ServiceUnavailable",
+            "details": {
+                "name": "tokenreviews",
+                "group": "authentication.k8s.io",
+                "kind": "TokenReview",
+                "uid": "uid-1",
+                "causes": [{
+                    "reason": "DependencyFailure",
+                    "message": "JWKS unavailable",
+                    "field": "spec.token"
+                }],
+                "retryAfterSeconds": 1
+            },
+            "code": 503
+        }),
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "metadata": {
+                "selfLink": "/apis/authentication.k8s.io/v1/tokenreviews",
+                "resourceVersion": "7",
+                "continue": "next",
+                "remainingItemCount": 2
+            },
+            "status": "Success",
+            "code": 200
+        }),
+    ] {
+        let encoded = encode_protobuf(&status).unwrap();
+        let decoded = decode_protobuf(&encoded).unwrap();
+        assert_eq!(decoded, status);
+    }
+}

@@ -564,26 +564,36 @@ async fn openid_configuration(State(_state): State<Arc<AppState>>) -> Json<Value
 }
 
 async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+    let signing_key_path =
+        crate::paths::service_account_signing_key_path(&state.config.containerd_namespace);
+    let signing_key_pem =
+        crate::auth::read_service_account_signing_key_async(&signing_key_path, &state.file_process)
+            .await
+            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+    let crypto = klights_supervisor::CryptoExecutor::new(state.task_supervisor.clone());
+    let jwks = crypto
+        .run_blocking("build-openid-jwks", move || {
+            build_openid_jwks(&signing_key_pem)
+        })
+        .await
+        .map_err(|error| AppError::InternalError(format!("OpenID JWK worker failed: {error}")))??;
+    Ok(Json(jwks))
+}
+
+fn build_openid_jwks(signing_key_pem: &str) -> Result<Value, AppError> {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, traits::PublicKeyParts};
     use sha2::Digest;
 
-    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-        &state.file_process,
-        &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
-    )
-    .await
-    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
-
-    if let Ok(private_key) = RsaPrivateKey::from_pkcs8_pem(&signing_key_pem) {
+    if let Ok(private_key) = RsaPrivateKey::from_pkcs8_pem(signing_key_pem) {
         let n_bytes = private_key.n().to_bytes_be();
         let e_bytes = private_key.e().to_bytes_be();
         let n_b64 = URL_SAFE_NO_PAD.encode(&n_bytes);
         let e_b64 = URL_SAFE_NO_PAD.encode(&e_bytes);
         let thumbprint_input = format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, e_b64, n_b64);
         let kid = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(thumbprint_input.as_bytes()));
-        return Ok(Json(serde_json::json!({
+        return Ok(serde_json::json!({
             "keys": [{
                 "kty": "RSA",
                 "use": "sig",
@@ -592,10 +602,10 @@ async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
                 "e": e_b64,
                 "kid": kid
             }]
-        })));
+        }));
     }
 
-    let key_pair = rcgen::KeyPair::from_pem(&signing_key_pem)
+    let key_pair = rcgen::KeyPair::from_pem(signing_key_pem)
         .map_err(|e| AppError::InternalError(format!("Failed to parse signing key: {}", e)))?;
     let public_key_der = key_pair.public_key_der();
     let der_bytes: &[u8] = public_key_der.as_ref();
@@ -618,7 +628,7 @@ async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
     );
     let kid = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(thumbprint_input.as_bytes()));
 
-    Ok(Json(serde_json::json!({
+    Ok(serde_json::json!({
         "keys": [{
             "kty": "EC",
             "crv": "P-256",
@@ -628,7 +638,7 @@ async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
             "alg": "ES256",
             "kid": kid
         }]
-    })))
+    }))
 }
 
 /// 2A-12: Role/status surface for manual promotion.

@@ -367,9 +367,13 @@ async fn load_local_node_client_identity(
         CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
     };
 
-    let store =
-        SupervisedFilesystemWorkerCredentialStore::for_namespace(namespace, node_name, supervisor);
-    match resolve_credential_async(&store).await? {
+    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
+        namespace,
+        node_name,
+        supervisor.clone(),
+    );
+    let crypto = klights_supervisor::CryptoExecutor::new(supervisor);
+    match resolve_credential_async(&store, &crypto).await? {
         CredentialSource::ExistingCert(cred) => Ok(ClientIdentity {
             client_cert_pem: cred.certificate_pem,
             client_key_pem: cred.private_key_pem,

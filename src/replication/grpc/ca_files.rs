@@ -25,7 +25,6 @@ impl ControlplaneCaFiles {
         }
     }
 
-    #[cfg(not(test))]
     pub(super) fn set_files(&mut self, files: ReplicationRuntimeFiles) {
         self.files = Some(files);
     }
@@ -43,11 +42,11 @@ impl ControlplaneCaFiles {
         let files = self.files.as_ref().ok_or_else(|| {
             Status::failed_precondition("ServiceAccount signing key not available on this node")
         })?;
-        crate::auth::read_service_account_signing_key_path_supervised(
-            &files.service_account_signing_key,
-            self.supervisor.as_ref(),
+        self.read_text_file(
+            "grpc_service_account_signing_key",
+            files.service_account_signing_key.clone(),
         )
-        .await
+        .await?
         .map_err(|err| {
             Status::failed_precondition(format!("ServiceAccount signing key not available: {err}"))
         })

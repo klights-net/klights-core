@@ -1,3 +1,4 @@
+use std::time::Instant;
 use time::OffsetDateTime;
 
 /// Object-safe time source for auth code that must be unit-testable without
@@ -12,6 +13,20 @@ pub struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> OffsetDateTime {
         OffsetDateTime::now_utc()
+    }
+}
+
+/// Object-safe monotonic time source for auth caches.
+pub trait MonotonicClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// Production monotonic clock source.
+pub struct SystemMonotonicClock;
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn now(&self) -> Instant {
+        Instant::now()
     }
 }
 

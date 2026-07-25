@@ -16,7 +16,6 @@ pub mod finalizer_delete;
 pub mod generated_handlers;
 mod handlers;
 pub mod helpers;
-mod impersonation_headers;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
@@ -32,6 +31,7 @@ mod query;
 mod quotas;
 pub mod raft_proxy;
 mod rbac_admission;
+pub(crate) mod request_info;
 mod response;
 #[cfg(test)]
 mod response_tests;

@@ -1805,8 +1805,9 @@ mod tests {
             .unwrap();
         let namespace_dir = tempfile::tempdir().unwrap();
         let namespace = namespace_dir.path().to_string_lossy().to_string();
+        let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
         crate::auth::persist_service_account_signing_key(
-            &crate::paths::service_account_signing_key_path(&namespace),
+            &signing_key_path,
             "signing-key",
             &supervisor,
         )

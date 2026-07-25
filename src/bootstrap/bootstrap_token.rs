@@ -116,6 +116,31 @@ pub struct BootstrapTokenIdentity {
     pub extra_groups: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapTokenAuthenticationError {
+    Rejected { message: String },
+    DependencyFailure { message: String },
+    InternalFailure { message: String },
+}
+
+impl BootstrapTokenAuthenticationError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Rejected { message }
+            | Self::DependencyFailure { message }
+            | Self::InternalFailure { message } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for BootstrapTokenAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for BootstrapTokenAuthenticationError {}
+
 pub fn generate_bootstrap_token() -> String {
     use rand_core::RngCore;
 
@@ -257,25 +282,46 @@ fn scoped_bootstrap_token_secret(
 pub async fn validate_bootstrap_token(
     db: &dyn DatastoreBackend,
     token: &str,
-) -> Result<BootstrapTokenIdentity> {
-    let (token_id, token_secret) = parse_bootstrap_token(token)?;
+) -> std::result::Result<BootstrapTokenIdentity, BootstrapTokenAuthenticationError> {
+    let (token_id, token_secret) = parse_bootstrap_token(token).map_err(|error| {
+        BootstrapTokenAuthenticationError::Rejected {
+            message: error.to_string(),
+        }
+    })?;
     for name in [
         WORKER_BOOTSTRAP_TOKEN_SECRET_NAME,
         CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME,
     ] {
         let Some(secret) = db
             .get_resource("v1", "Secret", Some(BOOTSTRAP_TOKEN_NAMESPACE), name)
-            .await?
+            .await
+            .map_err(
+                |error| BootstrapTokenAuthenticationError::DependencyFailure {
+                    message: error.to_string(),
+                },
+            )?
         else {
             continue;
         };
 
-        if matches_token_secret(&secret.data, &token_id, &token_secret).unwrap_or(false) {
-            return validate_bootstrap_token_secret(&secret, &token_id, &token_secret);
+        let matches =
+            matches_token_secret(&secret.data, &token_id, &token_secret).map_err(|error| {
+                BootstrapTokenAuthenticationError::InternalFailure {
+                    message: format!("bootstrap token Secret {name} is malformed: {error}"),
+                }
+            })?;
+        if matches {
+            return validate_bootstrap_token_secret(&secret, &token_id, &token_secret).map_err(
+                |error| BootstrapTokenAuthenticationError::Rejected {
+                    message: error.to_string(),
+                },
+            );
         }
     }
 
-    Err(anyhow!("bootstrap token {token_id} not found"))
+    Err(BootstrapTokenAuthenticationError::Rejected {
+        message: format!("bootstrap token {token_id} not found"),
+    })
 }
 
 pub async fn validate_bootstrap_token_for_scope(

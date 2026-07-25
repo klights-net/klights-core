@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_pod_api::PodRepositoryError;
 
 use crate::resource_preconditions::ResourcePreconditionError;
@@ -39,6 +40,25 @@ pub enum AppError {
         message: String,
         details: serde_json::Value,
     },
+}
+
+impl From<AuthenticationError> for AppError {
+    fn from(error: AuthenticationError) -> Self {
+        match error {
+            AuthenticationError::Unauthenticated { message } => Self::Unauthorized(message),
+            AuthenticationError::DependencyFailure { message } => Self::ServiceUnavailable(message),
+            AuthenticationError::InternalFailure { message } => Self::InternalError(message),
+        }
+    }
+}
+
+impl From<ImpersonationError> for AppError {
+    fn from(error: ImpersonationError) -> Self {
+        match error {
+            ImpersonationError::InvalidRequest { message } => Self::BadRequest(message),
+            ImpersonationError::Forbidden { message } => Self::Forbidden(message),
+        }
+    }
 }
 
 impl From<PodRepositoryError> for AppError {
@@ -327,6 +347,47 @@ mod tests {
         let (status, body) = body_of(AppError::NotFound("pods \"x\" not found".into())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["reason"], "NotFound");
+    }
+
+    #[tokio::test]
+    async fn neutral_auth_failures_map_to_kubernetes_http_statuses() {
+        let cases = [
+            (
+                AppError::from(AuthenticationError::unauthenticated("invalid token")),
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+            ),
+            (
+                AppError::from(AuthenticationError::dependency_failure(
+                    "credential store unavailable",
+                )),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+            ),
+            (
+                AppError::from(AuthenticationError::internal_failure(
+                    "verification worker failed",
+                )),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+            ),
+            (
+                AppError::from(ImpersonationError::invalid_request("invalid header")),
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+            ),
+            (
+                AppError::from(ImpersonationError::forbidden("policy denied")),
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+            ),
+        ];
+
+        for (error, expected_status, expected_reason) in cases {
+            let (status, body) = body_of(error).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body["reason"], expected_reason);
+        }
     }
 
     #[tokio::test]

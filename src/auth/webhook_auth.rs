@@ -9,9 +9,10 @@
 //! - `HttpWebhookTokenReviewer` — production implementation using reqwest.
 //! - `WebhookAuth` — cached authenticator wrapping the reviewer.
 
-use crate::auth::AuthError;
+use crate::auth::clock::MonotonicClock;
 use crate::auth::identity::AuthenticatedIdentity;
 use anyhow::{Result, anyhow};
+use klights_auth::AuthenticationError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -66,24 +67,40 @@ pub trait WebhookTokenReviewer: Send + Sync {
         &self,
         token: &str,
         audiences: &[String],
-    ) -> Result<Option<TokenReviewStatus>, String>;
+    ) -> Result<Option<TokenReviewStatus>, AuthenticationError>;
+}
+
+/// Focused policy port for an already-composed webhook authenticator.
+///
+/// Authentication policy depends on this capability rather than owning the
+/// concrete HTTP client/cache implementation.
+#[async_trait::async_trait]
+pub trait WebhookAuthenticator: Send + Sync {
+    async fn authenticate(
+        &self,
+        token: &str,
+    ) -> Option<Result<AuthenticatedIdentity, AuthenticationError>>;
+
+    async fn authenticate_for_review(
+        &self,
+        token: &str,
+        audiences: &[String],
+    ) -> Option<Result<(AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
+        self.authenticate(token).await.map(|result| {
+            result.and_then(|identity| {
+                if audiences.is_empty() {
+                    Ok((identity, Vec::new()))
+                } else {
+                    Err(AuthenticationError::unauthenticated(
+                        "webhook authenticator does not expose audience-aware TokenReview",
+                    ))
+                }
+            })
+        })
+    }
 }
 
 // ─── Cached authenticator ──────────────────────────────────────────────────
-
-/// Monotonic time source for webhook cache expiry.
-pub trait WebhookClock: Send + Sync {
-    fn now(&self) -> Instant;
-}
-
-/// Production monotonic clock.
-pub struct SystemWebhookClock;
-
-impl WebhookClock for SystemWebhookClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
 
 const DEFAULT_WEBHOOK_AUTH_CACHE_CAPACITY: usize = 4096;
 const DEFAULT_WEBHOOK_AUTH_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
@@ -91,7 +108,7 @@ const DEFAULT_WEBHOOK_AUTH_AUDIENCE: &str = "https://kubernetes.default.svc.clus
 /// Cached entry in the token review cache.
 #[derive(Clone)]
 struct CachedEntry {
-    result: Result<Option<TokenReviewStatus>, String>,
+    result: Result<Option<TokenReviewStatus>, AuthenticationError>,
     inserted_at: Instant,
 }
 
@@ -104,7 +121,7 @@ struct WebhookAuthCache {
 /// Webhook token authenticator with TTL cache.
 pub struct WebhookAuth {
     reviewer: Arc<dyn WebhookTokenReviewer>,
-    clock: Arc<dyn WebhookClock>,
+    clock: Arc<dyn MonotonicClock>,
     cache: Mutex<WebhookAuthCache>,
     cache_capacity: usize,
     authorized_ttl: Duration,
@@ -118,6 +135,7 @@ impl WebhookAuth {
         authorized_ttl: Duration,
         unauthorized_ttl: Duration,
         audiences: Vec<String>,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Self {
         Self::new_with_cache_capacity(
             reviewer,
@@ -125,6 +143,7 @@ impl WebhookAuth {
             unauthorized_ttl,
             audiences,
             DEFAULT_WEBHOOK_AUTH_CACHE_CAPACITY,
+            clock,
         )
     }
 
@@ -134,24 +153,7 @@ impl WebhookAuth {
         unauthorized_ttl: Duration,
         audiences: Vec<String>,
         cache_capacity: usize,
-    ) -> Self {
-        Self::new_with_clock_and_cache_capacity(
-            reviewer,
-            Arc::new(SystemWebhookClock),
-            authorized_ttl,
-            unauthorized_ttl,
-            audiences,
-            cache_capacity,
-        )
-    }
-
-    pub fn new_with_clock_and_cache_capacity(
-        reviewer: Arc<dyn WebhookTokenReviewer>,
-        clock: Arc<dyn WebhookClock>,
-        authorized_ttl: Duration,
-        unauthorized_ttl: Duration,
-        audiences: Vec<String>,
-        cache_capacity: usize,
+        clock: Arc<dyn MonotonicClock>,
     ) -> Self {
         Self {
             reviewer,
@@ -170,8 +172,18 @@ impl WebhookAuth {
     pub async fn authenticate(
         &self,
         token: &str,
-    ) -> Option<Result<AuthenticatedIdentity, AuthError>> {
-        let cache_key = sha256_token(token);
+    ) -> Option<Result<AuthenticatedIdentity, AuthenticationError>> {
+        self.authenticate_with_audiences(token, &self.audiences)
+            .await
+            .map(|result| result.map(|(identity, _audiences)| identity))
+    }
+
+    async fn authenticate_with_audiences(
+        &self,
+        token: &str,
+        audiences: &[String],
+    ) -> Option<Result<(AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
+        let cache_key = sha256_token_and_audiences(token, audiences);
         let now = self.clock.now();
 
         // Check cache with lazy eviction
@@ -185,19 +197,21 @@ impl WebhookAuth {
                 };
                 if now.duration_since(entry.inserted_at) < ttl {
                     let result = entry.result.clone();
-                    return self.convert_result(result);
+                    return self.convert_result(result, audiences);
                 }
                 remove_cache_entry(&mut cache, &cache_key);
             }
         }
 
         // Cache miss — call webhook
-        let result = self.reviewer.review_token(token, &self.audiences).await;
+        let result = self.reviewer.review_token(token, audiences).await;
 
         // If the result has audiences, validate intersection
         let result = if let Ok(Some(ref status)) = result {
-            if status.authenticated && !audiences_compatible(&status.audiences, &self.audiences) {
-                Err("webhook audiences don't intersect with server audiences".to_string())
+            if status.authenticated && !audiences_compatible(&status.audiences, audiences) {
+                Err(AuthenticationError::unauthenticated(
+                    "webhook audiences don't intersect with server audiences",
+                ))
             } else {
                 Ok(Some(status.clone()))
             }
@@ -205,7 +219,10 @@ impl WebhookAuth {
             result
         };
 
-        // Insert into cache
+        // Cache only definitive authenticated/unauthenticated decisions.
+        // Transport failures and webhook status errors are retryable.
+        if matches!(&result, Ok(Some(status)) if status.error.as_deref().is_none_or(str::is_empty))
+            || matches!(&result, Ok(None))
         {
             let mut cache = self.cache.lock().await;
             insert_cache_entry(
@@ -219,22 +236,16 @@ impl WebhookAuth {
             );
         }
 
-        self.convert_result(result)
+        self.convert_result(result, audiences)
     }
 
     fn convert_result(
         &self,
-        result: Result<Option<TokenReviewStatus>, String>,
-    ) -> Option<Result<AuthenticatedIdentity, AuthError>> {
+        result: Result<Option<TokenReviewStatus>, AuthenticationError>,
+        requested_audiences: &[String],
+    ) -> Option<Result<(AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
         match result {
             Ok(Some(status)) => {
-                // K8s: error takes precedence over authenticated status
-                // See staging/src/k8s.io/apiserver/plugin/pkg/authenticator/token/webhook/webhook.go
-                if let Some(err) = status.error.filter(|e| !e.is_empty()) {
-                    return Some(Err(AuthError::unauthenticated(format!(
-                        "webhook token review error: {err}"
-                    ))));
-                }
                 if status.authenticated {
                     let user = status.user?;
                     let identity = AuthenticatedIdentity::webhook(
@@ -243,19 +254,66 @@ impl WebhookAuth {
                         user.uid,
                         user.extra,
                     );
-                    return Some(Ok(identity));
+                    let audiences = if status.audiences.is_empty() {
+                        requested_audiences.to_vec()
+                    } else {
+                        requested_audiences
+                            .iter()
+                            .filter(|audience| status.audiences.contains(audience))
+                            .cloned()
+                            .collect()
+                    };
+                    return Some(Ok((identity, audiences)));
                 }
-                Some(Err(AuthError::unauthenticated(
+                if let Some(err) = status.error.filter(|error| !error.is_empty()) {
+                    return Some(Err(AuthenticationError::dependency_failure(format!(
+                        "webhook token review error: {err}"
+                    ))));
+                }
+                Some(Err(AuthenticationError::unauthenticated(
                     "webhook token review: not authenticated".to_string(),
                 )))
             }
-            Ok(None) => Some(Err(AuthError::unauthenticated(
+            Ok(None) => Some(Err(AuthenticationError::unauthenticated(
                 "webhook token review: no status returned".to_string(),
             ))),
-            Err(err) => Some(Err(AuthError::unauthenticated(format!(
-                "webhook token review failed: {err}"
-            )))),
+            Err(err) => Some(Err(err)),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl WebhookAuthenticator for WebhookAuth {
+    async fn authenticate(
+        &self,
+        token: &str,
+    ) -> Option<Result<AuthenticatedIdentity, AuthenticationError>> {
+        WebhookAuth::authenticate(self, token).await
+    }
+
+    async fn authenticate_for_review(
+        &self,
+        token: &str,
+        audiences: &[String],
+    ) -> Option<Result<(AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
+        let effective_audiences = if audiences.is_empty() {
+            self.audiences.as_slice()
+        } else {
+            audiences
+        };
+        let result = self
+            .authenticate_with_audiences(token, effective_audiences)
+            .await?;
+        Some(result.map(|(identity, validated_audiences)| {
+            (
+                identity,
+                if audiences.is_empty() {
+                    Vec::new()
+                } else {
+                    validated_audiences
+                },
+            )
+        }))
     }
 }
 
@@ -286,9 +344,15 @@ fn insert_cache_entry(
     }
 }
 
-fn sha256_token(token: &str) -> [u8; 32] {
+fn sha256_token_and_audiences(token: &str, audiences: &[String]) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update((token.len() as u64).to_be_bytes());
     hasher.update(token.as_bytes());
+    hasher.update((audiences.len() as u64).to_be_bytes());
+    for audience in audiences {
+        hasher.update((audience.len() as u64).to_be_bytes());
+        hasher.update(audience.as_bytes());
+    }
     let result = hasher.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&result);
@@ -303,18 +367,21 @@ fn audiences_intersect(response_audiences: &[String], server_audiences: &[String
 
 fn audiences_compatible(response_audiences: &[String], server_audiences: &[String]) -> bool {
     if response_audiences.is_empty() {
-        return server_audiences
-            .iter()
-            .any(|audience| audience == DEFAULT_WEBHOOK_AUTH_AUDIENCE);
+        return !server_audiences.is_empty();
     }
     audiences_intersect(response_audiences, server_audiences)
 }
 
 // ─── Builder ───────────────────────────────────────────────────────────────
 
-/// Build a WebhookAuth from config. Returns None if webhook auth is not configured.
-pub fn build_webhook_auth(config: Option<WebhookAuthConfig>) -> Result<Option<Arc<WebhookAuth>>> {
-    let Some(config) = config else {
+/// Validate and default focused webhook-auth configuration.
+///
+/// Root composition owns concrete reviewer and cached-authenticator selection
+/// after this transport-neutral configuration step succeeds.
+pub fn prepare_webhook_auth_config(
+    config: Option<WebhookAuthConfig>,
+) -> Result<Option<WebhookAuthConfig>> {
+    let Some(mut config) = config else {
         return Ok(None);
     };
     if config.url.is_empty() {
@@ -326,29 +393,30 @@ pub fn build_webhook_auth(config: Option<WebhookAuthConfig>) -> Result<Option<Ar
         return Err(anyhow!("webhook auth URL must use https"));
     }
 
-    let reviewer: Arc<dyn WebhookTokenReviewer> =
-        Arc::new(HttpWebhookTokenReviewer::new(config.clone())?);
-
-    let audiences: Vec<String> = if config.audiences.is_empty() {
-        vec![DEFAULT_WEBHOOK_AUTH_AUDIENCE.to_string()]
-    } else {
-        config.audiences
-    };
-
-    Ok(Some(Arc::new(WebhookAuth::new(
-        reviewer,
-        Duration::from_secs(config.cache_authorized_ttl_secs.max(1)),
-        Duration::from_secs(config.cache_unauthorized_ttl_secs.max(1)),
-        audiences,
-    ))))
+    if config.audiences.is_empty() {
+        config.audiences = vec![DEFAULT_WEBHOOK_AUTH_AUDIENCE.to_string()];
+    }
+    config.cache_authorized_ttl_secs = config.cache_authorized_ttl_secs.max(1);
+    config.cache_unauthorized_ttl_secs = config.cache_unauthorized_ttl_secs.max(1);
+    Ok(Some(config))
 }
 
 /// Try webhook token auth. Returns `None` if not configured.
 pub async fn try_webhook_auth(
-    authenticator: &Option<Arc<WebhookAuth>>,
+    authenticator: Option<&dyn WebhookAuthenticator>,
     token: &str,
-) -> Option<Result<AuthenticatedIdentity, AuthError>> {
-    authenticator.as_ref()?.authenticate(token).await
+) -> Option<Result<AuthenticatedIdentity, AuthenticationError>> {
+    authenticator?.authenticate(token).await
+}
+
+pub async fn try_webhook_auth_for_review(
+    authenticator: Option<&dyn WebhookAuthenticator>,
+    token: &str,
+    audiences: &[String],
+) -> Option<Result<(AuthenticatedIdentity, Vec<String>), AuthenticationError>> {
+    authenticator?
+        .authenticate_for_review(token, audiences)
+        .await
 }
 
 // ─── Wire format (K8s authentication.k8s.io/v1) ────────────────────────────
@@ -466,7 +534,7 @@ impl WebhookTokenReviewer for HttpWebhookTokenReviewer {
         &self,
         token: &str,
         audiences: &[String],
-    ) -> Result<Option<TokenReviewStatus>, String> {
+    ) -> Result<Option<TokenReviewStatus>, AuthenticationError> {
         let request = TokenReviewRequest {
             api_version: "authentication.k8s.io/v1".to_string(),
             kind: "TokenReview".to_string(),
@@ -483,16 +551,20 @@ impl WebhookTokenReviewer for HttpWebhookTokenReviewer {
             .json(&request)
             .send()
             .await
-            .map_err(|e| format!("webhook request failed: {e}"))?;
+            .map_err(|e| {
+                AuthenticationError::dependency_failure(format!("webhook request failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
-            return Err(format!("webhook returned status {}", resp.status()));
+            return Err(AuthenticationError::dependency_failure(format!(
+                "webhook returned status {}",
+                resp.status()
+            )));
         }
 
-        let review: TokenReviewResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("webhook response parse failed: {e}"))?;
+        let review: TokenReviewResponse = resp.json().await.map_err(|e| {
+            AuthenticationError::dependency_failure(format!("webhook response parse failed: {e}"))
+        })?;
 
         let Some(status) = review.status else {
             return Ok(None);

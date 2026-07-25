@@ -5301,7 +5301,7 @@ async fn test_task_supervisor_accepts_admin_client_certificate_identity() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/categories")
-                .extension(crate::auth::TlsClientCertificate(pem_cert_der(
+                .extension(klights_types::TlsClientCertificate(pem_cert_der(
                     &admin_cert_pem,
                 )))
                 .body(Body::empty())
@@ -5328,7 +5328,7 @@ async fn test_task_supervisor_rejects_non_admin_client_certificate_identity() {
             Request::builder()
                 .method("GET")
                 .uri("/klights/v1/task-supervisor/categories")
-                .extension(crate::auth::TlsClientCertificate(pem_cert_der(
+                .extension(klights_types::TlsClientCertificate(pem_cert_der(
                     &server_cert_pem,
                 )))
                 .body(Body::empty())
@@ -5399,7 +5399,7 @@ async fn test_trusted_api_proxy_identity_is_authorized_as_delegated_user() {
                 .header("x-remote-user", "delegated-user")
                 .header("x-remote-group", "delegated-group")
                 .header("x-remote-group", "system:authenticated")
-                .extension(crate::auth::TlsClientCertificate(pem_cert_der(
+                .extension(klights_types::TlsClientCertificate(pem_cert_der(
                     &proxy_cert_pem,
                 )))
                 .body(Body::empty())
@@ -5445,7 +5445,7 @@ async fn test_server_cert_identity_cannot_delegate_requestheaders() {
                 .uri("/api/v1/nodes")
                 .header("x-remote-user", "delegated-user")
                 .header("x-remote-group", "delegated-group")
-                .extension(crate::auth::TlsClientCertificate(pem_cert_der(
+                .extension(klights_types::TlsClientCertificate(pem_cert_der(
                     &server_cert_pem,
                 )))
                 .body(Body::empty())
@@ -5509,7 +5509,7 @@ async fn test_raft_follower_proxy_forwards_authenticated_client_cert_identity_he
                 .uri("/api/v1/nodes")
                 .header("x-remote-user", "spoofed-user")
                 .header("x-remote-group", "spoofed-group")
-                .extension(crate::auth::TlsClientCertificate(pem_cert_der(
+                .extension(klights_types::TlsClientCertificate(pem_cert_der(
                     &admin_cert_pem,
                 )))
                 .body(Body::empty())

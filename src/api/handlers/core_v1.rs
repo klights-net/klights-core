@@ -614,22 +614,28 @@ async fn create_serviceaccount_token(
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
+    use crate::auth::clock::Clock;
+
     let sa = state
         .db
         .get_resource("v1", "ServiceAccount", Some(&namespace), &name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("ServiceAccount {} not found", name)))?;
 
-    let audiences: Vec<&str> = body
+    let audiences: Vec<String> = body
         .get("spec")
         .and_then(|s| s.get("audiences"))
         .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_else(|| {
             vec![
-                "https://kubernetes.default.svc.cluster.local",
-                "https://kubernetes.default.svc",
-                "api",
+                "https://kubernetes.default.svc.cluster.local".to_string(),
+                "https://kubernetes.default.svc".to_string(),
+                "api".to_string(),
             ]
         });
     let expiration_seconds = crate::auth::normalize_service_account_token_expiration_seconds(
@@ -733,32 +739,70 @@ async fn create_serviceaccount_token(
         }
     }
 
-    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-        &state.file_process,
-        &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
-    )
-    .await
-    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+    let signing_key_path =
+        crate::paths::service_account_signing_key_path(&state.config.containerd_namespace);
+    let signing_key_pem =
+        crate::auth::read_service_account_signing_key_async(&signing_key_path, &state.file_process)
+            .await
+            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
 
     let sa_uid = sa
         .data
         .get("metadata")
         .and_then(|m| m.get("uid"))
-        .and_then(|u| u.as_str());
-    bound.sa_uid = sa_uid;
-    let token =
-        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
-            ca_key_pem: &signing_key_pem,
-            service_account: &name,
-            namespace: &namespace,
-            audiences: &audiences,
-            expiration_seconds: Some(expiration_seconds),
-            bound,
+        .and_then(|u| u.as_str())
+        .map(str::to_string);
+    bound.sa_uid = sa_uid.as_deref();
+    let issued_at = crate::auth::clock::SystemClock.now();
+    let owned_bound = (
+        bound.pod_name.map(str::to_string),
+        bound.pod_uid.map(str::to_string),
+        bound.node_name.map(str::to_string),
+        bound.node_uid.map(str::to_string),
+        bound.secret_name.map(str::to_string),
+        bound.secret_uid.map(str::to_string),
+        sa_uid,
+    );
+    let signing_name = name.clone();
+    let signing_namespace = namespace.clone();
+    let signing_audiences = audiences.clone();
+    let crypto = klights_supervisor::CryptoExecutor::new(state.task_supervisor.clone());
+    let token = crypto
+        .run_blocking("sign-token-request-service-account-jwt", move || {
+            let audience_refs = signing_audiences
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            crate::auth::generate_sa_token_with_bound_pod_at(
+                crate::auth::ServiceAccountTokenRequest {
+                    ca_key_pem: &signing_key_pem,
+                    service_account: &signing_name,
+                    namespace: &signing_namespace,
+                    audiences: &audience_refs,
+                    expiration_seconds: Some(expiration_seconds),
+                    bound: crate::auth::BoundServiceAccountToken {
+                        pod_name: owned_bound.0.as_deref(),
+                        pod_uid: owned_bound.1.as_deref(),
+                        node_name: owned_bound.2.as_deref(),
+                        node_uid: owned_bound.3.as_deref(),
+                        secret_name: owned_bound.4.as_deref(),
+                        secret_uid: owned_bound.5.as_deref(),
+                        sa_uid: owned_bound.6.as_deref(),
+                    },
+                },
+                issued_at,
+            )
         })
-        .map_err(|e| AppError::InternalError(format!("Failed to generate token: {}", e)))?;
+        .await
+        .map_err(|error| AppError::InternalError(format!("Token signing worker failed: {error}")))?
+        .map_err(|error| AppError::InternalError(format!("Failed to generate token: {error}")))?;
 
-    let now = crate::utils::k8s_timestamp();
-    let expiration_timestamp = chrono::Utc::now() + chrono::Duration::seconds(expiration_seconds);
+    let now = chrono::DateTime::from_timestamp(issued_at.unix_timestamp(), 0)
+        .expect("OffsetDateTime timestamp must be representable by chrono");
+    let expiration_timestamp = issued_at + time::Duration::seconds(expiration_seconds);
+    let expiration_timestamp =
+        chrono::DateTime::from_timestamp(expiration_timestamp.unix_timestamp(), 0)
+            .expect("ServiceAccount token expiration must be representable by chrono");
 
     let mut spec = serde_json::json!({
         "audiences": audiences,
@@ -774,7 +818,7 @@ async fn create_serviceaccount_token(
         "metadata": {
             "name": name,
             "namespace": namespace,
-            "creationTimestamp": now
+            "creationTimestamp": now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         },
         "spec": spec,
         "status": {

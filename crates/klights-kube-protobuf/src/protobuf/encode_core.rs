@@ -139,7 +139,10 @@ pub fn encode_status_protobuf(value: &Value) -> Result<Vec<u8>, crate::CodecErro
 
     let metadata = value.get("metadata").and_then(|m| m.as_object());
     let list_meta = metadata.map(|m| metav1::ListMeta {
-        self_link: None,
+        self_link: m
+            .get("selfLink")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         resource_version: m
             .get("resourceVersion")
             .and_then(|v| v.as_str())
@@ -148,7 +151,7 @@ pub fn encode_status_protobuf(value: &Value) -> Result<Vec<u8>, crate::CodecErro
             .get("continue")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-        remaining_item_count: None,
+        remaining_item_count: m.get("remainingItemCount").and_then(|v| v.as_i64()),
     });
 
     let details = value.get("details").and_then(|d| d.as_object()).map(|d| {

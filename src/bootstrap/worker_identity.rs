@@ -395,17 +395,27 @@ pub fn resolve_credential(store: &dyn WorkerCredentialStore) -> Result<Credentia
 /// Async variant of [`resolve_credential`] for production runtime paths.
 pub async fn resolve_credential_async(
     store: &dyn AsyncWorkerCredentialStore,
+    crypto: &klights_supervisor::CryptoExecutor,
 ) -> Result<CredentialSource> {
     match store.load().await? {
-        Some(cred) => match validate_credential(&cred) {
-            Ok(()) => Ok(CredentialSource::ExistingCert(cred)),
-            Err(e) => {
-                let _ = store.delete().await;
-                Err(anyhow::anyhow!(
-                    "persisted credential invalid, cleared for bootstrap: {e}"
-                ))
+        Some(cred) => {
+            let credential_for_validation = cred.clone();
+            let validation = crypto
+                .run_blocking("validate-persisted-worker-credential", move || {
+                    validate_credential(&credential_for_validation)
+                })
+                .await
+                .context("persisted credential validation worker failed")?;
+            match validation {
+                Ok(()) => Ok(CredentialSource::ExistingCert(cred)),
+                Err(e) => {
+                    let _ = store.delete().await;
+                    Err(anyhow::anyhow!(
+                        "persisted credential invalid, cleared for bootstrap: {e}"
+                    ))
+                }
             }
-        },
+        }
         None => Ok(CredentialSource::BootstrapRequired),
     }
 }
@@ -794,8 +804,15 @@ pub async fn bootstrap_with_csr_async_store(
     node_name: &str,
     client: &dyn CsrBootstrapClient,
     store: &dyn AsyncWorkerCredentialStore,
+    crypto: &klights_supervisor::CryptoExecutor,
 ) -> Result<WorkerCredential> {
-    let csr = crate::auth::kubelet_client_cert::generate_kubelet_client_csr(node_name)
+    let node_name_for_csr = node_name.to_string();
+    let csr = crypto
+        .run_blocking("generate-worker-kubelet-client-csr", move || {
+            crate::auth::kubelet_client_cert::generate_kubelet_client_csr(&node_name_for_csr)
+        })
+        .await
+        .context("kubelet client CSR worker failed")?
         .context("failed to generate kubelet client CSR")?;
 
     let csr_name = client

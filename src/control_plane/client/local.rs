@@ -171,6 +171,7 @@ pub struct LocalApiClient {
     authoring_node: String,
     containerd_namespace: String,
     file_process: klights_supervisor::FileProcessExecutor,
+    crypto: klights_supervisor::CryptoExecutor,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     /// Set once the leader's `ControllerDispatcher` is constructed (later in
     /// bootstrap than `LocalApiClient`). When present, every successful
@@ -213,6 +214,7 @@ impl LeadershipGenerationFence {
         }
     }
 
+    #[cfg(test)]
     fn sign_if_unchanged<T>(
         &self,
         sign: impl FnOnce() -> T,
@@ -236,9 +238,11 @@ impl LocalApiClient {
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
             }
+            let signing_key_path =
+                crate::paths::service_account_signing_key_path(&self.containerd_namespace);
             let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+                &signing_key_path,
                 &self.file_process,
-                &crate::paths::service_account_signing_key_path(&self.containerd_namespace),
             )
             .await;
             let signing_key_pem = signing_key_pem.map_err(|error| {
@@ -258,20 +262,29 @@ impl LocalApiClient {
             .await;
             leadership.ensure_unchanged()?;
             let claims = claims?;
-            leadership.sign_if_unchanged(|| {
-                #[cfg(test)]
-                if let Some(probe) =
-                    projected_token_issue_test_probe(&self.containerd_namespace)
-                {
-                    probe
-                        .sign_attempts
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                crate::control_plane::service_account_tokens::sign_authorized_projected_service_account_token(
+            #[cfg(test)]
+            if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
+                probe
+                    .sign_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let crypto: &klights_supervisor::CryptoExecutor = &self.crypto;
+            let token = crypto
+                .run_blocking("sign-projected-service-account-token", move || {
+                    crate::control_plane::service_account_tokens::sign_authorized_projected_service_account_token(
                     &signing_key_pem,
                     claims,
+                    &crate::auth::clock::SystemClock,
                 )
-            })?
+                })
+                .await
+                .map_err(|error| {
+                    ProjectedServiceAccountTokenError::signing_failed(format!(
+                        "projected ServiceAccount token signing worker failed: {error}"
+                    ))
+                })?;
+            leadership.ensure_unchanged()?;
+            token
         })
     }
 
@@ -402,6 +415,7 @@ impl LocalApiClient {
     ) -> Self {
         let pod_store = Arc::new(PodStore::new(db.clone()));
         let positioned_watch = datastore_positioned_watch_service(db.clone());
+        let crypto = file_process.crypto_executor();
         Self {
             raft: crate::datastore::raft::state_machine::N1Raft::new(db.clone()),
             db,
@@ -410,6 +424,7 @@ impl LocalApiClient {
             authoring_node,
             containerd_namespace,
             file_process,
+            crypto,
             node_lease_tracker,
             controller_dispatcher: Arc::new(OnceCell::new()),
             is_leader_rx,

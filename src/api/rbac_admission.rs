@@ -277,6 +277,8 @@ mod tests {
     use crate::auth::authorizer::{AuthorizerChain, DenyAuthorizer, SystemMastersAuthorizer};
     use crate::auth::identity::AuthenticatedIdentity;
     use crate::auth::rbac_authorizer::RbacAuthorizer;
+    use crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore;
+    use crate::bootstrap::auth_adapters::DatastoreRbacResourceReader;
 
     fn cluster_role(name: &str, rules: serde_json::Value) -> serde_json::Value {
         json!({
@@ -301,7 +303,9 @@ mod tests {
     /// seed a ClusterRole granting `alice` the given rules + a binding.
     async fn alice_router(alice_rules: serde_json::Value) -> axum::Router {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        let store = crate::bootstrap::auth_store_adapters::rbac_policy_store(state.db.clone());
+        let store = Arc::new(ReaderBackedRbacPolicyStore::new(Arc::new(
+            DatastoreRbacResourceReader::new(state.db.clone()),
+        )));
         state.authorizer = Arc::new(AuthorizerChain::new(vec![
             Box::new(SystemMastersAuthorizer),
             Box::new(RbacAuthorizer::new(store.clone())),

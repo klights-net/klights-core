@@ -1,9 +1,9 @@
-//! Framework-neutral Kubernetes impersonation authorization.
+//! Kubernetes impersonation authorization policy.
 
-use crate::auth::AuthError;
 use crate::auth::authorizer::{AuthorizationDecision, Authorizer};
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::request_attributes::AuthorizationRequest;
+use klights_auth::ImpersonationError;
 
 const AUTHENTICATION_API_GROUP: &str = "authentication.k8s.io";
 const SERVICEACCOUNT_PREFIX: &str = "system:serviceaccount:";
@@ -20,7 +20,7 @@ pub async fn effective_identity(
     authorizer: &dyn Authorizer,
     real_identity: &AuthenticatedIdentity,
     request: Option<ImpersonationRequest>,
-) -> Result<AuthenticatedIdentity, AuthError> {
+) -> Result<AuthenticatedIdentity, ImpersonationError> {
     let Some(request) = request else {
         return Ok(real_identity.clone());
     };
@@ -39,7 +39,7 @@ async fn authorize_impersonation(
     authorizer: &dyn Authorizer,
     real_identity: &AuthenticatedIdentity,
     request: &ImpersonationRequest,
-) -> Result<(), AuthError> {
+) -> Result<(), ImpersonationError> {
     let (api_group, resource, namespace, name) =
         if let Some((namespace, name)) = service_account_username_parts(&request.username) {
             ("", "serviceaccounts", Some(namespace), name)
@@ -95,7 +95,7 @@ async fn authorize_impersonate_value(
     resource: &str,
     namespace: Option<&str>,
     name: &str,
-) -> Result<(), AuthError> {
+) -> Result<(), ImpersonationError> {
     let request = AuthorizationRequest::resource(
         "impersonate",
         api_group,
@@ -109,9 +109,9 @@ async fn authorize_impersonate_value(
     if decision.allowed {
         return Ok(());
     }
-    Err(AuthError::Forbidden(impersonation_forbidden_message(
-        &decision, resource, name,
-    )))
+    Err(ImpersonationError::forbidden(
+        impersonation_forbidden_message(&decision, resource, name),
+    ))
 }
 
 fn impersonation_forbidden_message(
@@ -199,7 +199,6 @@ mod tests {
             uid: Some("sa-uid-a".to_string()),
             extra: vec![("scopes".to_string(), "view".to_string())],
         };
-
         let identity = effective_identity(
             &authorizer,
             &AuthenticatedIdentity::admin("real-admin"),
@@ -278,7 +277,6 @@ mod tests {
     #[tokio::test]
     async fn impersonation_denied_without_permission() {
         let (authorizer, _seen) = authorizer(vec![AuthorizationDecision::deny("no sudo")]);
-
         let err = effective_identity(
             &authorizer,
             &AuthenticatedIdentity::client_cert("bob".to_string(), vec![]),
@@ -293,7 +291,7 @@ mod tests {
         .expect_err("denied impersonation must fail");
 
         match err {
-            AuthError::Forbidden(reason) => assert_eq!(reason, "no sudo"),
+            ImpersonationError::Forbidden { message } => assert_eq!(message, "no sudo"),
             other => panic!("expected forbidden, got {other:?}"),
         }
     }

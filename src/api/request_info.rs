@@ -9,6 +9,7 @@
 //! "secure by construction": no handler can be reached without it.
 
 use crate::auth::request_attributes::AuthorizationRequest;
+use axum::http::Method;
 
 /// Outcome of resolving a request path into authorization attributes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,22 +27,22 @@ pub enum ResolvedAuthz {
 const CREATE_VERB_SUBRESOURCES: &[&str] = &["exec", "attach", "portforward", "eviction", "token"];
 
 /// Lowercased HTTP method used as the verb for non-resource URL requests.
-fn non_resource_verb(method: &str) -> &'static str {
-    match method {
-        "GET" | "HEAD" => "get",
-        "POST" => "post",
-        "PUT" => "put",
-        "PATCH" => "patch",
-        "DELETE" => "delete",
-        "OPTIONS" => "options",
+fn non_resource_verb(method: &Method) -> &'static str {
+    match *method {
+        Method::GET | Method::HEAD => "get",
+        Method::POST => "post",
+        Method::PUT => "put",
+        Method::PATCH => "patch",
+        Method::DELETE => "delete",
+        Method::OPTIONS => "options",
         _ => "get",
     }
 }
 
 /// Verb for a resource request with no subresource.
-fn resource_verb(method: &str, has_name: bool, watch: bool) -> &'static str {
-    match method {
-        "GET" | "HEAD" => {
+fn resource_verb(method: &Method, has_name: bool, watch: bool) -> &'static str {
+    match *method {
+        Method::GET | Method::HEAD => {
             if has_name {
                 "get"
             } else if watch {
@@ -50,10 +51,10 @@ fn resource_verb(method: &str, has_name: bool, watch: bool) -> &'static str {
                 "list"
             }
         }
-        "POST" => "create",
-        "PUT" => "update",
-        "PATCH" => "patch",
-        "DELETE" => {
+        Method::POST => "create",
+        Method::PUT => "update",
+        Method::PATCH => "patch",
+        Method::DELETE => {
             if has_name {
                 "delete"
             } else {
@@ -65,7 +66,7 @@ fn resource_verb(method: &str, has_name: bool, watch: bool) -> &'static str {
 }
 
 /// Verb for a subresource request.
-fn subresource_verb(method: &str, subresource: &str) -> &'static str {
+fn subresource_verb(method: &Method, subresource: &str) -> &'static str {
     if CREATE_VERB_SUBRESOURCES.contains(&subresource) {
         return "create";
     }
@@ -73,12 +74,12 @@ fn subresource_verb(method: &str, subresource: &str) -> &'static str {
         return "get";
     }
     // proxy / status / scale / ephemeralcontainers / unknown: map HTTP method.
-    match method {
-        "GET" | "HEAD" => "get",
-        "POST" => "create",
-        "PUT" => "update",
-        "PATCH" => "patch",
-        "DELETE" => "delete",
+    match *method {
+        Method::GET | Method::HEAD => "get",
+        Method::POST => "create",
+        Method::PUT => "update",
+        Method::PATCH => "patch",
+        Method::DELETE => "delete",
         _ => "get",
     }
 }
@@ -122,7 +123,7 @@ fn finish(req: AuthorizationRequest, raw_query: Option<&str>) -> ResolvedAuthz {
 ///
 /// `path` must be the URL path (no query string); `raw_query` is the raw query
 /// string (without the leading `?`), if any.
-pub fn resolve_request_info(method: &str, path: &str, raw_query: Option<&str>) -> ResolvedAuthz {
+pub fn resolve_request_info(method: &Method, path: &str, raw_query: Option<&str>) -> ResolvedAuthz {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     // Determine api prefix, group and version, and the remaining path parts.
@@ -219,7 +220,7 @@ pub fn resolve_request_info(method: &str, path: &str, raw_query: Option<&str>) -
 
 /// Parse `[resource, name?, subresource?, ...]` into an authorization request.
 fn resolve_resource_parts(
-    method: &str,
+    method: &Method,
     api_group: &str,
     api_version: &str,
     namespace: Option<&str>,
@@ -249,7 +250,7 @@ fn resolve_resource_parts(
     )
 }
 
-fn non_resource(method: &str, path: &str) -> ResolvedAuthz {
+fn non_resource(method: &Method, path: &str) -> ResolvedAuthz {
     ResolvedAuthz::Authorize(Box::new(AuthorizationRequest::non_resource(
         non_resource_verb(method),
         path,
@@ -260,11 +261,10 @@ fn non_resource(method: &str, path: &str) -> ResolvedAuthz {
 mod tests {
     use super::*;
     use crate::auth::request_attributes::RequestKind;
-    use axum::http::Method;
 
     /// Helper: resolve and unwrap to an authorization request.
     fn req(method: Method, path: &str, query: Option<&str>) -> AuthorizationRequest {
-        let ResolvedAuthz::Authorize(r) = resolve_request_info(method.as_str(), path, query);
+        let ResolvedAuthz::Authorize(r) = resolve_request_info(&method, path, query);
         *r
     }
 

@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use rand_core::OsRng;
-use rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType};
+use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType};
 use rsa::{RsaPrivateKey, pkcs8::EncodePrivateKey};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -14,7 +14,6 @@ use time::{Duration, OffsetDateTime};
 
 const CERTIFICATE_VALIDITY_YEARS: i64 = 10;
 pub const API_PROXY_COMMON_NAME_PREFIX: &str = "system:klights:api-proxy:";
-pub const APISERVICE_PROXY_COMMON_NAME: &str = "system:klights:apiservice-proxy";
 pub const APISERVICE_PROXY_GROUP: &str = "system:klights:apiservice-proxies";
 
 /// Standard node group carried by every node (control-plane and worker) client
@@ -77,6 +76,9 @@ pub struct InitCertificateRequest<'a> {
     pub host_ip: Option<String>,
     /// Optional FQDN included as a DNS SAN in the server certificate.
     pub api_fqdn: Option<&'a str>,
+    /// Caller-owned wall-clock sample used consistently for every certificate
+    /// created during this initialization pass.
+    pub valid_at: OffsetDateTime,
     /// Whether this node may create a new local cluster CA when no CA
     /// material exists. Seed leaders/controlplanes set this; joining
     /// controlplanes must use leader CSR signing instead.
@@ -102,6 +104,7 @@ pub async fn init_certificates(
         node_name,
         host_ip,
         api_fqdn,
+        valid_at,
         allow_local_ca_generation,
     } = request;
 
@@ -138,9 +141,19 @@ pub async fn init_certificates(
             read_utf8_file_keyed(task_supervisor, &ca_cert_path, "cert_read_ca_cert").await?;
         let key_pem =
             read_utf8_file_keyed(task_supervisor, &ca_key_path, "cert_read_ca_key").await?;
-        let key = KeyPair::from_pem(&key_pem)?;
-        let params = generate_ca_params();
-        let cert = params.self_signed(&key)?;
+        let key_for_parse = key_pem.clone();
+        let (cert, key) = task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "parse-existing-cluster-ca",
+                move || -> Result<_> {
+                    let key = KeyPair::from_pem(&key_for_parse)?;
+                    let params = generate_ca_params_at(valid_at);
+                    let cert = params.self_signed(&key)?;
+                    Ok((std::sync::Arc::new(cert), std::sync::Arc::new(key)))
+                },
+            )
+            .await??;
         (cert_pem, key_pem, cert, key)
     } else if ca_cert_exists || !allow_local_ca_generation {
         // CA cert exists but CA key is missing (e.g. joining controlplane
@@ -153,13 +166,27 @@ pub async fn init_certificates(
             ca_key_exists,
             "Generating server CSR (CA key not available locally)"
         );
-        let (server_key_pem, server_csr_pem) = generate_server_csr(
-            service_cidr,
-            pod_subnet,
-            host_ip.as_deref(),
-            node_name,
-            api_fqdn,
-        )?;
+        let service_cidr = service_cidr.to_string();
+        let pod_subnet = pod_subnet.to_string();
+        let node_name = node_name.to_string();
+        let api_fqdn = api_fqdn.map(str::to_string);
+        let host_ip_for_csr = host_ip.clone();
+        let (server_key_pem, server_csr_pem) = task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "generate-server-csr",
+                move || {
+                    generate_server_csr(
+                        &service_cidr,
+                        &pod_subnet,
+                        host_ip_for_csr.as_deref(),
+                        &node_name,
+                        api_fqdn.as_deref(),
+                        valid_at,
+                    )
+                },
+            )
+            .await??;
         write_file_keyed(
             task_supervisor,
             &server_key_path,
@@ -174,7 +201,13 @@ pub async fn init_certificates(
         }));
     } else {
         tracing::info!("Generating new CA certificates");
-        let (cert, key, cert_pem, key_pem) = generate_ca_full()?;
+        let (cert, key, cert_pem, key_pem) = task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "generate-cluster-ca",
+                move || generate_ca_full_at(valid_at),
+            )
+            .await??;
         write_file_keyed(
             task_supervisor,
             &ca_cert_path,
@@ -189,7 +222,12 @@ pub async fn init_certificates(
             "cert_write_ca_key",
         )
         .await?;
-        (cert_pem, key_pem, cert, key)
+        (
+            cert_pem,
+            key_pem,
+            std::sync::Arc::new(cert),
+            std::sync::Arc::new(key),
+        )
     };
 
     ensure_service_account_signing_key(
@@ -213,29 +251,35 @@ pub async fn init_certificates(
                 .await?;
         let key =
             read_utf8_file_keyed(task_supervisor, &server_key_path, "cert_read_server_key").await?;
-        if server_cert_matches_config(
-            &cert,
-            service_cidr,
-            pod_subnet,
-            host_ip.as_deref(),
-            node_name,
-            api_fqdn,
-        ) {
+        if server_cert_matches_config_supervised(
+            task_supervisor,
+            cert.clone(),
+            service_cidr.to_string(),
+            pod_subnet.to_string(),
+            host_ip.clone(),
+            node_name.to_string(),
+            api_fqdn.map(str::to_string),
+        )
+        .await?
+        {
             tracing::info!("Loading existing server certificates");
             (cert, key)
         } else {
             tracing::info!(
                 "Regenerating server certificates because existing SANs do not match current API endpoints"
             );
-            let (cert, key) = generate_server_cert_with_config(
-                &ca_cert,
-                &ca_key,
-                service_cidr,
-                pod_subnet,
+            let (cert, key) = generate_server_cert_supervised(
+                task_supervisor,
+                ca_cert.clone(),
+                ca_key.clone(),
+                service_cidr.to_string(),
+                pod_subnet.to_string(),
                 host_ip.clone(),
-                node_name,
-                api_fqdn,
-            )?;
+                node_name.to_string(),
+                api_fqdn.map(str::to_string),
+                valid_at,
+            )
+            .await?;
             write_file_keyed(
                 task_supervisor,
                 &server_cert_path,
@@ -259,15 +303,18 @@ pub async fn init_certificates(
             pod_subnet,
             host_ip
         );
-        let (cert, key) = generate_server_cert_with_config(
-            &ca_cert,
-            &ca_key,
-            service_cidr,
-            pod_subnet,
+        let (cert, key) = generate_server_cert_supervised(
+            task_supervisor,
+            ca_cert.clone(),
+            ca_key.clone(),
+            service_cidr.to_string(),
+            pod_subnet.to_string(),
             host_ip.clone(),
-            node_name,
-            api_fqdn,
-        )?;
+            node_name.to_string(),
+            api_fqdn.map(str::to_string),
+            valid_at,
+        )
+        .await?;
         write_file_keyed(
             task_supervisor,
             &server_cert_path,
@@ -299,7 +346,15 @@ pub async fn init_certificates(
         (cert, key)
     } else {
         tracing::info!("Generating new admin certificates");
-        let (cert, key) = generate_admin_cert(&ca_cert, &ca_key)?;
+        let ca_cert_for_admin = ca_cert.clone();
+        let ca_key_for_admin = ca_key.clone();
+        let (cert, key) = task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "generate-admin-certificate",
+                move || generate_admin_cert_at(&ca_cert_for_admin, &ca_key_for_admin, valid_at),
+            )
+            .await??;
         write_file_keyed(
             task_supervisor,
             &admin_cert_path,
@@ -323,6 +378,7 @@ pub async fn init_certificates(
         &ca_cert_pem,
         &ca_key_pem,
         node_name,
+        valid_at,
     )
     .await?;
     let _apiservice_proxy_identity = ensure_apiservice_proxy_certificate_from_pem(
@@ -330,6 +386,7 @@ pub async fn init_certificates(
         etc_dir,
         &ca_cert_pem,
         &ca_key_pem,
+        valid_at,
     )
     .await?;
 
@@ -362,6 +419,68 @@ pub async fn init_certificates(
         server_cert: server_cert_pem,
         server_key: server_key_pem,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_server_cert_supervised(
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    ca_cert: std::sync::Arc<Certificate>,
+    ca_key: std::sync::Arc<KeyPair>,
+    service_cidr: String,
+    pod_subnet: String,
+    host_ip: Option<String>,
+    node_name: String,
+    api_fqdn: Option<String>,
+    valid_at: OffsetDateTime,
+) -> Result<(String, String)> {
+    task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "generate-server-certificate",
+            move || {
+                generate_server_cert_with_config_at(
+                    &ca_cert,
+                    &ca_key,
+                    ServerCertGenerationConfig {
+                        service_cidr: &service_cidr,
+                        pod_subnet: &pod_subnet,
+                        host_ip: host_ip.as_deref(),
+                        node_name: &node_name,
+                        api_fqdn: api_fqdn.as_deref(),
+                        valid_at,
+                    },
+                )
+            },
+        )
+        .await?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn server_cert_matches_config_supervised(
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    cert: String,
+    service_cidr: String,
+    pod_subnet: String,
+    host_ip: Option<String>,
+    node_name: String,
+    api_fqdn: Option<String>,
+) -> Result<bool> {
+    task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "validate-server-certificate",
+            move || {
+                server_cert_matches_config(
+                    &cert,
+                    &service_cidr,
+                    &pod_subnet,
+                    host_ip.as_deref(),
+                    &node_name,
+                    api_fqdn.as_deref(),
+                )
+            },
+        )
+        .await
 }
 
 async fn path_exists_keyed(
@@ -417,7 +536,14 @@ async fn ensure_service_account_signing_key(
     let exists = path_exists_keyed(task_supervisor, path, "cert_check_sa_signing_key").await?;
     if exists {
         let pem = read_utf8_file_keyed(task_supervisor, path, "cert_read_sa_signing_key").await?;
-        validate_service_account_signing_key(path, &pem)?;
+        let path_for_validation = path.to_path_buf();
+        task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "validate-service-account-signing-key",
+                move || validate_service_account_signing_key(&path_for_validation, &pem),
+            )
+            .await??;
         set_key_permissions_keyed(task_supervisor, path, "cert_chmod_sa_signing_key").await?;
         return Ok(());
     }
@@ -433,7 +559,13 @@ async fn ensure_service_account_signing_key(
         path = %path.display(),
         "Generating dedicated ServiceAccount signing key"
     );
-    let pem = generate_service_account_signing_key_pem()?;
+    let pem = task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "generate-service-account-signing-key",
+            generate_service_account_signing_key_pem,
+        )
+        .await??;
     write_file_keyed(task_supervisor, path, pem, "cert_write_sa_signing_key").await
 }
 
@@ -483,8 +615,13 @@ async fn set_key_permissions_keyed(
     Ok(())
 }
 
+fn set_certificate_validity(params: &mut CertificateParams, valid_at: OffsetDateTime) {
+    params.not_before = valid_at;
+    params.not_after = valid_at + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
+}
+
 /// Generate CA certificate parameters.
-pub fn generate_ca_params() -> CertificateParams {
+fn generate_ca_params_at(valid_at: OffsetDateTime) -> CertificateParams {
     let mut params = CertificateParams::default();
 
     let mut dn = DistinguishedName::new();
@@ -492,8 +629,7 @@ pub fn generate_ca_params() -> CertificateParams {
     params.distinguished_name = dn;
 
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
+    set_certificate_validity(&mut params, valid_at);
     params
 }
 
@@ -515,8 +651,10 @@ fn generate_rsa_key_pair() -> Result<KeyPair> {
 /// Returns: (cert, key, cert_pem, key_pem)
 /// - `cert` and `key`: rcgen objects for signing
 /// - `cert_pem` and `key_pem`: PEM strings for file I/O
-pub fn generate_ca_full() -> Result<(rcgen::Certificate, KeyPair, String, String)> {
-    let params = generate_ca_params();
+fn generate_ca_full_at(
+    valid_at: OffsetDateTime,
+) -> Result<(rcgen::Certificate, KeyPair, String, String)> {
+    let params = generate_ca_params_at(valid_at);
     let key_pair = generate_rsa_key_pair()?;
     let cert = params.self_signed(&key_pair)?;
     let cert_pem = cert.pem();
@@ -525,9 +663,51 @@ pub fn generate_ca_full() -> Result<(rcgen::Certificate, KeyPair, String, String
     Ok((cert, key_pair, cert_pem, key_pem))
 }
 
+#[cfg(test)]
+pub fn generate_ca_full() -> Result<(rcgen::Certificate, KeyPair, String, String)> {
+    generate_ca_full_at(OffsetDateTime::now_utc())
+}
+
 /// Generate a server certificate with dynamic service CIDR and optional host IP.
 ///
 /// This version allows configuration for testing and multi-namespace deployments.
+struct ServerCertGenerationConfig<'a> {
+    service_cidr: &'a str,
+    pod_subnet: &'a str,
+    host_ip: Option<&'a str>,
+    node_name: &'a str,
+    api_fqdn: Option<&'a str>,
+    valid_at: OffsetDateTime,
+}
+
+fn generate_server_cert_with_config_at(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+    config: ServerCertGenerationConfig<'_>,
+) -> Result<(String, String)> {
+    let mut params = CertificateParams::default();
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "klights-server");
+    params.distinguished_name = dn;
+
+    params.subject_alt_names = server_cert_san_types(
+        config.service_cidr,
+        config.pod_subnet,
+        config.host_ip,
+        config.node_name,
+        config.api_fqdn,
+    );
+
+    set_certificate_validity(&mut params, config.valid_at);
+
+    let key_pair = generate_rsa_key_pair()?;
+    let cert = params.signed_by(&key_pair, ca_cert, ca_key)?;
+
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+#[cfg(test)]
 pub fn generate_server_cert_with_config(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
@@ -537,27 +717,18 @@ pub fn generate_server_cert_with_config(
     node_name: &str,
     api_fqdn: Option<&str>,
 ) -> Result<(String, String)> {
-    let mut params = CertificateParams::default();
-
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "klights-server");
-    params.distinguished_name = dn;
-
-    params.subject_alt_names = server_cert_san_types(
-        service_cidr,
-        pod_subnet,
-        host_ip.as_deref(),
-        node_name,
-        api_fqdn,
-    );
-
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
-
-    let key_pair = generate_rsa_key_pair()?;
-    let cert = params.signed_by(&key_pair, ca_cert, ca_key)?;
-
-    Ok((cert.pem(), key_pair.serialize_pem()))
+    generate_server_cert_with_config_at(
+        ca_cert,
+        ca_key,
+        ServerCertGenerationConfig {
+            service_cidr,
+            pod_subnet,
+            host_ip: host_ip.as_deref(),
+            node_name,
+            api_fqdn,
+            valid_at: OffsetDateTime::now_utc(),
+        },
+    )
 }
 
 /// Generate a server certificate with hardcoded defaults (for backward compatibility).
@@ -569,21 +740,25 @@ pub fn generate_server_cert(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
 ) -> Result<(String, String)> {
-    generate_server_cert_with_config(
+    generate_server_cert_with_config_at(
         ca_cert,
         ca_key,
-        "10.43.128.0/17",
-        "10.43.0.0/17",
-        None,
-        "test-node",
-        None,
+        ServerCertGenerationConfig {
+            service_cidr: "10.43.128.0/17",
+            pod_subnet: "10.43.0.0/17",
+            host_ip: None,
+            node_name: "test-node",
+            api_fqdn: None,
+            valid_at: OffsetDateTime::now_utc(),
+        },
     )
 }
 
 /// Generate an admin certificate signed by the CA.
-pub fn generate_admin_cert(
+fn generate_admin_cert_at(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
     let mut params = CertificateParams::default();
 
@@ -592,13 +767,20 @@ pub fn generate_admin_cert(
     dn.push(DnType::OrganizationName, "system:masters");
     params.distinguished_name = dn;
 
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
+    set_certificate_validity(&mut params, valid_at);
 
     let key_pair = generate_rsa_key_pair()?;
     let cert = params.signed_by(&key_pair, ca_cert, ca_key)?;
 
     Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+#[cfg(test)]
+pub fn generate_admin_cert(
+    ca_cert: &rcgen::Certificate,
+    ca_key: &KeyPair,
+) -> Result<(String, String)> {
+    generate_admin_cert_at(ca_cert, ca_key, OffsetDateTime::now_utc())
 }
 
 /// Generate the dedicated follower API-proxy client certificate.
@@ -609,6 +791,7 @@ pub fn generate_api_proxy_cert(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
     node_name: &str,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
     let mut params = CertificateParams::default();
 
@@ -623,8 +806,7 @@ pub fn generate_api_proxy_cert(
         .extended_key_usages
         .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
 
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
+    set_certificate_validity(&mut params, valid_at);
 
     let key_pair = generate_rsa_key_pair()?;
     let cert = params.signed_by(&key_pair, ca_cert, ca_key)?;
@@ -640,11 +822,15 @@ pub fn generate_api_proxy_cert(
 pub fn generate_apiservice_proxy_cert(
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
     let mut params = CertificateParams::default();
 
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, APISERVICE_PROXY_COMMON_NAME);
+    dn.push(
+        DnType::CommonName,
+        klights_types::APISERVICE_PROXY_COMMON_NAME,
+    );
     dn.push(DnType::OrganizationName, APISERVICE_PROXY_GROUP);
     params.distinguished_name = dn;
     params.key_usages = vec![
@@ -655,8 +841,7 @@ pub fn generate_apiservice_proxy_cert(
         .extended_key_usages
         .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
 
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
+    set_certificate_validity(&mut params, valid_at);
 
     let key_pair = generate_rsa_key_pair()?;
     let cert = params.signed_by(&key_pair, ca_cert, ca_key)?;
@@ -670,10 +855,22 @@ pub async fn ensure_api_proxy_certificate_from_pem(
     ca_cert_pem: &str,
     ca_key_pem: &str,
     node_name: &str,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
-    let ca_key = KeyPair::from_pem(ca_key_pem)?;
-    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca_key_pem = ca_key_pem.to_string();
+    let ca_cert_pem = ca_cert_pem.to_string();
+    let (ca_cert, ca_key) = task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "parse-api-proxy-ca",
+            move || -> Result<_> {
+                let ca_key = KeyPair::from_pem(&ca_key_pem)?;
+                let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
+                let ca_cert = ca_params.self_signed(&ca_key)?;
+                Ok((std::sync::Arc::new(ca_cert), std::sync::Arc::new(ca_key)))
+            },
+        )
+        .await??;
 
     let cert_path = etc_dir.join("api-proxy.crt");
     let key_path = etc_dir.join("api-proxy.key");
@@ -687,13 +884,36 @@ pub async fn ensure_api_proxy_certificate_from_pem(
             read_utf8_file_keyed(task_supervisor, &cert_path, "cert_read_api_proxy_cert").await?;
         let key =
             read_utf8_file_keyed(task_supervisor, &key_path, "cert_read_api_proxy_key").await?;
-        if api_proxy_cert_and_key_match_config(&cert, &key, node_name) {
+        let cert_for_validation = cert.clone();
+        let key_for_validation = key.clone();
+        let node_for_validation = node_name.to_string();
+        let matches = task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "validate-api-proxy-certificate",
+                move || {
+                    api_proxy_cert_and_key_match_config(
+                        &cert_for_validation,
+                        &key_for_validation,
+                        &node_for_validation,
+                    )
+                },
+            )
+            .await?;
+        if matches {
             return Ok((cert, key));
         }
         tracing::info!("Regenerating api-proxy certificate because existing identity is invalid");
     }
 
-    let (cert, key) = generate_api_proxy_cert(&ca_cert, &ca_key, node_name)?;
+    let node_name = node_name.to_string();
+    let (cert, key) = task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "generate-api-proxy-certificate",
+            move || generate_api_proxy_cert(&ca_cert, &ca_key, &node_name, valid_at),
+        )
+        .await??;
     write_file_keyed(
         task_supervisor,
         &cert_path,
@@ -716,10 +936,22 @@ pub async fn ensure_apiservice_proxy_certificate_from_pem(
     etc_dir: &Path,
     ca_cert_pem: &str,
     ca_key_pem: &str,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, String)> {
-    let ca_key = KeyPair::from_pem(ca_key_pem)?;
-    let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca_key_pem = ca_key_pem.to_string();
+    let ca_cert_pem = ca_cert_pem.to_string();
+    let (ca_cert, ca_key) = task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "parse-apiservice-proxy-ca",
+            move || -> Result<_> {
+                let ca_key = KeyPair::from_pem(&ca_key_pem)?;
+                let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
+                let ca_cert = ca_params.self_signed(&ca_key)?;
+                Ok((std::sync::Arc::new(ca_cert), std::sync::Arc::new(ca_key)))
+            },
+        )
+        .await??;
 
     let cert_path = etc_dir.join("apiservice-proxy.crt");
     let key_path = etc_dir.join("apiservice-proxy.key");
@@ -746,7 +978,21 @@ pub async fn ensure_apiservice_proxy_certificate_from_pem(
         let key =
             read_utf8_file_keyed(task_supervisor, &key_path, "cert_read_apiservice_proxy_key")
                 .await?;
-        if apiservice_proxy_cert_and_key_match_config(&cert, &key) {
+        let cert_for_validation = cert.clone();
+        let key_for_validation = key.clone();
+        let matches = task_supervisor
+            .run_blocking(
+                klights_supervisor::TaskCategory::Others,
+                "validate-apiservice-proxy-certificate",
+                move || {
+                    apiservice_proxy_cert_and_key_match_config(
+                        &cert_for_validation,
+                        &key_for_validation,
+                    )
+                },
+            )
+            .await?;
+        if matches {
             return Ok((cert, key));
         }
         tracing::info!(
@@ -754,7 +1000,13 @@ pub async fn ensure_apiservice_proxy_certificate_from_pem(
         );
     }
 
-    let (cert, key) = generate_apiservice_proxy_cert(&ca_cert, &ca_key)?;
+    let (cert, key) = task_supervisor
+        .run_blocking(
+            klights_supervisor::TaskCategory::Others,
+            "generate-apiservice-proxy-certificate",
+            move || generate_apiservice_proxy_cert(&ca_cert, &ca_key, valid_at),
+        )
+        .await??;
     write_file_keyed(
         task_supervisor,
         &cert_path,
@@ -802,7 +1054,7 @@ fn apiservice_proxy_cert_and_key_match_config(cert_pem: &str, key_pem: &str) -> 
     let Ok(user) = super::user::user_from_cert(&der) else {
         return false;
     };
-    if user.username != APISERVICE_PROXY_COMMON_NAME
+    if user.username != klights_types::APISERVICE_PROXY_COMMON_NAME
         || user.groups != [APISERVICE_PROXY_GROUP.to_string()]
         || user.groups.iter().any(|group| group == "system:masters")
     {
@@ -868,7 +1120,7 @@ fn with_parsed_certificate<T>(
 /// The gateway is always the first IP (network address + 1).
 /// Example: "10.43.0.0/17" -> "10.43.0.1"
 pub fn derive_gateway_ip(pod_subnet: &str) -> String {
-    crate::utils::derive_first_ip(pod_subnet)
+    klights_types::first_usable_ipv4(pod_subnet)
 }
 
 /// Build the SAN list shared between server cert generation and CSR generation.
@@ -890,8 +1142,7 @@ fn server_cert_san_types(
         ),
     ];
 
-    let kubernetes_service_ip =
-        crate::controllers::kube_service::derive_kubernetes_service_ip(service_cidr);
+    let kubernetes_service_ip = klights_types::first_usable_ipv4(service_cidr);
     if let Ok(ip_addr) = kubernetes_service_ip.parse::<std::net::IpAddr>() {
         sans.push(SanType::IpAddress(ip_addr));
     }
@@ -1004,6 +1255,7 @@ pub fn generate_server_csr(
     host_ip: Option<&str>,
     node_name: &str,
     api_fqdn: Option<&str>,
+    valid_at: OffsetDateTime,
 ) -> Result<(String, Vec<u8>)> {
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
@@ -1011,8 +1263,7 @@ pub fn generate_server_csr(
     params.distinguished_name = dn;
     params.subject_alt_names =
         server_cert_san_types(service_cidr, pod_subnet, host_ip, node_name, api_fqdn);
-    params.not_before = OffsetDateTime::now_utc();
-    params.not_after = OffsetDateTime::now_utc() + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365);
+    set_certificate_validity(&mut params, valid_at);
 
     let key_pair = generate_rsa_key_pair()?;
     let csr = params.serialize_request(&key_pair)?;
@@ -1029,8 +1280,14 @@ mod tests {
 
     #[test]
     fn test_generate_ca_params_is_ca() {
-        let params = generate_ca_params();
+        let valid_at = OffsetDateTime::UNIX_EPOCH + Duration::days(20_000);
+        let params = generate_ca_params_at(valid_at);
         assert!(matches!(params.is_ca, IsCa::Ca(_)));
+        assert_eq!(params.not_before, valid_at);
+        assert_eq!(
+            params.not_after,
+            valid_at + Duration::days(CERTIFICATE_VALIDITY_YEARS * 365)
+        );
     }
 
     #[test]
@@ -1166,6 +1423,7 @@ mod tests {
                 node_name: "mn-controlplane2",
                 host_ip: Some("10.99.0.14".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,
@@ -1218,6 +1476,7 @@ mod tests {
                 node_name: "mn-controlplane2",
                 host_ip: Some("10.99.0.14".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,
@@ -1279,6 +1538,7 @@ mod tests {
                 node_name: "mn-controlplane1",
                 host_ip: Some("10.99.0.10".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,
@@ -1321,6 +1581,7 @@ mod tests {
                 node_name: "mn-controlplane1",
                 host_ip: Some("10.99.0.10".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,
@@ -1356,6 +1617,7 @@ mod tests {
                 node_name: "mn-controlplane1",
                 host_ip: Some("10.99.0.10".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,
@@ -1396,6 +1658,7 @@ mod tests {
                 node_name: "mn-controlplane2",
                 host_ip: Some("10.99.0.14".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: false,
             },
             &supervisor,
@@ -1428,6 +1691,7 @@ mod tests {
             node_name: "mn-controlplane2",
             host_ip: Some("10.99.0.14".to_string()),
             api_fqdn: None,
+            valid_at: OffsetDateTime::now_utc(),
             allow_local_ca_generation: true,
         };
         init_certificates(request(), &supervisor).await.unwrap();
@@ -1439,8 +1703,13 @@ mod tests {
             .unwrap()
             .self_signed(&wrong_ca_key)
             .unwrap();
-        let (_, wrong_key_pem) =
-            generate_api_proxy_cert(&wrong_ca_cert, &wrong_ca_key, "mn-controlplane2").unwrap();
+        let (_, wrong_key_pem) = generate_api_proxy_cert(
+            &wrong_ca_cert,
+            &wrong_ca_key,
+            "mn-controlplane2",
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         std::fs::write(&proxy_key_path, wrong_key_pem).unwrap();
 
         init_certificates(request(), &supervisor).await.unwrap();
@@ -1485,6 +1754,7 @@ mod tests {
                 node_name: "mn-controlplane1",
                 host_ip: Some("10.99.0.10".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,
@@ -1518,6 +1788,7 @@ mod tests {
                 node_name: "perm-node",
                 host_ip: Some("10.99.0.10".to_string()),
                 api_fqdn: None,
+                valid_at: OffsetDateTime::now_utc(),
                 allow_local_ca_generation: true,
             },
             &supervisor,

@@ -1,6 +1,7 @@
-//! RBAC policy store traits, policy resolution, and in-memory fakes.
+//! RBAC policy store traits and transport-neutral implementations.
 //!
-//! Production injects an `RbacResourceReader`; tests use in-memory stores.
+//! Root composition supplies an `RbacResourceReader` adapter; auth owns only
+//! policy resolution and in-memory fakes.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -102,6 +103,20 @@ pub trait RbacPolicyStore: Send + Sync {
     }
 }
 
+/// Focused transport-neutral reader for raw Kubernetes RBAC resources.
+///
+/// Concrete datastore or remote leader adapters are composed outside auth.
+#[async_trait]
+pub trait RbacResourceReader: Send + Sync {
+    async fn list_cluster_rbac_resources(&self, kind: &str) -> Result<Vec<Value>, String>;
+
+    async fn list_namespaced_rbac_resources(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<Value>, String>;
+}
+
 /// In-memory policy store for tests.
 pub struct InMemoryRbacPolicyStore {
     bindings: Vec<ResolvedBinding>,
@@ -137,45 +152,36 @@ impl RbacPolicyStore for InMemoryRbacPolicyStore {
     }
 }
 
-/// Focused source of raw RBAC objects.
-#[async_trait]
-pub trait RbacResourceReader: Send + Sync {
-    async fn list_rbac_resources(
-        &self,
-        kind: &str,
-        namespace: Option<&str>,
-    ) -> Result<Vec<Value>, String>;
+/// Resolves ClusterRole/ClusterRoleBinding and Role/RoleBinding objects from
+/// an injected focused resource reader on each authorization check.
+pub struct ReaderBackedRbacPolicyStore {
+    reader: Arc<dyn RbacResourceReader>,
 }
 
-/// Resolves RBAC bindings from an injected resource reader.
-pub struct ResourceRbacPolicyStore {
-    resources: Arc<dyn RbacResourceReader>,
-}
-
-impl ResourceRbacPolicyStore {
-    pub fn new(resources: Arc<dyn RbacResourceReader>) -> Self {
-        Self { resources }
+impl ReaderBackedRbacPolicyStore {
+    pub fn new(reader: Arc<dyn RbacResourceReader>) -> Self {
+        Self { reader }
     }
 }
 
 #[async_trait]
-impl RbacPolicyStore for ResourceRbacPolicyStore {
+impl RbacPolicyStore for ReaderBackedRbacPolicyStore {
     async fn list_bindings_for_namespace(&self, namespace: Option<&str>) -> Vec<ResolvedBinding> {
         let mut bindings: Vec<ResolvedBinding> = Vec::new();
 
         // Load all ClusterRoles (needed for ClusterRoleBinding resolution)
-        let cluster_roles = match load_cluster_roles(self.resources.as_ref()).await {
+        let cluster_roles = match load_cluster_roles(self.reader.as_ref()).await {
             Ok(roles) => roles,
             Err(err) => {
-                tracing::warn!("failed to load ClusterRoles for RBAC: {err:#}");
+                tracing::warn!("failed to load ClusterRoles for RBAC: {err}");
                 return bindings;
             }
         };
 
         // Load all ClusterRoleBindings → resolve to ResolvedBindings
         if let Ok(crb_list) = self
-            .resources
-            .list_rbac_resources("ClusterRoleBinding", None)
+            .reader
+            .list_cluster_rbac_resources("ClusterRoleBinding")
             .await
         {
             for crb in &crb_list {
@@ -187,18 +193,18 @@ impl RbacPolicyStore for ResourceRbacPolicyStore {
 
         // Load Roles for this namespace
         if let Some(ns) = namespace {
-            let roles = match load_namespaced_roles(self.resources.as_ref(), ns).await {
+            let roles = match load_namespaced_roles(self.reader.as_ref(), ns).await {
                 Ok(r) => r,
                 Err(err) => {
-                    tracing::warn!("failed to load Roles for namespace {ns}: {err:#}");
+                    tracing::warn!("failed to load Roles for namespace {ns}: {err}");
                     return bindings;
                 }
             };
 
             // Load RoleBindings for this namespace → resolve
             if let Ok(rb_list) = self
-                .resources
-                .list_rbac_resources("RoleBinding", Some(ns))
+                .reader
+                .list_namespaced_rbac_resources(ns, "RoleBinding")
                 .await
             {
                 for rb in &rb_list {
@@ -344,9 +350,9 @@ fn default_service_account_subjects(subjects: &mut [Subject], namespace: &str) {
 }
 
 async fn load_cluster_roles(
-    resources: &dyn RbacResourceReader,
+    reader: &dyn RbacResourceReader,
 ) -> Result<std::collections::HashMap<String, Vec<PolicyRule>>, String> {
-    let list = resources.list_rbac_resources("ClusterRole", None).await?;
+    let list = reader.list_cluster_rbac_resources("ClusterRole").await?;
     let mut map = std::collections::HashMap::new();
     for item in &list {
         let name = item
@@ -365,11 +371,11 @@ async fn load_cluster_roles(
 }
 
 async fn load_namespaced_roles(
-    resources: &dyn RbacResourceReader,
+    reader: &dyn RbacResourceReader,
     namespace: &str,
 ) -> Result<std::collections::HashMap<String, Vec<PolicyRule>>, String> {
-    let list = resources
-        .list_rbac_resources("Role", Some(namespace))
+    let list = reader
+        .list_namespaced_rbac_resources(namespace, "Role")
         .await?;
     let mut map = std::collections::HashMap::new();
     for item in &list {
@@ -389,26 +395,69 @@ async fn load_namespaced_roles(
 }
 
 #[cfg(test)]
-mod datastore_tests {
+mod reader_tests {
     use super::*;
     use crate::auth::identity::AuthenticatedIdentity;
-    use crate::datastore::backend::DatastoreHandle;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     const RBAC_API_VERSION: &str = "rbac.authorization.k8s.io/v1";
 
-    struct DatastoreRbacPolicyStore;
+    #[derive(Default)]
+    struct FakeRbacResourceReader {
+        resources: std::sync::Mutex<HashMap<(Option<String>, String), Vec<Value>>>,
+    }
 
-    impl DatastoreRbacPolicyStore {
-        fn new(handle: DatastoreHandle) -> ResourceRbacPolicyStore {
-            ResourceRbacPolicyStore::new(Arc::new(
-                crate::bootstrap::auth_store_adapters::DatastoreRbacResourceReader::new(handle),
-            ))
+    impl FakeRbacResourceReader {
+        async fn create_resource(
+            &self,
+            _api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            _name: &str,
+            value: Value,
+        ) -> Result<(), String> {
+            self.resources
+                .lock()
+                .expect("fake RBAC reader lock")
+                .entry((namespace.map(str::to_string), kind.to_string()))
+                .or_default()
+                .push(value);
+            Ok(())
         }
     }
 
-    fn as_handle(db: &crate::datastore::sqlite::Datastore) -> DatastoreHandle {
-        Arc::new(db.clone()) as DatastoreHandle
+    #[async_trait]
+    impl RbacResourceReader for FakeRbacResourceReader {
+        async fn list_cluster_rbac_resources(&self, kind: &str) -> Result<Vec<Value>, String> {
+            Ok(self
+                .resources
+                .lock()
+                .expect("fake RBAC reader lock")
+                .get(&(None, kind.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn list_namespaced_rbac_resources(
+            &self,
+            namespace: &str,
+            kind: &str,
+        ) -> Result<Vec<Value>, String> {
+            Ok(self
+                .resources
+                .lock()
+                .expect("fake RBAC reader lock")
+                .get(&(Some(namespace.to_string()), kind.to_string()))
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    fn reader_backed_store() -> (Arc<FakeRbacResourceReader>, ReaderBackedRbacPolicyStore) {
+        let reader = Arc::new(FakeRbacResourceReader::default());
+        let store = ReaderBackedRbacPolicyStore::new(reader.clone());
+        (reader, store)
     }
 
     fn default_sa_identity() -> AuthenticatedIdentity {
@@ -424,9 +473,7 @@ mod datastore_tests {
 
     #[tokio::test]
     async fn resolves_clusterrole_and_binding() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let handle = as_handle(&db);
-        let store = DatastoreRbacPolicyStore::new(handle);
+        let (db, store) = reader_backed_store();
 
         db.create_resource(
             RBAC_API_VERSION,
@@ -485,9 +532,7 @@ mod datastore_tests {
 
     #[tokio::test]
     async fn resolves_role_and_rolebinding_with_sa_defaulting() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let handle = as_handle(&db);
-        let store = DatastoreRbacPolicyStore::new(handle);
+        let (db, store) = reader_backed_store();
 
         db.create_resource(
             RBAC_API_VERSION,
@@ -546,9 +591,7 @@ mod datastore_tests {
 
     #[tokio::test]
     async fn rolebinding_with_empty_role_ref_api_group_resolves_role() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let handle = as_handle(&db);
-        let store = DatastoreRbacPolicyStore::new(handle);
+        let (db, store) = reader_backed_store();
 
         db.create_resource(
             RBAC_API_VERSION,
@@ -612,9 +655,7 @@ mod datastore_tests {
 
     #[tokio::test]
     async fn rolebinding_to_clusterrole_scoped_to_namespace() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let handle = as_handle(&db);
-        let store = DatastoreRbacPolicyStore::new(handle);
+        let (db, store) = reader_backed_store();
 
         db.create_resource(
             RBAC_API_VERSION,
@@ -669,9 +710,7 @@ mod datastore_tests {
 
     #[tokio::test]
     async fn enumerate_effective_rules_matches_identity() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let handle = as_handle(&db);
-        let store = DatastoreRbacPolicyStore::new(handle);
+        let (db, store) = reader_backed_store();
 
         db.create_resource(
             RBAC_API_VERSION,
@@ -807,9 +846,7 @@ mod datastore_tests {
 
     #[tokio::test]
     async fn empty_store_returns_empty() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let handle = as_handle(&db);
-        let store = DatastoreRbacPolicyStore::new(handle);
+        let (_db, store) = reader_backed_store();
 
         let bindings = store.list_bindings_for_namespace(Some("default")).await;
         assert!(bindings.is_empty());

@@ -114,7 +114,7 @@ pub(crate) async fn serve_https_connection(
     let service = hyper::service::service_fn(move |mut req| {
         if let Some(cert) = client_cert.clone() {
             req.extensions_mut()
-                .insert(crate::auth::TlsClientCertificate(cert));
+                .insert(klights_types::TlsClientCertificate(cert));
         }
         crate::replication::grpc::server::insert_tonic_tcp_connect_info(
             &mut req,

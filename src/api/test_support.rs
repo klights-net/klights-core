@@ -61,6 +61,11 @@ pub async fn build_test_app_state() -> crate::api::AppState {
         .await;
     crate::api::AppState {
         db: db_handle.clone(),
+        bootstrap_token_authenticator: Arc::new(
+            crate::api::auth_middleware::DatastoreBootstrapTokenAuthenticator::new(
+                db_handle.clone(),
+            ),
+        ),
         cluster_api,
         crd_registry,
         mode: crate::bootstrap::NodeMode::Root,
@@ -97,8 +102,12 @@ pub async fn build_test_app_state() -> crate::api::AppState {
         api_priority_fairness: std::sync::Arc::new(
             crate::api_priority_fairness::ApiPriorityFairness::new(),
         ),
-        rbac_policy_store: crate::bootstrap::auth_store_adapters::rbac_policy_store(
-            db_handle.clone(),
+        rbac_policy_store: std::sync::Arc::new(
+            crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(std::sync::Arc::new(
+                crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
+                    db_handle.clone(),
+                ),
+            )),
         ),
         oidc_authenticator: None,
         webhook_authenticator: None,

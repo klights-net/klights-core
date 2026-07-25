@@ -182,14 +182,6 @@ fn has_events_v1_only_fields(decoded: &Value) -> bool {
         || decoded.get("action").is_some()
 }
 
-fn unsupported_encode(api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
-    let kind = value
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-    anyhow::bail!("Unknown kind for protobuf encoding: {api_version}/{kind}")
-}
-
 fn decode_generic_kind(api_version: &str, kind: &str, data: &[u8]) -> anyhow::Result<Value> {
     decode_generic_protobuf(api_version, kind, data)
 }
@@ -874,6 +866,7 @@ encode_openapi_result_raw_fn!(
     k8s_openapi::api::batch::v1::Job,
     json_job_to_pb
 );
+encode_value_result_fn!(encode_tokenreview, json_tokenreview_to_pb);
 encode_openapi_result_fn!(
     encode_apiservice,
     k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService,
@@ -1462,7 +1455,7 @@ static BUILTIN_ENTRIES: &[BuiltinCodecEntry] = &[
         api_version_prefix: "authentication.k8s.io",
         kind: "TokenReview",
         decode: decode_tokenreview,
-        encode: unsupported_encode,
+        encode: encode_tokenreview,
     },
     BuiltinCodecEntry {
         api_version_prefix: "apiregistration.k8s.io",

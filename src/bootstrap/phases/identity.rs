@@ -1,6 +1,7 @@
 //! Phase 4: Identity — certificates and dataplane metadata.
 
 use anyhow::{Context, Result, anyhow};
+use time::OffsetDateTime;
 
 use super::config::ConfigPhase;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
@@ -39,6 +40,7 @@ pub async fn setup_leader(
             node_name: &cfg.config.node_name,
             host_ip: Some(api_host_for_certificates(&cfg.config, node_ip)),
             api_fqdn: cfg.config.api_fqdn.as_deref(),
+            valid_at: OffsetDateTime::now_utc(),
             allow_local_ca_generation: role_allows_local_ca_generation(role),
         },
         cfg.supervisor.as_ref(),
@@ -179,8 +181,9 @@ async fn resolve_csr_via_rpc(
         .context("failed to decrypt ServiceAccount signing key from CSR response")?;
         let service_account_signing_key_pem = String::from_utf8(service_account_signing_key_bytes)
             .context("ServiceAccount signing key from CSR response is not UTF-8 PEM")?;
+        let service_account_signing_key_path = pending.etc_dir.join("service-account-signing.key");
         crate::auth::persist_service_account_signing_key(
-            &crate::paths::service_account_signing_key_path(&cfg.config.containerd_namespace),
+            &service_account_signing_key_path,
             &service_account_signing_key_pem,
             cfg.supervisor.as_ref(),
         )
@@ -220,6 +223,7 @@ async fn resolve_csr_via_rpc(
                 &local_dataplane.endpoint,
             )),
             api_fqdn: cfg.config.api_fqdn.as_deref(),
+            valid_at: OffsetDateTime::now_utc(),
             allow_local_ca_generation: false,
         },
         cfg.supervisor.as_ref(),
@@ -277,9 +281,13 @@ async fn controlplane_rpc_client_identity_for_token(
         CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
     };
 
-    let store =
-        SupervisedFilesystemWorkerCredentialStore::for_namespace(namespace, node_name, supervisor);
-    match resolve_credential_async(&store).await? {
+    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
+        namespace,
+        node_name,
+        supervisor.clone(),
+    );
+    let crypto = klights_supervisor::CryptoExecutor::new(supervisor.clone());
+    match resolve_credential_async(&store, &crypto).await? {
         CredentialSource::ExistingCert(cred) => {
             Ok((Some(cred.certificate_pem), Some(cred.private_key_pem)))
         }
@@ -301,13 +309,26 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         &cfg.config.node_name,
         cfg.supervisor.clone(),
     );
-    if let Ok(CredentialSource::ExistingCert(existing)) = resolve_credential_async(&store).await {
+    let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
+    if let Ok(CredentialSource::ExistingCert(existing)) =
+        resolve_credential_async(&store, &crypto).await
+    {
         // Reuse the persisted cert only if it already carries the
         // `system:controlplanes` group. A cert minted before that group existed
         // (in-place upgrade, or a seed-leader cert preserved across harness
         // runs) must be re-minted — otherwise this control plane cannot
         // authorize its outbound raft consensus RPCs and the cluster deadlocks.
-        if credential_has_group(&existing, crate::auth::CONTROLPLANE_NODES_GROUP) {
+        let credential_for_group_check = existing.clone();
+        let has_controlplane_group = crypto
+            .run_blocking("check-controlplane-client-certificate-group", move || {
+                credential_has_group(
+                    &credential_for_group_check,
+                    crate::auth::CONTROLPLANE_NODES_GROUP,
+                )
+            })
+            .await
+            .context("controlplane certificate group check worker failed")?;
+        if has_controlplane_group {
             return Ok(());
         }
         tracing::info!(
@@ -341,28 +362,37 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
             )
         })?;
 
-    let csr = crate::auth::kubelet_client_cert::generate_kubelet_client_csr(&cfg.config.node_name)
-        .context("failed to generate local node client CSR")?;
-    let signer = crate::auth::csr_signer::CaCsrSigner::new(ca_cert_pem, ca_key_pem);
-    let signed = signer
-        .sign(crate::auth::csr_signer::SignRequest {
-            csr_pem: csr.csr_pem,
-            common_name: format!("system:node:{}", cfg.config.node_name),
-            // Control-plane nodes (seed leader, joining controlplanes, and
-            // learner replicas — all reach this path only after a
-            // controlplane-token-gated bootstrap) carry the extra
-            // `system:controlplanes` group. It is the authorization signal for
-            // raft consensus RPCs; worker node certs, signed via the Kubernetes
-            // CSR API, carry only `system:nodes` and cannot drive consensus.
-            organizations: vec![
-                crate::auth::NODES_GROUP.to_string(),
-                crate::auth::CONTROLPLANE_NODES_GROUP.to_string(),
-            ],
-            usages: vec!["client auth".to_string()],
-            ttl_seconds: 31_536_000,
-        })
-        .map_err(anyhow::Error::msg)
-        .context("failed to sign local node client certificate")?;
+    let node_name = cfg.config.node_name.clone();
+    let (csr, signed) = crypto
+        .run_blocking(
+            "issue-local-controlplane-client-certificate",
+            move || -> Result<_> {
+                let csr = crate::auth::kubelet_client_cert::generate_kubelet_client_csr(&node_name)
+                    .context("failed to generate local node client CSR")?;
+                let signer = crate::auth::csr_signer::CaCsrSigner::new(
+                    ca_cert_pem,
+                    ca_key_pem,
+                    std::sync::Arc::new(crate::auth::clock::SystemClock),
+                );
+                let signed = signer
+                    .sign(crate::auth::csr_signer::SignRequest {
+                        csr_pem: csr.csr_pem.clone(),
+                        common_name: format!("system:node:{node_name}"),
+                        // Control-plane nodes carry the authorization group
+                        // required for raft consensus RPCs.
+                        organizations: vec![
+                            crate::auth::NODES_GROUP.to_string(),
+                            crate::auth::CONTROLPLANE_NODES_GROUP.to_string(),
+                        ],
+                        usages: vec!["client auth".to_string()],
+                        ttl_seconds: 31_536_000,
+                    })
+                    .context("failed to sign local node client certificate")?;
+                Ok((csr, signed))
+            },
+        )
+        .await
+        .context("local controlplane client certificate worker failed")??;
 
     store
         .save(&WorkerCredential {
@@ -602,7 +632,8 @@ mod tests {
             "mn-controlplane1",
             supervisor.clone(),
         );
-        let source = crate::bootstrap::worker_identity::resolve_credential_async(&store)
+        let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
+        let source = crate::bootstrap::worker_identity::resolve_credential_async(&store, &crypto)
             .await
             .expect("load persisted node credential");
         assert!(
@@ -728,7 +759,8 @@ mod tests {
                 "mn-controlplane2",
                 joiner_supervisor.clone(),
             );
-        let source = crate::bootstrap::worker_identity::resolve_credential_async(&store)
+        let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
+        let source = crate::bootstrap::worker_identity::resolve_credential_async(&store, &crypto)
             .await
             .expect("load persisted controlplane node credential");
         assert!(

@@ -1,6 +1,7 @@
 //! Shared domain types for klights.
 
 pub mod field_selector;
+pub mod ip;
 pub mod json_patch;
 pub mod label_selector;
 pub mod pod_status_merge;
@@ -9,10 +10,21 @@ pub mod resource_semantics;
 
 use std::fmt;
 
+/// A client certificate already accepted by a TLS transport.
+///
+/// This transport credential is shared by the API and internal RPC adapters;
+/// auth policy derives identities from the DER bytes through focused ports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TlsClientCertificate(pub Vec<u8>);
+
+/// Common name used by the extension API server request-header client.
+pub const APISERVICE_PROXY_COMMON_NAME: &str = "system:klights:apiservice-proxy";
+
 pub use field_selector::{
     FieldRequirement, FieldSelector, FieldSelectorOperator, FieldSelectorParseError,
     default_field_value, resolve_field_value,
 };
+pub use ip::first_usable_ipv4;
 pub use json_patch::apply_merge_patch;
 pub use label_selector::{
     LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,

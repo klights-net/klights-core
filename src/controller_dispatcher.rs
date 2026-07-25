@@ -113,7 +113,7 @@ impl ControllerDispatcher {
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        csr_signer: Option<Arc<dyn crate::auth::csr_signer::CsrSigner>>,
+        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
     ) -> Self {
         let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
             HashMap::new();
@@ -172,11 +172,11 @@ impl ControllerDispatcher {
         );
 
         // CSR signer controller — only registered when a signer is available
-        if let Some(signer) = csr_signer {
+        if let Some(issuer) = csr_issuer {
             controllers.insert(
                 ("certificates.k8s.io/v1", "CertificateSigningRequest"),
                 Arc::new(crate::controllers::csr_signer::CsrSignerController::new(
-                    signer,
+                    issuer,
                 )) as Arc<dyn Controller>,
             );
         }

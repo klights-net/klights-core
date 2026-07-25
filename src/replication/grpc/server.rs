@@ -44,7 +44,6 @@ use crate::replication::service::{
 use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
-#[cfg(not(test))]
 use super::ca_files::ReplicationRuntimeFiles;
 
 const MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS: i64 = 100;
@@ -307,6 +306,79 @@ pub(crate) struct ReplicationServerPorts {
     authenticated_outbox: Arc<dyn klights_leader_api::LeaderAuthenticatedOutboxDelivery>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ReplicationPeerIdentity {
+    pub(crate) username: String,
+    pub(crate) groups: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplicationPeerAuthenticationError {
+    Rejected { message: String },
+    DependencyFailure { message: String },
+    InternalFailure { message: String },
+}
+
+impl std::fmt::Display for ReplicationPeerAuthenticationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Rejected { message }
+            | Self::DependencyFailure { message }
+            | Self::InternalFailure { message } => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for ReplicationPeerAuthenticationError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ControlplaneCredentialError {
+    Rejected { message: String },
+    DependencyFailure { message: String },
+    InternalFailure { message: String },
+}
+
+impl std::fmt::Display for ControlplaneCredentialError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Rejected { message }
+            | Self::DependencyFailure { message }
+            | Self::InternalFailure { message } => message,
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for ControlplaneCredentialError {}
+
+/// Consumer-owned authentication port for internal RPC peer certificates.
+#[async_trait::async_trait]
+pub(crate) trait ReplicationPeerAuthenticator: Send + Sync {
+    async fn authenticate(
+        &self,
+        certificate: &klights_types::TlsClientCertificate,
+    ) -> Result<ReplicationPeerIdentity, ReplicationPeerAuthenticationError>;
+}
+
+/// Consumer-owned certificate/key operation port used during control-plane
+/// bootstrap. The replication transport never owns auth policy or key crypto.
+#[async_trait::async_trait]
+pub(crate) trait ControlplaneCredentialIssuer: Send + Sync {
+    async fn sign_server_csr(
+        &self,
+        ca_cert_pem: &str,
+        ca_key_pem: &str,
+        csr_pem: Vec<u8>,
+    ) -> Result<String, ControlplaneCredentialError>;
+
+    async fn encrypt_key_material(
+        &self,
+        join_token: &str,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), ControlplaneCredentialError>;
+}
+
 impl ReplicationServerPorts {
     pub(crate) fn from_shared<T>(
         shared: Arc<T>,
@@ -347,11 +419,13 @@ pub struct GrpcReplicationServer {
     service: Arc<ReplicationService>,
     ports: ReplicationServerPorts,
     #[cfg(test)]
-    db: DatastoreHandle,
+    db: Option<DatastoreHandle>,
     node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     authoritative_snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
+    peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
+    credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     /// Phase 3 raft RPC dispatcher. Populated by the leader bootstrap
     /// (P3-11c) when raft mode is wired. When None, the three Raft
     /// RPCs respond with `RaftRpcRouterError::Disabled` so the client
@@ -381,7 +455,9 @@ impl GrpcReplicationServer {
         authoritative_snapshot_capture: Arc<
             dyn klights_cluster_store::AuthoritativeSnapshotCapture,
         >,
-        #[cfg(test)] db: DatastoreHandle,
+        peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
+        credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
+        #[cfg(test)] db: Option<DatastoreHandle>,
     ) -> Self {
         let controlplane_ca_files = ControlplaneCaFiles::new(service.task_supervisor());
         Self {
@@ -393,6 +469,8 @@ impl GrpcReplicationServer {
             node_self_status: None,
             node_lifecycle_status: None,
             authoritative_snapshot_capture,
+            peer_authenticator,
+            credential_issuer,
             raft_rpc_router: None,
             controlplane_join_handler: None,
             controlplane_ca_files,
@@ -433,15 +511,24 @@ impl GrpcReplicationServer {
         self
     }
 
-    #[cfg(not(test))]
     pub(crate) fn new_with_ports(
         service: Arc<ReplicationService>,
         ports: ReplicationServerPorts,
         authoritative_snapshot_capture: Arc<
             dyn klights_cluster_store::AuthoritativeSnapshotCapture,
         >,
+        peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
+        credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     ) -> Self {
-        Self::from_parts(service, ports, authoritative_snapshot_capture)
+        Self::from_parts(
+            service,
+            ports,
+            authoritative_snapshot_capture,
+            peer_authenticator,
+            credential_issuer,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -516,7 +603,24 @@ impl GrpcReplicationServer {
                 db.clone(),
             ),
         );
-        Self::from_parts(service, ports, capture, db)
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
+        Self::from_parts(
+            service,
+            ports,
+            capture,
+            Arc::new(
+                crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
+                    supervisor.clone(),
+                ),
+            ),
+            Arc::new(
+                crate::bootstrap::auth_adapters::AuthControlplaneCredentialIssuer::new(
+                    Arc::new(crate::auth::clock::SystemClock),
+                    supervisor,
+                ),
+            ),
+            Some(db),
+        )
     }
 
     /// P3-11b: attach a Raft RPC dispatcher so this server can handle
@@ -549,7 +653,6 @@ impl GrpcReplicationServer {
         self
     }
 
-    #[cfg(not(test))]
     pub(crate) fn with_runtime_files(mut self, files: ReplicationRuntimeFiles) -> Self {
         self.controlplane_ca_files.set_files(files);
         self
@@ -624,26 +727,18 @@ impl GrpcReplicationServer {
     ) -> std::result::Result<(), Status> {
         let Some(cert) = request
             .extensions()
-            .get::<crate::auth::TlsClientCertificate>()
+            .get::<klights_types::TlsClientCertificate>()
         else {
             return Err(Status::unauthenticated(format!(
                 "{action} require a node client certificate"
             )));
         };
-        let user = crate::auth::user_from_cert(&cert.0).map_err(|err| {
-            Status::unauthenticated(format!("invalid control-plane node certificate: {err}"))
-        })?;
-        let identity = crate::auth::AuthenticatedIdentity::client_cert(user.username, user.groups);
+        let identity = authenticate_peer_identity(self.peer_authenticator.as_ref(), cert).await?;
         let _node_name = identity
             .username
             .strip_prefix("system:node:")
             .filter(|name| !name.is_empty())
-            .filter(|_| {
-                identity
-                    .groups
-                    .iter()
-                    .any(|group| group == crate::auth::NODES_GROUP)
-            })
+            .filter(|_| identity.groups.iter().any(|group| group == "system:nodes"))
             .ok_or_else(|| {
                 Status::unauthenticated("control-plane certificate must be a node identity")
             })?;
@@ -663,7 +758,7 @@ impl GrpcReplicationServer {
         if !identity
             .groups
             .iter()
-            .any(|group| group == crate::auth::CONTROLPLANE_NODES_GROUP)
+            .any(|group| group == "system:controlplanes")
         {
             return Err(Status::permission_denied(format!(
                 "{action} require a system:controlplanes node certificate"
@@ -694,34 +789,79 @@ impl GrpcReplicationServer {
     async fn require_steady_state_auth<T>(
         &self,
         request: &Request<T>,
-    ) -> std::result::Result<crate::auth::AuthenticatedIdentity, Status> {
-        node_client_identity(request)?.ok_or_else(|| {
+    ) -> std::result::Result<ReplicationPeerIdentity, Status> {
+        self.node_client_identity(request).await?.ok_or_else(|| {
             Status::unauthenticated(
                 "steady-state replication RPC requires a node client certificate",
             )
         })
     }
+    async fn node_client_identity<T>(
+        &self,
+        request: &Request<T>,
+    ) -> std::result::Result<Option<ReplicationPeerIdentity>, Status> {
+        let Some(cert) = request
+            .extensions()
+            .get::<klights_types::TlsClientCertificate>()
+        else {
+            return Ok(None);
+        };
+        let identity = authenticate_peer_identity(self.peer_authenticator.as_ref(), cert).await?;
+        validate_node_client_identity(&identity, None)?;
+        Ok(Some(identity))
+    }
 }
 
-fn node_client_identity<T>(
-    request: &Request<T>,
-) -> std::result::Result<Option<crate::auth::AuthenticatedIdentity>, Status> {
-    let Some(cert) = request
-        .extensions()
-        .get::<crate::auth::TlsClientCertificate>()
-    else {
-        return Ok(None);
-    };
-    let user = crate::auth::user_from_cert(&cert.0).map_err(|err| {
-        Status::unauthenticated(format!("invalid node client certificate: {err}"))
-    })?;
-    let identity = crate::auth::AuthenticatedIdentity::client_cert(user.username, user.groups);
-    validate_node_client_identity(&identity, None)?;
-    Ok(Some(identity))
+async fn authenticate_peer_identity(
+    authenticator: &dyn ReplicationPeerAuthenticator,
+    certificate: &klights_types::TlsClientCertificate,
+) -> std::result::Result<ReplicationPeerIdentity, Status> {
+    authenticator
+        .authenticate(certificate)
+        .await
+        .map_err(replication_peer_authentication_status)
+}
+
+fn replication_peer_authentication_status(error: ReplicationPeerAuthenticationError) -> Status {
+    match error {
+        ReplicationPeerAuthenticationError::Rejected { message } => {
+            Status::unauthenticated(format!("invalid node client certificate: {message}"))
+        }
+        ReplicationPeerAuthenticationError::DependencyFailure { message } => {
+            Status::unavailable(message)
+        }
+        ReplicationPeerAuthenticationError::InternalFailure { message } => {
+            Status::internal(message)
+        }
+    }
+}
+
+fn controlplane_credential_status(
+    operation: &'static str,
+    error: ControlplaneCredentialError,
+) -> Status {
+    let message = format!("{operation} failed: {error}");
+    match error {
+        ControlplaneCredentialError::Rejected { .. } => Status::invalid_argument(message),
+        ControlplaneCredentialError::DependencyFailure { .. } => Status::unavailable(message),
+        ControlplaneCredentialError::InternalFailure { .. } => Status::internal(message),
+    }
+}
+
+async fn encrypt_controlplane_key_material(
+    issuer: &dyn ControlplaneCredentialIssuer,
+    operation: &'static str,
+    join_token: &str,
+    plaintext: &[u8],
+) -> std::result::Result<(Vec<u8>, Vec<u8>), Status> {
+    issuer
+        .encrypt_key_material(join_token, plaintext)
+        .await
+        .map_err(|error| controlplane_credential_status(operation, error))
 }
 
 fn validate_node_client_identity(
-    identity: &crate::auth::AuthenticatedIdentity,
+    identity: &ReplicationPeerIdentity,
     expected_node_name: Option<&str>,
 ) -> std::result::Result<(), Status> {
     let Some(node_name) = identity.username.strip_prefix("system:node:") else {
@@ -765,25 +905,11 @@ enum CallerAuthority {
 /// missing certificates are not node identities and are left unrestricted. The
 /// node-scoped RPC handlers call `require_steady_state_auth` before this helper,
 /// so token-only/no-cert callers do not reach the unrestricted branch.
-fn caller_node_authority<T>(request: &Request<T>) -> CallerAuthority {
-    let Some(cert) = request
-        .extensions()
-        .get::<crate::auth::TlsClientCertificate>()
-    else {
-        return CallerAuthority::Unrestricted;
-    };
-    let Ok(user) = crate::auth::user_from_cert(&cert.0) else {
-        return CallerAuthority::Unrestricted;
-    };
-    let identity = crate::auth::AuthenticatedIdentity::client_cert(user.username, user.groups);
-    node_authority_from_identity(&identity)
-}
-
-fn node_authority_from_identity(identity: &crate::auth::AuthenticatedIdentity) -> CallerAuthority {
+fn node_authority_from_identity(identity: &ReplicationPeerIdentity) -> CallerAuthority {
     let is_controlplane = identity
         .groups
         .iter()
-        .any(|group| group == crate::auth::CONTROLPLANE_NODES_GROUP);
+        .any(|group| group == "system:controlplanes");
     let is_node = !is_controlplane
         && identity.username.starts_with("system:node:")
         && identity.groups.iter().any(|group| group == "system:nodes");
@@ -802,9 +928,7 @@ fn node_authority_from_identity(identity: &crate::auth::AuthenticatedIdentity) -
 /// Projected token issuance is stricter than general NodeRestriction: every
 /// authenticated node certificate, including a control-plane node certificate,
 /// may mint only for the exact node encoded in its `system:node:<name>` CN.
-fn exact_projected_token_node_authority(
-    identity: &crate::auth::AuthenticatedIdentity,
-) -> CallerAuthority {
+fn exact_projected_token_node_authority(identity: &ReplicationPeerIdentity) -> CallerAuthority {
     let is_node = identity.username.starts_with("system:node:")
         && identity.groups.iter().any(|group| group == "system:nodes");
     if is_node {
@@ -1110,12 +1234,13 @@ pub fn mount_service_full_with_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(not(test))]
-pub(crate) fn mount_service_full(
+pub(crate) fn mount_service_full_production(
     app: axum::Router,
     service: Arc<ReplicationService>,
     ports: ReplicationServerPorts,
     authoritative_snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
+    peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
+    credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
     controlplane_join_handler: Option<
         Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
@@ -1128,10 +1253,15 @@ pub(crate) fn mount_service_full(
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
-    let mut grpc =
-        GrpcReplicationServer::new_with_ports(service, ports, authoritative_snapshot_capture)
-            .with_runtime_files(runtime_files)
-            .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
+    let mut grpc = GrpcReplicationServer::new_with_ports(
+        service,
+        ports,
+        authoritative_snapshot_capture,
+        peer_authenticator,
+        credential_issuer,
+    )
+    .with_runtime_files(runtime_files)
+    .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
     if let Some(is_leader_rx) = is_leader_rx {
         grpc = grpc.with_leader_gate(is_leader_rx);
     }
@@ -1192,7 +1322,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<tonic::Streaming<generated::FollowerMessage>>,
     ) -> std::result::Result<Response<Self::ConnectStream>, Status> {
         let remote_addr = request.remote_addr();
-        let client_cert_identity = node_client_identity(&request)?;
+        let client_cert_identity = self.node_client_identity(&request).await?;
         let mut inbound = request.into_inner();
         let first = inbound.message().await?.ok_or_else(|| {
             Status::unauthenticated("first replication message must be JoinRequest")
@@ -1754,6 +1884,10 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         }
         #[cfg(test)]
         {
+            let db = self
+                .db
+                .as_ref()
+                .expect("test mount must provide a datastore");
             let topic = klights_watch::WatchTopic::new(&req.api_version, &req.kind);
             // For new peers, the exact position came from the same read snapshot as
             // LIST. For legacy scalar-RV peers, capture a durable high-water mark
@@ -1764,22 +1898,22 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .start_watch_replay_position
                 .as_ref()
                 .map(watch_replay_position_from_proto);
-            let watch_anchor = crate::datastore::DatastoreBackendWatchStore::new(self.db.clone());
+            let watch_anchor = crate::datastore::DatastoreBackendWatchStore::new(db.clone());
             let (signal_rx, replay_position) = if let Some(position) = requested_position {
                 // Exact positioned continuations do not need to sample an anchor,
                 // but still install their wakeup edge before any later await.
-                (self.db.subscribe_watch_signals(topic.clone()), position)
+                (db.subscribe_watch_signals(topic.clone()), position)
             } else {
                 subscribe_grpc_watch_handoff(
                     &watch_anchor,
-                    || self.db.subscribe_watch_signals(topic.clone()),
+                    || db.subscribe_watch_signals(topic.clone()),
                     req.start_resource_version.unwrap_or(0),
                 )
                 .await?
             };
             let resource_scope =
                 crate::control_plane::client::local::datastore_watch_resource_scope(
-                    self.db.as_ref(),
+                    db.as_ref(),
                     &req.api_version,
                     &req.kind,
                 )
@@ -1788,7 +1922,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
             let replay_source = DatastoreWatchReplaySource::new(
                 std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    self.db.clone(),
+                    db.clone(),
                 )),
                 vec![watch_target_for_request(&req, resource_scope)],
             );
@@ -2010,9 +2144,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         &self,
         request: Request<generated::RenewNodeLeaseRequest>,
     ) -> std::result::Result<Response<generated::RenewNodeLeaseResponse>, Status> {
-        self.require_steady_state_auth(&request).await?;
+        let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        let caller = caller_node_authority(&request);
+        let caller = node_authority_from_identity(&identity);
         let req = request.into_inner();
         // NodeRestriction: a node may only renew its own lease.
         enforce_node_authority(&caller, &req.node_name)?;
@@ -2040,9 +2174,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         &self,
         request: Request<generated::AllocateNodeSubnetRequest>,
     ) -> std::result::Result<Response<generated::NodeSubnetResponse>, Status> {
-        self.require_steady_state_auth(&request).await?;
+        let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        let authority = caller_node_authority(&request);
+        let authority = node_authority_from_identity(&identity);
         let req = request.into_inner();
         enforce_node_authority(&authority, &req.node_name)?;
         let focused_request = klights_leader_api::NodeSubnetAllocationRequest::try_new(
@@ -2145,8 +2279,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         &self,
         request: Request<generated::ObservePeerEndpointRequest>,
     ) -> std::result::Result<Response<generated::ObservePeerEndpointResponse>, Status> {
-        self.require_steady_state_auth(&request).await?;
-        let caller = caller_node_authority(&request);
+        let identity = self.require_steady_state_auth(&request).await?;
+        let caller = node_authority_from_identity(&identity);
         let observed_endpoint = request.remote_addr().map(|addr| addr.ip().to_string());
         let req = request.into_inner();
         enforce_node_authority(&caller, &req.node_name)?;
@@ -2183,9 +2317,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::ListPodCleanupIntentsForNodeRequest>,
     ) -> std::result::Result<Response<generated::ListPodCleanupIntentsForNodeResponse>, Status>
     {
-        self.require_steady_state_auth(&request).await?;
+        let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        let caller = caller_node_authority(&request);
+        let caller = node_authority_from_identity(&identity);
         let req = request.into_inner();
         let request =
             crate::control_plane::client::PodCleanupIntentListRequest::try_new(req.node_name)
@@ -2209,9 +2343,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         &self,
         request: Request<generated::DeletePodCleanupIntentRequest>,
     ) -> std::result::Result<Response<generated::DeletePodCleanupIntentResponse>, Status> {
-        self.require_steady_state_auth(&request).await?;
+        let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        let caller = caller_node_authority(&request);
+        let caller = node_authority_from_identity(&identity);
         let req = request.into_inner();
         let request = crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
             req.node_name,
@@ -2343,7 +2477,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .require_controlplane_join_token(request.metadata())
             .await
             .is_ok();
-        let client_cert_identity = node_client_identity(&request)?;
+        let client_cert_identity = self.node_client_identity(&request).await?;
         let mut req = request.into_inner();
         let Some(identity) = client_cert_identity.as_ref() else {
             return Err(Status::unauthenticated(
@@ -2522,7 +2656,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // before the auth match consumes `token_auth`. Node-cert auth (used for
         // server-cert renewal by existing nodes) must never leak that material.
         let controlplane_token_authenticated = token_auth.is_ok();
-        let client_cert_identity = node_client_identity(&request)?;
+        let client_cert_identity = self.node_client_identity(&request).await?;
 
         let req = request.into_inner();
         match token_auth {
@@ -2559,18 +2693,21 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let ca_key_pem = self.controlplane_ca_files.signing_ca_key_pem().await?;
         let service_account_signing_key_pem = self.service_account_signing_key_pem().await?;
 
-        let signer =
-            crate::auth::csr_signer::CaCsrSigner::new(ca_cert_pem.clone(), ca_key_pem.clone());
-        use crate::auth::csr_signer::CsrSigner;
-        let sign_result = signer
-            .sign(crate::auth::csr_signer::SignRequest {
-                csr_pem: req.server_csr,
-                common_name: "klights-server".to_string(),
-                organizations: vec![],
-                usages: vec!["server auth".to_string()],
-                ttl_seconds: 86400 * 365 * 10,
-            })
-            .map_err(|e| Status::invalid_argument(format!("CSR signing failed: {e}")))?;
+        let signed_server_cert = self
+            .credential_issuer
+            .sign_server_csr(&ca_cert_pem, &ca_key_pem, req.server_csr)
+            .await
+            .map_err(|error| match error {
+                ControlplaneCredentialError::Rejected { message } => {
+                    Status::invalid_argument(format!("CSR signing failed: {message}"))
+                }
+                ControlplaneCredentialError::DependencyFailure { message } => {
+                    Status::unavailable(message)
+                }
+                ControlplaneCredentialError::InternalFailure { message } => {
+                    Status::internal(message)
+                }
+            })?;
 
         let (
             encrypted_ca_key,
@@ -2578,26 +2715,21 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             encrypted_service_account_signing_key,
             service_account_signing_key_nonce,
         ) = if controlplane_token_authenticated && !join_token.is_empty() {
-            let (encrypted_ca_key, ca_key_nonce) =
-                match crate::auth::ca_transport::encrypt_ca_key(&join_token, ca_key_pem.as_bytes())
-                {
-                    Ok((ct, nonce)) => (ct, nonce.to_vec()),
-                    Err(e) => {
-                        return Err(Status::internal(format!("CA key encryption failed: {e}")));
-                    }
-                };
+            let (encrypted_ca_key, ca_key_nonce) = encrypt_controlplane_key_material(
+                self.credential_issuer.as_ref(),
+                "CA key encryption",
+                &join_token,
+                ca_key_pem.as_bytes(),
+            )
+            .await?;
             let (encrypted_service_account_signing_key, service_account_signing_key_nonce) =
-                match crate::auth::ca_transport::encrypt_ca_key(
+                encrypt_controlplane_key_material(
+                    self.credential_issuer.as_ref(),
+                    "ServiceAccount signing key encryption",
                     &join_token,
                     service_account_signing_key_pem.as_bytes(),
-                ) {
-                    Ok((ct, nonce)) => (ct, nonce.to_vec()),
-                    Err(e) => {
-                        return Err(Status::internal(format!(
-                            "ServiceAccount signing key encryption failed: {e}"
-                        )));
-                    }
-                };
+                )
+                .await?;
             (
                 encrypted_ca_key,
                 ca_key_nonce,
@@ -2614,7 +2746,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         );
 
         Ok(Response::new(generated::SignControlplaneCsrResponse {
-            signed_server_cert: sign_result.certificate_pem,
+            signed_server_cert,
             ca_cert_pem,
             encrypted_ca_key,
             ca_key_nonce,
@@ -3371,7 +3503,7 @@ fn node_metrics_response_from_proto(
 mod tests {
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
@@ -3959,7 +4091,7 @@ mod tests {
                     let service = hyper::service::service_fn(move |mut req| {
                         if let Some(node_name) = injected_node_cert.as_deref() {
                             req.extensions_mut()
-                                .insert(crate::auth::TlsClientCertificate(node_client_cert_der(
+                                .insert(klights_types::TlsClientCertificate(node_client_cert_der(
                                     node_name,
                                     &["system:nodes"],
                                 )));
@@ -4032,7 +4164,7 @@ mod tests {
                     let service = hyper::service::service_fn(move |mut req| {
                         if let Some(node_name) = injected_node_cert.as_deref() {
                             req.extensions_mut()
-                                .insert(crate::auth::TlsClientCertificate(node_client_cert_der(
+                                .insert(klights_types::TlsClientCertificate(node_client_cert_der(
                                     node_name,
                                     &["system:nodes"],
                                 )));
@@ -5128,7 +5260,7 @@ mod tests {
         let mut request = tonic::Request::new(message);
         request
             .extensions_mut()
-            .insert(crate::auth::TlsClientCertificate(node_client_cert_der(
+            .insert(klights_types::TlsClientCertificate(node_client_cert_der(
                 node_name,
                 &["system:nodes"],
             )));
@@ -5142,7 +5274,7 @@ mod tests {
         let mut request = tonic::Request::new(message);
         request
             .extensions_mut()
-            .insert(crate::auth::TlsClientCertificate(node_client_cert_der(
+            .insert(klights_types::TlsClientCertificate(node_client_cert_der(
                 node_name,
                 &["system:nodes", "system:controlplanes"],
             )));
@@ -5173,7 +5305,7 @@ mod tests {
         let mut request = tonic::Request::new(message);
         request
             .extensions_mut()
-            .insert(crate::auth::TlsClientCertificate(node_client_cert_der(
+            .insert(klights_types::TlsClientCertificate(node_client_cert_der(
                 "admin",
                 &["system:masters"],
             )));
@@ -5183,31 +5315,210 @@ mod tests {
     // ── CRIT-2: NodeRestriction on node-scoped RPCs ──
 
     #[test]
-    fn caller_node_authority_token_only_is_unrestricted() {
-        // No client certificate: not a system:nodes identity, so the raw
-        // classifier is not node-restricted. Production node-scoped handlers
-        // reject no-cert callers before this helper is used.
-        let request = tonic::Request::new(());
+    fn production_auth_mount_graph_is_compiler_reachable_in_tests() {
+        let _mount = super::mount_service_full_production;
+    }
+
+    struct StatefulPeerAuthenticator {
+        calls: AtomicUsize,
+        reject_first: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::ReplicationPeerAuthenticator for StatefulPeerAuthenticator {
+        async fn authenticate(
+            &self,
+            _certificate: &klights_types::TlsClientCertificate,
+        ) -> Result<super::ReplicationPeerIdentity, super::ReplicationPeerAuthenticationError>
+        {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_first || call > 0 {
+                return Err(super::ReplicationPeerAuthenticationError::Rejected {
+                    message: "stateful rejection".to_string(),
+                });
+            }
+            Ok(super::ReplicationPeerIdentity {
+                username: "system:node:worker-7".to_string(),
+                groups: vec!["system:nodes".to_string()],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn node_authority_reuses_exactly_one_authenticated_identity() {
+        let authenticator = StatefulPeerAuthenticator {
+            calls: AtomicUsize::new(0),
+            reject_first: false,
+        };
+        let certificate = klights_types::TlsClientCertificate(vec![1, 2, 3]);
+        let identity = super::authenticate_peer_identity(&authenticator, &certificate)
+            .await
+            .unwrap();
         assert!(matches!(
-            super::caller_node_authority(&request),
+            super::node_authority_from_identity(&identity),
+            super::CallerAuthority::Node(node) if node == "worker-7"
+        ));
+        assert_eq!(authenticator.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn node_authority_fails_closed_when_the_single_authentication_rejects() {
+        let authenticator = StatefulPeerAuthenticator {
+            calls: AtomicUsize::new(0),
+            reject_first: true,
+        };
+        let certificate = klights_types::TlsClientCertificate(vec![1, 2, 3]);
+        let status = super::authenticate_peer_identity(&authenticator, &certificate)
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(authenticator.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct RejectingPeerAuthenticator(super::ReplicationPeerAuthenticationError);
+
+    #[async_trait::async_trait]
+    impl super::ReplicationPeerAuthenticator for RejectingPeerAuthenticator {
+        async fn authenticate(
+            &self,
+            _certificate: &klights_types::TlsClientCertificate,
+        ) -> Result<super::ReplicationPeerIdentity, super::ReplicationPeerAuthenticationError>
+        {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn replication_peer_authentication_errors_preserve_tonic_categories() {
+        let cases = [
+            (
+                super::ReplicationPeerAuthenticationError::Rejected {
+                    message: "rejected".to_string(),
+                },
+                tonic::Code::Unauthenticated,
+            ),
+            (
+                super::ReplicationPeerAuthenticationError::DependencyFailure {
+                    message: "dependency".to_string(),
+                },
+                tonic::Code::Unavailable,
+            ),
+            (
+                super::ReplicationPeerAuthenticationError::InternalFailure {
+                    message: "internal".to_string(),
+                },
+                tonic::Code::Internal,
+            ),
+        ];
+        let certificate = klights_types::TlsClientCertificate(vec![1, 2, 3]);
+        for (error, expected) in cases {
+            let authenticator = RejectingPeerAuthenticator(error);
+            assert_eq!(
+                super::authenticate_peer_identity(&authenticator, &certificate)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                expected
+            );
+        }
+    }
+
+    struct RejectingCredentialIssuer(super::ControlplaneCredentialError);
+
+    #[async_trait::async_trait]
+    impl super::ControlplaneCredentialIssuer for RejectingCredentialIssuer {
+        async fn sign_server_csr(
+            &self,
+            _ca_cert_pem: &str,
+            _ca_key_pem: &str,
+            _csr_pem: Vec<u8>,
+        ) -> Result<String, super::ControlplaneCredentialError> {
+            unreachable!("encryption mapping test must not sign")
+        }
+
+        async fn encrypt_key_material(
+            &self,
+            _join_token: &str,
+            _plaintext: &[u8],
+        ) -> Result<(Vec<u8>, Vec<u8>), super::ControlplaneCredentialError> {
+            Err(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn controlplane_credential_errors_preserve_tonic_categories() {
+        let cases = [
+            (
+                super::ControlplaneCredentialError::Rejected {
+                    message: "rejected".to_string(),
+                },
+                tonic::Code::InvalidArgument,
+            ),
+            (
+                super::ControlplaneCredentialError::DependencyFailure {
+                    message: "dependency".to_string(),
+                },
+                tonic::Code::Unavailable,
+            ),
+            (
+                super::ControlplaneCredentialError::InternalFailure {
+                    message: "internal".to_string(),
+                },
+                tonic::Code::Internal,
+            ),
+        ];
+        for (error, expected) in cases {
+            let issuer = RejectingCredentialIssuer(error);
+            assert_eq!(
+                super::encrypt_controlplane_key_material(
+                    &issuer,
+                    "test operation",
+                    "join-token",
+                    b"secret",
+                )
+                .await
+                .unwrap_err()
+                .code(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn caller_node_authority_non_node_identity_is_unrestricted() {
+        let identity = super::ReplicationPeerIdentity {
+            username: "admin".to_string(),
+            groups: vec!["system:masters".to_string()],
+        };
+        assert!(matches!(
+            super::node_authority_from_identity(&identity),
             super::CallerAuthority::Unrestricted
         ));
     }
 
     #[test]
     fn caller_node_authority_extracts_node_name() {
-        let request = request_with_node_client_cert((), "worker-7");
-        match super::caller_node_authority(&request) {
+        let identity = super::ReplicationPeerIdentity {
+            username: "system:node:worker-7".to_string(),
+            groups: vec!["system:nodes".to_string()],
+        };
+        match super::node_authority_from_identity(&identity) {
             super::CallerAuthority::Node(name) => assert_eq!(name, "worker-7"),
             super::CallerAuthority::Unrestricted => panic!("node cert must be node-bound"),
         }
     }
 
     #[test]
-    fn caller_node_authority_admin_is_unrestricted() {
-        let request = request_with_admin_cert(());
+    fn caller_node_authority_controlplane_node_is_unrestricted() {
+        let identity = super::ReplicationPeerIdentity {
+            username: "system:node:cp1".to_string(),
+            groups: vec![
+                "system:nodes".to_string(),
+                "system:controlplanes".to_string(),
+            ],
+        };
         assert!(matches!(
-            super::caller_node_authority(&request),
+            super::node_authority_from_identity(&identity),
             super::CallerAuthority::Unrestricted
         ));
     }
@@ -5221,10 +5532,24 @@ mod tests {
             super::enforce_node_authority(&super::CallerAuthority::Node("w1".to_string()), "w1")
                 .is_ok()
         );
-        let err =
-            super::enforce_node_authority(&super::CallerAuthority::Node("w1".to_string()), "w2")
-                .expect_err("node may not act for another node");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        for operation in [
+            "renew_node_lease",
+            "allocate_node_subnet",
+            "observe_peer_endpoint",
+            "list_pod_cleanup_intents_for_node",
+            "delete_pod_cleanup_intent",
+        ] {
+            let err = super::enforce_node_authority(
+                &super::CallerAuthority::Node("w1".to_string()),
+                "w2",
+            )
+            .expect_err("node may not act for another node");
+            assert_eq!(
+                err.code(),
+                tonic::Code::PermissionDenied,
+                "{operation} must reject a mismatched node identity"
+            );
+        }
     }
 
     // ── CRIT-1: raft RPC authentication ──
@@ -6795,6 +7120,7 @@ mod tests {
                 Some("10.99.0.14"),
                 node_name,
                 None,
+                time::OffsetDateTime::now_utc(),
             )
             .unwrap();
             let mut request = tonic::Request::new(generated::SignControlplaneCsrRequest {
@@ -6861,6 +7187,7 @@ mod tests {
             Some("10.99.0.14"),
             "worker-1",
             None,
+            time::OffsetDateTime::now_utc(),
         )
         .unwrap();
         let mut request = request_with_node_client_cert(

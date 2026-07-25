@@ -4257,69 +4257,272 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     let req_body = json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenReview",
+        "metadata": {
+            "name": "preserved-review",
+            "labels": {"review.example.test/source": "json-protobuf"}
+        },
         "spec": {
             "token": token,
             "audiences": ["https://kubernetes.default.svc.cluster.local"]
         }
     });
-    let resp = app
+    let mut format_responses = Vec::new();
+    for content_type in ["application/json", "application/vnd.kubernetes.protobuf"] {
+        let request_body = if content_type == "application/json" {
+            serde_json::to_vec(&req_body).unwrap()
+        } else {
+            klights_kube_protobuf::encode_protobuf(&req_body).unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header("content-type", content_type)
+                    .header("accept", content_type)
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "TokenReview create endpoint must authenticate valid SA tokens for {content_type}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: serde_json::Value = if content_type == "application/json" {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            klights_kube_protobuf::decode_protobuf(&body).unwrap()
+        };
+        assert_eq!(response["kind"], "TokenReview");
+        assert_eq!(response["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(response["metadata"], req_body["metadata"]);
+        assert_eq!(response["spec"], req_body["spec"]);
+        assert_eq!(response["status"]["authenticated"], true);
+        assert_eq!(
+            response["status"]["user"]["username"],
+            "system:serviceaccount:kube-system:default"
+        );
+
+        let groups = response["status"]["user"]["groups"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            groups
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|g| g == "system:authenticated"),
+            "TokenReview user groups must include system:authenticated; got: {groups:?}"
+        );
+        let credential_id =
+            response["status"]["user"]["extra"]["authentication.kubernetes.io/credential-id"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+        assert_eq!(
+            credential_id.len(),
+            1,
+            "TokenReview user extra credential-id must contain exactly one item; got: {credential_id:?}"
+        );
+        assert!(
+            credential_id[0]
+                .as_str()
+                .is_some_and(|v| v.starts_with("JTI=")),
+            "TokenReview user extra credential-id must start with JTI=; got: {credential_id:?}"
+        );
+        format_responses.push(response);
+    }
+    assert_eq!(
+        format_responses[0], format_responses[1],
+        "successful TokenReview JSON and protobuf objects must be identical"
+    );
+
+    let other_audience_token =
+        crate::auth::generate_sa_token_with_bound_pod(crate::auth::ServiceAccountTokenRequest {
+            ca_key_pem: &ca_key_pem,
+            service_account: "default",
+            namespace: "kube-system",
+            audiences: &["https://untrusted.example.test"],
+            expiration_seconds: None,
+            bound: crate::auth::BoundServiceAccountToken {
+                sa_uid: Some(sa_uid),
+                ..crate::auth::BoundServiceAccountToken::default()
+            },
+        })
+        .unwrap();
+    let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/apis/authentication.k8s.io/v1/tokenreviews")
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "apiVersion": "authentication.k8s.io/v1",
+                        "kind": "TokenReview",
+                        "spec": {"token": other_audience_token}
+                    }))
+                    .unwrap(),
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "TokenReview create endpoint must exist and authenticate valid SA tokens"
-    );
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["kind"], "TokenReview");
-    assert_eq!(json["apiVersion"], "authentication.k8s.io/v1");
-    assert_eq!(json["status"]["authenticated"], true);
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        json["status"]["user"]["username"],
-        "system:serviceaccount:kube-system:default"
-    );
-
-    let groups = json["status"]["user"]["groups"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(
-        groups
-            .iter()
-            .filter_map(|v| v.as_str())
-            .any(|g| g == "system:authenticated"),
-        "TokenReview user groups must include system:authenticated; got: {groups:?}"
-    );
-    let credential_id =
-        json["status"]["user"]["extra"]["authentication.kubernetes.io/credential-id"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-    assert_eq!(
-        credential_id.len(),
-        1,
-        "TokenReview user extra credential-id must contain exactly one item; got: {credential_id:?}"
-    );
-    assert!(
-        credential_id[0]
-            .as_str()
-            .is_some_and(|v| v.starts_with("JTI=")),
-        "TokenReview user extra credential-id must start with JTI=; got: {credential_id:?}"
+        response["status"]["authenticated"], false,
+        "an omitted TokenReview audience must validate the default API audience"
     );
 
     std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
+}
+
+#[tokio::test]
+async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let mut state = build_test_app_state().await;
+    let namespace = format!("tokenreview-rejected-{}", uuid::Uuid::new_v4());
+    let mut config = crate::KlightsConfig::test_default();
+    config.containerd_namespace = namespace.clone();
+    state.config = std::sync::Arc::new(config);
+    let signing_key = crate::auth::generate_ca_full().unwrap().3;
+    let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
+    crate::auth::persist_service_account_signing_key(
+        &signing_key_path,
+        &signing_key,
+        state.task_supervisor.as_ref(),
+    )
+    .await
+    .unwrap();
+    let app = crate::api::build_router(state);
+    let request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "metadata": {
+            "name": "preserved-rejection",
+            "annotations": {"review.example.test/reason": "invalid"}
+        },
+        "spec": {"token": "not-a-valid-token"}
+    });
+    let mut format_responses = Vec::new();
+    for content_type in ["application/json", "application/vnd.kubernetes.protobuf"] {
+        let request_body = if content_type == "application/json" {
+            serde_json::to_vec(&request).unwrap()
+        } else {
+            klights_kube_protobuf::encode_protobuf(&request).unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header("content-type", content_type)
+                    .header("accept", content_type)
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let review = if content_type == "application/json" {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            klights_kube_protobuf::decode_protobuf(&body).unwrap()
+        };
+        assert_eq!(review["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(review["kind"], "TokenReview");
+        assert_eq!(review["metadata"], request["metadata"]);
+        assert_eq!(review["spec"], request["spec"]);
+        assert_eq!(review["status"]["authenticated"], false);
+        format_responses.push(review);
+    }
+    assert_eq!(
+        format_responses[0], format_responses[1],
+        "unauthenticated TokenReview JSON and protobuf objects must be identical"
+    );
+
+    std::fs::remove_dir_all(crate::paths::data_root_path(&namespace)).ok();
+}
+
+#[tokio::test]
+async fn test_tokenreview_empty_token_is_bad_request_in_json_and_protobuf() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let app = crate::api::build_router(build_test_app_state().await);
+    let request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "metadata": {"name": "empty-token"},
+        "spec": {"token": ""}
+    });
+    for content_type in ["application/json", "application/vnd.kubernetes.protobuf"] {
+        let request_body = if content_type == "application/json" {
+            serde_json::to_vec(&request).unwrap()
+        } else {
+            klights_kube_protobuf::encode_protobuf(&request).unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header("content-type", content_type)
+                    .header("accept", content_type)
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = if content_type == "application/json" {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            klights_kube_protobuf::decode_protobuf(&body).unwrap()
+        };
+        assert_eq!(status["kind"], "Status");
+        assert_eq!(status["reason"], "BadRequest");
+        assert_eq!(status["code"], 400);
+    }
 }
 
 #[tokio::test]
@@ -4408,7 +4611,10 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
         "kind": "TokenReview",
         "spec": {
             "token": token,
-            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+            "audiences": [
+                "https://kubernetes.default.svc.cluster.local",
+                "https://untrusted.example.test"
+            ]
         }
     });
     let resp = app
@@ -4437,6 +4643,11 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
         json["status"]["user"]["extra"]["authentication.kubernetes.io/pod-uid"][0],
         pod_uid
     );
+    assert_eq!(
+        json["status"]["audiences"],
+        json!(["https://kubernetes.default.svc.cluster.local"]),
+        "service-account TokenReview must return only token-validated audiences"
+    );
 
     std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
 }
@@ -4457,9 +4668,19 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
         async fn review_token(
             &self,
             token: &str,
-            _audiences: &[String],
-        ) -> Result<Option<crate::auth::webhook_auth::TokenReviewStatus>, String> {
+            audiences: &[String],
+        ) -> Result<
+            Option<crate::auth::webhook_auth::TokenReviewStatus>,
+            klights_auth::AuthenticationError,
+        > {
             assert_eq!(token, "opaque-tokenreview-token");
+            assert_eq!(
+                audiences,
+                [
+                    "https://kubernetes.default.svc.cluster.local",
+                    "https://untrusted.example.test",
+                ]
+            );
             Ok(Some(crate::auth::webhook_auth::TokenReviewStatus {
                 authenticated: true,
                 user: Some(crate::auth::webhook_auth::TokenReviewUser {
@@ -4483,6 +4704,7 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
         Duration::from_secs(60),
         Duration::from_secs(10),
         vec!["https://kubernetes.default.svc.cluster.local".to_string()],
+        Arc::new(crate::auth::clock::SystemMonotonicClock),
     )));
     let app = crate::api::build_router(state);
 
@@ -4491,7 +4713,10 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
         "kind": "TokenReview",
         "spec": {
             "token": "opaque-tokenreview-token",
-            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+            "audiences": [
+                "https://kubernetes.default.svc.cluster.local",
+                "https://untrusted.example.test"
+            ]
         }
     });
     let resp = app
@@ -4529,6 +4754,121 @@ async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
         json["status"]["user"]["extra"]["example.com/authenticator"][0],
         "webhook"
     );
+    assert_eq!(
+        json["status"]["audiences"],
+        json!(["https://kubernetes.default.svc.cluster.local"]),
+        "webhook TokenReview must return only authenticator-validated audiences"
+    );
+}
+
+#[tokio::test]
+async fn test_tokenreview_omitted_audiences_validate_webhook_default_without_echoing_status() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    const DEFAULT_API_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
+
+    struct RecordingWebhook {
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::webhook_auth::WebhookAuthenticator for RecordingWebhook {
+        async fn authenticate(
+            &self,
+            _token: &str,
+        ) -> Option<Result<crate::auth::AuthenticatedIdentity, klights_auth::AuthenticationError>>
+        {
+            unreachable!("TokenReview must use the audience-aware capability")
+        }
+
+        async fn authenticate_for_review(
+            &self,
+            token: &str,
+            audiences: &[String],
+        ) -> Option<
+            Result<
+                (crate::auth::AuthenticatedIdentity, Vec<String>),
+                klights_auth::AuthenticationError,
+            >,
+        > {
+            assert_eq!(token, "opaque-omitted-audience-token");
+            self.seen.lock().unwrap().push(audiences.to_vec());
+            if !audiences.is_empty() {
+                return Some(Err(klights_auth::AuthenticationError::unauthenticated(
+                    "omitted TokenReview audience was not preserved",
+                )));
+            }
+            Some(Ok((
+                crate::auth::AuthenticatedIdentity::webhook(
+                    "webhook-default-audience-user".to_string(),
+                    vec!["webhook-default-audience-group".to_string()],
+                    None,
+                    Vec::new(),
+                ),
+                vec![DEFAULT_API_AUDIENCE.to_string()],
+            )))
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut state = build_test_app_state().await;
+    state.webhook_authenticator = Some(Arc::new(RecordingWebhook { seen: seen.clone() }));
+    let app = crate::api::build_router(state);
+    let request_body = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {"token": "opaque-omitted-audience-token"}
+    });
+    let expected = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "metadata": {},
+        "spec": {"token": "opaque-omitted-audience-token"},
+        "status": {
+            "authenticated": true,
+            "user": {
+                "username": "webhook-default-audience-user",
+                "groups": [
+                    "webhook-default-audience-group",
+                    "system:authenticated"
+                ]
+            }
+        }
+    });
+
+    for accept in ["application/json", "application/vnd.kubernetes.protobuf"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header("content-type", "application/json")
+                    .header("accept", accept)
+                    .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded = if accept == "application/json" {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            klights_kube_protobuf::decode_protobuf(&body).unwrap()
+        };
+        assert_eq!(decoded, expected, "response parity failed for {accept}");
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Vec::<String>::new(), Vec::<String>::new()]
+    );
 }
 
 #[tokio::test]
@@ -4548,12 +4888,13 @@ async fn test_tokenreview_uses_oidc_authenticator_for_jwt_tokens() {
             &self,
             token: &str,
             _now: OffsetDateTime,
-        ) -> Result<crate::auth::oidc::OidcClaims, String> {
+        ) -> Result<crate::auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
             assert_eq!(token, "header.payload.signature");
             Ok(crate::auth::oidc::OidcClaims {
                 username: "oidc-tokenreview-user".to_string(),
                 groups: vec!["oidc-group".to_string()],
                 uid: Some("oidc-tokenreview-uid".to_string()),
+                audiences: vec!["klights".to_string()],
             })
         }
     }
@@ -4567,10 +4908,14 @@ async fn test_tokenreview_uses_oidc_authenticator_for_jwt_tokens() {
         "kind": "TokenReview",
         "spec": {
             "token": "header.payload.signature",
-            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+            "audiences": [
+                "https://kubernetes.default.svc.cluster.local",
+                "https://untrusted.example.test"
+            ]
         }
     });
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -4598,6 +4943,329 @@ async fn test_tokenreview_uses_oidc_authenticator_for_jwt_tokens() {
             .any(|group| group == "oidc-group"),
         "OIDC groups must be preserved: {json}"
     );
+    assert_eq!(
+        json["status"]["audiences"],
+        json!(["https://kubernetes.default.svc.cluster.local"]),
+        "OIDC TokenReview must return only authenticator-validated audiences"
+    );
+
+    let omitted_request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "metadata": {"name": "oidc-omitted-audience"},
+        "spec": {"token": "header.payload.signature"}
+    });
+    let mut omitted_responses = Vec::new();
+    for content_type in ["application/json", "application/vnd.kubernetes.protobuf"] {
+        let request_body = if content_type == "application/json" {
+            serde_json::to_vec(&omitted_request).unwrap()
+        } else {
+            klights_kube_protobuf::encode_protobuf(&omitted_request).unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header("content-type", content_type)
+                    .header("accept", content_type)
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let review = if content_type == "application/json" {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            klights_kube_protobuf::decode_protobuf(&body).unwrap()
+        };
+        assert_eq!(review["metadata"], omitted_request["metadata"]);
+        assert_eq!(review["spec"], omitted_request["spec"]);
+        assert_eq!(review["status"]["authenticated"], true);
+        assert!(
+            review["status"].get("audiences").is_none(),
+            "omitted OIDC TokenReview audiences must not be echoed: {review}"
+        );
+        omitted_responses.push(review);
+    }
+    assert_eq!(
+        omitted_responses[0], omitted_responses[1],
+        "omitted-audience OIDC TokenReview JSON and protobuf must match"
+    );
+
+    let unrelated_request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {
+            "token": "header.payload.signature",
+            "audiences": ["https://untrusted.example.test"]
+        }
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&unrelated_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["status"]["authenticated"], false);
+}
+
+#[tokio::test]
+async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
+    use serde_json::json;
+    use std::sync::Arc;
+    use time::OffsetDateTime;
+
+    struct RejectingOidc;
+    #[async_trait::async_trait]
+    impl crate::auth::oidc::OidcValidator for RejectingOidc {
+        async fn validate_token(
+            &self,
+            _token: &str,
+            _now: OffsetDateTime,
+        ) -> Result<crate::auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
+            Err(klights_auth::AuthenticationError::unauthenticated(
+                "not an OIDC token",
+            ))
+        }
+    }
+    struct RejectingWebhook;
+    #[async_trait::async_trait]
+    impl crate::auth::webhook_auth::WebhookAuthenticator for RejectingWebhook {
+        async fn authenticate(
+            &self,
+            _token: &str,
+        ) -> Option<
+            Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>,
+        > {
+            Some(Err(klights_auth::AuthenticationError::unauthenticated(
+                "webhook rejected token",
+            )))
+        }
+    }
+
+    let mut state = build_test_app_state().await;
+    let namespace = format!("tokenreview-missing-key-{}", uuid::Uuid::new_v4());
+    let mut config = crate::KlightsConfig::test_default();
+    config.containerd_namespace = namespace.clone();
+    state.config = std::sync::Arc::new(config);
+    state.oidc_authenticator = Some(Arc::new(RejectingOidc));
+    state.webhook_authenticator = Some(Arc::new(RejectingWebhook));
+    let app = crate::api::build_router(state);
+    let request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {
+            "token": "header.payload.signature",
+            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+        }
+    });
+
+    assert_tokenreview_dependency_failure_formats(app, &request).await;
+    std::fs::remove_dir_all(crate::paths::data_root_path(&namespace)).ok();
+}
+
+async fn assert_tokenreview_dependency_failure_formats(
+    app: axum::Router,
+    request: &serde_json::Value,
+) {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let mut request = request.clone();
+    request["metadata"] = serde_json::json!({
+        "name": "preserved-failure",
+        "annotations": {"review.example.test/failure": "dependency-or-internal"}
+    });
+    let mut format_responses = Vec::new();
+    for content_type in ["application/json", "application/vnd.kubernetes.protobuf"] {
+        let body = if content_type == "application/json" {
+            serde_json::to_vec(&request).unwrap()
+        } else {
+            klights_kube_protobuf::encode_protobuf(&request).unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                    .header("content-type", content_type)
+                    .header("accept", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        format_responses
+            .push(assert_tokenreview_dependency_error(response, content_type, &request).await);
+    }
+    assert_eq!(
+        format_responses[0], format_responses[1],
+        "dependency/internal TokenReview JSON and protobuf objects must be identical"
+    );
+}
+
+async fn assert_tokenreview_dependency_error(
+    response: axum::response::Response,
+    content_type: &str,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    use axum::http::StatusCode;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some(content_type)
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let review: serde_json::Value = if content_type == "application/json" {
+        serde_json::from_slice(&body).unwrap()
+    } else {
+        klights_kube_protobuf::decode_protobuf(&body).unwrap()
+    };
+    assert_eq!(review["apiVersion"], request["apiVersion"]);
+    assert_eq!(review["kind"], request["kind"]);
+    assert_eq!(review["metadata"], request["metadata"]);
+    assert_eq!(review["spec"], request["spec"]);
+    assert_eq!(review["status"]["authenticated"], false);
+    assert!(
+        review["status"]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "dependency failure must be exposed in TokenReview status: {review}"
+    );
+    review
+}
+
+#[tokio::test]
+async fn test_tokenreview_reports_webhook_dependency_failure_in_status() {
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct FailingWebhook;
+    #[async_trait::async_trait]
+    impl crate::auth::webhook_auth::WebhookAuthenticator for FailingWebhook {
+        async fn authenticate(
+            &self,
+            _token: &str,
+        ) -> Option<
+            Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>,
+        > {
+            Some(Err(klights_auth::AuthenticationError::dependency_failure(
+                "webhook unavailable",
+            )))
+        }
+    }
+
+    let mut state = build_test_app_state().await;
+    state.webhook_authenticator = Some(Arc::new(FailingWebhook));
+    let app = crate::api::build_router(state);
+    let request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {
+            "token": "opaque-token",
+            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+        }
+    });
+    assert_tokenreview_dependency_failure_formats(app, &request).await;
+}
+
+#[tokio::test]
+async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
+    use serde_json::json;
+    use std::sync::Arc;
+    use time::OffsetDateTime;
+
+    struct FailingOidc;
+    #[async_trait::async_trait]
+    impl crate::auth::oidc::OidcValidator for FailingOidc {
+        async fn validate_token(
+            &self,
+            _token: &str,
+            _now: OffsetDateTime,
+        ) -> Result<crate::auth::oidc::OidcClaims, klights_auth::AuthenticationError> {
+            Err(klights_auth::AuthenticationError::internal_failure(
+                "OIDC validator invariant failed",
+            ))
+        }
+    }
+
+    let mut state = build_test_app_state().await;
+    let namespace = format!("tokenreview-oidc-key-{}", uuid::Uuid::new_v4());
+    let mut config = crate::KlightsConfig::test_default();
+    config.containerd_namespace = namespace.clone();
+    state.config = Arc::new(config);
+    let signing_key = crate::auth::generate_ca_full().unwrap().3;
+    let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
+    crate::auth::persist_service_account_signing_key(
+        &signing_key_path,
+        &signing_key,
+        state.task_supervisor.as_ref(),
+    )
+    .await
+    .unwrap();
+    state.oidc_authenticator = Some(Arc::new(FailingOidc));
+    let app = crate::api::build_router(state);
+    let request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {"token": "header.payload.signature"}
+    });
+    assert_tokenreview_dependency_failure_formats(app, &request).await;
+    std::fs::remove_dir_all(crate::paths::data_root_path(&namespace)).ok();
+}
+
+#[tokio::test]
+async fn test_tokenreview_reports_bootstrap_store_failure_in_status() {
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct FailingBootstrapStore;
+    #[async_trait::async_trait]
+    impl crate::auth::middleware::BootstrapTokenAuthenticator for FailingBootstrapStore {
+        async fn authenticate_bootstrap_token(
+            &self,
+            _token: &str,
+        ) -> Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>
+        {
+            Err(klights_auth::AuthenticationError::dependency_failure(
+                "bootstrap datastore unavailable",
+            ))
+        }
+    }
+
+    let mut state = build_test_app_state().await;
+    state.bootstrap_token_authenticator = Arc::new(FailingBootstrapStore);
+    let app = crate::api::build_router(state);
+    let request = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {"token": "abcdef.0123456789abcdef"}
+    });
+    assert_tokenreview_dependency_failure_formats(app, &request).await;
 }
 
 #[tokio::test]
