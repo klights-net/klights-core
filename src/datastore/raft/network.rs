@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::datastore::raft::types::RaftMemberNode;
 use async_trait::async_trait;
-use openraft::BasicNode;
 use openraft::Raft;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -48,7 +48,7 @@ pub struct StubRaftNetwork;
 impl RaftNetworkFactory<TypeConfig> for StubRaftNetwork {
     type Network = StubRaftNetwork;
 
-    async fn new_client(&mut self, _target: NodeId, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, _target: NodeId, _node: &RaftMemberNode) -> Self::Network {
         StubRaftNetwork
     }
 }
@@ -65,7 +65,8 @@ impl RaftNetwork<TypeConfig> for StubRaftNetwork {
         &mut self,
         _rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>>
+    {
         Err(RPCError::Unreachable(unreachable("append_entries")))
     }
 
@@ -75,7 +76,7 @@ impl RaftNetwork<TypeConfig> for StubRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+        RPCError<NodeId, RaftMemberNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         Err(RPCError::Unreachable(unreachable("install_snapshot")))
     }
@@ -84,7 +85,7 @@ impl RaftNetwork<TypeConfig> for StubRaftNetwork {
         &mut self,
         _rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>> {
         Err(RPCError::Unreachable(unreachable("vote")))
     }
 }
@@ -97,7 +98,14 @@ impl RaftNetwork<TypeConfig> for StubRaftNetwork {
 
 #[derive(Clone, Default)]
 pub struct LoopbackRegistry {
-    inner: Arc<RwLock<HashMap<NodeId, Raft<TypeConfig>>>>,
+    inner: Arc<RwLock<HashMap<NodeId, LoopbackRegistryEntry>>>,
+}
+
+#[derive(Clone)]
+struct LoopbackRegistryEntry {
+    raft: Raft<TypeConfig>,
+    generation: u64,
+    storage_incarnation: String,
 }
 
 impl LoopbackRegistry {
@@ -105,11 +113,22 @@ impl LoopbackRegistry {
         Self::default()
     }
 
-    pub fn register(&self, node_id: NodeId, raft: Raft<TypeConfig>) {
-        self.inner.write().unwrap().insert(node_id, raft);
+    pub fn register(&self, node_id: NodeId, raft: Raft<TypeConfig>, storage_incarnation: String) {
+        let mut inner = self.inner.write().unwrap();
+        let generation = inner
+            .get(&node_id)
+            .map_or(1, |entry| entry.generation.saturating_add(1));
+        inner.insert(
+            node_id,
+            LoopbackRegistryEntry {
+                raft,
+                generation,
+                storage_incarnation,
+            },
+        );
     }
 
-    fn lookup(&self, node_id: NodeId) -> Option<Raft<TypeConfig>> {
+    fn lookup(&self, node_id: NodeId) -> Option<LoopbackRegistryEntry> {
         self.inner.read().unwrap().get(&node_id).cloned()
     }
 }
@@ -121,9 +140,12 @@ impl LeaderForwarder for LoopbackRegistry {
         leader_id: NodeId,
         payload: StorageCommandPayload,
     ) -> anyhow::Result<()> {
-        let raft = self.lookup(leader_id).ok_or_else(|| {
-            anyhow::anyhow!("loopback forward: leader {leader_id} not registered")
-        })?;
+        let raft = self
+            .lookup(leader_id)
+            .map(|entry| entry.raft)
+            .ok_or_else(|| {
+                anyhow::anyhow!("loopback forward: leader {leader_id} not registered")
+            })?;
         raft.client_write(payload)
             .await
             .map(|_| ())
@@ -149,9 +171,16 @@ impl LoopbackRaftNetworkFactory {
 impl RaftNetworkFactory<TypeConfig> for LoopbackRaftNetworkFactory {
     type Network = LoopbackRaftNetwork;
 
-    async fn new_client(&mut self, target: NodeId, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, _node: &RaftMemberNode) -> Self::Network {
+        let bound_generation = self
+            .registry
+            .lookup(target)
+            .map(|entry| entry.generation)
+            .unwrap_or(0);
         LoopbackRaftNetwork {
             target,
+            bound_generation,
+            receiver_admission: _node.clone(),
             registry: self.registry.clone(),
         }
     }
@@ -159,7 +188,34 @@ impl RaftNetworkFactory<TypeConfig> for LoopbackRaftNetworkFactory {
 
 pub struct LoopbackRaftNetwork {
     target: NodeId,
+    bound_generation: u64,
+    receiver_admission: RaftMemberNode,
     registry: LoopbackRegistry,
+}
+
+impl LoopbackRaftNetwork {
+    fn receiver_session_is_stale(&self, entry: &LoopbackRegistryEntry) -> bool {
+        if self.bound_generation != entry.generation
+            || (self.receiver_admission.storage_incarnation != uuid::Uuid::nil().to_string()
+                && self.receiver_admission.storage_incarnation != entry.storage_incarnation)
+        {
+            return true;
+        }
+        let Some(required) = self.receiver_admission.admitted_log.as_ref() else {
+            return false;
+        };
+        let metrics = entry.raft.metrics().borrow().clone();
+        let local_index = [
+            metrics.last_log_index,
+            metrics.last_applied.as_ref().map(|log| log.index),
+            metrics.snapshot.as_ref().map(|log| log.index),
+            metrics.purged.as_ref().map(|log| log.index),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        local_index.is_none_or(|index| index < required.index)
+    }
 }
 
 impl RaftNetwork<TypeConfig> for LoopbackRaftNetwork {
@@ -167,11 +223,19 @@ impl RaftNetwork<TypeConfig> for LoopbackRaftNetwork {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let raft = self.registry.lookup(self.target).ok_or_else(|| {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>>
+    {
+        let entry = self.registry.lookup(self.target).ok_or_else(|| {
             RPCError::Unreachable(unreachable("append_entries: peer not registered"))
         })?;
-        raft.append_entries(rpc)
+        if self.receiver_session_is_stale(&entry) {
+            return Err(RPCError::Unreachable(unreachable(
+                "append_entries: stale receiver session generation",
+            )));
+        }
+        entry
+            .raft
+            .append_entries(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
@@ -182,12 +246,19 @@ impl RaftNetwork<TypeConfig> for LoopbackRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+        RPCError<NodeId, RaftMemberNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let raft = self.registry.lookup(self.target).ok_or_else(|| {
+        let entry = self.registry.lookup(self.target).ok_or_else(|| {
             RPCError::Unreachable(unreachable("install_snapshot: peer not registered"))
         })?;
-        raft.install_snapshot(rpc)
+        if self.receiver_session_is_stale(&entry) {
+            return Err(RPCError::Unreachable(unreachable(
+                "install_snapshot: stale receiver session generation",
+            )));
+        }
+        entry
+            .raft
+            .install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
@@ -196,12 +267,19 @@ impl RaftNetwork<TypeConfig> for LoopbackRaftNetwork {
         &mut self,
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let raft = self
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>> {
+        let entry = self
             .registry
             .lookup(self.target)
             .ok_or_else(|| RPCError::Unreachable(unreachable("vote: peer not registered")))?;
-        raft.vote(rpc)
+        if self.receiver_session_is_stale(&entry) {
+            return Err(RPCError::Unreachable(unreachable(
+                "vote: stale receiver session generation",
+            )));
+        }
+        entry
+            .raft
+            .vote(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
@@ -215,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn factory_returns_stub() {
         let mut f = StubRaftNetwork;
-        let _net = f.new_client(42u64, &BasicNode { addr: "x".into() }).await;
+        let _net = f.new_client(42u64, &RaftMemberNode::unproven("x")).await;
     }
 
     #[tokio::test]

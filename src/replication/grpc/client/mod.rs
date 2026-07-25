@@ -1234,7 +1234,7 @@ impl ReplicationGrpcClient {
             kind: req.kind().to_string(),
             namespace: req.namespace().map(str::to_owned),
             field_selector: req.field_selector().map(str::to_owned),
-            start_resource_version: req.start_resource_version().unwrap_or(0),
+            start_resource_version: req.start_resource_version(),
             label_selector: req.label_selector().map(str::to_owned),
             start_watch_replay_position: req
                 .start_watch_replay_position()
@@ -1260,7 +1260,7 @@ impl ReplicationGrpcClient {
                     Ok(event)
                 })
         });
-        Ok(Box::pin(stream))
+        Ok(WatchStream::deferred_transport(Box::pin(stream)))
     }
 
     /// Opens a long-lived streaming RPC through the same bounded candidate
@@ -1566,8 +1566,12 @@ impl ReplicationGrpcClient {
     /// `datastore::raft::grpc_network::GrpcRaftRpcClient`.
     pub async fn raft_append_entries_rpc(
         &self,
+        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
+        let receiver_admission = serde_json::to_vec(&receiver).map_err(|error| {
+            UnaryRpcError::Retryable(format!("encode receiver admission: {error}"))
+        })?;
         let byte_len = payload.len() as u64;
         self.raft_append_entries_call_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1584,6 +1588,7 @@ impl ReplicationGrpcClient {
                                 payload,
                                 supported_features:
                                     crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                                receiver_admission,
                             },
                         ))
                         .await
@@ -1600,8 +1605,12 @@ impl ReplicationGrpcClient {
 
     pub async fn raft_vote_rpc(
         &self,
+        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
+        let receiver_admission = serde_json::to_vec(&receiver).map_err(|error| {
+            UnaryRpcError::Retryable(format!("encode receiver admission: {error}"))
+        })?;
         let response = self
             .raft_unary_call(
                 "grpc_raft_vote",
@@ -1612,6 +1621,7 @@ impl ReplicationGrpcClient {
                             payload,
                             supported_features:
                                 crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                            receiver_admission,
                         }))
                         .await
                         .map(|r| r.into_inner())
@@ -1627,8 +1637,12 @@ impl ReplicationGrpcClient {
 
     pub async fn raft_install_snapshot_rpc(
         &self,
+        receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
+        let receiver_admission = serde_json::to_vec(&receiver).map_err(|error| {
+            UnaryRpcError::Retryable(format!("encode receiver admission: {error}"))
+        })?;
         let response = self
             .raft_unary_call(
                 "grpc_raft_install_snapshot",
@@ -1640,6 +1654,7 @@ impl ReplicationGrpcClient {
                                 payload,
                                 supported_features:
                                     crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                                receiver_admission,
                             },
                         ))
                         .await
@@ -1699,6 +1714,27 @@ impl ReplicationGrpcClient {
             node_git_commit: registration.snapshot.host.git_commit.clone(),
             node_registration: Some(node_registration_to_proto(&registration.snapshot)),
             supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+            storage_incarnation: registration.storage_incarnation.clone(),
+            storage_log_attestation: Some(generated::RaftStorageAttestation {
+                high_watermark: registration
+                    .storage_log_attestation
+                    .high_watermark
+                    .as_ref()
+                    .map(|attestation| generated::RaftStorageLogId {
+                        term: attestation.term,
+                        leader_node_id: attestation.leader_node_id,
+                        index: attestation.index,
+                    }),
+                current_boundary: registration
+                    .storage_log_attestation
+                    .current_boundary
+                    .as_ref()
+                    .map(|attestation| generated::RaftStorageLogId {
+                        term: attestation.term,
+                        leader_node_id: attestation.leader_node_id,
+                        index: attestation.index,
+                    }),
+            }),
         };
         let join_token = self.controlplane_join_token_value()?;
         let response = self

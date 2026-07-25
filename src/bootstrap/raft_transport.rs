@@ -44,9 +44,23 @@ fn map_rpc_outcome(
     match outcome {
         Ok(Ok(bytes)) => Ok(bytes),
         Ok(Err(server_msg)) => {
-            // Server-side router error (e.g. router not installed yet)
-            // — surface as unreachable so openraft retries with backoff.
-            Err(GrpcRaftRpcError::Server(server_msg))
+            if server_msg.starts_with("raft RPC retryable:") {
+                Err(GrpcRaftRpcError::Retryable(server_msg))
+            } else if server_msg.starts_with("raft RPC remote fatal:") {
+                Err(GrpcRaftRpcError::Remote(server_msg))
+            } else if let Some(encoded) = server_msg.strip_prefix("raft RPC snapshot mismatch: ") {
+                match serde_json::from_str(encoded) {
+                    Ok(mismatch) => Err(GrpcRaftRpcError::SnapshotMismatch(mismatch)),
+                    Err(error) => Err(GrpcRaftRpcError::Server(format!(
+                        "decode remote snapshot mismatch: {error}"
+                    ))),
+                }
+            } else {
+                // Disabled/uninstalled routers and legacy Dispatch strings are
+                // retryable server-admission failures. Only the explicit
+                // RemoteFatal variant above receives terminal classification.
+                Err(GrpcRaftRpcError::Server(server_msg))
+            }
         }
         Err(transport_err) => {
             // P0#3 fix #1: preserve the exact tonic status. Downcast to the
@@ -79,22 +93,69 @@ fn map_rpc_outcome(
 
 #[async_trait]
 impl GrpcRaftRpcClient for ReplicationGrpcRaftRpcClient {
-    async fn append_entries(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+    async fn append_entries(
+        &self,
+        receiver: crate::datastore::raft::types::RaftMemberNode,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        let receiver = crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+            addr: receiver.addr,
+            storage_incarnation: receiver.storage_incarnation,
+            admitted_log: receiver.admitted_log.map(|log| {
+                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                    term: log.term,
+                    leader_node_id: log.leader_node_id,
+                    index: log.index,
+                }
+            }),
+        };
         map_rpc_outcome(
             self.peer_addr.as_str(),
-            self.inner.raft_append_entries_rpc(payload).await,
+            self.inner.raft_append_entries_rpc(receiver, payload).await,
         )
     }
-    async fn vote(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+    async fn vote(
+        &self,
+        receiver: crate::datastore::raft::types::RaftMemberNode,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        let receiver = crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+            addr: receiver.addr,
+            storage_incarnation: receiver.storage_incarnation,
+            admitted_log: receiver.admitted_log.map(|log| {
+                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                    term: log.term,
+                    leader_node_id: log.leader_node_id,
+                    index: log.index,
+                }
+            }),
+        };
         map_rpc_outcome(
             self.peer_addr.as_str(),
-            self.inner.raft_vote_rpc(payload).await,
+            self.inner.raft_vote_rpc(receiver, payload).await,
         )
     }
-    async fn install_snapshot(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+    async fn install_snapshot(
+        &self,
+        receiver: crate::datastore::raft::types::RaftMemberNode,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        let receiver = crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+            addr: receiver.addr,
+            storage_incarnation: receiver.storage_incarnation,
+            admitted_log: receiver.admitted_log.map(|log| {
+                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                    term: log.term,
+                    leader_node_id: log.leader_node_id,
+                    index: log.index,
+                }
+            }),
+        };
         map_rpc_outcome(
             self.peer_addr.as_str(),
-            self.inner.raft_install_snapshot_rpc(payload).await,
+            self.inner
+                .raft_install_snapshot_rpc(receiver, payload)
+                .await,
         )
     }
 }
@@ -113,7 +174,7 @@ pub struct ReplicationGrpcRaftClientTemplate {
 }
 
 /// Mints a per-peer `ReplicationGrpcClient` on demand, keyed on the
-/// peer address openraft passes in via `BasicNode.addr` when it calls
+/// peer address openraft passes in via `RaftMemberNode.addr` when it calls
 /// `RaftNetworkFactory::new_client`.
 pub struct ReplicationGrpcRaftClientFactory {
     supervisor: Arc<TaskSupervisor>,
@@ -290,5 +351,32 @@ mod tests {
             }
             other => panic!("expected Unreachable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_rpc_outcome_treats_remote_raft_fatal_as_terminal() {
+        let outcome = Ok(Err(
+            "raft RPC remote fatal: raft.install_snapshot: storage fatal".to_string(),
+        ));
+        assert!(matches!(
+            map_rpc_outcome("https://10.99.0.14:7679", outcome),
+            Err(GrpcRaftRpcError::Remote(message)) if message.contains("storage fatal")
+        ));
+    }
+
+    #[test]
+    fn map_rpc_outcome_preserves_snapshot_mismatch_structure() {
+        let mismatch = openraft::error::SnapshotMismatch {
+            expect: ("snapshot-a", 0).into(),
+            got: ("snapshot-a", 512).into(),
+        };
+        let outcome = Ok(Err(
+            crate::replication::grpc::raft_rpc::RaftRpcRouterError::snapshot_mismatch(&mismatch)
+                .to_string(),
+        ));
+        assert!(matches!(
+            map_rpc_outcome("https://10.99.0.14:7679", outcome),
+            Err(GrpcRaftRpcError::SnapshotMismatch(actual)) if actual == mismatch
+        ));
     }
 }

@@ -228,6 +228,34 @@ fn events_preserve_canonical_resource_arc_and_reject_bad_wire_semantics() {
 }
 
 #[test]
+fn namespaced_watch_accepts_namespace_free_bookmark_progress() {
+    let request = WatchRequest::try_new(
+        "coordination.k8s.io/v1",
+        "Lease",
+        Some("kube-node-lease".to_string()),
+        None,
+        None,
+        Some(41),
+        None,
+    )
+    .expect("valid namespaced Lease watch");
+    let bookmark = ResourceEvent::try_new(
+        WatchEventType::Bookmark,
+        resource("coordination.k8s.io/v1", "Lease", None, "", 42),
+        Some(WatchReplayPosition {
+            resource_version: 42,
+            event_id: 92,
+            resource_version_filter_through_event_id: 0,
+        }),
+    )
+    .expect("valid bookmark");
+
+    bookmark
+        .validate_for(&request)
+        .expect("BOOKMARK progress is scoped by its stream and need not carry metadata.namespace");
+}
+
+#[test]
 fn cursor_advances_only_after_explicit_apply_and_keeps_event_id_order() {
     let initial_position = WatchReplayPosition {
         resource_version: 41,

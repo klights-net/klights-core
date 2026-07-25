@@ -227,6 +227,19 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         (r, Some(stores)) if uses_leader_runtime(r) => {
             let node_id =
                 crate::datastore::raft::types::raft_node_id_for_node_name(&config.node_name);
+            if r.is_learner_join() && stores.raft_log.reset_orphaned_learner_log().await? {
+                tracing::warn!(
+                    node_id,
+                    node = %config.node_name,
+                    "discarded unanchored learner Raft log suffix; authoritative state will be reacquired from the leader"
+                );
+            }
+            let storage_incarnation = stores
+                .raft_log
+                .load_or_create_storage_incarnation()
+                .await
+                .context("load or create node-local Raft storage incarnation")?;
+            let join_raft_log = stores.raft_log.clone();
             let advertise_addr = format!(
                 "https://{}:{}",
                 config
@@ -521,6 +534,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         as_learner: join_node_registration
                             .controlplane_as_learner()
                             .expect("control-plane bootstrap captured a control-plane role"),
+                        storage_incarnation: storage_incarnation.clone(),
+                        storage_log_attestation:
+                            crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+                                high_watermark: None,
+                                current_boundary: None,
+                            },
                         snapshot:
                             crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
                                 node_mode: match join_node_registration.node_mode {
@@ -620,11 +639,41 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                     node_id,
                                     "controlplane_join_task: sending JoinAsControlplane"
                                 );
+                                let mut current_registration = join_node_registration.clone();
+                                let (high_watermark, current_boundary) = tokio::join!(
+                                    join_raft_log.load_storage_log_attestation(),
+                                    join_raft_log.load_storage_current_boundary(),
+                                );
+                                let (high_watermark, current_boundary) =
+                                    match (high_watermark, current_boundary) {
+                                        (Ok(high_watermark), Ok(current_boundary)) => {
+                                            (high_watermark, current_boundary)
+                                        }
+                                        (Err(error), _) | (_, Err(error)) => {
+                                        tracing::warn!(
+                                            %error,
+                                            "controlplane_join_task: cannot attest local Raft storage"
+                                        );
+                                        return;
+                                        }
+                                    };
+                                let map_coordinate = |coordinate: klights_node_store::RaftLogCoordinate| {
+                                    crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
+                                        term: coordinate.term(),
+                                        leader_node_id: coordinate.leader_node_id(),
+                                        index: coordinate.index(),
+                                    }
+                                };
+                                current_registration.storage_log_attestation =
+                                    crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+                                        high_watermark: high_watermark.map(map_coordinate),
+                                        current_boundary: current_boundary.map(map_coordinate),
+                                    };
                                 match client
                                     .join_as_controlplane_rpc(
                                         node_id,
                                         &my_addr,
-                                        &join_node_registration,
+                                        &current_registration,
                                     )
                                     .await
                                 {

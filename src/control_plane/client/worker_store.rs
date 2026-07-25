@@ -467,8 +467,6 @@ impl WorkerStoreAdapter {
                             event = stream.next() => {
                                 match event {
                                     Some(Ok(event)) => {
-                                        reconnect_attempt = 0;
-                                        immediate_expiry_relist_available = true;
                                         let delivered = event.clone();
                                         let event_rv = delivered.resource().resource_version;
                                         let mut applied_cursor = WatchResumeCursor::try_new(
@@ -505,6 +503,8 @@ impl WorkerStoreAdapter {
                                             }
                                             next_resource_version = applied_cursor.resource_version();
                                             next_watch_replay_position = applied_cursor.replay_position();
+                                            reconnect_attempt = 0;
+                                            immediate_expiry_relist_available = true;
                                             continue;
                                         };
                                         let transitioned = match self
@@ -529,6 +529,8 @@ impl WorkerStoreAdapter {
                                         }
                                         next_resource_version = applied_cursor.resource_version();
                                         next_watch_replay_position = applied_cursor.replay_position();
+                                        reconnect_attempt = 0;
+                                        immediate_expiry_relist_available = true;
                                     }
                                     Some(Err(err)) => {
                                         if is_watch_window_expired(&err) {
@@ -3467,11 +3469,13 @@ mod tests {
                         }),
                     )
                     .expect("valid positioned event");
-                    return Ok(
-                        Box::pin(futures::stream::once(async move { Ok(event) })) as WatchStream
-                    );
+                    return Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::once(async move { Ok(event) }),
+                    ));
                 }
-                Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
             })
         }
     }
@@ -3661,7 +3665,9 @@ mod tests {
         fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
             Box::pin(async move {
                 if req.api_version() != "v1" || req.kind() != "Pod" {
-                    return Ok(Box::pin(futures::stream::pending()) as WatchStream);
+                    return Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::pending(),
+                    ));
                 }
                 assert_eq!(req.field_selector(), Some("spec.nodeName=worker-a"));
                 let attempt = self.watch_count.fetch_add(1, Ordering::SeqCst);
@@ -3689,7 +3695,9 @@ mod tests {
                         OpenExpiryMode::UnmarkedOnce => 41,
                     })
                 );
-                Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
             })
         }
     }
@@ -4844,7 +4852,9 @@ mod tests {
                 Box::pin(async move {
                     if req.api_version() == "v1" && req.kind() == "Pod" {
                         if req.start_resource_version() != Some(41) {
-                            return Ok(Box::pin(futures::stream::pending()) as WatchStream);
+                            return Ok(WatchStream::unpositioned_test_stream(
+                                futures::stream::pending(),
+                            ));
                         }
                         let events = vec![
                             Self::event(
@@ -4921,10 +4931,13 @@ mod tests {
                                 }),
                             ),
                         ];
-                        return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
-                            as WatchStream);
+                        return Ok(WatchStream::unpositioned_test_stream(
+                            futures::stream::iter(events.into_iter().map(Ok)),
+                        ));
                     }
-                    Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                    Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::pending(),
+                    ))
                 })
             }
         }

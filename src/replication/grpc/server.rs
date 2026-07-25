@@ -1674,7 +1674,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             req.namespace.clone(),
             req.label_selector.clone(),
             req.field_selector.clone(),
-            Some(req.start_resource_version),
+            req.start_resource_version,
             req.start_watch_replay_position
                 .as_ref()
                 .map(watch_replay_position_from_proto),
@@ -1687,15 +1687,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .watch_resources(watch_request)
                 .await
                 .map_err(leader_watch_error_to_status)?;
+            let accepted_cursor = positioned_stream.accepted_cursor().ok_or_else(|| {
+                Status::internal("local positioned watch omitted its accepted session cursor")
+            })?;
             Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
             let supervisor = self.service.task_supervisor();
             let heartbeat_interval = self.watch_heartbeat_interval;
             let mut leader_rx = leadership_rx;
-            let mut last_rv = req.start_resource_version;
-            let mut last_position = req
-                .start_watch_replay_position
-                .as_ref()
-                .map(watch_replay_position_from_proto)
+            let mut last_rv = accepted_cursor.resource_version().unwrap_or(0);
+            let mut last_position = accepted_cursor
+                .replay_position()
                 .unwrap_or_else(|| WatchReplayPosition::from_resource_version(last_rv));
             let stream = async_stream::stream! {
                 let mut positioned_stream = positioned_stream;
@@ -1772,7 +1773,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 subscribe_grpc_watch_handoff(
                     &watch_anchor,
                     || self.db.subscribe_watch_signals(topic.clone()),
-                    req.start_resource_version,
+                    req.start_resource_version.unwrap_or(0),
                 )
                 .await?
             };
@@ -1804,6 +1805,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             let stream = async_stream::stream! {
                 let mut last_rv = req
                     .start_resource_version
+                    .unwrap_or(0)
                     .max(replay_position.resource_version);
                 let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
                     signal_rx,
@@ -2243,10 +2245,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         )
         .map_err(Status::failed_precondition)?;
         let payload = request.payload;
+        let receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission =
+            serde_json::from_slice(&request.receiver_admission).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "invalid exact-v3 Raft receiver admission proof: {error}"
+                ))
+            })?;
         Ok(Response::new(generated::RaftAppendEntriesResponse {
             result: Some(
                 match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
-                    r.append_entries(payload.clone())
+                    r.append_entries(receiver.clone(), payload.clone())
                 })
                 .await
                 {
@@ -2269,10 +2277,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         )
         .map_err(Status::failed_precondition)?;
         let payload = request.payload;
+        let receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission =
+            serde_json::from_slice(&request.receiver_admission).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "invalid exact-v3 Raft receiver admission proof: {error}"
+                ))
+            })?;
         Ok(Response::new(generated::RaftVoteResponse {
             result: Some(
-                match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| r.vote(payload.clone()))
-                    .await
+                match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
+                    r.vote(receiver.clone(), payload.clone())
+                })
+                .await
                 {
                     Ok(bytes) => generated::raft_vote_response::Result::Ok(bytes),
                     Err(msg) => generated::raft_vote_response::Result::Error(msg),
@@ -2293,10 +2309,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         )
         .map_err(Status::failed_precondition)?;
         let payload = request.payload;
+        let receiver: crate::replication::grpc::raft_rpc::RaftReceiverAdmission =
+            serde_json::from_slice(&request.receiver_admission).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "invalid exact-v3 Raft receiver admission proof: {error}"
+                ))
+            })?;
         Ok(Response::new(generated::RaftInstallSnapshotResponse {
             result: Some(
                 match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
-                    r.install_snapshot(payload.clone())
+                    r.install_snapshot(receiver.clone(), payload.clone())
                 })
                 .await
                 {
@@ -2399,6 +2421,26 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 Status::invalid_argument(format!("invalid node_internal_ip: {err}"))
             })?;
         }
+        let storage_incarnation = req.storage_incarnation.trim().to_string();
+        if uuid::Uuid::parse_str(&storage_incarnation).is_err() {
+            return Err(Status::invalid_argument(
+                "JoinAsControlplane requires a valid storage_incarnation UUID",
+            ));
+        }
+        let storage_log_attestation = req.storage_log_attestation.ok_or_else(|| {
+            Status::invalid_argument("JoinAsControlplane requires storage_log_attestation")
+        })?;
+        let map_log_id = |attestation: generated::RaftStorageLogId| {
+            crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
+                term: attestation.term,
+                leader_node_id: attestation.leader_node_id,
+                index: attestation.index,
+            }
+        };
+        let storage_log_attestation = crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+            high_watermark: storage_log_attestation.high_watermark.map(map_log_id),
+            current_boundary: storage_log_attestation.current_boundary.map(map_log_id),
+        };
         let outcome = handler
             .join(
                 crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
@@ -2406,6 +2448,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     addr: raft_addr,
                     node_name: req.node_name,
                     as_learner: req.as_learner,
+                    storage_incarnation,
+                    storage_log_attestation,
                     supported_features: req.supported_features,
                     node_internal_ip,
                     node_registration,
@@ -3664,7 +3708,7 @@ mod tests {
             kind: kind.to_string(),
             namespace: namespace.map(str::to_string),
             field_selector: None,
-            start_resource_version: 0,
+            start_resource_version: Some(0),
             label_selector: None,
             start_watch_replay_position: None,
         }
@@ -4077,6 +4121,64 @@ mod tests {
     /// heartbeat deadline on every loop iteration, so unrelated traffic starved
     /// the bookmark and the worker idle-reconnected every window.
     #[tokio::test]
+    async fn fresh_idle_watch_heartbeat_carries_the_sampled_anchor() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        db.create_namespace(
+            "anchor",
+            serde_json::json!({"metadata": {"name": "anchor"}}),
+        )
+        .await
+        .expect("create anchor namespace");
+        let policy = crate::replication::grpc::transport_policy::GrpcTransportPolicy {
+            watch_heartbeat_interval: std::time::Duration::from_millis(100),
+            ..Default::default()
+        }
+        .shared();
+        let (endpoint, handle) =
+            grpc_test_server_with_policy(db.clone(), policy, Some("worker-1")).await;
+        let sampled_anchor = db
+            .current_watch_replay_position()
+            .await
+            .expect("sample current replay anchor after server bootstrap");
+
+        let channel = tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ReplicationClient::new(channel);
+        let mut watch = client
+            .watch_resources(generated::WatchResourcesRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: None,
+                field_selector: None,
+                start_resource_version: None,
+                label_selector: None,
+                start_watch_replay_position: None,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+
+        let heartbeat = tokio::time::timeout(std::time::Duration::from_secs(1), watch.message())
+            .await
+            .expect("fresh idle watch must emit a heartbeat")
+            .expect("heartbeat stream must remain healthy")
+            .expect("heartbeat event");
+        handle.abort();
+
+        assert_eq!(heartbeat.event_type, "BOOKMARK");
+        let resource = heartbeat.resource.expect("heartbeat resource");
+        assert_eq!(resource.resource_version, sampled_anchor.resource_version);
+        let position = heartbeat
+            .resume_position
+            .expect("heartbeat replay position");
+        assert_eq!(position.resource_version, sampled_anchor.resource_version);
+        assert_eq!(position.event_id, sampled_anchor.event_id);
+    }
+
+    #[tokio::test]
     async fn watch_stream_emits_bookmark_during_stream_local_silence_under_nonmatching_traffic() {
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         db.create_namespace("hb", serde_json::json!({"metadata": {"name": "hb"}}))
@@ -4102,7 +4204,7 @@ mod tests {
                 kind: "ConfigMap".to_string(),
                 namespace: None,
                 field_selector: None,
-                start_resource_version: 0,
+                start_resource_version: Some(0),
                 label_selector: None,
                 start_watch_replay_position: None,
             })
@@ -4244,7 +4346,7 @@ mod tests {
                 kind: "Pod".to_string(),
                 namespace: None,
                 field_selector: Some("spec.nodeName=worker-1".to_string()),
-                start_resource_version: 0,
+                start_resource_version: Some(0),
                 label_selector: None,
                 start_watch_replay_position: None,
             })
@@ -4318,7 +4420,7 @@ mod tests {
             kind: "Pod".to_string(),
             namespace: None,
             field_selector: None,
-            start_resource_version: 0,
+            start_resource_version: Some(0),
             label_selector: None,
             start_watch_replay_position: None,
         }
@@ -4330,7 +4432,7 @@ mod tests {
             kind: "ConfigMap".to_string(),
             namespace: None,
             field_selector: None,
-            start_resource_version,
+            start_resource_version: Some(start_resource_version),
             label_selector: None,
             start_watch_replay_position: None,
         }
@@ -4423,7 +4525,7 @@ mod tests {
             kind: kind.to_string(),
             namespace: None,
             field_selector: None,
-            start_resource_version: 0,
+            start_resource_version: Some(0),
             label_selector: None,
             start_watch_replay_position: None,
         }
@@ -4699,7 +4801,7 @@ mod tests {
             tonic::Code::InvalidArgument
         );
         let mut invalid_watch = watch_pods_request();
-        invalid_watch.start_resource_version = -1;
+        invalid_watch.start_resource_version = Some(-1);
         assert_eq!(
             leader
                 .watch_resources(request_with_node_client_cert(invalid_watch, "worker-1"))
@@ -4948,6 +5050,8 @@ mod tests {
                 addr,
                 node_name,
                 as_learner,
+                storage_incarnation: _,
+                storage_log_attestation: _,
                 supported_features: _,
                 node_internal_ip,
                 node_registration,
@@ -5132,6 +5236,15 @@ mod tests {
         super::GrpcReplicationServer::new(service, db)
     }
 
+    fn test_raft_receiver_admission() -> Vec<u8> {
+        serde_json::to_vec(&crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+            addr: "test".to_string(),
+            storage_incarnation: uuid::Uuid::nil().to_string(),
+            admitted_log: None,
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn raft_append_entries_rejects_unauthenticated() {
         let grpc = raft_test_server().await;
@@ -5140,6 +5253,7 @@ mod tests {
             .raft_append_entries(tonic::Request::new(generated::RaftAppendEntriesRequest {
                 payload: vec![],
                 supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                receiver_admission: test_raft_receiver_admission(),
             }))
             .await
             .expect_err("unauthenticated raft RPC must be rejected");
@@ -5270,6 +5384,7 @@ mod tests {
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
                 &token,
             ))
@@ -5285,6 +5400,7 @@ mod tests {
             .raft_vote(tonic::Request::new(generated::RaftVoteRequest {
                 payload: vec![],
                 supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                receiver_admission: test_raft_receiver_admission(),
             }))
             .await
             .expect_err("unauthenticated raft vote must be rejected");
@@ -5305,12 +5421,30 @@ mod tests {
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
                 "controlplane-2",
             ))
             .await
             .expect("system:controlplanes node cert must authorize the raft peer");
         assert!(resp.into_inner().result.is_some());
+    }
+
+    #[tokio::test]
+    async fn raft_append_entries_rejects_missing_receiver_admission_before_dispatch() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .raft_append_entries(request_with_controlplane_client_cert(
+                generated::RaftAppendEntriesRequest {
+                    payload: vec![],
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: Vec::new(),
+                },
+                "controlplane-2",
+            ))
+            .await
+            .expect_err("exact-v3 consensus must carry receiver admission proof");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
@@ -5321,6 +5455,7 @@ mod tests {
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::COMMITTED_APPLY_RV_V1,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
                 "old-controlplane",
             ))
@@ -5343,6 +5478,7 @@ mod tests {
                 generated::RaftInstallSnapshotRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
                 "controlplane-3",
             ))
@@ -5365,6 +5501,7 @@ mod tests {
                 generated::RaftVoteRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
                 "worker-1",
             ))
@@ -5381,6 +5518,7 @@ mod tests {
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
                 "worker-1",
             ))
@@ -5397,6 +5535,7 @@ mod tests {
                 generated::RaftInstallSnapshotRequest {
                     payload: vec![],
                     supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    receiver_admission: test_raft_receiver_admission(),
                 },
             ))
             .await
@@ -6775,6 +6914,8 @@ mod tests {
                 node_git_commit: "testhash1".to_string(),
                 node_registration: Some(test_node_registration_proto("testhash1")),
                 supported_features: 0,
+                storage_incarnation: "00000000-0000-4000-8000-000000000001".to_string(),
+                storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
             },
             "worker-1",
         );
@@ -6821,6 +6962,8 @@ mod tests {
             node_git_commit: "testhash2".to_string(),
             node_registration: Some(test_node_registration_proto("testhash2")),
             supported_features: 0,
+            storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
+            storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
         };
 
         let mut mismatched_id = join_request.clone();
@@ -7177,6 +7320,8 @@ mod tests {
             node_git_commit: "testhash3".to_string(),
             node_registration: None,
             supported_features: 0,
+            storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
+            storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
         });
 
         let response = client
@@ -7234,6 +7379,8 @@ mod tests {
             node_git_commit: "joinhash1".to_string(),
             node_registration: Some(test_node_registration_proto("joinhash1")),
             supported_features: 0,
+            storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
+            storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
         });
 
         let response = client

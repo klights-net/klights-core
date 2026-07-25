@@ -192,6 +192,11 @@ async fn omitted_cursor_subscribes_before_atomic_anchor_and_replays_the_gap() {
         )
         .await
         .expect("positioned watch");
+    let accepted = stream
+        .accepted_cursor()
+        .expect("local positioned watch exposes its atomic accepted cursor");
+    assert_eq!(accepted.resource_version(), Some(anchor.resource_version));
+    assert_eq!(accepted.replay_position(), Some(anchor));
 
     let event = stream
         .next()

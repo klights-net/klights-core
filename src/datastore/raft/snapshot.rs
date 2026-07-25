@@ -41,7 +41,7 @@ use crate::datastore::raft::types::{NodeId, TypeConfig};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RaftSnapshotData {
     pub last_applied: Option<LogId<NodeId>>,
-    pub membership: StoredMembership<NodeId, openraft::BasicNode>,
+    pub membership: StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
     #[serde(default)]
     pub current_rv: i64,
     /// Persisted assignment protocol. Missing from legacy envelopes means the
@@ -87,7 +87,7 @@ impl RaftSnapshotData {
     pub async fn serialize_from_backend_to_cursor(
         db: DatastoreHandle,
         last_applied: Option<LogId<NodeId>>,
-        membership: &StoredMembership<NodeId, openraft::BasicNode>,
+        membership: &StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
     ) -> Result<Cursor<Vec<u8>>> {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         let (snapshot, _, _) = Self::serialize_from_backend_to_cursor_inner(
@@ -109,7 +109,7 @@ impl RaftSnapshotData {
     ) -> Result<(
         Cursor<Vec<u8>>,
         Option<LogId<NodeId>>,
-        StoredMembership<NodeId, openraft::BasicNode>,
+        StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
     )> {
         let anchor = RaftSnapshotCaptureAnchor::new(applied_state_source);
         let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
@@ -259,14 +259,14 @@ enum RaftSnapshotAppliedStateSource {
     #[cfg(test)]
     Fixed {
         last_applied: Option<LogId<NodeId>>,
-        membership: StoredMembership<NodeId, openraft::BasicNode>,
+        membership: StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
     },
     Durable(Arc<dyn RaftAppliedStateDurability>),
 }
 
 type CapturedRaftAppliedState = (
     Option<LogId<NodeId>>,
-    StoredMembership<NodeId, openraft::BasicNode>,
+    StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
 );
 
 impl RaftSnapshotAppliedStateSource {
@@ -683,13 +683,17 @@ mod tests {
     #[tokio::test]
     async fn missing_cluster_identity_is_rejected_after_raft_state_exists() {
         let log_id = LogId::new(openraft::LeaderId::new(3, 7), 11);
-        let membership = StoredMembership::new(
-            Some(log_id),
-            openraft::Membership::new(
-                vec![std::collections::BTreeSet::from([7])],
-                std::collections::BTreeMap::<NodeId, openraft::BasicNode>::new(),
-            ),
-        );
+        let membership =
+            StoredMembership::new(
+                Some(log_id),
+                openraft::Membership::new(
+                    vec![std::collections::BTreeSet::from([7])],
+                    std::collections::BTreeMap::<
+                        NodeId,
+                        crate::datastore::raft::types::RaftMemberNode,
+                    >::new(),
+                ),
+            );
         let cases = [
             (
                 "applied log",
@@ -804,7 +808,8 @@ mod tests {
         .await
         .unwrap();
 
-        let membership = StoredMembership::<NodeId, openraft::BasicNode>::default();
+        let membership =
+            StoredMembership::<NodeId, crate::datastore::raft::types::RaftMemberNode>::default();
         let cursor = RaftSnapshotData::serialize_from_backend_to_cursor(
             Arc::new(db.clone()),
             None,
@@ -849,7 +854,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let membership = StoredMembership::<NodeId, openraft::BasicNode>::default();
+        let membership =
+            StoredMembership::<NodeId, crate::datastore::raft::types::RaftMemberNode>::default();
         let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
             Arc::new(db.clone()),
             None,
@@ -987,7 +993,7 @@ mod tests {
     fn legacy_snapshot_without_watch_allocator_remains_decodable() {
         let legacy = serde_json::json!({
             "last_applied": null,
-            "membership": StoredMembership::<NodeId, openraft::BasicNode>::default(),
+            "membership": StoredMembership::<NodeId, crate::datastore::raft::types::RaftMemberNode>::default(),
             "current_rv": 7,
             "commits": []
         });

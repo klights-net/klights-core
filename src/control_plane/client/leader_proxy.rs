@@ -273,21 +273,23 @@ fn terminate_watch_on_leadership_change(
     stream: WatchStream,
     leadership_rx: watch::Receiver<bool>,
 ) -> WatchStream {
-    Box::pin(futures::stream::unfold(
-        (stream, leadership_rx),
-        move |(mut stream, mut leadership_rx)| async move {
-            tokio::select! {
-                biased;
-                changed = leadership_rx.changed() => {
-                    let _ = changed;
-                    None
+    stream.map_inner(|stream| {
+        Box::pin(futures::stream::unfold(
+            (stream, leadership_rx),
+            move |(mut stream, mut leadership_rx)| async move {
+                tokio::select! {
+                    biased;
+                    changed = leadership_rx.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                    item = stream.next() => {
+                        item.map(|item| (item, (stream, leadership_rx)))
+                    }
                 }
-                item = stream.next() => {
-                    item.map(|item| (item, (stream, leadership_rx)))
-                }
-            }
-        },
-    ))
+            },
+        ))
+    })
 }
 
 impl LeaderResourceQuery for LeaderProxyApiClient {
@@ -790,7 +792,11 @@ mod tests {
                     sender.send(true).expect("restore after transient demotion");
                 }
             }
-            Box::pin(async { Ok(Box::pin(futures::stream::pending()) as WatchStream) })
+            Box::pin(async {
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
+            })
         }
     }
 

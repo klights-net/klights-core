@@ -6,7 +6,7 @@
 //!   human-readable node name. u64 (rather than `String`) keeps openraft's
 //!   `Vote` and `LeaderId` types compact and hashable without serde
 //!   round-trips inside the consensus core hot path.
-//! - `Node = BasicNode` — carries the API endpoint URL so peers can drive
+//! - `Node = RaftMemberNode` — carries the API endpoint URL so peers can drive
 //!   `RaftNetwork` without consulting an external membership directory.
 //! - `D = StorageCommandPayload` — opaque bytes carrying a serialized
 //!   `crate::datastore::command::StorageCommand` (protobuf), the unit of
@@ -21,7 +21,6 @@
 
 use std::io::Cursor;
 
-use openraft::BasicNode;
 use openraft::TokioRuntime;
 use openraft::declare_raft_types;
 use openraft::impls::OneshotResponder;
@@ -30,6 +29,67 @@ use serde::{Deserialize, Serialize};
 use crate::datastore::Resource;
 
 pub use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
+
+/// Receiver admission proof captured by each OpenRaft replication worker.
+///
+/// OpenRaft may retain a worker after a deterministic node ID is recreated.
+/// Carrying the receiver's durable incarnation in membership makes the old
+/// worker distinguishable from the replacement worker created by
+/// remove/re-add. `admitted_log` additionally prevents a restored node.db
+/// with the same UUID from silently rolling back below a proven boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftMemberNode {
+    pub addr: String,
+    pub storage_incarnation: String,
+    pub admitted_log: Option<RaftMemberLogId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RaftMemberLogId {
+    pub term: u64,
+    pub leader_node_id: NodeId,
+    pub index: u64,
+}
+
+impl RaftMemberNode {
+    pub fn new(
+        addr: String,
+        storage_incarnation: String,
+        admitted_log: Option<RaftMemberLogId>,
+    ) -> Self {
+        Self {
+            addr,
+            storage_incarnation,
+            admitted_log,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_admission(addr: impl Into<String>) -> Self {
+        Self::new(addr.into(), uuid::Uuid::nil().to_string(), None)
+    }
+
+    #[cfg(test)]
+    pub fn unproven(addr: impl Into<String>) -> Self {
+        Self::without_admission(addr)
+    }
+}
+
+impl From<RaftMemberNode> for crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+    fn from(value: RaftMemberNode) -> Self {
+        Self {
+            addr: value.addr,
+            storage_incarnation: value.storage_incarnation,
+            admitted_log: value.admitted_log.map(|log| {
+                crate::replication::grpc::raft_rpc::RaftReceiverLogId {
+                    term: log.term,
+                    leader_node_id: log.leader_node_id,
+                    index: log.index,
+                }
+            }),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageCommandPayload(pub Vec<u8>);
@@ -75,7 +135,7 @@ declare_raft_types!(
         D            = StorageCommandPayload,
         R            = StorageCommandResult,
         NodeId       = NodeId,
-        Node         = BasicNode,
+        Node         = RaftMemberNode,
         Entry        = openraft::Entry<TypeConfig>,
         SnapshotData = Cursor<Vec<u8>>,
         AsyncRuntime = TokioRuntime,
@@ -90,27 +150,21 @@ mod tests {
 
     #[test]
     fn membership_round_trips_three_voters() {
-        let mut nodes: BTreeMap<NodeId, BasicNode> = BTreeMap::new();
+        let mut nodes: BTreeMap<NodeId, RaftMemberNode> = BTreeMap::new();
         nodes.insert(
             1,
-            BasicNode {
-                addr: "https://10.99.0.10:7679".to_string(),
-            },
+            RaftMemberNode::unproven("https://10.99.0.10:7679".to_string()),
         );
         nodes.insert(
             2,
-            BasicNode {
-                addr: "https://10.99.0.13:7679".to_string(),
-            },
+            RaftMemberNode::unproven("https://10.99.0.13:7679".to_string()),
         );
         nodes.insert(
             3,
-            BasicNode {
-                addr: "https://10.99.0.11:7679".to_string(),
-            },
+            RaftMemberNode::unproven("https://10.99.0.11:7679".to_string()),
         );
         let voters: std::collections::BTreeSet<NodeId> = nodes.keys().copied().collect();
-        let m: Membership<NodeId, BasicNode> = Membership::new(vec![voters], nodes);
+        let m: Membership<NodeId, RaftMemberNode> = Membership::new(vec![voters], nodes);
         assert_eq!(m.voter_ids().count(), 3);
     }
 

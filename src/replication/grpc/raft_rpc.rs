@@ -12,6 +12,20 @@
 
 use async_trait::async_trait;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct RaftReceiverAdmission {
+    pub addr: String,
+    pub storage_incarnation: String,
+    pub admitted_log: Option<RaftReceiverLogId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct RaftReceiverLogId {
+    pub term: u64,
+    pub leader_node_id: u64,
+    pub index: u64,
+}
+
 /// Errors returned by the router. The gRPC layer wraps these in
 /// `Status::internal` (transport-level) or `RaftRpcRouterError::Disabled`
 /// (router not installed → respond with the proto `error` arm so the
@@ -20,8 +34,23 @@ use async_trait::async_trait;
 pub enum RaftRpcRouterError {
     #[error("raft RPC router not installed on this server")]
     Disabled,
+    #[error("raft RPC retryable: {0}")]
+    Retryable(String),
+    #[error("raft RPC remote fatal: {0}")]
+    RemoteFatal(String),
+    #[error("raft RPC snapshot mismatch: {0}")]
+    SnapshotMismatch(String),
     #[error("raft RPC router dispatch: {0}")]
     Dispatch(String),
+}
+
+impl RaftRpcRouterError {
+    pub fn snapshot_mismatch(error: &openraft::error::SnapshotMismatch) -> Self {
+        Self::SnapshotMismatch(
+            serde_json::to_string(error)
+                .unwrap_or_else(|encode_error| format!("invalid:{encode_error}")),
+        )
+    }
 }
 
 /// Server-side dispatcher for Raft consensus RPCs. Implementations
@@ -30,9 +59,21 @@ pub enum RaftRpcRouterError {
 /// the response back into the wire envelope.
 #[async_trait]
 pub trait RaftRpcRouter: Send + Sync {
-    async fn append_entries(&self, payload: Vec<u8>) -> Result<Vec<u8>, RaftRpcRouterError>;
-    async fn vote(&self, payload: Vec<u8>) -> Result<Vec<u8>, RaftRpcRouterError>;
-    async fn install_snapshot(&self, payload: Vec<u8>) -> Result<Vec<u8>, RaftRpcRouterError>;
+    async fn append_entries(
+        &self,
+        receiver: RaftReceiverAdmission,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, RaftRpcRouterError>;
+    async fn vote(
+        &self,
+        receiver: RaftReceiverAdmission,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, RaftRpcRouterError>;
+    async fn install_snapshot(
+        &self,
+        receiver: RaftReceiverAdmission,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, RaftRpcRouterError>;
 }
 
 /// Outcome of a `JoinAsControlplane` RPC. The server-side handler in
@@ -126,11 +167,26 @@ pub struct RemoteNodeRegistrationSnapshot {
     pub host: RemoteNodeHostFacts,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct RaftStorageLogAttestation {
+    pub term: u64,
+    pub leader_node_id: u64,
+    pub index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftStorageAttestation {
+    pub high_watermark: Option<RaftStorageLogAttestation>,
+    pub current_boundary: Option<RaftStorageLogAttestation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlplaneJoinRegistration {
     pub node_name: String,
     pub node_internal_ip: String,
     pub as_learner: bool,
+    pub storage_incarnation: String,
+    pub storage_log_attestation: RaftStorageAttestation,
     pub snapshot: RemoteNodeRegistrationSnapshot,
 }
 
@@ -140,6 +196,8 @@ pub struct ControlplaneJoinRequest {
     pub addr: String,
     pub node_name: String,
     pub as_learner: bool,
+    pub storage_incarnation: String,
+    pub storage_log_attestation: RaftStorageAttestation,
     pub supported_features: u64,
     pub node_internal_ip: Option<String>,
     pub node_registration: Option<RemoteNodeRegistrationSnapshot>,
@@ -188,15 +246,27 @@ mod tests {
 
     #[async_trait]
     impl RaftRpcRouter for CountingRouter {
-        async fn append_entries(&self, payload: Vec<u8>) -> Result<Vec<u8>, RaftRpcRouterError> {
+        async fn append_entries(
+            &self,
+            _receiver: RaftReceiverAdmission,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, RaftRpcRouterError> {
             *self.ae_calls.lock().unwrap() += 1;
             Ok(payload)
         }
-        async fn vote(&self, payload: Vec<u8>) -> Result<Vec<u8>, RaftRpcRouterError> {
+        async fn vote(
+            &self,
+            _receiver: RaftReceiverAdmission,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, RaftRpcRouterError> {
             *self.vote_calls.lock().unwrap() += 1;
             Ok(payload)
         }
-        async fn install_snapshot(&self, payload: Vec<u8>) -> Result<Vec<u8>, RaftRpcRouterError> {
+        async fn install_snapshot(
+            &self,
+            _receiver: RaftReceiverAdmission,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, RaftRpcRouterError> {
             *self.snap_calls.lock().unwrap() += 1;
             Ok(payload)
         }
@@ -205,11 +275,19 @@ mod tests {
     #[tokio::test]
     async fn router_dispatches_each_rpc_independently() {
         let router: Arc<dyn RaftRpcRouter> = Arc::new(CountingRouter::default());
-        let out = router.append_entries(vec![1, 2, 3]).await.unwrap();
+        let receiver = RaftReceiverAdmission {
+            addr: "loopback".to_string(),
+            storage_incarnation: uuid::Uuid::nil().to_string(),
+            admitted_log: None,
+        };
+        let out = router
+            .append_entries(receiver.clone(), vec![1, 2, 3])
+            .await
+            .unwrap();
         assert_eq!(out, vec![1, 2, 3]);
-        let out = router.vote(vec![4]).await.unwrap();
+        let out = router.vote(receiver.clone(), vec![4]).await.unwrap();
         assert_eq!(out, vec![4]);
-        let out = router.install_snapshot(vec![5, 6]).await.unwrap();
+        let out = router.install_snapshot(receiver, vec![5, 6]).await.unwrap();
         assert_eq!(out, vec![5, 6]);
     }
 }

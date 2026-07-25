@@ -295,6 +295,7 @@ debug = 1
 tempfile = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 syn = { workspace = true }
 walkdir = { workspace = true }
 proc-macro2 = { workspace = true }

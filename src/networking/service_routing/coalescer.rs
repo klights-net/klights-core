@@ -864,15 +864,17 @@ async fn run_service_routing_watch_worker(
                 event = streams.next() => {
                     match event {
                         Some(ServiceRoutingWatchItem::Event { target, event: Ok(event) }) => {
-                            reconnect_attempt = 0;
                             match apply_service_routing_watch_event_to_inventory(table.as_ref(), target, event) {
                                 Ok(Some(super::inventory::InventoryApply::Applied | super::inventory::InventoryApply::Removed)) => {
+                                    reconnect_attempt = 0;
                                     if service_inventory_watch_target_requires_full_sync(target) {
                                         force_full_sync.store(true, Ordering::Release);
                                     }
                                     notify.notify_one();
                                 }
-                                Ok(Some(super::inventory::InventoryApply::NoChange)) => {}
+                                Ok(Some(super::inventory::InventoryApply::NoChange)) => {
+                                    reconnect_attempt = 0;
+                                }
                                 Ok(None) => {
                                     force_full_sync.store(true, Ordering::Release);
                                     notify.notify_one();
@@ -1519,7 +1521,11 @@ mod tests {
                 .lock()
                 .expect("watch target record lock not poisoned")
                 .push((req.api_version().to_string(), req.kind().to_string()));
-            Box::pin(async { Ok(Box::pin(futures::stream::pending()) as WatchStream) })
+            Box::pin(async {
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
+            })
         }
     }
 
@@ -1539,9 +1545,13 @@ mod tests {
                     .swap(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
                 if close {
-                    Ok(Box::pin(futures::stream::empty()) as WatchStream)
+                    Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::empty(),
+                    ))
                 } else {
-                    Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                    Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::pending(),
+                    ))
                 }
             })
         }
@@ -1774,9 +1784,13 @@ mod tests {
                     let burst: Vec<std::result::Result<ResourceEvent, LeaderWatchError>> = (0..20)
                         .map(|_| Err(LeaderWatchError::transport("simulated watch error")))
                         .collect();
-                    return Ok(Box::pin(futures::stream::iter(burst)) as WatchStream);
+                    return Ok(WatchStream::unpositioned_test_stream(
+                        futures::stream::iter(burst),
+                    ));
                 }
-                Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::pending(),
+                ))
             })
         }
     }

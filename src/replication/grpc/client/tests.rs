@@ -35,6 +35,37 @@ mod cases {
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn raft_receiver() -> crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+        crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
+            addr: "test".to_string(),
+            storage_incarnation: uuid::Uuid::nil().to_string(),
+            admitted_log: None,
+        }
+    }
+
+    #[test]
+    fn watch_request_wire_preserves_absent_and_explicit_zero_resource_version() {
+        for expected in [None, Some(0)] {
+            let request = generated::WatchResourcesRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: None,
+                field_selector: None,
+                start_resource_version: expected,
+                label_selector: None,
+                start_watch_replay_position: None,
+            };
+            let bytes = prost::Message::encode_to_vec(&request);
+            let decoded =
+                <generated::WatchResourcesRequest as prost::Message>::decode(bytes.as_slice())
+                    .expect("decode WatchResourcesRequest");
+            assert_eq!(
+                decoded.start_resource_version, expected,
+                "fresh-watch absence and explicit Kubernetes RV=0 are distinct wire intents"
+            );
+        }
+    }
+
     #[test]
     fn projected_token_client_error_mapping_preserves_binding_and_authority_classes() {
         use klights_leader_api::ProjectedServiceAccountTokenError as Error;
@@ -942,6 +973,18 @@ mod cases {
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ) {
+        grpc_watch_gate_server_with_policy(is_leader, default_transport_policy()).await
+    }
+
+    async fn grpc_watch_gate_server_with_policy(
+        is_leader: bool,
+        policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
+    ) -> (
+        String,
+        DatastoreHandle,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -963,7 +1006,7 @@ mod cases {
             None,
             None,
             None,
-            default_transport_policy(),
+            policy,
         );
         let app = mount_test_service_with_node_cert(app, "worker-1");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1217,6 +1260,181 @@ mod cases {
 
         stale_handle.abort();
         leader_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_watch_without_resource_version_starts_after_compacted_history() {
+        let _guard = ENV_LOCK.lock().await;
+        let (endpoint, db, _leader_tx, handle) = grpc_watch_gate_server(true).await;
+        db.create_namespace(
+            "default",
+            serde_json::json!({"metadata": {"name": "default"}}),
+        )
+        .await
+        .expect("create namespace");
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "compacted",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "compacted"},
+                "data": {"key": "old"}
+            }),
+        )
+        .await
+        .expect("create compacted configmap");
+        db.gc_watch_events(1, 1000)
+            .await
+            .expect("compact durable watch history");
+
+        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+            .await
+            .expect("read token");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            default_transport_policy(),
+        );
+        let mut stream = client
+            .watch_resources_rpc(
+                crate::control_plane::client::WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("valid fresh watch"),
+            )
+            .await
+            .expect("fresh watch must open after history compaction");
+        assert_eq!(
+            stream.accepted_cursor(),
+            None,
+            "remote transport must not claim the server-sampled cursor before an event or heartbeat delivers it"
+        );
+
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "future",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "future"},
+                "data": {"key": "new"}
+            }),
+        )
+        .await
+        .expect("create future configmap");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("fresh watch must deliver a future event")
+            .expect("fresh watch stream must remain open")
+            .expect("fresh watch must not replay from compacted RV 0");
+        assert_eq!(
+            event
+                .resource()
+                .data
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str),
+            Some("future")
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_remote_watch_decodes_the_server_sampled_heartbeat_cursor() {
+        let _guard = ENV_LOCK.lock().await;
+        let policy = crate::replication::grpc::transport_policy::GrpcTransportPolicy {
+            watch_heartbeat_interval: Duration::from_millis(100),
+            ..Default::default()
+        }
+        .shared();
+        let (endpoint, db, _leader_tx, handle) =
+            grpc_watch_gate_server_with_policy(true, policy).await;
+        let namespace = db
+            .create_namespace(
+                "anchor",
+                serde_json::json!({"metadata": {"name": "anchor"}}),
+            )
+            .await
+            .expect("create anchor namespace");
+        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+            .await
+            .expect("read token");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            default_transport_policy(),
+        );
+        let mut stream = client
+            .watch_resources_rpc(
+                crate::control_plane::client::WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("valid fresh watch"),
+            )
+            .await
+            .expect("fresh remote watch");
+        assert_eq!(stream.accepted_cursor(), None);
+
+        let heartbeat = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("fresh remote watch must receive a heartbeat")
+            .expect("fresh remote watch remains open")
+            .expect("heartbeat decodes");
+        handle.abort();
+
+        assert_eq!(
+            heartbeat.event_type(),
+            crate::control_plane::client::WatchEventType::Bookmark
+        );
+        assert_eq!(
+            heartbeat.resource().resource_version,
+            namespace.resource_version
+        );
+        let position = heartbeat
+            .resume_position()
+            .expect("decoded heartbeat carries exact event-ID position");
+        assert_eq!(position.resource_version, namespace.resource_version);
+        assert!(position.event_id > 0);
     }
 
     #[tokio::test]
@@ -2183,6 +2401,12 @@ mod cases {
                     .internal_ip()
                     .to_string(),
                 as_learner: false,
+                storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
+                storage_log_attestation:
+                    crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+                        high_watermark: None,
+                        current_boundary: None,
+                    },
                 snapshot:
                     crate::replication::grpc::client::RegistrationSnapshotView::remote_snapshot(
                         &controlplane_registration,
@@ -2345,7 +2569,7 @@ mod cases {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(1),
-            client.raft_append_entries_rpc(Vec::new()),
+            client.raft_append_entries_rpc(raft_receiver(), Vec::new()),
         )
         .await;
 
@@ -2379,7 +2603,9 @@ mod cases {
         // wedge nothing for IS (empty path never matches), just drive one call
         // through the client to materialize the lane pool.
         let (client, handle) = raft_timeout_client("/never-wedges").await;
-        let _ = client.raft_install_snapshot_rpc(Vec::new()).await;
+        let _ = client
+            .raft_install_snapshot_rpc(raft_receiver(), Vec::new())
+            .await;
         assert!(
             client
                 .lane_pool_present_for_test(ChannelLane::InstallSnapshot)
@@ -3105,7 +3331,7 @@ mod cases {
         let (client, handle) = raft_timeout_client("/RaftAppendEntries").await;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            client.raft_append_entries_rpc(Vec::new()),
+            client.raft_append_entries_rpc(raft_receiver(), Vec::new()),
         )
         .await
         .expect("must complete within wall-clock bound");
@@ -3124,9 +3350,12 @@ mod cases {
     #[tokio::test]
     async fn request_vote_timeout_invalidates_lane() {
         let (client, handle) = raft_timeout_client("/RaftVote").await;
-        let result = tokio::time::timeout(Duration::from_secs(2), client.raft_vote_rpc(Vec::new()))
-            .await
-            .expect("must complete within wall-clock bound");
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.raft_vote_rpc(raft_receiver(), Vec::new()),
+        )
+        .await
+        .expect("must complete within wall-clock bound");
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("deadline exceeded"),
@@ -3144,7 +3373,7 @@ mod cases {
         let (client, handle) = raft_timeout_client("/RaftInstallSnapshot").await;
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            client.raft_install_snapshot_rpc(Vec::new()),
+            client.raft_install_snapshot_rpc(raft_receiver(), Vec::new()),
         )
         .await
         .expect("must complete within wall-clock bound");
@@ -3209,7 +3438,9 @@ mod cases {
         );
         // Send an empty payload — the server returns an raft application error
         // in the response body, not a transport-level failure.
-        let result = client.raft_append_entries_rpc(Vec::new()).await;
+        let result = client
+            .raft_append_entries_rpc(raft_receiver(), Vec::new())
+            .await;
         // The call must complete (not time out) — it reached the server.
         // The result may be Ok(Err(msg)) (application error from the raft state
         // machine) or Err (transport) — we only care that the lane is NOT evicted.
@@ -3263,20 +3494,21 @@ mod cases {
             let result = match method {
                 "AppendEntries" => tokio::time::timeout(
                     Duration::from_secs(2),
-                    client.raft_append_entries_rpc(Vec::new()),
+                    client.raft_append_entries_rpc(raft_receiver(), Vec::new()),
                 )
                 .await
                 .expect("must finish")
                 .map(|_| ()),
-                "Vote" => {
-                    tokio::time::timeout(Duration::from_secs(2), client.raft_vote_rpc(Vec::new()))
-                        .await
-                        .expect("must finish")
-                        .map(|_| ())
-                }
+                "Vote" => tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.raft_vote_rpc(raft_receiver(), Vec::new()),
+                )
+                .await
+                .expect("must finish")
+                .map(|_| ()),
                 "InstallSnapshot" | _ => tokio::time::timeout(
                     Duration::from_secs(2),
-                    client.raft_install_snapshot_rpc(Vec::new()),
+                    client.raft_install_snapshot_rpc(raft_receiver(), Vec::new()),
                 )
                 .await
                 .expect("must finish")
@@ -3304,7 +3536,7 @@ mod cases {
         let payload = vec![0u8; 16]; // 16 bytes — verifiable in byte counter
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
-            client.raft_append_entries_rpc(payload.clone()),
+            client.raft_append_entries_rpc(raft_receiver(), payload.clone()),
         )
         .await;
         assert_eq!(

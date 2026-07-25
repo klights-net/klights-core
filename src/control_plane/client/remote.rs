@@ -268,7 +268,6 @@ impl RemoteApiClient {
                     };
                     match next {
                         IdleNext::Item(Ok(event)) => {
-                            reconnect_attempt = 0;
                             // bug-grpc B2/B3: cursor-advance-only-after-safe-apply.
                             // The resume RV must advance ONLY once the event is
                             // decoded and applied (a BOOKMARK applies as a no-op
@@ -303,6 +302,7 @@ impl RemoteApiClient {
                                 }
                                 next_resource_version = applied_cursor.resource_version();
                                 next_watch_replay_position = applied_cursor.replay_position();
+                                reconnect_attempt = 0;
                                 continue;
                             };
                             let event = match focused_watch_event(
@@ -329,6 +329,7 @@ impl RemoteApiClient {
                             }
                             next_resource_version = applied_cursor.resource_version();
                             next_watch_replay_position = applied_cursor.replay_position();
+                            reconnect_attempt = 0;
                         }
                         IdleNext::Item(Err(err)) => {
                             if watch_error_requires_relist(&err) {
@@ -1581,7 +1582,7 @@ mod tests {
         // instead of blocking forever (the 10-minute pod-deletion stall).
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
 
-        let mut wedged: super::WatchStream = Box::pin(futures::stream::pending());
+        let mut wedged = super::WatchStream::unpositioned_test_stream(futures::stream::pending());
         let started = std::time::Instant::now();
         let outcome = super::next_event_within_idle(
             Some(&supervisor),
@@ -1599,8 +1600,10 @@ mod tests {
         let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
         let event =
             ResourceEvent::try_new(WatchEventType::Added, pod, None).expect("valid live event");
-        let mut live: super::WatchStream =
-            Box::pin(futures::stream::once(async move { Ok(event) }));
+        let mut live =
+            super::WatchStream::unpositioned_test_stream(futures::stream::once(async move {
+                Ok(event)
+            }));
         let outcome = super::next_event_within_idle(
             Some(&supervisor),
             std::time::Duration::from_secs(5),

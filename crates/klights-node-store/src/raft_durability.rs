@@ -307,6 +307,25 @@ pub trait RaftLogDurability: Send + Sync {
     fn store_vote(&self, encoded_vote: OpaqueRaftBytes) -> RaftDurabilityFuture<'_, ()>;
     fn load_committed(&self) -> RaftDurabilityFuture<'_, Option<OpaqueRaftBytes>>;
     fn store_committed(&self, encoded_committed: OpaqueRaftBytes) -> RaftDurabilityFuture<'_, ()>;
+    /// Return the durable identity of this node-local Raft store, creating it
+    /// atomically on first open. Reopening the same node.db returns the same
+    /// value; recreating node.db produces a new value.
+    fn load_or_create_storage_incarnation(&self) -> RaftDurabilityFuture<'_, String>;
+    /// Monotonic highest Raft LogId ever durably accepted by this incarnation.
+    /// Full term/leader identity detects an anchored node.db rollback even
+    /// when a restored backup contains the same incarnation UUID.
+    fn load_storage_log_attestation(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>>;
+    /// Current durable Raft boundary: the greater of the last retained log
+    /// entry and last-purged/snapshot anchor.
+    fn load_storage_current_boundary(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>>;
+    /// Atomically discard a learner-only log suffix that has neither a
+    /// snapshot/purge boundary nor applied state and starts above index zero.
+    ///
+    /// Such a suffix cannot be replayed: its predecessor identity is unknown.
+    /// Callers must restrict this operation to nodes configured as non-voting
+    /// learners, which can safely reacquire authoritative state from a leader.
+    /// The durable vote is deliberately preserved.
+    fn reset_orphaned_learner_log(&self) -> RaftDurabilityFuture<'_, bool>;
 }
 
 pub trait RaftAppliedStateDurability: Send + Sync {

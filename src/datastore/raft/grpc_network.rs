@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::datastore::raft::types::RaftMemberNode;
 use async_trait::async_trait;
-use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -184,9 +184,21 @@ impl GrpcRaftNetworkMetrics {
 /// loopback port.
 #[async_trait]
 pub trait GrpcRaftRpcClient: Send + Sync {
-    async fn append_entries(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError>;
-    async fn vote(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError>;
-    async fn install_snapshot(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError>;
+    async fn append_entries(
+        &self,
+        receiver: RaftMemberNode,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, GrpcRaftRpcError>;
+    async fn vote(
+        &self,
+        receiver: RaftMemberNode,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, GrpcRaftRpcError>;
+    async fn install_snapshot(
+        &self,
+        receiver: RaftMemberNode,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, GrpcRaftRpcError>;
 }
 
 /// Transport-level outcome of a peer RPC. `Unreachable` triggers
@@ -198,8 +210,12 @@ pub trait GrpcRaftRpcClient: Send + Sync {
 pub enum GrpcRaftRpcError {
     #[error("peer unreachable: {0}")]
     Unreachable(RaftPeerTransportError),
+    #[error("peer Raft admission is not ready: {0}")]
+    Retryable(String),
     #[error("peer returned consensus error: {0}")]
     Remote(String),
+    #[error("peer snapshot stream mismatch: {0}")]
+    SnapshotMismatch(openraft::error::SnapshotMismatch),
     #[error("peer raft router error: {0}")]
     Server(String),
 }
@@ -265,6 +281,7 @@ pub struct GrpcRaftNetwork {
     /// stamps the target id so subsequent RPC calls know which peer
     /// they're talking to.
     bound_target: Option<NodeId>,
+    bound_receiver_admission: Option<RaftMemberNode>,
     metrics: Arc<GrpcRaftNetworkMetrics>,
     /// T4: shared RTT estimator fed by successful AppendEntries round-trips.
     /// AppendEntries is the most frequent raft RPC (heartbeats), so it is the
@@ -279,6 +296,7 @@ impl GrpcRaftNetwork {
             clients: Arc::new(RwLock::new(HashMap::new())),
             addrs: Arc::new(RwLock::new(HashMap::new())),
             bound_target: None,
+            bound_receiver_admission: None,
             metrics: Arc::new(GrpcRaftNetworkMetrics::default()),
             rtt: Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
         }
@@ -337,7 +355,7 @@ impl GrpcRaftNetwork {
 impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetwork {
     type Network = GrpcRaftNetwork;
 
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: NodeId, node: &RaftMemberNode) -> Self::Network {
         // Record the peer address so an evicted client can be rebuilt
         // without another new_client call, then materialize (or reuse)
         // the per-peer client and stamp the returned network with the
@@ -361,6 +379,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetwork {
             clients: self.clients.clone(),
             addrs: self.addrs.clone(),
             bound_target: Some(target),
+            bound_receiver_admission: Some(node.clone()),
             metrics: self.metrics.clone(),
             rtt: self.rtt.clone(),
         }
@@ -377,7 +396,8 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>>
+    {
         let target = self.bound_target.unwrap_or(0);
         let client = self.client_for_bound().map_err(RPCError::Unreachable)?;
         let entries_len = rpc.entries.len();
@@ -399,7 +419,10 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         self.metrics
             .record_append_entries_call(target, payload.len(), entries_len, lag_entries);
         let call_start = std::time::Instant::now();
-        let bytes = match client.append_entries(payload).await {
+        let receiver = self.bound_receiver_admission.clone().ok_or_else(|| {
+            RPCError::Unreachable(unreachable_io("missing bound receiver admission"))
+        })?;
+        let bytes = match client.append_entries(receiver, payload).await {
             Ok(b) => {
                 // T4: a successful round-trip is a clean RTT sample. Failures
                 // (timeouts/stalls) are NOT sampled — they reflect loss, not RTT.
@@ -419,11 +442,16 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(te.to_string())));
             }
-            Err(GrpcRaftRpcError::Server(msg)) => {
+            Err(GrpcRaftRpcError::Retryable(msg) | GrpcRaftRpcError::Server(msg)) => {
                 self.metrics.record_append_entries_failure(target);
-                tracing::warn!(target, %msg, "GrpcRaftNetwork::append_entries: server router error");
-                self.invalidate(target);
+                tracing::warn!(target, %msg, "GrpcRaftNetwork::append_entries: peer admission not ready");
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
+            }
+            Err(GrpcRaftRpcError::SnapshotMismatch(mismatch)) => {
+                self.metrics.record_append_entries_failure(target);
+                return Err(RPCError::Unreachable(unreachable_io(format!(
+                    "unexpected AppendEntries snapshot mismatch: {mismatch}"
+                ))));
             }
             Err(GrpcRaftRpcError::Remote(msg)) => {
                 self.metrics.record_append_entries_failure(target);
@@ -444,13 +472,16 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         &mut self,
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, RaftMemberNode, RaftError<NodeId>>> {
         let target = self.bound_target.unwrap_or(0);
         let client = self.client_for_bound().map_err(RPCError::Unreachable)?;
         let payload = serde_json::to_vec(&rpc)
             .map_err(|e| RPCError::Unreachable(unreachable_io(format!("encode Vote: {e}"))))?;
         self.metrics.record_vote_call(target, payload.len());
-        let bytes = match client.vote(payload).await {
+        let receiver = self.bound_receiver_admission.clone().ok_or_else(|| {
+            RPCError::Unreachable(unreachable_io("missing bound receiver admission"))
+        })?;
+        let bytes = match client.vote(receiver, payload).await {
             Ok(b) => b,
             Err(GrpcRaftRpcError::Unreachable(te)) => {
                 self.metrics.record_vote_failure(target);
@@ -464,11 +495,16 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(te.to_string())));
             }
-            Err(GrpcRaftRpcError::Server(msg)) => {
+            Err(GrpcRaftRpcError::Retryable(msg) | GrpcRaftRpcError::Server(msg)) => {
                 self.metrics.record_vote_failure(target);
-                tracing::warn!(target, %msg, "GrpcRaftNetwork::vote: server router error");
-                self.invalidate(target);
+                tracing::warn!(target, %msg, "GrpcRaftNetwork::vote: peer admission not ready");
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
+            }
+            Err(GrpcRaftRpcError::SnapshotMismatch(mismatch)) => {
+                self.metrics.record_vote_failure(target);
+                return Err(RPCError::Unreachable(unreachable_io(format!(
+                    "unexpected Vote snapshot mismatch: {mismatch}"
+                ))));
             }
             Err(GrpcRaftRpcError::Remote(msg)) => {
                 self.metrics.record_vote_failure(target);
@@ -488,7 +524,7 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
+        RPCError<NodeId, RaftMemberNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         let target = self.bound_target.unwrap_or(0);
         let client = self.client_for_bound().map_err(RPCError::Unreachable)?;
@@ -496,7 +532,10 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
             .map_err(|e| RPCError::Unreachable(unreachable_io(format!("encode IS: {e}"))))?;
         self.metrics
             .record_install_snapshot_call(target, payload.len());
-        let bytes = match client.install_snapshot(payload).await {
+        let receiver = self.bound_receiver_admission.clone().ok_or_else(|| {
+            RPCError::Unreachable(unreachable_io("missing bound receiver admission"))
+        })?;
+        let bytes = match client.install_snapshot(receiver, payload).await {
             Ok(b) => b,
             Err(GrpcRaftRpcError::Unreachable(te)) => {
                 self.metrics.record_install_snapshot_failure(target);
@@ -510,11 +549,17 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(te.to_string())));
             }
-            Err(GrpcRaftRpcError::Server(msg)) => {
+            Err(GrpcRaftRpcError::Retryable(msg) | GrpcRaftRpcError::Server(msg)) => {
                 self.metrics.record_install_snapshot_failure(target);
-                tracing::warn!(target, %msg, "GrpcRaftNetwork::install_snapshot: server router error");
-                self.invalidate(target);
+                tracing::warn!(target, %msg, "GrpcRaftNetwork::install_snapshot: peer admission not ready");
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
+            }
+            Err(GrpcRaftRpcError::SnapshotMismatch(mismatch)) => {
+                self.metrics.record_install_snapshot_failure(target);
+                return Err(RPCError::RemoteError(RemoteError::new(
+                    target,
+                    RaftError::APIError(InstallSnapshotError::SnapshotMismatch(mismatch)),
+                )));
             }
             Err(GrpcRaftRpcError::Remote(msg)) => {
                 self.metrics.record_install_snapshot_failure(target);
@@ -548,21 +593,39 @@ mod tests {
 
     #[async_trait]
     impl GrpcRaftRpcClient for LoopbackClient {
-        async fn append_entries(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        async fn append_entries(
+            &self,
+            _receiver: RaftMemberNode,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
             self.ae_log.lock().unwrap().push(payload);
             Ok(self.ae_reply.clone())
         }
-        async fn vote(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        async fn vote(
+            &self,
+            _receiver: RaftMemberNode,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
             self.vote_log.lock().unwrap().push(payload);
             Ok(self.vote_reply.clone())
         }
-        async fn install_snapshot(&self, payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        async fn install_snapshot(
+            &self,
+            _receiver: RaftMemberNode,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
             self.snap_log.lock().unwrap().push(payload);
             Ok(self.snap_reply.clone())
         }
     }
 
     struct UnreachableClient;
+    struct RemoteFatalClient;
+    struct SnapshotMismatchClient;
+    struct SessionFenceClient {
+        ready: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
 
     fn unreachable_peer_down() -> GrpcRaftRpcError {
         GrpcRaftRpcError::Unreachable(RaftPeerTransportError {
@@ -575,14 +638,113 @@ mod tests {
 
     #[async_trait]
     impl GrpcRaftRpcClient for UnreachableClient {
-        async fn append_entries(&self, _payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        async fn append_entries(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
             Err(unreachable_peer_down())
         }
-        async fn vote(&self, _payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        async fn vote(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
             Err(unreachable_peer_down())
         }
-        async fn install_snapshot(&self, _payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
+        async fn install_snapshot(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
             Err(unreachable_peer_down())
+        }
+    }
+
+    #[async_trait]
+    impl GrpcRaftRpcClient for RemoteFatalClient {
+        async fn append_entries(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            Err(GrpcRaftRpcError::Remote("remote Raft fatal".to_string()))
+        }
+        async fn vote(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            Err(GrpcRaftRpcError::Remote("remote Raft fatal".to_string()))
+        }
+        async fn install_snapshot(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            Err(GrpcRaftRpcError::Remote("remote Raft fatal".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl GrpcRaftRpcClient for SnapshotMismatchClient {
+        async fn append_entries(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            unreachable!("snapshot mismatch test only installs a snapshot")
+        }
+        async fn vote(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            unreachable!("snapshot mismatch test only installs a snapshot")
+        }
+        async fn install_snapshot(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            Err(GrpcRaftRpcError::SnapshotMismatch(
+                openraft::error::SnapshotMismatch {
+                    expect: ("snapshot-a", 0).into(),
+                    got: ("snapshot-a", 512).into(),
+                },
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl GrpcRaftRpcClient for SessionFenceClient {
+        async fn append_entries(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(sample_ae_response())
+            } else {
+                Err(GrpcRaftRpcError::Retryable(
+                    "same-ID member session is not reset".to_string(),
+                ))
+            }
+        }
+        async fn vote(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            unreachable!("session-fence test only sends AppendEntries")
+        }
+        async fn install_snapshot(
+            &self,
+            _receiver: RaftMemberNode,
+            _payload: Vec<u8>,
+        ) -> Result<Vec<u8>, GrpcRaftRpcError> {
+            unreachable!("session-fence test only sends AppendEntries")
         }
     }
 
@@ -687,12 +849,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(
-                20u64,
-                &BasicNode {
-                    addr: "down".into(),
-                },
-            )
+            .new_client(20u64, &RaftMemberNode::unproven("down"))
             .await;
 
         // First RPC uses the initially-built (wedged) client → Unreachable.
@@ -743,6 +900,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_fatal_does_not_invalidate_or_rebuild_peer_client() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let working = Arc::new(LoopbackClient {
+            ae_log: Mutex::new(Vec::new()),
+            vote_log: Mutex::new(Vec::new()),
+            snap_log: Mutex::new(Vec::new()),
+            ae_reply: sample_ae_response(),
+            vote_reply: sample_vote_response(),
+            snap_reply: sample_snapshot_response(),
+        });
+        let factory = Arc::new(SeqFactory {
+            calls: calls.clone(),
+            fail_first: Arc::new(RemoteFatalClient),
+            then: working,
+        });
+        let mut network = GrpcRaftNetwork::new(factory);
+        let mut peer = network
+            .new_client(20u64, &RaftMemberNode::unproven("fatal"))
+            .await;
+
+        for _ in 0..2 {
+            let error = peer
+                .install_snapshot(
+                    sample_snapshot_request(),
+                    RPCOption::new(std::time::Duration::from_secs(1)),
+                )
+                .await
+                .expect_err("remote fatal must propagate");
+            assert!(matches!(error, RPCError::RemoteError(_)));
+        }
+
+        assert!(
+            peer.clients.read().unwrap().contains_key(&20),
+            "a reached remote peer must remain cached"
+        );
+        assert_eq!(
+            peer.metrics_snapshot().client_invalidations_total,
+            0,
+            "remote application/storage fatal is not a wedged transport"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "remote fatal must not rebuild the same healthy connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_session_fence_is_retryable_until_leader_session_reset_without_rebuild() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let client = Arc::new(SessionFenceClient {
+            ready: std::sync::atomic::AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(SeqFactory {
+            calls: factory_calls.clone(),
+            fail_first: client.clone(),
+            then: Arc::new(UnreachableClient),
+        });
+        let mut network = GrpcRaftNetwork::new(factory);
+        let mut peer = network
+            .new_client(20u64, &RaftMemberNode::unproven("same-id"))
+            .await;
+
+        let error = peer
+            .append_entries(
+                sample_ae_request(),
+                RPCOption::new(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .expect_err("stale member session must be fenced");
+        assert!(
+            matches!(error, RPCError::Unreachable(_)),
+            "OpenRaft must receive a retryable transport result, never Conflict"
+        );
+        assert_eq!(peer.metrics_snapshot().client_invalidations_total, 0);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+
+        client.ready.store(true, Ordering::SeqCst);
+        let response = peer
+            .append_entries(
+                sample_ae_request(),
+                RPCOption::new(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .expect("fresh leader session must use the same healthy transport");
+        assert_eq!(response, AppendEntriesResponse::Success);
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            factory_calls.load(Ordering::SeqCst),
+            1,
+            "session fencing must not hot-rebuild the transport client"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_mismatch_reaches_openraft_as_typed_reset_signal() {
+        let factory = Arc::new(FixedFactory {
+            client: Arc::new(SnapshotMismatchClient),
+        });
+        let mut network = GrpcRaftNetwork::new(factory);
+        let mut peer = network
+            .new_client(20u64, &RaftMemberNode::unproven("snapshot"))
+            .await;
+
+        let error = peer
+            .install_snapshot(
+                sample_snapshot_request(),
+                RPCOption::new(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .expect_err("snapshot offset mismatch must be returned to OpenRaft");
+        assert!(matches!(
+            error,
+            RPCError::RemoteError(RemoteError {
+                source: RaftError::APIError(InstallSnapshotError::SnapshotMismatch(_)),
+                ..
+            })
+        ));
+        assert_eq!(
+            peer.metrics_snapshot().client_invalidations_total,
+            0,
+            "snapshot stream reset is not a transport failure"
+        );
+    }
+
+    #[tokio::test]
     async fn vote_rpc_round_trips_through_grpc_envelope() {
         let loopback = Arc::new(LoopbackClient {
             ae_log: Mutex::new(Vec::new()),
@@ -757,7 +1043,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(20u64, &BasicNode { addr: "x".into() })
+            .new_client(20u64, &RaftMemberNode::unproven("x"))
             .await;
         let response = peer
             .vote(
@@ -803,7 +1089,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(20u64, &BasicNode { addr: "x".into() })
+            .new_client(20u64, &RaftMemberNode::unproven("x"))
             .await;
         let response = peer
             .install_snapshot(
@@ -834,12 +1120,7 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let mut peer = network
-            .new_client(
-                20u64,
-                &BasicNode {
-                    addr: "down".into(),
-                },
-            )
+            .new_client(20u64, &RaftMemberNode::unproven("down"))
             .await;
         let err = peer
             .vote(
@@ -879,15 +1160,15 @@ mod tests {
         });
         let mut network = GrpcRaftNetwork::new(factory);
         let _peer1 = network
-            .new_client(20u64, &BasicNode { addr: "x".into() })
+            .new_client(20u64, &RaftMemberNode::unproven("x"))
             .await;
         let _peer1_again = network
-            .new_client(20u64, &BasicNode { addr: "x".into() })
+            .new_client(20u64, &RaftMemberNode::unproven("x"))
             .await;
         // Both new_client calls for the same target reuse one entry.
         assert_eq!(network.clients.read().unwrap().len(), 1);
         let _peer2 = network
-            .new_client(30u64, &BasicNode { addr: "y".into() })
+            .new_client(30u64, &RaftMemberNode::unproven("y"))
             .await;
         assert_eq!(network.clients.read().unwrap().len(), 2);
     }

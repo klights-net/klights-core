@@ -5,6 +5,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use klights_cluster_core::{Resource, StorageCommand, StorageResponse, WatchReplayPosition};
@@ -995,10 +996,13 @@ impl ResourceEvent {
         }
         if self.resource.api_version != request.api_version
             || self.resource.kind != request.kind
-            || request
+            || (matches!(
+                self.event_type,
+                WatchEventType::Added | WatchEventType::Modified | WatchEventType::Deleted
+            ) && request
                 .namespace
                 .as_deref()
-                .is_some_and(|namespace| self.resource.namespace.as_deref() != Some(namespace))
+                .is_some_and(|namespace| self.resource.namespace.as_deref() != Some(namespace)))
         {
             return Err(LeaderWatchError::mismatched_event(format!(
                 "watch event {}/{} {:?} does not match request {}/{} {:?}",
@@ -1074,10 +1078,70 @@ impl WatchResumeCursor {
     }
 }
 
-/// Pull-based stream. The caller controls demand and dropping the stream is
-/// the cancellation mechanism; implementations must not hide unbounded queues.
-pub type WatchStream =
+/// Heap-erased watch event stream. The caller controls demand and dropping the
+/// stream is the cancellation mechanism; implementations must not hide
+/// unbounded queues.
+pub type WatchEventStream =
     Pin<Box<dyn Stream<Item = Result<ResourceEvent, LeaderWatchError>> + Send + 'static>>;
+
+/// One established watch session with an optional exact accepted cursor.
+/// Local positioned watches expose the cursor sampled after installing their
+/// live signal edge. A remote transport may return `None` when that cursor is
+/// not carried in response headers; in that case its first event or heartbeat
+/// must deliver the exact server cursor, and reconnecting before the first
+/// frame repeats the original fresh-watch request.
+pub struct WatchStream {
+    inner: WatchEventStream,
+    accepted_cursor: Option<WatchResumeCursor>,
+}
+
+impl WatchStream {
+    pub fn positioned(inner: WatchEventStream, accepted_cursor: WatchResumeCursor) -> Self {
+        Self {
+            inner,
+            accepted_cursor: Some(accepted_cursor),
+        }
+    }
+
+    /// Establish a transport stream whose server-selected fresh cursor is
+    /// delivered by its first event/heartbeat rather than response headers.
+    pub fn deferred_transport(inner: WatchEventStream) -> Self {
+        Self {
+            inner,
+            accepted_cursor: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn unpositioned_test_stream(
+        stream: impl Stream<Item = Result<ResourceEvent, LeaderWatchError>> + Send + 'static,
+    ) -> Self {
+        Self::deferred_transport(Box::pin(stream))
+    }
+
+    /// Transform the delivery mechanics without changing the cursor accepted
+    /// by the watch origin.
+    pub fn map_inner(self, transform: impl FnOnce(WatchEventStream) -> WatchEventStream) -> Self {
+        Self {
+            inner: transform(self.inner),
+            accepted_cursor: self.accepted_cursor,
+        }
+    }
+
+    /// Exact cursor accepted during session open, when the adapter can expose
+    /// it out of band. `None` means the first stream frame establishes it.
+    pub const fn accepted_cursor(&self) -> Option<WatchResumeCursor> {
+        self.accepted_cursor
+    }
+}
+
+impl Stream for WatchStream {
+    type Item = Result<ResourceEvent, LeaderWatchError>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().inner.as_mut().poll_next(context)
+    }
+}
 
 /// Heap-erased future used to establish one positioned watch.
 pub type LeaderWatchFuture<'a> =

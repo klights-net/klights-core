@@ -349,7 +349,7 @@ message WatchResourcesRequest {
   string kind = 2;
   optional string namespace = 3;
   optional string field_selector = 4;
-  int64 start_resource_version = 5;
+  optional int64 start_resource_version = 5;
   optional string label_selector = 6;
   optional WatchReplayPosition start_watch_replay_position = 7;
 }
@@ -503,6 +503,9 @@ message RaftAppendEntriesRequest {
   // Serde-encoded openraft::AppendEntriesRequest<TypeConfig>.
   bytes payload = 1;
   uint64 supported_features = 2;
+  // JSON-encoded RaftMemberNode receiver admission proof captured by the
+  // immutable OpenRaft replication worker.
+  bytes receiver_admission = 3;
 }
 
 message RaftAppendEntriesResponse {
@@ -518,6 +521,7 @@ message RaftVoteRequest {
   // Serde-encoded openraft::VoteRequest<NodeId>.
   bytes payload = 1;
   uint64 supported_features = 2;
+  bytes receiver_admission = 3;
 }
 
 message RaftVoteResponse {
@@ -531,6 +535,7 @@ message RaftInstallSnapshotRequest {
   // Serde-encoded openraft::InstallSnapshotRequest<TypeConfig>.
   bytes payload = 1;
   uint64 supported_features = 2;
+  bytes receiver_admission = 3;
 }
 
 message RaftInstallSnapshotResponse {
@@ -565,6 +570,24 @@ message JoinAsControlplaneRequest {
   string node_git_commit = 11;
   NodeRegistrationSnapshot node_registration = 12;
   uint64 supported_features = 13;
+  // Durable identity of the joiner's node.db Raft store. Stable across a
+  // healthy restart and regenerated when node.db is recreated, allowing the
+  // leader to distinguish an idempotent Join from a wiped same-ID member.
+  string storage_incarnation = 14;
+  RaftStorageAttestation storage_log_attestation = 15;
+}
+
+message RaftStorageLogId {
+  uint64 term = 1;
+  uint64 leader_node_id = 2;
+  uint64 index = 3;
+}
+
+message RaftStorageAttestation {
+  // Monotonic full LogId ever durably accepted by this incarnation.
+  RaftStorageLogId high_watermark = 1;
+  // Current full LogId boundary: max(last retained log, last-purged anchor).
+  RaftStorageLogId current_boundary = 2;
 }
 
 // Joiner-owned host facts used to construct the joining node's Kubernetes

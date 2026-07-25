@@ -12,7 +12,7 @@ use klights_cluster_store::{
 };
 use klights_leader_api::{
     LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent, WatchEventType, WatchRequest,
-    WatchStream,
+    WatchResumeCursor, WatchStream,
 };
 
 use crate::{
@@ -248,7 +248,11 @@ impl PositionedWatchService {
                 }
             }
         };
-        Ok(Box::pin(stream))
+        let accepted_cursor = WatchResumeCursor::try_new(
+            Some(replay_position.resource_version),
+            Some(replay_position),
+        )?;
+        Ok(WatchStream::positioned(Box::pin(stream), accepted_cursor))
     }
 
     pub fn watch_projected_resources(&self, plan: ProjectedWatchPlan) -> LeaderWatchFuture<'_> {
@@ -368,7 +372,11 @@ impl PositionedWatchService {
                 }
             }
         };
-        Ok(Box::pin(stream))
+        let accepted_cursor = WatchResumeCursor::try_new(
+            Some(replay_position.resource_version),
+            Some(replay_position),
+        )?;
+        Ok(WatchStream::positioned(Box::pin(stream), accepted_cursor))
     }
 }
 

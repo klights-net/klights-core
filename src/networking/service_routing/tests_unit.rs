@@ -965,7 +965,11 @@ impl crate::control_plane::client::LeaderWatch for FreshServiceInventoryClient {
         _req: crate::control_plane::client::WatchRequest,
     ) -> crate::control_plane::client::LeaderWatchFuture<'_> {
         Box::pin(async {
-            Ok(Box::pin(futures::stream::empty()) as crate::control_plane::client::WatchStream)
+            Ok(
+                crate::control_plane::client::WatchStream::unpositioned_test_stream(
+                    futures::stream::empty(),
+                ),
+            )
         })
     }
 }

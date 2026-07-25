@@ -162,7 +162,11 @@ impl LeaderResourceQuery for FakeLeaderApiClient {
 
 impl LeaderWatch for FakeLeaderApiClient {
     fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
-        Box::pin(async { Ok(Box::pin(futures::stream::empty()) as WatchStream) })
+        Box::pin(async {
+            Ok(WatchStream::unpositioned_test_stream(
+                futures::stream::empty(),
+            ))
+        })
     }
 }
 

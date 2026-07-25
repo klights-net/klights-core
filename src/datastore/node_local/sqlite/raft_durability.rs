@@ -12,6 +12,38 @@ const COMMITTED: &str = "committed";
 const LAST_PURGED: &str = "last_purged_log_id";
 const LAST_APPLIED: &str = "last_applied";
 const LAST_MEMBERSHIP: &str = "last_membership";
+const STORAGE_INCARNATION: &str = "storage_incarnation";
+const STORAGE_LOG_HIGH_WATERMARK: &str = "storage_log_high_watermark";
+const STORAGE_LOG_HIGH_TERM: &str = "storage_log_high_term";
+const STORAGE_LOG_HIGH_LEADER: &str = "storage_log_high_leader";
+
+fn advance_storage_log_attestation(
+    tx: &rusqlite::Transaction<'_>,
+    coordinate: RaftLogCoordinate,
+) -> rusqlite::Result<()> {
+    let index = index_i64("storage_attestation.index", coordinate.index())
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let current = tx
+        .query_row(
+            queries::RAFT_META_GET,
+            [STORAGE_LOG_HIGH_WATERMARK],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if current.is_none_or(|current| index > current) {
+        for (key, value) in [
+            (STORAGE_LOG_HIGH_WATERMARK, index),
+            (STORAGE_LOG_HIGH_TERM, bit_pattern_i64(coordinate.term())),
+            (
+                STORAGE_LOG_HIGH_LEADER,
+                bit_pattern_i64(coordinate.leader_node_id()),
+            ),
+        ] {
+            tx.execute(queries::RAFT_META_SET, rusqlite::params![key, value])?;
+        }
+    }
+    Ok(())
+}
 
 fn persistence(operation: &'static str, error: impl std::fmt::Display) -> RaftDurabilityError {
     RaftDurabilityError::persistence_failed(operation, error.to_string())
@@ -133,6 +165,9 @@ impl RaftLogDurability for SqliteNodeLocalDb {
                     ))
                 })
                 .collect::<Result<Vec<_>, RaftDurabilityError>>()?;
+            let high_watermark = entries.iter().max_by_key(|entry| entry.0).map(|entry| {
+                RaftLogCoordinate::new(entry.0 as u64, entry.1 as u64, entry.2 as u64)
+            });
             self.db_call("node_local:raft_log_append_batch", move |conn| {
                 let tx = conn.transaction()?;
                 for (index, term, leader, payload) in entries {
@@ -140,6 +175,9 @@ impl RaftLogDurability for SqliteNodeLocalDb {
                         queries::RAFT_LOG_INSERT,
                         rusqlite::params![index, term, leader, payload],
                     )?;
+                }
+                if let Some(high_watermark) = high_watermark {
+                    advance_storage_log_attestation(&tx, high_watermark)?;
                 }
                 tx.commit()?;
                 Ok(())
@@ -164,7 +202,8 @@ impl RaftLogDurability for SqliteNodeLocalDb {
     fn purge_log_through(&self, request: RaftPurgeRequest) -> RaftDurabilityFuture<'_, ()> {
         Box::pin(async move {
             let (through, encoded) = request.into_parts();
-            let through = index_i64("through.index", through.index())?;
+            let through_coordinate = through;
+            let through = index_i64("through.index", through_coordinate.index())?;
             let encoded = encoded.into_vec();
             self.db_call("node_local:raft_log_purge", move |conn| {
                 let tx = conn.transaction()?;
@@ -173,6 +212,7 @@ impl RaftLogDurability for SqliteNodeLocalDb {
                     queries::RAFT_META_SET,
                     rusqlite::params![LAST_PURGED, encoded],
                 )?;
+                advance_storage_log_attestation(&tx, through_coordinate)?;
                 tx.commit()?;
                 Ok(())
             })
@@ -195,6 +235,192 @@ impl RaftLogDurability for SqliteNodeLocalDb {
 
     fn store_committed(&self, value: OpaqueRaftBytes) -> RaftDurabilityFuture<'_, ()> {
         write_meta(self, COMMITTED, value, "store_committed")
+    }
+
+    fn load_or_create_storage_incarnation(&self) -> RaftDurabilityFuture<'_, String> {
+        Box::pin(async move {
+            let generated = uuid::Uuid::new_v4().to_string().into_bytes();
+            self.db_call("node_local:raft_storage_incarnation", move |conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO raft_meta (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![STORAGE_INCARNATION, generated],
+                )?;
+                let value = tx.query_row(queries::RAFT_META_GET, [STORAGE_INCARNATION], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                tx.commit()?;
+                Ok(String::from_utf8(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?)
+            })
+            .await
+            .map_err(|error| map_db_error("load_or_create_storage_incarnation", error))
+        })
+    }
+
+    fn load_storage_log_attestation(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>> {
+        Box::pin(async move {
+            self.db_call("node_local:raft_storage_log_high_watermark", move |conn| {
+                let tx = conn.transaction()?;
+                let current_index = tx
+                    .query_row(
+                        queries::RAFT_META_GET,
+                        [STORAGE_LOG_HIGH_WATERMARK],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                let coordinate = match current_index {
+                    Some(index) => {
+                        let term =
+                            tx.query_row(queries::RAFT_META_GET, [STORAGE_LOG_HIGH_TERM], |row| {
+                                row.get::<_, i64>(0)
+                            })?;
+                        let leader = tx.query_row(
+                            queries::RAFT_META_GET,
+                            [STORAGE_LOG_HIGH_LEADER],
+                            |row| row.get::<_, i64>(0),
+                        )?;
+                        Some(RaftLogCoordinate::new(
+                            decode_index(index)?,
+                            term as u64,
+                            leader as u64,
+                        ))
+                    }
+                    None => {
+                        let coordinate = tx
+                            .query_row(queries::RAFT_LOG_LAST, [], |row| {
+                                Ok(RaftLogCoordinate::new(
+                                    decode_index(row.get::<_, i64>(0)?)?,
+                                    row.get::<_, i64>(1)? as u64,
+                                    row.get::<_, i64>(2)? as u64,
+                                ))
+                            })
+                            .optional()?;
+                        if let Some(coordinate) = coordinate {
+                            advance_storage_log_attestation(&tx, coordinate)?;
+                        }
+                        coordinate
+                    }
+                };
+                tx.commit()?;
+                Ok(coordinate)
+            })
+            .await
+            .map_err(|error| map_db_error("load_storage_log_high_watermark", error))
+        })
+    }
+
+    fn load_storage_current_boundary(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>> {
+        Box::pin(async move {
+            self.db_call("node_local:raft_storage_current_boundary", move |conn| {
+                let last = conn
+                    .query_row(queries::RAFT_LOG_LAST, [], |row| {
+                        Ok(RaftLogCoordinate::new(
+                            decode_index(row.get::<_, i64>(0)?)?,
+                            row.get::<_, i64>(1)? as u64,
+                            row.get::<_, i64>(2)? as u64,
+                        ))
+                    })
+                    .optional()?;
+                let purged = conn
+                    .query_row(queries::RAFT_META_GET, [LAST_PURGED], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .optional()?
+                    .map(|encoded| {
+                        serde_json::from_slice::<openraft::LogId<u64>>(&encoded)
+                            .map(|log_id| {
+                                RaftLogCoordinate::new(
+                                    log_id.index,
+                                    log_id.leader_id.term,
+                                    log_id.leader_id.node_id,
+                                )
+                            })
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Blob,
+                                    Box::new(error),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                let snapshot_anchor = conn
+                    .query_row(queries::RAFT_META_GET, [LAST_APPLIED], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .optional()?
+                    .map(|encoded| {
+                        serde_json::from_slice::<Option<openraft::LogId<u64>>>(&encoded)
+                            .map(|log_id| {
+                                log_id.map(|log_id| {
+                                    RaftLogCoordinate::new(
+                                        log_id.index,
+                                        log_id.leader_id.term,
+                                        log_id.leader_id.node_id,
+                                    )
+                                })
+                            })
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Blob,
+                                    Box::new(error),
+                                )
+                            })
+                    })
+                    .transpose()?
+                    .flatten();
+                Ok([last, purged, snapshot_anchor]
+                    .into_iter()
+                    .flatten()
+                    .max_by_key(|coordinate| coordinate.index()))
+            })
+            .await
+            .map_err(|error| map_db_error("load_storage_current_boundary", error))
+        })
+    }
+
+    fn reset_orphaned_learner_log(&self) -> RaftDurabilityFuture<'_, bool> {
+        Box::pin(async move {
+            let replacement_incarnation = uuid::Uuid::new_v4().to_string().into_bytes();
+            self.db_call("node_local:raft_learner_orphan_reset", move |conn| {
+                let tx = conn.transaction()?;
+                let first_index = tx
+                    .query_row(queries::RAFT_LOG_FIRST_INDEX, [], |row| {
+                        decode_index(row.get::<_, i64>(0)?)
+                    })
+                    .optional()?;
+                let has_last_purged = tx
+                    .query_row(queries::RAFT_META_GET, [LAST_PURGED], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                let has_last_applied = tx
+                    .query_row(queries::RAFT_META_GET, [LAST_APPLIED], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                let orphaned = first_index.is_some_and(|index| index > 0)
+                    && !has_last_purged
+                    && !has_last_applied;
+                if orphaned {
+                    tx.execute("DELETE FROM raft_log_entries", [])?;
+                    tx.execute(queries::RAFT_META_DELETE_RECOVERABLE_STATE, [])?;
+                    tx.execute(
+                        queries::RAFT_META_SET,
+                        rusqlite::params![STORAGE_INCARNATION, replacement_incarnation],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(orphaned)
+            })
+            .await
+            .map_err(|error| map_db_error("reset_orphaned_learner_log", error))
+        })
     }
 }
 
@@ -221,13 +447,30 @@ impl RaftAppliedStateDurability for SqliteNodeLocalDb {
     fn store_applied_state(&self, state: RaftAppliedStateWrite) -> RaftDurabilityFuture<'_, ()> {
         Box::pin(async move {
             let (last, membership) = state.into_parts();
+            let last = last.map(OpaqueRaftBytes::into_vec);
+            let last_coordinate = last
+                .as_deref()
+                .map(serde_json::from_slice::<Option<openraft::LogId<u64>>>)
+                .transpose()
+                .map_err(|error| persistence("decode applied LogId", error))?
+                .flatten()
+                .map(|log_id| {
+                    RaftLogCoordinate::new(
+                        log_id.index,
+                        log_id.leader_id.term,
+                        log_id.leader_id.node_id,
+                    )
+                });
             self.db_call("node_local:raft_applied_state_store", move |conn| {
                 let tx = conn.transaction()?;
                 if let Some(value) = last {
                     tx.execute(
                         queries::RAFT_META_SET,
-                        rusqlite::params![LAST_APPLIED, value.into_vec()],
+                        rusqlite::params![LAST_APPLIED, value],
                     )?;
+                }
+                if let Some(coordinate) = last_coordinate {
+                    advance_storage_log_attestation(&tx, coordinate)?;
                 }
                 if let Some(value) = membership {
                     tx.execute(
@@ -348,6 +591,139 @@ mod tests {
         let (last, stored_purged) = db.load_log_state().await.unwrap().into_parts();
         assert_eq!(last.unwrap().index(), 3);
         assert_eq!(stored_purged.unwrap(), purged);
+    }
+
+    #[tokio::test]
+    async fn learner_recovery_resets_orphaned_suffix_and_committed_but_preserves_vote() {
+        let db = fresh().await;
+        let old_incarnation = db.load_or_create_storage_incarnation().await.unwrap();
+        db.append_log_entries(
+            RaftLogBatch::new(vec![
+                EncodedRaftLogEntry::new(
+                    RaftLogCoordinate::new(124_022, 1, 7),
+                    OpaqueRaftBytes::new(b"first-orphan".to_vec()),
+                ),
+                EncodedRaftLogEntry::new(
+                    RaftLogCoordinate::new(128_367, 1, 7),
+                    OpaqueRaftBytes::new(b"last-orphan".to_vec()),
+                ),
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let vote = OpaqueRaftBytes::new(b"durable-vote".to_vec());
+        db.store_vote(vote.clone()).await.unwrap();
+        db.store_committed(OpaqueRaftBytes::new(b"orphan-commit".to_vec()))
+            .await
+            .unwrap();
+
+        assert!(
+            db.reset_orphaned_learner_log().await.unwrap(),
+            "an unanchored non-zero suffix cannot be replayed and must be reacquired"
+        );
+
+        let (last, purged) = db.load_log_state().await.unwrap().into_parts();
+        assert_eq!(last, None);
+        assert_eq!(purged, None);
+        assert_eq!(db.load_committed().await.unwrap(), None);
+        assert_eq!(db.load_vote().await.unwrap(), Some(vote));
+        assert_ne!(
+            db.load_or_create_storage_incarnation().await.unwrap(),
+            old_incarnation,
+            "discarding an orphaned suffix must create a new admission identity"
+        );
+        assert_eq!(db.load_storage_log_attestation().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn raft_storage_incarnation_is_stable_for_the_lifetime_of_node_db() {
+        let db = fresh().await;
+
+        let first = db.load_or_create_storage_incarnation().await.unwrap();
+        let reopened = db.load_or_create_storage_incarnation().await.unwrap();
+
+        assert_eq!(reopened, first);
+        assert_eq!(
+            uuid::Uuid::parse_str(&first).unwrap().get_version(),
+            Some(uuid::Version::Random)
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_storage_log_high_watermark_never_moves_back_on_truncate() {
+        let db = fresh().await;
+        db.append_log_entries(
+            RaftLogBatch::new(vec![EncodedRaftLogEntry::new(
+                RaftLogCoordinate::new(41, 1, 7),
+                OpaqueRaftBytes::new(b"entry".to_vec()),
+            )])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.truncate_log_from(41).await.unwrap();
+
+        assert_eq!(
+            db.load_storage_log_attestation()
+                .await
+                .unwrap()
+                .unwrap()
+                .index(),
+            41
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_applied_log_id_advances_highwater_and_current_boundary() {
+        let db = fresh().await;
+        let snapshot_log = openraft::LogId::new(openraft::LeaderId::new(7, 11), 93);
+        db.store_applied_state(RaftAppliedStateWrite::new(
+            Some(OpaqueRaftBytes::new(
+                serde_json::to_vec(&Some(snapshot_log)).unwrap(),
+            )),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let high = db.load_storage_log_attestation().await.unwrap().unwrap();
+        let boundary = db.load_storage_current_boundary().await.unwrap().unwrap();
+        assert_eq!(
+            (high.index(), high.term(), high.leader_node_id()),
+            (93, 7, 11)
+        );
+        assert_eq!(boundary, high);
+    }
+
+    #[tokio::test]
+    async fn learner_recovery_never_discards_snapshot_anchored_state() {
+        let db = fresh().await;
+        db.append_log_entries(
+            RaftLogBatch::new(vec![EncodedRaftLogEntry::new(
+                RaftLogCoordinate::new(124_022, 1, 7),
+                OpaqueRaftBytes::new(b"anchored".to_vec()),
+            )])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.store_applied_state(RaftAppliedStateWrite::new(
+            Some(OpaqueRaftBytes::new(
+                serde_json::to_vec(&Some(openraft::LogId::new(
+                    openraft::LeaderId::new(1, 7),
+                    124_022,
+                )))
+                .unwrap(),
+            )),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        assert!(!db.reset_orphaned_learner_log().await.unwrap());
+        let (last, _) = db.load_log_state().await.unwrap().into_parts();
+        assert_eq!(last.unwrap().index(), 124_022);
     }
 
     #[tokio::test]

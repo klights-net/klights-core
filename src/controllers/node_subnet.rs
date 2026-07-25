@@ -353,10 +353,7 @@ pub async fn run_focused_peer_watch(
             }
         };
         let mut stream = match watch.watch_resources(request).await {
-            Ok(stream) => {
-                reconnect_attempt = 0;
-                stream
-            }
+            Ok(stream) => stream,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to open focused Node watch");
                 if !wait_for_peer_watch_reconnect(
@@ -448,6 +445,10 @@ pub async fn run_focused_peer_watch(
                             tracing::warn!(error = %error, "focused Node watch cursor rejected event");
                             break;
                         }
+                        // Opening a transport is not progress: only a safely
+                        // applied event proves the watch is healthy enough to
+                        // reset exponential reconnect backoff.
+                        reconnect_attempt = 0;
                     }
                     Some(Err(error)) => {
                         tracing::warn!(error = %error, "focused Node watch stream failed");
@@ -1360,9 +1361,104 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                Ok(Box::pin(futures::stream::iter(events)) as klights_leader_api::WatchStream)
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::iter(events),
+                ))
             })
         }
+    }
+
+    #[derive(Default)]
+    struct ImmediatelyFailingWatch {
+        opens: std::sync::atomic::AtomicUsize,
+        opened: tokio::sync::Notify,
+    }
+
+    impl ImmediatelyFailingWatch {
+        async fn wait_for_opens(&self, expected: usize) {
+            loop {
+                let opened = self.opened.notified();
+                if self.opens.load(std::sync::atomic::Ordering::SeqCst) >= expected {
+                    return;
+                }
+                opened.await;
+            }
+        }
+    }
+
+    impl klights_leader_api::LeaderWatch for ImmediatelyFailingWatch {
+        fn watch_resources(
+            &self,
+            _request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.opened.notify_waiters();
+            Box::pin(async {
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::once(async {
+                        Err(klights_leader_api::LeaderWatchError::ReplayExpired {
+                            accepted_resource_version: 0,
+                        })
+                    }),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn focused_watch_backs_off_after_stream_fails_without_progress() {
+        let watch = Arc::new(ImmediatelyFailingWatch::default());
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let cancel = CancellationToken::new();
+        let handle = {
+            let ports = Arc::new(NoopLeaderPorts);
+            let watch = watch.clone();
+            let router = Arc::new(MockNetworkProvider::new());
+            let task_supervisor = supervisor.clone();
+            let task_cancel = cancel.clone();
+            supervisor
+                .spawn_async(
+                    klights_supervisor::TaskCategory::Network,
+                    "focused_watch_stream_failure_backoff_test",
+                    async move {
+                        super::run_focused_peer_watch(
+                            ports.clone(),
+                            ports.clone(),
+                            watch,
+                            None,
+                            "node-a".to_string(),
+                            router,
+                            task_supervisor,
+                            None,
+                            ports,
+                            task_cancel,
+                        )
+                        .await;
+                    },
+                )
+                .await
+                .unwrap()
+        };
+
+        watch.wait_for_opens(1).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        watch.wait_for_opens(2).await;
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            watch.opens.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second consecutive failure must wait the full one-second backoff"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        watch.wait_for_opens(3).await;
+        cancel.cancel();
+        handle.join().await.unwrap();
+        let report = supervisor.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.remaining_active, 0);
+        assert_eq!(watch.opens.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     struct FailProjectionOnce {

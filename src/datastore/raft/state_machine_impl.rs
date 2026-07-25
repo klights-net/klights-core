@@ -110,7 +110,7 @@ impl SqliteRaftStateMachine {
     ) -> Result<
         (
             Option<LogId<NodeId>>,
-            StoredMembership<NodeId, openraft::BasicNode>,
+            StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
         ),
         StorageError<NodeId>,
     > {
@@ -140,7 +140,9 @@ impl SqliteRaftStateMachine {
     async fn write_applied_state(
         &self,
         id: Option<LogId<NodeId>>,
-        membership: Option<&StoredMembership<NodeId, openraft::BasicNode>>,
+        membership: Option<
+            &StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+        >,
     ) -> Result<(), StorageError<NodeId>> {
         let last = id
             .map(|value| serde_json::to_vec(&Some(value)))
@@ -174,7 +176,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
     ) -> Result<
         (
             Option<LogId<NodeId>>,
-            StoredMembership<NodeId, openraft::BasicNode>,
+            StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
         ),
         StorageError<NodeId>,
     > {
@@ -290,7 +292,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
+        meta: &SnapshotMeta<NodeId, crate::datastore::raft::types::RaftMemberNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
@@ -1701,7 +1703,8 @@ mod tests {
     async fn apply_membership_entry_stores_membership() {
         let mut sm = fresh_sm().await;
         let voters: BTreeSet<NodeId> = [10u64, 20, 30].into_iter().collect();
-        let m: Membership<NodeId, openraft::BasicNode> = Membership::new(vec![voters], None);
+        let m: Membership<NodeId, crate::datastore::raft::types::RaftMemberNode> =
+            Membership::new(vec![voters], None);
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(LeaderId::new(2, 10), 7),
             payload: EntryPayload::Membership(m),
