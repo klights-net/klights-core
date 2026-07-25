@@ -904,6 +904,11 @@ impl PodApiService {
         normalize_resource_for_storage("v1", "Pod", &mut body);
         preserve_status_from_current(&current.data, &mut body);
         enforce_pod_security_admission(self.db.as_ref(), ns, &body).await?;
+        let requested_resource_version = body
+            .pointer("/metadata/resourceVersion")
+            .and_then(Value::as_str)
+            .and_then(|resource_version| resource_version.parse::<i64>().ok())
+            .unwrap_or(current.resource_version);
 
         if dry_run {
             return Ok(PodApiUpdateOutcome::DryRun(body));
@@ -911,7 +916,7 @@ impl PodApiService {
 
         let resource = self
             .store
-            .update(ns, name, body, current.resource_version)
+            .update(ns, name, body, requested_resource_version)
             .await
             .map_err(|e| -> AppError { e.into() })?;
         if let Err(err) = self

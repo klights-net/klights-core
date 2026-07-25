@@ -4142,6 +4142,98 @@ async fn test_put_pod_status_with_stale_resource_version_returns_409() {
     );
 }
 
+/// A normal Pod PUT must use the resourceVersion supplied by the client, not
+/// the fresher resourceVersion observed by the handler. Otherwise a scheduler
+/// bind committed between GET and PUT can be silently overwritten, briefly
+/// removing `spec.nodeName` and causing the kubelet to finalize a live Pod.
+#[tokio::test]
+async fn test_put_pod_with_stale_resource_version_preserves_concurrent_scheduler_bind() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        serde_json::json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}),
+    )
+    .await
+    .unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "pod-put-bind-race",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "pod-put-bind-race",
+                    "namespace": "default",
+                    "uid": "uid-pod-put-bind-race",
+                    "labels": {"name": "matching"}
+                },
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+    let stale_rv = created.resource_version;
+    let mut stale_client_body = (*created.data).clone();
+    stale_client_body["metadata"]["resourceVersion"] = stale_rv.to_string().into();
+    stale_client_body["metadata"]["labels"]["name"] = "not-matching".into();
+
+    let mut bound_body = (*created.data).clone();
+    bound_body["metadata"]["resourceVersion"] = stale_rv.to_string().into();
+    bound_body["spec"]["nodeName"] = "worker-a".into();
+    let bound = db
+        .update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "pod-put-bind-race",
+            bound_body,
+            stale_rv,
+        )
+        .await
+        .unwrap();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/namespaces/default/pods/pod-put-bind-race")
+        .header("content-type", "application/json")
+        .body(Body::from(stale_client_body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "stale Pod PUT must conflict with a concurrent scheduler bind"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "pod-put-bind-race")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.resource_version, bound.resource_version);
+    assert_eq!(
+        live.data
+            .pointer("/spec/nodeName")
+            .and_then(serde_json::Value::as_str),
+        Some("worker-a"),
+        "the stale client body must not erase the scheduler-owned nodeName"
+    );
+}
+
 // ========================
 // API chunking list tests
 // ========================
