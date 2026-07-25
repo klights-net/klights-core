@@ -99,23 +99,17 @@ impl AuthorizerChain {
     /// Create the full production chain with RBAC.
     ///
     /// Order: system:masters bypass → bootstrap CSR → RBAC → Node authorizer → deny.
-    pub fn default_chain_with_rbac(
-        db: crate::datastore::backend::DatastoreHandle,
-        pod_repository: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+    pub fn chain_with_policy_stores(
+        rbac_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
+        node_store: std::sync::Arc<dyn crate::auth::node_policy_store::NodePolicyStore>,
     ) -> Self {
         use crate::auth::bootstrap_authorizer::BootstrapCsrAuthorizer;
-        use crate::auth::node_policy_store::DatastoreNodePolicyStore;
         use crate::auth::rbac_authorizer::RbacAuthorizer;
-        use crate::auth::rbac_policy_store::DatastoreRbacPolicyStore;
         Self::new(vec![
             Box::new(SystemMastersAuthorizer),
             Box::new(BootstrapCsrAuthorizer),
-            Box::new(RbacAuthorizer::new(std::sync::Arc::new(
-                DatastoreRbacPolicyStore::new(db),
-            ))),
-            Box::new(NodeAuthorizer::new(Some(std::sync::Arc::new(
-                DatastoreNodePolicyStore::new(pod_repository),
-            )))),
+            Box::new(RbacAuthorizer::new(rbac_store)),
+            Box::new(NodeAuthorizer::new(Some(node_store))),
             Box::new(DenyAuthorizer),
         ])
     }

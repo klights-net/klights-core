@@ -9,7 +9,7 @@
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::webhook_auth::*;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ─── Mock implementation ───────────────────────────────────────────────────
 
@@ -87,6 +87,29 @@ fn test_user(name: &str) -> TokenReviewUser {
     }
 }
 
+struct FixedWebhookClock {
+    now: std::sync::Mutex<Instant>,
+}
+
+impl FixedWebhookClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            now: std::sync::Mutex::new(now),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        let mut now = self.now.lock().unwrap();
+        *now += duration;
+    }
+}
+
+impl WebhookClock for FixedWebhookClock {
+    fn now(&self) -> Instant {
+        *self.now.lock().unwrap()
+    }
+}
+
 // ─── Cache tests ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -141,6 +164,29 @@ async fn test_cache_expired_rechecks_webhook() {
     assert_eq!(reviewer.call_count(), 1);
 
     assert!(auth.authenticate("token").await.is_some());
+    assert_eq!(reviewer.call_count(), 2);
+}
+
+#[tokio::test]
+async fn injected_clock_controls_cache_expiry_without_a_timer() {
+    let reviewer = reviewer_arc(Ok(Some(auth_status(test_user("alice")))));
+    let clock = Arc::new(FixedWebhookClock::new(Instant::now()));
+    let auth = WebhookAuth::new_with_clock_and_cache_capacity(
+        reviewer.clone() as Arc<dyn WebhookTokenReviewer>,
+        clock.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+        vec!["https://kubernetes.default.svc.cluster.local".to_string()],
+        8,
+    );
+
+    auth.authenticate("token").await;
+    clock.advance(Duration::from_secs(59));
+    auth.authenticate("token").await;
+    assert_eq!(reviewer.call_count(), 1);
+
+    clock.advance(Duration::from_secs(2));
+    auth.authenticate("token").await;
     assert_eq!(reviewer.call_count(), 2);
 }
 
@@ -554,27 +600,6 @@ fn test_build_webhook_auth_errors_for_partial_client_identity() {
         msg.contains("certificate and key"),
         "unexpected error: {msg}"
     );
-}
-
-#[tokio::test]
-async fn test_build_webhook_auth_from_config_reads_ca_bundle_path() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let ca_path = temp_dir.path().join("webhook-ca.pem");
-    let cert =
-        rcgen::generate_simple_self_signed(vec!["auth-webhook.example.com".to_string()]).unwrap();
-    std::fs::write(&ca_path, cert.cert.pem()).unwrap();
-
-    let mut config = crate::KlightsConfig::from_env().unwrap();
-    config.webhook_auth_url = Some("https://auth-webhook.example.com/token".to_string());
-    config.webhook_auth_ca_bundle = Some(ca_path.to_string_lossy().into_owned());
-
-    let supervisor =
-        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
-    let auth = build_webhook_auth_from_config(&config, &supervisor)
-        .await
-        .unwrap();
-
-    assert!(auth.is_some());
 }
 
 #[test]

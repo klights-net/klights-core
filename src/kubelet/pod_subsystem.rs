@@ -11,8 +11,8 @@ use crate::kubelet::ProbeManager;
 use crate::kubelet::pod_cluster_runtime::RuntimeNodeRole;
 use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
 use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
-use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::kubelet::pod_lifecycle_router::executor::{PodLifecycleExecutor, PodWorkExecutor};
+use crate::kubelet::pod_lifecycle_router::{PodLifecycleRouteMode, PodLifecycleRouter};
 use crate::kubelet::pod_lifecycle_service::PodLifecycleService;
 use crate::kubelet::pod_repository::PodRepository;
 use crate::kubelet::pod_repository::background::PodRepositoryBackground;
@@ -33,6 +33,7 @@ pub struct PodSubsystemConfig {
     pub node_name: String,
     pub service_cidr: String,
     pub lifecycle_concurrency: PodLifecycleConcurrencyConfig,
+    pub lifecycle_route_mode: PodLifecycleRouteMode,
     // Task 19: runtime dependencies for RealPodRuntimeService construction (Task 24).
     pub cri: Option<crate::kubelet::cri::SharedCriClient>,
     pub containerd_ns: String,
@@ -103,6 +104,7 @@ impl PodSubsystem {
         let cluster_api = config.cluster_api.clone();
         let runtime_node_role = config.runtime_node_role.clone();
         let outbox = config.outbox.clone();
+        let lifecycle_concurrency = config.lifecycle_concurrency.clone();
         let parts = config.repository_parts;
         let (repository, repository_background, deletion_finalizer) =
             parts.into_pod_subsystem_parts();
@@ -110,14 +112,21 @@ impl PodSubsystem {
         let registry = Arc::new(
             PodLifecycleRegistry::new(
                 config.supervisor.clone(),
-                config.lifecycle_concurrency,
+                lifecycle_concurrency.clone(),
                 Arc::new(std::sync::Mutex::new(Arc::new(
                     crate::kubelet::pod_lifecycle_router::executor::NoopExecutor,
                 ))),
             )
             .with_runtime_observation_store(outbox.clone()),
         );
-        let lifecycle_router = Arc::new(PodLifecycleRouter::new_actor(registry));
+        let lifecycle_router = match config.lifecycle_route_mode {
+            PodLifecycleRouteMode::Actor => Arc::new(PodLifecycleRouter::new_actor(registry)),
+            PodLifecycleRouteMode::Multiplex => Arc::new(PodLifecycleRouter::new(
+                supervisor.clone(),
+                lifecycle_concurrency,
+                PodLifecycleRouteMode::Multiplex,
+            )),
+        };
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
         let repository = Arc::new(repository);
         let probe_cri_runtime = config.cri.clone().map(|cri| {
@@ -372,6 +381,7 @@ mod tests {
             node_name: "node-1".to_string(),
             service_cidr: "10.43.128.0/17".to_string(),
             lifecycle_concurrency: PodLifecycleConcurrencyConfig::production_default(),
+            lifecycle_route_mode: PodLifecycleRouteMode::Actor,
             cri: None,
             containerd_ns: "klights".to_string(),
             lifecycle_tx,

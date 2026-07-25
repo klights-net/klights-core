@@ -347,7 +347,6 @@ first public stable release.
 | `KLIGHTS_GC_INTERVAL_SECS` | `30` | Leader-scoped GC scheduler interval |
 | `KLIGHTS_MAX_WATCH_EVENTS` | `100000` | Retained watch event rows before GC |
 | `KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS` | `0` | Extra wait after confirmed node silence before pod cleanup |
-| `KLIGHTS_POD_LIFECYCLE_MODE` | `actor` | Pod lifecycle router mode: `actor` or `multiplex` |
 | `KLIGHTS_POD_ACTOR_IDLE_GRACE_SECS` | `30` | Idle grace before per-pod lifecycle actor shutdown |
 
 ### TaskSupervisor Limits

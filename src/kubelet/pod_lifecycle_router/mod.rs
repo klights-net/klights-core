@@ -1,9 +1,4 @@
-//! Pod lifecycle router — facade that selects transport backend by environment.
-//!
-//! Reads `KLIGHTS_POD_LIFECYCLE_MODE` once at construction:
-//! - unset or "actor" → actor backend (default)
-//! - "multiplex" → multiplex backend
-//! - invalid → actor backend with a warning
+//! Pod lifecycle router — facade over the root-selected transport backend.
 
 pub mod actor;
 pub mod executor;
@@ -148,7 +143,7 @@ pub trait PodLifecycleRouteBackend: Send + Sync {
     }
 }
 
-/// Pod lifecycle router: selects transport backend from environment at construction.
+/// Pod lifecycle router with a transport backend selected by root composition.
 pub struct PodLifecycleRouter {
     backend: Arc<dyn PodLifecycleRouteBackend>,
 }
@@ -194,41 +189,12 @@ impl PodLifecycleRouter {
         Self { backend }
     }
 
-    /// Create a router from env-selected mode (for bootstrap).
-    pub fn from_env(
+    /// Create a router from an explicitly injected mode.
+    pub fn new(
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
+        mode: PodLifecycleRouteMode,
     ) -> Self {
-        Self::from_env_impl(supervisor, config, |key| std::env::var(key))
-    }
-
-    /// Construct with injectable env reader (for testing).
-    fn from_env_impl(
-        supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        config: PodLifecycleConcurrencyConfig,
-        get_env: impl Fn(&str) -> Result<String, std::env::VarError>,
-    ) -> Self {
-        let mode = match get_env("KLIGHTS_POD_LIFECYCLE_MODE") {
-            Ok(val) => match val.to_lowercase().as_str() {
-                "actor" => PodLifecycleRouteMode::Actor,
-                "multiplex" => PodLifecycleRouteMode::Multiplex,
-                other => {
-                    tracing::warn!(
-                        mode = %other,
-                        "unknown KLIGHTS_POD_LIFECYCLE_MODE value; falling back to actor mode"
-                    );
-                    PodLifecycleRouteMode::Actor
-                }
-            },
-            Err(std::env::VarError::NotPresent) => PodLifecycleRouteMode::Actor,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                tracing::warn!(
-                    "KLIGHTS_POD_LIFECYCLE_MODE is not valid Unicode; falling back to actor mode"
-                );
-                PodLifecycleRouteMode::Actor
-            }
-        };
-
         let backend: Arc<dyn PodLifecycleRouteBackend> = match mode {
             PodLifecycleRouteMode::Actor => {
                 let executor_holder = Arc::new(std::sync::Mutex::new(
@@ -249,6 +215,14 @@ impl PodLifecycleRouter {
         };
 
         Self { backend }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_env(
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        config: PodLifecycleConcurrencyConfig,
+    ) -> Self {
+        Self::new(supervisor, config, PodLifecycleRouteMode::Actor)
     }
 
     /// Route a lifecycle message to the selected backend.
@@ -298,7 +272,6 @@ mod tests {
     use super::*;
     use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-    use std::collections::HashMap;
 
     fn test_supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
@@ -326,82 +299,24 @@ mod tests {
         ))
     }
 
-    fn test_env<'a>(
-        vars: &'a [(&'a str, &'a str)],
-    ) -> impl Fn(&str) -> Result<String, std::env::VarError> + 'a {
-        let map: HashMap<String, String> = vars
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |key: &str| map.get(key).cloned().ok_or(std::env::VarError::NotPresent)
-    }
-
-    // ── env parsing ──
-
     #[test]
-    fn env_unset_defaults_to_actor() {
-        let env = test_env(&[]);
-        let router = PodLifecycleRouter::from_env_impl(
+    fn injected_actor_mode_selects_actor() {
+        let router = PodLifecycleRouter::new(
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
-            env,
+            PodLifecycleRouteMode::Actor,
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
     }
 
     #[test]
-    fn env_actor_selects_actor() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "actor")]);
-        let router = PodLifecycleRouter::from_env_impl(
+    fn injected_multiplex_mode_selects_multiplex() {
+        let router = PodLifecycleRouter::new(
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
-            env,
-        );
-        assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
-    }
-
-    #[test]
-    fn env_actor_case_insensitive() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "ACTOR")]);
-        let router = PodLifecycleRouter::from_env_impl(
-            test_supervisor(),
-            PodLifecycleConcurrencyConfig::production_default(),
-            env,
-        );
-        assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
-    }
-
-    #[test]
-    fn env_multiplex_selects_multiplex() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "multiplex")]);
-        let router = PodLifecycleRouter::from_env_impl(
-            test_supervisor(),
-            PodLifecycleConcurrencyConfig::production_default(),
-            env,
+            PodLifecycleRouteMode::Multiplex,
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Multiplex);
-    }
-
-    #[test]
-    fn env_multiplex_case_insensitive() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "MULTIPLEX")]);
-        let router = PodLifecycleRouter::from_env_impl(
-            test_supervisor(),
-            PodLifecycleConcurrencyConfig::production_default(),
-            env,
-        );
-        assert_eq!(router.mode(), PodLifecycleRouteMode::Multiplex);
-    }
-
-    #[test]
-    fn env_invalid_falls_back_to_actor() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "foobar")]);
-        let router = PodLifecycleRouter::from_env_impl(
-            test_supervisor(),
-            PodLifecycleConcurrencyConfig::production_default(),
-            env,
-        );
-        assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
     }
 
     // ── actor backend integration ──
@@ -493,11 +408,10 @@ mod tests {
 
     #[tokio::test]
     async fn multiplex_router_returns_not_available_on_route() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "multiplex")]);
-        let router = PodLifecycleRouter::from_env_impl(
+        let router = PodLifecycleRouter::new(
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
-            env,
+            PodLifecycleRouteMode::Multiplex,
         );
 
         let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -508,11 +422,10 @@ mod tests {
 
     #[tokio::test]
     async fn multiplex_router_diagnostics_returns_empty() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "multiplex")]);
-        let router = PodLifecycleRouter::from_env_impl(
+        let router = PodLifecycleRouter::new(
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
-            env,
+            PodLifecycleRouteMode::Multiplex,
         );
 
         let diag = router.diagnostics().await;
@@ -527,11 +440,10 @@ mod tests {
     /// zero active pods, and outputs `Multiplex` in mode + diagnostics.
     #[tokio::test]
     async fn multiplex_backend_contract_reports_notavailable_without_runtime_calls() {
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "multiplex")]);
-        let router = PodLifecycleRouter::from_env_impl(
+        let router = PodLifecycleRouter::new(
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
-            env,
+            PodLifecycleRouteMode::Multiplex,
         );
 
         // Mode selection works.
@@ -1199,11 +1111,10 @@ mod tests {
         assert_eq!(diag.mode, PodLifecycleRouteMode::Actor);
 
         // ── Multiplex backend: NotAvailable contract ──
-        let env = test_env(&[("KLIGHTS_POD_LIFECYCLE_MODE", "multiplex")]);
-        let mux_router = PodLifecycleRouter::from_env_impl(
+        let mux_router = PodLifecycleRouter::new(
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
-            env,
+            PodLifecycleRouteMode::Multiplex,
         );
 
         assert_eq!(mux_router.mode(), PodLifecycleRouteMode::Multiplex);

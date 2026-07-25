@@ -1,7 +1,7 @@
 use crate::bootstrap::{NodeMode, NodeRole};
 use crate::control_plane::client::LeaderApiClient;
 use crate::controllers::crd::CrdRegistry;
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
+use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_creation_state::PodStartRetryTracker;
 use std::sync::Arc;
 
@@ -107,16 +107,4 @@ pub struct AppState {
     /// single-node or tests), in which case the leader falls back to the
     /// header-asserted requestheader identity.
     pub cluster_ca_pem: Option<Arc<String>>,
-}
-
-impl AppState {
-    /// Borrow the datastore as a trait object for helpers that depend on the
-    /// abstraction boundary rather than the concrete type.
-    ///
-    /// Equivalent to `&self.db as &dyn DatastoreBackend`.  Provided so call
-    /// sites can be ported in-place as helper signatures migrate from
-    /// `&Datastore` to `&dyn DatastoreBackend`.
-    pub fn db_backend(&self) -> &dyn DatastoreBackend {
-        self.db.as_ref()
-    }
 }

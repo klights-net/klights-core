@@ -17,7 +17,7 @@ pub fn api_group_from_version(api_version: &str) -> &str {
 
 // Per-handler authorization helpers have been removed: authorization is now
 // enforced once, for every route, by the global authorize_request middleware
-// chokepoint (see src/auth/middleware.rs and src/auth/request_info.rs).
+// chokepoint (see src/api/auth_middleware.rs and src/auth/request_info.rs).
 
 /// Stamp CSR spec identity fields from the authenticated identity.
 ///

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::api::{AppError, AppState, build_admission_context, run_admission_for_request};
 
 // Authorization for all pod subresources is enforced by the global
-// `authorize_request` middleware chokepoint (see src/auth/middleware.rs);
+// `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs);
 // handlers no longer authorize individually.
 
 mod binding;

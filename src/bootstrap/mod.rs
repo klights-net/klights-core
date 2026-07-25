@@ -1,3 +1,5 @@
+pub(crate) mod auth_composition;
+pub(crate) mod auth_store_adapters;
 pub mod bootstrap_token;
 pub mod cluster_meta;
 pub mod config;

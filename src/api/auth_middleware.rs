@@ -1,5 +1,6 @@
-//! Request authentication for the klights API.
+//! Axum adaptation for authentication and authorization policies.
 
+use crate::auth::TlsClientCertificate;
 use crate::auth::identity::AuthenticatedIdentity;
 use axum::extract::Request;
 use axum::http::header::AUTHORIZATION;
@@ -8,8 +9,15 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TlsClientCertificate(pub Vec<u8>);
+impl From<crate::auth::AuthError> for crate::api::AppError {
+    fn from(error: crate::auth::AuthError) -> Self {
+        match error {
+            crate::auth::AuthError::InvalidRequest(message) => Self::BadRequest(message),
+            crate::auth::AuthError::Unauthenticated(message) => Self::Unauthorized(message),
+            crate::auth::AuthError::Forbidden(message) => Self::Forbidden(message),
+        }
+    }
+}
 
 /// Header carrying the *end user's* actual client certificate (base64 DER),
 /// forwarded by a trusted follower API proxy to the leader so the leader can
@@ -99,15 +107,19 @@ pub async fn authenticate_request(
     } else {
         real_identity
     };
-    let effective_identity = match crate::auth::impersonation::effective_identity_from_headers(
+    let impersonation = match crate::api::impersonation_headers::parse(request.headers()) {
+        Ok(request) => request,
+        Err(err) => return crate::api::AppError::from(err).into_response(),
+    };
+    let effective_identity = match crate::auth::impersonation::effective_identity(
         state.authorizer.as_ref(),
         &authenticated_identity,
-        request.headers(),
+        impersonation,
     )
     .await
     {
         Ok(id) => id,
-        Err(err) => return err.into_response(),
+        Err(err) => return crate::api::AppError::from(err).into_response(),
     };
     inject_remote_identity_headers(&mut request, &effective_identity);
     request.extensions_mut().insert(effective_identity);
@@ -135,7 +147,7 @@ pub async fn authorize_request(
     use crate::auth::request_info::{ResolvedAuthz, resolve_request_info};
 
     let ResolvedAuthz::Authorize(authz) = resolve_request_info(
-        request.method(),
+        request.method().as_str(),
         request.uri().path(),
         request.uri().query(),
     );
@@ -228,7 +240,7 @@ async fn authenticate_bearer_token(
                     )
                     .await
                     {
-                        return result;
+                        return result.map_err(Into::into);
                     }
                     Err(crate::api::AppError::Unauthorized(format!(
                         "invalid bootstrap token: {bootstrap_err}"
@@ -242,10 +254,14 @@ async fn authenticate_bearer_token(
                 Ok(identity) => Ok(identity),
                 Err(_sa_err) => {
                     // SA failed — try OIDC if configured
-                    if let Some(result) =
-                        crate::auth::oidc::try_oidc_auth(&state.oidc_authenticator, token).await
+                    if let Some(result) = crate::auth::oidc::try_oidc_auth(
+                        &state.oidc_authenticator,
+                        token,
+                        &crate::auth::clock::SystemClock,
+                    )
+                    .await
                     {
-                        return result;
+                        return result.map_err(Into::into);
                     }
                     // OIDC not configured — try webhook if configured
                     if let Some(result) = crate::auth::webhook_auth::try_webhook_auth(
@@ -254,7 +270,7 @@ async fn authenticate_bearer_token(
                     )
                     .await
                     {
-                        return result;
+                        return result.map_err(Into::into);
                     }
                     // Neither OIDC nor webhook configured — return SA error
                     Err(_sa_err)
@@ -266,7 +282,7 @@ async fn authenticate_bearer_token(
                 crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
                     .await
             {
-                return result;
+                return result.map_err(Into::into);
             }
             Err(crate::api::AppError::Unauthorized(
                 "invalid bearer token".to_string(),
@@ -280,7 +296,7 @@ async fn validate_sa_token(
     token: &str,
 ) -> Result<AuthenticatedIdentity, crate::api::AppError> {
     let signing_key_pem = crate::auth::read_service_account_signing_key_supervised(
-        &state.config.containerd_namespace,
+        &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
         state.task_supervisor.as_ref(),
     )
     .await
@@ -589,6 +605,31 @@ mod tests {
     };
     use std::time::Duration;
 
+    #[test]
+    fn auth_error_categories_map_at_the_api_boundary() {
+        let cases = [
+            (
+                crate::auth::AuthError::invalid_request("invalid"),
+                "bad-request",
+            ),
+            (
+                crate::auth::AuthError::unauthenticated("unauthenticated"),
+                "unauthorized",
+            ),
+            (crate::auth::AuthError::forbidden("forbidden"), "forbidden"),
+        ];
+
+        for (error, expected) in cases {
+            let actual = match crate::api::AppError::from(error) {
+                crate::api::AppError::BadRequest(_) => "bad-request",
+                crate::api::AppError::Unauthorized(_) => "unauthorized",
+                crate::api::AppError::Forbidden(_) => "forbidden",
+                other => panic!("unexpected API error mapping: {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
     struct StaticWebhookReviewer {
         status: TokenReviewStatus,
     }
@@ -648,8 +689,8 @@ mod tests {
 
         // A real API-proxy client cert (CA-signed, CN under the proxy prefix,
         // no system:masters) is the only thing trusted to delegate.
-        let (proxy_pem, _) = crate::auth::cert::generate_api_proxy_cert(&ca_cert, &ca_key, "cp1")
-            .expect("api-proxy cert");
+        let (proxy_pem, _) =
+            crate::auth::generate_api_proxy_cert(&ca_cert, &ca_key, "cp1").expect("api-proxy cert");
         let proxy_der = TlsClientCertificate(pem_to_der(&proxy_pem));
         assert!(
             client_cert_is_trusted_proxy(Some(&proxy_der)),
@@ -673,7 +714,7 @@ mod tests {
 
     #[test]
     fn proxy_cannot_be_trusted_using_its_own_master_credential() {
-        use crate::auth::cert::api_proxy_common_name;
+        use crate::auth::api_proxy_common_name;
 
         // Defense in depth on the subject check itself: even a cert under the
         // api-proxy prefix that *also* carries system:masters in its own O must

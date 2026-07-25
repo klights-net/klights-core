@@ -174,18 +174,27 @@ async fn authenticate_non_serviceaccount_token_review(
                 Err(_) => {
                     crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
                         .await
+                        .map(|result| result.map_err(Into::into))
                 }
             }
         }
         3 => {
-            if let Some(result) =
-                crate::auth::oidc::try_oidc_auth(&state.oidc_authenticator, token).await
+            if let Some(result) = crate::auth::oidc::try_oidc_auth(
+                &state.oidc_authenticator,
+                token,
+                &crate::auth::clock::SystemClock,
+            )
+            .await
             {
-                return Some(result);
+                return Some(result.map_err(Into::into));
             }
-            crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token).await
+            crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
+                .await
+                .map(|result| result.map_err(Into::into))
         }
-        _ => crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token).await,
+        _ => crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
+            .await
+            .map(|result| result.map_err(Into::into)),
     }
 }
 
@@ -213,7 +222,7 @@ pub async fn create_token_review(
 
     if token.split('.').count() == 3
         && let Ok(signing_key_pem) = crate::auth::read_service_account_signing_key_supervised(
-            &state.config.containerd_namespace,
+            &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
             state.task_supervisor.as_ref(),
         )
         .await
@@ -226,7 +235,7 @@ pub async fn create_token_review(
         // Honor SA-UID revocation and bound pod/node invalidation, exactly like
         // the request auth path — otherwise TokenReview would report a token
         // from a deleted SA (or bound to a deleted pod) as authenticated.
-        if crate::auth::validate_sa_token_bindings(&state, &claims)
+        if crate::api::auth_middleware::validate_sa_token_bindings(&state, &claims)
             .await
             .is_err()
         {

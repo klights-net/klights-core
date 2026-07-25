@@ -180,7 +180,7 @@ async fn resolve_csr_via_rpc(
         let service_account_signing_key_pem = String::from_utf8(service_account_signing_key_bytes)
             .context("ServiceAccount signing key from CSR response is not UTF-8 PEM")?;
         crate::auth::persist_service_account_signing_key(
-            &cfg.config.containerd_namespace,
+            &crate::paths::service_account_signing_key_path(&cfg.config.containerd_namespace),
             &service_account_signing_key_pem,
             cfg.supervisor.as_ref(),
         )

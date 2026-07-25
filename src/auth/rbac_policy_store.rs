@@ -1,14 +1,13 @@
-//! RBAC policy store trait, in-memory mock, and datastore-backed adapter.
+//! RBAC policy store traits, policy resolution, and in-memory fakes.
 //!
-//! Production uses `DatastoreRbacPolicyStore`; tests use `InMemoryRbacPolicyStore`.
+//! Production injects an `RbacResourceReader`; tests use in-memory stores.
 
-use anyhow::Context;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::auth::rbac_rule_evaluator::{PolicyRule, Subject, SubjectKind};
-use crate::datastore::backend::DatastoreHandle;
 
 /// A resolved role binding: the subjects and the rules they grant.
 #[derive(Clone, Debug)]
@@ -138,25 +137,34 @@ impl RbacPolicyStore for InMemoryRbacPolicyStore {
     }
 }
 
-/// Datastore-backed RBAC policy store. Resolves ClusterRole/ClusterRoleBinding
-/// and Role/RoleBinding objects from the datastore on each authorization check.
-pub struct DatastoreRbacPolicyStore {
-    db: DatastoreHandle,
+/// Focused source of raw RBAC objects.
+#[async_trait]
+pub trait RbacResourceReader: Send + Sync {
+    async fn list_rbac_resources(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Value>, String>;
 }
 
-impl DatastoreRbacPolicyStore {
-    pub fn new(db: DatastoreHandle) -> Self {
-        Self { db }
+/// Resolves RBAC bindings from an injected resource reader.
+pub struct ResourceRbacPolicyStore {
+    resources: Arc<dyn RbacResourceReader>,
+}
+
+impl ResourceRbacPolicyStore {
+    pub fn new(resources: Arc<dyn RbacResourceReader>) -> Self {
+        Self { resources }
     }
 }
 
 #[async_trait]
-impl RbacPolicyStore for DatastoreRbacPolicyStore {
+impl RbacPolicyStore for ResourceRbacPolicyStore {
     async fn list_bindings_for_namespace(&self, namespace: Option<&str>) -> Vec<ResolvedBinding> {
         let mut bindings: Vec<ResolvedBinding> = Vec::new();
 
         // Load all ClusterRoles (needed for ClusterRoleBinding resolution)
-        let cluster_roles = match load_cluster_roles(&*self.db).await {
+        let cluster_roles = match load_cluster_roles(self.resources.as_ref()).await {
             Ok(roles) => roles,
             Err(err) => {
                 tracing::warn!("failed to load ClusterRoles for RBAC: {err:#}");
@@ -165,7 +173,11 @@ impl RbacPolicyStore for DatastoreRbacPolicyStore {
         };
 
         // Load all ClusterRoleBindings → resolve to ResolvedBindings
-        if let Ok(crb_list) = list_cluster_resources(&*self.db, "ClusterRoleBinding").await {
+        if let Ok(crb_list) = self
+            .resources
+            .list_rbac_resources("ClusterRoleBinding", None)
+            .await
+        {
             for crb in &crb_list {
                 if let Some(binding) = resolve_cluster_role_binding(crb, &cluster_roles) {
                     bindings.push(binding);
@@ -175,7 +187,7 @@ impl RbacPolicyStore for DatastoreRbacPolicyStore {
 
         // Load Roles for this namespace
         if let Some(ns) = namespace {
-            let roles = match load_namespaced_roles(&*self.db, ns).await {
+            let roles = match load_namespaced_roles(self.resources.as_ref(), ns).await {
                 Ok(r) => r,
                 Err(err) => {
                     tracing::warn!("failed to load Roles for namespace {ns}: {err:#}");
@@ -184,7 +196,11 @@ impl RbacPolicyStore for DatastoreRbacPolicyStore {
             };
 
             // Load RoleBindings for this namespace → resolve
-            if let Ok(rb_list) = list_namespaced_resources(&*self.db, ns, "RoleBinding").await {
+            if let Ok(rb_list) = self
+                .resources
+                .list_rbac_resources("RoleBinding", Some(ns))
+                .await
+            {
                 for rb in &rb_list {
                     if let Some(binding) = resolve_role_binding(rb, &roles, &cluster_roles, ns) {
                         bindings.push(binding);
@@ -196,10 +212,6 @@ impl RbacPolicyStore for DatastoreRbacPolicyStore {
         bindings
     }
 }
-
-// --- Datastore helpers ---
-
-const RBAC_API_VERSION: &str = "rbac.authorization.k8s.io/v1";
 
 #[derive(Deserialize)]
 struct RoleRef {
@@ -272,45 +284,6 @@ fn parse_rules(rules: &[RuleObject]) -> Vec<PolicyRule> {
         .collect()
 }
 
-async fn list_cluster_resources(
-    db: &dyn crate::datastore::backend::DatastoreBackend,
-    kind: &str,
-) -> anyhow::Result<Vec<Value>> {
-    use crate::datastore::types::ListPageRequest;
-    let list = db
-        .list_resources_page(
-            RBAC_API_VERSION,
-            kind,
-            None,
-            None,
-            None,
-            ListPageRequest::unbounded(),
-        )
-        .await
-        .context("failed to list cluster RBAC resources")?;
-    Ok(list.items.into_iter().map(|r| (*r.data).clone()).collect())
-}
-
-async fn list_namespaced_resources(
-    db: &dyn crate::datastore::backend::DatastoreBackend,
-    namespace: &str,
-    kind: &str,
-) -> anyhow::Result<Vec<Value>> {
-    use crate::datastore::types::ListPageRequest;
-    let list = db
-        .list_resources_page(
-            RBAC_API_VERSION,
-            kind,
-            Some(namespace),
-            None,
-            None,
-            ListPageRequest::unbounded(),
-        )
-        .await
-        .context("failed to list namespaced RBAC resources")?;
-    Ok(list.items.into_iter().map(|r| (*r.data).clone()).collect())
-}
-
 fn resolve_cluster_role_binding(
     crb: &Value,
     cluster_roles: &std::collections::HashMap<String, Vec<PolicyRule>>,
@@ -371,9 +344,9 @@ fn default_service_account_subjects(subjects: &mut [Subject], namespace: &str) {
 }
 
 async fn load_cluster_roles(
-    db: &dyn crate::datastore::backend::DatastoreBackend,
-) -> anyhow::Result<std::collections::HashMap<String, Vec<PolicyRule>>> {
-    let list = list_cluster_resources(db, "ClusterRole").await?;
+    resources: &dyn RbacResourceReader,
+) -> Result<std::collections::HashMap<String, Vec<PolicyRule>>, String> {
+    let list = resources.list_rbac_resources("ClusterRole", None).await?;
     let mut map = std::collections::HashMap::new();
     for item in &list {
         let name = item
@@ -392,10 +365,12 @@ async fn load_cluster_roles(
 }
 
 async fn load_namespaced_roles(
-    db: &dyn crate::datastore::backend::DatastoreBackend,
+    resources: &dyn RbacResourceReader,
     namespace: &str,
-) -> anyhow::Result<std::collections::HashMap<String, Vec<PolicyRule>>> {
-    let list = list_namespaced_resources(db, namespace, "Role").await?;
+) -> Result<std::collections::HashMap<String, Vec<PolicyRule>>, String> {
+    let list = resources
+        .list_rbac_resources("Role", Some(namespace))
+        .await?;
     let mut map = std::collections::HashMap::new();
     for item in &list {
         let name = item
@@ -419,6 +394,18 @@ mod datastore_tests {
     use crate::auth::identity::AuthenticatedIdentity;
     use crate::datastore::backend::DatastoreHandle;
     use std::sync::Arc;
+
+    const RBAC_API_VERSION: &str = "rbac.authorization.k8s.io/v1";
+
+    struct DatastoreRbacPolicyStore;
+
+    impl DatastoreRbacPolicyStore {
+        fn new(handle: DatastoreHandle) -> ResourceRbacPolicyStore {
+            ResourceRbacPolicyStore::new(Arc::new(
+                crate::bootstrap::auth_store_adapters::DatastoreRbacResourceReader::new(handle),
+            ))
+        }
+    }
 
     fn as_handle(db: &crate::datastore::sqlite::Datastore) -> DatastoreHandle {
         Arc::new(db.clone()) as DatastoreHandle

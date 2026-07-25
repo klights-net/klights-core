@@ -247,7 +247,7 @@ async fn proxy_raw(
         let lname = name.as_str().to_ascii_lowercase();
         if lname == "x-remote-user"
             || lname == "x-remote-uid"
-            || lname == crate::auth::FORWARDED_CLIENT_CERT_HEADER
+            || lname == crate::api::auth_middleware::FORWARDED_CLIENT_CERT_HEADER
             || lname.starts_with("x-remote-group")
             || lname.starts_with("x-remote-extra-")
         {
@@ -340,7 +340,10 @@ fn stamp_forwarded_client_cert(
 ) -> reqwest::RequestBuilder {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&cert.0);
-    req_builder.header(crate::auth::FORWARDED_CLIENT_CERT_HEADER, encoded)
+    req_builder.header(
+        crate::api::auth_middleware::FORWARDED_CLIENT_CERT_HEADER,
+        encoded,
+    )
 }
 
 fn service_unavailable(msg: &str) -> Response {
@@ -367,7 +370,7 @@ mod tests {
         let req = builder.build().expect("request builds");
         let header = req
             .headers()
-            .get(crate::auth::FORWARDED_CLIENT_CERT_HEADER)
+            .get(crate::api::auth_middleware::FORWARDED_CLIENT_CERT_HEADER)
             .expect("forwarded client cert header present")
             .to_str()
             .unwrap();

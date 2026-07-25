@@ -4,6 +4,7 @@
 pub mod macros;
 
 pub mod apiservice_proxy;
+pub(crate) mod auth_middleware;
 pub(crate) mod backend_proxy_headers;
 mod crd_conversion;
 mod custom_resources;
@@ -15,6 +16,7 @@ pub mod finalizer_delete;
 pub mod generated_handlers;
 mod handlers;
 pub mod helpers;
+mod impersonation_headers;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]

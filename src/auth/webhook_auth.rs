@@ -7,11 +7,11 @@
 //!
 //! - `WebhookTokenReviewer` trait — sends TokenReview, returns status. Mockable.
 //! - `HttpWebhookTokenReviewer` — production implementation using reqwest.
-//! - `WebhookAuth` — cached authenticator wrapping the reviewer. Held in AppState.
+//! - `WebhookAuth` — cached authenticator wrapping the reviewer.
 
-use crate::api::AppError;
+use crate::auth::AuthError;
 use crate::auth::identity::AuthenticatedIdentity;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -71,6 +71,20 @@ pub trait WebhookTokenReviewer: Send + Sync {
 
 // ─── Cached authenticator ──────────────────────────────────────────────────
 
+/// Monotonic time source for webhook cache expiry.
+pub trait WebhookClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// Production monotonic clock.
+pub struct SystemWebhookClock;
+
+impl WebhookClock for SystemWebhookClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
 const DEFAULT_WEBHOOK_AUTH_CACHE_CAPACITY: usize = 4096;
 const DEFAULT_WEBHOOK_AUTH_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
 
@@ -90,6 +104,7 @@ struct WebhookAuthCache {
 /// Webhook token authenticator with TTL cache.
 pub struct WebhookAuth {
     reviewer: Arc<dyn WebhookTokenReviewer>,
+    clock: Arc<dyn WebhookClock>,
     cache: Mutex<WebhookAuthCache>,
     cache_capacity: usize,
     authorized_ttl: Duration,
@@ -120,8 +135,27 @@ impl WebhookAuth {
         audiences: Vec<String>,
         cache_capacity: usize,
     ) -> Self {
+        Self::new_with_clock_and_cache_capacity(
+            reviewer,
+            Arc::new(SystemWebhookClock),
+            authorized_ttl,
+            unauthorized_ttl,
+            audiences,
+            cache_capacity,
+        )
+    }
+
+    pub fn new_with_clock_and_cache_capacity(
+        reviewer: Arc<dyn WebhookTokenReviewer>,
+        clock: Arc<dyn WebhookClock>,
+        authorized_ttl: Duration,
+        unauthorized_ttl: Duration,
+        audiences: Vec<String>,
+        cache_capacity: usize,
+    ) -> Self {
         Self {
             reviewer,
+            clock,
             cache: Mutex::new(WebhookAuthCache::default()),
             cache_capacity,
             authorized_ttl,
@@ -136,9 +170,9 @@ impl WebhookAuth {
     pub async fn authenticate(
         &self,
         token: &str,
-    ) -> Option<Result<AuthenticatedIdentity, AppError>> {
+    ) -> Option<Result<AuthenticatedIdentity, AuthError>> {
         let cache_key = sha256_token(token);
-        let now = Instant::now();
+        let now = self.clock.now();
 
         // Check cache with lazy eviction
         {
@@ -191,13 +225,13 @@ impl WebhookAuth {
     fn convert_result(
         &self,
         result: Result<Option<TokenReviewStatus>, String>,
-    ) -> Option<Result<AuthenticatedIdentity, AppError>> {
+    ) -> Option<Result<AuthenticatedIdentity, AuthError>> {
         match result {
             Ok(Some(status)) => {
                 // K8s: error takes precedence over authenticated status
                 // See staging/src/k8s.io/apiserver/plugin/pkg/authenticator/token/webhook/webhook.go
                 if let Some(err) = status.error.filter(|e| !e.is_empty()) {
-                    return Some(Err(AppError::Unauthorized(format!(
+                    return Some(Err(AuthError::unauthenticated(format!(
                         "webhook token review error: {err}"
                     ))));
                 }
@@ -211,14 +245,14 @@ impl WebhookAuth {
                     );
                     return Some(Ok(identity));
                 }
-                Some(Err(AppError::Unauthorized(
+                Some(Err(AuthError::unauthenticated(
                     "webhook token review: not authenticated".to_string(),
                 )))
             }
-            Ok(None) => Some(Err(AppError::Unauthorized(
+            Ok(None) => Some(Err(AuthError::unauthenticated(
                 "webhook token review: no status returned".to_string(),
             ))),
-            Err(err) => Some(Err(AppError::Unauthorized(format!(
+            Err(err) => Some(Err(AuthError::unauthenticated(format!(
                 "webhook token review failed: {err}"
             )))),
         }
@@ -309,76 +343,11 @@ pub fn build_webhook_auth(config: Option<WebhookAuthConfig>) -> Result<Option<Ar
     ))))
 }
 
-pub async fn build_webhook_auth_from_config(
-    config: &crate::KlightsConfig,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-) -> Result<Option<Arc<WebhookAuth>>> {
-    let Some(url) = config.webhook_auth_url.as_ref() else {
-        return Ok(None);
-    };
-
-    let ca_bundle = read_optional_pem_file(
-        task_supervisor,
-        "webhook_auth_read_ca_bundle",
-        "webhook auth CA bundle",
-        config.webhook_auth_ca_bundle.as_ref(),
-    )
-    .await?;
-    let client_cert = read_optional_pem_file(
-        task_supervisor,
-        "webhook_auth_read_client_cert",
-        "webhook auth client certificate",
-        config.webhook_auth_client_cert.as_ref(),
-    )
-    .await?;
-    let client_key = read_optional_pem_file(
-        task_supervisor,
-        "webhook_auth_read_client_key",
-        "webhook auth client key",
-        config.webhook_auth_client_key.as_ref(),
-    )
-    .await?;
-
-    build_webhook_auth(Some(WebhookAuthConfig {
-        url: url.clone(),
-        ca_bundle,
-        client_cert,
-        client_key,
-        audiences: config
-            .webhook_auth_audiences
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
-        cache_authorized_ttl_secs: config.webhook_auth_cache_authorized_ttl_secs,
-        cache_unauthorized_ttl_secs: config.webhook_auth_cache_unauthorized_ttl_secs,
-    }))
-}
-
-async fn read_optional_pem_file(
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    label: &'static str,
-    description: &'static str,
-    path: Option<&String>,
-) -> Result<Option<String>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let path_buf = std::path::PathBuf::from(path);
-    let key = path_buf.to_string_lossy().into_owned();
-    let pem = task_supervisor
-        .run_blocking_file_keyed(label, key, move || crate::utils::read_utf8_file(path_buf))
-        .await
-        .with_context(|| format!("failed to join {description} read"))?
-        .with_context(|| format!("failed to read {description} {path}"))?;
-    Ok(Some(pem))
-}
-
 /// Try webhook token auth. Returns `None` if not configured.
 pub async fn try_webhook_auth(
     authenticator: &Option<Arc<WebhookAuth>>,
     token: &str,
-) -> Option<Result<AuthenticatedIdentity, AppError>> {
+) -> Option<Result<AuthenticatedIdentity, AuthError>> {
     authenticator.as_ref()?.authenticate(token).await
 }
 

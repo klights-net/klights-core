@@ -44,23 +44,21 @@ fn validate_signing_key_io(path: &Path, pem: String) -> io::Result<String> {
     Ok(pem)
 }
 
-pub fn read_service_account_signing_key(containerd_ns: &str) -> Result<String> {
-    let signing_key_path = crate::paths::service_account_signing_key_path(containerd_ns);
-    let pem = crate::utils::read_utf8_file(&signing_key_path).with_context(|| {
+pub fn read_service_account_signing_key(signing_key_path: &Path) -> Result<String> {
+    let pem = crate::utils::read_utf8_file(signing_key_path).with_context(|| {
         format!(
             "Failed to read ServiceAccount signing key {}",
             signing_key_path.display()
         )
     })?;
-    validate_signing_key(&signing_key_path, pem)
+    validate_signing_key(signing_key_path, pem)
 }
 
 pub async fn read_service_account_signing_key_async(
     file_process: &klights_supervisor::FileProcessExecutor,
-    containerd_ns: &str,
+    signing_key_path: &Path,
 ) -> io::Result<String> {
-    let signing_key_path = crate::paths::service_account_signing_key_path(containerd_ns);
-    let pem = crate::utils::read_utf8_file_async(file_process, &signing_key_path)
+    let pem = crate::utils::read_utf8_file_async(file_process, signing_key_path)
         .await
         .map_err(|err| {
             io::Error::new(
@@ -71,15 +69,14 @@ pub async fn read_service_account_signing_key_async(
                 ),
             )
         })?;
-    validate_signing_key_io(&signing_key_path, pem)
+    validate_signing_key_io(signing_key_path, pem)
 }
 
 pub async fn read_service_account_signing_key_supervised(
-    containerd_ns: &str,
+    signing_key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<String> {
-    let signing_key_path = crate::paths::service_account_signing_key_path(containerd_ns);
-    read_service_account_signing_key_path_supervised(&signing_key_path, task_supervisor).await
+    read_service_account_signing_key_path_supervised(signing_key_path, task_supervisor).await
 }
 
 pub(crate) async fn read_service_account_signing_key_path_supervised(
@@ -109,7 +106,7 @@ pub(crate) async fn read_service_account_signing_key_path_supervised(
 }
 
 pub async fn persist_service_account_signing_key(
-    containerd_ns: &str,
+    signing_key_path: &Path,
     pem: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<()> {
@@ -117,7 +114,10 @@ pub async fn persist_service_account_signing_key(
         anyhow::bail!("ServiceAccount signing key is empty");
     }
 
-    let etc_dir = crate::paths::etc_dir_path(containerd_ns);
+    let etc_dir = signing_key_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("ServiceAccount signing key path has no parent"))?
+        .to_path_buf();
     let etc_key = etc_dir.to_string_lossy().into_owned();
     task_supervisor
         .run_blocking_file_keyed("sa_signer_create_etc_dir", etc_key, {
@@ -126,7 +126,7 @@ pub async fn persist_service_account_signing_key(
         })
         .await??;
 
-    let path = crate::paths::service_account_signing_key_path(containerd_ns);
+    let path = signing_key_path.to_path_buf();
     let key = path.to_string_lossy().into_owned();
     let contents = pem.to_string();
     task_supervisor
@@ -607,7 +607,10 @@ mod tests {
             "leader-joined-signing-key\n",
         );
 
-        let key = read_service_account_signing_key(&namespace).unwrap();
+        let key = read_service_account_signing_key(
+            &crate::paths::service_account_signing_key_path(&namespace),
+        )
+        .unwrap();
 
         assert_eq!(key, "leader-joined-signing-key\n");
     }
@@ -620,8 +623,10 @@ mod tests {
             "worker-local-ca-key\n",
         );
 
-        let err = read_service_account_signing_key(&namespace)
-            .expect_err("missing dedicated ServiceAccount signer must not fall back to ca.key");
+        let err = read_service_account_signing_key(
+            &crate::paths::service_account_signing_key_path(&namespace),
+        )
+        .expect_err("missing dedicated ServiceAccount signer must not fall back to ca.key");
 
         assert!(
             err.to_string().contains("service-account-signing.key"),
@@ -639,7 +644,8 @@ mod tests {
         );
 
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-        let async_err = read_service_account_signing_key_async(&file_process, &namespace)
+        let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
+        let async_err = read_service_account_signing_key_async(&file_process, &signing_key_path)
             .await
             .expect_err("async read must not fall back to ca.key");
         assert_eq!(async_err.kind(), std::io::ErrorKind::NotFound);
@@ -647,9 +653,10 @@ mod tests {
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
-        let supervised_err = read_service_account_signing_key_supervised(&namespace, &supervisor)
-            .await
-            .expect_err("supervised read must not fall back to ca.key");
+        let supervised_err =
+            read_service_account_signing_key_supervised(&signing_key_path, &supervisor)
+                .await
+                .expect_err("supervised read must not fall back to ca.key");
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
 
         assert!(
@@ -673,15 +680,17 @@ mod tests {
         );
 
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-        let async_key = read_service_account_signing_key_async(&file_process, &namespace)
+        let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
+        let async_key = read_service_account_signing_key_async(&file_process, &signing_key_path)
             .await
             .unwrap();
         let supervisor = klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         );
-        let supervised_key = read_service_account_signing_key_supervised(&namespace, &supervisor)
-            .await
-            .unwrap();
+        let supervised_key =
+            read_service_account_signing_key_supervised(&signing_key_path, &supervisor)
+                .await
+                .unwrap();
         supervisor.shutdown(std::time::Duration::from_secs(1)).await;
 
         assert_eq!(async_key, "leader-joined-signing-key\n");

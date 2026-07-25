@@ -14,11 +14,9 @@ pub use self::cert::{
 };
 #[cfg(test)]
 pub use self::cert::{generate_admin_cert, generate_ca_full, generate_server_cert};
+pub use self::credential::TlsClientCertificate;
+pub use self::error::AuthError;
 pub use self::identity::AuthenticatedIdentity;
-pub use self::middleware::{
-    FORWARDED_CLIENT_CERT_HEADER, TlsClientCertificate, authenticate_request, authorize_request,
-    validate_sa_token_bindings,
-};
 pub use self::token::generate_sa_token;
 pub use self::token::generate_sa_token_with_sa_uid;
 pub use self::token::persist_service_account_signing_key;
@@ -52,9 +50,10 @@ pub mod kubelet_client_cert;
 pub mod node_authorizer;
 pub mod node_policy_store;
 //mod token;
+mod credential;
 pub mod default_rbac;
 mod default_roles;
-mod middleware;
+mod error;
 pub mod oidc;
 #[cfg(test)]
 mod oidc_tests;

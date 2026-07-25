@@ -97,8 +97,8 @@ pub async fn build_test_app_state() -> crate::api::AppState {
         api_priority_fairness: std::sync::Arc::new(
             crate::api_priority_fairness::ApiPriorityFairness::new(),
         ),
-        rbac_policy_store: std::sync::Arc::new(
-            crate::auth::rbac_policy_store::DatastoreRbacPolicyStore::new(db_handle.clone()),
+        rbac_policy_store: crate::bootstrap::auth_store_adapters::rbac_policy_store(
+            db_handle.clone(),
         ),
         oidc_authenticator: None,
         webhook_authenticator: None,

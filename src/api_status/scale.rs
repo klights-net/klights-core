@@ -22,7 +22,7 @@ use crate::datastore::ResourcePreconditions;
 
 // Scale endpoints are split from helpers to keep each file manageable.
 // Authorization for scale subresources is enforced by the global
-// `authorize_request` middleware chokepoint (see src/auth/middleware.rs).
+// `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs).
 
 /// Extract the selector string from a resource's spec.selector.
 /// For apps/v1 resources (Deployment, StatefulSet, ReplicaSet), the selector

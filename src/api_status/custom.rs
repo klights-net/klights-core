@@ -23,7 +23,7 @@ use crate::api_status::{
 };
 
 // Cluster subresource (status) authorization is enforced by the global
-// `authorize_request` middleware chokepoint (see src/auth/middleware.rs).
+// `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs).
 
 pub async fn patch_node_status(
     State(state): State<Arc<AppState>>,

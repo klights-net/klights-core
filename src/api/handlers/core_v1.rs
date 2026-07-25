@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 // Service and serviceaccount-token authorization is enforced by the global
-// `authorize_request` middleware chokepoint (see src/auth/middleware.rs).
+// `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs).
 
 pub fn api_v1_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -735,7 +735,7 @@ async fn create_serviceaccount_token(
 
     let signing_key_pem = crate::auth::read_service_account_signing_key_async(
         &state.file_process,
-        &state.config.containerd_namespace,
+        &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
     )
     .await
     .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;

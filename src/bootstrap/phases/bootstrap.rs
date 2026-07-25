@@ -368,6 +368,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             node_name: config.node_name.clone(),
             service_cidr: config.service_cidr.clone(),
             lifecycle_concurrency: crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+            lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             cri: cri_for_pod_watcher.clone().map(SharedCriClient::new),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
@@ -447,13 +448,15 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     );
     side_effects.set_pod_repository(api_pod_repository.clone());
     let oidc_authenticator =
-        crate::auth::oidc::build_oidc_authenticator_from_config(config, supervisor.as_ref())
+        crate::bootstrap::auth_composition::build_oidc_authenticator(config, supervisor.as_ref())
             .await
             .context("failed to build OIDC authenticator")?;
-    let webhook_authenticator =
-        crate::auth::webhook_auth::build_webhook_auth_from_config(config, supervisor.as_ref())
-            .await
-            .context("failed to build webhook authenticator")?;
+    let webhook_authenticator = crate::bootstrap::auth_composition::build_webhook_authenticator(
+        config,
+        supervisor.as_ref(),
+    )
+    .await
+    .context("failed to build webhook authenticator")?;
 
     // P3-11f: leadership watch channels for API proxy gating.
     // The shape watcher updates the senders; AppState holds the
@@ -545,17 +548,19 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         pod_start_retry_state: Some(pod_start_retry_state.clone()),
         is_raft_leader_rx: raft_leader_proxy,
         authorizer: std::sync::Arc::new(
-            crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
-                db_handle.clone(),
-                api_pod_repository.clone(),
+            crate::auth::authorizer::AuthorizerChain::chain_with_policy_stores(
+                crate::bootstrap::auth_store_adapters::rbac_policy_store(db_handle.clone()),
+                crate::bootstrap::auth_store_adapters::node_policy_store(
+                    api_pod_repository.clone(),
+                ),
             ),
         ),
         audit_sink: crate::audit::default_audit_sink(),
         api_priority_fairness: std::sync::Arc::new(
             crate::api_priority_fairness::ApiPriorityFairness::new(),
         ),
-        rbac_policy_store: std::sync::Arc::new(
-            crate::auth::rbac_policy_store::DatastoreRbacPolicyStore::new(db_handle.clone()),
+        rbac_policy_store: crate::bootstrap::auth_store_adapters::rbac_policy_store(
+            db_handle.clone(),
         ),
         oidc_authenticator,
         webhook_authenticator,
@@ -572,8 +577,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         task_supervisor: supervisor.clone(),
         file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         config: Arc::clone(config),
-        node_mode: node_mode.clone(),
-        role: cli.role.clone(),
         network: network.clone(),
         pod_repository: pod_repository.clone(),
         pod_lifecycle_router: pod_lifecycle_router.clone(),

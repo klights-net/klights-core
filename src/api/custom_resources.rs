@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use axum::Extension;
 
 // Custom-resource authorization is enforced by the global `authorize_request`
-// middleware chokepoint (see src/auth/middleware.rs). The CRD handlers still
+// middleware chokepoint (see src/api/auth_middleware.rs). The CRD handlers still
 // receive the authenticated identity because it is forwarded to APIService
 // backends during aggregation proxying (see lookup_crd_or_proxy).
 

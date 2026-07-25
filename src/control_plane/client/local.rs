@@ -238,7 +238,7 @@ impl LocalApiClient {
             }
             let signing_key_pem = crate::auth::read_service_account_signing_key_async(
                 &self.file_process,
-                &self.containerd_namespace,
+                &crate::paths::service_account_signing_key_path(&self.containerd_namespace),
             )
             .await;
             let signing_key_pem = signing_key_pem.map_err(|error| {

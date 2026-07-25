@@ -1,12 +1,13 @@
 {
   "format": "rustdoc-json-reachable-api-v2",
+  "schema": 2,
   "packages": {
     "klights": {
-      "count": 42090,
-      "sha256": "3a0208d82a0a1f6fd194e10e02b6442dc8b019122e4024cf1af577e8d9575e28",
+      "count": 42278,
+      "sha256": "2cb33a38eb596a59cc91d169686d2931615d53608cd885b19e6ddbcb131abe8b",
       "source": {
-        "count": 505617,
-        "sha256": "4e369047e1be3996adf8c389cc7dac338a903f6ff796618ba2002bca98b389dd"
+        "count": 505881,
+        "sha256": "1f36f289aa648df807d1a5cb9eb27e52fe43e41ad0e6f07fdd16f81fdaebe12a"
       }
     },
     "klights-apiserver": {
@@ -177,6 +178,5 @@
         "sha256": "986efe33e97fdf0599d47028f7ec863bdb3bb342e21bfd954373d5366a444b90"
       }
     }
-  },
-  "schema": 2
+  }
 }

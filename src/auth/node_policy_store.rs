@@ -1,6 +1,6 @@
 //! Node policy store trait and in-memory mock for Node authorizer.
 //!
-//! Production uses the datastore; tests use `InMemoryNodePolicyStore`.
+//! Production injects a focused pod source; tests use `InMemoryNodePolicyStore`.
 
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +25,25 @@ pub trait NodePolicyStore: Send + Sync {
         pod_name: &str,
         resource: &str,
     ) -> Vec<String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct NodePolicyPod {
+    pub namespace: String,
+    pub name: String,
+    pub data: std::sync::Arc<serde_json::Value>,
+}
+
+/// Focused pod read port used by the Node authorizer adapter.
+#[async_trait]
+pub trait NodePodSource: Send + Sync {
+    async fn get_policy_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<NodePolicyPod>, String>;
+
+    async fn list_policy_pods(&self) -> Result<Vec<NodePolicyPod>, String>;
 }
 
 // --- In-memory implementation for tests ---
@@ -114,25 +133,30 @@ impl NodePolicyStore for InMemoryNodePolicyStore {
     }
 }
 
-/// Production `NodePolicyStore` backed by the pod repository.
+/// Production `NodePolicyStore` backed by an injected pod source.
 ///
 /// Queries pod resources to determine node assignments and referenced objects.
 /// Fail-closed: errors produce empty results, which the NodeAuthorizer treats
 /// as "no opinion" (defer to RBAC).
-pub struct DatastoreNodePolicyStore {
-    pods: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+pub struct PodSourceNodePolicyStore {
+    pods: std::sync::Arc<dyn NodePodSource>,
 }
 
-impl DatastoreNodePolicyStore {
-    pub fn new(pods: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>) -> Self {
+impl PodSourceNodePolicyStore {
+    pub fn new(pods: std::sync::Arc<dyn NodePodSource>) -> Self {
         Self { pods }
     }
 }
 
 #[async_trait]
-impl NodePolicyStore for DatastoreNodePolicyStore {
+impl NodePolicyStore for PodSourceNodePolicyStore {
     async fn get_pod_node(&self, namespace: &str, name: &str) -> Option<String> {
-        let pod = self.pods.get_pod(namespace, name).await.ok().flatten()?;
+        let pod = self
+            .pods
+            .get_policy_pod(namespace, name)
+            .await
+            .ok()
+            .flatten()?;
         pod.data
             .pointer("/spec/nodeName")
             .and_then(|v| v.as_str())
@@ -140,15 +164,14 @@ impl NodePolicyStore for DatastoreNodePolicyStore {
     }
 
     async fn list_pods_on_node(&self, node_name: &str) -> Vec<(String, String)> {
-        let Ok(pods) = self.pods.list_pods(None, None, None, None, None).await else {
+        let Ok(pods) = self.pods.list_policy_pods().await else {
             return Vec::new();
         };
         let mut result = Vec::new();
-        for pod in &pods.items {
+        for pod in &pods {
             let pod_node = pod.data.pointer("/spec/nodeName").and_then(|v| v.as_str());
             if pod_node == Some(node_name) {
-                let ns = pod.namespace.clone().unwrap_or_default();
-                result.push((ns, pod.name.clone()));
+                result.push((pod.namespace.clone(), pod.name.clone()));
             }
         }
         result
@@ -160,7 +183,7 @@ impl NodePolicyStore for DatastoreNodePolicyStore {
         pod_name: &str,
         resource: &str,
     ) -> Vec<String> {
-        let Ok(Some(pod)) = self.pods.get_pod(namespace, pod_name).await else {
+        let Ok(Some(pod)) = self.pods.get_policy_pod(namespace, pod_name).await else {
             return Vec::new();
         };
         extract_referenced_objects(&pod.data, resource)
@@ -260,6 +283,18 @@ fn extract_env_from_refs(pod: &serde_json::Value, ref_key: &str, names: &mut Has
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DatastoreNodePolicyStore;
+
+    impl DatastoreNodePolicyStore {
+        fn new(
+            pods: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+        ) -> PodSourceNodePolicyStore {
+            PodSourceNodePolicyStore::new(std::sync::Arc::new(
+                crate::bootstrap::auth_store_adapters::PodRepositoryNodePodSource::new(pods),
+            ))
+        }
+    }
 
     #[tokio::test]
     async fn pod_node_mapping_basics() {

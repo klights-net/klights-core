@@ -12,8 +12,7 @@
 //!
 //! The middleware only depends on `OidcValidator`, so tests inject a mock.
 
-use crate::api::AppError;
-use anyhow::Context;
+use crate::auth::AuthError;
 use jsonwebtoken::Algorithm;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -87,45 +86,6 @@ pub fn build_oidc_authenticator(config: Option<OidcConfig>) -> Option<Arc<dyn Oi
     }
     let discovery = HttpOidcDiscovery::new(config.ca_bundle.clone()).ok()?;
     Some(Arc::new(JwtOidcValidator::new(config, Box::new(discovery))))
-}
-
-pub async fn build_oidc_authenticator_from_config(
-    config: &crate::KlightsConfig,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-) -> anyhow::Result<Option<Arc<dyn OidcValidator>>> {
-    let Some(issuer) = config.oidc_issuer_url.as_ref() else {
-        return Ok(None);
-    };
-    if config.oidc_client_id.as_deref().unwrap_or("").is_empty() {
-        anyhow::bail!("OIDC client ID is required when OIDC issuer URL is configured");
-    }
-    let ca_bundle = match &config.oidc_ca_bundle {
-        Some(path) => {
-            let path_buf = std::path::PathBuf::from(path);
-            let key = path_buf.to_string_lossy().into_owned();
-            let pem = task_supervisor
-                .run_blocking_file_keyed("oidc_read_ca_bundle", key, move || {
-                    crate::utils::read_utf8_file(path_buf)
-                })
-                .await
-                .context("failed to join OIDC CA bundle read")?
-                .with_context(|| format!("failed to read OIDC CA bundle {path}"))?;
-            Some(pem)
-        }
-        None => None,
-    };
-    let authenticator = build_oidc_authenticator(Some(OidcConfig {
-        issuer_url: issuer.clone(),
-        client_id: config.oidc_client_id.clone().unwrap_or_default(),
-        username_claim: config.oidc_username_claim.clone(),
-        username_prefix: None,
-        groups_claim: config.oidc_groups_claim.clone(),
-        groups_prefix: config.oidc_groups_prefix.clone(),
-        ca_bundle,
-        signing_algs: default_signing_algs(),
-    }))
-    .ok_or_else(|| anyhow::anyhow!("invalid OIDC authenticator configuration"))?;
-    Ok(Some(authenticator))
 }
 
 pub fn default_signing_algs() -> Vec<Algorithm> {
@@ -298,9 +258,10 @@ fn defaulted_config(mut config: OidcConfig) -> Option<OidcConfig> {
 pub async fn try_oidc_auth(
     authenticator: &Option<Arc<dyn OidcValidator>>,
     token: &str,
-) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AppError>> {
+    clock: &dyn crate::auth::clock::Clock,
+) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AuthError>> {
     let authenticator = authenticator.as_ref()?;
-    let now = time::OffsetDateTime::now_utc();
+    let now = clock.now();
     match authenticator.validate_token(token, now).await {
         Ok(claims) => {
             let identity = crate::auth::identity::AuthenticatedIdentity::oidc(
@@ -310,7 +271,7 @@ pub async fn try_oidc_auth(
             );
             Some(Ok(identity))
         }
-        Err(err) => Some(Err(AppError::Unauthorized(format!(
+        Err(err) => Some(Err(AuthError::unauthenticated(format!(
             "invalid OIDC token: {err}"
         )))),
     }

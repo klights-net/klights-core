@@ -346,52 +346,14 @@ async fn test_jwt_oidc_validator_prefixes_non_email_username_claim_by_default() 
     );
 }
 
-#[tokio::test]
-async fn test_build_oidc_authenticator_from_config_reads_ca_bundle_path() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let ca_path = temp_dir.path().join("oidc-ca.pem");
-    let cert = rcgen::generate_simple_self_signed(vec!["oidc.example.com".to_string()]).unwrap();
-    std::fs::write(&ca_path, cert.cert.pem()).unwrap();
-    let supervisor =
-        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
-    let config = crate::KlightsConfig {
-        oidc_issuer_url: Some("https://oidc.example.com".to_string()),
-        oidc_client_id: Some("klights".to_string()),
-        oidc_ca_bundle: Some(ca_path.to_string_lossy().into_owned()),
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    };
-
-    let authenticator = build_oidc_authenticator_from_config(&config, &supervisor)
-        .await
-        .unwrap();
-
-    assert!(authenticator.is_some());
-}
-
-#[tokio::test]
-async fn test_build_oidc_authenticator_from_config_errors_for_missing_client_id() {
-    let supervisor =
-        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
-    let config = crate::KlightsConfig {
-        oidc_issuer_url: Some("https://oidc.example.com".to_string()),
-        oidc_client_id: None,
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    };
-
-    let result = build_oidc_authenticator_from_config(&config, &supervisor).await;
-
-    let err = match result {
-        Ok(_) => panic!("expected missing OIDC client ID to fail"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("client ID"));
-}
-
 // ─── try_oidc_auth integration tests ──────────────────────────────────────
 
 #[tokio::test]
 async fn test_try_oidc_auth_no_authenticator_returns_none() {
-    let result = try_oidc_auth(&None, "some-token").await;
+    let clock = crate::auth::clock::FixedClock {
+        now: OffsetDateTime::UNIX_EPOCH,
+    };
+    let result = try_oidc_auth(&None, "some-token", &clock).await;
     assert!(result.is_none(), "no OIDC authenticator should return None");
 }
 
@@ -402,7 +364,10 @@ async fn test_try_oidc_auth_success_returns_identity() {
         groups: vec!["dev".to_string()],
         uid: Some("uid-42".to_string()),
     })));
-    let result = try_oidc_auth(&Some(validator), "valid-oidc-token").await;
+    let clock = crate::auth::clock::FixedClock {
+        now: OffsetDateTime::UNIX_EPOCH,
+    };
+    let result = try_oidc_auth(&Some(validator), "valid-oidc-token", &clock).await;
     assert!(result.is_some());
     let identity = result.unwrap().unwrap();
     assert_eq!(identity.username, "alice");
@@ -419,7 +384,10 @@ async fn test_try_oidc_auth_success_returns_identity() {
 async fn test_try_oidc_auth_failure_returns_error() {
     let validator: Arc<dyn OidcValidator> =
         Arc::new(MockOidcValidator::new(Err("invalid signature".to_string())));
-    let result = try_oidc_auth(&Some(validator), "bad-token").await;
+    let clock = crate::auth::clock::FixedClock {
+        now: OffsetDateTime::UNIX_EPOCH,
+    };
+    let result = try_oidc_auth(&Some(validator), "bad-token", &clock).await;
     assert!(result.is_some());
     let err = result.unwrap().unwrap_err();
     // Should be Unauthorized with OIDC error

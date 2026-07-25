@@ -436,7 +436,9 @@ pub fn build_router(state: AppState) -> Router {
             let authz_state = state.clone();
             middleware::from_fn(move |request: Request, next: Next| {
                 let authz_state = authz_state.clone();
-                async move { crate::auth::authorize_request(authz_state, request, next).await }
+                async move {
+                    crate::api::auth_middleware::authorize_request(authz_state, request, next).await
+                }
             })
         })
         .layer({
@@ -456,7 +458,10 @@ pub fn build_router(state: AppState) -> Router {
             let auth_state = state.clone();
             middleware::from_fn(move |request: Request, next: Next| {
                 let auth_state = auth_state.clone();
-                async move { crate::auth::authenticate_request(auth_state, request, next).await }
+                async move {
+                    crate::api::auth_middleware::authenticate_request(auth_state, request, next)
+                        .await
+                }
             })
         })
         .layer(middleware::from_fn(log_request))
@@ -566,7 +571,7 @@ async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
 
     let signing_key_pem = crate::auth::read_service_account_signing_key_async(
         &state.file_process,
-        &state.config.containerd_namespace,
+        &crate::paths::service_account_signing_key_path(&state.config.containerd_namespace),
     )
     .await
     .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;

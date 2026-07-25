@@ -80,7 +80,7 @@ impl ApiPriorityFairness {
         path: &str,
         query: Option<&str>,
     ) -> Result<ApfAdmission, axum::response::Response> {
-        let ResolvedAuthz::Authorize(authz) = resolve_request_info(method, path, query);
+        let ResolvedAuthz::Authorize(authz) = resolve_request_info(method.as_str(), path, query);
         let Some(flow_schema) = select_matching_flow_schema(db, identity, &authz).await else {
             return Ok(ApfAdmission::Exempt);
         };

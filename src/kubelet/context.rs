@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::KlightsConfig;
-use crate::bootstrap::{NodeMode, NodeRole};
 use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::outbox::Outbox;
@@ -24,8 +23,6 @@ pub struct KubeletContext {
     pub task_supervisor: Arc<TaskSupervisor>,
     pub file_process: klights_supervisor::FileProcessExecutor,
     pub config: Arc<KlightsConfig>,
-    pub node_mode: NodeMode,
-    pub role: NodeRole,
     pub network: Arc<Network>,
     pub pod_repository: Arc<PodRepository>,
     pub pod_lifecycle_router: Arc<PodLifecycleRouter>,
