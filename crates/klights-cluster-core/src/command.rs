@@ -150,9 +150,9 @@ pub enum StorageCommand {
         name: String,
         pod_uid: String,
         node_name: String,
-        /// Leader-fresh Pod generation observed by the lifecycle actor before
-        /// enqueueing finalization. Apply must revalidate this exact RV with
-        /// the UID and node binding before removing the row.
+        /// Leader-fresh generation recorded as audit evidence. It is not a
+        /// replayed delete CAS: committed apply re-observes mutable Pod state
+        /// and serializes the exact live-row delete transactionally.
         observed_resource_version: i64,
     },
 

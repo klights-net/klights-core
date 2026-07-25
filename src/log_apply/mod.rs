@@ -62,11 +62,11 @@ where
 pub use klights_cluster_core::{
     ClusterMetaMutation, ClusterMutation, LogApplyAppliedOutboxRow, LogApplyCommit,
     LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation,
-    LogApplyNodeSubnetRow, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
-    LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow,
-    NamespaceMutation, NetworkMutation, OutboxLedgerMutation, OutboxStreamWatermark,
-    PodCleanupMutation, ResourceMutation, ResourceVersionAssignment, VersionedClusterMutation,
-    WatchHistoryMutation,
+    LogApplyNodeSubnetRow, LogApplyPodActorFinalization, LogApplyPodCleanupIntentKey,
+    LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
+    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, OutboxLedgerMutation,
+    OutboxStreamWatermark, PodCleanupMutation, ResourceMutation, ResourceVersionAssignment,
+    VersionedClusterMutation, WatchHistoryMutation,
 };
 
 impl From<&NodeSubnet> for LogApplyNodeSubnetRow {
@@ -315,6 +315,14 @@ impl WireFrom<LogApplyMutation> for ProtoLogApplyMutation {
                 Mutation::PatchResourceLatest(patch.into_wire())
             }
             LogApplyMutation::DeleteResource(key) => Mutation::DeleteResource(key.into_wire()),
+            LogApplyMutation::FinalizeBoundPod(finalization) => {
+                Mutation::FinalizeBoundPod(ProtoLogApplyPodActorFinalization {
+                    namespace: finalization.namespace,
+                    name: finalization.name,
+                    pod_uid: finalization.pod_uid,
+                    node_name: finalization.node_name,
+                })
+            }
             LogApplyMutation::PutNamespace(row) => Mutation::PutNamespace(row.into_wire()),
             LogApplyMutation::DeleteNamespace { name } => Mutation::DeleteNamespace(name),
             LogApplyMutation::DeleteNamespaceContents { name } => {
@@ -391,6 +399,14 @@ impl TryWireFrom<ProtoLogApplyMutation> for LogApplyMutation {
                     LogApplyMutation::PatchResourceLatest(patch.try_into_wire()?)
                 }
                 Mutation::DeleteResource(key) => LogApplyMutation::DeleteResource(key.into_wire()),
+                Mutation::FinalizeBoundPod(finalization) => {
+                    LogApplyMutation::FinalizeBoundPod(LogApplyPodActorFinalization {
+                        namespace: finalization.namespace,
+                        name: finalization.name,
+                        pod_uid: finalization.pod_uid,
+                        node_name: finalization.node_name,
+                    })
+                }
                 Mutation::PutNamespace(row) => LogApplyMutation::PutNamespace(row.try_into_wire()?),
                 Mutation::DeleteNamespace(name) => LogApplyMutation::DeleteNamespace { name },
                 Mutation::DeleteNamespaceContents(name) => {
@@ -826,6 +842,14 @@ mod parity_tests {
                 uid: "pod-uid-A".to_string(),
                 precondition_resource_version: None,
             }),
+            "FinalizeBoundPod" => {
+                LogApplyMutation::FinalizeBoundPod(LogApplyPodActorFinalization {
+                    namespace: "default".to_string(),
+                    name: "p1".to_string(),
+                    pod_uid: "pod-uid-A".to_string(),
+                    node_name: "worker-a".to_string(),
+                })
+            }
             "PutNamespace" => LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
                 name: "ns".to_string(),
                 uid: "ns-uid".to_string(),
@@ -947,6 +971,7 @@ mod parity_tests {
             "PutResource",
             "PatchResourceLatest",
             "DeleteResource",
+            "FinalizeBoundPod",
             "PutNamespace",
             "DeleteNamespace",
             "DeleteNamespaceContents",
@@ -975,24 +1000,25 @@ mod parity_tests {
             LogApplyMutation::PutResource(_) => 0,
             LogApplyMutation::PatchResourceLatest(_) => 1,
             LogApplyMutation::DeleteResource(_) => 2,
-            LogApplyMutation::PutNamespace(_) => 3,
-            LogApplyMutation::DeleteNamespace { .. } => 4,
-            LogApplyMutation::DeleteNamespaceContents { .. } => 5,
-            LogApplyMutation::PutNodeSubnet(_) => 6,
-            LogApplyMutation::AllocateNodeSubnet(_) => 7,
-            LogApplyMutation::DeleteNodeSubnet { .. } => 8,
-            LogApplyMutation::PutNodeDataplane(_) => 9,
-            LogApplyMutation::DeleteNodeDataplane { .. } => 10,
-            LogApplyMutation::PutAppliedOutbox(_) => 11,
-            LogApplyMutation::DeleteAppliedOutbox { .. } => 12,
-            LogApplyMutation::GcAppliedOutbox { .. } => 13,
-            LogApplyMutation::GcWatchEvents { .. } => 14,
-            LogApplyMutation::PutWatchEvent(_) => 15,
-            LogApplyMutation::AdvanceResourceVersion { .. } => 16,
-            LogApplyMutation::PutKlightsMeta { .. } => 17,
-            LogApplyMutation::PutPodCleanupIntent(_) => 18,
-            LogApplyMutation::DeletePodCleanupIntent(_) => 19,
-            LogApplyMutation::DeletePodCleanupIntentsForNode { .. } => 20,
+            LogApplyMutation::FinalizeBoundPod(_) => 3,
+            LogApplyMutation::PutNamespace(_) => 4,
+            LogApplyMutation::DeleteNamespace { .. } => 5,
+            LogApplyMutation::DeleteNamespaceContents { .. } => 6,
+            LogApplyMutation::PutNodeSubnet(_) => 7,
+            LogApplyMutation::AllocateNodeSubnet(_) => 8,
+            LogApplyMutation::DeleteNodeSubnet { .. } => 9,
+            LogApplyMutation::PutNodeDataplane(_) => 10,
+            LogApplyMutation::DeleteNodeDataplane { .. } => 11,
+            LogApplyMutation::PutAppliedOutbox(_) => 12,
+            LogApplyMutation::DeleteAppliedOutbox { .. } => 13,
+            LogApplyMutation::GcAppliedOutbox { .. } => 14,
+            LogApplyMutation::GcWatchEvents { .. } => 15,
+            LogApplyMutation::PutWatchEvent(_) => 16,
+            LogApplyMutation::AdvanceResourceVersion { .. } => 17,
+            LogApplyMutation::PutKlightsMeta { .. } => 18,
+            LogApplyMutation::PutPodCleanupIntent(_) => 19,
+            LogApplyMutation::DeletePodCleanupIntent(_) => 20,
+            LogApplyMutation::DeletePodCleanupIntentsForNode { .. } => 21,
         };
         names
     }

@@ -61,6 +61,9 @@ pub enum PodStartResult {
 pub enum PodDeletionFinalizeResult {
     /// Pod row was deleted or was already gone.
     DeletedOrAlreadyGone,
+    /// Stable UID-bound finalization is durable in the node outbox. The actor
+    /// waits for the committed `DELETED` watch instead of entering retry.
+    Queued,
     /// Finalizers are still pending; deletion was deferred.
     FinalizersPending,
 }

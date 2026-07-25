@@ -930,9 +930,9 @@ impl Datastore {
                 name,
                 pod_uid,
                 node_name,
-                observed_resource_version,
+                observed_resource_version: _,
             } => {
-                let Some((current_rv, current_uid, data_bytes)) =
+                let Some((_current_rv, current_uid, data_bytes)) =
                     Self::resource_row_optional_for_update_in_tx(
                         tx,
                         "v1",
@@ -947,7 +947,7 @@ impl Datastore {
                         current_public_rv,
                     ));
                 };
-                if current_uid != pod_uid || current_rv != observed_resource_version {
+                if current_uid != pod_uid {
                     let current_public_rv = Self::current_resource_version_in_tx(tx)?;
                     return Ok((
                         LogApplyCommit::new(current_public_rv, Vec::new()),
@@ -995,40 +995,18 @@ impl Datastore {
                     )?;
                     next_rv
                 };
-                let watch_event_row = LogApplyWatchEventRow {
-                    event_id: None,
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some(namespace.clone()),
-                    name: name.clone(),
-                    resource_version: finalize_rv,
-                    event_type: "DELETED".to_string(),
-                    data: hydrate_watch_event_data(
-                        data,
-                        "v1",
-                        "Pod",
-                        Some(namespace.as_str()),
-                        &name,
-                        finalize_rv,
-                    ),
-                };
                 LogApplyCommit::from_cluster_mutations(
                     finalize_rv,
-                    vec![
-                        ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(
-                            watch_event_row,
-                        )),
-                        ClusterMutation::Resource(ResourceMutation::DeleteResource(
-                            LogApplyResourceKey {
-                                api_version: "v1".to_string(),
-                                kind: "Pod".to_string(),
-                                namespace: Some(namespace),
+                    vec![ClusterMutation::Resource(
+                        ResourceMutation::FinalizeBoundPod(
+                            crate::log_apply::LogApplyPodActorFinalization {
+                                namespace,
                                 name,
-                                uid: current_uid,
-                                precondition_resource_version: Some(current_rv),
+                                pod_uid: current_uid,
+                                node_name,
                             },
-                        )),
-                    ],
+                        ),
+                    )],
                 )
             }
             StorageCommand::DeleteResourceWithTombstone {

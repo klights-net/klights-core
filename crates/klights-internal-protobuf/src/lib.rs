@@ -404,5 +404,19 @@ mod tests {
             ),
         };
         assert_eq!(mutation.encode_to_vec(), vec![0xaa, 0x01, 0x00]);
+
+        let finalization = crate::log_apply::ProtoLogApplyMutation {
+            mutation: Some(
+                crate::log_apply::proto_log_apply_mutation::Mutation::FinalizeBoundPod(
+                    crate::log_apply::ProtoLogApplyPodActorFinalization {
+                        namespace: String::new(),
+                        name: String::new(),
+                        pod_uid: String::new(),
+                        node_name: String::new(),
+                    },
+                ),
+            ),
+        };
+        assert_eq!(finalization.encode_to_vec(), vec![0xb2, 0x01, 0x00]);
     }
 }

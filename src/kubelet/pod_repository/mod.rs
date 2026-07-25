@@ -781,7 +781,10 @@ impl PodDeletionFinalizer for DeferredRuntimeCleanupFinalizer {
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
     ) -> Result<PodDeletionFinalizeResult> {
         let result = self.inner.finalize_after_actor_cleanup(key).await?;
-        if matches!(result, PodDeletionFinalizeResult::DeletedOrAlreadyGone) {
+        if matches!(
+            result,
+            PodDeletionFinalizeResult::DeletedOrAlreadyGone | PodDeletionFinalizeResult::Queued
+        ) {
             self.deferred_runtime.forget(&key.uid);
         }
         Ok(result)
@@ -1100,6 +1103,7 @@ impl PodRepository {
             .await?
         {
             PodDeletionFinalizeResult::DeletedOrAlreadyGone => Ok(true),
+            PodDeletionFinalizeResult::Queued => Ok(false),
             PodDeletionFinalizeResult::FinalizersPending => Ok(false),
         }
     }

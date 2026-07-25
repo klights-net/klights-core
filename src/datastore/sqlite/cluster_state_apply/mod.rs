@@ -137,6 +137,11 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
                         effects.push_watch_event(event);
                     }
                 }
+                crate::log_apply::ResourceMutation::FinalizeBoundPod(_) => {
+                    return Err(super::cluster_replace::other_error(
+                        "bound Pod finalization was not resolved before state-machine apply",
+                    ));
+                }
             },
             ClusterMutation::Namespace(mutation) => match mutation {
                 crate::log_apply::NamespaceMutation::PutNamespace(row) => {

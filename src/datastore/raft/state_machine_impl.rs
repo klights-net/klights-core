@@ -81,7 +81,8 @@ fn commit_activates_command_codec_v3(commit: &crate::log_apply::LogApplyCommit) 
         matches!(
             mutation,
             crate::log_apply::LogApplyMutation::PutKlightsMeta { key, value }
-                if key == super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION && value == "3"
+                if key == super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION
+                    && value == super::node::COMMAND_CODEC_ACTIVATION_VALUE
         )
     })
 }
@@ -257,7 +258,8 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                             .get_klights_meta(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
                             .await
                             .map_err(|error| apply_err(log_id, error))?;
-                        if persisted.as_deref() != Some("3") {
+                        if persisted.as_deref() != Some(super::node::COMMAND_CODEC_ACTIVATION_VALUE)
+                        {
                             return Err(apply_err(
                                 log_id,
                                 "exact-v3 activation mutation did not persist its marker",
@@ -337,7 +339,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
             .map_err(ioerr_read)?
             .as_deref()
         {
-            Some("3") => self
+            Some(super::node::COMMAND_CODEC_ACTIVATION_VALUE) => self
                 .command_codec_v3_activation
                 .mark_command_codec_v3_activated(),
             None => self

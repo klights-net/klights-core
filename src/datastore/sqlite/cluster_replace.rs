@@ -1014,6 +1014,12 @@ fn apply_commit_in_tx_with_watch_events(
             "log_apply commit resourceVersion must be non-negative",
         ));
     }
+    let commit = resolve_bound_pod_finalizations_in_tx(tx, commit)?;
+    let emit_watch_events = emit_watch_events
+        && !commit
+            .mutations
+            .iter()
+            .any(|mutation| matches!(mutation, LogApplyMutation::PutWatchEvent(_)));
     let commit = stamp_provisional_resource_version_in_tx(tx, commit)?;
     let applied_rv = commit.resource_version;
     let watermark = commit.outbox_watermark.clone();
@@ -1064,6 +1070,96 @@ fn apply_commit_in_tx_with_watch_events(
         emit_watch_events,
     );
     Ok((applied_rv, pending, applied_mutation))
+}
+
+fn resolve_bound_pod_finalizations_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    mut commit: LogApplyCommit,
+) -> tokio_rusqlite::Result<LogApplyCommit> {
+    let mutations = std::mem::take(&mut commit.mutations);
+    let mut resolved = Vec::with_capacity(mutations.len().saturating_add(1));
+    for mutation in mutations {
+        let LogApplyMutation::FinalizeBoundPod(finalization) = mutation else {
+            resolved.push(mutation);
+            continue;
+        };
+        let current = tx
+            .query_row(
+                queries::NAMESPACED_GET,
+                rusqlite::params!["v1", "Pod", &finalization.namespace, &finalization.name],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((current_rv, current_uid, data_bytes)) = current else {
+            continue;
+        };
+        if current_uid != finalization.pod_uid {
+            continue;
+        }
+        let data: serde_json::Value = serde_json::from_slice(&data_bytes)
+            .map_err(crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error)?;
+        let assigned_node = data
+            .pointer("/spec/nodeName")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let has_finalizers = data
+            .pointer("/metadata/finalizers")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|finalizers| !finalizers.is_empty());
+        let terminating = data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+            || (data
+                .pointer("/status/phase")
+                .and_then(serde_json::Value::as_str)
+                == Some("Failed")
+                && data
+                    .pointer("/status/reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("NodeLost"));
+        if assigned_node != Some(finalization.node_name.as_str()) || has_finalizers || !terminating
+        {
+            continue;
+        }
+        resolved.push(LogApplyMutation::PutWatchEvent(
+            crate::log_apply::LogApplyWatchEventRow {
+                event_id: None,
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some(finalization.namespace.clone()),
+                name: finalization.name.clone(),
+                resource_version: commit.resource_version,
+                event_type: "DELETED".to_string(),
+                data: crate::datastore::sqlite::resource_shape::hydrate_watch_event_data(
+                    data,
+                    "v1",
+                    "Pod",
+                    Some(finalization.namespace.as_str()),
+                    &finalization.name,
+                    commit.resource_version,
+                ),
+            },
+        ));
+        resolved.push(LogApplyMutation::DeleteResource(
+            crate::log_apply::LogApplyResourceKey {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some(finalization.namespace),
+                name: finalization.name,
+                uid: current_uid,
+                precondition_resource_version: Some(current_rv),
+            },
+        ));
+    }
+    commit.mutations = resolved;
+    Ok(commit)
 }
 
 fn applied_mutation_from_stamped_commit(

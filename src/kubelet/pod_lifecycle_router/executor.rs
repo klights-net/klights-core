@@ -442,6 +442,10 @@ async fn dispatch_via_runtime(
                         })
                         .await;
                 }
+                Ok(PodDeletionFinalizeResult::Queued) => {
+                    // The committed DELETED watch acknowledges normal
+                    // completion; do not turn durable enqueue into a retry.
+                }
                 Ok(PodDeletionFinalizeResult::FinalizersPending) => {
                     let _ = reply_to
                         .route(LifecycleMessage::PodWorkFailed {
@@ -835,6 +839,32 @@ mod tests {
                 name,
                 uid,
             } if namespace == "ns" && name == "delete-pod" && uid == "uid-del"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_actor_delete_waits_for_watch_without_scheduling_retry() {
+        let mock = std::sync::Arc::new(MockPodRuntimeService::new());
+        mock.set_finalize_result(
+            crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult::Queued,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(4);
+        let _keepalive = tx.clone();
+        dispatch_via_runtime(
+            mock.as_ref() as &dyn PodRuntimeService,
+            PodAction::FinalizePodDeletion {
+                key: PodLifecycleKey::new("ns", "delete-pod", "uid-del"),
+                operation_id: 4,
+                permit: None,
+            },
+            LifecycleReplyHandle::direct(tx),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
     }
 

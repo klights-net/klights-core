@@ -2161,7 +2161,10 @@ impl PodRuntimeService for RealPodRuntimeService {
         key: PodRuntimeKey,
     ) -> anyhow::Result<PodDeletionFinalizeResult> {
         let result = self.finalizer.finalize_after_actor_cleanup(&key).await?;
-        if matches!(result, PodDeletionFinalizeResult::DeletedOrAlreadyGone) {
+        if matches!(
+            result,
+            PodDeletionFinalizeResult::DeletedOrAlreadyGone | PodDeletionFinalizeResult::Queued
+        ) {
             self.status_emitter.forget(&key);
         }
         Ok(result)

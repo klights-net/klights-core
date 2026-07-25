@@ -348,6 +348,7 @@ pub enum LogApplyMutation {
     PutResource(LogApplyResourceRow),
     PatchResourceLatest(LogApplyResourcePatch),
     DeleteResource(LogApplyResourceKey),
+    FinalizeBoundPod(LogApplyPodActorFinalization),
     PutNamespace(LogApplyNamespaceRow),
     DeleteNamespace {
         name: String,
@@ -443,6 +444,17 @@ pub struct LogApplyResourceKey {
     pub uid: String,
     #[serde(default)]
     pub precondition_resource_version: Option<i64>,
+}
+
+/// Stable actor intent resolved against the live Pod row by the committed
+/// state-machine transaction. Mutable resourceVersion state is deliberately
+/// absent so transport replay cannot carry a stale CAS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogApplyPodActorFinalization {
+    pub namespace: String,
+    pub name: String,
+    pub pod_uid: String,
+    pub node_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -550,6 +562,7 @@ pub enum ResourceMutation {
     PutResource(LogApplyResourceRow),
     PatchResourceLatest(LogApplyResourcePatch),
     DeleteResource(LogApplyResourceKey),
+    FinalizeBoundPod(LogApplyPodActorFinalization),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -623,6 +636,9 @@ impl From<LogApplyMutation> for ClusterMutation {
             }
             LogApplyMutation::DeleteResource(value) => {
                 Self::Resource(ResourceMutation::DeleteResource(value))
+            }
+            LogApplyMutation::FinalizeBoundPod(value) => {
+                Self::Resource(ResourceMutation::FinalizeBoundPod(value))
             }
             LogApplyMutation::PutNamespace(value) => {
                 Self::Namespace(NamespaceMutation::PutNamespace(value))
@@ -707,6 +723,9 @@ impl From<ClusterMutation> for LogApplyMutation {
             }
             ClusterMutation::Resource(ResourceMutation::DeleteResource(value)) => {
                 Self::DeleteResource(value)
+            }
+            ClusterMutation::Resource(ResourceMutation::FinalizeBoundPod(value)) => {
+                Self::FinalizeBoundPod(value)
             }
             ClusterMutation::Namespace(NamespaceMutation::PutNamespace(value)) => {
                 Self::PutNamespace(value)
@@ -1213,6 +1232,15 @@ mod tests {
                     name: "pod-a".into(),
                     uid: "uid-a".into(),
                     precondition_resource_version: Some(7),
+                }),
+            ),
+            (
+                "bound-pod-finalization",
+                LogApplyMutation::FinalizeBoundPod(LogApplyPodActorFinalization {
+                    namespace: "default".into(),
+                    name: "pod-a".into(),
+                    pod_uid: "uid-a".into(),
+                    node_name: "worker-a".into(),
                 }),
             ),
             (

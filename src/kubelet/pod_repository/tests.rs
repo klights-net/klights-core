@@ -2097,7 +2097,7 @@ async fn worker_actor_finalization_uses_fresh_leader_read_before_emitting_finali
 }
 
 #[tokio::test]
-async fn worker_actor_finalization_retries_after_same_uid_resource_version_noop() {
+async fn worker_actor_finalization_serializes_same_uid_write_without_actor_retry() {
     let (cluster_db, cluster_handle) =
         crate::datastore::test_support::in_memory_with_handle().await;
     let cluster_store = super::store::PodStore::new(cluster_handle);
@@ -2158,7 +2158,7 @@ async fn worker_actor_finalization_retries_after_same_uid_resource_version_noop(
                 "uid-rv-retry-finalize",
             )
             .await
-            .expect("queue first exact-RV finalization"),
+            .expect("queue semantic finalization"),
         "queued finalization must keep the actor pending"
     );
 
@@ -2177,7 +2177,7 @@ async fn worker_actor_finalization_retries_after_same_uid_resource_version_noop(
         dispatcher
             .dispatch_due_once(i64::MAX / 4)
             .await
-            .expect("dispatch stale exact-RV finalization"),
+            .expect("dispatch semantic finalization"),
         crate::kubelet::outbox::DispatchOutcome::Dispatched
     );
     assert!(
@@ -2185,35 +2185,8 @@ async fn worker_actor_finalization_retries_after_same_uid_resource_version_noop(
             .get("default", "rv-retry-finalize")
             .await
             .expect("read after stale finalization")
-            .is_some(),
-        "same-UID resourceVersion race must make the first committed command a no-op"
-    );
-
-    assert!(
-        !repo
-            .finalize_pod_deletion_after_actor_cleanup(
-                "default",
-                "rv-retry-finalize",
-                "uid-rv-retry-finalize",
-            )
-            .await
-            .expect("scheduled actor retry queues fresh exact-RV finalization"),
-        "fresh retry remains pending until its committed removal is observed"
-    );
-    assert_eq!(
-        dispatcher
-            .dispatch_due_once(i64::MAX / 4)
-            .await
-            .expect("dispatch fresh exact-RV finalization"),
-        crate::kubelet::outbox::DispatchOutcome::Dispatched
-    );
-    assert!(
-        cluster_store
-            .get("default", "rv-retry-finalize")
-            .await
-            .expect("read committed removal")
             .is_none(),
-        "fresh UID/RV retry must complete actor-owned removal"
+        "the first semantic command must serialize after the status write and remove the Pod"
     );
     assert!(
         repo.finalize_pod_deletion_after_actor_cleanup(

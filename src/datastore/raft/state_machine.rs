@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actor_finalization_rejects_same_uid_newer_resource_generation() {
+    async fn actor_finalization_serializes_after_same_uid_metadata_generation() {
         let db = crate::datastore::test_support::in_memory().await;
         let observed = db
             .create_resource(
@@ -672,19 +672,18 @@ mod tests {
             .unwrap();
         let mut newer = (*observed.data).clone();
         newer["metadata"]["annotations"] = json!({"race.example/generation": "newer"});
-        let newer = db
-            .update_resource(
-                "v1",
-                "Pod",
-                Some("default"),
-                "generation-race",
-                newer,
-                observed.resource_version,
-            )
-            .await
-            .unwrap();
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "generation-race",
+            newer,
+            observed.resource_version,
+        )
+        .await
+        .unwrap();
 
-        let stale = propose_outbox_on_backend(
+        let finalized = propose_outbox_on_backend(
             &db,
             "stale-generation-finalize",
             OutboxOperation::PodMetadata,
@@ -700,20 +699,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(stale.command.is_none());
-        assert!(stale.resource.is_none());
-        let surviving = db
-            .get_resource("v1", "Pod", Some("default"), "generation-race")
-            .await
-            .unwrap()
-            .expect("same-UID newer generation must survive stale actor finalization");
-        assert_eq!(surviving.resource_version, newer.resource_version);
-        assert_eq!(
-            surviving
-                .data
-                .pointer("/metadata/annotations/race.example~1generation")
-                .and_then(serde_json::Value::as_str),
-            Some("newer")
+        assert!(matches!(
+            finalized.command,
+            Some(StorageCommand::FinalizeBoundPod { .. })
+        ));
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "generation-race")
+                .await
+                .unwrap()
+                .is_none(),
+            "benign same-UID metadata churn must serialize before actor finalization"
         );
     }
 

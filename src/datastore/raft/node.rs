@@ -30,7 +30,7 @@ use crate::datastore::raft::types::{
 };
 
 pub(crate) const KEY_COMMAND_CODEC_ACTIVATION_VERSION: &str = "command_codec_activation_version";
-const COMMAND_CODEC_ACTIVATION_VALUE: &str = "3";
+pub(crate) const COMMAND_CODEC_ACTIVATION_VALUE: &str = "3";
 const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -1857,7 +1857,7 @@ fn validate_committed_apply_v1_join_feature(
     assignment_mode: crate::log_apply::ResourceVersionAssignment,
     supported_features: u64,
 ) -> std::result::Result<(), String> {
-    if supported_features & crate::replication::protocol::COMMAND_CODEC_V3 == 0 {
+    if !crate::replication::protocol::supports_command_codec_v3(supported_features) {
         return Err(
             "joining voters and learners must advertise the exact COMMAND_CODEC_V3 capability"
                 .to_string(),
@@ -2173,7 +2173,7 @@ mod tests {
                     1,
                     Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
                 ),
-                (2, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+                (2, Ok(crate::replication::protocol::COMMAND_CODEC_V3)),
             ]
             .into_iter()
             .collect(),
@@ -2212,7 +2212,10 @@ mod tests {
                     1,
                     Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
                 ),
-                (2, Ok(crate::replication::protocol::COMMAND_CODEC_V3)),
+                (
+                    2,
+                    Ok(crate::replication::protocol::LOCAL_SUPPORTED_FEATURES),
+                ),
             ]
             .into_iter()
             .collect(),

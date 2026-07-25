@@ -32,7 +32,7 @@ pub struct ProtoOutboxStreamWatermark {
 pub struct ProtoLogApplyMutation {
     #[prost(
         oneof = "proto_log_apply_mutation::Mutation",
-        tags = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21"
+        tags = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22"
     )]
     pub mutation: Option<proto_log_apply_mutation::Mutation>,
 }
@@ -66,6 +66,18 @@ pub struct ProtoLogApplyNodeSubnetAllocation {
     pub cluster_cidr: String,
     #[prost(string, tag = "3")]
     pub node_ip: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoLogApplyPodActorFinalization {
+    #[prost(string, tag = "1")]
+    pub namespace: String,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(string, tag = "3")]
+    pub pod_uid: String,
+    #[prost(string, tag = "4")]
+    pub node_name: String,
 }
 
 pub mod proto_log_apply_mutation {
@@ -113,6 +125,8 @@ pub mod proto_log_apply_mutation {
         PatchResourceLatest(super::ProtoLogApplyResourcePatch),
         #[prost(message, tag = "21")]
         GcWatchEvents(super::ProtoLogApplyWatchEventsGc),
+        #[prost(message, tag = "22")]
+        FinalizeBoundPod(super::ProtoLogApplyPodActorFinalization),
     }
 }
 

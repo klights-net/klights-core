@@ -541,19 +541,13 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
             .finalize_bound_pod(finalization_request)
             .await
             .map_err(anyhow::Error::new)?;
+        if matches!(finalization_outcome, BoundPodFinalizationOutcome::Accepted) {
+            return Ok(PodDeletionFinalizeResult::Queued);
+        }
         if matches!(
             finalization_outcome,
-            BoundPodFinalizationOutcome::Accepted
-                | BoundPodFinalizationOutcome::FinalizersPending
-                | BoundPodFinalizationOutcome::Retry
+            BoundPodFinalizationOutcome::FinalizersPending | BoundPodFinalizationOutcome::Retry
         ) {
-            // Remote acceptance proves only that the exact UID/RV command is
-            // durable in node.db. It does not prove the leader committed row
-            // removal: an intervening same-UID write may make that command a
-            // transactional no-op. Keep the actor alive on its supervised
-            // one-shot retry path so it observes a fresh leader RV and emits
-            // a new idempotency key until a delete watch (or fresh absence)
-            // confirms actor-owned removal.
             return Ok(PodDeletionFinalizeResult::FinalizersPending);
         }
         self.delete_status_checkpoint_after_finalization(uid).await;

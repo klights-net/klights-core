@@ -4668,6 +4668,35 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .await
         .unwrap();
 
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalizer-race".to_string(),
+            pod_uid: "finalizer-race-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: observed.resource_version,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-finalizer-race",
+            "PodMetadata",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .expect("eligible actor finalization must produce a semantic commit")
+    else {
+        panic!("expected a new actor-finalization outbox commit");
+    };
+    assert!(commit.mutations.iter().any(|mutation| matches!(
+        mutation,
+        crate::log_apply::LogApplyMutation::FinalizeBoundPod(finalization)
+            if finalization.pod_uid == "finalizer-race-uid"
+    )));
+
     db.update_resource(
         "v1",
         "Pod",
@@ -4692,39 +4721,9 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     )
     .await
     .unwrap();
-
     let before_apply_rv = db.get_current_resource_version().await.unwrap();
     let before_apply_watch_count = watch_event_count(&db).await;
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
-        StorageCommand::FinalizeBoundPod {
-            namespace: "default".to_string(),
-            name: "finalizer-race".to_string(),
-            pod_uid: "finalizer-race-uid".to_string(),
-            node_name: "worker-a".to_string(),
-            observed_resource_version: before_apply_rv,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
-        .build_log_apply_commit_for_outbox(
-            "actor-finalize-finalizer-race",
-            "PodMetadata",
-            payload.as_ref(),
-            "worker-a",
-        )
-        .await
-        .expect("ineligible actor finalization is an acknowledged ledger-only commit")
-    else {
-        panic!("expected a new actor-finalization outbox commit");
-    };
-    assert!(
-        commit.mutations.iter().all(|mutation| matches!(
-            mutation,
-            crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
-        )),
-        "late finalizer must produce no Pod delete mutation"
-    );
+
     db.apply_raft_log_apply_commit(commit).await.unwrap();
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
@@ -4799,8 +4798,8 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     };
     assert!(fresh_commit.mutations.iter().any(|mutation| matches!(
         mutation,
-        crate::log_apply::LogApplyMutation::DeleteResource(key)
-            if key.kind == "Pod" && key.uid == "finalizer-race-uid"
+        crate::log_apply::LogApplyMutation::FinalizeBoundPod(finalization)
+            if finalization.pod_uid == "finalizer-race-uid"
     )));
     db.apply_raft_log_apply_commit(fresh_commit).await.unwrap();
     assert!(
@@ -4956,7 +4955,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         };
         assert!(commit.mutations.iter().any(|mutation| matches!(
             mutation,
-            crate::log_apply::LogApplyMutation::DeleteResource(_)
+            crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
         )));
         assert!(commit.resource_version > 0);
         assert_eq!(applied_rv, commit.resource_version);
@@ -5020,6 +5019,103 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .await
         .unwrap();
     assert_eq!(v1_placeholder_count, 0);
+}
+
+#[tokio::test]
+async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
+    let observed = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "finalize-rv-race",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "finalize-rv-race",
+                    "uid": "finalize-rv-race-uid",
+                    "deletionTimestamp": "2026-07-24T00:00:00Z"
+                },
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::FinalizeBoundPod {
+            namespace: "default".to_string(),
+            name: "finalize-rv-race".to_string(),
+            pod_uid: "finalize-rv-race-uid".to_string(),
+            node_name: "worker-a".to_string(),
+            observed_resource_version: observed.resource_version,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
+        .build_log_apply_commit_for_outbox(
+            "actor-finalize-rv-race",
+            "PodMetadata",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("eligible actor finalization must reach proposal");
+    };
+
+    let mut refreshed_data = (*observed.data).clone();
+    refreshed_data["status"]["phase"] = json!("Failed");
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "finalize-rv-race",
+        refreshed_data,
+        observed.resource_version,
+    )
+    .await
+    .unwrap();
+
+    let before_delete_rv = db.get_current_resource_version().await.unwrap();
+    let before_delete_watch_count = watch_event_count(&db).await;
+    db.apply_raft_log_apply_commit(commit)
+        .await
+        .expect("committed actor finalization must serialize after the status write");
+    assert!(
+        db.get_resource("v1", "Pod", Some("default"), "finalize-rv-race")
+            .await
+            .unwrap()
+            .is_none(),
+        "the actor-owned delete must complete without an RV retry"
+    );
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before_delete_rv + 1,
+        "semantic deletion must allocate exactly one public resourceVersion"
+    );
+    assert_eq!(
+        watch_event_count(&db).await,
+        before_delete_watch_count + 1,
+        "semantic deletion must publish exactly one DELETED watch event"
+    );
 }
 
 #[tokio::test]
@@ -5127,7 +5223,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibi
         assert_eq!(
             commit.mutations.iter().any(|mutation| matches!(
                 mutation,
-                crate::log_apply::LogApplyMutation::DeleteResource(_)
+                crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
             )),
             case.eligible,
             "{} delete mutation eligibility mismatch",

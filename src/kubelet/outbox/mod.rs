@@ -1054,6 +1054,19 @@ impl OutboxDispatcher {
                         "complete superseded pod status outbox rows failed"
                     );
                 }
+                if row.is_terminal_pod_delete
+                    && let Err(err) = self
+                        .node_db
+                        .delete_pod_status_checkpoint(&row.pod_uid)
+                        .await
+                {
+                    tracing::warn!(
+                        outbox_id = row.id,
+                        pod_uid = %row.pod_uid,
+                        error = %err,
+                        "delete terminal Pod status checkpoint failed"
+                    );
+                }
             }
             Err(err) if err.is_retryable() || !err.is_terminal() => {
                 self.dispatch_errors_total
@@ -1064,6 +1077,25 @@ impl OutboxDispatcher {
                     &row.idempotency_key,
                     self.rtt.estimate_ms(),
                 ));
+                if matches!(err, OutboxApplyError::CodecIncompatible { .. }) {
+                    match self
+                        .node_db
+                        .mark_outbox_attempt_failed(row.id, lease_token, backoff_until_ms, &error)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            outbox_id = row.id,
+                            "codec-incompatible outbox failure was not recorded because the lease was lost"
+                        ),
+                        Err(mark_err) => tracing::warn!(
+                            outbox_id = row.id,
+                            error = %mark_err,
+                            "record codec-incompatible outbox retry failed"
+                        ),
+                    }
+                    return;
+                }
                 match self
                     .node_db
                     .record_outbox_failure(
@@ -1120,7 +1152,7 @@ impl OutboxDispatcher {
                         .await
                     {
                         Ok(OutboxFailureDisposition::DeadLettered) => {
-                            if records_checkpoint
+                            if (records_checkpoint || row.is_terminal_pod_delete)
                                 && let Err(error) = self
                                     .node_db
                                     .delete_pod_status_checkpoint(&row.pod_uid)
@@ -1150,7 +1182,7 @@ impl OutboxDispatcher {
                         }
                     }
                 }
-                if records_checkpoint
+                if (records_checkpoint || row.is_terminal_pod_delete)
                     && let Err(error) = self
                         .node_db
                         .delete_pod_status_checkpoint(&row.pod_uid)
@@ -1664,6 +1696,73 @@ mod tests {
                     .unwrap_or(Ok(OutboxApplyResult::Applied { applied_rv: 1 }))
             })
         }
+    }
+
+    struct IncompatibleCodecDelivery;
+
+    impl LeaderOutboxDelivery for IncompatibleCodecDelivery {
+        fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+            Box::pin(async {
+                Err(OutboxApplyError::codec_incompatible(
+                    klights_cluster_core::COMMAND_CODEC_VERSION - 1,
+                    klights_cluster_core::COMMAND_CODEC_VERSION,
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_terminal_actor_delete_removes_uid_status_checkpoint() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        node_db
+            .upsert_pod_status_checkpoint(
+                "uid-terminal",
+                "default",
+                "terminal",
+                7,
+                serde_json::json!({"phase": "Failed"}),
+                1_000,
+            )
+            .await
+            .expect("seed UID status checkpoint");
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                "terminal-actor-delete",
+                OutboxOperation::PodMetadata,
+                OutboxSubject::new(
+                    "v1/Pod/default/terminal/uid-terminal",
+                    Some("default".to_string()),
+                    "terminal",
+                    Some("uid-terminal".to_string()),
+                ),
+                "uid-terminal",
+                StorageCommand::FinalizeBoundPod {
+                    namespace: "default".to_string(),
+                    name: "terminal".to_string(),
+                    pod_uid: "uid-terminal".to_string(),
+                    node_name: "worker-a".to_string(),
+                    observed_resource_version: 7,
+                },
+                1_000,
+            ))
+            .await
+            .expect("enqueue terminal actor delete");
+
+        let dispatcher =
+            OutboxDispatcher::for_tests(node_db.clone(), Arc::new(FakeApplyClient::default()));
+        assert_eq!(
+            dispatcher.dispatch_due_once(1_000).await.expect("dispatch"),
+            DispatchOutcome::Dispatched
+        );
+        assert!(
+            node_db
+                .get_pod_status_checkpoint("uid-terminal")
+                .await
+                .expect("read status checkpoint")
+                .is_none(),
+            "successful terminal actor delete must remove the UID status checkpoint"
+        );
     }
 
     #[derive(Default)]
@@ -2281,6 +2380,62 @@ mod tests {
                 .expect("claim after terminal drop")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn incompatible_codec_never_consumes_actor_delete_at_shared_retry_cap() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let dispatcher =
+            OutboxDispatcher::for_tests(node_db.clone(), Arc::new(IncompatibleCodecDelivery));
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                "codec-rejected-actor-delete",
+                OutboxOperation::PodMetadata,
+                OutboxSubject::new(
+                    "v1/Pod/default/web/uid-codec",
+                    Some("default".to_string()),
+                    "web",
+                    Some("uid-codec".to_string()),
+                ),
+                "uid-codec",
+                StorageCommand::FinalizeBoundPod {
+                    namespace: "default".to_string(),
+                    name: "web".to_string(),
+                    pod_uid: "uid-codec".to_string(),
+                    node_name: "worker-a".to_string(),
+                    observed_resource_version: 7,
+                },
+                1_000,
+            ))
+            .await
+            .expect("enqueue actor delete");
+
+        let mut now = 1_000;
+        for _ in 0..=super::MAX_OUTBOX_ATTEMPTS {
+            assert_eq!(
+                dispatcher.dispatch_due_once(now).await.expect("dispatch"),
+                DispatchOutcome::Dispatched
+            );
+            now = match dispatcher.dispatch_due_once(now).await.expect("next wake") {
+                DispatchOutcome::Idle {
+                    next_wake_ms: Some(next),
+                } => next,
+                other => panic!("expected retained row with a retry wake, got {other:?}"),
+            };
+        }
+
+        assert!(
+            node_db.list_dead_letter().await.unwrap().is_empty(),
+            "codec rejection must never dead-letter the durable actor delete"
+        );
+        let retained = node_db
+            .claim_next_due_outbox(now, 1_000, "retained-codec-row")
+            .await
+            .unwrap()
+            .expect("codec-rejected actor delete must remain durable");
+        assert_eq!(retained.idempotency_key, "codec-rejected-actor-delete");
+        assert!(retained.attempt > super::MAX_OUTBOX_ATTEMPTS);
     }
 
     #[tokio::test]

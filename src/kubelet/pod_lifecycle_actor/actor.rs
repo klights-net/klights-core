@@ -1574,6 +1574,12 @@ impl PodLifecycleActor {
             } => {
                 self.state.update_resource_version(resource_version);
                 if self.state.active_uid.is_none() {
+                    if self.state.in_flight_kind_for_uid(&key.uid)
+                        == Some(PodLifecycleWorkKind::FinalizePodDeletion)
+                    {
+                        self.state.cancel_in_flight();
+                        self.state.pending_delete_finalization_retry = false;
+                    }
                     self.state.phase = PodPhase::Terminated;
                     return PodAction::Noop;
                 }
@@ -1600,12 +1606,17 @@ impl PodLifecycleActor {
 
             // ── Retry / failure ──
             LifecycleMessage::RetryDue { key } => {
-                if self.state.phase == PodPhase::Terminated
-                    && self.state.in_flight.is_none()
-                    && self.state.active_uid.is_none()
-                {
-                    self.state.pending_delete_finalization_retry = false;
-                    return self.finalize_pod_deletion_action(key);
+                if self.state.phase == PodPhase::Terminated && self.state.active_uid.is_none() {
+                    if self.state.pending_delete_finalization_retry
+                        && self.state.in_flight.is_none()
+                    {
+                        self.state.pending_delete_finalization_retry = false;
+                        return self.finalize_pod_deletion_action(key);
+                    }
+                    // A watch-driven reissue or committed DELETED watch
+                    // supersedes any already-armed retry timer. Never let that
+                    // stale timer readmit the old UID into the name slot.
+                    return PodAction::Noop;
                 }
                 if self.state.phase == PodPhase::Stopping
                     && self.state.in_flight.is_none()

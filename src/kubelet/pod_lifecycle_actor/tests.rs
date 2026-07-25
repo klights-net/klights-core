@@ -3333,6 +3333,63 @@ fn stop_pod_completion_finalizes_delete_before_admitting_pending_replacement() {
 }
 
 #[test]
+fn late_finalizer_removal_reissues_semantic_delete_and_stale_retry_cannot_readmit_uid() {
+    use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let pod = test_pod("default", "pod-a", "uid-a");
+    let _ = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: pod.clone(),
+    });
+    let stop = actor.handle_for_test(LifecycleMessage::WatchDeleted {
+        key: key.clone(),
+        resource_version: Some(2),
+        pod: pod.clone(),
+    });
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: stop.operation_id().expect("stop operation"),
+        kind: PodLifecycleWorkKind::StopPod,
+        sandbox_id: None,
+    });
+    let retry = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key: key.clone(),
+        operation_id: finalize.operation_id().expect("finalize operation"),
+        kind: PodLifecycleWorkKind::FinalizePodDeletion,
+        retryable: true,
+        failure: PodLifecycleWorkFailure::FinalizersPending,
+    });
+    assert!(matches!(retry, PodAction::ScheduleRetry { .. }));
+
+    let mut finalizer_free = pod;
+    finalizer_free["metadata"]["deletionTimestamp"] = serde_json::json!("2026-07-25T00:00:00Z");
+    finalizer_free["metadata"]["finalizers"] = serde_json::json!([]);
+    let reissued = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key.clone(),
+        resource_version: Some(3),
+        pod: finalizer_free,
+    });
+    assert!(
+        matches!(reissued, PodAction::FinalizePodDeletion { .. }),
+        "finalizer removal must event-drive a fresh semantic finalization"
+    );
+
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::RetryDue { key }),
+        PodAction::Noop
+    ));
+    assert_eq!(
+        actor.active_uid_for_test(),
+        None,
+        "a superseded retry timer must not readmit the finalized UID"
+    );
+}
+
+#[test]
 fn stale_old_uid_messages_do_not_mutate_active_replacement() {
     use crate::kubelet::cri_events::KubeletEventKind;
     use crate::kubelet::lifecycle::LifecycleCommand;
