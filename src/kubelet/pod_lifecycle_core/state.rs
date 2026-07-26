@@ -398,6 +398,16 @@ impl PodLifecycleState {
         }
     }
 
+    pub fn defer_runtime_reconcile_event(
+        &mut self,
+        container_id: &str,
+        kind: crate::kubelet::cri_events::KubeletEventKind,
+    ) {
+        self.pending_runtime_reconcile = true;
+        self.runtime_reconcile_observations
+            .observe_event(container_id, kind);
+    }
+
     pub fn restore_runtime_reconcile_observations(
         &mut self,
         pod_uid: impl Into<String>,
@@ -436,8 +446,12 @@ impl PodLifecycleState {
             return crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
         }
         self.pending_runtime_reconcile = false;
-        let ids = self.runtime_reconcile_observations.drain();
-        crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_ids(ids)
+        let events = self.runtime_reconcile_observations.drain();
+        let mut hint = crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
+        for (container_id, kind) in events {
+            hint = hint.with_container_event(container_id, kind);
+        }
+        hint
     }
 }
 

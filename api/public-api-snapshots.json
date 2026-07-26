@@ -3,9 +3,9 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 42263,
-      "sha256": "c4600ac55cc5573a787d3f5e031bdcb411c956a502b08595dfeea43e522d0722",
-      "source": {"count": 521632, "sha256": "fd6930fcdd56e72d81819e3efb8e21c7939501039c7728eafdd3adb5b852ba30"}
+      "count": 42268,
+      "sha256": "1b89df0868013db96920ea5f9712ab8f3bcc853a3ba72c2e30fa83b7a8781156",
+      "source": {"count": 521877, "sha256": "b67edd5bd5faf6a688d9403a5aa150c1ed772adc62fad1be0369e62b6159c2b8"}
     },
     "klights-apiserver": {
       "count": 0,

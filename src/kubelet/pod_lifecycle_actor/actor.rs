@@ -837,6 +837,7 @@ impl PodLifecycleActor {
         &mut self,
         key: PodLifecycleKey,
         container_id: Option<&str>,
+        event_kind: Option<crate::kubelet::cri_events::KubeletEventKind>,
     ) -> PodAction {
         let in_flight = self.state.in_flight_kind_for_uid(&key.uid);
         let defer = in_flight.is_some()
@@ -850,15 +851,26 @@ impl PodLifecycleActor {
             "lifecycle-actor: CRI event → runtime_reconcile_action_or_defer"
         );
         if defer {
-            self.state.defer_runtime_reconcile(container_id);
+            if let (Some(container_id), Some(event_kind)) = (container_id, event_kind) {
+                self.state
+                    .defer_runtime_reconcile_event(container_id, event_kind);
+            } else {
+                self.state.defer_runtime_reconcile(container_id);
+            }
             PodAction::Noop
         } else {
-            self.reconcile_runtime_action(
-                key,
-                crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_id(
+            let hint = match (container_id, event_kind) {
+                (Some(container_id), Some(event_kind)) => {
+                    crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_event(
+                        container_id,
+                        event_kind,
+                    )
+                }
+                _ => crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_id(
                     container_id.unwrap_or(""),
                 ),
-            )
+            };
+            self.reconcile_runtime_action(key, hint)
         }
     }
 
@@ -1494,7 +1506,7 @@ impl PodLifecycleActor {
                         in_flight = ?self.state.in_flight_kind_for_uid(&key.uid),
                         "lifecycle-actor: Pending watch echo has podIP and running containers; reconciling runtime status"
                     );
-                    self.runtime_reconcile_action_or_defer(key, None)
+                    self.runtime_reconcile_action_or_defer(key, None, None)
                 } else if self.state.phase == PodPhase::Created {
                     self.state.phase = PodPhase::PendingStart;
                     self.start_or_check_slot_admission(key, pod.clone(), resource_version, true)
@@ -2096,13 +2108,15 @@ impl PodLifecycleActor {
 
             // ── Runtime reconcile ──
             LifecycleMessage::CriEvent {
-                key, container_id, ..
+                key,
+                container_id,
+                kind,
             } => {
                 if let Some(action) = self.stale_active_uid_noop("cri_event", &key, false) {
                     return action;
                 }
                 self.ensure_active_uid(&key);
-                self.runtime_reconcile_action_or_defer(key, Some(container_id.as_str()))
+                self.runtime_reconcile_action_or_defer(key, Some(container_id.as_str()), Some(kind))
             }
             LifecycleMessage::ActiveDeadlineDue { key } => {
                 if let Some(action) = self.stale_active_uid_noop("active_deadline_due", &key, false)
@@ -2110,7 +2124,7 @@ impl PodLifecycleActor {
                     return action;
                 }
                 self.ensure_active_uid(&key);
-                self.runtime_reconcile_action_or_defer(key, None)
+                self.runtime_reconcile_action_or_defer(key, None, None)
             }
 
             // ── Commands ──

@@ -2,13 +2,16 @@
 //!
 //! Replaces the single `pending_runtime_reconcile_container_id: Option<String>`
 //! field so that CRI events for multiple containers (or multiple events for the
-//! same container) are all preserved until the next reconcile drains them.
+//! same container) and each container's latest transition are preserved until
+//! the next reconcile drains them.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+
+use crate::kubelet::cri_events::KubeletEventKind;
 
 /// All container IDs observed from CRI events for a single Pod, keyed by
 /// Pod UID. The actor owns insertion and draining; the reconciler receives a
-/// snapshot via `RuntimeReconcileHint::from_container_ids`.
+/// snapshot via `RuntimeReconcileHint`.
 ///
 /// Properties:
 /// - Bounded: each actor holds at most one `RuntimeReconcileObservations` at
@@ -20,7 +23,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeReconcileObservations {
     pod_uid: String,
-    container_ids: BTreeSet<String>,
+    container_events: BTreeMap<String, KubeletEventKind>,
     generation: u64,
 }
 
@@ -28,7 +31,7 @@ impl RuntimeReconcileObservations {
     pub fn new(pod_uid: impl Into<String>) -> Self {
         Self {
             pod_uid: pod_uid.into(),
-            container_ids: BTreeSet::new(),
+            container_events: BTreeMap::new(),
             generation: 0,
         }
     }
@@ -40,10 +43,11 @@ impl RuntimeReconcileObservations {
     ) -> Self {
         Self {
             pod_uid: pod_uid.into(),
-            container_ids: container_ids
+            container_events: container_ids
                 .into_iter()
                 .map(Into::into)
                 .filter(|id: &String| !id.is_empty())
+                .map(|id| (id, KubeletEventKind::Created))
                 .collect(),
             generation,
         }
@@ -56,8 +60,13 @@ impl RuntimeReconcileObservations {
     /// Record a CRI event container ID. Idempotent (BTreeSet dedup).
     /// Generation increments only for new (non-duplicate) inserts.
     pub fn observe(&mut self, container_id: impl Into<String>) {
+        self.observe_event(container_id, KubeletEventKind::Created);
+    }
+
+    /// Record the latest typed transition for a container.
+    pub fn observe_event(&mut self, container_id: impl Into<String>, kind: KubeletEventKind) {
         let id = container_id.into();
-        if !id.is_empty() && self.container_ids.insert(id) {
+        if !id.is_empty() && self.container_events.insert(id, kind) != Some(kind) {
             self.generation += 1;
         }
     }
@@ -70,11 +79,11 @@ impl RuntimeReconcileObservations {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.container_ids.is_empty()
+        self.container_events.is_empty()
     }
 
     pub fn container_ids(&self) -> impl Iterator<Item = &str> {
-        self.container_ids.iter().map(String::as_str)
+        self.container_events.keys().map(String::as_str)
     }
 
     pub fn generation(&self) -> u64 {
@@ -83,9 +92,9 @@ impl RuntimeReconcileObservations {
 
     /// Drain all container IDs and reset generation. Called after a
     /// successful reconcile pass so stale observations don't accumulate.
-    pub fn drain(&mut self) -> BTreeSet<String> {
+    pub fn drain(&mut self) -> BTreeMap<String, KubeletEventKind> {
         self.generation = 0;
-        std::mem::take(&mut self.container_ids)
+        std::mem::take(&mut self.container_events)
     }
 }
 
@@ -99,7 +108,7 @@ mod tests {
         obs.observe("ctr-a");
         obs.observe("ctr-b");
         obs.observe("ctr-a"); // dedup
-        let ids: BTreeSet<_> = obs.container_ids().collect();
+        let ids: std::collections::BTreeSet<_> = obs.container_ids().collect();
         assert_eq!(ids, ["ctr-a", "ctr-b"].iter().copied().collect());
         assert_eq!(obs.generation(), 2);
     }
@@ -109,7 +118,7 @@ mod tests {
         let mut obs = RuntimeReconcileObservations::new("pod-uid");
         obs.observe("ctr-x");
         let drained = obs.drain();
-        assert!(drained.contains("ctr-x"));
+        assert!(drained.contains_key("ctr-x"));
         assert!(obs.is_empty());
         assert_eq!(obs.generation(), 0);
     }

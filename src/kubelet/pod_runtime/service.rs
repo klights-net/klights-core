@@ -168,6 +168,24 @@ const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Durati
 #[cfg(test)]
 const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
+fn apply_runtime_event_hint(
+    hint: &RuntimeReconcileHint,
+    container_id: &str,
+    state: crate::kubelet::pod_runtime::cri::ContainerRuntimeState,
+) -> crate::kubelet::pod_runtime::cri::ContainerRuntimeState {
+    if hint.event_kind(container_id) == Some(crate::kubelet::cri_events::KubeletEventKind::Started)
+        && matches!(
+            state,
+            crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Created
+                | crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Unknown
+        )
+    {
+        crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Running
+    } else {
+        state
+    }
+}
+
 pub(super) struct ContainerConfigBuildRequest<'a> {
     pub(super) key: &'a PodRuntimeKey,
     pub(super) pod: &'a serde_json::Value,
@@ -2221,6 +2239,14 @@ impl PodRuntimeService for RealPodRuntimeService {
             .list_containers(Some(&sandbox_id))
             .await
             .unwrap_or_default();
+        // containerd can publish a Started event a few milliseconds before
+        // ListContainers/ContainerStatus advances from Created. The event is
+        // the newer CRI observation, so preserve that monotonic transition
+        // while still sourcing container identity/image/timestamps below from
+        // ContainerStatus. A later Exited snapshot always wins.
+        for (container_id, state) in &mut containers {
+            *state = apply_runtime_event_hint(&hint, container_id, *state);
+        }
         // Augment with ALL observed container IDs from the hint, not just when
         // the listing is empty. Multi-container pods and partial listings miss
         // exited containers that have already been removed from the sandbox;
@@ -2230,12 +2256,13 @@ impl PodRuntimeService for RealPodRuntimeService {
             if containers.iter().any(|(id, _)| id == container_id) {
                 continue; // Already present in the listing — skip the direct fetch.
             }
-            if let Some(state) = status_projection::runtime_state_from_container_status(
+            if let Some(mut state) = status_projection::runtime_state_from_container_status(
                 self.cri.as_ref(),
                 container_id,
             )
             .await?
             {
+                state = apply_runtime_event_hint(&hint, container_id, state);
                 containers.push((container_id.to_string(), state));
             }
             // If the hinted ID has no runtime status, treat as observation miss

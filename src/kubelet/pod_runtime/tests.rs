@@ -10542,7 +10542,14 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
         .runtime
         .reconcile_runtime(
             key.clone(),
-            RuntimeReconcileHint::from_container_id("ctr-fast-exit"),
+            RuntimeReconcileHint::from_container_event(
+                "ctr-fast-exit",
+                crate::kubelet::cri_events::KubeletEventKind::Started,
+            )
+            .with_container_event(
+                "ctr-fast-exit",
+                crate::kubelet::cri_events::KubeletEventKind::Stopped,
+            ),
         )
         .await
         .unwrap();
@@ -10576,6 +10583,129 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
     );
 }
 
+#[tokio::test]
+async fn started_cri_event_overrides_lagging_created_status_snapshot() {
+    use crate::kubelet::cri_events::KubeletEventKind;
+    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
+    use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("kube-system", "coredns", "uid-coredns");
+    let image = "coredns/coredns:1.11.1";
+    let pod = serde_json::json!({
+        "apiVersion":"v1","kind":"Pod",
+        "metadata":{"namespace":"kube-system","name":"coredns","uid":"uid-coredns","resourceVersion":"1"},
+        "spec":{"nodeName":"test-node","restartPolicy":"Always","containers":[{"name":"coredns","image":image}]},
+        "status":{"phase":"Pending","containerStatuses":[{"name":"coredns","containerID":"containerd://ctr-coredns","image":image,"imageID":"","ready":false,"started":false,"restartCount":0,"state":{"waiting":{"reason":"ContainerCreating"}}}]}
+    });
+    harness.create_runtime_pod(pod.clone()).await;
+    harness
+        .repo
+        .set_pod_status_for_uid(
+            "kube-system",
+            "coredns",
+            "uid-coredns",
+            PodStatusUpdate {
+                phase: "Pending".to_string(),
+                pod_ip: "10.50.0.2".to_string(),
+                host_ip: "172.31.10.2".to_string(),
+                container_statuses: pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap(),
+                init_container_statuses: None,
+                qos_class: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    harness
+        .store
+        .record_sandbox(&key, "sandbox-coredns")
+        .await
+        .unwrap();
+
+    // containerd can emit Started before its ListContainers/ContainerStatus
+    // cache advances from Created. The event is the newer runtime observation.
+    harness.container_control.set_container_states(vec![(
+        "ctr-coredns".to_string(),
+        ContainerRuntimeState::Created,
+    )]);
+    harness.cri.set_container_status_for_test(
+        "ctr-coredns",
+        "coredns",
+        ContainerRuntimeState::Created,
+        0,
+        0,
+        0,
+        image,
+    );
+
+    harness
+        .runtime
+        .reconcile_runtime(
+            key.clone(),
+            RuntimeReconcileHint::from_container_event("ctr-coredns", KubeletEventKind::Started),
+        )
+        .await
+        .unwrap();
+
+    let updated = harness.stored_pod(&key).await;
+    assert_eq!(
+        updated
+            .pointer("/status/phase")
+            .and_then(|value| value.as_str()),
+        Some("Running")
+    );
+    let status = updated
+        .pointer("/status/containerStatuses/0")
+        .expect("container status");
+    assert_eq!(status.get("ready"), Some(&serde_json::json!(true)));
+    assert_eq!(status.get("started"), Some(&serde_json::json!(true)));
+    assert!(status.pointer("/state/running").is_some());
+    assert_eq!(status.get("image"), Some(&serde_json::json!(image)));
+    assert_eq!(
+        status.get("imageID"),
+        Some(&serde_json::json!("coredns/coredns:1.11.1"))
+    );
+
+    let first_resource_version = updated
+        .pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .expect("resource version after Started observation")
+        .to_string();
+    harness.container_control.set_container_states(vec![(
+        "ctr-coredns".to_string(),
+        ContainerRuntimeState::Running,
+    )]);
+    harness.cri.set_container_status_for_test(
+        "ctr-coredns",
+        "coredns",
+        ContainerRuntimeState::Running,
+        0,
+        0,
+        0,
+        image,
+    );
+    harness
+        .runtime
+        .reconcile_runtime(key.clone(), RuntimeReconcileHint::none())
+        .await
+        .unwrap();
+    let caught_up = harness.stored_pod(&key).await;
+    assert_eq!(
+        caught_up
+            .pointer("/metadata/resourceVersion")
+            .and_then(|value| value.as_str()),
+        Some(first_resource_version.as_str()),
+        "the status emitter must suppress the duplicate once CRI status catches up"
+    );
+}
+
 // Task 4 tests (red-green): track multiple CRI event container IDs
 #[cfg(test)]
 mod task4_runtime_observations {
@@ -10598,6 +10728,26 @@ mod task4_runtime_observations {
         assert!(ids.contains("ctr-b"), "must preserve ctr-b");
         assert!(ids.contains("ctr-c"), "must preserve ctr-c");
         assert_eq!(ids.len(), 3, "must have all 3 IDs, got: {ids:?}");
+    }
+
+    #[test]
+    fn deferred_runtime_reconcile_preserves_latest_kind_per_container() {
+        use crate::kubelet::cri_events::KubeletEventKind;
+
+        let mut state = PodLifecycleState::new();
+        state.defer_runtime_reconcile_event("ctr-a", KubeletEventKind::Created);
+        state.defer_runtime_reconcile_event("ctr-a", KubeletEventKind::Started);
+        state.defer_runtime_reconcile_event("ctr-b", KubeletEventKind::Started);
+        state.defer_runtime_reconcile_event("ctr-b", KubeletEventKind::Stopped);
+
+        let hint = state.take_runtime_reconcile_hint();
+        assert_eq!(hint.event_kind("ctr-a"), Some(KubeletEventKind::Started));
+        assert_eq!(
+            hint.event_kind("ctr-b"),
+            Some(KubeletEventKind::Stopped),
+            "a later Stopped observation must dominate Started"
+        );
+        assert_eq!(hint.container_ids().count(), 2);
     }
 
     #[test]

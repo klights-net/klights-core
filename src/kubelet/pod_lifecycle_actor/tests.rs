@@ -1832,8 +1832,11 @@ fn cri_event_during_startup_finalization_preserves_container_id_hint() {
             );
             assert_eq!(
                 hint,
-                RuntimeReconcileHint::from_container_id("ctr-fast-exit"),
-                "deferred reconcile must carry the CRI event's container id so the reconciler can read the concrete terminated status"
+                RuntimeReconcileHint::from_container_event(
+                    "ctr-fast-exit",
+                    KubeletEventKind::Stopped,
+                ),
+                "deferred reconcile must carry the CRI event's container id and transition kind so the reconciler can read the concrete terminated status"
             );
         }
         other => panic!(
