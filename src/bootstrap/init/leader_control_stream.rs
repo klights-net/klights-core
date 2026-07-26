@@ -7,16 +7,19 @@
 
 pub async fn start_worker_leader_control_stream(
     client: std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
+    runtimes: crate::replication::grpc::client::NodeControlRuntimes,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<klights_supervisor::SupervisedJoinHandle<()>> {
+    client.clear_stream().await;
     let supervisor_for_task = supervisor.clone();
     supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Network,
             "worker_leader_control_stream",
             async move {
-                run_worker_leader_control_stream(client, supervisor_for_task, cancel).await;
+                run_worker_leader_control_stream(client, runtimes, supervisor_for_task, cancel)
+                    .await;
             },
         )
         .await
@@ -25,6 +28,7 @@ pub async fn start_worker_leader_control_stream(
 
 async fn run_worker_leader_control_stream(
     client: std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
+    runtimes: crate::replication::grpc::client::NodeControlRuntimes,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -35,7 +39,7 @@ async fn run_worker_leader_control_stream(
             return;
         }
 
-        match client.ensure_joined().await {
+        match client.ensure_joined_with_runtimes(runtimes.clone()).await {
             Ok(_) => {
                 tracing::info!("worker leader control stream connected");
                 attempt = 0;

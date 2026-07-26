@@ -13,8 +13,8 @@ use crate::bootstrap::NodeRole;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
 use crate::datastore::backend_kind::BackendKind;
+use crate::datastore::raft::proposal::RaftProposal;
 use crate::datastore::selector::PassiveStoreOpenRequest;
-use crate::datastore::sequenced::RaftProposal;
 use klights_supervisor::TaskSupervisor;
 
 #[derive(Debug, thiserror::Error)]
@@ -304,11 +304,44 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             );
             let raft_network =
                 crate::datastore::raft::grpc_network::GrpcRaftNetwork::new(raft_factory);
+            let materializer = Arc::new(
+                crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+                    passive_backend.clone(),
+                ),
+            );
+            let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+                passive_backend.clone(),
+            ));
+            let state_machine_stores =
+                crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
+                    Arc::new(
+                        crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
+                            passive_backend.clone(),
+                            crate::datastore::raft::committed_apply(),
+                        ),
+                    ),
+                    Arc::new(
+                        crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new(
+                            passive_backend.clone(),
+                            recovery.clone(),
+                            crate::datastore::raft::snapshot_install(),
+                        ),
+                    ),
+                    recovery,
+                    Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+                        passive_backend.clone(),
+                    )),
+                    materializer.clone(),
+                );
+            let raft_stores = crate::datastore::raft::node::RaftStorePorts::new(
+                materializer,
+                state_machine_stores,
+            );
             let raft = Arc::new(
                 crate::datastore::raft::node::RaftNode::start_with_network(
                     node_id,
                     config.node_name.clone(),
-                    passive_backend.clone(),
+                    raft_stores,
                     stores.raft_log.clone(),
                     stores.raft_applied_state.clone(),
                     supervisor.clone(),
@@ -330,12 +363,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     "leader-class startup is codec-preactivation; command proposals remain gated while Raft RPC admission starts"
                 );
             }
-            let proposal: Arc<dyn crate::datastore::sequenced::RaftProposal> = raft.clone();
-            let db_handle: DatastoreHandle =
-                Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
+            let proposal: Arc<dyn crate::datastore::raft::proposal::RaftProposal> = raft.clone();
+            let db_handle: DatastoreHandle = Arc::new(
+                crate::bootstrap::sequenced_datastore::SequencedDatastore::new(
                     passive_backend.clone(),
                     proposal,
-                ));
+                ),
+            );
             // The local command client is built only from the fully constructed
             // sequenced facade. It never receives the passive backend used by
             // Raft proposal materialization and committed apply.

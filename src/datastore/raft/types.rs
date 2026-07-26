@@ -137,7 +137,7 @@ pub struct StorageCommandResult {
     /// Ephemeral local handoff from committed SQLite apply to the leader-side
     /// side-effect dispatcher. It is never serialized into a Raft response.
     #[serde(skip)]
-    pub(crate) pod_endpoint_effect: super::super::PodEndpointEffect,
+    pub(crate) pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
 }
 
 const fn is_false(value: &bool) -> bool {

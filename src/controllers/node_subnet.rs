@@ -1848,8 +1848,9 @@ mod tests {
 
     #[tokio::test]
     async fn follower_peer_node_event_does_not_write_cluster_state() {
+        use crate::bootstrap::sequenced_datastore::SequencedDatastore;
         use crate::datastore::DatastoreBackend;
-        use crate::datastore::sequenced::{RaftProposal, SequencedDatastore};
+        use crate::datastore::raft::proposal::RaftProposal;
         use crate::node_outbox::{OutboxApplyError, OutboxApplyResult};
         use klights_cluster_core::StorageCommand;
         use std::sync::Arc;

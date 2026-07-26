@@ -38,7 +38,7 @@ pub async fn handle_applied_pod_side_effects(
     sinks: PodSideEffectSinks<'_>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
-    pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+    pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) -> Result<(), String> {
     // The actor delete is already committed at this point. Its dependent
@@ -79,7 +79,7 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
     service_sink: Option<&dyn ServiceReconcileSink>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
-    pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+    pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) {
     if controller_sink.is_none() && service_sink.is_none() {
@@ -107,7 +107,7 @@ async fn enqueue_pod_status_side_effects_with_endpoint_change(
         StorageCommand::UpdateStatus { api_version, kind, .. }
             if api_version == "v1"
                 && kind == "Pod"
-                && pod_endpoint_effect == crate::datastore::PodEndpointEffect::Changed
+                && pod_endpoint_effect == klights_cluster_core::PodEndpointEffect::Changed
     );
     let is_pod_status_delete_or_endpoint_patch = is_endpoint_relevant_patch
         || matches!(
@@ -512,7 +512,7 @@ mod tests {
             Some(dispatcher.as_ref()),
             &command,
             Some(&resource),
-            crate::datastore::PodEndpointEffect::Unchanged,
+            klights_cluster_core::PodEndpointEffect::Unchanged,
             &db,
         )
         .await;
@@ -593,7 +593,7 @@ mod tests {
             },
             &command,
             Some(&receipt),
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
             &db,
         )
         .await
@@ -611,7 +611,7 @@ mod tests {
             },
             &command,
             Some(&receipt),
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
             &db,
         )
         .await
@@ -627,7 +627,7 @@ mod tests {
             },
             &command,
             None,
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
             &db,
         )
         .await
@@ -705,7 +705,7 @@ mod tests {
             },
             &command,
             Some(&receipt),
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
             &db,
         )
         .await
@@ -723,7 +723,7 @@ mod tests {
             },
             &command,
             Some(&receipt),
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
             &db,
         )
         .await
@@ -787,7 +787,7 @@ mod tests {
             Some(dispatcher.as_ref()),
             &command,
             Some(&resource),
-            crate::datastore::PodEndpointEffect::Changed,
+            klights_cluster_core::PodEndpointEffect::Changed,
             &db,
         )
         .await;
@@ -913,7 +913,7 @@ mod tests {
             Some(dispatcher.as_ref()),
             &command,
             Some(&resource),
-            crate::datastore::PodEndpointEffect::Changed,
+            klights_cluster_core::PodEndpointEffect::Changed,
             &db,
         )
         .await;
@@ -998,7 +998,7 @@ mod tests {
                     },
                     observed_status_stamp: None,
                 },
-                crate::datastore::PodEndpointEffect::Changed,
+                klights_cluster_core::PodEndpointEffect::Changed,
             ),
             (
                 "actor finalization",
@@ -1009,7 +1009,7 @@ mod tests {
                     node_name: "worker-a".to_string(),
                     observed_resource_version: 1,
                 },
-                crate::datastore::PodEndpointEffect::NotApplicable,
+                klights_cluster_core::PodEndpointEffect::NotApplicable,
             ),
         ];
 
@@ -1107,7 +1107,7 @@ mod tests {
             Some(dispatcher.as_ref()),
             &command,
             Some(&resource),
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            klights_cluster_core::PodEndpointEffect::NotApplicable,
             &db,
         )
         .await;
@@ -1186,7 +1186,7 @@ mod tests {
             Some(dispatcher.as_ref()),
             &command,
             Some(&resource),
-            crate::datastore::PodEndpointEffect::Unchanged,
+            klights_cluster_core::PodEndpointEffect::Unchanged,
             &db,
         )
         .await;
@@ -1209,7 +1209,7 @@ mod tests {
             Some(dispatcher.as_ref()),
             &repeated_full_status,
             Some(&resource),
-            crate::datastore::PodEndpointEffect::Unchanged,
+            klights_cluster_core::PodEndpointEffect::Unchanged,
             &db,
         )
         .await;

@@ -852,6 +852,11 @@ mod tests {
                 },
                 supervisor.clone(),
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+                crate::replication::grpc::client::NodeControlRuntimes::new(
+                    crate::replication::grpc::client::NodeExecCapability::Unavailable,
+                    crate::replication::grpc::client::NodeLogCapability::Unavailable,
+                    crate::replication::grpc::client::NodeMetricsCapability::Unavailable,
+                ),
             )
             .await
             .unwrap(),

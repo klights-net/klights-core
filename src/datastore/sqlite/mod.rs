@@ -133,7 +133,7 @@ enum OutboxTxnOutcome {
         applied_rv: i64,
         pending: Option<PendingWatchEvent>,
         resource_changed: bool,
-        pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+        pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
         committed_resource: Option<crate::datastore::Resource>,
     },
     AlreadyApplied(Option<AppliedOutboxRecord>),
@@ -2220,8 +2220,8 @@ impl Datastore {
                 .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
             return Ok(crate::datastore::CommittedOutboxApply::new(
                 OutboxApplyOutcome::Applied { applied_rv: 0 },
-                crate::datastore::ResourceMutationEffect::Unchanged,
-                crate::datastore::PodEndpointEffect::NotApplicable,
+                klights_cluster_core::ResourceMutationEffect::Unchanged,
+                klights_cluster_core::PodEndpointEffect::NotApplicable,
             ));
         }
         let pod_target = match &command {
@@ -2317,16 +2317,16 @@ impl Datastore {
                 )?;
                 let pod_after = pod_state(&tx)?;
                 let pod_endpoint_effect = if pod_target.is_none() {
-                    crate::datastore::PodEndpointEffect::NotApplicable
+                    klights_cluster_core::PodEndpointEffect::NotApplicable
                 } else if pod_before.as_ref().zip(pod_after.as_ref()).is_some_and(
                     |(before, after)| {
                         klights_cluster_core::pod_endpoint_state(before)
                             .differs_from(&klights_cluster_core::pod_endpoint_state(after))
                     },
                 ) {
-                    crate::datastore::PodEndpointEffect::Changed
+                    klights_cluster_core::PodEndpointEffect::Changed
                 } else {
-                    crate::datastore::PodEndpointEffect::Unchanged
+                    klights_cluster_core::PodEndpointEffect::Unchanged
                 };
                 tx.execute(
                     queries::APPLIED_OUTBOX_UPDATE_RESULT,
@@ -2381,9 +2381,9 @@ impl Datastore {
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv },
                     if resource_changed {
-                        crate::datastore::ResourceMutationEffect::Changed
+                        klights_cluster_core::ResourceMutationEffect::Changed
                     } else {
-                        crate::datastore::ResourceMutationEffect::Unchanged
+                        klights_cluster_core::ResourceMutationEffect::Unchanged
                     },
                     pod_endpoint_effect,
                 )
@@ -2397,11 +2397,11 @@ impl Datastore {
                 let applied_rv = record.as_ref().and_then(|record| record.applied_rv);
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     klights_cluster_core::OutboxApplyOutcome::AlreadyApplied { applied_rv },
-                    crate::datastore::ResourceMutationEffect::Unchanged,
+                    klights_cluster_core::ResourceMutationEffect::Unchanged,
                     if is_pod_status {
-                        crate::datastore::PodEndpointEffect::Unchanged
+                        klights_cluster_core::PodEndpointEffect::Unchanged
                     } else {
-                        crate::datastore::PodEndpointEffect::NotApplicable
+                        klights_cluster_core::PodEndpointEffect::NotApplicable
                     },
                 )
                 .with_committed_resource(committed_resource))
@@ -2836,9 +2836,9 @@ impl Datastore {
                         applied_rv: result.applied_rv.unwrap_or(applied_rv),
                     },
                     if result.public_resource_changed {
-                        crate::datastore::ResourceMutationEffect::Changed
+                        klights_cluster_core::ResourceMutationEffect::Changed
                     } else {
-                        crate::datastore::ResourceMutationEffect::Unchanged
+                        klights_cluster_core::ResourceMutationEffect::Unchanged
                     },
                     result.pod_endpoint_effect,
                 )
@@ -2849,15 +2849,15 @@ impl Datastore {
                 committed_resource,
             } => Ok(crate::datastore::CommittedOutboxApply::new(
                 OutboxApplyOutcome::AlreadyApplied { applied_rv },
-                crate::datastore::ResourceMutationEffect::Unchanged,
-                crate::datastore::PodEndpointEffect::Unchanged,
+                klights_cluster_core::ResourceMutationEffect::Unchanged,
+                klights_cluster_core::PodEndpointEffect::Unchanged,
             )
             .with_committed_resource(committed_resource)),
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     OutboxApplyOutcome::Applied { applied_rv: 0 },
-                    crate::datastore::ResourceMutationEffect::Unchanged,
-                    crate::datastore::PodEndpointEffect::NotApplicable,
+                    klights_cluster_core::ResourceMutationEffect::Unchanged,
+                    klights_cluster_core::PodEndpointEffect::NotApplicable,
                 ))
             }
         }

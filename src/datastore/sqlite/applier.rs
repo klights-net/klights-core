@@ -12,7 +12,7 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use crate::datastore::sequenced::DatastoreApplier;
+use crate::bootstrap::sequenced_datastore::DatastoreApplier;
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 
 use super::Datastore;

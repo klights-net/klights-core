@@ -1823,7 +1823,7 @@ async fn redb_find_owned_by_name_kind_empty_uid() {
 
 #[tokio::test]
 async fn redb_delete_resource_with_tombstone_command_stamps_and_watches_deleted_row() {
-    use crate::datastore::sequenced::DatastoreApplier;
+    use crate::bootstrap::sequenced_datastore::DatastoreApplier;
     use klights_cluster_core::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };

@@ -1,4 +1,5 @@
 mod authority;
+pub(crate) use authority::{committed_apply, snapshot_install};
 pub mod compressed;
 pub mod flow_control;
 pub mod grpc_network;
@@ -8,9 +9,9 @@ pub mod membership_client;
 pub(crate) use authority::{CommittedApplyAuthority, SnapshotInstallAuthority};
 pub mod network;
 pub mod node;
+pub(crate) mod proposal;
 pub mod rtt_estimator;
 pub(crate) mod snapshot;
-pub mod state_machine;
 pub mod state_machine_impl;
 pub mod types;
 
@@ -20,7 +21,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::datastore::raft::state_machine::N1Raft;
+    use crate::bootstrap::outbox_apply_adapter::N1Raft;
     use crate::node_outbox::payload::OutboxOperation;
 
     fn pod_status_payload(ns: &str, name: &str, uid: &str) -> Bytes {

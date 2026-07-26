@@ -1,4 +1,4 @@
-//! Replication-owned immutable datastore sequencing facade.
+//! Root-owned compatibility adapter for legacy broad datastore consumers.
 //!
 //! Normal application consumers receive this compatibility facade while Raft
 //! proposal materialization, snapshotting, and committed state-machine apply
@@ -20,95 +20,21 @@
 //! ```
 
 use anyhow::Result;
+#[cfg(test)]
 use async_trait::async_trait;
 #[cfg(test)]
 use klights_cluster_core::CommandMeta;
 use klights_cluster_core::StorageCommand;
-use klights_cluster_core::{
-    OutboxApplyError as OutboxDeliveryError, OutboxApplyOutcome as OutboxDeliveryResult,
-};
 use std::sync::Arc;
 
-use super::backend::DatastoreBackend;
+use crate::datastore::DatastoreBackend;
 #[cfg(test)]
-use super::types::ReplicatedCreateOptions;
+use crate::datastore::ReplicatedCreateOptions;
+use crate::datastore::raft::proposal::RaftProposal;
 #[cfg(test)]
 use klights_cluster_core::ResourcePatchRequest;
 
 mod backend_impl;
-
-// ---------------------------------------------------------------------------
-// RaftProposal — replication-private capability from the sequencer to RaftNode.
-//
-// The facade's mutation methods route every StorageCommand through
-// `RaftProposal::propose_command`. The proposal capability
-// encodes the command as an `OutboxPayload` and submits it to openraft's
-// `client_write`. openraft replicates it to peers and then drives the
-// state machine's apply, which calls the backend raft log-apply surface to
-// mutate cluster.db through the generic-to-typed helper path.
-//
-// The trait is intentionally narrow: a single method that takes a
-// fully-formed StorageCommand and returns once openraft has committed +
-// applied it. Concrete impl lives in `super::raft::node`.
-// ---------------------------------------------------------------------------
-
-/// Immutable, replication-private handle to the cluster's Raft consensus
-/// engine. This is deliberately not a second public leader command contract;
-/// application command admission remains in `klights-leader-api`.
-#[async_trait]
-pub(crate) trait RaftProposal: Send + Sync {
-    /// Submit a `StorageCommand` for replication and apply. Returns once
-    /// openraft has committed the entry and the state machine has applied
-    /// it to the local backend. Non-leader voters refuse before local
-    /// commit materialization; callers must route writes to the leader.
-    async fn propose_command(
-        &self,
-        command: StorageCommand,
-    ) -> Result<super::raft::types::StorageCommandResult>;
-
-    /// T6 step 4c: propose an outbox-flavored write through raft.
-    /// Same end result as `propose_command` (build LogApplyCommit →
-    /// raft commit → state machine apply on every member) but preserves
-    /// the worker outbox idempotency key plus stream watermark metadata.
-    /// Returns `OutboxApplyResult` for the outbox dispatcher.
-    async fn propose_outbox_command(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: StorageCommand,
-        authoring_node: &str,
-        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError>;
-
-    async fn propose_outbox_command_effect(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        command: StorageCommand,
-        authoring_node: &str,
-        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<super::CommittedOutboxApply, OutboxDeliveryError> {
-        let result = self
-            .propose_outbox_command(
-                idempotency_key,
-                operation,
-                command,
-                authoring_node,
-                watermark,
-            )
-            .await?;
-        let resource_effect = if matches!(result, OutboxDeliveryResult::Applied { .. }) {
-            super::ResourceMutationEffect::Changed
-        } else {
-            super::ResourceMutationEffect::Unchanged
-        };
-        Ok(super::CommittedOutboxApply::new(
-            result,
-            resource_effect,
-            super::PodEndpointEffect::NotApplicable,
-        ))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // WriteRejection
@@ -127,12 +53,11 @@ pub(crate) enum WriteRejection {
 /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
 /// Trait for deterministic local apply of storage commands.
 ///
-/// Local storage engines implement this trait.  The replication layer
-/// calls `apply_command` after role-based logic determines the write
-/// should proceed.
+/// Root compatibility tests use this trait to compare deterministic local
+/// application across passive storage engines.
 #[cfg(test)]
 #[async_trait]
-pub trait DatastoreApplier: Send + Sync {
+pub(crate) trait DatastoreApplier: Send + Sync {
     async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()>;
 }
 
@@ -157,14 +82,14 @@ impl SequencedDatastore {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<super::raft::types::StorageCommandResult> {
+    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.proposal.propose_command(command).await
     }
 }
 
 #[cfg(test)]
 /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-pub async fn apply_command_to_backend<B>(
+pub(crate) async fn apply_command_to_backend<B>(
     backend: &B,
     command: StorageCommand,
     meta: CommandMeta,
@@ -532,5 +457,5 @@ impl DatastoreApplier for SequencedDatastore {
 // methods sequence through the immutable proposal capability; committed apply
 // bypasses public admission and writes replicated data to the passive backend.
 #[cfg(test)]
-#[path = "sequenced/tests.rs"]
+#[path = "sequenced_datastore/tests.rs"]
 mod tests;

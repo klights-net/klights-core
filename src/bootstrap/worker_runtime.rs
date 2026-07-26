@@ -319,23 +319,29 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         tracing::warn!("worker node registration: {}", e);
     }
 
-    if let Some(cri) = &cri_for_api {
-        let eh = std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
-            cri.clone(),
-            task_supervisor.clone(),
-        ));
-        follower_grpc_client.set_node_exec_runtime(eh).await;
-        follower_grpc_client
-            .set_node_metrics_runtime(std::sync::Arc::new(
-                crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
+    let (exec_runtime, metrics_runtime) = match &cri_for_api {
+        Some(cri) => (
+            crate::replication::grpc::client::NodeExecCapability::Available(std::sync::Arc::new(
+                crate::kubelet::remote_runtime::CriNodeExecRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
-            ))
-            .await;
-    }
-    follower_grpc_client
-        .set_node_log_runtime(std::sync::Arc::new(
+            )),
+            crate::replication::grpc::client::NodeMetricsCapability::Available(
+                std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
+                    cri.clone(),
+                    task_supervisor.clone(),
+                )),
+            ),
+        ),
+        None => (
+            crate::replication::grpc::client::NodeExecCapability::Unavailable,
+            crate::replication::grpc::client::NodeMetricsCapability::Unavailable,
+        ),
+    };
+    let control_runtimes = crate::replication::grpc::client::NodeControlRuntimes::new(
+        exec_runtime,
+        crate::replication::grpc::client::NodeLogCapability::Available(std::sync::Arc::new(
             crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
@@ -345,10 +351,12 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                     ),
                 ),
             ),
-        ))
-        .await;
+        )),
+        metrics_runtime,
+    );
     let worker_control_stream_handle = start_worker_leader_control_stream(
         follower_grpc_client.clone(),
+        control_runtimes,
         task_supervisor.clone(),
         shutdown_token.clone(),
     )

@@ -20,11 +20,12 @@ use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{ChangeMembers, Config, Raft};
 
-use super::super::DatastoreBackend;
 use openraft::network::RaftNetworkFactory;
 
 use super::log_storage::SqliteRaftLogStorage;
-use super::network::{LeaderForwarder, StubRaftNetwork};
+use super::network::LeaderForwarder;
+#[cfg(test)]
+use super::network::StubRaftNetwork;
 use super::state_machine_impl::SqliteRaftStateMachine;
 use super::types::{
     NodeId, RaftMemberLogId, RaftMemberNode, RaftShape, StorageCommandPayload, TypeConfig,
@@ -60,9 +61,9 @@ pub(crate) struct CommandCodecV3Activation {
 }
 
 impl CommandCodecV3Activation {
-    async fn load(backend: &dyn DatastoreBackend) -> Result<Self> {
-        let value = backend
-            .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+    async fn load(materializer: &dyn RaftCommitMaterializer) -> Result<Self> {
+        let value = materializer
+            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
             .await
             .context("read command codec activation marker")?;
         let activated = match value.as_deref() {
@@ -207,6 +208,78 @@ pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
 /// safe range 8..=32.
 pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 32;
 
+#[derive(Debug, thiserror::Error)]
+#[error("raft commit materialization failed: {message}")]
+pub(crate) struct RaftMaterializationError {
+    message: String,
+}
+
+impl RaftMaterializationError {
+    pub(crate) fn persistence(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[async_trait]
+pub(crate) trait RaftCommitMaterializer: Send + Sync {
+    async fn read_raft_metadata(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, RaftMaterializationError>;
+
+    async fn build_command(
+        &self,
+        command: StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> std::result::Result<klights_cluster_core::LogApplyCommit, RaftMaterializationError>;
+
+    async fn build_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: StorageCommand,
+        authoring_node: &str,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> std::result::Result<klights_cluster_core::BuildOutboxOutcome, OutboxApplyError>;
+}
+
+pub struct RaftStorePorts {
+    materializer: Arc<dyn RaftCommitMaterializer>,
+    state_machine: super::state_machine_impl::RaftStateMachineStorePorts,
+}
+
+impl RaftStorePorts {
+    pub(crate) fn new(
+        materializer: Arc<dyn RaftCommitMaterializer>,
+        state_machine: super::state_machine_impl::RaftStateMachineStorePorts,
+    ) -> Self {
+        Self {
+            materializer,
+            state_machine,
+        }
+    }
+}
+
+pub(crate) trait IntoRaftStorePorts {
+    fn into_raft_store_ports(self) -> RaftStorePorts;
+}
+
+impl IntoRaftStorePorts for RaftStorePorts {
+    fn into_raft_store_ports(self) -> RaftStorePorts {
+        self
+    }
+}
+
+#[cfg(test)]
+impl IntoRaftStorePorts for Arc<dyn super::super::DatastoreBackend> {
+    fn into_raft_store_ports(self) -> RaftStorePorts {
+        super::super::cluster_store_adapter::raft_store_ports_for_test(self)
+    }
+}
+
 pub struct RaftNode {
     pub node_id: NodeId,
     pub raft: Raft<TypeConfig>,
@@ -215,12 +288,7 @@ pub struct RaftNode {
     /// T2: Serializes add_voter/remove_voter calls so concurrent
     /// joiners don't race and exhaust their retry budgets.
     membership_mutex: tokio::sync::Mutex<()>,
-    /// T1.4: cluster backend handle used by `propose_command` to build a
-    /// `LogApplyCommit` before submitting it through raft. The state
-    /// machine also holds this backend (it applies the committed entry);
-    /// keeping a clone here avoids reaching back through openraft just to
-    /// drive the leader-side build.
-    backend: Arc<dyn DatastoreBackend>,
+    materializer: Arc<dyn RaftCommitMaterializer>,
     /// T1.4: node name used by `build_log_apply_commit_for_command` to
     /// stamp the authoring node on the resulting commit.
     authoring_node: String,
@@ -240,18 +308,22 @@ impl RaftNode {
     /// `add_learner` + `change_membership` from a peer (Step 6) to join.
     /// Single-voter convenience constructor that wires a StubRaftNetwork
     /// (no peer RPCs ever issued).
-    pub async fn start(
+    #[cfg(test)]
+    pub(crate) async fn start<S>(
         node_id: NodeId,
         node_name: String,
-        cluster_backend: Arc<dyn DatastoreBackend>,
+        stores: S,
         log_durability: Arc<dyn RaftLogDurability>,
         applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        S: IntoRaftStorePorts,
+    {
         Self::start_with_network(
             node_id,
             node_name,
-            cluster_backend,
+            stores,
             log_durability,
             applied_state_durability,
             supervisor,
@@ -263,10 +335,10 @@ impl RaftNode {
     /// General constructor that accepts a caller-supplied
     /// `RaftNetworkFactory`. Use for multi-voter clusters (Step 6) and
     /// for the gRPC production transport (later).
-    pub async fn start_with_network<N>(
+    pub(crate) async fn start_with_network<N, S>(
         node_id: NodeId,
         node_name: String,
-        cluster_backend: Arc<dyn DatastoreBackend>,
+        stores: S,
         log_durability: Arc<dyn RaftLogDurability>,
         applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -274,7 +346,9 @@ impl RaftNode {
     ) -> Result<Self>
     where
         N: RaftNetworkFactory<TypeConfig>,
+        S: IntoRaftStorePorts,
     {
+        let stores = stores.into_raft_store_ports();
         let storage_incarnation = log_durability
             .load_or_create_storage_incarnation()
             .await
@@ -342,9 +416,9 @@ impl RaftNode {
         );
         let log_store = SqliteRaftLogStorage::new(log_durability, supervisor.clone());
         let command_codec_v3_activation =
-            Arc::new(CommandCodecV3Activation::load(cluster_backend.as_ref()).await?);
+            Arc::new(CommandCodecV3Activation::load(stores.materializer.as_ref()).await?);
         let state_machine = SqliteRaftStateMachine::new_with_command_codec_activation(
-            cluster_backend.clone(),
+            stores.state_machine,
             applied_state_durability,
             supervisor,
             command_codec_v3_activation.clone(),
@@ -358,7 +432,7 @@ impl RaftNode {
             storage_incarnation,
             forwarder: None,
             membership_mutex: tokio::sync::Mutex::new(()),
-            backend: cluster_backend,
+            materializer: stores.materializer,
             authoring_node: node_name,
             flow_control: Arc::new(super::flow_control::RaftCommitFlowControl::new(
                 RAFT_MAX_INFLIGHT_PROPOSALS,
@@ -568,8 +642,8 @@ impl RaftNode {
             return Err(CommandCodecV3ActivationError::NotLeader);
         }
         let codec_activated = self
-            .backend
-            .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .materializer
+            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
             .await
             .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?
             .as_deref()
@@ -581,8 +655,8 @@ impl RaftNode {
         // Re-read while membership and proposal lanes are frozen. A second
         // activation caller sees the committed marker and emits no extra entry.
         let codec_activated = self
-            .backend
-            .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .materializer
+            .read_raft_metadata(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
             .await
             .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?
             .as_deref()
@@ -697,8 +771,8 @@ impl RaftNode {
     }
 
     async fn read_member_admission(&self, node_id: NodeId) -> Result<Option<RaftMemberAdmission>> {
-        self.backend
-            .get_klights_meta(&Self::member_admission_meta_key(node_id))
+        self.materializer
+            .read_raft_metadata(&Self::member_admission_meta_key(node_id))
             .await?
             .map(|raw| serde_json::from_str(&raw).context("decode Raft member admission marker"))
             .transpose()
@@ -1196,7 +1270,7 @@ fn local_commit_materialization_allowed(
 /// leader, voter follower, and learner — is the only caller of
 /// `apply_commit_in_tx` after raft commits the entry.
 #[async_trait]
-impl super::super::sequenced::RaftProposal for RaftNode {
+impl super::proposal::RaftProposal for RaftNode {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
@@ -1211,8 +1285,8 @@ impl super::super::sequenced::RaftProposal for RaftNode {
         // failure, client_write failure) returns it to the pool.
         let _flow_permit = self.flow_control.acquire().await;
         let commit = self
-            .backend
-            .build_log_apply_commit_for_command(command, operation.as_str(), &self.authoring_node)
+            .materializer
+            .build_command(command, operation.as_str(), &self.authoring_node)
             .await
             .map_err(map_commit_materialization_error)?;
         let entry_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
@@ -1274,7 +1348,7 @@ impl super::super::sequenced::RaftProposal for RaftNode {
         command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
         watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<super::super::CommittedOutboxApply, OutboxApplyError> {
+    ) -> std::result::Result<super::proposal::RaftProposalEffect, OutboxApplyError> {
         use klights_cluster_core::BuildOutboxOutcome;
         if let Err(err) = self
             .command_codec_v3_activation
@@ -1307,8 +1381,8 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             })?
         };
         let outcome = self
-            .backend
-            .build_log_apply_commit_for_outbox_with_watermark(
+            .materializer
+            .build_outbox(
                 idempotency_key,
                 operation,
                 command,
@@ -1336,10 +1410,10 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             } => (commit, terminal_error),
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
                 // Lease renews don't go through raft.
-                return Ok(super::super::CommittedOutboxApply::new(
+                return Ok(super::proposal::RaftProposalEffect::new(
                     OutboxApplyOutcome::Applied { applied_rv: 0 },
-                    super::super::ResourceMutationEffect::Unchanged,
-                    super::super::PodEndpointEffect::NotApplicable,
+                    klights_cluster_core::ResourceMutationEffect::Unchanged,
+                    klights_cluster_core::PodEndpointEffect::NotApplicable,
                 ));
             }
             BuildOutboxOutcome::AlreadyApplied {
@@ -1348,10 +1422,10 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             } => {
                 // The idempotency key already applied, avoid duplicate
                 // proposal and keep the existing RV.
-                return Ok(super::super::CommittedOutboxApply::new(
+                return Ok(super::proposal::RaftProposalEffect::new(
                     OutboxApplyOutcome::AlreadyApplied { applied_rv },
-                    super::super::ResourceMutationEffect::Unchanged,
-                    super::super::PodEndpointEffect::Unchanged,
+                    klights_cluster_core::ResourceMutationEffect::Unchanged,
+                    klights_cluster_core::PodEndpointEffect::Unchanged,
                 )
                 .with_committed_resource(committed_resource));
             }
@@ -1372,9 +1446,9 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             }
         };
         let resource_effect = if apply_result.public_resource_changed {
-            super::super::ResourceMutationEffect::Changed
+            klights_cluster_core::ResourceMutationEffect::Changed
         } else {
-            super::super::ResourceMutationEffect::Unchanged
+            klights_cluster_core::ResourceMutationEffect::Unchanged
         };
         let pod_endpoint_effect = apply_result.pod_endpoint_effect;
         let committed_resource =
@@ -1391,7 +1465,7 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             return Err(error);
         }
         let applied_rv = apply_result.applied_rv.unwrap_or(0);
-        Ok(super::super::CommittedOutboxApply::new(
+        Ok(super::proposal::RaftProposalEffect::new(
             OutboxApplyOutcome::Applied { applied_rv },
             resource_effect,
             pod_endpoint_effect,
@@ -1405,7 +1479,8 @@ impl super::super::sequenced::RaftProposal for RaftNode {
 /// semantic failures inside a database error string; adding anyhow context
 /// directly would hide the nested 409/404 from `AppError::from`, which
 /// intentionally uses the top-level display string.
-fn map_commit_materialization_error(error: anyhow::Error) -> anyhow::Error {
+fn map_commit_materialization_error(error: RaftMaterializationError) -> anyhow::Error {
+    let error = anyhow::Error::new(error);
     let contextual = error.context("build log_apply commit for raft propose");
     let diagnostic = format!("{contextual:#}");
     let lower = diagnostic.to_ascii_lowercase();
@@ -1962,6 +2037,7 @@ mod tests {
     use crate::bootstrap::controlplane_join_handler::{
         RaftNodeJoinHandler, validate_command_codec_v3_join,
     };
+    use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::sqlite_boundary::DbExecutor;
     use crate::sqlite_open as opener;
@@ -2182,7 +2258,11 @@ mod tests {
             Some(COMMAND_CODEC_ACTIVATION_VALUE),
             "activation proof must be Raft-committed cluster state"
         );
-        let restored_activation = CommandCodecV3Activation::load(backend.as_ref())
+        let materializer =
+            crate::datastore::cluster_store_adapter::DatastoreRaftCommitMaterializer::new(
+                backend.clone(),
+            );
+        let restored_activation = CommandCodecV3Activation::load(&materializer)
             .await
             .expect("restore exact-v3 activation marker");
         restored_activation.enforce_startup_gate();
@@ -2215,9 +2295,8 @@ mod tests {
         use crate::datastore::raft::network::LoopbackRegistry;
 
         let registry = LoopbackRegistry::new();
-        let leader = fresh_voter_in_registry(703, &registry).await;
+        let (leader, backend) = fresh_voter_in_registry_with_backend(703, &registry).await;
         let incompatible_voter = fresh_voter_in_registry(704, &registry).await;
-        let backend = leader.backend.clone();
         leader
             .bootstrap_single_voter("https://127.0.0.1:7703".to_string())
             .await
@@ -2393,11 +2472,13 @@ mod tests {
     /// the shared registry so the test can hold and shut them down cleanly.
     async fn fresh_three_voter_cluster() -> (
         Vec<RaftNode>,
+        Vec<Arc<dyn DatastoreBackend>>,
         crate::datastore::raft::network::LoopbackRegistry,
     ) {
         use crate::datastore::raft::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
+        let mut backends = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let exec = DbExecutor::open_with_opts(
@@ -2415,7 +2496,7 @@ mod tests {
             let n = RaftNode::start_with_network(
                 id,
                 format!("n{id}"),
-                backend,
+                backend.clone(),
                 node_local.clone(),
                 node_local,
                 supervisor,
@@ -2425,13 +2506,14 @@ mod tests {
             .expect("RaftNode::start_with_network");
             registry.register(id, n.raft.clone(), n.storage_incarnation.clone());
             nodes.push(n);
+            backends.push(backend);
         }
-        (nodes, registry)
+        (nodes, backends, registry)
     }
 
     #[tokio::test]
     async fn three_voter_cluster_elects_a_leader() {
-        let (nodes, _registry) = fresh_three_voter_cluster().await;
+        let (nodes, _backends, _registry) = fresh_three_voter_cluster().await;
         // Have node 10 initialize the cluster with all three voters.
         let mut members = std::collections::BTreeMap::new();
         for n in &nodes {
@@ -2472,9 +2554,9 @@ mod tests {
 
     #[tokio::test]
     async fn production_startup_gate_with_restored_membership_exposes_no_proposal_capability() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
-        let (nodes, _registry) = fresh_three_voter_cluster().await;
+        let (nodes, backends, _registry) = fresh_three_voter_cluster().await;
         let mut members = std::collections::BTreeMap::new();
         for node in &nodes {
             members.insert(
@@ -2522,8 +2604,8 @@ mod tests {
             Err(CommandCodecV3PreflightError::Unsupported { .. })
         ));
 
-        let rv_before = leader
-            .backend
+        let leader_backend = &backends[leader_index];
+        let rv_before = leader_backend
             .get_current_resource_version()
             .await
             .expect("read pre-proposal RV");
@@ -2538,8 +2620,7 @@ mod tests {
             "proposal must fail at the activation gate, got: {error}"
         );
         assert_eq!(
-            leader
-                .backend
+            leader_backend
                 .get_current_resource_version()
                 .await
                 .expect("read post-proposal RV"),
@@ -2547,8 +2628,7 @@ mod tests {
             "gated proposal must not materialize or mutate cluster state"
         );
         assert!(
-            leader
-                .backend
+            leader_backend
                 .get_klights_meta(KEY_COMMAND_CODEC_ACTIVATION_VERSION)
                 .await
                 .expect("read activation marker")
@@ -2669,7 +2749,7 @@ mod tests {
     #[tokio::test]
     async fn follower_raft_proposer_refuses_before_local_commit_materialization() {
         use crate::datastore::raft::network::{LoopbackRaftNetworkFactory, LoopbackRegistry};
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let registry = LoopbackRegistry::new();
         let mut nodes = Vec::new();
@@ -2786,7 +2866,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_materialized_commit_leaves_no_proposal_time_ledger_state() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = DbExecutor::open_with_opts(
@@ -2916,6 +2996,13 @@ mod tests {
         id: NodeId,
         registry: &crate::datastore::raft::network::LoopbackRegistry,
     ) -> RaftNode {
+        fresh_voter_in_registry_with_backend(id, registry).await.0
+    }
+
+    async fn fresh_voter_in_registry_with_backend(
+        id: NodeId,
+        registry: &crate::datastore::raft::network::LoopbackRegistry,
+    ) -> (RaftNode, Arc<dyn DatastoreBackend>) {
         use crate::datastore::raft::network::LoopbackRaftNetworkFactory;
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let exec = DbExecutor::open_with_opts(
@@ -2933,7 +3020,7 @@ mod tests {
         let node = RaftNode::start_with_network(
             id,
             format!("n{id}"),
-            backend,
+            backend.clone(),
             node_local.clone(),
             node_local,
             supervisor,
@@ -2942,7 +3029,7 @@ mod tests {
         .await
         .expect("start node");
         registry.register(id, node.raft.clone(), node.storage_incarnation.clone());
-        node
+        (node, backend)
     }
 
     async fn wait_for_voter_count(node: &RaftNode, expected: usize) {
@@ -2989,7 +3076,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_node_subnet_proposals_do_not_close_apply_channel() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(90).await;
         node.bootstrap_single_voter("https://10.99.0.90:7679".into())
@@ -3053,7 +3140,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_node_propose_command_does_not_create_applied_outbox_placeholder() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(92).await;
         node.bootstrap_single_voter("https://10.99.0.92:7679".into())
@@ -3108,7 +3195,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_create_resource_rejects_duplicate_name() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(91).await;
         node.bootstrap_single_voter("https://10.99.0.91:7679".into())
@@ -4549,7 +4636,7 @@ mod tests {
     /// would make this test fail (rv would advance during the timeout window).
     #[tokio::test]
     async fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(70).await;
         node.bootstrap_single_voter("https://10.99.0.70:7679".into())
@@ -4602,7 +4689,7 @@ mod tests {
     /// an RV backlog ahead of raft progress.
     #[tokio::test]
     async fn raft_pod_status_outbox_waits_for_flow_control_without_reserving_rv() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(75).await;
         node.bootstrap_single_voter("https://10.99.0.75:7679".into())
@@ -4656,7 +4743,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_critical_outbox_uses_reserved_permit_when_general_gate_is_saturated() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
         use OutboxOperation;
 
         let (node, backend) = fresh_node(76).await;
@@ -4756,7 +4843,7 @@ mod tests {
     /// not the smaller payload-entries value.
     #[tokio::test]
     async fn at_most_max_inflight_raft_proposals_are_in_flight() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(71).await;
         node.bootstrap_single_voter("https://10.99.0.71:7679".into())
@@ -4812,7 +4899,7 @@ mod tests {
     /// RAII guard handles this naturally on every error-return path.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_materialization_failure() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(72).await;
         node.bootstrap_single_voter("https://10.99.0.72:7679".into())
@@ -4860,7 +4947,7 @@ mod tests {
     /// rather than hiding the materialization CAS failure behind HTTP 500.
     #[tokio::test]
     async fn stale_csi_pv_update_materialization_surfaces_conflict() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(75).await;
         node.bootstrap_single_voter("https://10.99.0.75:7679".into())
@@ -5010,7 +5097,7 @@ mod tests {
     /// can proceed.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_terminal_success() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, _backend) = fresh_node(74).await;
         node.bootstrap_single_voter("https://10.99.0.74:7679".into())
@@ -5038,7 +5125,7 @@ mod tests {
 
     #[tokio::test]
     async fn raft_outbox_effect_preserves_committed_actor_delete_receipt() {
-        use crate::datastore::sequenced::RaftProposal;
+        use crate::datastore::raft::proposal::RaftProposal;
 
         let (node, backend) = fresh_node(77).await;
         node.bootstrap_single_voter("https://10.99.0.77:7679".into())
@@ -5088,7 +5175,7 @@ mod tests {
         let (_, resource_effect, _, receipt) = effect.into_parts();
         assert_eq!(
             resource_effect,
-            crate::datastore::ResourceMutationEffect::Changed
+            klights_cluster_core::ResourceMutationEffect::Changed
         );
         let receipt = receipt.expect("committed delete receipt");
         assert_eq!(receipt.resource_version, observed.resource_version);

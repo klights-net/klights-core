@@ -9,7 +9,8 @@ mod cases {
     use crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime;
     use crate::datastore::backend::DatastoreHandle;
     use crate::replication::grpc::client::{
-        ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
+        ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, NodeControlRuntimes,
+        NodeExecCapability, NodeLogCapability, NodeMetricsCapability, ReplicationGrpcClient,
     };
     use crate::replication::grpc::client::{ConnectDispatchContext, dispatch_leader_message};
     use crate::replication::protocol::{JoinRole, ReplicationEntry, StreamItem};
@@ -34,6 +35,14 @@ mod cases {
     use crate::leader_tls_policy::ResolvedLeaderTlsVerification;
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn unavailable_runtimes() -> NodeControlRuntimes {
+        NodeControlRuntimes::new(
+            NodeExecCapability::Unavailable,
+            NodeLogCapability::Unavailable,
+            NodeMetricsCapability::Unavailable,
+        )
+    }
 
     #[test]
     fn resource_command_already_exists_survives_grpc_decode() {
@@ -123,13 +132,18 @@ mod cases {
     ) -> ConnectDispatchContext {
         ConnectDispatchContext {
             supervisor,
-            node_exec_runtime: Arc::new(tokio::sync::Mutex::new(exec)),
+            runtimes: NodeControlRuntimes::new(
+                exec.map_or(
+                    NodeExecCapability::Unavailable,
+                    NodeExecCapability::Available,
+                ),
+                logs.map_or(NodeLogCapability::Unavailable, NodeLogCapability::Available),
+                NodeMetricsCapability::Unavailable,
+            ),
             node_exec_inputs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             node_stream_cancellations: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            node_log_runtime: Arc::new(tokio::sync::Mutex::new(logs)),
-            node_metrics_runtime: Arc::new(tokio::sync::Mutex::new(None)),
             observed_leader_endpoint: None,
         }
     }
@@ -682,13 +696,11 @@ mod cases {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let context = ConnectDispatchContext {
             supervisor,
-            node_exec_runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            runtimes: unavailable_runtimes(),
             node_exec_inputs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             node_stream_cancellations: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            node_log_runtime: Arc::new(tokio::sync::Mutex::new(None)),
-            node_metrics_runtime: Arc::new(tokio::sync::Mutex::new(None)),
             observed_leader_endpoint: Some("10.99.0.10".to_string()),
         };
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel(1);
@@ -846,6 +858,7 @@ mod cases {
                 },
                 self.client_supervisor.clone(),
                 default_transport_policy(),
+                unavailable_runtimes(),
             )
             .await
         }
@@ -1144,6 +1157,7 @@ mod cases {
             },
             supervisor.clone(),
             default_transport_policy(),
+            unavailable_runtimes(),
         )
         .await
         .unwrap();
@@ -1680,6 +1694,7 @@ mod cases {
             },
             fixture.supervisor.clone(),
             default_transport_policy(),
+            unavailable_runtimes(),
         )
         .await
         .unwrap();
@@ -1730,6 +1745,7 @@ mod cases {
             },
             supervisor,
             default_transport_policy(),
+            unavailable_runtimes(),
         )
         .await
         .unwrap();
@@ -1780,7 +1796,10 @@ mod cases {
         }
 
         client.reset_stream().await;
-        client.ensure_joined().await.unwrap();
+        client
+            .ensure_joined_with_runtimes(unavailable_runtimes())
+            .await
+            .unwrap();
         service.notify_entry(sample_entry(9));
 
         match client.stream_next().await.unwrap() {
@@ -2099,6 +2118,7 @@ mod cases {
             },
             supervisor,
             default_transport_policy(),
+            unavailable_runtimes(),
         )
         .await
         .unwrap();
@@ -2185,6 +2205,7 @@ mod cases {
             },
             supervisor,
             default_transport_policy(),
+            unavailable_runtimes(),
         )
         .await
         .unwrap();
@@ -2674,6 +2695,7 @@ mod cases {
             },
             supervisor.clone(),
             default_transport_policy(),
+            unavailable_runtimes(),
         )
         .await
         .unwrap();
@@ -2906,9 +2928,13 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         client
-            .set_node_exec_runtime(Arc::new(StaticExecHandler))
-            .await;
-        client.ensure_joined().await.unwrap();
+            .ensure_joined_with_runtimes(NodeControlRuntimes::new(
+                NodeExecCapability::Available(Arc::new(StaticExecHandler)),
+                NodeLogCapability::Unavailable,
+                NodeMetricsCapability::Unavailable,
+            ))
+            .await
+            .unwrap();
 
         let request = NodeExecSyncRequest::try_new(
             NodeExecTarget::try_new(
@@ -2973,9 +2999,13 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         client
-            .set_node_metrics_runtime(Arc::new(StaticMetricsHandler))
-            .await;
-        client.ensure_joined().await.unwrap();
+            .ensure_joined_with_runtimes(NodeControlRuntimes::new(
+                NodeExecCapability::Unavailable,
+                NodeLogCapability::Unavailable,
+                NodeMetricsCapability::Available(Arc::new(StaticMetricsHandler)),
+            ))
+            .await
+            .unwrap();
 
         let response = service
             .collect_metrics(NodeMetricsRequest::new(
@@ -3080,9 +3110,13 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         client
-            .set_node_exec_runtime(Arc::new(EchoExecStreamHandler))
-            .await;
-        client.ensure_joined().await.unwrap();
+            .ensure_joined_with_runtimes(NodeControlRuntimes::new(
+                NodeExecCapability::Available(Arc::new(EchoExecStreamHandler)),
+                NodeLogCapability::Unavailable,
+                NodeMetricsCapability::Unavailable,
+            ))
+            .await
+            .unwrap();
 
         let request = NodeExecRequest::exec(
             NodeExecTarget::try_new("worker-1", "default", "remote-exec", "remote-container")

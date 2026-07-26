@@ -555,7 +555,8 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    async fn make_raft_cronjob_datastore() -> crate::datastore::sequenced::SequencedDatastore {
+    async fn make_raft_cronjob_datastore()
+    -> crate::bootstrap::sequenced_datastore::SequencedDatastore {
         use crate::datastore::backend::DatastoreHandle;
         use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
         use klights_cluster_core::StorageCommand;
@@ -565,14 +566,14 @@ mod tests {
         }
 
         #[async_trait]
-        impl crate::datastore::sequenced::RaftProposal for InlineProposer {
+        impl crate::datastore::raft::proposal::RaftProposal for InlineProposer {
             async fn propose_command(
                 &self,
                 command: StorageCommand,
             ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 let payload = OutboxPayload::from_command(command).encode_protobuf()?;
                 let key = format!("cronjob-inline-{}", uuid::Uuid::new_v4());
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
                     OutboxOperation::PodStatus,
@@ -607,7 +608,7 @@ mod tests {
                     .map_err(|err| {
                         crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                     })?;
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     OutboxOperation::try_from(operation).map_err(|err| {
@@ -623,7 +624,7 @@ mod tests {
 
         let inner = crate::datastore::test_support::in_memory().await;
         let handle: DatastoreHandle = Arc::new(inner);
-        crate::datastore::sequenced::SequencedDatastore::new(
+        crate::bootstrap::sequenced_datastore::SequencedDatastore::new(
             handle.clone(),
             Arc::new(InlineProposer { inner: handle }),
         )

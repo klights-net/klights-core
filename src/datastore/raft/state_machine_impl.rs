@@ -17,6 +17,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use klights_node_store::{OpaqueRaftBytes, RaftAppliedStateDurability, RaftAppliedStateWrite};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{
@@ -24,15 +25,59 @@ use openraft::{
     StoredMembership,
 };
 
-use super::super::{BackendLifecycleStore, DatastoreBackend, DurableRecoveryStore};
+use super::super::{BackendLifecycleStore, DurableRecoveryStore};
 use super::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
 use super::types::{NodeId, StorageCommandResult, TypeConfig};
 
-#[derive(Clone)]
-pub struct SqliteRaftStateMachine {
-    backend: Arc<dyn DatastoreBackend>,
+#[async_trait]
+pub(crate) trait RaftCommittedApply: Send + Sync {
+    async fn apply_committed(
+        &self,
+        request: klights_cluster_store::CommittedRaftApplyRequest,
+    ) -> Result<StorageCommandResult, klights_cluster_store::CommittedApplyError>;
+}
+
+#[async_trait]
+pub(crate) trait RaftSnapshotRestore: Send + Sync {
+    async fn restore_snapshot(
+        &self,
+        data: RaftSnapshotData,
+    ) -> Result<(), klights_cluster_store::SnapshotPersistenceError>;
+}
+
+pub struct RaftStateMachineStorePorts {
+    committed_apply: Arc<dyn RaftCommittedApply>,
+    snapshot_restore: Arc<dyn RaftSnapshotRestore>,
     recovery: Arc<dyn DurableRecoveryStore>,
     lifecycle: Arc<dyn BackendLifecycleStore>,
+    metadata: Arc<dyn super::node::RaftCommitMaterializer>,
+}
+
+impl RaftStateMachineStorePorts {
+    pub(crate) fn new(
+        committed_apply: Arc<dyn RaftCommittedApply>,
+        snapshot_restore: Arc<dyn RaftSnapshotRestore>,
+        recovery: Arc<dyn DurableRecoveryStore>,
+        lifecycle: Arc<dyn BackendLifecycleStore>,
+        metadata: Arc<dyn super::node::RaftCommitMaterializer>,
+    ) -> Self {
+        Self {
+            committed_apply,
+            snapshot_restore,
+            recovery,
+            lifecycle,
+            metadata,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteRaftStateMachine {
+    committed_apply: Arc<dyn RaftCommittedApply>,
+    snapshot_restore: Arc<dyn RaftSnapshotRestore>,
+    recovery: Arc<dyn DurableRecoveryStore>,
+    lifecycle: Arc<dyn BackendLifecycleStore>,
+    metadata: Arc<dyn super::node::RaftCommitMaterializer>,
     applied_state: Arc<dyn RaftAppliedStateDurability>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
@@ -41,12 +86,14 @@ pub struct SqliteRaftStateMachine {
 impl SqliteRaftStateMachine {
     #[cfg(test)]
     pub fn new(
-        backend: Arc<dyn DatastoreBackend>,
+        backend: Arc<dyn super::super::DatastoreBackend>,
         applied_state: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
+        let stores =
+            super::super::cluster_store_adapter::raft_state_machine_store_ports_for_test(backend);
         Self::new_with_command_codec_activation(
-            backend,
+            stores,
             applied_state,
             supervisor,
             Arc::new(super::node::CommandCodecV3Activation::inactive_for_state_machine_test()),
@@ -54,21 +101,17 @@ impl SqliteRaftStateMachine {
     }
 
     pub(crate) fn new_with_command_codec_activation(
-        backend: Arc<dyn DatastoreBackend>,
+        stores: RaftStateMachineStorePorts,
         applied_state: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
     ) -> Self {
-        let recovery = Arc::new(super::super::DatastoreDurableRecoveryPort::new(
-            backend.clone(),
-        ));
-        let lifecycle = Arc::new(super::super::DatastoreBackendLifecyclePort::new(
-            backend.clone(),
-        ));
         Self {
-            backend,
-            recovery,
-            lifecycle,
+            committed_apply: stores.committed_apply,
+            snapshot_restore: stores.snapshot_restore,
+            recovery: stores.recovery,
+            lifecycle: stores.lifecycle,
+            metadata: stores.metadata,
             applied_state,
             supervisor,
             command_codec_v3_activation,
@@ -241,21 +284,17 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                     )
                     .map_err(|e| apply_err(log_id, e))?;
                     let activates_command_codec_v3 = commit_activates_command_codec_v3(&commit);
-                    let port =
-                        super::super::cluster_store_adapter::DatastoreCommittedRaftApply::new(
-                            self.backend.clone(),
-                            super::authority::committed_apply(),
-                        );
-                    let result = port
-                        .apply_committed_raft_result(
-                            klights_cluster_store::CommittedRaftApplyRequest::new(commit),
-                        )
+                    let result = self
+                        .committed_apply
+                        .apply_committed(klights_cluster_store::CommittedRaftApplyRequest::new(
+                            commit,
+                        ))
                         .await
                         .map_err(|e| apply_err(log_id, e))?;
                     if activates_command_codec_v3 {
                         let persisted = self
-                            .backend
-                            .get_klights_meta(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+                            .metadata
+                            .read_raft_metadata(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
                             .await
                             .map_err(|error| apply_err(log_id, error))?;
                         if persisted.as_deref() != Some(super::node::COMMAND_CODEC_ACTIVATION_VALUE)
@@ -323,18 +362,15 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         // authoritative replace primitive, which deletes all replicated
         // tables first, then replays the snapshot commits and restores the
         // leader RV. (finding.md H1 / P0 cluster.db divergence.)
-        super::super::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new(
-            self.backend.clone(),
-            super::authority::snapshot_install(),
-        )
-        .restore_authoritative_raft_snapshot(data)
-        .await
-        .map_err(|e| StorageError::IO {
-            source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
-        })?;
+        self.snapshot_restore
+            .restore_snapshot(data)
+            .await
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
+            })?;
         match self
-            .backend
-            .get_klights_meta(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
+            .metadata
+            .read_raft_metadata(super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)
             .await
             .map_err(ioerr_read)?
             .as_deref()
@@ -368,6 +404,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::sqlite_boundary::DbExecutor;
     use crate::sqlite_open as opener;
@@ -1657,7 +1694,7 @@ mod tests {
         );
         assert_eq!(
             result[0].pod_endpoint_effect,
-            crate::datastore::PodEndpointEffect::Changed,
+            klights_cluster_core::PodEndpointEffect::Changed,
             "real committed-Raft apply must carry the transaction-derived endpoint effect"
         );
         assert!(

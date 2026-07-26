@@ -18,6 +18,96 @@ use klights_cluster_store::{
 
 use super::{DatastoreHandle, ResourceListQuery};
 
+pub(crate) struct DatastoreRaftCommitMaterializer {
+    db: DatastoreHandle,
+}
+
+impl DatastoreRaftCommitMaterializer {
+    pub(crate) fn new(db: DatastoreHandle) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::datastore::raft::node::RaftCommitMaterializer for DatastoreRaftCommitMaterializer {
+    async fn read_raft_metadata(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, crate::datastore::raft::node::RaftMaterializationError> {
+        self.db.get_klights_meta(key).await.map_err(|error| {
+            crate::datastore::raft::node::RaftMaterializationError::persistence(error.to_string())
+        })
+    }
+
+    async fn build_command(
+        &self,
+        command: klights_cluster_core::StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<
+        klights_cluster_core::LogApplyCommit,
+        crate::datastore::raft::node::RaftMaterializationError,
+    > {
+        self.db
+            .build_log_apply_commit_for_command(command, operation, authoring_node)
+            .await
+            .map_err(|error| {
+                crate::datastore::raft::node::RaftMaterializationError::persistence(
+                    error.to_string(),
+                )
+            })
+    }
+
+    async fn build_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: klights_cluster_core::StorageCommand,
+        authoring_node: &str,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> Result<klights_cluster_core::BuildOutboxOutcome, klights_cluster_core::OutboxApplyError>
+    {
+        self.db
+            .build_log_apply_commit_for_outbox_with_watermark(
+                idempotency_key,
+                operation,
+                command,
+                authoring_node,
+                watermark,
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn raft_state_machine_store_ports_for_test(
+    db: DatastoreHandle,
+) -> crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts {
+    let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db.clone()));
+    crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
+        std::sync::Arc::new(DatastoreCommittedRaftApply::new_for_test(db.clone())),
+        std::sync::Arc::new(DatastoreAuthoritativeSnapshotPersistence::new_for_test(
+            db.clone(),
+        )),
+        std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+            db.clone(),
+        )),
+        std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(db)),
+        materializer,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn raft_store_ports_for_test(
+    db: DatastoreHandle,
+) -> crate::datastore::raft::node::RaftStorePorts {
+    let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db.clone()));
+    crate::datastore::raft::node::RaftStorePorts::new(
+        materializer,
+        raft_state_machine_store_ports_for_test(db),
+    )
+}
+
 /// Read-only capability wrapper over the legacy umbrella datastore handle.
 ///
 /// REMOVE(Phase 10): concrete cluster datastore adapters implement the
@@ -332,6 +422,21 @@ impl DatastoreCommittedRaftApply {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::datastore::raft::state_machine_impl::RaftCommittedApply
+    for DatastoreCommittedRaftApply
+{
+    async fn apply_committed(
+        &self,
+        request: CommittedRaftApplyRequest,
+    ) -> Result<
+        crate::datastore::raft::types::StorageCommandResult,
+        klights_cluster_store::CommittedApplyError,
+    > {
+        self.apply_committed_raft_result(request).await
+    }
+}
+
 impl PrivilegedCommittedRaftApply for DatastoreCommittedRaftApply {
     fn apply_committed_raft(
         &self,
@@ -605,9 +710,10 @@ pub(crate) struct DatastoreAuthoritativeSnapshotPersistence {
 impl DatastoreAuthoritativeSnapshotPersistence {
     pub(crate) fn new(
         db: DatastoreHandle,
+        recovery: std::sync::Arc<dyn crate::datastore::DurableRecoveryStore>,
         _authority: crate::datastore::raft::SnapshotInstallAuthority,
     ) -> Self {
-        Self::from_handle(db)
+        Self { db, recovery }
     }
 
     #[cfg(test)]
@@ -615,6 +721,7 @@ impl DatastoreAuthoritativeSnapshotPersistence {
         Self::from_handle(db)
     }
 
+    #[cfg(test)]
     fn from_handle(db: DatastoreHandle) -> Self {
         let recovery = std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
             db.clone(),
@@ -655,6 +762,20 @@ impl DatastoreAuthoritativeSnapshotPersistence {
                 }),
             )
             .await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::datastore::raft::state_machine_impl::RaftSnapshotRestore
+    for DatastoreAuthoritativeSnapshotPersistence
+{
+    async fn restore_snapshot(
+        &self,
+        data: crate::datastore::raft::snapshot::RaftSnapshotData,
+    ) -> Result<(), SnapshotPersistenceError> {
+        self.restore_authoritative_raft_snapshot(data)
+            .await
+            .map_err(|error| SnapshotPersistenceError::persistence_failed(error.to_string()))
     }
 }
 

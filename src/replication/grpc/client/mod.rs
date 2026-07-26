@@ -72,7 +72,6 @@ const NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
 // gone so client, CRI, and server cannot drift.
 // `DEFAULT_FORWARD_RESPONSE_TIMEOUT` and `PendingForward` removed in T6.
 type StreamItemQueue = Arc<Mutex<mpsc::Receiver<Result<StreamItem>>>>;
-type NodeExecRuntimeSlot = Arc<Mutex<Option<Arc<dyn NodeExecRuntime>>>>;
 #[derive(Clone)]
 struct NodeExecInputRoute {
     sender: mpsc::Sender<NodeExecFrame>,
@@ -86,8 +85,50 @@ enum ActiveRuntimeKind {
 }
 type RuntimeCancellationRoutes =
     Arc<Mutex<std::collections::HashMap<(ActiveRuntimeKind, String), Arc<CancellationToken>>>>;
-type NodeLogRuntimeSlot = Arc<Mutex<Option<Arc<dyn NodeLogRuntime>>>>;
-type NodeMetricsRuntimeSlot = Arc<Mutex<Option<Arc<dyn NodeMetricsRuntime>>>>;
+
+#[derive(Clone)]
+pub enum NodeExecCapability {
+    Available(Arc<dyn NodeExecRuntime>),
+    Unavailable,
+}
+
+#[derive(Clone)]
+pub enum NodeLogCapability {
+    Available(Arc<dyn NodeLogRuntime>),
+    Unavailable,
+}
+
+#[derive(Clone)]
+pub enum NodeMetricsCapability {
+    Available(Arc<dyn NodeMetricsRuntime>),
+    Unavailable,
+}
+
+/// Complete, immutable runtime capability bundle for a node control stream.
+///
+/// Unsupported capabilities are represented explicitly instead of through
+/// mutable late-bound slots, so an operational stream can never observe a
+/// partially populated client.
+#[derive(Clone)]
+pub struct NodeControlRuntimes {
+    exec: NodeExecCapability,
+    logs: NodeLogCapability,
+    metrics: NodeMetricsCapability,
+}
+
+impl NodeControlRuntimes {
+    pub fn new(
+        exec: NodeExecCapability,
+        logs: NodeLogCapability,
+        metrics: NodeMetricsCapability,
+    ) -> Self {
+        Self {
+            exec,
+            logs,
+            metrics,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct SkipCaServerCertVerifier {
@@ -152,11 +193,9 @@ impl ServerCertVerifier for SkipCaServerCertVerifier {
 #[derive(Clone)]
 struct ConnectDispatchContext {
     supervisor: Arc<TaskSupervisor>,
-    node_exec_runtime: NodeExecRuntimeSlot,
+    runtimes: NodeControlRuntimes,
     node_exec_inputs: NodeExecInputRoutes,
     node_stream_cancellations: RuntimeCancellationRoutes,
-    node_log_runtime: NodeLogRuntimeSlot,
-    node_metrics_runtime: NodeMetricsRuntimeSlot,
     observed_leader_endpoint: Option<String>,
 }
 
@@ -306,9 +345,6 @@ pub struct ReplicationGrpcClient {
     supervisor: Arc<TaskSupervisor>,
     stream: Arc<Mutex<Option<OpenConnectStream>>>,
     join_response: Arc<Mutex<Option<JoinResponse>>>,
-    node_exec_runtime: NodeExecRuntimeSlot,
-    node_log_runtime: NodeLogRuntimeSlot,
-    node_metrics_runtime: NodeMetricsRuntimeSlot,
     /// T2 step 5: list of all known leader endpoints (from --leader).
     /// When the stream fails, the reconnect loop cycles through these
     /// to find a reachable leader instead of retrying the same fixed
@@ -515,9 +551,6 @@ impl ReplicationGrpcClient {
             supervisor,
             stream: Arc::new(Mutex::new(None)),
             join_response: Arc::new(Mutex::new(None)),
-            node_exec_runtime: Arc::new(Mutex::new(None)),
-            node_log_runtime: Arc::new(Mutex::new(None)),
-            node_metrics_runtime: Arc::new(Mutex::new(None)),
             all_leader_endpoints: Arc::new(std::sync::Mutex::new(Vec::new())),
             endpoint_index: Arc::new(std::sync::Mutex::new(0)),
             current_endpoint_override: Arc::new(std::sync::Mutex::new(None)),
@@ -697,18 +730,6 @@ impl ReplicationGrpcClient {
         candidates
     }
 
-    pub async fn set_node_exec_runtime(&self, runtime: Arc<dyn NodeExecRuntime>) {
-        *self.node_exec_runtime.lock().await = Some(runtime);
-    }
-
-    pub async fn set_node_log_runtime(&self, handler: Arc<dyn NodeLogRuntime>) {
-        *self.node_log_runtime.lock().await = Some(handler);
-    }
-
-    pub async fn set_node_metrics_runtime(&self, runtime: Arc<dyn NodeMetricsRuntime>) {
-        *self.node_metrics_runtime.lock().await = Some(runtime);
-    }
-
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn worker(
@@ -742,13 +763,24 @@ impl ReplicationGrpcClient {
         config: GrpcClientConfig,
         supervisor: Arc<TaskSupervisor>,
         policy: Arc<GrpcTransportPolicy>,
+        runtimes: NodeControlRuntimes,
     ) -> Result<Self> {
         let client = Self::new(config, supervisor, policy);
-        client.ensure_joined().await?;
+        client.ensure_joined_with_runtimes(runtimes).await?;
         Ok(client)
     }
 
-    pub async fn ensure_joined(&self) -> Result<JoinResponse> {
+    pub(crate) async fn ensure_joined_with_runtimes(
+        &self,
+        runtimes: NodeControlRuntimes,
+    ) -> Result<JoinResponse> {
+        self.ensure_joined_with_dispatch(runtimes).await
+    }
+
+    async fn ensure_joined_with_dispatch(
+        &self,
+        runtimes: NodeControlRuntimes,
+    ) -> Result<JoinResponse> {
         let mut guard = self.stream.lock().await;
         if guard.is_some() {
             if let Some(response) = self.join_response.lock().await.clone() {
@@ -760,7 +792,7 @@ impl ReplicationGrpcClient {
                 current_rv: 0,
             });
         }
-        let (stream, response) = self.open_connect_stream().await?;
+        let (stream, response) = self.open_connect_stream(runtimes).await?;
         *self.join_response.lock().await = Some(response.clone());
         *guard = Some(stream);
         Ok(response)
@@ -1810,7 +1842,10 @@ impl ReplicationGrpcClient {
     // `forward_command_with_meta` removed in T6. Workers now route writes
     // through outbox -> ApplyOutbox.
 
-    async fn open_connect_stream(&self) -> Result<(OpenConnectStream, JoinResponse)> {
+    async fn open_connect_stream(
+        &self,
+        runtimes: NodeControlRuntimes,
+    ) -> Result<(OpenConnectStream, JoinResponse)> {
         // bug-grpc: the long-lived bidi stream gets its own dedicated
         // connection (Stream lane) so it never head-of-line blocks the
         // hot Status RPCs (`apply_outbox`/`renew_node_lease`).
@@ -1858,11 +1893,9 @@ impl ReplicationGrpcClient {
         let (stream_tx, stream_rx) = mpsc::channel(STREAM_ITEM_CHANNEL_CAPACITY);
         let dispatch_context = ConnectDispatchContext {
             supervisor: self.supervisor.clone(),
-            node_exec_runtime: self.node_exec_runtime.clone(),
+            runtimes,
             node_exec_inputs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             node_stream_cancellations: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            node_log_runtime: self.node_log_runtime.clone(),
-            node_metrics_runtime: self.node_metrics_runtime.clone(),
             observed_leader_endpoint: self.observed_leader_endpoint_for_report(),
         };
         self.supervisor
@@ -1887,17 +1920,14 @@ impl ReplicationGrpcClient {
         mpsc::Sender<klights_internal_protobuf::FollowerMessage>,
         StreamItemQueue,
     )> {
-        let mut guard = self.stream.lock().await;
-        if guard.is_none() {
-            let (stream, response) = self.open_connect_stream().await?;
-            *self.join_response.lock().await = Some(response);
-            *guard = Some(stream);
-        }
-        let stream = guard.as_ref().expect("stream set above");
+        let guard = self.stream.lock().await;
+        let stream = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("replication control stream is not connected"))?;
         Ok((stream.sender.clone(), stream.stream_items.clone()))
     }
 
-    async fn clear_stream(&self) {
+    pub(crate) async fn clear_stream(&self) {
         *self.stream.lock().await = None;
         // bug-grpc: a dropped stream means only the stream's connection
         // is suspect. Invalidate ONLY the Stream lane so the next
@@ -2294,7 +2324,7 @@ async fn dispatch_leader_message(
         }
         // T6: legacy ForwardResponse payload removed.
         Some(klights_internal_protobuf::leader_message::Payload::NodeExecSyncRequest(request)) => {
-            let response = handle_node_exec_sync_request(request, &context.node_exec_runtime).await;
+            let response = handle_node_exec_sync_request(request, &context.runtimes.exec).await;
             outbound
                 .send(klights_internal_protobuf::FollowerMessage {
                     payload: Some(
@@ -2311,7 +2341,7 @@ async fn dispatch_leader_message(
                 request,
                 outbound,
                 context.supervisor.clone(),
-                &context.node_exec_runtime,
+                &context.runtimes.exec,
                 &context.node_exec_inputs,
                 &context.node_stream_cancellations,
             )
@@ -2347,14 +2377,14 @@ async fn dispatch_leader_message(
             if request.follow.as_deref() == Some("true") {
                 handle_pod_log_follow_request(
                     request,
-                    &context.node_log_runtime,
+                    &context.runtimes.logs,
                     outbound.clone(),
                     context.supervisor.clone(),
                     context.node_stream_cancellations.clone(),
                 )
                 .await?;
             } else {
-                let response = handle_pod_log_request(request, &context.node_log_runtime).await;
+                let response = handle_pod_log_request(request, &context.runtimes.logs).await;
                 outbound
                     .send(klights_internal_protobuf::FollowerMessage {
                         payload: Some(
@@ -2370,8 +2400,7 @@ async fn dispatch_leader_message(
             }
         }
         Some(klights_internal_protobuf::leader_message::Payload::NodeMetricsRequest(request)) => {
-            let response =
-                handle_node_metrics_request(request, &context.node_metrics_runtime).await;
+            let response = handle_node_metrics_request(request, &context.runtimes.metrics).await;
             outbound
                 .send(klights_internal_protobuf::FollowerMessage {
                     payload: Some(
@@ -2421,7 +2450,7 @@ async fn dispatch_leader_message(
 
 async fn handle_node_exec_sync_request(
     request: klights_internal_protobuf::NodeExecSyncRequest,
-    handler: &NodeExecRuntimeSlot,
+    capability: &NodeExecCapability,
 ) -> klights_internal_protobuf::NodeExecSyncResponse {
     let request_id = request.request_id.clone();
     let request = match node_exec_sync_request_from_proto(request) {
@@ -2436,7 +2465,7 @@ async fn handle_node_exec_sync_request(
             };
         }
     };
-    let Some(handler) = handler.lock().await.clone() else {
+    let NodeExecCapability::Available(handler) = capability else {
         return klights_internal_protobuf::NodeExecSyncResponse {
             request_id,
             stdout: Vec::new(),
@@ -2504,13 +2533,13 @@ async fn handle_node_exec_stream_request(
     request: klights_internal_protobuf::NodeExecRequest,
     outbound: &mpsc::Sender<klights_internal_protobuf::FollowerMessage>,
     supervisor: Arc<TaskSupervisor>,
-    handler: &NodeExecRuntimeSlot,
+    capability: &NodeExecCapability,
     node_exec_inputs: &NodeExecInputRoutes,
     node_stream_cancellations: &RuntimeCancellationRoutes,
 ) -> Result<()> {
     let request_id = request.request_id.clone();
     let request = node_exec_request_from_proto(request)?;
-    let Some(handler) = handler.lock().await.clone() else {
+    let NodeExecCapability::Available(handler) = capability else {
         send_node_exec_frame_to_leader(
             outbound,
             &request_id,
@@ -2556,6 +2585,7 @@ async fn handle_node_exec_stream_request(
         );
     }
 
+    let handler = handler.clone();
     let task_request_id = request_id.clone();
     let task_cancel = runtime_cancel.clone();
     let output = outbound.clone();
@@ -2674,7 +2704,7 @@ async fn send_node_exec_frame_to_leader(
 
 async fn handle_pod_log_request(
     request: klights_internal_protobuf::PodLogRequest,
-    handler: &NodeLogRuntimeSlot,
+    capability: &NodeLogCapability,
 ) -> klights_internal_protobuf::PodLogResponse {
     let request_id = request.request_id.clone();
     let request = match node_log_request_from_proto(request) {
@@ -2683,7 +2713,7 @@ async fn handle_pod_log_request(
             return node_log_error_to_proto(request_id, error.to_string());
         }
     };
-    let Some(handler) = handler.lock().await.clone() else {
+    let NodeLogCapability::Available(handler) = capability else {
         return node_log_error_to_proto(request_id, "pod log handler is not available".to_string());
     };
     match handler.read_logs(request).await {
@@ -2694,7 +2724,7 @@ async fn handle_pod_log_request(
 
 async fn handle_node_metrics_request(
     request: klights_internal_protobuf::NodeMetricsRequest,
-    runtime: &NodeMetricsRuntimeSlot,
+    capability: &NodeMetricsCapability,
 ) -> klights_internal_protobuf::NodeMetricsResponse {
     let request = match node_metrics_request_from_proto(request) {
         Ok(request) => request,
@@ -2702,9 +2732,9 @@ async fn handle_node_metrics_request(
     };
     let request_id = request.request_id;
     let node_name = request.request.target().node_name().to_string();
-    let result = match runtime.lock().await.clone() {
-        Some(runtime) => runtime.collect_metrics(request.request).await,
-        None => Err(NodeMetricsError::unavailable(
+    let result = match capability {
+        NodeMetricsCapability::Available(runtime) => runtime.collect_metrics(request.request).await,
+        NodeMetricsCapability::Unavailable => Err(NodeMetricsError::unavailable(
             "node metrics handler is not available",
         )),
     };
@@ -2717,7 +2747,7 @@ async fn handle_node_metrics_request(
 
 async fn handle_pod_log_follow_request(
     request: klights_internal_protobuf::PodLogRequest,
-    handler: &NodeLogRuntimeSlot,
+    capability: &NodeLogCapability,
     outbound: mpsc::Sender<klights_internal_protobuf::FollowerMessage>,
     supervisor: Arc<TaskSupervisor>,
     node_stream_cancellations: RuntimeCancellationRoutes,
@@ -2739,7 +2769,7 @@ async fn handle_pod_log_follow_request(
             return Ok(());
         }
     };
-    let Some(handler) = handler.lock().await.clone() else {
+    let NodeLogCapability::Available(handler) = capability else {
         outbound
             .send(klights_internal_protobuf::FollowerMessage {
                 payload: Some(
@@ -2758,6 +2788,7 @@ async fn handle_pod_log_follow_request(
         return Ok(());
     };
 
+    let handler = handler.clone();
     let runtime_cancel = Arc::new(CancellationToken::new());
     {
         let mut cancellations = node_stream_cancellations.lock().await;

@@ -17,7 +17,6 @@ pub mod raft;
 pub mod redb;
 pub(crate) mod replay_retention;
 pub(crate) mod selector;
-pub(crate) mod sequenced;
 pub mod snapshot;
 pub(crate) mod snapshot_export;
 pub mod sqlite;

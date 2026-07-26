@@ -8,8 +8,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::bootstrap::sequenced_datastore::DatastoreApplier;
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::sequenced::DatastoreApplier;
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;

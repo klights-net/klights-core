@@ -464,7 +464,7 @@ impl RaftLogApplyOutcome {
     fn try_new(
         committed_outcome: klights_cluster_core::CommittedApplyOutcome,
         pending: Vec<PendingWatchEvent>,
-        pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+        pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     ) -> tokio_rusqlite::Result<Self> {
         let result = match &committed_outcome {
             klights_cluster_core::CommittedApplyOutcome::Visible {
@@ -615,17 +615,17 @@ fn pod_endpoint_effect(
     target: Option<&(Option<String>, String)>,
     before: Option<&serde_json::Value>,
     after: Option<&serde_json::Value>,
-) -> crate::datastore::PodEndpointEffect {
+) -> klights_cluster_core::PodEndpointEffect {
     if target.is_none() {
-        return crate::datastore::PodEndpointEffect::NotApplicable;
+        return klights_cluster_core::PodEndpointEffect::NotApplicable;
     }
     if before.zip(after).is_some_and(|(before, after)| {
         klights_cluster_core::pod_endpoint_state(before)
             .differs_from(&klights_cluster_core::pod_endpoint_state(after))
     }) {
-        crate::datastore::PodEndpointEffect::Changed
+        klights_cluster_core::PodEndpointEffect::Changed
     } else {
-        crate::datastore::PodEndpointEffect::Unchanged
+        klights_cluster_core::PodEndpointEffect::Unchanged
     }
 }
 
@@ -1355,7 +1355,7 @@ fn storage_result_from_applied_outbox(
                 rejection_code: None,
                 public_resource_changed: false,
                 applied_mutation: None,
-                pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
+                pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::Unchanged,
             })
         }
         Ok(klights_cluster_core::command::StorageResponse::Resource {
@@ -1373,7 +1373,7 @@ fn storage_result_from_applied_outbox(
                 applied_mutation: Some(crate::datastore::raft::types::AppliedMutation::Resource(
                     resource,
                 )),
-                pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
+                pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::Unchanged,
             })
         }
         Ok(_) => Ok(crate::datastore::raft::types::StorageCommandResult {
@@ -1382,7 +1382,7 @@ fn storage_result_from_applied_outbox(
             rejection_code: None,
             public_resource_changed: false,
             applied_mutation: None,
-            pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
+            pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::Unchanged,
         }),
         Err(err) => Err(other_error(format!(
             "failed to decode applied_outbox result: {err}"

@@ -53,7 +53,7 @@ mod cases {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("inline-{}", uuid::Uuid::new_v4());
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
                     crate::node_outbox::payload::OutboxOperation::PodStatus,
@@ -90,7 +90,7 @@ mod cases {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
                     .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
@@ -2268,7 +2268,7 @@ mod cases {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("inline-{}", uuid::Uuid::new_v4());
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
                     crate::node_outbox::payload::OutboxOperation::PodStatus,
@@ -2302,7 +2302,7 @@ mod cases {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
                     .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let result = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let result = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
@@ -2466,7 +2466,7 @@ mod cases {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
                     .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
@@ -2582,7 +2582,7 @@ mod cases {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
                     .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
@@ -2844,7 +2844,7 @@ mod cases {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_command_applies_cluster_id_once() {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
         use klights_cluster_core::command::{
             COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
         };
@@ -3186,7 +3186,7 @@ mod cases {
     /// `DisruptionTarget` condition is not dropped on the floor.
     #[tokio::test]
     async fn replicated_update_resource_preserves_disruption_target_over_newer_kubelet_status() {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         // Victim is already Running on the node with the four kubelet-rebuilt
@@ -3338,7 +3338,7 @@ mod cases {
     /// waits for Running time out on a pod that kubelet never admits.
     #[tokio::test]
     async fn replicated_scheduler_bind_overwrites_pod_scheduled_pending_condition() {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
@@ -3468,7 +3468,7 @@ mod cases {
     /// DisruptionTarget.
     #[tokio::test]
     async fn leader_direct_status_apply_preserves_disruption_target_without_outbox_stamp() {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         // Post-preemption victim: terminating with the four kubelet-rebuilt
@@ -3571,7 +3571,7 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_stale_status_preserves_live_job_status_scalars() {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
@@ -3677,7 +3677,7 @@ mod cases {
     async fn apply_replicated_stale_status_case(
         case: ReplicatedStaleStatusCase,
     ) -> crate::datastore::Resource {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
@@ -4037,7 +4037,7 @@ mod cases {
 
     #[tokio::test]
     async fn replicated_fresh_service_status_replaces_load_balancer_and_preserves_conditions() {
-        use crate::datastore::sequenced::apply_command_to_backend;
+        use crate::bootstrap::sequenced_datastore::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db

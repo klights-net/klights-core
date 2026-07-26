@@ -155,7 +155,7 @@ async fn apply_outbox_to_local_leader_with_node_operation(
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
     Ok(
-        crate::datastore::raft::state_machine::propose_outbox_on_backend_with_watermark(
+        crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend_with_watermark(
             db,
             idempotency_key,
             operation,

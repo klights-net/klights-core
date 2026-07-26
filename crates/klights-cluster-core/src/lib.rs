@@ -64,3 +64,17 @@ pub use status::{
     StatusMergeProfileKind, StatusMergeRegistry, apply_status_merge, merge_node_status_for_update,
     merge_status_for_apply,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceMutationEffect {
+    Unchanged,
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PodEndpointEffect {
+    #[default]
+    NotApplicable,
+    Unchanged,
+    Changed,
+}

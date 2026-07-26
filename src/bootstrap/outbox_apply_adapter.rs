@@ -10,29 +10,31 @@ use klights_cluster_store::{
 };
 use tokio::sync::RwLock;
 
-use super::super::DatastoreBackend;
+use crate::datastore::DatastoreBackend;
 use crate::replication::protocol::ForwardedResource;
 use crate::storage_wire_codec::decode_outbox_payload_protobuf;
 
 #[derive(Clone)]
-pub struct N1Raft {
+pub(crate) struct RootOutboxApplyAdapter {
     backend: Arc<dyn DatastoreBackend>,
     last_commit_index: Arc<RwLock<i64>>,
 }
 
-impl N1Raft {
-    pub fn new(backend: Arc<dyn DatastoreBackend>) -> Self {
+impl RootOutboxApplyAdapter {
+    pub(crate) fn new(backend: Arc<dyn DatastoreBackend>) -> Self {
         Self {
             backend,
             last_commit_index: Arc::new(RwLock::new(0)),
         }
     }
 
-    pub async fn last_commit_index(&self) -> i64 {
+    #[cfg(test)]
+    pub(crate) async fn last_commit_index(&self) -> i64 {
         *self.last_commit_index.read().await
     }
 
-    pub async fn propose_outbox(
+    #[cfg(test)]
+    pub(crate) async fn propose_outbox(
         &self,
         idempotency_key: &str,
         operation: OutboxOperation,
@@ -73,7 +75,11 @@ impl N1Raft {
     }
 }
 
-pub async fn propose_outbox_on_backend(
+#[cfg(test)]
+pub(crate) type N1Raft = RootOutboxApplyAdapter;
+
+#[cfg(test)]
+pub(crate) async fn propose_outbox_on_backend(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
     operation: OutboxOperation,
@@ -91,7 +97,7 @@ pub async fn propose_outbox_on_backend(
     .await
 }
 
-pub async fn propose_outbox_on_backend_with_watermark(
+pub(crate) async fn propose_outbox_on_backend_with_watermark(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
     operation: OutboxOperation,
@@ -108,7 +114,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
             result: OutboxApplyOutcome::Applied { applied_rv: 0 },
             resource: None,
             command: None,
-            pod_endpoint_effect: super::super::PodEndpointEffect::NotApplicable,
+            pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::NotApplicable,
         });
     }
     if watermark.is_none() {
@@ -160,7 +166,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
             return Err(classified);
         }
     };
-    let resource_changed = resource_effect == super::super::ResourceMutationEffect::Changed;
+    let resource_changed = resource_effect == klights_cluster_core::ResourceMutationEffect::Changed;
 
     // T1: All apply results are now propagated (errors surface,
     // AlreadyApplied returns the stored resource). The log_apply
@@ -208,30 +214,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
     } else {
         resource
     };
-    let effect_command = if durable_actor_finalization
-        && matches!(decoded.command, StorageCommand::DeleteResource { .. })
-    {
-        resource.as_ref().map_or(decoded.command, |resource| {
-            crate::bound_pod_finalization_command::author(
-                resource
-                    .namespace
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string()),
-                resource.name.clone(),
-                resource
-                    .data
-                    .pointer("/metadata/uid")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                authoring_node.to_string(),
-                resource.resource_version,
-            )
-        })
-    } else {
-        decoded.command
-    };
-    let command = (!suppress_side_effect).then_some(effect_command);
+    let command = (!suppress_side_effect).then_some(decoded.command);
     Ok(RaftOutboxApply {
         result,
         resource,
@@ -323,15 +306,15 @@ fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
             .is_some_and(|uid| !uid.is_empty())
 }
 
-pub struct RaftOutboxApply {
+pub(crate) struct RaftOutboxApply {
     pub(crate) result: OutboxApplyOutcome,
     pub(crate) resource: Option<ForwardedResource>,
     pub(crate) command: Option<StorageCommand>,
-    pub(crate) pod_endpoint_effect: super::super::PodEndpointEffect,
+    pub(crate) pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
 }
 
 impl RaftOutboxApply {
-    pub fn applied_resource_version(&self) -> Option<i64> {
+    pub(crate) fn applied_resource_version(&self) -> Option<i64> {
         match &self.result {
             OutboxApplyOutcome::Applied { applied_rv } => Some(*applied_rv),
             OutboxApplyOutcome::AlreadyApplied { applied_rv } => *applied_rv,
@@ -804,7 +787,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             unchanged.pod_endpoint_effect,
-            crate::datastore::PodEndpointEffect::Unchanged
+            klights_cluster_core::PodEndpointEffect::Unchanged
         );
 
         let changed = apply(
@@ -819,7 +802,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             changed.pod_endpoint_effect,
-            crate::datastore::PodEndpointEffect::Changed
+            klights_cluster_core::PodEndpointEffect::Changed
         );
     }
 
@@ -995,7 +978,7 @@ mod tests {
         );
         assert_eq!(
             duplicate.pod_endpoint_effect,
-            crate::datastore::PodEndpointEffect::Unchanged,
+            klights_cluster_core::PodEndpointEffect::Unchanged,
             "AlreadyApplied must preserve the atomic no-effect classification"
         );
         assert_eq!(
@@ -1028,7 +1011,7 @@ mod tests {
             );
             assert_eq!(
                 no_change.pod_endpoint_effect,
-                crate::datastore::PodEndpointEffect::NotApplicable,
+                klights_cluster_core::PodEndpointEffect::NotApplicable,
                 "{key} has no committed Pod mutation to classify"
             );
             assert_eq!(
@@ -1070,7 +1053,7 @@ mod tests {
         assert!(newer.command.is_some(), "newer status must emit effects");
         assert_eq!(
             newer.pod_endpoint_effect,
-            crate::datastore::PodEndpointEffect::Changed
+            klights_cluster_core::PodEndpointEffect::Changed
         );
         assert!(
             newer.resource.is_some(),

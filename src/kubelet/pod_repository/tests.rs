@@ -1858,31 +1858,32 @@ async fn non_leader_pod_status_writer_without_outbox_retries_later() {
 #[tokio::test]
 async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
     let (_ds, direct_db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_leader_ds, leader_db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
-    let pod = crate::datastore::Resource {
-        id: 1,
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        namespace: Some("default".to_string()),
-        name: "leader-finalize".to_string(),
-        uid: "uid-leader-finalize".to_string(),
-        resource_version: 13,
-        data: Arc::new(json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "namespace": "default",
-                "name": "leader-finalize",
-                "uid": "uid-leader-finalize",
-                "resourceVersion": "13",
-                "deletionTimestamp": "2026-05-13T00:00:00Z",
-                "deletionGracePeriodSeconds": 0
-            },
-            "spec": {"nodeName": "worker-1", "containers": [{"name": "app", "image": "nginx"}]},
-            "status": {"phase": "Running"}
-        })),
-    };
+    let pod = leader_db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "leader-finalize",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "leader-finalize",
+                    "uid": "uid-leader-finalize",
+                    "resourceVersion": "13",
+                    "deletionTimestamp": "2026-05-13T00:00:00Z",
+                    "deletionGracePeriodSeconds": 0
+                },
+                "spec": {"nodeName": "worker-1", "containers": [{"name": "app", "image": "nginx"}]},
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await
+        .expect("seed authoritative leader Pod");
     let cluster_api = Arc::new(FakeLeaderApiClient::new(pod));
     let worker_db: crate::datastore::DatastoreHandle = Arc::new(
         crate::control_plane::client::worker_store::WorkerStoreAdapter::new(
@@ -1933,7 +1934,7 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
     let payload =
         crate::node_outbox::payload::OutboxPayload::decode_protobuf(row.payload_proto.as_slice())
             .expect("decode delete payload");
-    match payload.command {
+    match &payload.command {
         klights_cluster_core::command::StorageCommand::FinalizeBoundPod {
             namespace,
             name,
@@ -1946,12 +1947,33 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
             assert_eq!(pod_uid, "uid-leader-finalize");
             assert_eq!(node_name, "worker-1");
             assert!(
-                observed_resource_version > 0,
+                *observed_resource_version > 0,
                 "actor finalization must carry its leader-fresh Pod generation"
             );
         }
         other => panic!("expected FinalizeBoundPod outbox command, got {other:?}"),
     }
+    let applied = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
+        leader_db.as_ref(),
+        &row.idempotency_key,
+        crate::node_outbox::payload::OutboxOperation::PodMetadata,
+        bytes::Bytes::copy_from_slice(row.payload_proto.as_slice()),
+        "worker-1",
+    )
+    .await
+    .expect("apply the actor-authored command through the Raft outbox reducer");
+    assert!(
+        applied.command.is_some(),
+        "newly committed actor finalization must preserve its side-effect receipt"
+    );
+    assert!(
+        leader_db
+            .get_resource("v1", "Pod", Some("default"), "leader-finalize")
+            .await
+            .expect("read authoritative leader Pod after finalization")
+            .is_none(),
+        "the real lifecycle-authored FinalizeBoundPod command must remove only its matching UID"
+    );
 }
 
 #[tokio::test]
@@ -2607,14 +2629,14 @@ impl StatusRacingRaftProposal {
         authoring_node: &str,
         _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::datastore::raft::state_machine::RaftOutboxApply,
+        crate::bootstrap::outbox_apply_adapter::RaftOutboxApply,
         crate::node_outbox::OutboxApplyError,
     > {
         self.bump_status_before_delete_mark(&command).await;
         let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        crate::datastore::raft::state_machine::propose_outbox_on_backend(
+        crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
             self.inner.as_ref(),
             idempotency_key,
             operation,
@@ -2626,7 +2648,7 @@ impl StatusRacingRaftProposal {
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::sequenced::RaftProposal for StatusRacingRaftProposal {
+impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
@@ -2684,9 +2706,8 @@ async fn build_raft_repo_with_status_race_on_delete(
         pod_name: pod_name.to_string(),
         bumps: bumps.clone(),
     });
-    let sequenced = Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
-        inner, proposal,
-    ));
+    let sequenced =
+        Arc::new(crate::bootstrap::sequenced_datastore::SequencedDatastore::new(inner, proposal));
     let db: crate::datastore::DatastoreHandle = sequenced;
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
@@ -13041,13 +13062,17 @@ impl DeleteCasRacingRaftProposal {
                 .unwrap_or(0),
             authoring_node: "delete-cas-race-leader".to_string(),
         };
-        crate::datastore::sequenced::apply_command_to_backend(self.inner.as_ref(), command, meta)
-            .await
+        crate::bootstrap::sequenced_datastore::apply_command_to_backend(
+            self.inner.as_ref(),
+            command,
+            meta,
+        )
+        .await
     }
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::sequenced::RaftProposal for DeleteCasRacingRaftProposal {
+impl crate::datastore::raft::proposal::RaftProposal for DeleteCasRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
@@ -13101,9 +13126,8 @@ async fn build_store_with_delete_cas_race(
         set_node_name,
         raced: raced.clone(),
     });
-    let sequenced = Arc::new(crate::datastore::sequenced::SequencedDatastore::new(
-        inner, proposal,
-    ));
+    let sequenced =
+        Arc::new(crate::bootstrap::sequenced_datastore::SequencedDatastore::new(inner, proposal));
     let db: crate::datastore::DatastoreHandle = sequenced;
     (PodStore::new(db.clone()), db, raced)
 }

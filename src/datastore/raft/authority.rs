@@ -8,10 +8,10 @@ pub(crate) struct SnapshotInstallAuthority {
     _private: (),
 }
 
-pub(super) const fn committed_apply() -> CommittedApplyAuthority {
+pub(crate) const fn committed_apply() -> CommittedApplyAuthority {
     CommittedApplyAuthority { _private: () }
 }
 
-pub(super) const fn snapshot_install() -> SnapshotInstallAuthority {
+pub(crate) const fn snapshot_install() -> SnapshotInstallAuthority {
     SnapshotInstallAuthority { _private: () }
 }

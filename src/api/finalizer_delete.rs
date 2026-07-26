@@ -799,7 +799,7 @@ mod tests {
             let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                 .encode_protobuf()?;
             let key = format!("orphan-race-{}", uuid::Uuid::new_v4());
-            let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+            let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                 self.inner.as_ref(),
                 &key,
                 crate::node_outbox::payload::OutboxOperation::PodStatus,
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::datastore::sequenced::RaftProposal for OrphanFinalizerReinjectingProposer {
+    impl crate::datastore::raft::proposal::RaftProposal for OrphanFinalizerReinjectingProposer {
         async fn propose_command(
             &self,
             command: StorageCommand,
@@ -891,7 +891,8 @@ mod tests {
             inner: inner.clone(),
             reinjected: AtomicBool::new(false),
         });
-        let db = crate::datastore::sequenced::SequencedDatastore::new(inner, proposer.clone());
+        let db =
+            crate::bootstrap::sequenced_datastore::SequencedDatastore::new(inner, proposer.clone());
 
         db.create_namespace(
             "orphan-raft-race",

@@ -382,8 +382,9 @@ mod tests {
     }
 
     async fn raft_handle() -> crate::datastore::backend::DatastoreHandle {
+        use crate::bootstrap::sequenced_datastore::SequencedDatastore;
         use crate::datastore::backend::DatastoreHandle;
-        use crate::datastore::sequenced::{RaftProposal, SequencedDatastore};
+        use crate::datastore::raft::proposal::RaftProposal;
         use klights_cluster_core::StorageCommand;
 
         struct InlineProposer {
@@ -399,7 +400,7 @@ mod tests {
                 let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("csr-signer-test-{}", uuid::Uuid::new_v4());
-                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
                     crate::node_outbox::payload::OutboxOperation::PodStatus,
@@ -438,7 +439,7 @@ mod tests {
                     .map_err(|err| {
                     crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                 })?;
-                crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     operation,

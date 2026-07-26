@@ -25,27 +25,7 @@ fn snapshot_replay_floor_cursor_key(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResourceMutationEffect {
-    Unchanged,
-    Changed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PodEndpointEffect {
-    NotApplicable,
-    Unchanged,
-    Changed,
-}
-
-// Keep the explicit stable implementation: derived impl metadata changes the
-// compiler-rendered public API digest despite identical behavior.
-#[allow(clippy::derivable_impls)]
-impl Default for PodEndpointEffect {
-    fn default() -> Self {
-        Self::NotApplicable
-    }
-}
+use klights_cluster_core::{PodEndpointEffect, ResourceMutationEffect};
 
 /// Transaction-derived metadata for an outbox apply. Its fields remain
 /// private so transport and API layers cannot synthesize apply effects.
@@ -259,7 +239,7 @@ pub trait DatastoreBackend: Send + Sync {
         command: StorageCommand,
         meta: CommandMeta,
     ) -> Result<()> {
-        crate::datastore::sequenced::apply_command_to_backend(self, command, meta).await
+        crate::bootstrap::sequenced_datastore::apply_command_to_backend(self, command, meta).await
     }
 
     /// Atomically replace Kubernetes resource tables from a full leader snapshot.

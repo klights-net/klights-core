@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::watch;
 
+use crate::bootstrap::sequenced_datastore::WriteRejection;
 use crate::control_plane::client::{
     LeaderApiClient, focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
@@ -29,7 +30,6 @@ use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::cluster_store_adapter::{
     DatastoreClusterResourceRead, DatastoreDurableAllocatorRead, DatastoreDurableWatchHistory,
 };
-use crate::datastore::sequenced::WriteRejection;
 use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::node_outbox::OutboxApplyError;
@@ -167,7 +167,7 @@ pub struct LocalApiClient {
     db: DatastoreHandle,
     positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
-    raft: crate::datastore::raft::state_machine::N1Raft,
+    outbox_apply: crate::bootstrap::outbox_apply_adapter::RootOutboxApplyAdapter,
     authoring_node: String,
     containerd_namespace: String,
     service_account_signing_key_path: std::path::PathBuf,
@@ -439,7 +439,9 @@ impl LocalApiClient {
         let positioned_watch = datastore_positioned_watch_service(db.clone());
         let crypto = file_process.crypto_executor();
         Self {
-            raft: crate::datastore::raft::state_machine::N1Raft::new(db.clone()),
+            outbox_apply: crate::bootstrap::outbox_apply_adapter::RootOutboxApplyAdapter::new(
+                db.clone(),
+            ),
             db,
             positioned_watch,
             pod_store,
@@ -509,7 +511,7 @@ impl LocalApiClient {
 
     #[cfg(test)]
     pub async fn last_raft_commit_index_for_test(&self) -> i64 {
-        self.raft.last_commit_index().await
+        self.outbox_apply.last_commit_index().await
     }
 }
 
@@ -1311,7 +1313,7 @@ impl LocalApiClient {
             return Err(error);
         }
         let outcome = self
-            .raft
+            .outbox_apply
             .propose_outbox_with_watermark(
                 &idempotency_key,
                 operation.into(),
