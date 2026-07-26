@@ -1944,12 +1944,21 @@ impl PodLifecycleActor {
                 }
                 self.state.reset_start_retry_attempts();
                 self.state.pending_start_pod = None;
+                // A successful StartPod completion is itself an authoritative,
+                // event-driven runtime observation. Queue one status reconcile
+                // behind startup finalization instead of depending on a
+                // separate CRI stream event, which can race container startup.
+                // The actor's pending observation set coalesces a CRI event
+                // already deferred for this UID.
+                self.state.defer_runtime_reconcile(None);
                 let action = self.state.on_started(&sid);
                 match action {
                     FinalizationAction::RunFinalizers => {
                         self.finalize_startup_action(key, None, sid)
                     }
-                    FinalizationAction::AlreadyFinalized => PodAction::Noop,
+                    FinalizationAction::AlreadyFinalized => {
+                        self.drain_pending_runtime_reconcile(key)
+                    }
                 }
             }
 

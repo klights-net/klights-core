@@ -1719,20 +1719,20 @@ fn cri_event_during_runtime_reconcile_dispatches_followup_after_completion() {
         kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
         sandbox_id: Some("sandbox-a".to_string()),
     });
-    assert!(matches!(finalized, PodAction::Noop));
-
-    let reconcile = actor.handle_for_test(LifecycleMessage::CriEvent {
-        key: key.clone(),
-        container_id: "old-container".to_string(),
-        kind: KubeletEventKind::Stopped,
-    });
     assert!(matches!(
-        reconcile,
+        finalized,
         PodAction::ReconcileRuntime {
             operation_id: 3,
             ..
         }
     ));
+
+    let deferred_old = actor.handle_for_test(LifecycleMessage::CriEvent {
+        key: key.clone(),
+        container_id: "old-container".to_string(),
+        kind: KubeletEventKind::Stopped,
+    });
+    assert!(matches!(deferred_old, PodAction::Noop));
 
     let deferred = actor.handle_for_test(LifecycleMessage::CriEvent {
         key: key.clone(),
@@ -2345,20 +2345,20 @@ fn running_watch_echo_during_runtime_reconcile_preserves_deferred_followup() {
         kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
         sandbox_id: Some("sandbox-a".to_string()),
     });
-    assert!(matches!(finalized, PodAction::Noop));
-
-    let reconcile = actor.handle_for_test(LifecycleMessage::CriEvent {
-        key: key.clone(),
-        container_id: "old-container".to_string(),
-        kind: KubeletEventKind::Stopped,
-    });
     assert!(matches!(
-        reconcile,
+        finalized,
         PodAction::ReconcileRuntime {
             operation_id: 3,
             ..
         }
     ));
+
+    let deferred_old = actor.handle_for_test(LifecycleMessage::CriEvent {
+        key: key.clone(),
+        container_id: "old-container".to_string(),
+        kind: KubeletEventKind::Stopped,
+    });
+    assert!(matches!(deferred_old, PodAction::Noop));
 
     let deferred = actor.handle_for_test(LifecycleMessage::CriEvent {
         key: key.clone(),
@@ -2453,20 +2453,20 @@ fn pending_running_status_with_pod_ip_during_runtime_reconcile_dispatches_follow
         kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
         sandbox_id: Some("sandbox-a".to_string()),
     });
-    assert!(matches!(finalized, PodAction::Noop));
-
-    let reconcile = actor.handle_for_test(LifecycleMessage::CriEvent {
-        key: key.clone(),
-        container_id: "container-a".to_string(),
-        kind: KubeletEventKind::Started,
-    });
     assert!(matches!(
-        reconcile,
+        finalized,
         PodAction::ReconcileRuntime {
             operation_id: 3,
             ..
         }
     ));
+
+    let deferred_cri = actor.handle_for_test(LifecycleMessage::CriEvent {
+        key: key.clone(),
+        container_id: "container-a".to_string(),
+        kind: KubeletEventKind::Started,
+    });
+    assert!(matches!(deferred_cri, PodAction::Noop));
 
     let pending_running_echo = actor.handle_for_test(LifecycleMessage::WatchModified {
         key: key.clone(),
@@ -4209,10 +4209,17 @@ async fn watch_modified_with_ephemeral_container_dispatches_reconcile_after_star
     })
     .unwrap();
     tx.try_send(LifecycleMessage::PodWorkCompleted {
-        key,
+        key: key.clone(),
         operation_id: 2,
         kind: PodLifecycleWorkKind::FinalizeStartup,
         sandbox_id: Some("sandbox-a".to_string()),
+    })
+    .unwrap();
+    tx.try_send(LifecycleMessage::PodWorkCompleted {
+        key,
+        operation_id: 3,
+        kind: PodLifecycleWorkKind::ReconcileRuntime,
+        sandbox_id: None,
     })
     .unwrap();
     drop(tx);
@@ -4286,7 +4293,7 @@ fn ephemeral_update_during_startup_finalization_reconciles_after_finalization() 
     );
 
     let after_finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
-        key,
+        key: key.clone(),
         operation_id: 2,
         kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
         sandbox_id: Some("sandbox-a".to_string()),
@@ -4294,12 +4301,29 @@ fn ephemeral_update_during_startup_finalization_reconciles_after_finalization() 
     assert!(
         matches!(
             after_finalize,
-            PodAction::ReconcileEphemeral {
+            PodAction::ReconcileRuntime {
                 operation_id: 3,
                 ..
             }
         ),
-        "deferred ephemeral update must run after startup finalization, got {after_finalize:?}"
+        "runtime status must reconcile before the deferred ephemeral update, got {after_finalize:?}"
+    );
+
+    let after_runtime = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key,
+        operation_id: 3,
+        kind: super::message::PodLifecycleWorkKind::ReconcileRuntime,
+        sandbox_id: None,
+    });
+    assert!(
+        matches!(
+            after_runtime,
+            PodAction::ReconcileEphemeral {
+                operation_id: 4,
+                ..
+            }
+        ),
+        "deferred ephemeral update must run after startup runtime status reconciliation, got {after_runtime:?}"
     );
 }
 
@@ -4471,9 +4495,69 @@ async fn cri_event_during_start_dispatches_runtime_reconcile_after_startup_final
         .iter()
         .position(|action| matches!(action, PodAction::ReconcileRuntime { .. }))
         .expect("deferred CRI event must dispatch runtime reconcile after startup finalization");
+    let reconcile_count = actions
+        .iter()
+        .filter(|action| matches!(action, PodAction::ReconcileRuntime { .. }))
+        .count();
     assert!(
         reconcile_position > finalize_position,
         "runtime reconcile must run after startup finalization; actions={actions:?}"
+    );
+    assert_eq!(
+        reconcile_count, 1,
+        "the successful-start observation and deferred CRI event must coalesce into one runtime reconcile; actions={actions:?}"
+    );
+}
+
+#[test]
+fn successful_start_dispatches_runtime_reconcile_without_cri_event() {
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+
+    let start = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: test_pod("default", "pod-a", "uid-a"),
+    });
+    assert!(matches!(
+        start,
+        PodAction::StartPod {
+            operation_id: 1,
+            ..
+        }
+    ));
+
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: 1,
+        kind: super::message::PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sandbox-a".to_string()),
+    });
+    assert!(matches!(
+        finalize,
+        PodAction::FinalizeStartup {
+            operation_id: 2,
+            ..
+        }
+    ));
+
+    let after_finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key,
+        operation_id: 2,
+        kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: None,
+    });
+    assert!(
+        matches!(
+            after_finalize,
+            PodAction::ReconcileRuntime {
+                operation_id: 3,
+                ..
+            }
+        ),
+        "the kubelet's successful start observation must drive runtime status reconciliation without relying on a separate CRI event; got {after_finalize:?}"
     );
 }
 

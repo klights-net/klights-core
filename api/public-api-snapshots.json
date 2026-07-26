@@ -5,7 +5,7 @@
     "klights": {
       "count": 42263,
       "sha256": "c4600ac55cc5573a787d3f5e031bdcb411c956a502b08595dfeea43e522d0722",
-      "source": {"count": 521539, "sha256": "5c67649e1b7259a253b69ccdb54e9e6e673d1d178c394c90a31810dc9bc63f9d"}
+      "source": {"count": 521632, "sha256": "fd6930fcdd56e72d81819e3efb8e21c7939501039c7728eafdd3adb5b852ba30"}
     },
     "klights-apiserver": {
       "count": 0,
