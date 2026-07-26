@@ -3933,3 +3933,139 @@ fn validate_delivery_resource_version(resource_version: i64) -> Result<(), Outbo
         Ok(())
     }
 }
+pub type NodeOutboxFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, NodeOutboxError>> + Send + 'a>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeOutboxSubject {
+    pub key: String,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub uid: Option<String>,
+}
+
+impl NodeOutboxSubject {
+    pub fn new(
+        key: impl Into<String>,
+        namespace: Option<String>,
+        name: impl Into<String>,
+        uid: Option<String>,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            namespace,
+            name: name.into(),
+            uid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeOutboxCommand {
+    pub idempotency_key: String,
+    pub operation: klights_cluster_core::OutboxOperation,
+    pub subject: NodeOutboxSubject,
+    pub pod_uid: String,
+    pub command: klights_cluster_core::StorageCommand,
+    pub now_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeOutboxRoute {
+    Enqueued,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeOutboxError {
+    message: String,
+}
+
+impl NodeOutboxError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NodeOutboxError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NodeOutboxError {}
+
+pub trait NodeOutbox: Send + Sync {
+    fn enqueue(&self, command: NodeOutboxCommand) -> NodeOutboxFuture<'_, NodeOutboxRoute>;
+
+    fn next_status_stamp(&self) -> NodeOutboxFuture<'_, i64>;
+
+    fn record_pod_status_checkpoint<'a>(
+        &'a self,
+        checkpoint: &'a klights_cluster_core::Resource,
+        updated_ms: i64,
+    ) -> NodeOutboxFuture<'a, ()>;
+
+    fn merge_pod_status_checkpoint(
+        &self,
+        pod: klights_cluster_core::Resource,
+    ) -> NodeOutboxFuture<'_, klights_cluster_core::Resource>;
+
+    fn delete_pod_status_checkpoint<'a>(&'a self, pod_uid: &'a str) -> NodeOutboxFuture<'a, ()>;
+
+    fn record_runtime_observation_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+        container_ids: Vec<String>,
+        generation: u64,
+        updated_ms: i64,
+    ) -> NodeOutboxFuture<'a, ()>;
+
+    fn get_runtime_observation_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+    ) -> NodeOutboxFuture<'a, Option<NodeRuntimeObservationCheckpoint>>;
+
+    fn delete_runtime_observation_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+    ) -> NodeOutboxFuture<'a, ()>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRuntimeObservationCheckpoint {
+    pod_uid: String,
+    container_ids: Vec<String>,
+    generation: u64,
+}
+
+impl NodeRuntimeObservationCheckpoint {
+    pub fn new(pod_uid: String, container_ids: Vec<String>, generation: u64) -> Self {
+        Self {
+            pod_uid,
+            container_ids,
+            generation,
+        }
+    }
+
+    pub fn container_ids(&self) -> &[String] {
+        &self.container_ids
+    }
+
+    pub fn into_parts(self) -> (String, Vec<String>, u64) {
+        (self.pod_uid, self.container_ids, self.generation)
+    }
+}
+
+pub async fn route_node_outbox(
+    outbox: Option<&dyn NodeOutbox>,
+    command: NodeOutboxCommand,
+) -> Result<NodeOutboxRoute, NodeOutboxError> {
+    let outbox = outbox.ok_or_else(|| {
+        NodeOutboxError::new(
+            "outbox is unavailable for node-local queueing; caller must retry after outbox initialization",
+        )
+    })?;
+    outbox.enqueue(command).await
+}

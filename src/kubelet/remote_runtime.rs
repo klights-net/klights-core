@@ -4,11 +4,9 @@ use anyhow::{Result, anyhow};
 use klights_node_api::{
     ExecStreamChannel, ExecTerminalError, NodeExecFrame, NodeExecRequest, NodeExecRuntime,
     NodeExecRuntimeFuture, NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult,
-    NodeMetricsError, NodeMetricsRequest, NodeMetricsResult, NodeMetricsRuntime,
+    NodeMetricsRequest, NodeMetricsResult, NodeMetricsRuntime,
 };
 use klights_supervisor::TaskSupervisor;
-
-use crate::metrics::NodeMetricsSampler;
 
 pub(crate) struct CriNodeExecRuntime {
     pub(crate) cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
@@ -28,19 +26,12 @@ impl CriNodeExecRuntime {
 }
 
 pub(crate) struct CriNodeMetricsRuntime {
-    pub(crate) cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    pub(crate) task_supervisor: Arc<TaskSupervisor>,
+    sampler: Arc<dyn klights_node_api::NodeMetricsSampler>,
 }
 
 impl CriNodeMetricsRuntime {
-    pub(crate) fn new(
-        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-        task_supervisor: Arc<TaskSupervisor>,
-    ) -> Self {
-        Self {
-            cri,
-            task_supervisor,
-        }
+    pub(crate) fn new(sampler: Arc<dyn klights_node_api::NodeMetricsSampler>) -> Self {
+        Self { sampler }
     }
 }
 
@@ -107,41 +98,7 @@ impl NodeMetricsRuntime for CriNodeMetricsRuntime {
         &self,
         request: NodeMetricsRequest,
     ) -> klights_node_api::NodeMetricsFuture<'_, NodeMetricsResult> {
-        Box::pin(async move {
-            let node = match crate::metrics::LinuxProcNodeMetricsSampler::new(
-                self.task_supervisor.clone(),
-            )
-            .sample_node()
-            .await
-            {
-                Ok(sample) => Some(sample),
-                Err(error) => {
-                    tracing::debug!(%error, "node resource metrics unavailable");
-                    None
-                }
-            };
-            let mut client = {
-                let guard = self.cri.lock().await;
-                guard.clone()
-            };
-            match client.list_pod_sandbox_stats(None).await {
-                Ok(stats) => Ok(crate::metrics::node_metrics_result_from_pod_sandbox_stats(
-                    &request, node, stats,
-                )),
-                Err(err) => {
-                    tracing::debug!(error = %err, "CRI pod sandbox metrics unavailable");
-                    if let Some(node) = node {
-                        Ok(NodeMetricsResult::new(
-                            request.target().clone(),
-                            Some(node),
-                            Vec::new(),
-                        ))
-                    } else {
-                        Err(NodeMetricsError::unavailable(format!("{err:#}")))
-                    }
-                }
-            }
-        })
+        self.sampler.sample_metrics(request)
     }
 }
 
@@ -304,4 +261,50 @@ async fn run_cri_node_exec_stream(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingMetricsSampler {
+        calls: AtomicUsize,
+    }
+
+    impl klights_node_api::NodeMetricsSampler for RecordingMetricsSampler {
+        fn sample_metrics(
+            &self,
+            request: NodeMetricsRequest,
+        ) -> klights_node_api::NodeMetricsFuture<'_, NodeMetricsResult> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(NodeMetricsResult::new(
+                    request.target().clone(),
+                    None,
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn node_metrics_runtime_delegates_to_injected_sampler() {
+        let sampler = Arc::new(RecordingMetricsSampler {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = CriNodeMetricsRuntime::new(sampler.clone());
+        let target =
+            klights_node_api::NodeMetricsTarget::try_new("worker-a").expect("valid node target");
+        let result = runtime
+            .collect_metrics(NodeMetricsRequest::new(
+                target.clone(),
+                vec!["pod-a".to_string()],
+            ))
+            .await
+            .expect("injected sampler result");
+
+        assert_eq!(result.target(), &target);
+        assert_eq!(sampler.calls.load(Ordering::Relaxed), 1);
+    }
 }

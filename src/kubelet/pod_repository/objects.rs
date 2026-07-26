@@ -11,8 +11,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::node_outbox::payload::OutboxOperation;
-use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use crate::kubelet::outbox::OutboxOperation;
+use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_cluster_core::StorageCommand;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_leader_api::LeaderResourceQuery;

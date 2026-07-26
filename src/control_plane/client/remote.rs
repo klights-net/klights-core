@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use super::Pod;
 use super::informer::{list as list_cached, replace_scope, scope_for_request};
 use super::{
-    LeaderApiClient, ListRequest, ResourceList, focused_watch_event, legacy_list_request,
-    legacy_list_response, legacy_watch_event, query_error, query_list_result,
+    ListRequest, ResourceList, focused_watch_event, legacy_list_request, legacy_list_response,
+    legacy_watch_event, query_error, query_list_result,
 };
 use crate::replication::grpc::client::ReplicationGrpcClient;
 use klights_cluster_core::Resource;
@@ -701,8 +701,6 @@ impl LeaderNetworkTopologyQuery for RemoteApiClient {
 }
 
 #[async_trait]
-impl LeaderApiClient for RemoteApiClient {}
-
 impl LeaderOutboxDelivery for RemoteApiClient {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
         Box::pin(async move {

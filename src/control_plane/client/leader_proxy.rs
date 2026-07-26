@@ -22,15 +22,14 @@
 //! call, so the next read or write after promotion / demotion picks the new
 //! dispatch target without any setup.
 //!
-//! Both `local` and `remote` are `Arc<dyn LeaderApiClient>` so the
-//! proxy is fully mockable: tests inject recording fakes and assert
-//! the dispatch table without spinning up a real cluster.
+//! Every capability is stored as its own focused trait object. Tests inject
+//! recording fakes through `LeaderClientPorts` and assert the dispatch table
+//! without spinning up a real cluster.
 
 use std::sync::Arc;
 
 #[cfg(test)]
 use crate::node_outbox::payload::OutboxOperationExt as _;
-use async_trait::async_trait;
 #[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -52,7 +51,7 @@ use klights_leader_api::{
 };
 use tokio::sync::watch;
 
-use super::LeaderApiClient;
+use super::LeaderClientPorts;
 use klights_cluster_core::Resource;
 
 #[cfg(test)]
@@ -117,8 +116,13 @@ impl FocusedLeaderTargets {
 /// learner). The decision is per-call; promotion / demotion flips the
 /// watch and the next write picks the new target without rewiring.
 pub struct LeaderProxyApiClient {
-    local: Arc<dyn LeaderApiClient>,
-    remote: Arc<dyn LeaderApiClient>,
+    resource_queries: ArcPair<dyn LeaderResourceQuery>,
+    watches: ArcPair<dyn LeaderWatch>,
+    cache_readiness: ArcPair<dyn LeaderCacheReadiness>,
+    projected_tokens: ArcPair<dyn LeaderProjectedServiceAccountToken>,
+    pod_cleanup_intents: ArcPair<dyn LeaderPodCleanupIntents>,
+    node_subnet_allocations: ArcPair<dyn LeaderNodeSubnetAllocation>,
+    network_topology: ArcPair<dyn LeaderNetworkTopologyQuery>,
     focused_targets: Option<Arc<FocusedLeaderTargets>>,
     is_leader_rx: watch::Receiver<bool>,
 }
@@ -132,16 +136,77 @@ impl LeaderProxyApiClient {
     /// watch — the SAME receiver fed to `LocalApiClient`'s gate, so
     /// the two layers can never disagree about who the leader is.
     pub fn new(
-        local: Arc<dyn LeaderApiClient>,
-        remote: Arc<dyn LeaderApiClient>,
+        local: LeaderClientPorts,
+        remote: LeaderClientPorts,
         is_leader_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
-            local,
-            remote,
+            resource_queries: ArcPair {
+                local: Some(local.resource_query),
+                remote: Some(remote.resource_query),
+            },
+            watches: ArcPair {
+                local: Some(local.watch),
+                remote: Some(remote.watch),
+            },
+            cache_readiness: ArcPair {
+                local: Some(local.cache_readiness),
+                remote: Some(remote.cache_readiness),
+            },
+            projected_tokens: ArcPair {
+                local: Some(local.projected_tokens),
+                remote: Some(remote.projected_tokens),
+            },
+            pod_cleanup_intents: ArcPair {
+                local: Some(local.pod_cleanup_intents),
+                remote: Some(remote.pod_cleanup_intents),
+            },
+            node_subnet_allocations: ArcPair {
+                local: Some(local.node_subnet_allocation),
+                remote: Some(remote.node_subnet_allocation),
+            },
+            network_topology: ArcPair {
+                local: Some(local.network_topology),
+                remote: Some(remote.network_topology),
+            },
             focused_targets: None,
             is_leader_rx,
         }
+    }
+
+    #[cfg(test)]
+    fn from_clients<L, R>(
+        local: Arc<L>,
+        remote: Arc<R>,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self
+    where
+        L: LeaderResourceQuery
+            + LeaderWatch
+            + LeaderCacheReadiness
+            + LeaderProjectedServiceAccountToken
+            + LeaderPodCleanupIntents
+            + LeaderNodeSubnetAllocation
+            + LeaderNetworkTopologyQuery
+            + Send
+            + Sync
+            + 'static,
+        R: LeaderResourceQuery
+            + LeaderWatch
+            + LeaderCacheReadiness
+            + LeaderProjectedServiceAccountToken
+            + LeaderPodCleanupIntents
+            + LeaderNodeSubnetAllocation
+            + LeaderNetworkTopologyQuery
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::new(
+            LeaderClientPorts::from_client(local),
+            LeaderClientPorts::from_client(remote),
+            is_leader_rx,
+        )
     }
 
     pub fn with_resource_command_targets(
@@ -188,12 +253,9 @@ impl LeaderProxyApiClient {
         *self.is_leader_rx.borrow()
     }
 
-    fn leader_target(&self) -> &Arc<dyn LeaderApiClient> {
-        if self.is_leader() {
-            &self.local
-        } else {
-            &self.remote
-        }
+    fn target<'a, T: ?Sized>(&self, pair: &'a ArcPair<T>) -> &'a Arc<T> {
+        pair.target(self.is_leader())
+            .expect("leader proxy focused target is wired at construction")
     }
 
     #[cfg(test)]
@@ -300,11 +362,11 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
     ) -> ResourceQueryFuture<'_, Option<Resource>> {
         let mut leadership_rx = self.is_leader_rx.clone();
         let initial_is_leader = *leadership_rx.borrow_and_update();
-        let target = if initial_is_leader {
-            self.local.clone()
-        } else {
-            self.remote.clone()
-        };
+        let target = self
+            .resource_queries
+            .target(initial_is_leader)
+            .expect("resource-query targets are wired")
+            .clone();
         Box::pin(async move {
             let consistency = request.consistency();
             let result = target.get_resource(request).await?;
@@ -325,11 +387,11 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
     ) -> ResourceQueryFuture<'_, ResourceListResult> {
         let mut leadership_rx = self.is_leader_rx.clone();
         let initial_is_leader = *leadership_rx.borrow_and_update();
-        let target = if initial_is_leader {
-            self.local.clone()
-        } else {
-            self.remote.clone()
-        };
+        let target = self
+            .resource_queries
+            .target(initial_is_leader)
+            .expect("resource-query targets are wired")
+            .clone();
         Box::pin(async move {
             let consistency = request.consistency();
             let result = target.list_resources(request).await?;
@@ -349,11 +411,11 @@ impl LeaderWatch for LeaderProxyApiClient {
     fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
         let mut leadership_rx = self.is_leader_rx.clone();
         let initial_is_leader = *leadership_rx.borrow_and_update();
-        let target = if initial_is_leader {
-            self.local.clone()
-        } else {
-            self.remote.clone()
-        };
+        let target = self
+            .watches
+            .target(initial_is_leader)
+            .expect("watch targets are wired")
+            .clone();
         Box::pin(async move {
             let stream = LeaderWatch::watch_resources(target.as_ref(), req).await?;
             if leadership_rx.has_changed().unwrap_or(true) {
@@ -368,7 +430,7 @@ impl LeaderWatch for LeaderProxyApiClient {
 
 impl LeaderCacheReadiness for LeaderProxyApiClient {
     fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
-        LeaderCacheReadiness::wait_cache_ready(self.leader_target().as_ref(), scope)
+        self.target(&self.cache_readiness).wait_cache_ready(scope)
     }
 }
 
@@ -377,7 +439,7 @@ impl LeaderProjectedServiceAccountToken for LeaderProxyApiClient {
         &self,
         request: ProjectedServiceAccountTokenRequest,
     ) -> ProjectedServiceAccountTokenFuture<'_> {
-        self.leader_target()
+        self.target(&self.projected_tokens)
             .issue_projected_service_account_token(request)
     }
 }
@@ -389,9 +451,21 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
     ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
         Box::pin(async move {
             let local_is_leader = self.is_leader();
-            match self.remote.list_pod_cleanup_intents(request.clone()).await {
+            let remote = self
+                .pod_cleanup_intents
+                .remote
+                .as_ref()
+                .expect("remote cleanup-intent target is wired");
+            match remote.list_pod_cleanup_intents(request.clone()).await {
                 Ok(intents) => Ok(intents),
-                Err(_) if local_is_leader => self.local.list_pod_cleanup_intents(request).await,
+                Err(_) if local_is_leader => {
+                    self.pod_cleanup_intents
+                        .local
+                        .as_ref()
+                        .expect("local cleanup-intent target is wired")
+                        .list_pod_cleanup_intents(request)
+                        .await
+                }
                 Err(error) => Err(error),
             }
         })
@@ -402,14 +476,20 @@ impl LeaderPodCleanupIntents for LeaderProxyApiClient {
         request: PodCleanupIntentAckRequest,
     ) -> PodCleanupIntentFuture<'_, ()> {
         Box::pin(async move {
-            match self
+            let remote = self
+                .pod_cleanup_intents
                 .remote
-                .acknowledge_pod_cleanup_intent(request.clone())
-                .await
-            {
+                .as_ref()
+                .expect("remote cleanup-intent target is wired");
+            match remote.acknowledge_pod_cleanup_intent(request.clone()).await {
                 Ok(()) => Ok(()),
                 Err(_) if self.is_leader() => {
-                    self.local.acknowledge_pod_cleanup_intent(request).await
+                    self.pod_cleanup_intents
+                        .local
+                        .as_ref()
+                        .expect("local cleanup-intent target is wired")
+                        .acknowledge_pod_cleanup_intent(request)
+                        .await
                 }
                 Err(error) => Err(error),
             }
@@ -422,7 +502,8 @@ impl LeaderNodeSubnetAllocation for LeaderProxyApiClient {
         &self,
         request: NodeSubnetAllocationRequest,
     ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
-        self.leader_target().allocate_node_subnet(request)
+        self.target(&self.node_subnet_allocations)
+            .allocate_node_subnet(request)
     }
 }
 
@@ -431,26 +512,25 @@ impl LeaderNetworkTopologyQuery for LeaderProxyApiClient {
         &self,
         request: NodeSubnetQuery,
     ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
-        self.leader_target().get_node_subnet(request)
+        self.target(&self.network_topology).get_node_subnet(request)
     }
 
     fn list_peer_subnets(
         &self,
         request: PeerSubnetsQuery,
     ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
-        self.leader_target().list_peer_subnets(request)
+        self.target(&self.network_topology)
+            .list_peer_subnets(request)
     }
 
     fn get_node_dataplane(
         &self,
         request: NodeDataplaneQuery,
     ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
-        self.leader_target().get_node_dataplane(request)
+        self.target(&self.network_topology)
+            .get_node_dataplane(request)
     }
 }
-
-#[async_trait]
-impl LeaderApiClient for LeaderProxyApiClient {}
 
 impl LeaderOutboxDelivery for LeaderProxyApiClient {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
@@ -634,9 +714,6 @@ impl LeaderNetworkTopologyQuery for StubRemoteForwarder {
         Box::pin(async move { Err(NetworkTopologyError::retryable(message)) })
     }
 }
-
-#[async_trait]
-impl LeaderApiClient for StubRemoteForwarder {}
 
 impl LeaderOutboxDelivery for StubRemoteForwarder {
     fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
@@ -873,9 +950,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl LeaderApiClient for RecordingApiClient {}
-
     impl LeaderOutboxDelivery for RecordingApiClient {
         fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
             self.apply_outbox.fetch_add(1, Ordering::Relaxed);
@@ -891,7 +965,7 @@ mod tests {
         initial_leader: bool,
     ) -> (LeaderProxyApiClient, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(initial_leader);
-        let proxy = LeaderProxyApiClient::new(local.clone(), remote.clone(), rx)
+        let proxy = LeaderProxyApiClient::from_clients(local.clone(), remote.clone(), rx)
             .with_resource_command_targets(local.clone(), remote.clone())
             .with_outbox_delivery_targets(local.clone(), remote.clone())
             .with_node_lease_renewal_targets(local, remote);
@@ -1544,9 +1618,6 @@ mod tests {
             }
         }
 
-        #[async_trait]
-        impl LeaderApiClient for NoLeaderRemote {}
-
         impl LeaderOutboxDelivery for NoLeaderRemote {
             fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
                 Box::pin(async {
@@ -1559,9 +1630,8 @@ mod tests {
 
         let local = RecordingApiClient::new("local");
         let remote = Arc::new(NoLeaderRemote);
-        let remote_api: Arc<dyn LeaderApiClient> = remote.clone();
         let (_tx, rx) = watch::channel(false); // follower
-        let proxy = LeaderProxyApiClient::new(local.clone(), remote_api, rx)
+        let proxy = LeaderProxyApiClient::from_clients(local.clone(), remote.clone(), rx)
             .with_outbox_delivery_targets(local.clone(), remote);
 
         // apply_outbox must surface the remote's Retryable, not panic
@@ -1607,17 +1677,20 @@ mod tests {
         assert_eq!(local.allocate_node_subnet.load(Ordering::Relaxed), 0);
     }
 
-    /// Object safety: `Arc<dyn LeaderApiClient>` must work for the
-    /// proxy. Compile-time check via type ascription.
+    /// Every focused capability remains independently object-safe.
     #[test]
-    fn leader_proxy_is_object_safe() {
+    fn leader_proxy_focused_ports_are_object_safe() {
         let local = RecordingApiClient::new("local");
         let remote = RecordingApiClient::new("remote");
         let (_tx, rx) = watch::channel(true);
-        let proxy: Arc<dyn LeaderApiClient> =
-            Arc::new(LeaderProxyApiClient::new(local, remote, rx));
-        // Use the trait object so the compiler proves object safety.
-        let _: &dyn LeaderApiClient = proxy.as_ref();
+        let proxy = Arc::new(LeaderProxyApiClient::from_clients(local, remote, rx));
+        let _: Arc<dyn LeaderResourceQuery> = proxy.clone();
+        let _: Arc<dyn LeaderWatch> = proxy.clone();
+        let _: Arc<dyn LeaderCacheReadiness> = proxy.clone();
+        let _: Arc<dyn LeaderProjectedServiceAccountToken> = proxy.clone();
+        let _: Arc<dyn LeaderPodCleanupIntents> = proxy.clone();
+        let _: Arc<dyn LeaderNodeSubnetAllocation> = proxy.clone();
+        let _: Arc<dyn LeaderNetworkTopologyQuery> = proxy;
     }
 
     /// T6 step 4: the boot-time `StubRemoteForwarder` refuses every
@@ -1679,9 +1752,7 @@ mod tests {
         let (tx, rx) = watch::channel(true); // simulate seed cp1
         let local_real = Arc::new(LocalApiClient::new(Arc::new(db), "cp1".into(), rx.clone()));
         let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));
-        let local_api: Arc<dyn LeaderApiClient> = local_real.clone();
-        let remote_api: Arc<dyn LeaderApiClient> = stub_remote.clone();
-        let proxy = LeaderProxyApiClient::new(local_api, remote_api, rx)
+        let proxy = LeaderProxyApiClient::from_clients(local_real.clone(), stub_remote.clone(), rx)
             .with_outbox_delivery_targets(local_real, stub_remote);
 
         // As leader: write reaches local, succeeds (no Pod precondition).
@@ -1771,7 +1842,7 @@ mod tests {
         // heap pointer. There is no supervisor, spawn handle, timer, or
         // background task state.
         use std::mem::size_of;
-        let thin_dispatcher_fields = size_of::<Arc<dyn LeaderApiClient>>() * 2
+        let thin_dispatcher_fields = size_of::<ArcPair<dyn LeaderResourceQuery>>() * 7
             + size_of::<watch::Receiver<bool>>()
             + size_of::<Option<Arc<FocusedLeaderTargets>>>();
         assert_eq!(
@@ -1824,25 +1895,34 @@ mod tests {
         // shared leader backend. is_leader=true.
         let (_tx_l, rx_l) = watch::channel(true);
         let leader_unused_remote = RecordingApiClient::new("leader-unused-remote");
-        let leader_proxy =
-            LeaderProxyApiClient::new(leader_backend.clone(), leader_unused_remote.clone(), rx_l)
-                .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
+        let leader_proxy = LeaderProxyApiClient::from_clients(
+            leader_backend.clone(),
+            leader_unused_remote.clone(),
+            rx_l,
+        )
+        .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
 
         // Follower 1: cluster_api proxy whose REMOTE arm is the
         // shared leader backend (modeling the gRPC forward).
         // is_leader=false.
         let (_tx_f1, rx_f1) = watch::channel(false);
         let follower1_local = RecordingApiClient::new("f1-local-unused");
-        let follower1_proxy =
-            LeaderProxyApiClient::new(follower1_local.clone(), leader_backend.clone(), rx_f1)
-                .with_outbox_delivery_targets(follower1_local, leader_backend.clone());
+        let follower1_proxy = LeaderProxyApiClient::from_clients(
+            follower1_local.clone(),
+            leader_backend.clone(),
+            rx_f1,
+        )
+        .with_outbox_delivery_targets(follower1_local, leader_backend.clone());
 
         // Follower 2: same shape as follower 1.
         let (_tx_f2, rx_f2) = watch::channel(false);
         let follower2_local = RecordingApiClient::new("f2-local-unused");
-        let follower2_proxy =
-            LeaderProxyApiClient::new(follower2_local.clone(), leader_backend.clone(), rx_f2)
-                .with_outbox_delivery_targets(follower2_local, leader_backend.clone());
+        let follower2_proxy = LeaderProxyApiClient::from_clients(
+            follower2_local.clone(),
+            leader_backend.clone(),
+            rx_f2,
+        )
+        .with_outbox_delivery_targets(follower2_local, leader_backend.clone());
 
         // Each member issues one write. All three calls must reach
         // the shared leader backend.

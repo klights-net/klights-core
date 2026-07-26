@@ -88,7 +88,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
     client: Option<std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
     cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     config: &std::sync::Arc<crate::KlightsConfig>,
-    pod_event_db: crate::datastore::DatastoreHandle,
+    pod_watch: std::sync::Arc<dyn crate::api_pod_subresources::logs::PodLogFollowWatchPort>,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<Option<klights_supervisor::SupervisedJoinHandle<()>>> {
@@ -107,8 +107,10 @@ async fn start_controlplane_leader_control_stream_if_needed(
             )),
             crate::replication::grpc::client::NodeMetricsCapability::Available(
                 std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
-                    cri.clone(),
-                    task_supervisor.clone(),
+                    std::sync::Arc::new(crate::metrics::CriNodeMetricsSampler::new(
+                        cri.clone(),
+                        task_supervisor.clone(),
+                    )),
                 )),
             ),
         ),
@@ -124,13 +126,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
                 crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
-                    std::sync::Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                            std::sync::Arc::new(
-                                crate::datastore::DatastoreBackendWatchStore::new(pod_event_db),
-                            ),
-                        ),
-                    ),
+                    pod_watch,
                 ),
             ),
         )),
@@ -210,7 +206,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     .await?;
     let db_handle = ds.db_handle;
     let db: &dyn datastore::DatastoreBackend = &*db_handle;
-    let cluster_api = ds.cluster_api;
+    let leader_ports = ds.leader_ports;
     let remote_api_client = ds.remote_api_client;
     let replication_service_for_router = ds.replication_service.clone();
     let _replication_service = ds.replication_service;
@@ -263,7 +259,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         Some(
             start_worker_store_adapter(
                 remote_api_client,
-                node_local.clone(),
                 config.node_name.clone(),
                 task_supervisor.clone(),
                 shutdown_token.clone(),
@@ -275,10 +270,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     } else {
         None
     };
-    let kubelet_db_handle = worker_store_adapter
-        .as_ref()
-        .map(|worker_store| worker_store.clone() as crate::datastore::DatastoreHandle)
-        .unwrap_or_else(|| db_handle.clone());
     if should_publish_local_dataplane_metadata(&cli.role) {
         // Self-heal: publish from KLIGHTS_EXTERNAL_ENDPOINT when set, otherwise
         // fall back to the ExternalIP already recorded on the local Node (e.g.
@@ -305,7 +296,10 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         node_mode: &node_mode,
         node_ip: &node_ip,
-        cluster_api: cluster_api.clone(),
+        resource_query: leader_ports.resource_query.clone(),
+        watch: leader_ports.watch.clone(),
+        subnet_allocation: leader_ports.node_subnet_allocation.clone(),
+        network_topology: leader_ports.network_topology.clone(),
         node_local: node_local.clone(),
         network_cleanup: &network_cleanup,
         runtime_paths: &runtime_paths,
@@ -333,7 +327,27 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
             control_plane_lease_client.clone(),
             cri_for_api.as_ref(),
             &config,
-            kubelet_db_handle.clone(),
+            worker_store_adapter
+                .as_ref()
+                .map(|store| {
+                    std::sync::Arc::new(
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                            store.clone(),
+                        ),
+                    )
+                        as std::sync::Arc<
+                            dyn crate::api_pod_subresources::logs::PodLogFollowWatchPort,
+                        >
+                })
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                                db_handle.clone(),
+                            )),
+                        ),
+                    )
+                }),
             task_supervisor.clone(),
             shutdown_token.clone(),
         )
@@ -348,12 +362,11 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         member_feature_probe,
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
         db_handle: &db_handle,
-        kubelet_db_handle: &kubelet_db_handle,
         node_local: node_local.clone(),
         worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
         db,
-        cluster_api: cluster_api.clone(),
+        leader_ports: leader_ports.clone(),
         remote_api_client: remote_api_client.clone(),
         pod_network_cache,
         pod_runtime_store,

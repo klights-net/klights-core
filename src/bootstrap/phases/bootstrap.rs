@@ -48,13 +48,12 @@ pub struct BootstrapRunArgs<'a> {
     /// delivered the seed's state into the local cluster.db.
     pub skip_seed_bootstrap: bool,
     pub db_handle: &'a DatastoreHandle,
-    pub kubelet_db_handle: &'a DatastoreHandle,
     pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub worker_store_adapter:
         Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
     pub db: &'a dyn crate::datastore::DatastoreBackend,
-    pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    pub leader_ports: crate::control_plane::client::LeaderClientPorts,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
@@ -292,12 +291,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         leader_election,
         skip_seed_bootstrap,
         db_handle,
-        kubelet_db_handle,
         node_local,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
         db,
-        cluster_api,
+        leader_ports,
         remote_api_client,
         pod_network_cache,
         pod_runtime_store: node_pod_runtime_store,
@@ -492,26 +490,32 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_build_config = crate::pod_repository_composition::PodRepositoryBuildConfig {
-        db: kubelet_db_handle.clone(),
-        node_local: Some(node_local.clone()),
-        supervisor: supervisor.clone(),
-        side_effects: side_effects.clone(),
-        metrics: metrics.clone(),
-        pod_network_cache: pod_network_cache.clone(),
-        assignment_waiter: assignment_waiter.clone(),
-        scheduling_mode,
-        outbox: Some(outbox_runtime.clone()),
-        cluster_api: Some(cluster_api.clone()),
-    };
     let pod_repository_parts = if kubelet_uses_worker_store_adapter {
-        crate::pod_repository_composition::build_pod_repository_parts(
-            pod_repository_build_config,
-            None,
+        crate::pod_repository_composition::build_worker_pod_repository_parts(
+            crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+                resource_query: leader_ports.resource_query.clone(),
+                node_local: node_local.clone(),
+                supervisor: supervisor.clone(),
+                metrics: metrics.clone(),
+                pod_network_cache: pod_network_cache.clone(),
+                assignment_waiter: assignment_waiter.clone(),
+                outbox: outbox_runtime.clone(),
+            },
         )
     } else {
         crate::pod_repository_composition::build_pod_repository_parts(
-            pod_repository_build_config,
+            crate::pod_repository_composition::PodRepositoryBuildConfig {
+                db: db_handle.clone(),
+                node_local: Some(node_local.clone()),
+                supervisor: supervisor.clone(),
+                side_effects: side_effects.clone(),
+                metrics: metrics.clone(),
+                pod_network_cache: pod_network_cache.clone(),
+                assignment_waiter: assignment_waiter.clone(),
+                scheduling_mode,
+                outbox: Some(outbox_runtime.clone()),
+                cluster_api: Some(leader_ports.resource_query.clone()),
+            },
             Some(is_leader_rx.clone()),
         )
     };
@@ -534,10 +538,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         services.clone(),
     );
     let kubelet_status_delivery = crate::kubelet::context::KubeletStatusDeliveryServices::new(
-        cluster_api.clone(),
-        cluster_api.clone(),
-        cluster_api.clone(),
-        cluster_api.clone(),
+        leader_ports.resource_query.clone(),
+        leader_ports.cache_readiness.clone(),
+        leader_ports.pod_cleanup_intents.clone(),
+        leader_ports.projected_tokens.clone(),
         outbox_runtime.clone(),
     );
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
@@ -578,10 +582,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     config.node_name.clone(),
                 ),
             ),
-            event_sink: Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
-                Some(outbox_runtime.clone()),
-                kubelet_db_handle.clone(),
-            )),
+            event_sink: if kubelet_uses_worker_store_adapter {
+                Arc::new(crate::bootstrap::kubelet_ports::WorkerPodEventSink::new(
+                    outbox_runtime.clone(),
+                    leader_ports.resource_query.clone(),
+                ))
+            } else {
+                Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
+                    Some(outbox_runtime.clone()),
+                    db_handle.clone(),
+                ))
+            },
         },
     )
     .context("pod subsystem construction")?;
@@ -616,7 +627,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 assignment_waiter: assignment_waiter.clone(),
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
-                cluster_api: Some(cluster_api.clone()),
+                cluster_api: Some(leader_ports.resource_query.clone()),
             },
             Some(is_leader_rx.clone()),
         );
@@ -796,7 +807,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         crate::api::ApiResourceMutationServices {
             db: db_handle.clone(),
-            resource_query: cluster_api.clone(),
+            resource_query: leader_ports.resource_query.clone(),
             resource_command: local_api_client.clone(),
             finalizer_lifecycle,
             mutation_effects,
@@ -963,7 +974,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     }
 
     let leader_peer_endpoint_observer_handle = if replication_service_for_router.is_some() {
-        let endpoint_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = cluster_api.clone();
+        let endpoint_query = leader_ports.resource_query.clone();
         let endpoint_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
             Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
                 config.node_name.clone(),
@@ -1232,14 +1243,23 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // Spawn pod watcher
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
         let ctx = kubelet_services.clone();
-        let watch_source = Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                crate::datastore::DatastoreBackendWatchStore::new(kubelet_db_handle.clone()),
-            )),
-        );
+        let watch_source: Arc<dyn crate::kubelet::pod_watch_source::PodWatchSource> =
+            if let Some(worker_store) = worker_store_adapter.as_ref() {
+                Arc::new(
+                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                        worker_store.clone(),
+                    ),
+                )
+            } else {
+                Arc::new(
+                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                        crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+                    )),
+                )
+            };
         let volume_events = Arc::new(
             crate::bootstrap::kubelet_ports::LeaderPersistentVolumeEventHandler::new(
-                kubelet_db_handle.clone(),
+                db_handle.clone(),
                 is_leader_rx.clone(),
                 ctx.local_execution().file_process,
             ),
@@ -1289,6 +1309,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     kubelet::node::run_heartbeat_with_lease_client(
                         watch_source,
                         lease_client,
+                        Arc::new(crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock),
                         cfg.node_name.clone(),
                         cancel,
                         s,
@@ -1305,11 +1326,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let state = watcher_state.clone();
         let cancel = shutdown_token.clone();
         let health = dataplane_health.clone();
-        let leader_ports =
-            crate::bootstrap::network_adapters::FocusedNetworkLeaderPorts::new(cluster_api.clone());
-        let topology = leader_ports.topology();
-        let query = leader_ports.resource_query();
-        let watch = leader_ports.watch();
+        let topology = leader_ports.network_topology.clone();
+        let query = leader_ports.resource_query.clone();
+        let watch = leader_ports.watch.clone();
         let projection =
             crate::node_subnet_controller_adapter::DatastorePeerTopologyProjection::new(
                 state.resource_mutation().db.clone(),

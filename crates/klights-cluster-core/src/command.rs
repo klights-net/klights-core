@@ -776,3 +776,4 @@ mod tests {
 /// Kubernetes' default node lease duration used by authored Lease objects and
 /// admission freshness checks.
 pub const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 = 30;
+pub const DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS: i64 = 8;

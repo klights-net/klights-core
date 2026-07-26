@@ -10537,7 +10537,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
     repo.create_controller_pod("sonobuoy", "sonobuoy", "test-node", pod.clone())
         .await
         .unwrap();
-    let cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
+    let cluster_api: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
         std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
             db.clone(),
             "test-node".to_string(),

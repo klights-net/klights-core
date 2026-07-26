@@ -980,9 +980,6 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use async_trait::async_trait;
-
-        use crate::control_plane::client::LeaderApiClient;
         use crate::kubelet::pod_env::{EnvSourceReader, LeaderApiEnvSourceReader};
         use klights_cluster_core::Resource;
         use klights_leader_api::{
@@ -1051,9 +1048,6 @@ mod tests {
         crate::control_plane::client::impl_unavailable_leader_pod_effects!(
             FreshOnlyLeaderApiClient
         );
-
-        #[async_trait]
-        impl LeaderApiClient for FreshOnlyLeaderApiClient {}
 
         fn secret_resource() -> Resource {
             Resource {

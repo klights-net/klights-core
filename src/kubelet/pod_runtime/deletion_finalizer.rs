@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_runtime::service::{PodDeletionFinalizeResult, PodRuntimeKey};
-use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_pod_api::{
     BoundPodFinalization, BoundPodFinalizationError, BoundPodFinalizationFuture,
     BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
@@ -136,7 +136,7 @@ impl RootBoundPodFinalization {
                 subject_key,
                 uuid::Uuid::new_v4()
             ),
-            operation: crate::node_outbox::payload::OutboxOperation::PodMetadata,
+            operation: crate::kubelet::outbox::OutboxOperation::PodMetadata,
             subject: OutboxSubject {
                 key: subject_key,
                 namespace: Some(ns.to_string()),
@@ -357,7 +357,7 @@ impl RealPodDeletionFinalizer {
         let subject_key = format!("v1/Pod/{ns}/{name}/{uid}");
         OutboxCommand {
             idempotency_key: format!("{}:actor-delete-mark:{}", subject_key, uuid::Uuid::new_v4()),
-            operation: crate::node_outbox::payload::OutboxOperation::PodMetadata,
+            operation: crate::kubelet::outbox::OutboxOperation::PodMetadata,
             subject: OutboxSubject {
                 key: subject_key,
                 namespace: Some(ns.to_string()),

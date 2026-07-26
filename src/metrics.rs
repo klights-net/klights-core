@@ -496,7 +496,20 @@ async fn collect_local_cri_node_metrics(
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<NodeMetricsResult, NodeMetricsError> {
     let target = NodeMetricsTarget::try_new(node_name)?;
-    let request = NodeMetricsRequest::new(target.clone(), Vec::new());
+    collect_local_cri_node_metrics_request(
+        cri,
+        NodeMetricsRequest::new(target, Vec::new()),
+        supervisor,
+    )
+    .await
+}
+
+async fn collect_local_cri_node_metrics_request(
+    cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
+    request: NodeMetricsRequest,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+) -> Result<NodeMetricsResult, NodeMetricsError> {
+    let target = request.target().clone();
     let node = match LinuxProcNodeMetricsSampler::new(supervisor)
         .sample_node()
         .await
@@ -531,6 +544,36 @@ async fn collect_local_cri_node_metrics(
                 Err(NodeMetricsError::unavailable(format!("{error:#}")))
             }
         }
+    }
+}
+
+pub(crate) struct CriNodeMetricsSampler {
+    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+}
+
+impl CriNodeMetricsSampler {
+    pub(crate) fn new(
+        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    ) -> Self {
+        Self { cri, supervisor }
+    }
+}
+
+impl klights_node_api::NodeMetricsSampler for CriNodeMetricsSampler {
+    fn sample_metrics(
+        &self,
+        request: NodeMetricsRequest,
+    ) -> klights_node_api::NodeMetricsFuture<'_, NodeMetricsResult> {
+        Box::pin(async move {
+            collect_local_cri_node_metrics_request(
+                Some(self.cri.clone()),
+                request,
+                self.supervisor.clone(),
+            )
+            .await
+        })
     }
 }
 

@@ -3,11 +3,11 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 41651,
-      "sha256": "dec994898682b4887ca9f83376d0b54c5594a8669c98c66dbf6e95a2f0e07eb4",
+      "count": 41743,
+      "sha256": "2c78b2e063838b3771bade40979a37bf990bf17cdb52194b15d10fc81c8ed3ef",
       "source": {
-        "count": 517136,
-        "sha256": "b5495534f7be5d51f9e423ea0637a344b868102483975cd5a38d42c1a66df6ce"
+        "count": 517423,
+        "sha256": "994788d2c6f4bddaf488d185504da469261f8a0832b0681a3eb97ed3d8ca5b61"
       }
     },
     "klights-apiserver": {
@@ -27,11 +27,11 @@
       }
     },
     "klights-cluster-core": {
-      "count": 3528,
-      "sha256": "1ad183715142793f52bd5349014731a8955692ddc2ebf0582ce4a1f55754fb6a",
+      "count": 3529,
+      "sha256": "a6a55c60aab64485afb8aba403b3d19c5c82524031df2dde1fb309515ab10853",
       "source": {
-        "count": 14278,
-        "sha256": "7162cc8c7e73550c825202402db9a2779bcd025146e93008ca70c08f3f88020f"
+        "count": 14280,
+        "sha256": "9f94e134fd04b893c4a0fc5bda909770cd719d4b8eba8ea5832a0a31321efeaf"
       }
     },
     "klights-cluster-datastore": {
@@ -83,11 +83,11 @@
       }
     },
     "klights-leader-api": {
-      "count": 2900,
-      "sha256": "3feccfb5e20e4030821981e1636f1083ee1ce0422b7acacc2569bbf8ee9b3b36",
+      "count": 3115,
+      "sha256": "9c1dc93b4bb0b1711676a67f2f8af8c8ce547f534eb1fe6cfc083723bd241114",
       "source": {
-        "count": 13654,
-        "sha256": "c69080f128cd2696d53451d14f6cde95ec1888768afd1179c306e899ee4c7cb2"
+        "count": 13790,
+        "sha256": "acb3ee060714b3700e3ed65b152c7ecad2eabf0c65d5541bf2a8bb108393ec5f"
       }
     },
     "klights-network-api": {
@@ -107,11 +107,11 @@
       }
     },
     "klights-node-api": {
-      "count": 1515,
-      "sha256": "cc5b93d14f918b87457a7ca1f54916d0655b9302aee95e89c0c883e7ae41901c",
+      "count": 1517,
+      "sha256": "b41625b201ad219e48607e7f94a7de594045f0194218814b031d8801828450c9",
       "source": {
-        "count": 10297,
-        "sha256": "a4bdbb48f04bf2914baeda120733d7f44c829e1bcb5683a5e26b79982ded07d0"
+        "count": 10304,
+        "sha256": "a81d8fafd539d7e0e803625f36f1af75c35278f36a9f3eee6b057e903a5f00e0"
       }
     },
     "klights-node-datastore": {

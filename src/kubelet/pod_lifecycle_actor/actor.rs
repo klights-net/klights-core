@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_core::action::PodAction;
 use crate::kubelet::pod_lifecycle_core::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind, PodSlotKey,
@@ -13,7 +14,6 @@ use crate::kubelet::pod_lifecycle_core::state::{FinalizationAction, PodPhase};
 use crate::kubelet::pod_lifecycle_core::trace::{LifecycleTraceEntry, LifecycleTraceRing};
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
-use crate::node_outbox::Outbox;
 #[cfg(test)]
 use klights_supervisor::TaskCategoryConfig;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
@@ -519,11 +519,12 @@ impl PodLifecycleActor {
         };
         match store.get_runtime_observation_checkpoint(&key.uid).await {
             Ok(Some(checkpoint)) => {
-                let count = checkpoint.container_ids.len();
+                let count = checkpoint.container_ids().len();
+                let (pod_uid, container_ids, generation) = checkpoint.into_parts();
                 self.state.restore_runtime_reconcile_observations(
-                    checkpoint.pod_uid,
-                    checkpoint.container_ids,
-                    checkpoint.generation,
+                    pod_uid,
+                    container_ids,
+                    generation,
                 );
                 tracing::info!(
                     namespace = %key.namespace,

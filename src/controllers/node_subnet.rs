@@ -1168,8 +1168,13 @@ async fn reconcile_local_readiness(
     if last_readiness.as_ref() == Some(&new_status) {
         return;
     }
-    match crate::kubelet::node::refresh_node_network_conditions(db, outbox, my_node_name, health)
-        .await
+    match crate::kubelet::node::refresh_node_network_conditions(
+        db,
+        outbox.map(|outbox| outbox as &dyn klights_leader_api::NodeOutbox),
+        my_node_name,
+        health,
+    )
+    .await
     {
         Ok(crate::kubelet::node::NodeNetworkRefreshResult::Updated) => {
             tracing::info!(

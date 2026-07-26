@@ -10,15 +10,13 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::control_plane::client::{
-    LeaderApiClient, legacy_dataplane, legacy_list_response, legacy_node_subnet, legacy_watch_event,
+    legacy_dataplane, legacy_list_response, legacy_node_subnet, legacy_watch_event,
 };
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::datastore::replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 use crate::datastore::{
-    AppliedOutboxRecord, CatchUpResource, DatastoreBackend, ListPageRequest, NodeSubnet, PatchKind,
-    PodCleanupIntent, PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
-    RawWatchEvent, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
-    SnapshotAtRv, WatchReplayPosition, WatchReplayRead, WatchStore, WatchTarget, WatchTargetScope,
+    CatchUpResource, ListPageRequest, NodeSubnet, PodCleanupIntent, PositionedWatchEvent,
+    PositionedWatchReplay, PositionedWatchReplayRead, Resource, ResourceList,
+    ResourcePreconditions, WatchReplayPosition, WatchStore, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -282,13 +280,62 @@ fn worker_replay_boundaries(
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
 /// This type deliberately does not open or own `cluster.db`. Cluster resource
-/// reads are served through the node/worker cache exposed by `LeaderApiClient`;
+/// reads are served through the focused leader query/cache port;
 /// node-local runtime/network rows are served through `NodeLocalBackend`.
+pub trait WorkerWatchEvents: Send + Sync {
+    fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
+    #[cfg(test)]
+    fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
+    fn publish_signal(&self, signal: WatchSignal);
+    #[cfg(test)]
+    fn publish(&self, event: WatchEvent);
+}
+
+pub struct WorkerWatchBus {
+    bus: WatchBus,
+}
+
+impl WorkerWatchBus {
+    pub fn new() -> Self {
+        Self {
+            bus: WatchBus::new(1024),
+        }
+    }
+}
+
+impl Default for WorkerWatchBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkerWatchEvents for WorkerWatchBus {
+    fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
+        self.bus.subscribe_signals(topic)
+    }
+
+    #[cfg(test)]
+    fn subscribe(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
+        self.bus.subscribe(topic)
+    }
+
+    fn publish_signal(&self, signal: WatchSignal) {
+        self.bus.publish_signal(signal);
+    }
+
+    #[cfg(test)]
+    fn publish(&self, event: WatchEvent) {
+        self.bus.publish(event);
+    }
+}
+
 pub struct WorkerStoreAdapter {
-    cluster_api: Arc<dyn LeaderApiClient>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     leader_watch: Arc<dyn LeaderWatch>,
-    node_local: NodeLocalHandle,
-    watch_bus: Arc<WatchBus>,
+    subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+    cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    watch_events: Arc<dyn WorkerWatchEvents>,
     node_name: String,
     current_rv: AtomicI64,
     event_history: Mutex<WorkerWatchHistory>,
@@ -297,17 +344,45 @@ pub struct WorkerStoreAdapter {
 }
 
 impl WorkerStoreAdapter {
-    pub fn new(
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
+    #[cfg(test)]
+    pub fn new<T>(cluster_api: Arc<T>, node_name: String) -> Self
+    where
+        T: klights_leader_api::LeaderResourceQuery
+            + LeaderWatch
+            + klights_leader_api::LeaderNodeSubnetAllocation
+            + klights_leader_api::LeaderNetworkTopologyQuery
+            + klights_leader_api::LeaderPodCleanupIntents
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::from_ports(
+            cluster_api.clone(),
+            cluster_api.clone(),
+            cluster_api.clone(),
+            cluster_api.clone(),
+            cluster_api,
+            Arc::new(WorkerWatchBus::new()),
+            node_name,
+        )
+    }
+
+    pub fn from_ports(
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        leader_watch: Arc<dyn LeaderWatch>,
+        subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+        network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+        cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+        watch_events: Arc<dyn WorkerWatchEvents>,
         node_name: String,
     ) -> Self {
-        let leader_watch: Arc<dyn LeaderWatch> = cluster_api.clone();
         Self {
-            cluster_api,
+            resource_query,
             leader_watch,
-            node_local,
-            watch_bus: Arc::new(WatchBus::new(1024)),
+            subnet_allocation,
+            network_topology,
+            cleanup_intents,
+            watch_events,
             node_name,
             current_rv: AtomicI64::new(0),
             event_history: Mutex::new(WorkerWatchHistory::default()),
@@ -350,12 +425,12 @@ impl WorkerStoreAdapter {
     }
 
     pub fn watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_bus.subscribe_signals(topic)
+        self.watch_events.subscribe_signals(topic)
     }
 
     #[cfg(test)]
     pub fn watch_topic(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        self.watch_bus.subscribe(topic)
+        self.watch_events.subscribe(topic)
     }
 
     fn worker_watch_requests(&self) -> Vec<WatchRequest> {
@@ -601,7 +676,7 @@ impl WorkerStoreAdapter {
         selector_membership: Option<&mut crate::watch::SelectorMembership>,
     ) -> Result<(i64, Option<WatchReplayPosition>)> {
         let list = self
-            .cluster_api
+            .resource_query
             .list_resources(ResourceListRequest::try_new(
                 req.api_version().to_string(),
                 req.kind().to_string(),
@@ -668,10 +743,10 @@ impl WorkerStoreAdapter {
         }
         self.record_watch_event(event.clone());
         if let Some(signal) = WatchSignal::from_event(&event) {
-            self.watch_bus.publish_signal(signal);
+            self.watch_events.publish_signal(signal);
         }
         #[cfg(test)]
-        self.watch_bus.publish(event);
+        self.watch_events.publish(event);
     }
 
     fn local_pod_lifecycle_message(&self, event: &WatchEvent) -> Option<LifecycleMessage> {
@@ -786,10 +861,6 @@ impl WorkerStoreAdapter {
             .pointer("/spec/nodeName")
             .and_then(|node| node.as_str())
             .is_some_and(|node| node == self.node_name)
-    }
-
-    fn snapshot_replay_event_type(since_rv: i64) -> &'static str {
-        if since_rv > 0 { "MODIFIED" } else { "ADDED" }
     }
 
     fn local_pod_field_selector(&self, field_selector: Option<&str>) -> String {
@@ -949,12 +1020,12 @@ impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
 #[async_trait]
 impl WatchStore for WorkerStoreAdapter {
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_bus.subscribe_signals(topic)
+        self.watch_events.subscribe_signals(topic)
     }
 
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
-        self.watch_bus.subscribe(topic)
+        self.watch_events.subscribe(topic)
     }
 
     async fn list_watch_events_since(
@@ -1010,798 +1081,6 @@ impl WatchStore for WorkerStoreAdapter {
             events,
             next_position,
         }))
-    }
-}
-
-#[async_trait]
-impl DatastoreBackend for WorkerStoreAdapter {
-    fn close(&self) {
-        self.node_local.close();
-    }
-
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_bus.subscribe_signals(topic)
-    }
-
-    #[cfg(test)]
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
-        self.watch_bus.subscribe(topic)
-    }
-
-    #[cfg(test)]
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
-        self.watch_bus.subscribe_many(topics)
-    }
-
-    #[cfg(test)]
-    fn broadcast_watch_event(&self, pending: crate::datastore::PendingWatchEvent) {
-        self.publish_watch(pending.event);
-    }
-
-    async fn apply_raft_log_apply_commit(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        self.unsupported("apply_raft_log_apply_commit")
-    }
-
-    async fn apply_raft_log_apply_commit_outcome(
-        &self,
-        _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        self.unsupported("apply_raft_log_apply_commit_outcome")
-    }
-
-    async fn create_resource(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _data: Value,
-    ) -> Result<Resource> {
-        self.unsupported("create_resource")
-    }
-
-    async fn get_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Option<Resource>> {
-        let key = ResourceKey {
-            api_version: api_version.to_string(),
-            kind: kind.to_string(),
-            namespace: namespace.map(str::to_string),
-            name: name.to_string(),
-        };
-        let resource = self
-            .cluster_api
-            .get_resource(ResourceGetRequest::try_new(
-                key,
-                ResourceQueryConsistency::Cached,
-            )?)
-            .await?;
-        if Self::is_pod_resource(api_version, kind)
-            && resource
-                .as_ref()
-                .is_some_and(|resource| !self.pod_belongs_to_local_node(resource))
-        {
-            return Ok(None);
-        }
-        if let Some(resource) = &resource {
-            self.observe_rv(resource.resource_version);
-        }
-        Ok(resource)
-    }
-
-    async fn list_resources_page(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        page: ListPageRequest,
-    ) -> Result<ResourceList> {
-        let field_selector = if Self::is_pod_resource(api_version, kind) {
-            Some(self.local_pod_field_selector(field_selector))
-        } else {
-            field_selector.map(str::to_string)
-        };
-        // Fetch the full scope from the leader and paginate locally. The worker
-        // cache (and the leader datastore) own the authoritative collection, but
-        // pagination must be applied exactly once: passing limit/continue_token
-        // to the leader *and* re-applying ListPageRequest here would let the
-        // local pass clear the leader-provided continue_token (the leader has
-        // already truncated to the limit), silently dropping the rest of the
-        // collection from a worker LIST. The node/worker cache also returns
-        // items in arbitrary (hash-map) order, so sort by name before applying
-        // the page so name-based continuation is deterministic and matches the
-        // leader's ordering.
-        let list = self
-            .cluster_api
-            .list_resources(ResourceListRequest::try_new(
-                api_version,
-                kind,
-                namespace.map(str::to_string),
-                label_selector.map(str::to_string),
-                field_selector,
-                None,
-                None,
-                ResourceQueryConsistency::Cached,
-            )?)
-            .await?;
-        let mut list = legacy_list_response(list);
-        self.observe_rv(list.resource_version);
-        if page.limit().is_some() || page.continue_token().is_some() {
-            list.items.sort_by(|a, b| a.name.cmp(&b.name));
-            list = page.apply_to_sorted_resource_list(list);
-        }
-        Ok(list)
-    }
-
-    async fn list_resource_keys_for_scope(
-        &self,
-        api_version: String,
-        kind: String,
-        namespaced: bool,
-    ) -> Result<Vec<(Option<String>, String)>> {
-        let list = self
-            .list_resources(
-                &api_version,
-                &kind,
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        Ok(list
-            .items
-            .into_iter()
-            .map(|resource| {
-                (
-                    namespaced.then_some(resource.namespace).flatten(),
-                    resource.name,
-                )
-            })
-            .collect())
-    }
-
-    async fn update_resource(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _data: Value,
-        _expected_rv: i64,
-    ) -> Result<Resource> {
-        self.unsupported("update_resource")
-    }
-
-    async fn update_resource_with_preconditions(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _data: Value,
-        _preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
-        self.unsupported("update_resource_with_preconditions")
-    }
-
-    async fn update_status_only(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _status: Value,
-        _expected_rv: Option<i64>,
-    ) -> Result<Resource> {
-        self.unsupported("update_status_only")
-    }
-
-    async fn update_status_only_with_preconditions(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _status: Value,
-        _preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
-        self.unsupported("update_status_only_with_preconditions")
-    }
-
-    async fn delete_resource(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-    ) -> Result<()> {
-        self.unsupported("delete_resource")
-    }
-
-    async fn delete_resource_with_preconditions(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _preconditions: ResourcePreconditions,
-    ) -> Result<()> {
-        self.unsupported("delete_resource_with_preconditions")
-    }
-
-    async fn get_current_resource_version(&self) -> Result<i64> {
-        Ok(self.current_rv.load(Ordering::Relaxed))
-    }
-
-    async fn create_namespace(&self, _name: &str, _data: Value) -> Result<Resource> {
-        self.unsupported("create_namespace")
-    }
-
-    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        let key = ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Namespace".to_string(),
-            namespace: None,
-            name: name.to_string(),
-        };
-        let resource = self
-            .cluster_api
-            .get_resource(ResourceGetRequest::try_new(
-                key,
-                ResourceQueryConsistency::LeaderFresh,
-            )?)
-            .await?;
-        if let Some(resource) = &resource {
-            self.observe_rv(resource.resource_version);
-        }
-        Ok(resource)
-    }
-
-    async fn list_namespaces_page(
-        &self,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        page: ListPageRequest,
-    ) -> Result<ResourceList> {
-        self.list_resources_page(
-            "v1",
-            "Namespace",
-            None,
-            label_selector,
-            field_selector,
-            page,
-        )
-        .await
-    }
-
-    async fn update_namespace(
-        &self,
-        _name: &str,
-        _data: Value,
-        _expected_rv: i64,
-    ) -> Result<Resource> {
-        self.unsupported("update_namespace")
-    }
-
-    async fn delete_namespace_contents(&self, _name: &str) -> Result<()> {
-        self.unsupported("delete_namespace_contents")
-    }
-
-    async fn delete_namespace(&self, _name: &str) -> Result<()> {
-        self.unsupported("delete_namespace")
-    }
-
-    async fn find_owned_resources(
-        &self,
-        _owner_uid: &str,
-        _namespace: Option<&str>,
-    ) -> Result<Vec<Resource>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_resources_by_owner_uid(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _owner_uid: &str,
-    ) -> Result<Vec<Resource>> {
-        Ok(Vec::new())
-    }
-
-    async fn find_owned_by_name_kind_empty_uid(
-        &self,
-        _owner_api_version: &str,
-        _owner_name: &str,
-        _owner_kind: &str,
-        _namespace: Option<&str>,
-    ) -> Result<Vec<Resource>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_cluster_resources_modified_since(
-        &self,
-        api_version: &str,
-        kind: &str,
-        since_rv: i64,
-    ) -> Result<Vec<CatchUpResource>> {
-        let list = self
-            .list_resources(
-                api_version,
-                kind,
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        let event_type = Self::snapshot_replay_event_type(since_rv);
-        Ok(list
-            .items
-            .into_iter()
-            .filter(|resource| resource.resource_version > since_rv)
-            .map(|resource| CatchUpResource {
-                resource,
-                event_type: std::borrow::Cow::Borrowed(event_type),
-            })
-            .collect())
-    }
-
-    async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
-        self.unsupported("list_cluster_resources")
-    }
-
-    async fn list_resources_modified_since(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        since_rv: i64,
-    ) -> Result<Vec<CatchUpResource>> {
-        let list = self
-            .list_resources(
-                api_version,
-                kind,
-                namespace,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        let event_type = Self::snapshot_replay_event_type(since_rv);
-        Ok(list
-            .items
-            .into_iter()
-            .filter(|resource| resource.resource_version > since_rv)
-            .map(|resource| CatchUpResource {
-                resource,
-                event_type: std::borrow::Cow::Borrowed(event_type),
-            })
-            .collect())
-    }
-
-    async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        self.observe_rv(min_rv);
-        Ok(self.current_rv.load(Ordering::Relaxed))
-    }
-
-    async fn list_namespace_resources(&self, _namespace: &str) -> Result<Vec<Resource>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_namespace_resources_of_kind(
-        &self,
-        namespace: &str,
-        kind: &str,
-    ) -> Result<Vec<Resource>> {
-        Ok(self
-            .list_resources(
-                "v1",
-                kind,
-                Some(namespace),
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?
-            .items)
-    }
-
-    async fn list_namespace_resources_excluding_kind(
-        &self,
-        _namespace: &str,
-        _kind: &str,
-    ) -> Result<Vec<Resource>> {
-        Ok(Vec::new())
-    }
-
-    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
-        Ok(self.list_namespace_resources(namespace).await?.len() as i64)
-    }
-
-    async fn list_watch_events_since(
-        &self,
-        targets: &[WatchTarget],
-        since_rv: i64,
-    ) -> Result<Vec<CatchUpResource>> {
-        Ok(self.historical_watch_events_since(targets, since_rv))
-    }
-
-    async fn list_watch_events_after_position_checked_bounded(
-        &self,
-        targets: &[WatchTarget],
-        position: WatchReplayPosition,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        let high_water_event_id = self.next_event_id.load(Ordering::Relaxed).saturating_sub(1);
-        let history = self
-            .event_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if targets.iter().any(|target| {
-            ReplayRetentionBoundary::classify_all(
-                worker_replay_boundaries(&history, target),
-                position,
-            ) == ReplayAvailability::Expired
-        }) {
-            return Ok(PositionedWatchReplayRead::Expired);
-        }
-        let events: Vec<_> = history
-            .events
-            .iter()
-            .filter(|(event_id, event)| {
-                worker_replay_event_follows_position(position, *event_id, event)
-            })
-            .filter(|(_, event)| watch_event_matches_targets(event, targets))
-            .filter_map(|(event_id, event)| {
-                let resource_version = event.resource_version()?;
-                Some(PositionedWatchEvent {
-                    position: WatchReplayPosition {
-                        resource_version,
-                        event_id: *event_id,
-                        resource_version_filter_through_event_id: 0,
-                    },
-                    event: catchup_resource_from_watch_event(event)?,
-                })
-            })
-            .take(limit.get())
-            .collect();
-        let next_position =
-            WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
-        Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-            events,
-            next_position,
-        }))
-    }
-
-    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        Ok(WatchReplayPosition {
-            resource_version: self.current_rv.load(Ordering::Relaxed),
-            event_id: self.next_event_id.load(Ordering::Relaxed).saturating_sub(1),
-            resource_version_filter_through_event_id: 0,
-        })
-    }
-
-    async fn snapshot_resources_at_position(
-        &self,
-        targets: &[WatchTarget],
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        position: WatchReplayPosition,
-    ) -> Result<SnapshotAtRv> {
-        let high_water_event_id = self.next_event_id.load(Ordering::Relaxed).saturating_sub(1);
-        if position.event_id > high_water_event_id
-            || position.resource_version_filter_through_event_id > high_water_event_id
-            || (position.event_id == 0
-                && position.resource_version_filter_through_event_id == 0
-                && position.resource_version > self.current_rv.load(Ordering::Relaxed))
-        {
-            return Ok(SnapshotAtRv::Expired);
-        }
-
-        let history = self
-            .event_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for target in targets {
-            let boundaries = worker_replay_boundaries(&history, target);
-            if ReplayRetentionBoundary::classify_all(boundaries.iter().copied(), position)
-                == ReplayAvailability::Expired
-                || !boundaries.is_empty()
-            {
-                return Ok(SnapshotAtRv::Expired);
-            }
-        }
-
-        let mut resources = HashMap::<ReflectedResourceKey, Resource>::new();
-        for (event_id, event) in &history.events {
-            if !watch_event_matches_targets(event, targets) {
-                continue;
-            }
-            let Some(resource_version) = event.resource_version() else {
-                return Ok(SnapshotAtRv::Expired);
-            };
-            if !crate::datastore::position_membership::position_represents(
-                position,
-                *event_id,
-                resource_version,
-            ) {
-                continue;
-            }
-            let Some(resource) =
-                catchup_resource_from_watch_event(event).map(|catchup| catchup.resource)
-            else {
-                return Ok(SnapshotAtRv::Expired);
-            };
-            let key = ReflectedResourceKey {
-                api_version: resource.api_version.clone(),
-                kind: resource.kind.clone(),
-                namespace: resource.namespace.clone(),
-                name: resource.name.clone(),
-            };
-            if event.event_type == EventType::Deleted {
-                resources.remove(&key);
-            } else {
-                resources.insert(key, resource);
-            }
-        }
-        drop(history);
-
-        let mut items = crate::datastore::position_membership::apply_membership_selectors(
-            resources.into_values().collect(),
-            label_selector,
-            field_selector,
-        )?;
-        crate::datastore::position_membership::sort_for_watch_targets(&mut items, targets);
-        Ok(SnapshotAtRv::List(ResourceList {
-            items,
-            resource_version: position.resource_version,
-            watch_replay_position: Some(position),
-            continue_token: None,
-            remaining_item_count: None,
-        }))
-    }
-
-    async fn list_raw_watch_events_since_checked_bounded(
-        &self,
-        _targets: &[WatchTarget],
-        _since_rv: i64,
-        _limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
-        self.unsupported("list_raw_watch_events_since_checked_bounded")
-    }
-
-    async fn list_all_watch_events_since(&self, _since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_all_watch_events_since_paged(
-        &self,
-        _since_rv: i64,
-        _after_resource_version: i64,
-        _after_id: i64,
-        _limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<(i64, CatchUpResource)>> {
-        Ok(Vec::new())
-    }
-
-    async fn list_deleted_watch_events_since(
-        &self,
-        _since_rv: i64,
-    ) -> Result<Vec<CatchUpResource>> {
-        Ok(Vec::new())
-    }
-
-    async fn allocate_node_subnet(
-        &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet> {
-        let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
-            .map_err(anyhow::Error::new)?;
-        let result = self
-            .cluster_api
-            .allocate_node_subnet(request)
-            .await
-            .map_err(anyhow::Error::new)?;
-        legacy_node_subnet(result.into_subnet()).map_err(anyhow::Error::new)
-    }
-
-    async fn update_node_peer_attributes(
-        &self,
-        _node_name: &str,
-        _mode: crate::controllers::annotations::NodePeerMode,
-        _hostport_range: Option<klights_types::HostPortRange>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn update_node_dataplane(
-        &self,
-        _metadata: klights_cluster_store::DataplanePeerMetadata,
-    ) -> Result<()> {
-        self.unsupported("update_node_dataplane")
-    }
-
-    async fn get_node_dataplane(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
-        let request = NodeDataplaneQuery::try_new(node_name).map_err(anyhow::Error::new)?;
-        self.cluster_api
-            .get_node_dataplane(request)
-            .await
-            .map_err(anyhow::Error::new)?
-            .into_option()
-            .map(legacy_dataplane)
-            .transpose()
-            .map_err(anyhow::Error::new)
-    }
-
-    async fn list_pod_cleanup_intents_for_node(
-        &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        self.cluster_api
-            .list_pod_cleanup_intents(
-                PodCleanupIntentListRequest::try_new(node_name).map_err(anyhow::Error::new)?,
-            )
-            .await
-            .map(|intents| intents.into_iter().map(legacy_pod_cleanup_intent).collect())
-            .map_err(anyhow::Error::new)
-    }
-
-    async fn delete_pod_cleanup_intent(
-        &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        self.cluster_api
-            .acknowledge_pod_cleanup_intent(
-                PodCleanupIntentAckRequest::try_new(
-                    node_name, namespace, pod_name, pod_uid, reason,
-                )
-                .map_err(anyhow::Error::new)?,
-            )
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        let request = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
-        self.cluster_api
-            .get_node_subnet(request)
-            .await
-            .map_err(anyhow::Error::new)?
-            .into_option()
-            .map(legacy_node_subnet)
-            .transpose()
-            .map_err(anyhow::Error::new)
-    }
-
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        let request = PeerSubnetsQuery::try_new(my_node_name).map_err(anyhow::Error::new)?;
-        self.cluster_api
-            .list_peer_subnets(request)
-            .await
-            .map_err(anyhow::Error::new)?
-            .into_vec()
-            .into_iter()
-            .map(legacy_node_subnet)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::new)
-    }
-
-    async fn delete_node_subnet(&self, _node_name: &str) -> Result<()> {
-        Ok(())
-    }
-
-    async fn patch_resource_latest(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _patch_kind: PatchKind,
-        _patch: Value,
-    ) -> Result<Option<Resource>> {
-        self.unsupported("patch_resource_latest")
-    }
-
-    async fn patch_resource_latest_with_preconditions(
-        &self,
-        _api_version: &str,
-        _kind: &str,
-        _namespace: Option<&str>,
-        _name: &str,
-        _request: ResourcePatchRequest,
-    ) -> Result<Option<Resource>> {
-        self.unsupported("patch_resource_latest_with_preconditions")
-    }
-
-    async fn watch_events_gc_prunable_count(
-        &self,
-        _max_rows: i64,
-        _batch_cap: i64,
-    ) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn gc_watch_events(&self, _max_rows: i64, _batch_cap: i64) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        self.node_local.get_node_meta(key).await
-    }
-
-    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.node_local.set_node_meta(key, value).await
-    }
-
-    async fn get_applied_outbox(
-        &self,
-        _idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
-        Ok(None)
-    }
-
-    async fn insert_applied_outbox(&self, _record: AppliedOutboxRecord) -> Result<bool> {
-        Ok(false)
-    }
-
-    async fn apply_outbox_transactionally(
-        &self,
-        _idempotency_key: &str,
-        _operation: &str,
-        _command: klights_cluster_core::command::StorageCommand,
-        _authoring_node: &str,
-    ) -> std::result::Result<
-        crate::node_outbox::OutboxApplyResult,
-        crate::node_outbox::OutboxApplyError,
-    > {
-        Err(crate::node_outbox::OutboxApplyError::Retryable(
-            "worker-local store does not support leader-side outbox apply".to_string(),
-        ))
-    }
-
-    async fn build_log_apply_commit_for_outbox(
-        &self,
-        _idempotency_key: &str,
-        _operation: &str,
-        _command: klights_cluster_core::command::StorageCommand,
-        _authoring_node: &str,
-    ) -> std::result::Result<
-        klights_cluster_core::BuildOutboxOutcome,
-        crate::node_outbox::OutboxApplyError,
-    > {
-        Err(crate::node_outbox::OutboxApplyError::Retryable(
-            "worker-local store does not support leader-side outbox build".to_string(),
-        ))
-    }
-
-    async fn gc_applied_outbox(&self, _now_ms: i64, _ttl_ms: i64) -> Result<usize> {
-        Ok(0)
-    }
-
-    async fn applied_outbox_gc_prunable_count(&self, _cutoff_ms: i64) -> Result<usize> {
-        Ok(0)
-    }
-
-    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-    #[cfg(test)]
-    async fn apply_replicated_command(
-        &self,
-        _command: StorageCommand,
-        _meta: CommandMeta,
-    ) -> Result<()> {
-        self.unsupported("apply_replicated_command")
     }
 }
 
@@ -1832,7 +1111,7 @@ impl crate::datastore::ResourceStore for WorkerStoreAdapter {
             name: name.to_string(),
         };
         let resource = self
-            .cluster_api
+            .resource_query
             .get_resource(ResourceGetRequest::try_new(
                 key,
                 ResourceQueryConsistency::Cached,
@@ -1914,7 +1193,7 @@ impl crate::datastore::ResourceListStore for WorkerStoreAdapter {
             field_selector.map(str::to_string)
         };
         let list = self
-            .cluster_api
+            .resource_query
             .list_resources(ResourceListRequest::try_new(
                 api_version,
                 kind,
@@ -2122,17 +1401,6 @@ impl crate::datastore::StatusStore for WorkerStoreAdapter {
 }
 
 #[async_trait]
-impl crate::datastore::MetaStore for WorkerStoreAdapter {
-    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        self.node_local.get_node_meta(key).await
-    }
-
-    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.node_local.set_node_meta(key, value).await
-    }
-}
-
-#[async_trait]
 impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
     async fn allocate_node_subnet(
         &self,
@@ -2143,7 +1411,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
         let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
             .map_err(anyhow::Error::new)?;
         let result = self
-            .cluster_api
+            .subnet_allocation
             .allocate_node_subnet(request)
             .await
             .map_err(anyhow::Error::new)?;
@@ -2171,7 +1439,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         let request = NodeDataplaneQuery::try_new(node_name).map_err(anyhow::Error::new)?;
-        self.cluster_api
+        self.network_topology
             .get_node_dataplane(request)
             .await
             .map_err(anyhow::Error::new)?
@@ -2183,7 +1451,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
 
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
         let request = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
-        self.cluster_api
+        self.network_topology
             .get_node_subnet(request)
             .await
             .map_err(anyhow::Error::new)?
@@ -2195,7 +1463,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
 
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
         let request = PeerSubnetsQuery::try_new(my_node_name).map_err(anyhow::Error::new)?;
-        self.cluster_api
+        self.network_topology
             .list_peer_subnets(request)
             .await
             .map_err(anyhow::Error::new)?
@@ -2229,7 +1497,7 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
         &self,
         node_name: &str,
     ) -> Result<Vec<PodCleanupIntent>> {
-        self.cluster_api
+        self.cleanup_intents
             .list_pod_cleanup_intents(
                 PodCleanupIntentListRequest::try_new(node_name).map_err(anyhow::Error::new)?,
             )
@@ -2246,7 +1514,7 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        self.cluster_api
+        self.cleanup_intents
             .acknowledge_pod_cleanup_intent(
                 PodCleanupIntentAckRequest::try_new(
                     node_name, namespace, pod_name, pod_uid, reason,
@@ -2267,7 +1535,7 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
 mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::datastore::DatastoreBackend;
+    use crate::datastore::{NetworkMetadataStore, ResourceListStore, ResourceStore};
     use crate::kubelet::pod_lifecycle_router::{
         PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
         PodLifecycleRouteMode,
@@ -2431,7 +1699,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2440,16 +1708,16 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
-        let worker_a = DatastoreBackend::allocate_node_subnet(
+        let worker_a = NetworkMetadataStore::allocate_node_subnet(
             &adapter,
             "worker-a",
             "10.77.0.0/16",
             "192.0.2.10",
         )
         .await
-        .expect("allocate through broad datastore compatibility surface");
+        .expect("allocate through focused network metadata surface");
         let worker_b = crate::datastore::NetworkMetadataStore::allocate_node_subnet(
             &adapter,
             "worker-b",
@@ -2466,15 +1734,15 @@ mod tests {
             Some(worker_a.clone())
         );
         assert_eq!(
-            DatastoreBackend::get_node_subnet(&adapter, "worker-b")
+            NetworkMetadataStore::get_node_subnet(&adapter, "worker-b")
                 .await
-                .expect("query compatibility surface"),
+                .expect("query focused surface"),
             Some(worker_b.clone())
         );
         assert_eq!(
-            DatastoreBackend::list_peer_subnets(&adapter, "worker-a")
+            NetworkMetadataStore::list_peer_subnets(&adapter, "worker-a")
                 .await
-                .expect("list compatibility peers"),
+                .expect("list focused peers"),
             vec![worker_b]
         );
         assert_eq!(
@@ -2484,9 +1752,9 @@ mod tests {
             vec![worker_a]
         );
         assert_eq!(
-            DatastoreBackend::get_node_dataplane(&adapter, "worker-b")
+            NetworkMetadataStore::get_node_dataplane(&adapter, "worker-b")
                 .await
-                .expect("query compatibility dataplane"),
+                .expect("query focused dataplane"),
             Some(dataplane.clone())
         );
         assert_eq!(
@@ -2570,7 +1838,7 @@ mod tests {
     #[tokio::test]
     async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2579,11 +1847,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(
-            Arc::new(HandoffLeaderApi),
-            node_local,
-            "worker-a".to_string(),
-        );
+        let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
         let backend = Arc::new(FailingPodLifecycleBackend::new(1));
         adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
             backend.clone(),
@@ -2651,7 +1915,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -2660,7 +1924,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
         let backend = Arc::new(FailingPodLifecycleBackend::new(1));
         adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
             backend.clone(),
@@ -3034,13 +2298,10 @@ mod tests {
 
     crate::control_plane::client::impl_unavailable_leader_pod_effects!(HandoffLeaderApi);
 
-    #[async_trait]
-    impl LeaderApiClient for HandoffLeaderApi {}
-
     #[tokio::test]
     async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3051,7 +2312,6 @@ mod tests {
         .expect("open node-local");
         let adapter = Arc::new(WorkerStoreAdapter::new(
             Arc::new(HandoffLeaderApi),
-            node_local,
             "worker-a".to_string(),
         ));
         let backend = Arc::new(FailingPodLifecycleBackend::new(1));
@@ -3258,13 +2518,10 @@ mod tests {
         OpenExpiredThenRelistLeaderApi
     );
 
-    #[async_trait]
-    impl LeaderApiClient for OpenExpiredThenRelistLeaderApi {}
-
     #[tokio::test]
     async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3273,11 +2530,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(
-            Arc::new(HandoffLeaderApi),
-            node_local,
-            "worker-a".to_string(),
-        );
+        let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
 
         let pod = adapter
             .get_resource("v1", "Pod", Some("default"), "cached-deleted")
@@ -3303,11 +2556,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(
-            Arc::new(HandoffLeaderApi),
-            node_local.clone(),
-            "worker-a".to_string(),
-        );
+        let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
         let outbox = crate::node_outbox::Outbox::new(node_local.clone());
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -3323,9 +2572,9 @@ mod tests {
             }
         });
 
-        crate::pod_events::emit_pod_event_with_outbox(
-            &adapter,
-            Some(&outbox),
+        crate::pod_events::emit_worker_pod_event(
+            adapter.resource_query.as_ref(),
+            &outbox,
             crate::pod_events::PodEventRecord {
                 pod: &pod,
                 reason: "Started",
@@ -3351,7 +2600,7 @@ mod tests {
     #[tokio::test]
     async fn worker_pod_lists_are_constrained_to_local_node() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3360,11 +2609,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(
-            Arc::new(HandoffLeaderApi),
-            node_local,
-            "worker-a".to_string(),
-        );
+        let adapter = WorkerStoreAdapter::new(Arc::new(HandoffLeaderApi), "worker-a".to_string());
 
         let list = adapter
             .list_resources_page(
@@ -3412,7 +2657,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3421,7 +2666,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
         let first = adapter
             .list_resources_page(
@@ -3500,7 +2745,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3509,7 +2754,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
         for (index, name) in ["cm-a", "cm-b", "cm-c"].into_iter().enumerate() {
             adapter.publish_watch(WatchEvent::added(serde_json::json!({
                 "apiVersion": "v1",
@@ -3559,73 +2804,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_snapshot_expires_after_compaction_can_hide_unchanged_live_objects() {
-        let cluster_db = crate::datastore::test_support::in_memory().await;
-        let cluster_api = Arc::new(LocalApiClient::new(
-            Arc::new(cluster_db),
-            "worker-a".to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        ));
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
-            crate::datastore::backend_kind::BackendKind::Sqlite,
-            None,
-            supervisor,
-            None,
-            "sqlite:worker-store-snapshot-compaction-test",
-        )
-        .await
-        .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
-        adapter.publish_watch(WatchEvent::added(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "namespace": "default",
-                "name": "unchanged-live",
-                "uid": "uid-unchanged-live",
-                "resourceVersion": "1"
-            }
-        })));
-
-        for index in 0..WORKER_WATCH_EVENT_HISTORY_CAPACITY {
-            let rv = index + 2;
-            adapter.publish_watch(WatchEvent::added(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "namespace": "default",
-                    "name": format!("noise-{index}"),
-                    "uid": format!("uid-noise-{index}"),
-                    "resourceVersion": rv.to_string()
-                }
-            })));
-        }
-
-        let target = [WatchTarget::namespaced_in_namespace(
-            "v1",
-            "ConfigMap",
-            "default",
-        )];
-        let position = adapter
-            .current_watch_replay_position()
-            .await
-            .expect("worker replay position");
-        assert!(
-            position.event_id > WORKER_WATCH_EVENT_HISTORY_CAPACITY as i64,
-            "test must force worker watch-history compaction"
-        );
-        let snapshot = adapter
-            .snapshot_resources_at_position(&target, None, None, position)
-            .await
-            .expect("worker snapshot");
-        assert!(
-            matches!(snapshot, SnapshotAtRv::Expired),
-            "worker snapshots must fail closed after compaction because unchanged live objects can have no retained establishing event"
-        );
-    }
-
-    #[tokio::test]
     async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_state() {
         let cluster_db = crate::datastore::test_support::in_memory().await;
         cluster_db
@@ -3651,7 +2829,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3660,7 +2838,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
         let replay = crate::datastore::WatchStore::list_watch_events_since(
             &adapter,
@@ -3689,7 +2867,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3698,10 +2876,9 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
-        crate::datastore::DatastoreBackend::broadcast_watch_event(
-            &adapter,
+        adapter.publish_watch(
             crate::datastore::create_pending_watch_event(
                 "v1",
                 "ConfigMap",
@@ -3719,7 +2896,8 @@ mod tests {
                     },
                     "data": {"data-1": "value-1"}
                 }),
-            ),
+            )
+            .event,
         );
 
         let replay = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
@@ -3779,7 +2957,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor,
@@ -3788,7 +2966,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
         let mut created_event = (*created.data).clone();
         created_event["metadata"]["resourceVersion"] =
             serde_json::json!(created.resource_version.to_string());
@@ -3906,8 +3084,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter =
-            WorkerStoreAdapter::new(cluster_api, node_local.clone(), "worker-a".to_string());
+        let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
         let pod = adapter
             .get_resource("v1", "Pod", Some("default"), "web")
@@ -3962,7 +3139,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -3971,11 +3148,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = Arc::new(WorkerStoreAdapter::new(
-            cluster_api,
-            node_local,
-            "worker-a".to_string(),
-        ));
+        let adapter = Arc::new(WorkerStoreAdapter::new(cluster_api, "worker-a".to_string()));
         configure_successful_pod_router(&adapter);
         let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -4037,7 +3210,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -4046,11 +3219,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = Arc::new(WorkerStoreAdapter::new(
-            cluster_api,
-            node_local,
-            "worker-a".to_string(),
-        ));
+        let adapter = Arc::new(WorkerStoreAdapter::new(cluster_api, "worker-a".to_string()));
         let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Namespace"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -4098,7 +3267,7 @@ mod tests {
     async fn watch_mirror_relists_after_open_time_replay_window_expiration() {
         let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::typed_expiry());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -4109,7 +3278,6 @@ mod tests {
         .expect("open node-local");
         let adapter = Arc::new(WorkerStoreAdapter::new(
             cluster_api.clone(),
-            node_local,
             "worker-a".to_string(),
         ));
         configure_successful_pod_router(&adapter);
@@ -4169,7 +3337,7 @@ mod tests {
     async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
         let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::unmarked_out_of_range());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -4180,7 +3348,6 @@ mod tests {
         .expect("open node-local");
         let adapter = Arc::new(WorkerStoreAdapter::new(
             cluster_api.clone(),
-            node_local,
             "worker-a".to_string(),
         ));
         configure_successful_pod_router(&adapter);
@@ -4225,7 +3392,7 @@ mod tests {
     async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
         let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::repeated_typed_expiry());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -4236,7 +3403,6 @@ mod tests {
         .expect("open node-local");
         let adapter = Arc::new(WorkerStoreAdapter::new(
             cluster_api.clone(),
-            node_local,
             "worker-a".to_string(),
         ));
         configure_successful_pod_router(&adapter);
@@ -4492,11 +3658,8 @@ mod tests {
 
         crate::control_plane::client::impl_unavailable_leader_pod_effects!(LocalPodLeaderApi);
 
-        #[async_trait]
-        impl LeaderApiClient for LocalPodLeaderApi {}
-
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -4507,7 +3670,6 @@ mod tests {
         .expect("open node-local");
         let adapter = Arc::new(WorkerStoreAdapter::new(
             Arc::new(LocalPodLeaderApi),
-            node_local,
             "worker-a".to_string(),
         ));
         let executor = crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
@@ -4607,7 +3769,7 @@ mod tests {
     async fn watch_mirror_replays_pods_bound_between_initial_list_and_watch() {
         let cluster_api = Arc::new(HandoffLeaderApi);
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_local = crate::datastore::node_local::selector::open_node_local(
+        let _node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
             None,
             supervisor.clone(),
@@ -4616,11 +3778,7 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = Arc::new(WorkerStoreAdapter::new(
-            cluster_api,
-            node_local,
-            "worker-a".to_string(),
-        ));
+        let adapter = Arc::new(WorkerStoreAdapter::new(cluster_api, "worker-a".to_string()));
         configure_successful_pod_router(&adapter);
         let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();

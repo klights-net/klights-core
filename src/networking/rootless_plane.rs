@@ -590,7 +590,7 @@ mod tests {
     fn cluster_api_for_test(
         db: crate::datastore::sqlite::Datastore,
         node_name: &str,
-    ) -> Arc<dyn crate::control_plane::client::LeaderApiClient> {
+    ) -> Arc<crate::control_plane::client::local::LocalApiClient> {
         Arc::new(crate::control_plane::client::local::LocalApiClient::new(
             Arc::new(db),
             node_name.to_string(),

@@ -27,7 +27,7 @@ use klights_supervisor::TaskSupervisor;
 pub struct PodSubsystemConfig {
     pub repository_parts: PodRepositoryParts,
     pub supervisor: Arc<TaskSupervisor>,
-    pub outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     pub resource_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     pub projected_tokens: Option<Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>>,
     pub node_name: String,

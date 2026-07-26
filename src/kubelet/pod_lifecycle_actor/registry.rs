@@ -6,9 +6,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
-use crate::node_outbox::Outbox;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 
 use super::actor::{PodLifecycleActor, PodLifecycleActorRuntime};

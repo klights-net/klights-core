@@ -8,6 +8,8 @@ pub mod types;
 
 pub use backend::NodeLocalBackend;
 pub use handle::NodeLocalHandle;
+#[cfg(test)]
+pub type KubeletTestStoreHandle = NodeLocalHandle;
 pub use sqlite::SqliteNodeLocalDb;
 #[cfg(test)]
 pub use types::DeadLetterTestInsert;

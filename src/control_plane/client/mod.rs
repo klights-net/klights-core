@@ -7,7 +7,6 @@ pub mod pod_status_side_effects;
 pub mod remote;
 pub mod worker_store;
 
-use async_trait::async_trait;
 use klights_leader_api::{
     DataplaneEncryption, HostPortRange as LeaderHostPortRange, LeaderCacheReadiness,
     LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
@@ -15,6 +14,7 @@ use klights_leader_api::{
     NetworkDataplane, NetworkNodeMode, NetworkTopologyError, ResourceEvent, ResourceListRequest,
     ResourceListResult, ResourceQueryError, WatchEventType, WatchRequest,
 };
+use std::sync::Arc;
 
 use crate::datastore::{NodeSubnet, Resource, ResourceList};
 use crate::watch::WatchEvent;
@@ -252,18 +252,46 @@ pub(crate) fn focused_watch_event(
     )
 }
 
-#[async_trait]
-pub trait LeaderApiClient:
-    LeaderResourceQuery
-    + LeaderWatch
-    + LeaderCacheReadiness
-    + LeaderProjectedServiceAccountToken
-    + LeaderPodCleanupIntents
-    + LeaderNodeSubnetAllocation
-    + LeaderNetworkTopologyQuery
-    + Send
-    + Sync
-{
+/// Focused leader capabilities assembled only at a composition root.
+///
+/// Consumers take the individual port they need; this bundle exists to move
+/// the complete immutable set between bootstrap phases without recreating the
+/// former seven-capability trait object.
+#[derive(Clone)]
+pub struct LeaderClientPorts {
+    pub resource_query: Arc<dyn LeaderResourceQuery>,
+    pub watch: Arc<dyn LeaderWatch>,
+    pub cache_readiness: Arc<dyn LeaderCacheReadiness>,
+    pub projected_tokens: Arc<dyn LeaderProjectedServiceAccountToken>,
+    pub pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
+    pub node_subnet_allocation: Arc<dyn LeaderNodeSubnetAllocation>,
+    pub network_topology: Arc<dyn LeaderNetworkTopologyQuery>,
+}
+
+impl LeaderClientPorts {
+    pub fn from_client<T>(client: Arc<T>) -> Self
+    where
+        T: LeaderResourceQuery
+            + LeaderWatch
+            + LeaderCacheReadiness
+            + LeaderProjectedServiceAccountToken
+            + LeaderPodCleanupIntents
+            + LeaderNodeSubnetAllocation
+            + LeaderNetworkTopologyQuery
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            resource_query: client.clone(),
+            watch: client.clone(),
+            cache_readiness: client.clone(),
+            projected_tokens: client.clone(),
+            pod_cleanup_intents: client.clone(),
+            node_subnet_allocation: client.clone(),
+            network_topology: client,
+        }
+    }
 }
 
 #[cfg(test)]

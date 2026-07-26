@@ -402,6 +402,131 @@ impl Outbox {
     }
 }
 
+impl klights_leader_api::NodeOutbox for Outbox {
+    fn enqueue(
+        &self,
+        command: klights_leader_api::NodeOutboxCommand,
+    ) -> klights_leader_api::NodeOutboxFuture<'_, klights_leader_api::NodeOutboxRoute> {
+        Box::pin(async move {
+            self.enqueue_command(OutboxCommand {
+                idempotency_key: command.idempotency_key,
+                operation: command.operation,
+                subject: OutboxSubject {
+                    key: command.subject.key,
+                    namespace: command.subject.namespace,
+                    name: command.subject.name,
+                    uid: command.subject.uid,
+                },
+                pod_uid: command.pod_uid,
+                command: command.command,
+                now_ms: command.now_ms,
+            })
+            .await
+            .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))?;
+            Ok(klights_leader_api::NodeOutboxRoute::Enqueued)
+        })
+    }
+
+    fn next_status_stamp(&self) -> klights_leader_api::NodeOutboxFuture<'_, i64> {
+        Box::pin(async move {
+            Outbox::next_status_stamp(self)
+                .await
+                .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))
+        })
+    }
+
+    fn record_pod_status_checkpoint<'a>(
+        &'a self,
+        checkpoint: &'a Resource,
+        updated_ms: i64,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async move {
+            let status = checkpoint
+                .data
+                .pointer("/status")
+                .cloned()
+                .unwrap_or(Value::Null);
+            Outbox::record_pod_status_checkpoint(self, checkpoint, status, updated_ms)
+                .await
+                .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))
+        })
+    }
+
+    fn merge_pod_status_checkpoint(
+        &self,
+        pod: Resource,
+    ) -> klights_leader_api::NodeOutboxFuture<'_, Resource> {
+        Box::pin(async move {
+            Outbox::merge_pod_status_checkpoint(self, pod)
+                .await
+                .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))
+        })
+    }
+
+    fn delete_pod_status_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async move {
+            Outbox::delete_pod_status_checkpoint(self, pod_uid)
+                .await
+                .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))
+        })
+    }
+
+    fn record_runtime_observation_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+        container_ids: Vec<String>,
+        generation: u64,
+        updated_ms: i64,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async move {
+            Outbox::record_runtime_observation_checkpoint(
+                self,
+                pod_uid,
+                container_ids,
+                generation,
+                updated_ms,
+            )
+            .await
+            .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))
+        })
+    }
+
+    fn get_runtime_observation_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+    ) -> klights_leader_api::NodeOutboxFuture<
+        'a,
+        Option<klights_leader_api::NodeRuntimeObservationCheckpoint>,
+    > {
+        Box::pin(async move {
+            let checkpoint = Outbox::get_runtime_observation_checkpoint(self, pod_uid)
+                .await
+                .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))?;
+            Ok(checkpoint.map(|checkpoint| {
+                klights_leader_api::NodeRuntimeObservationCheckpoint::new(
+                    checkpoint.pod_uid,
+                    checkpoint.container_ids,
+                    checkpoint.generation,
+                )
+            }))
+        })
+    }
+
+    fn delete_runtime_observation_checkpoint<'a>(
+        &'a self,
+        pod_uid: &'a str,
+    ) -> klights_leader_api::NodeOutboxFuture<'a, ()> {
+        Box::pin(async move {
+            Outbox::delete_runtime_observation_checkpoint(self, pod_uid)
+                .await
+                .map_err(|error| klights_leader_api::NodeOutboxError::new(error.to_string()))
+        })
+    }
+}
+
 fn merge_checkpoint_status_for_record(
     pod: &Resource,
     mut incoming: Value,
@@ -1467,6 +1592,52 @@ mod tests {
             klights_node_store::OutboxSequencePolicy::PerSubject,
         )
         .expect("valid Pod status classification")
+    }
+
+    #[tokio::test]
+    async fn focused_outbox_checkpoint_preserves_pod_identity_rv_and_status_payload() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let checkpoint = klights_cluster_core::Resource {
+            id: 7,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("tenant-a".to_string()),
+            name: "worker-pod".to_string(),
+            uid: "uid-worker-pod".to_string(),
+            resource_version: 42,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "tenant-a",
+                    "name": "worker-pod",
+                    "uid": "uid-worker-pod",
+                    "resourceVersion": "42"
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.50.8.9"
+                }
+            })),
+        };
+
+        klights_leader_api::NodeOutbox::record_pod_status_checkpoint(&outbox, &checkpoint, 1_234)
+            .await
+            .expect("record through focused outbox port");
+
+        let stored = node_db
+            .get_pod_status_checkpoint("uid-worker-pod")
+            .await
+            .expect("read checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(stored.pod_uid, "uid-worker-pod");
+        assert_eq!(stored.namespace, "tenant-a");
+        assert_eq!(stored.pod_name, "worker-pod");
+        assert_eq!(stored.base_rv, 42);
+        assert_eq!(stored.updated_ms, 1_234);
+        assert_eq!(stored.status["phase"], "Running");
+        assert_eq!(stored.status["podIP"], "10.50.8.9");
     }
 
     #[test]

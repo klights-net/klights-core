@@ -1217,9 +1217,7 @@ async fn ensure_sysctl_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::client::LeaderApiClient;
     use crate::datastore::Resource;
-    use async_trait::async_trait;
     use klights_leader_api::{
         CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
         LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent,
@@ -1530,9 +1528,6 @@ mod tests {
     impl_unavailable_cache_readiness!(WatchOnlyLeaderApiClient);
     crate::control_plane::client::impl_unavailable_leader_pod_effects!(WatchOnlyLeaderApiClient);
 
-    #[async_trait]
-    impl LeaderApiClient for WatchOnlyLeaderApiClient {}
-
     impl LeaderWatch for ReopeningLeaderApiClient {
         fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
@@ -1557,9 +1552,6 @@ mod tests {
 
     impl_unavailable_cache_readiness!(ReopeningLeaderApiClient);
     crate::control_plane::client::impl_unavailable_leader_pod_effects!(ReopeningLeaderApiClient);
-
-    #[async_trait]
-    impl LeaderApiClient for ReopeningLeaderApiClient {}
 
     #[tokio::test]
     async fn service_routing_watch_worker_requests_full_sync_after_watches_open() {
@@ -1795,9 +1787,6 @@ mod tests {
 
     impl_unavailable_cache_readiness!(ErroringLeaderApiClient);
     crate::control_plane::client::impl_unavailable_leader_pod_effects!(ErroringLeaderApiClient);
-
-    #[async_trait]
-    impl LeaderApiClient for ErroringLeaderApiClient {}
 
     /// Regression test for the per-watch reconnect introduced in f46660f: an
     /// erroring watch stream must NOT leak duplicate watches (one new open per

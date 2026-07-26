@@ -32,7 +32,10 @@ pub struct NetworkBootArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
     pub node_mode: &'a NodeMode,
     pub node_ip: &'a str,
-    pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    pub resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    pub subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    pub network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
     pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
     pub network_cleanup: &'a NetworkCleanup,
     pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
@@ -56,7 +59,10 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         config,
         node_mode,
         node_ip,
-        cluster_api,
+        resource_query,
+        watch,
+        subnet_allocation,
+        network_topology,
         node_local,
         network_cleanup,
         runtime_paths,
@@ -67,8 +73,6 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     } = args;
     let (cni_readiness_publisher, cni_readiness) =
         crate::kubelet::cni_readiness::CniReadiness::channel();
-    let leader_ports =
-        crate::bootstrap::network_adapters::FocusedNetworkLeaderPorts::new(cluster_api.clone());
     let node_network = crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(
         node_local.clone(),
     );
@@ -93,8 +97,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let network_boot = match networking::NetworkBoot::boot(
         &network_config,
         networking::boot::NetworkBootStores::new(
-            leader_ports.subnet_allocation(),
-            leader_ports.topology(),
+            subnet_allocation,
+            network_topology.clone(),
             node_network.clone(),
             node_network.clone(),
             node_network.clone(),
@@ -119,8 +123,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     {
         let mut applied = std::collections::HashMap::new();
         if let Err(e) = crate::controllers::node_subnet::sync_peer_routes_with_ports(
-            leader_ports.topology().as_ref(),
-            leader_ports.resource_query().as_ref(),
+            network_topology.as_ref(),
+            resource_query.as_ref(),
             &config.node_name,
             boot_peering.as_ref(),
             &mut applied,
@@ -140,7 +144,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let endpoint_adapter = Arc::new(networking::SqlitePodEndpointResolver::new(
         node_network.clone(),
         node_network.clone(),
-        leader_ports.topology(),
+        network_topology.clone(),
     ));
     let endpoint_source: Arc<dyn klights_network_api::PodEndpointEventSource> =
         endpoint_adapter.clone();
@@ -158,8 +162,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         networking::service_routing::NftServiceRouter::boot_with_defaults(
             networking::service_routing::NftServiceRouterDefaultBoot::new(
                 networking::service_routing::NftServiceRouterStores::new(
-                    leader_ports.resource_query(),
-                    leader_ports.watch(),
+                    resource_query,
+                    watch,
                     endpoint_source,
                 ),
                 networking::service_routing::NftServiceRouterTableConfig::new(

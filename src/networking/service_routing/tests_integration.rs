@@ -1021,7 +1021,7 @@ mod integration_tests {
         let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
+        let cluster_api =
             std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
                 std::sync::Arc::new(db),
                 "node-a".to_string(),

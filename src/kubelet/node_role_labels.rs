@@ -77,7 +77,7 @@ mod tests {
     /// `controlplane` stable, and also carry `leader` when elected leader.
     #[test]
     fn role_label_keys_for_shape_solo_voter_is_controlplane_leader() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 1,
@@ -97,7 +97,7 @@ mod tests {
     /// must emit BOTH `controlplane` and `leader`.
     #[test]
     fn role_label_keys_for_shape_three_voter_leader_emits_both() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 3,
@@ -118,7 +118,7 @@ mod tests {
     /// voter, not every controlplane.
     #[test]
     fn role_label_keys_for_shape_three_voter_follower_is_control_plane_only() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 3,
@@ -136,7 +136,7 @@ mod tests {
     /// claiming a stamp before membership lands.
     #[test]
     fn role_label_keys_for_shape_unjoined_emits_nothing() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 0,
@@ -167,7 +167,7 @@ mod tests {
     /// promote commits, this node serves as a learner replica.
     #[test]
     fn role_label_keys_for_shape_learner_controlplane_emits_replica() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 3,
@@ -186,7 +186,7 @@ mod tests {
     /// ground truth; the CLI role is only a starting hint.
     #[test]
     fn role_label_keys_for_shape_learner_overrides_leader_role() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let role = crate::kubelet::node_config::KubeletNodeRole::Leader;
         let shape = RaftShape {
             voter_count: 1,
@@ -206,7 +206,7 @@ mod tests {
     /// `role_label_keys_for_shape_learner_controlplane_emits_replica`).
     #[test]
     fn role_label_keys_for_shape_worker_stays_static() {
-        use crate::datastore::raft::types::RaftShape;
+        use klights_cluster_core::RaftShape;
         let shape = RaftShape {
             voter_count: 3,
             is_leader: true,

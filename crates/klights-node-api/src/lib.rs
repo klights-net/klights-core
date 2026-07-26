@@ -1571,3 +1571,11 @@ pub trait NodeMetricsRuntime: Send + Sync {
         request: NodeMetricsRequest,
     ) -> NodeMetricsFuture<'_, NodeMetricsResult>;
 }
+
+/// Focused sampler injected into the node runtime transport adapter.
+pub trait NodeMetricsSampler: Send + Sync {
+    fn sample_metrics(
+        &self,
+        request: NodeMetricsRequest,
+    ) -> NodeMetricsFuture<'_, NodeMetricsResult>;
+}

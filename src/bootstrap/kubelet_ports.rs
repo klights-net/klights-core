@@ -2,9 +2,22 @@ use std::sync::Arc;
 
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CurrentResourceVersionStore, WatchStore};
+use crate::kubelet::node_heartbeat::{
+    NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
+};
 use crate::kubelet::pod_watch_source::{BoxedWatchReplaySource, PodWatchSource};
-use crate::node_heartbeat::NodeHeartbeatWatchSource;
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WindowPolicy,
+};
 use klights_watch::WatchTopic;
+
+pub struct SystemNodeHeartbeatClock;
+
+impl NodeHeartbeatClock for SystemNodeHeartbeatClock {
+    fn now_microtime(&self) -> String {
+        crate::utils::k8s_microtime_now()
+    }
+}
 
 pub struct LeaderPersistentVolumeEventHandler {
     db: crate::datastore::DatastoreHandle,
@@ -281,6 +294,7 @@ impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter
 pub struct DatastorePodWatchSource {
     watch_store: Arc<dyn WatchStore>,
     resource_versions: Arc<dyn CurrentResourceVersionStore>,
+    heartbeat_cursor: tokio::sync::Mutex<Option<SignalWatchCursor<BoxedWatchReplaySource>>>,
 }
 
 impl DatastorePodWatchSource {
@@ -291,6 +305,7 @@ impl DatastorePodWatchSource {
         Self {
             watch_store: store.clone(),
             resource_versions: store,
+            heartbeat_cursor: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -355,21 +370,63 @@ fn datastore_watch_target(target: klights_watch::WatchTarget) -> crate::datastor
     }
 }
 
-#[async_trait::async_trait]
-impl NodeHeartbeatWatchSource for DatastorePodWatchSource {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_store.subscribe_watch_signals(topic)
-    }
-
-    fn replay_source(&self, targets: Vec<crate::datastore::WatchTarget>) -> BoxedWatchReplaySource {
-        BoxedWatchReplaySource::new(Arc::new(DatastoreWatchReplaySource::new(
-            self.watch_store.clone(),
-            targets,
-        )))
-    }
-
-    async fn current_resource_version(&self) -> anyhow::Result<i64> {
-        self.resource_versions.get_current_resource_version().await
+impl NodeHeartbeatEventSource for DatastorePodWatchSource {
+    fn next_node_event(&self) -> NodeHeartbeatEventFuture<'_> {
+        Box::pin(async move {
+            let mut cursor = self.heartbeat_cursor.lock().await;
+            if cursor.is_none() {
+                let topic = WatchTopic::new("v1", "Node");
+                let replay =
+                    BoxedWatchReplaySource::new(Arc::new(DatastoreWatchReplaySource::new(
+                        self.watch_store.clone(),
+                        vec![crate::datastore::WatchTarget::cluster("v1", "Node")],
+                    )));
+                let mut next = SignalWatchCursor::new(
+                    self.watch_store.subscribe_watch_signals(topic.clone()),
+                    replay,
+                    topic,
+                    WatchDeliveryScope::Cluster,
+                    self.resource_versions
+                        .get_current_resource_version()
+                        .await
+                        .unwrap_or(0),
+                    WindowPolicy::default_watch_delivery(),
+                );
+                if let Err(error) = next.prime_replay_or_expired().await {
+                    tracing::warn!(?error, "Node heartbeat initial replay failed");
+                }
+                *cursor = Some(next);
+            }
+            let event = cursor
+                .as_mut()
+                .expect("heartbeat cursor initialized")
+                .next_event()
+                .await;
+            match event {
+                Ok(event)
+                    if !matches!(event.event_type, EventType::Bookmark | EventType::Deleted)
+                        && event.object.get("kind").and_then(|kind| kind.as_str())
+                            == Some("Node") =>
+                {
+                    let Some(node_name) = event
+                        .object
+                        .pointer("/metadata/name")
+                        .and_then(|name| name.as_str())
+                    else {
+                        return Ok(NodeHeartbeatEvent::Other);
+                    };
+                    Ok(NodeHeartbeatEvent::NodeChanged {
+                        node_name: node_name.to_string(),
+                    })
+                }
+                Ok(_) => Ok(NodeHeartbeatEvent::Other),
+                Err(WatchCursorError::Expired) => Ok(NodeHeartbeatEvent::ReplayExpired),
+                Err(WatchCursorError::Closed) => {
+                    anyhow::bail!("Node heartbeat watch signal channel closed")
+                }
+                Err(WatchCursorError::Replay(error)) => Err(error),
+            }
+        })
     }
 }
 pub struct RootPodEventSink {
@@ -407,6 +464,58 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
         crate::pod_events::emit_pod_event_with_outbox(
             self.datastore.as_ref(),
             self.outbox.as_deref(),
+            crate::pod_events::PodEventRecord {
+                pod: &pod,
+                reason,
+                message,
+                event_type,
+                reporting_component,
+                reporting_instance: node_name,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+pub struct WorkerPodEventSink {
+    outbox: Arc<crate::node_outbox::Outbox>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+}
+
+impl WorkerPodEventSink {
+    pub fn new(
+        outbox: Arc<crate::node_outbox::Outbox>,
+        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ) -> Self {
+        Self {
+            outbox,
+            resource_query,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
+    async fn emit_pod_event(
+        &self,
+        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+        event_type: &str,
+        reason: &str,
+        message: &str,
+        reporting_component: &str,
+        node_name: &str,
+    ) -> anyhow::Result<()> {
+        let pod = serde_json::json!({
+            "metadata": {
+                "namespace": key.namespace,
+                "name": key.name,
+                "uid": key.uid,
+            },
+        });
+        crate::pod_events::emit_worker_pod_event(
+            self.resource_query.as_ref(),
+            self.outbox.as_ref(),
             crate::pod_events::PodEventRecord {
                 pod: &pod,
                 reason,

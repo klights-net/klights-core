@@ -264,7 +264,7 @@ impl ContainerdManager {
     async fn write_cni_config(
         file_process: &klights_supervisor::FileProcessExecutor,
         cni_conf_dir: &str,
-        namespace: &str,
+        cni_rpc_socket: &Path,
         bridge_name: &str,
         pod_subnet: &str,
         pod_link_mtu: u32,
@@ -288,7 +288,7 @@ impl ContainerdManager {
             "bridge": bridge_name,
             "subnet": pod_subnet,
             "mtu": pod_link_mtu,
-            "rpcSocket": crate::cni_plugin::rpc_socket_path(namespace)
+            "rpcSocket": cni_rpc_socket
         });
 
         let config_json =
@@ -498,7 +498,7 @@ state = "{state_dir}"
         Self::write_cni_config(
             &file_process,
             &cni_conf_dir,
-            namespace,
+            &paths.cni_rpc_socket(),
             bridge_name,
             pod_subnet,
             pod_link_mtu,
@@ -1861,7 +1861,7 @@ mod tests {
         ContainerdManager::write_cni_config(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             &cni_dir,
-            "klights-test",
+            &crate::paths::cni_rpc_socket_path("klights-test"),
             "klights-test",
             "10.43.0.0/24",
             crate::networking::wireguard::WIREGUARD_MTU,

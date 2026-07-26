@@ -24,7 +24,7 @@ use tokio::sync::watch;
 
 use crate::bootstrap::sequenced_datastore::WriteRejection;
 use crate::control_plane::client::{
-    LeaderApiClient, focused_dataplane, focused_node_subnet, query_error, query_list_result,
+    focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::cluster_store_adapter::{
@@ -1210,8 +1210,6 @@ impl LeaderNetworkTopologyCommand for LocalApiClient {
 }
 
 #[async_trait]
-impl LeaderApiClient for LocalApiClient {}
-
 impl LeaderOutboxDelivery for LocalApiClient {
     fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
         Box::pin(self.deliver_outbox_as(request, &self.authoring_node))

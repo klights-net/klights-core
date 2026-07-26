@@ -186,8 +186,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             config.node_name.clone(),
         ),
     );
-    let cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
-        remote_api_client.clone();
+    let leader_ports =
+        crate::control_plane::client::LeaderClientPorts::from_client(remote_api_client.clone());
 
     let nldb: Option<&std::path::Path> = if config.in_memory {
         None
@@ -237,7 +237,6 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     }
     let worker_store = start_worker_store_adapter(
         remote_api_client.clone(),
-        node_local.clone(),
         config.node_name.clone(),
         task_supervisor.clone(),
         shutdown_token.clone(),
@@ -251,7 +250,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         node_mode: &node_mode,
         node_ip: &node_ip,
-        cluster_api: cluster_api.clone(),
+        resource_query: leader_ports.resource_query.clone(),
+        watch: leader_ports.watch.clone(),
+        subnet_allocation: leader_ports.node_subnet_allocation.clone(),
+        network_topology: leader_ports.network_topology.clone(),
         node_local: node_local.clone(),
         network_cleanup: &network_cleanup,
         runtime_paths: &runtime_paths,
@@ -308,9 +310,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     )
     .await;
     let registration_health = dataplane_health.snapshot();
-    if let Err(e) = crate::bootstrap::node_registration_adapter::register_node_snapshot(
-        &*db,
-        Some(outbox.as_ref()),
+    if let Err(e) = crate::bootstrap::node_registration_adapter::register_worker_node_snapshot(
+        db.as_ref(),
+        outbox.as_ref(),
         Some(&registration_health),
         &registration,
     )
@@ -329,8 +331,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             )),
             crate::replication::grpc::client::NodeMetricsCapability::Available(
                 std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
-                    cri.clone(),
-                    task_supervisor.clone(),
+                    std::sync::Arc::new(crate::metrics::CriNodeMetricsSampler::new(
+                        cri.clone(),
+                        task_supervisor.clone(),
+                    )),
                 )),
             ),
         ),
@@ -417,7 +421,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             metrics.clone(),
             Some(services.clone()),
             Some(task_supervisor.clone()),
-            Some(db.clone()),
+            None,
         ));
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(128);
@@ -432,21 +436,16 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_parts = crate::pod_repository_composition::build_pod_repository_parts(
-        crate::pod_repository_composition::PodRepositoryBuildConfig {
-            db: db.clone(),
-            node_local: Some(node_local.clone()),
+    let pod_repository_parts = crate::pod_repository_composition::build_worker_pod_repository_parts(
+        crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+            resource_query: leader_ports.resource_query.clone(),
+            node_local: node_local.clone(),
             supervisor: task_supervisor.clone(),
-            side_effects: side_effects.clone(),
             metrics: metrics.clone(),
             pod_network_cache,
             assignment_waiter,
-            scheduling_mode:
-                crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
-            outbox: Some(outbox.clone()),
-            cluster_api: Some(cluster_api.clone()),
+            outbox: outbox.clone(),
         },
-        None,
     );
     let kubelet_capacity =
         crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
@@ -463,10 +462,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         services.clone(),
     );
     let kubelet_status_delivery = crate::kubelet::context::KubeletStatusDeliveryServices::new(
-        cluster_api.clone(),
-        cluster_api.clone(),
-        cluster_api.clone(),
-        cluster_api.clone(),
+        leader_ports.resource_query.clone(),
+        leader_ports.cache_readiness.clone(),
+        leader_ports.pod_cleanup_intents.clone(),
+        leader_ports.projected_tokens.clone(),
         outbox.clone(),
     );
     let pod_slot_adapter =
@@ -512,9 +511,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 ),
             ),
             event_sink: std::sync::Arc::new(
-                crate::bootstrap::kubelet_ports::RootPodEventSink::new(
-                    Some(outbox.clone()),
-                    db.clone(),
+                crate::bootstrap::kubelet_ports::WorkerPodEventSink::new(
+                    outbox.clone(),
+                    leader_ports.resource_query.clone(),
                 ),
             ),
         },
@@ -620,6 +619,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                     kubelet::node::run_heartbeat_with_lease_client(
                         watch_source,
                         lease_client,
+                        std::sync::Arc::new(
+                            crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock,
+                        ),
                         cfc.node_name.clone(),
                         c,
                         s,

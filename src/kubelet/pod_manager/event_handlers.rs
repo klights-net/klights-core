@@ -713,7 +713,7 @@ mod tests {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> (
         Arc<crate::kubelet::pod_repository::PodRepository>,
-        crate::datastore::node_local::NodeLocalHandle,
+        crate::datastore::node_local::KubeletTestStoreHandle,
     ) {
         let node_local =
             crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;

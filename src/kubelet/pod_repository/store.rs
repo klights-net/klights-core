@@ -133,9 +133,13 @@ pub(crate) trait PodPersistence: Send + Sync {
     ) -> Result<PodDeleteCasOutcome>;
     fn log_status_noop(&self, namespace: &str, name: &str, resource: &Resource);
     #[cfg(test)]
-    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<WatchEvent>;
+    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
+        panic!("watch subscription is unavailable for this persistence adapter")
+    }
     #[cfg(test)]
-    fn legacy_db(&self) -> DatastoreHandle;
+    fn legacy_db(&self) -> DatastoreHandle {
+        panic!("legacy datastore access is unavailable for this persistence adapter")
+    }
 }
 
 pub struct PodStore {

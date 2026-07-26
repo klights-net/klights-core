@@ -55,7 +55,7 @@ pub struct OpenLeaderArgs<'a> {
 
 pub struct DatastorePhase {
     pub db_handle: DatastoreHandle,
-    pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    pub leader_ports: crate::control_plane::client::LeaderClientPorts,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     /// The concrete leader-side LocalApiClient that the outbox dispatcher
     /// uses as its apply client. Must be reused (not re-created) by later
@@ -88,7 +88,7 @@ pub struct DatastorePhase {
 }
 
 struct RemoteForwarderParts {
-    forwarder: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    leader_ports: crate::control_plane::client::LeaderClientPorts,
     resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     outbox_deliveries: Arc<dyn klights_leader_api::LeaderOutboxDelivery>,
     node_lease_renewals: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
@@ -220,7 +220,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // (quorum = 1). Workers do not enter this composition path and route
     // writes through the outbox/leader proxy.
     let member_feature_probe;
-    let (raft_node, db_handle, local_api_client, leader_proxy, cluster_api) = match (
+    let (raft_node, db_handle, local_api_client, leader_proxy, leader_ports) = match (
         role,
         leader_node_local.as_ref(),
     ) {
@@ -386,8 +386,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             );
             let leader_proxy = Arc::new(
                 crate::control_plane::client::leader_proxy::LeaderProxyApiClient::new(
-                    local_api_client.clone(),
-                    remote_parts.forwarder.clone(),
+                    crate::control_plane::client::LeaderClientPorts::from_client(
+                        local_api_client.clone(),
+                    ),
+                    remote_parts.leader_ports.clone(),
                     is_leader_rx.clone(),
                 )
                 .with_resource_command_targets(
@@ -403,8 +405,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     remote_parts.node_lease_renewals.clone(),
                 ),
             );
-            let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> =
-                leader_proxy.clone();
+            let leader_ports =
+                crate::control_plane::client::LeaderClientPorts::from_client(leader_proxy.clone());
             // Seed branch: no --leader on Controlplane (or any
             // seed Leader boot) bootstraps as the sole voter.
             // Joining controlplane (--leader non-empty) skips this and
@@ -608,7 +610,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     crate::bootstrap::credential_store::SupervisedBootstrapCredentialStore::new(
                         join_supervisor.clone(),
                     );
-                let join_cluster_api = cluster_api.clone();
+                let join_resource_query = leader_ports.resource_query.clone();
                 let join_resource_commands = leader_proxy.clone();
                 supervisor
                     .spawn_delay(
@@ -738,7 +740,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         }
                                         if let Err(err) =
                                             crate::kubelet::node::refresh_current_git_commit_annotation_via_leader(
-                                                join_cluster_api.as_ref(),
+                                                join_resource_query.as_ref(),
                                                 join_resource_commands.as_ref(),
                                                 &node_name,
                                             )
@@ -808,7 +810,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 db_handle,
                 local_api_client,
                 leader_proxy,
-                cluster_api,
+                leader_ports,
             )
         }
         _ => {
@@ -936,7 +938,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     Ok(DatastorePhase {
         db_handle,
-        cluster_api,
+        leader_ports,
         remote_api_client: remote_parts.remote_api_client,
         local_api_client,
         replication_service,
@@ -996,7 +998,9 @@ fn build_remote_forwarder(
             // remote forwarding target is available in this role.
             let stub = Arc::new(StubRemoteForwarder::new(config.node_name.clone()));
             return RemoteForwarderParts {
-                forwarder: stub.clone(),
+                leader_ports: crate::control_plane::client::LeaderClientPorts::from_client(
+                    stub.clone(),
+                ),
                 resource_commands: stub.clone(),
                 outbox_deliveries: stub.clone(),
                 node_lease_renewals: stub,
@@ -1044,7 +1048,7 @@ fn build_remote_forwarder(
         config.node_name.clone(),
     ));
     RemoteForwarderParts {
-        forwarder: remote.clone(),
+        leader_ports: crate::control_plane::client::LeaderClientPorts::from_client(remote.clone()),
         resource_commands: remote.clone(),
         outbox_deliveries: remote.clone(),
         node_lease_renewals: remote.clone(),
@@ -1630,16 +1634,16 @@ mod tests {
             skip_ca: false,
             as_learner: false,
         };
-        let _: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
-            super::build_remote_forwarder(
-                &test_config(),
-                &role,
-                test_supervisor(),
-                super::ControlplaneJoinClientIdentity::default(),
-                test_dataplane(),
-                test_transport_policy(),
-            )
-            .forwarder;
+        let ports = super::build_remote_forwarder(
+            &test_config(),
+            &role,
+            test_supervisor(),
+            super::ControlplaneJoinClientIdentity::default(),
+            test_dataplane(),
+            test_transport_policy(),
+        )
+        .leader_ports;
+        let _: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> = ports.resource_query;
     }
 
     #[test]

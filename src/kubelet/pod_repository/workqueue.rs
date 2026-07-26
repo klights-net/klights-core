@@ -113,7 +113,7 @@ fn legacy_entry(row: PodWorkqueueEntry) -> LegacyPodWorkqueueEntry {
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl PodWorkqueuePersistence for crate::datastore::node_local::NodeLocalHandle {
+impl PodWorkqueuePersistence for crate::datastore::node_local::KubeletTestStoreHandle {
     async fn enqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -1186,7 +1186,7 @@ mod tests {
     async fn test_workqueue() -> (
         Arc<PodWorkqueue>,
         crate::datastore::DatastoreHandle,
-        crate::datastore::node_local::NodeLocalHandle,
+        crate::datastore::node_local::KubeletTestStoreHandle,
     ) {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
@@ -1209,7 +1209,7 @@ mod tests {
     async fn test_non_leader_workqueue() -> (
         Arc<PodWorkqueue>,
         crate::datastore::DatastoreHandle,
-        crate::datastore::node_local::NodeLocalHandle,
+        crate::datastore::node_local::KubeletTestStoreHandle,
     ) {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));

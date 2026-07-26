@@ -1,10 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_creation_state::PodStartRetryTracker;
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::kubelet::pod_repository::PodRepository;
-use crate::node_outbox::Outbox;
 use klights_supervisor::{FileProcessExecutor, TaskSupervisor};
 
 pub(crate) type PodLifecycleReceiver = Arc<

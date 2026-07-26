@@ -71,12 +71,12 @@ fn resource_list_from_leader(result: klights_leader_api::ResourceListResult) -> 
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
-    node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
+    node_local: Option<crate::datastore::node_local::KubeletTestStoreHandle>,
 }
 
 #[cfg(test)]
 pub(crate) fn test_pod_network_cache(
-    node_local: crate::datastore::node_local::NodeLocalHandle,
+    node_local: crate::datastore::node_local::KubeletTestStoreHandle,
 ) -> Arc<dyn klights_node_store::PodNetworkCache> {
     Arc::new(TestDatastorePodNetworkCache {
         node_local: Some(node_local),
@@ -97,7 +97,7 @@ pub(crate) fn test_assignment_bus()
 #[cfg(test)]
 pub(crate) async fn test_node_local_store(
     supervisor: Arc<TaskSupervisor>,
-) -> crate::datastore::node_local::NodeLocalHandle {
+) -> crate::datastore::node_local::KubeletTestStoreHandle {
     crate::datastore::node_local::selector::open_node_local(
         crate::datastore::backend_kind::BackendKind::Sqlite,
         None,
@@ -388,7 +388,7 @@ pub(crate) struct PodRepositoryNetworkDependencies {
 }
 
 pub(crate) struct PodRepositoryDeliveryDependencies {
-    pub outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
 }
 
@@ -403,7 +403,7 @@ pub(crate) struct PodRepositoryAdapters {
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     #[cfg(test)]
-    pub api_for_test: Arc<crate::pod_api_service::PodApiService>,
+    pub api_for_test: Option<Arc<crate::pod_api_service::PodApiService>>,
 }
 
 pub(crate) trait PodRepositoryAdapterFactory: Send + Sync {
@@ -799,13 +799,13 @@ pub struct PodRepository {
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     supervisor: Arc<TaskSupervisor>,
-    outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: crate::kubelet::context::HostIpState,
     #[cfg(test)]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
     #[cfg(test)]
-    api_for_test: Arc<crate::pod_api_service::PodApiService>,
+    api_for_test: Option<Arc<crate::pod_api_service::PodApiService>>,
 }
 
 impl PodRepository {
@@ -836,7 +836,7 @@ struct PodDeletionFinalizerDependencies {
     pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
-    outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     supervisor: Arc<TaskSupervisor>,
@@ -979,7 +979,7 @@ impl PodRepository {
         self.host_ip.clone()
     }
 
-    pub fn outbox(&self) -> Option<&crate::node_outbox::Outbox> {
+    pub fn outbox(&self) -> Option<&crate::kubelet::outbox::Outbox> {
         self.outbox.as_deref()
     }
 
@@ -1008,7 +1008,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<crate::TestNodeOutbox>>,
     ) -> Self {
         let network_cache = empty_test_pod_network_cache();
         let assignment_bus = test_assignment_bus();
@@ -1031,7 +1031,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<crate::TestNodeOutbox>>,
         cluster_api: Arc<dyn LeaderResourceQuery>,
     ) -> Self {
         let pod_network_cache = empty_test_pod_network_cache();
@@ -1059,7 +1059,7 @@ impl PodRepository {
         pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
         assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        outbox: Option<Arc<crate::TestNodeOutbox>>,
     ) -> Self {
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
@@ -1373,7 +1373,10 @@ impl PodRepository {
         &self,
         gate: Arc<crate::pod_api_service::SchedulerBindGateForTest>,
     ) {
-        self.api_for_test.set_scheduler_bind_gate_for_test(gate);
+        self.api_for_test
+            .as_ref()
+            .expect("scheduler bind gate requires root Pod API adapter")
+            .set_scheduler_bind_gate_for_test(gate);
     }
 
     /// Enqueue the owning Job for asynchronous reconciliation after a pod

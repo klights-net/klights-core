@@ -48,7 +48,7 @@ pub async fn emit_pod_event(
     let node_db = test_node_db().await?;
     let outbox = Outbox::new(node_db.clone());
     let event = emit_pod_event_impl(
-        ds,
+        PodEventQuery::Datastore(ds),
         PodEventPersistence::NodeOutbox(Some(&outbox)),
         PodEventRecord {
             pod,
@@ -121,7 +121,25 @@ pub async fn emit_pod_event_with_outbox(
     outbox: Option<&Outbox>,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
-    emit_pod_event_impl(ds, PodEventPersistence::NodeOutbox(outbox), record).await
+    emit_pod_event_impl(
+        PodEventQuery::Datastore(ds),
+        PodEventPersistence::NodeOutbox(outbox),
+        record,
+    )
+    .await
+}
+
+pub(crate) async fn emit_worker_pod_event(
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
+    outbox: &Outbox,
+    record: PodEventRecord<'_>,
+) -> Result<Value> {
+    emit_pod_event_impl(
+        PodEventQuery::Leader(resource_query),
+        PodEventPersistence::NodeOutbox(Some(outbox)),
+        record,
+    )
+    .await
 }
 
 /// Persist an Event authored by a leader-owned control-plane component.
@@ -134,12 +152,94 @@ pub(crate) async fn emit_control_plane_pod_event(
     ds: &dyn DatastoreBackend,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
-    emit_pod_event_impl(ds, PodEventPersistence::LeaderStore, record).await
+    emit_pod_event_impl(
+        PodEventQuery::Datastore(ds),
+        PodEventPersistence::LeaderStore(ds),
+        record,
+    )
+    .await
 }
 
 enum PodEventPersistence<'a> {
     NodeOutbox(Option<&'a Outbox>),
-    LeaderStore,
+    LeaderStore(&'a dyn DatastoreBackend),
+}
+
+enum PodEventQuery<'a> {
+    Datastore(&'a dyn DatastoreBackend),
+    Leader(&'a dyn klights_leader_api::LeaderResourceQuery),
+}
+
+impl PodEventQuery<'_> {
+    async fn namespace_eligibility(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<crate::namespace_admission::NamespaceCreateEligibility> {
+        let resource = match self {
+            Self::Datastore(ds) => {
+                return crate::namespace_admission::create_eligibility(*ds, namespace).await;
+            }
+            Self::Leader(query) => query
+                .get_resource(klights_leader_api::ResourceGetRequest::try_new(
+                    klights_types::ResourceKey::new("v1", "Namespace", None, namespace),
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                )?)
+                .await
+                .map_err(anyhow::Error::new)?,
+        };
+        let Some(resource) = resource else {
+            return Ok(if crate::namespace_admission::is_protected(namespace) {
+                crate::namespace_admission::NamespaceCreateEligibility::Allowed
+            } else {
+                crate::namespace_admission::NamespaceCreateEligibility::Missing
+            });
+        };
+        Ok(
+            if resource
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                crate::namespace_admission::NamespaceCreateEligibility::Terminating
+            } else {
+                crate::namespace_admission::NamespaceCreateEligibility::Allowed
+            },
+        )
+    }
+
+    async fn list_events(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+        match self {
+            Self::Datastore(ds) => Ok(ds
+                .list_resources(
+                    "v1",
+                    "Event",
+                    Some(namespace),
+                    crate::datastore::ResourceListQuery::all(),
+                )
+                .await?
+                .items),
+            Self::Leader(query) => {
+                let result = query
+                    .list_resources(klights_leader_api::ResourceListRequest::try_new(
+                        "v1",
+                        "Event",
+                        Some(namespace.to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                    )?)
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                Ok(result.into_parts().0)
+            }
+        }
+    }
 }
 
 /// Outcome of the namespace preflight before emitting a pod event.
@@ -175,7 +275,7 @@ fn classify_namespace_preflight(
 }
 
 async fn emit_pod_event_impl(
-    ds: &dyn DatastoreBackend,
+    query: PodEventQuery<'_>,
     persistence: PodEventPersistence<'_>,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
@@ -202,7 +302,7 @@ async fn emit_pod_event_impl(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Pod missing metadata.uid"))?;
 
-    let preflight = crate::namespace_admission::create_eligibility(ds, namespace).await;
+    let preflight = query.namespace_eligibility(namespace).await;
     if let Err(err) = &preflight {
         // Fail open: do not drop the event on a transport/DB error. The leader
         // re-validates the namespace when it applies the EventCreate.
@@ -238,15 +338,8 @@ async fn emit_pod_event_impl(
     // same pod while assignment is unchanged. Avoid unbounded duplicate Scheduled
     // events for the same pod+message+source tuple.
     if reason == "Scheduled" {
-        let existing = ds
-            .list_resources(
-                "v1",
-                "Event",
-                Some(namespace),
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        let duplicate = existing.items.iter().any(|res| {
+        let existing = query.list_events(namespace).await?;
+        let duplicate = existing.iter().any(|res| {
             let data = &res.data;
             data.pointer("/involvedObject/uid")
                 .and_then(|v| v.as_str())
@@ -325,7 +418,7 @@ async fn emit_pod_event_impl(
                 })
                 .await?;
         }
-        PodEventPersistence::LeaderStore => {
+        PodEventPersistence::LeaderStore(ds) => {
             ds.create_resource("v1", "Event", Some(namespace), &event_name, event.clone())
                 .await?;
         }

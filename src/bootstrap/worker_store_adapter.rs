@@ -2,7 +2,6 @@ use anyhow::Context;
 
 pub(crate) async fn start_worker_store_adapter(
     remote_api_client: std::sync::Arc<crate::control_plane::client::remote::RemoteApiClient>,
-    node_local: crate::datastore::node_local::NodeLocalHandle,
     node_name: String,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
@@ -12,17 +11,19 @@ pub(crate) async fn start_worker_store_adapter(
     initial_leader_endpoints: Vec<String>,
 ) -> anyhow::Result<std::sync::Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>
 {
-    let cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
-        remote_api_client.clone();
     remote_api_client
         .start_required_worker_informers(shutdown_token.clone())
         .await
         .context("worker informers")?;
 
     let worker_store = std::sync::Arc::new(
-        crate::control_plane::client::worker_store::WorkerStoreAdapter::new(
-            cluster_api,
-            node_local,
+        crate::control_plane::client::worker_store::WorkerStoreAdapter::from_ports(
+            remote_api_client.clone(),
+            remote_api_client.clone(),
+            remote_api_client.clone(),
+            remote_api_client.clone(),
+            remote_api_client,
+            std::sync::Arc::new(crate::control_plane::client::worker_store::WorkerWatchBus::new()),
             node_name,
         ),
     );
@@ -56,12 +57,14 @@ pub(crate) async fn start_worker_store_adapter(
                                 continue;
                             }
                         };
-                        let nodes = match crate::datastore::DatastoreBackend::list_resources(
+                        let nodes = match <crate::control_plane::client::worker_store::WorkerStoreAdapter as crate::datastore::ResourceListStore>::list_resources_page(
                             discovery_store.as_ref(),
                             "v1",
                             "Node",
                             None,
-                            crate::datastore::ResourceListQuery::all(),
+                            None,
+                            None,
+                            crate::datastore::ListPageRequest::unbounded(),
                         )
                         .await
                         {

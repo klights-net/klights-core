@@ -1,7 +1,7 @@
-use crate::node_outbox::payload::OutboxOperation;
 #[cfg(test)]
-use crate::node_outbox::payload::OutboxPayload;
-use crate::node_outbox::{
+use crate::TestNodeOutboxPayload as OutboxPayload;
+use crate::kubelet::outbox::OutboxOperation;
+use crate::kubelet::outbox::{
     Outbox, OutboxCommand, OutboxSendPlanner, OutboxSendRoute, OutboxSubject,
 };
 #[cfg(test)]
@@ -10,6 +10,7 @@ use anyhow::Result;
 use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::StorageCommand;
 
+pub use crate::kubelet::node_heartbeat::run_heartbeat_with_lease_client;
 pub(crate) use crate::kubelet::node_leader_labels::clear_leader_label_from_other_nodes;
 pub(crate) use crate::kubelet::node_registration::{
     NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
@@ -32,7 +33,6 @@ pub use crate::kubelet::node_status_projection::{
     set_node_dataplane_annotations, set_node_external_ip_from_dataplane_annotation,
     set_node_pod_cidr,
 };
-pub use crate::node_heartbeat::run_heartbeat_with_lease_client;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeCapacity {
@@ -140,7 +140,7 @@ impl klights_leader_api::LeaderNodeSelfStatus for OutboxNodeSelfStatusPublisher 
             let node_uid = request.node_uid().to_string();
             let command = request.into_command();
             self.outbox
-                .enqueue_command(OutboxCommand {
+                .enqueue(OutboxCommand {
                     idempotency_key: format!(
                         "NodeStatus:v1/Node/{}/{}:{}",
                         self.node_name,
@@ -406,10 +406,10 @@ fn epoch_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
-    use crate::networking::dataplane_health::DataplaneHealth;
-    use crate::node_heartbeat::{
+    use crate::kubelet::node_heartbeat::{
         NODE_HEARTBEAT_INTERVAL, build_lease, run_heartbeat_with_interval,
     };
+    use crate::networking::dataplane_health::DataplaneHealth;
     use crate::utils::k8s_time_now;
     use std::sync::{Arc as StdArc, Mutex};
     use std::time::Duration;
@@ -1186,7 +1186,7 @@ mod tests {
                 "172.31.50.2".to_string(),
                 Some("192.0.2.50".to_string()),
             ),
-            raft_shape: Some(crate::datastore::raft::types::RaftShape {
+            raft_shape: Some(klights_cluster_core::RaftShape {
                 voter_count: 2,
                 is_leader: false,
                 is_learner: false,
@@ -1910,6 +1910,14 @@ mod tests {
         }
     }
 
+    struct FixedHeartbeatClock;
+
+    impl crate::kubelet::node_heartbeat::NodeHeartbeatClock for FixedHeartbeatClock {
+        fn now_microtime(&self) -> String {
+            "2026-07-27T00:00:00.000000Z".to_string()
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_heartbeat_with_interval_never_writes_lease_to_db() {
         // T6: the production heartbeat is memory-only. It renews via the lease
@@ -1926,6 +1934,7 @@ mod tests {
         let handle = tokio::spawn(run_heartbeat_with_interval(
             watch_source,
             client.clone(),
+            std::sync::Arc::new(FixedHeartbeatClock),
             "test-node".to_string(),
             cancel.clone(),
             std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -1989,7 +1998,7 @@ mod tests {
         )
         .await
         .expect("open node-local db");
-        let outbox = std::sync::Arc::new(Outbox::new(node_local.clone()));
+        let outbox = std::sync::Arc::new(crate::TestNodeOutbox::new(node_local.clone()));
         let publisher = OutboxNodeSelfStatusPublisher::new("worker-a", leader_query, outbox);
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -2059,7 +2068,7 @@ mod tests {
         let publisher = OutboxNodeSelfStatusPublisher::new(
             "worker-a",
             leader_query,
-            std::sync::Arc::new(Outbox::new(node_local.clone())),
+            std::sync::Arc::new(crate::TestNodeOutbox::new(node_local.clone())),
         );
         let request =
             klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {

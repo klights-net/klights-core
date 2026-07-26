@@ -11,11 +11,11 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::kubelet::context::HostIpState;
+use crate::kubelet::outbox::OutboxOperation;
+use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
-use crate::node_outbox::payload::OutboxOperation;
-use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_cluster_core::Resource;
 use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
@@ -325,7 +325,7 @@ impl PodStatusService {
             );
             if let Some(outbox) = &self.outbox {
                 outbox
-                    .record_pod_status_checkpoint(pod_resource, status, now_ms())
+                    .record_pod_status_checkpoint(&synthetic, now_ms())
                     .await?;
                 tracing::info!(
                     target: "klights::pod_status::trace",

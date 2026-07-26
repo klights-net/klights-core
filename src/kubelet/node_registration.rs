@@ -1,7 +1,7 @@
 use crate::kubelet::node;
 use crate::kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
-use crate::node_outbox::payload::OutboxOperation;
-use crate::node_outbox::{Outbox, OutboxSendRoute};
+use crate::kubelet::outbox::OutboxOperation;
+use crate::kubelet::outbox::{Outbox, OutboxSendRoute};
 use crate::utils::k8s_time_now;
 use anyhow::{Context, Result};
 use klights_cluster_core::ResourcePreconditions;
@@ -381,7 +381,7 @@ pub(crate) async fn register_node(
 pub(crate) async fn register_node_with_outbox(
     file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn crate::datastore::DatastoreBackend,
-    outbox: &Outbox,
+    outbox: &crate::TestNodeOutbox,
     node_name: &str,
     profile: &NodeRegistrationProfile,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,

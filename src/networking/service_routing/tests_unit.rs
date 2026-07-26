@@ -983,9 +983,6 @@ impl klights_leader_api::LeaderCacheReadiness for FreshServiceInventoryClient {
 
 crate::control_plane::client::impl_unavailable_leader_pod_effects!(FreshServiceInventoryClient);
 
-#[async_trait::async_trait]
-impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClient {}
-
 #[tokio::test]
 async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {
     let api = FreshServiceInventoryClient::default();
