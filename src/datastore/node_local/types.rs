@@ -56,6 +56,36 @@ impl std::fmt::Display for PodNetworkReservationError {
 
 impl std::error::Error for PodNetworkReservationError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodRuntimeOwnershipError {
+    Conflict {
+        pod_uid: String,
+        existing_namespace: String,
+        existing_pod_name: String,
+        existing_node_name: String,
+        existing_sandbox_id: Option<String>,
+    },
+    Persistence {
+        message: String,
+    },
+}
+
+impl std::fmt::Display for PodRuntimeOwnershipError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict { pod_uid, .. } => {
+                write!(
+                    formatter,
+                    "pod runtime ownership conflict for UID {pod_uid}"
+                )
+            }
+            Self::Persistence { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PodRuntimeOwnershipError {}
+
 /// Durable result of recording one leased outbox delivery failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutboxFailureDisposition {

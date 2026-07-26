@@ -125,7 +125,8 @@ pub trait NodeLocalBackend: Send + Sync {
         pod_name: &str,
         node_name: &str,
         sandbox_id: &str,
-    ) -> Result<()>;
+        created_ms: i64,
+    ) -> std::result::Result<(), super::PodRuntimeOwnershipError>;
     async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()>;
     async fn delete_pod_runtime_for_uid(&self, pod_uid: &str) -> Result<()>;
     async fn get_pod_runtime(&self, pod_uid: &str) -> Result<Option<PodRuntimeRow>>;
@@ -446,9 +447,10 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         pod_name: &str,
         node_name: &str,
         sandbox_id: &str,
-    ) -> Result<()> {
+        created_ms: i64,
+    ) -> std::result::Result<(), super::PodRuntimeOwnershipError> {
         SqliteNodeLocalDb::record_owned_sandbox(
-            self, pod_uid, namespace, pod_name, node_name, sandbox_id,
+            self, pod_uid, namespace, pod_name, node_name, sandbox_id, created_ms,
         )
         .await
     }

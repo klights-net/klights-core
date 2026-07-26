@@ -1644,6 +1644,97 @@ async fn duplicate_pod_create_preserves_already_exists_for_json_and_protobuf_rou
 }
 
 #[tokio::test]
+async fn duplicate_generated_resource_create_preserves_already_exists_across_scope_and_format() {
+    use prost::Message as _;
+
+    let resources = [
+        (
+            "rolebinding",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings",
+            json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "duplicate-rolebinding", "namespace": "default"},
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": "reader"
+                },
+                "subjects": []
+            }),
+        ),
+        (
+            "runtimeclass",
+            "/apis/node.k8s.io/v1/runtimeclasses",
+            json!({
+                "apiVersion": "node.k8s.io/v1",
+                "kind": "RuntimeClass",
+                "metadata": {"name": "duplicate-runtimeclass"},
+                "handler": "runc"
+            }),
+        ),
+    ];
+    let formats = [
+        ("json", "application/json"),
+        ("protobuf", "application/vnd.kubernetes.protobuf"),
+    ];
+
+    for (resource_name, uri, resource) in resources {
+        for (format_name, content_type) in formats {
+            let state = build_test_app_state().await;
+            let app = crate::api::build_router(state);
+            let body = if format_name == "json" {
+                serde_json::to_vec(&resource).unwrap()
+            } else {
+                klights_kube_protobuf::encode_protobuf(&resource).unwrap()
+            };
+            let send = || {
+                app.clone().oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", content_type)
+                        .header("accept", content_type)
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+            };
+
+            assert_eq!(
+                send().await.unwrap().status(),
+                StatusCode::CREATED,
+                "{resource_name}/{format_name} initial create"
+            );
+            let duplicate = send().await.unwrap();
+            assert_eq!(
+                duplicate.status(),
+                StatusCode::CONFLICT,
+                "{resource_name}/{format_name} duplicate create"
+            );
+            let bytes = to_bytes(duplicate.into_body(), usize::MAX).await.unwrap();
+            let reason = if format_name == "protobuf" {
+                let envelope = klights_kube_protobuf::Unknown::decode(&bytes[4..]).unwrap();
+                klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::Status::decode(
+                    &*envelope.raw,
+                )
+                .unwrap()
+                .reason
+                .unwrap_or_default()
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert_eq!(
+                reason, "AlreadyExists",
+                "{resource_name}/{format_name} must preserve Kubernetes AlreadyExists"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn mutation_update_bumps_generation_only_when_spec_changes_for_generated_and_crd_paths() {
     let state = build_test_app_state().await;
     let app = crate::api::build_router(state);

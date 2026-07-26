@@ -1,6 +1,6 @@
 use klights_node_store::{
-    DueTimeMs, ObservedPodVersion, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
-    PodRuntimeSandbox, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
+    DueTimeMs, ObservedPodVersion, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup,
+    PodRuntimeRecord, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
     PodSlotAdmissionRequest, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore,
     PodSlotClearResult, PodSlotEventSubscription, PodSlotMutationResult, PodWorkIdentity,
     PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueueStore, ProbeKey,
@@ -19,7 +19,7 @@ impl PodRuntimeStore for EmptyRuntimeWorkStore {
         Box::pin(async { Ok(()) })
     }
 
-    fn record_sandbox(&self, _sandbox: PodRuntimeSandbox) -> RuntimeWorkFuture<'_, ()> {
+    fn record_owned_sandbox(&self, _sandbox: OwnedPodSandbox) -> RuntimeWorkFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
 
@@ -155,10 +155,11 @@ fn runtime_values_preserve_uid_identity_sandbox_cgroup_and_timestamps() {
     assert_eq!(admission.pod(), &pod());
     assert_eq!(admission.node_name(), "node/raw");
 
-    let sandbox = PodRuntimeSandbox::try_new(pod(), "node/raw", "sandbox/raw").unwrap();
+    let sandbox = OwnedPodSandbox::try_new(pod(), "node/raw", "sandbox/raw", 41).unwrap();
     assert_eq!(sandbox.pod(), &pod());
     assert_eq!(sandbox.node_name(), "node/raw");
     assert_eq!(sandbox.sandbox_id(), "sandbox/raw");
+    assert_eq!(sandbox.created_ms(), 41);
 
     let cgroup = PodRuntimeCgroup::try_new("uid/raw", "/cgroup/raw").unwrap();
     assert_eq!(cgroup.pod_uid(), "uid/raw");
@@ -344,9 +345,21 @@ fn slot_values_preserve_uid_cas_observed_version_state_and_event_identity() {
 #[test]
 fn invalid_and_operational_errors_remain_distinct() {
     assert!(matches!(
-        PodRuntimeSandbox::try_new(PodIdentity::new("default", "pod", ""), "node", "sandbox"),
+        OwnedPodSandbox::try_new(
+            PodIdentity::new("default", "pod", ""),
+            "node",
+            "sandbox",
+            41,
+        ),
         Err(RuntimeWorkError::InvalidInput {
             field: "pod.uid",
+            ..
+        })
+    ));
+    assert!(matches!(
+        OwnedPodSandbox::try_new(pod(), "node", "sandbox", -1),
+        Err(RuntimeWorkError::InvalidInput {
+            field: "created_ms",
             ..
         })
     ));

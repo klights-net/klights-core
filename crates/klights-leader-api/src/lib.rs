@@ -363,6 +363,9 @@ pub enum ResourceCommandError {
     PodDeletionForbidden,
     NotLeader,
     Unauthorized,
+    AlreadyExists {
+        message: String,
+    },
     Conflict {
         message: String,
     },
@@ -428,7 +431,8 @@ impl fmt::Display for ResourceCommandError {
             Self::NotLeader => formatter.write_str("resource command target is not raft leader"),
             Self::Unauthorized => formatter
                 .write_str("resource command submission requires a control-plane node identity"),
-            Self::Conflict { message }
+            Self::AlreadyExists { message }
+            | Self::Conflict { message }
             | Self::NotFound { message }
             | Self::SubmissionFailed { message }
             | Self::CorruptResponse { message }

@@ -763,6 +763,7 @@ pub struct MockPodRuntimeStore {
     sandboxes: Mutex<std::collections::HashMap<(String, String, String), String>>,
     calls: Mutex<Vec<String>>,
     record_failure: Mutex<Option<String>>,
+    lookup_failure: Mutex<Option<String>>,
 }
 
 impl Default for MockPodRuntimeStore {
@@ -777,6 +778,7 @@ impl MockPodRuntimeStore {
             sandboxes: Mutex::new(std::collections::HashMap::new()),
             calls: Mutex::new(Vec::new()),
             record_failure: Mutex::new(None),
+            lookup_failure: Mutex::new(None),
         }
     }
 
@@ -790,6 +792,10 @@ impl MockPodRuntimeStore {
 
     pub fn fail_record_sandbox(&self, message: impl Into<String>) {
         *self.record_failure.lock().unwrap() = Some(message.into());
+    }
+
+    pub fn fail_sandbox_lookup(&self, message: impl Into<String>) {
+        *self.lookup_failure.lock().unwrap() = Some(message.into());
     }
 }
 
@@ -822,6 +828,9 @@ impl crate::kubelet::pod_runtime::store::PodRuntimeStore for MockPodRuntimeStore
             "get_sandbox_id:{}/{}/{}",
             key.namespace, key.name, key.uid
         ));
+        if let Some(message) = self.lookup_failure.lock().unwrap().clone() {
+            anyhow::bail!("{message}");
+        }
         Ok(self
             .sandboxes
             .lock()

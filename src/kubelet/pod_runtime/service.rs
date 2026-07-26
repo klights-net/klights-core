@@ -1152,15 +1152,10 @@ impl PodRuntimeService for RealPodRuntimeService {
         let sandbox_id = match self.store.get_sandbox_id(&key).await {
             Ok(Some(existing)) if !existing.trim().is_empty() => existing,
             Ok(_) => self.create_and_record_sandbox(&key, sandbox_config).await?,
-            Err(e) => {
-                tracing::warn!(
-                    namespace = key.namespace,
-                    name = key.name,
-                    uid = key.uid,
-                    "Failed to look up existing sandbox in store before pod start: {}",
-                    e
-                );
-                self.create_and_record_sandbox(&key, sandbox_config).await?
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read UID-qualified sandbox ownership before pod start: {error:#}"
+                ));
             }
         };
 

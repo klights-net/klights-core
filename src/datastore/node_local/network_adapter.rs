@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use klights_node_store::{
     CacheNetworkError, CacheNetworkFuture, EndpointDeleteOutcome, EndpointUpsertOutcome, NodeKey,
-    PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodEndpointStoreEvent,
+    OwnedPodSandbox, PodEndpointMode, PodEndpointRecord, PodEndpointStore, PodEndpointStoreEvent,
     PodEndpointStoreEventSource, PodEndpointStoreEventStream, PodEndpointStoreEventSubscription,
     PodIpamStore, PodNetworkAllocation, PodNetworkAllocationRequest, PodNetworkAssignmentSnapshot,
     PodNetworkCache, PodNetworkEndpoint, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
-    PodRuntimeSandbox, PodRuntimeStore, PodUidKey, RuntimeNamespace, RuntimePodUid,
-    RuntimeWorkError, RuntimeWorkFuture, SandboxKey,
+    PodRuntimeStore, PodUidKey, RuntimeNamespace, RuntimePodUid, RuntimeWorkError,
+    RuntimeWorkFuture, SandboxKey,
 };
 
 use super::NodeLocalHandle;
@@ -450,13 +450,37 @@ impl PodRuntimeStore for NodeLocalNetworkAdapter {
         })
     }
 
-    fn record_sandbox(&self, sandbox: PodRuntimeSandbox) -> RuntimeWorkFuture<'_, ()> {
+    fn record_owned_sandbox(&self, sandbox: OwnedPodSandbox) -> RuntimeWorkFuture<'_, ()> {
         Box::pin(async move {
-            let (pod, node_name, sandbox_id) = sandbox.into_parts();
+            let (pod, node_name, sandbox_id, created_ms) = sandbox.into_parts();
             self.backend
-                .record_owned_sandbox(&pod.uid, &pod.namespace, &pod.name, &node_name, &sandbox_id)
+                .record_owned_sandbox(
+                    &pod.uid,
+                    &pod.namespace,
+                    &pod.name,
+                    &node_name,
+                    &sandbox_id,
+                    created_ms,
+                )
                 .await
-                .map_err(runtime_error)
+                .map_err(|error| match error {
+                    super::PodRuntimeOwnershipError::Conflict {
+                        pod_uid,
+                        existing_namespace,
+                        existing_pod_name,
+                        existing_node_name,
+                        existing_sandbox_id,
+                    } => RuntimeWorkError::ownership_conflict(
+                        pod_uid,
+                        existing_namespace,
+                        existing_pod_name,
+                        existing_node_name,
+                        existing_sandbox_id,
+                    ),
+                    super::PodRuntimeOwnershipError::Persistence { message } => {
+                        RuntimeWorkError::persistence_failed(message)
+                    }
+                })
         })
     }
 
@@ -524,8 +548,9 @@ impl PodRuntimeStore for NodeLocalNetworkAdapter {
 #[cfg(test)]
 mod tests {
     use klights_node_store::{
-        CacheNetworkError, PodIpamStore, PodNetworkAllocationRequest, PodNetworkCache,
-        PodRuntimeAdmission, PodRuntimeSandbox, PodRuntimeStore, PodUidKey, SandboxKey,
+        CacheNetworkError, OwnedPodSandbox, PodIpamStore, PodNetworkAllocationRequest,
+        PodNetworkCache, PodRuntimeRecord, PodRuntimeStore, PodUidKey, RuntimePodUid,
+        RuntimeWorkError, SandboxKey,
     };
 
     use super::NodeLocalNetworkAdapter;
@@ -547,11 +572,9 @@ mod tests {
         let adapter = NodeLocalNetworkAdapter::new(backend);
         let pod = klights_types::PodIdentity::new("default", "pod-a", "uid-a");
         adapter
-            .admit_pod_runtime(PodRuntimeAdmission::try_new(pod.clone(), "node-a").unwrap())
-            .await
-            .unwrap();
-        adapter
-            .record_sandbox(PodRuntimeSandbox::try_new(pod.clone(), "node-a", "sandbox-a").unwrap())
+            .record_owned_sandbox(
+                OwnedPodSandbox::try_new(pod.clone(), "node-a", "sandbox-a", 123).unwrap(),
+            )
             .await
             .unwrap();
 
@@ -583,15 +606,52 @@ mod tests {
             .unwrap();
         assert_eq!(by_sandbox, by_uid);
         assert_eq!(by_uid.veth_host(), "veth-a");
+        let runtime_rows = adapter.list_pod_runtime().await.unwrap();
         assert_eq!(
-            adapter
-                .list_pod_runtime()
-                .await
-                .unwrap()
-                .first()
-                .and_then(|record| record.sandbox_id()),
+            runtime_rows.first().and_then(|record| record.sandbox_id()),
             Some("sandbox-a")
         );
+        assert_eq!(
+            runtime_rows.first().map(PodRuntimeRecord::created_ms),
+            Some(123)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_owned_sandbox_records_preserve_one_immutable_winner() {
+        let adapter = adapter_for_identity_test("sqlite:owned-sandbox-cas-test").await;
+        let pod = klights_types::PodIdentity::new("default", "pod-cas", "uid-cas");
+        let first = adapter.record_owned_sandbox(
+            OwnedPodSandbox::try_new(pod.clone(), "node-a", "sandbox-a", 101).unwrap(),
+        );
+        let second = adapter.record_owned_sandbox(
+            OwnedPodSandbox::try_new(pod, "node-a", "sandbox-b", 102).unwrap(),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one competing sandbox may establish UID ownership"
+        );
+        let conflict = first.err().or_else(|| second.err()).unwrap();
+        assert!(matches!(
+            conflict,
+            RuntimeWorkError::OwnershipConflict {
+                pod_uid,
+                existing_sandbox_id: Some(_),
+                ..
+            } if pod_uid == "uid-cas"
+        ));
+        let persisted = adapter
+            .get_pod_runtime(RuntimePodUid::try_new("uid-cas").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            persisted.sandbox_id(),
+            Some("sandbox-a" | "sandbox-b")
+        ));
     }
 
     async fn adapter_for_identity_test(

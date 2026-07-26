@@ -571,25 +571,63 @@ impl SqliteNodeLocalDb {
         pod_name: &str,
         node_name: &str,
         sandbox_id: &str,
-    ) -> Result<()> {
+        created_ms: i64,
+    ) -> std::result::Result<(), super::PodRuntimeOwnershipError> {
         let pod_uid = pod_uid.to_string();
+        let conflict_pod_uid = pod_uid.clone();
         let namespace = namespace.to_string();
         let pod_name = pod_name.to_string();
         let node_name = node_name.to_string();
         let sandbox_id = sandbox_id.to_string();
-        let now = now_ms();
-        self.db_call("node_local:pod_runtime_record_owned_sandbox", move |conn| {
-            let updated = conn.execute(
-                queries::POD_RUNTIME_RECORD_OWNED_SANDBOX,
-                rusqlite::params![pod_uid, namespace, pod_name, node_name, sandbox_id, now],
-            )?;
-            if updated != 1 {
-                return Err(rusqlite::Error::QueryReturnedNoRows.into());
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("pod_runtime record owned sandbox failed: {e}"))
+        let existing = self
+            .db_call("node_local:pod_runtime_record_owned_sandbox", move |conn| {
+                let tx = conn.transaction()?;
+                let updated = tx.execute(
+                    queries::POD_RUNTIME_RECORD_OWNED_SANDBOX,
+                    rusqlite::params![
+                        pod_uid, namespace, pod_name, node_name, sandbox_id, created_ms
+                    ],
+                )?;
+                if updated == 1 {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                let existing = tx
+                    .query_row(
+                        queries::POD_RUNTIME_OWNERSHIP_GET_UID,
+                        rusqlite::params![pod_uid],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                tx.commit()?;
+                Ok(existing)
+            })
+            .await
+            .map_err(|error| super::PodRuntimeOwnershipError::Persistence {
+                message: format!("pod_runtime record owned sandbox failed: {error}"),
+            })?;
+        match existing {
+            None => Ok(()),
+            Some((
+                existing_namespace,
+                existing_pod_name,
+                existing_node_name,
+                existing_sandbox_id,
+            )) => Err(super::PodRuntimeOwnershipError::Conflict {
+                pod_uid: conflict_pod_uid,
+                existing_namespace,
+                existing_pod_name,
+                existing_node_name,
+                existing_sandbox_id,
+            }),
+        }
     }
 
     pub async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()> {

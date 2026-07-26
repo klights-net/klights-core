@@ -476,6 +476,7 @@ impl RaftLogApplyOutcome {
             } => crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: Some(*resource_version),
                 error_message: None,
+                rejection_code: None,
                 public_resource_changed: true,
                 applied_mutation: resource
                     .clone()
@@ -488,6 +489,7 @@ impl RaftLogApplyOutcome {
             } => crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: Some(*resource_version),
                 error_message: None,
+                rejection_code: None,
                 public_resource_changed: false,
                 applied_mutation: None,
                 pod_endpoint_effect,
@@ -496,6 +498,24 @@ impl RaftLogApplyOutcome {
                 crate::datastore::raft::types::StorageCommandResult {
                     applied_rv: None,
                     error_message: Some(rejection.message().to_string()),
+                    rejection_code: Some(match rejection {
+                        klights_cluster_core::CommittedApplyRejection::AlreadyExists { .. } => {
+                            crate::datastore::raft::types::StorageCommandRejectionCode::AlreadyExists
+                        }
+                        klights_cluster_core::CommittedApplyRejection::NotFound { .. } => {
+                            crate::datastore::raft::types::StorageCommandRejectionCode::NotFound
+                        }
+                        klights_cluster_core::CommittedApplyRejection::UidConflict { .. }
+                        | klights_cluster_core::CommittedApplyRejection::ResourceVersionConflict {
+                            ..
+                        } => crate::datastore::raft::types::StorageCommandRejectionCode::Conflict,
+                        klights_cluster_core::CommittedApplyRejection::InvalidCommit { .. } => {
+                            crate::datastore::raft::types::StorageCommandRejectionCode::InvalidCommit
+                        }
+                        _ => {
+                            crate::datastore::raft::types::StorageCommandRejectionCode::InvalidCommit
+                        }
+                    }),
                     public_resource_changed: false,
                     applied_mutation: None,
                     pod_endpoint_effect,
@@ -1335,6 +1355,7 @@ fn storage_result_from_applied_outbox(
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
                 error_message: Some(message),
+                rejection_code: None,
                 public_resource_changed: false,
                 applied_mutation: None,
                 pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
@@ -1350,6 +1371,7 @@ fn storage_result_from_applied_outbox(
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
                 error_message: None,
+                rejection_code: None,
                 public_resource_changed: false,
                 applied_mutation: Some(crate::datastore::raft::types::AppliedMutation::Resource(
                     resource,
@@ -1360,6 +1382,7 @@ fn storage_result_from_applied_outbox(
         Ok(_) => Ok(crate::datastore::raft::types::StorageCommandResult {
             applied_rv: row.applied_rv,
             error_message: None,
+            rejection_code: None,
             public_resource_changed: false,
             applied_mutation: None,
             pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,

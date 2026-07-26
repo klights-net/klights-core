@@ -32,6 +32,14 @@ pub enum RuntimeWorkError {
         expected_uid: String,
         actual_uid: String,
     },
+    /// An immutable pod-runtime owner or sandbox already owns the UID row.
+    OwnershipConflict {
+        pod_uid: String,
+        existing_namespace: String,
+        existing_pod_name: String,
+        existing_node_name: String,
+        existing_sandbox_id: Option<String>,
+    },
     Timeout,
     Cancelled,
 }
@@ -62,6 +70,22 @@ impl RuntimeWorkError {
         }
     }
 
+    pub fn ownership_conflict(
+        pod_uid: impl Into<String>,
+        existing_namespace: impl Into<String>,
+        existing_pod_name: impl Into<String>,
+        existing_node_name: impl Into<String>,
+        existing_sandbox_id: Option<String>,
+    ) -> Self {
+        Self::OwnershipConflict {
+            pod_uid: pod_uid.into(),
+            existing_namespace: existing_namespace.into(),
+            existing_pod_name: existing_pod_name.into(),
+            existing_node_name: existing_node_name.into(),
+            existing_sandbox_id,
+        }
+    }
+
     fn invalid(field: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidInput {
             field,
@@ -85,6 +109,18 @@ impl fmt::Display for RuntimeWorkError {
             } => write!(
                 formatter,
                 "pod slot UID precondition failed: expected {expected_uid:?}, found {actual_uid:?}"
+            ),
+            Self::OwnershipConflict {
+                pod_uid,
+                existing_namespace,
+                existing_pod_name,
+                existing_node_name,
+                existing_sandbox_id,
+            } => write!(
+                formatter,
+                "pod runtime ownership conflict for UID {pod_uid:?}: existing owner \
+                 {existing_namespace}/{existing_pod_name} on {existing_node_name:?}, sandbox \
+                 {existing_sandbox_id:?}"
             ),
             Self::Timeout => formatter.write_str("node runtime/work persistence timed out"),
             Self::Cancelled => formatter.write_str("node runtime/work persistence was cancelled"),
@@ -211,27 +247,31 @@ impl PodRuntimeAdmission {
 
 /// UID-qualified runtime ownership and sandbox record.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PodRuntimeSandbox {
+pub struct OwnedPodSandbox {
     pod: PodIdentity,
     node_name: String,
     sandbox_id: String,
+    created_ms: i64,
 }
 
-impl PodRuntimeSandbox {
+impl OwnedPodSandbox {
     pub fn try_new(
         pod: PodIdentity,
         node_name: impl Into<String>,
         sandbox_id: impl Into<String>,
+        created_ms: i64,
     ) -> Result<Self, RuntimeWorkError> {
         let node_name = node_name.into();
         let sandbox_id = sandbox_id.into();
         validate_pod_identity(&pod)?;
         require_nonempty(&node_name, "node_name")?;
         require_nonempty(&sandbox_id, "sandbox_id")?;
+        require_nonnegative(created_ms, "created_ms")?;
         Ok(Self {
             pod,
             node_name,
             sandbox_id,
+            created_ms,
         })
     }
 
@@ -247,8 +287,12 @@ impl PodRuntimeSandbox {
         &self.sandbox_id
     }
 
-    pub fn into_parts(self) -> (PodIdentity, String, String) {
-        (self.pod, self.node_name, self.sandbox_id)
+    pub const fn created_ms(&self) -> i64 {
+        self.created_ms
+    }
+
+    pub fn into_parts(self) -> (PodIdentity, String, String, i64) {
+        (self.pod, self.node_name, self.sandbox_id, self.created_ms)
     }
 }
 
@@ -877,7 +921,7 @@ pub trait PodRuntimeStore: Send + Sync {
     /// Inserts by Pod UID or confirms the same immutable identity/node owner
     /// without resetting the original creation timestamp.
     fn admit_pod_runtime(&self, admission: PodRuntimeAdmission) -> RuntimeWorkFuture<'_, ()>;
-    fn record_sandbox(&self, sandbox: PodRuntimeSandbox) -> RuntimeWorkFuture<'_, ()>;
+    fn record_owned_sandbox(&self, sandbox: OwnedPodSandbox) -> RuntimeWorkFuture<'_, ()>;
     fn record_cgroup(&self, cgroup: PodRuntimeCgroup) -> RuntimeWorkFuture<'_, ()>;
     fn delete_pod_runtime_for_uid(&self, pod_uid: RuntimePodUid) -> RuntimeWorkFuture<'_, ()>;
     fn get_pod_runtime(

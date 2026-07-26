@@ -811,6 +811,7 @@ mod tests {
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: outcome.applied_resource_version(),
                 error_message: None,
+                rejection_code: None,
                 public_resource_changed: false,
                 applied_mutation: None,
                 pod_endpoint_effect: Default::default(),

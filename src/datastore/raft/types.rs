@@ -109,10 +109,24 @@ pub enum AppliedMutation {
     Resource(Resource),
 }
 
+/// Machine-readable reason for a terminal committed-apply rejection.
+///
+/// The message remains diagnostic text; callers must use this discriminator
+/// when mapping Kubernetes API errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StorageCommandRejectionCode {
+    AlreadyExists,
+    NotFound,
+    Conflict,
+    InvalidCommit,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StorageCommandResult {
     pub applied_rv: Option<i64>,
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_code: Option<StorageCommandRejectionCode>,
     /// True only when this state-machine invocation newly committed a
     /// Kubernetes-visible resource change. This is deliberately independent
     /// of `applied_mutation`, which carries delete tombstones rather than a

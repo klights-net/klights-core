@@ -2,6 +2,22 @@ use std::sync::Arc;
 
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
+pub trait RuntimeClock: Send + Sync {
+    fn now_ms(&self) -> i64;
+}
+
+pub struct SystemRuntimeClock;
+
+impl RuntimeClock for SystemRuntimeClock {
+    fn now_ms(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
+    }
+}
+
 /// Node-local runtime persistence port for sandbox rows, pod network rows,
 /// and pod slot admission.
 #[async_trait::async_trait]
@@ -40,16 +56,19 @@ pub trait PodSlotAdmission: Send + Sync {
 pub struct RealPodRuntimeStore {
     store: Arc<dyn klights_node_store::PodRuntimeStore>,
     node_name: String,
+    clock: Arc<dyn RuntimeClock>,
 }
 
 impl RealPodRuntimeStore {
     pub fn new(
         store: Arc<dyn klights_node_store::PodRuntimeStore>,
         node_name: impl Into<String>,
+        clock: Arc<dyn RuntimeClock>,
     ) -> Self {
         Self {
             store,
             node_name: node_name.into(),
+            clock,
         }
     }
 }
@@ -61,13 +80,14 @@ impl PodRuntimeStore for RealPodRuntimeStore {
         // identity, node ownership, and sandbox in one node-store command so a
         // successful startup can always be recovered and reconciled. The UID
         // primary key prevents same-name replacement aliasing.
-        let sandbox = klights_node_store::PodRuntimeSandbox::try_new(
+        let sandbox = klights_node_store::OwnedPodSandbox::try_new(
             klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
             self.node_name.clone(),
             sandbox_id,
+            self.clock.now_ms(),
         )?;
         self.store
-            .record_sandbox(sandbox)
+            .record_owned_sandbox(sandbox)
             .await
             .map_err(anyhow::Error::from)
     }

@@ -3,9 +3,9 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 42268,
-      "sha256": "c2d8f43bee8247e82925588f76a9ddb237deb891cba53731067a73e527820045",
-      "source": {"count": 521986, "sha256": "61c881528e4db0e184a8bab9b9dcb78121bab68bd592c5b4ab68b0137feea2c3"}
+      "count": 42470,
+      "sha256": "4b771eb77ea21acb393d3412f9ab1e0ee53468e46274e87550a1fbb1c794569f",
+      "source": {"count": 522454, "sha256": "adc325374177c3ea43d704a7605fbc8b267bc4d2a194f5a647232e8f6838d9cd"}
     },
     "klights-apiserver": {
       "count": 0,
@@ -53,9 +53,9 @@
       "source": {"count": 7423, "sha256": "1f9acc48fd6082967976185dd355edade450ff5c8bce2e15c52fe8eb0adbca26"}
     },
     "klights-leader-api": {
-      "count": 2899,
-      "sha256": "6aa304b4c6c36c18cb6a2308d67f6cb47988c9ed3fa3043b9575f4164f01a61b",
-      "source": {"count": 13633, "sha256": "3b2d7cd8950e248dad9e874d76bda33f9a4c78ae02ca74f5e8c4b2dcc6176dd4"}
+      "count": 2900,
+      "sha256": "3feccfb5e20e4030821981e1636f1083ee1ce0422b7acacc2569bbf8ee9b3b36",
+      "source": {"count": 13637, "sha256": "d6b8f9b97d885bc86ed219eec92deaea97d8b9f366ecbe81c077ad11cbdb0909"}
     },
     "klights-network-api": {
       "count": 1205,
@@ -78,9 +78,9 @@
       "source": {"count": 7423, "sha256": "1f9acc48fd6082967976185dd355edade450ff5c8bce2e15c52fe8eb0adbca26"}
     },
     "klights-node-store": {
-      "count": 3452,
-      "sha256": "6771095775786e3646486b01812fcd6c896d7c7fc42c593ceed1f43b44000c77",
-      "source": {"count": 12683, "sha256": "d6d804e820257831784b494dda0c13810f9aaaf87d119fcc60e5dc4769f806b6"}
+      "count": 3455,
+      "sha256": "df68a2ca8f6bd1baa330a37a1a66c4ce9e75d4c9b850b55ece65e96ba1a70818",
+      "source": {"count": 12739, "sha256": "afb3fd22687ba9292675579b43a3f89c5448e235f85c3717815565b6c9ecad81"}
     },
     "klights-pod-api": {
       "count": 1679,

@@ -115,6 +115,9 @@ impl From<klights_leader_api::ResourceCommandError> for AppError {
             }
             klights_leader_api::ResourceCommandError::PodDeletionForbidden
             | klights_leader_api::ResourceCommandError::Unauthorized => Self::Forbidden(display),
+            klights_leader_api::ResourceCommandError::AlreadyExists { .. } => {
+                Self::AlreadyExists(display)
+            }
             klights_leader_api::ResourceCommandError::Conflict { .. } => Self::Conflict(display),
             klights_leader_api::ResourceCommandError::NotFound { .. } => Self::NotFound(display),
             klights_leader_api::ResourceCommandError::NotLeader

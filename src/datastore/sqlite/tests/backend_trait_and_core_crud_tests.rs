@@ -3839,6 +3839,10 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
             .is_some_and(|msg| msg.contains("already exists") && msg.contains("409 Conflict")),
         "first apply must persist the terminal duplicate-create rejection: {rejected:?}"
     );
+    assert_eq!(
+        rejected.rejection_code,
+        Some(crate::datastore::raft::types::StorageCommandRejectionCode::AlreadyExists)
+    );
 
     let retry = db
         .build_log_apply_commit_for_outbox(
@@ -3925,6 +3929,10 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
             .as_deref()
             .is_some_and(|msg| msg.contains("already exists") && msg.contains("409 Conflict")),
         "expected apply-time 409 result, got {rejected:?}"
+    );
+    assert_eq!(
+        rejected.rejection_code,
+        Some(crate::datastore::raft::types::StorageCommandRejectionCode::AlreadyExists)
     );
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),

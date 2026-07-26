@@ -817,8 +817,12 @@ pub(crate) async fn submit_resource_command_to_store(
 fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
     if let Some(error) = error.downcast_ref::<crate::datastore::errors::DatastoreError>() {
         return match error {
-            crate::datastore::errors::DatastoreError::AlreadyExists { message }
-            | crate::datastore::errors::DatastoreError::Conflict { message } => {
+            crate::datastore::errors::DatastoreError::AlreadyExists { message } => {
+                ResourceCommandError::AlreadyExists {
+                    message: message.clone(),
+                }
+            }
+            crate::datastore::errors::DatastoreError::Conflict { message } => {
                 ResourceCommandError::Conflict {
                     message: message.clone(),
                 }
@@ -1828,7 +1832,7 @@ mod inner_gate_tests {
     }
 
     #[tokio::test]
-    async fn local_resource_command_maps_duplicate_create_to_conflict() {
+    async fn local_resource_command_preserves_duplicate_create_as_already_exists() {
         let db = crate::datastore::test_support::in_memory().await;
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
@@ -1854,8 +1858,8 @@ mod inner_gate_tests {
             ResourceCommandRequest::try_new(command).expect("valid command"),
         )
         .await
-        .expect_err("duplicate create must conflict");
-        assert!(matches!(error, ResourceCommandError::Conflict { .. }));
+        .expect_err("duplicate create must be rejected");
+        assert!(matches!(error, ResourceCommandError::AlreadyExists { .. }));
     }
 
     /// `allocate_node_subnet` writes cluster state and must be gated.

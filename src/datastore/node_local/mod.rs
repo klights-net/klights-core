@@ -13,8 +13,8 @@ pub use sqlite::SqliteNodeLocalDb;
 pub use types::DeadLetterTestInsert;
 pub use types::{
     DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
-    PodNetworkAssignmentRow, PodNetworkReservationError, PodRuntimeRow, PodStatusCheckpoint,
-    ProbeStateRow, ReplicationCheckpoint,
+    PodNetworkAssignmentRow, PodNetworkReservationError, PodRuntimeOwnershipError, PodRuntimeRow,
+    PodStatusCheckpoint, ProbeStateRow, ReplicationCheckpoint,
 };
 
 #[cfg(test)]

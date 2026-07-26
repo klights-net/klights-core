@@ -1237,9 +1237,9 @@ mod tests {
             Box::pin(async { unreachable!("CNI only lists runtime rows") })
         }
 
-        fn record_sandbox(
+        fn record_owned_sandbox(
             &self,
-            _sandbox: klights_node_store::PodRuntimeSandbox,
+            _sandbox: klights_node_store::OwnedPodSandbox,
         ) -> klights_node_store::RuntimeWorkFuture<'_, ()> {
             Box::pin(async { unreachable!("CNI only lists runtime rows") })
         }

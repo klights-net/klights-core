@@ -35,6 +35,17 @@ mod cases {
 
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[test]
+    fn resource_command_already_exists_survives_grpc_decode() {
+        let error = super::super::resource_command_rpc_error(super::super::UnaryRpcError::Status(
+            tonic::Status::already_exists("duplicate RuntimeClass"),
+        ));
+        assert!(matches!(
+            error,
+            klights_leader_api::ResourceCommandError::AlreadyExists { .. }
+        ));
+    }
+
     fn raft_receiver() -> crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
         crate::replication::grpc::raft_rpc::RaftReceiverAdmission {
             addr: "test".to_string(),

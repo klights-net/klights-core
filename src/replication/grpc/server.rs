@@ -2732,6 +2732,7 @@ fn resource_command_status(error: klights_leader_api::ResourceCommandError) -> S
             Status::permission_denied(error.to_string())
         }
         ResourceCommandError::NotLeader => Status::failed_precondition(error.to_string()),
+        ResourceCommandError::AlreadyExists { .. } => Status::already_exists(error.to_string()),
         ResourceCommandError::Conflict { .. } => Status::aborted(error.to_string()),
         ResourceCommandError::NotFound { .. } => Status::not_found(error.to_string()),
         ResourceCommandError::Retryable { .. } => Status::unavailable(error.to_string()),
@@ -3401,6 +3402,16 @@ mod tests {
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
         server_reflection_request, server_reflection_response,
     };
+
+    #[test]
+    fn resource_command_already_exists_uses_distinct_grpc_status() {
+        let status = super::resource_command_status(
+            klights_leader_api::ResourceCommandError::AlreadyExists {
+                message: "duplicate RuntimeClass".to_string(),
+            },
+        );
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+    }
 
     #[test]
     fn positioned_replay_expiry_keeps_the_typed_grpc_relist_marker() {

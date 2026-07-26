@@ -3071,7 +3071,8 @@ async fn test_resourcequota_status_get_put_patch() {
     );
 
     // PATCH /status — merge patch
-    let patch_body = r#"{"status":{"used":{"secrets":"5","pods":"2"}}}"#;
+    let patch_body =
+        r#"{"status":{"hard":{"secrets":"20","pods":"20"},"used":{"secrets":"5","pods":"2"}}}"#;
     let req = Request::builder()
         .method("PATCH")
         .uri("/api/v1/namespaces/rq-test/resourcequotas/test-quota/status")
@@ -3091,6 +3092,26 @@ async fn test_resourcequota_status_get_put_patch() {
     assert_eq!(
         patched["status"]["used"]["secrets"], "5",
         "PATCH /status must update status.used.secrets"
+    );
+    assert_eq!(
+        patched["status"]["hard"]["secrets"], "20",
+        "PATCH response must expose the client-written status before reconciliation"
+    );
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces/rq-test/resourcequotas/test-quota/status")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let reconciled: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        reconciled["status"]["hard"]["secrets"], "10",
+        "event-driven ResourceQuota reconciliation must restore spec.hard after a status PATCH"
     );
 }
 

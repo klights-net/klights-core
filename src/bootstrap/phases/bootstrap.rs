@@ -568,6 +568,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
                     node_pod_runtime_store.clone(),
                     config.node_name.clone(),
+                    Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
                 ),
             ),
             slot_admission: Arc::new(

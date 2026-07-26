@@ -82,6 +82,29 @@ async fn enqueue_post_status_reconcile(
         .await;
 }
 
+async fn dispatch_resource_quota_status_reconcile(
+    state: &AppState,
+    api_version: &str,
+    kind: &str,
+    resource: &Value,
+) {
+    if (api_version, kind) != ("v1", "ResourceQuota") {
+        return;
+    }
+    crate::api::mutation::dispatch_mutation_event(
+        state.resource_mutation().mutation_effects.as_ref(),
+        crate::api::mutation::MutationEvent {
+            operation: klights_reconcile_api::MutationOperation::Update,
+            resource,
+            old_resource: None,
+            persisted: true,
+            dry_run: crate::api::mutation::DryRunMode::Live,
+            context: "resourcequota-status",
+        },
+    )
+    .await;
+}
+
 /// Generic status subresource update handler for namespaced resources.
 ///
 /// K8s status subresource semantics:
@@ -115,12 +138,13 @@ pub async fn update_status_subresource(
         .execute(&target, &StatusPutOperation::new(body))
         .await?;
 
-    // ResourceQuota: do NOT reconcile immediately after a /status PATCH/PUT.
-    // The K8s conformance test watches for the patched status value to appear
-    // in the watch stream before expecting the controller to eventually reset
-    // it. Immediate reconciliation would overwrite the patched value before
-    // the watch can observe it. The periodic background reconciler handles
-    // syncing Status.Hard = Spec.Hard.
+    dispatch_resource_quota_status_reconcile(
+        state.as_ref(),
+        &api_version,
+        &kind,
+        &outcome.final_resource.data,
+    )
+    .await;
 
     enqueue_post_status_reconcile(
         state.as_ref(),
@@ -156,16 +180,13 @@ pub async fn patch_status_subresource(
         )
         .await?;
 
-    // ResourceQuota: the /status PATCH may diverge Status.Hard from Spec.Hard.
-    // Route the persisted resource through the normal supervised dispatcher so
-    // the ResourceQuota controller re-syncs Status.Hard = Spec.Hard.
-    if kind == "ResourceQuota" {
-        state
-            .controller_reconcile()
-            .controller_dispatcher
-            .enqueue(&outcome.response)
-            .await;
-    }
+    dispatch_resource_quota_status_reconcile(
+        state.as_ref(),
+        &api_version,
+        &kind,
+        &outcome.final_resource.data,
+    )
+    .await;
 
     enqueue_post_status_reconcile(
         state.as_ref(),

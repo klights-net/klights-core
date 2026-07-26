@@ -1215,7 +1215,7 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             .backend
             .build_log_apply_commit_for_command(command, operation.as_str(), &self.authoring_node)
             .await
-            .map_err(|err| anyhow::anyhow!("build log_apply commit for raft propose: {err}"))?;
+            .context("build log_apply commit for raft propose")?;
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit)
             .context("encode LogApplyCommit for raft propose")?;
         let apply_result = match self
@@ -1226,7 +1226,20 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             Err(err) => return Err(err),
         };
         if let Some(message) = apply_result.error_message {
-            return Err(anyhow::anyhow!(message));
+            return Err(match apply_result.rejection_code {
+                Some(super::types::StorageCommandRejectionCode::AlreadyExists) => {
+                    super::super::errors::DatastoreError::already_exists(message).into()
+                }
+                Some(super::types::StorageCommandRejectionCode::NotFound) => {
+                    super::super::errors::DatastoreError::not_found(message).into()
+                }
+                Some(super::types::StorageCommandRejectionCode::Conflict) => {
+                    super::super::errors::DatastoreError::conflict(message).into()
+                }
+                Some(super::types::StorageCommandRejectionCode::InvalidCommit) | None => {
+                    anyhow::anyhow!(message)
+                }
+            });
         }
         Ok(apply_result)
     }
@@ -3113,6 +3126,10 @@ mod tests {
             .propose_command(runtime_class_create("second-uid"))
             .await
             .expect_err("duplicate create must fail before raft overwrites the live row");
+        assert!(matches!(
+            err.downcast_ref::<super::super::super::errors::DatastoreError>(),
+            Some(super::super::super::errors::DatastoreError::AlreadyExists { .. })
+        ));
         let msg = err.to_string();
         assert!(
             msg.contains("already exists") && msg.contains("409 Conflict"),

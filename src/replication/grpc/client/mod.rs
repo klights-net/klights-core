@@ -2999,9 +2999,8 @@ fn resource_command_rpc_error(error: UnaryRpcError) -> ResourceCommandError {
                     ResourceCommandError::Unauthorized
                 }
                 tonic::Code::FailedPrecondition => ResourceCommandError::NotLeader,
-                tonic::Code::AlreadyExists | tonic::Code::Aborted => {
-                    ResourceCommandError::Conflict { message }
-                }
+                tonic::Code::AlreadyExists => ResourceCommandError::AlreadyExists { message },
+                tonic::Code::Aborted => ResourceCommandError::Conflict { message },
                 tonic::Code::NotFound => ResourceCommandError::NotFound { message },
                 tonic::Code::DeadlineExceeded => ResourceCommandError::Timeout,
                 tonic::Code::Cancelled => ResourceCommandError::Cancelled,

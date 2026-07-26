@@ -1359,8 +1359,9 @@ impl DatastoreBackend for WorkerStoreAdapter {
         sandbox_id: &str,
     ) -> Result<()> {
         self.node_local
-            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id)
+            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id, 0)
             .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
@@ -2422,8 +2423,9 @@ impl crate::datastore::NetworkStore for WorkerStoreAdapter {
         sandbox_id: &str,
     ) -> Result<()> {
         self.node_local
-            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id)
+            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id, 0)
             .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {

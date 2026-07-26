@@ -30,8 +30,8 @@ pub use raft_durability::{
     RaftLogBatch, RaftLogCoordinate, RaftLogDurability, RaftLogRange, RaftPurgeRequest,
 };
 pub use runtime_work::{
-    DueTimeMs, ObservedPodVersion, PodRuntimeAdmission, PodRuntimeCgroup, PodRuntimeRecord,
-    PodRuntimeSandbox, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
+    DueTimeMs, ObservedPodVersion, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup,
+    PodRuntimeRecord, PodRuntimeStore, PodSlotAdmissionEvent, PodSlotAdmissionEventSource,
     PodSlotAdmissionRequest, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotAdmissionStore,
     PodSlotClearResult, PodSlotEventSubscription, PodSlotMutationResult, PodWorkIdentity,
     PodWorkqueueEnqueue, PodWorkqueueEntry, PodWorkqueueKind, PodWorkqueueStore, ProbeKey,
