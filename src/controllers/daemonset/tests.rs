@@ -14,7 +14,15 @@ fn active_pods(items: &[Resource]) -> Vec<&Resource> {
 /// in-memory `Datastore`.
 async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
-    super::reconcile_daemonset(db, repo.as_ref(), repo.as_ref(), repo.as_ref(), daemonset).await
+    super::reconcile_daemonset(
+        db,
+        repo.as_ref(),
+        repo.as_ref(),
+        repo.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+        daemonset,
+    )
+    .await
 }
 
 async fn setup_db_with_node(node_name: &str) -> Datastore {

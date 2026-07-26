@@ -13,12 +13,12 @@ use crate::api_status::{
     ScaleMutationTarget, ScalePatchOperation, ScalePutOperation, ScaleSelectorStyle,
     build_scale_response,
 };
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 
 #[cfg(test)]
 use crate::api_status::{extract_scale_replicas, extract_scale_resource_version};
 #[cfg(test)]
-use crate::datastore::ResourcePreconditions;
+use klights_cluster_core::ResourcePreconditions;
 
 // Scale endpoints are split from helpers to keep each file manageable.
 // Authorization for scale subresources is enforced by the global
@@ -62,6 +62,7 @@ pub async fn get_replicaset_scale(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let rs = state
+        .resource_mutation()
         .db
         .get_resource("apps/v1", "ReplicaSet", Some(&namespace), &name)
         .await?
@@ -105,6 +106,7 @@ async fn get_apps_v1_scale(
     name: String,
 ) -> Result<Json<Value>, AppError> {
     let resource = state
+        .resource_mutation()
         .db
         .get_resource("apps/v1", kind, Some(&namespace), &name)
         .await?
@@ -246,6 +248,7 @@ pub async fn get_replicationcontroller_scale(
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let rc = state
+        .resource_mutation()
         .db
         .get_resource("v1", "ReplicationController", Some(&namespace), &name)
         .await?

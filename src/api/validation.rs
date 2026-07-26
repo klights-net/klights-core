@@ -2,6 +2,18 @@ use crate::api::*;
 use axum::http::HeaderMap;
 use klights_kube_protobuf as k8s_pb;
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
+
+pub type AdmissionExecutionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, AppError>> + Send + 'a>>;
+
+pub trait AdmissionExecution: Send + Sync {
+    fn execute_admission<'a>(
+        &'a self,
+        context: crate::admission::AdmissionRequestContext,
+    ) -> AdmissionExecutionFuture<'a>;
+}
 
 pub fn validate_crd_field_selector(
     api_version: &str,
@@ -1163,13 +1175,13 @@ pub fn validate_webhook_configuration(body: &Value) -> Result<(), AppError> {
 /// Validate a custom resource body against the CRD's OpenAPI schema when fieldValidation=Strict.
 /// Rejects extra properties not defined in the schema at any level.
 pub async fn check_cr_field_validation_strict(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
     group: &str,
     version: &str,
     kind: &str,
     body: &Value,
 ) -> Result<(), AppError> {
-    let schema = match load_crd_openapi_schema(db, group, version, kind).await? {
+    let schema = match load_crd_openapi_schema(resource_query, group, version, kind).await? {
         Some(s) => s,
         None => return Ok(()), // No schema found, allow
     };
@@ -1180,47 +1192,46 @@ pub async fn check_cr_field_validation_strict(
 /// Apply CRD schema defaults to a custom resource body.
 /// Walks the schema tree and sets default values for missing fields.
 pub async fn apply_crd_defaults(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
     group: &str,
     version: &str,
     kind: &str,
     body: &mut Value,
 ) {
-    if let Ok(Some(schema)) = load_crd_openapi_schema(db, group, version, kind).await {
+    if let Ok(Some(schema)) = load_crd_openapi_schema(resource_query, group, version, kind).await {
         apply_schema_defaults(body, &schema);
     }
 }
 
 /// Apply CRD schema pruning to remove unknown fields not allowed by schema.
 pub async fn apply_crd_pruning(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
     group: &str,
     version: &str,
     kind: &str,
     body: &mut Value,
 ) {
-    if let Ok(Some(schema)) = load_crd_openapi_schema(db, group, version, kind).await {
+    if let Ok(Some(schema)) = load_crd_openapi_schema(resource_query, group, version, kind).await {
         prune_against_schema(body, &schema, true);
     }
 }
 
 async fn load_crd_openapi_schema(
-    db: &dyn crate::datastore::DatastoreBackend,
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
     group: &str,
     version: &str,
     kind: &str,
 ) -> Result<Option<Value>, AppError> {
-    let crds = db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .map_err(|e| AppError::InternalError(format!("Failed to list CRDs: {}", e)))?;
+    let crds = crate::api::resource_query_ports::list_all_resources(
+        resource_query,
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+    )
+    .await
+    .map_err(|error| AppError::InternalError(format!("Failed to list CRDs: {error:?}")))?;
 
-    for crd in &crds.items {
+    for crd in crds.items() {
         let crd_group = crd.data.pointer("/spec/group").and_then(|g| g.as_str());
         let crd_kind = crd
             .data
@@ -1548,9 +1559,9 @@ impl DeleteOptions {
 
     pub fn resource_preconditions(
         &self,
-    ) -> Result<crate::datastore::ResourcePreconditions, String> {
+    ) -> Result<klights_cluster_core::ResourcePreconditions, String> {
         let Some(preconditions) = &self.preconditions else {
-            return Ok(crate::datastore::ResourcePreconditions::default());
+            return Ok(klights_cluster_core::ResourcePreconditions::default());
         };
         let resource_version = preconditions
             .resource_version
@@ -1561,7 +1572,7 @@ impl DeleteOptions {
                 })
             })
             .transpose()?;
-        Ok(crate::datastore::ResourcePreconditions {
+        Ok(klights_cluster_core::ResourcePreconditions {
             uid: preconditions.uid.clone(),
             resource_version,
         })
@@ -1697,20 +1708,17 @@ pub fn build_admission_context(
 }
 
 pub async fn run_admission_for_request(
-    db: &dyn DatastoreBackend,
-    mut ctx: crate::admission::AdmissionRequestContext,
+    admission: &(impl AdmissionExecution + ?Sized),
+    ctx: crate::admission::AdmissionRequestContext,
 ) -> Result<Value, AppError> {
-    let engine = crate::admission::AdmissionEngine::new(db);
-    let admitted = engine
-        .run_with_context(&ctx, true)
-        .await
-        .map_err(map_mutating_admission_error)?;
-    ctx.object = admitted.clone();
-    engine
-        .run_with_context(&ctx, false)
-        .await
-        .map_err(map_validating_admission_error)?;
-    Ok(admitted)
+    admission.execute_admission(ctx).await
+}
+
+pub async fn run_admission(
+    admission: &(impl AdmissionExecution + ?Sized),
+    request: AdmissionContextRequest<'_>,
+) -> Result<Value, AppError> {
+    run_admission_for_request(admission, build_admission_context(request)).await
 }
 
 // Helper function to check content negotiation

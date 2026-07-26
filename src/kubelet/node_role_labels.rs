@@ -1,14 +1,14 @@
-fn node_role_label_key(role: &crate::bootstrap::NodeRole) -> &'static str {
+fn node_role_label_key(role: &crate::kubelet::node_config::KubeletNodeRole) -> &'static str {
+    use crate::kubelet::node_config::KubeletNodeRole;
     match role {
-        crate::bootstrap::NodeRole::Leader { .. }
-        | crate::bootstrap::NodeRole::Controlplane { .. } => {
+        KubeletNodeRole::Leader | KubeletNodeRole::Controlplane { .. } => {
             // Static fallback used only when no `RaftShape` is supplied
             // (e.g. legacy LeaderFollower mode). The shape-driven label
             // arms below in `role_label_keys_for_shape` replace this
             // whenever P3-11d wiring passes a live shape snapshot.
             "node-role.kubernetes.io/leader"
         }
-        crate::bootstrap::NodeRole::Worker { .. } => "node-role.kubernetes.io/worker",
+        KubeletNodeRole::Worker => "node-role.kubernetes.io/worker",
     }
 }
 
@@ -23,11 +23,11 @@ fn node_role_label_key(role: &crate::bootstrap::NodeRole) -> &'static str {
 /// lands.
 ///
 /// Worker / replica labels are static and unaffected.
-pub fn role_label_keys_for_shape(
-    role: &crate::bootstrap::NodeRole,
-    shape: Option<&crate::datastore::raft::types::RaftShape>,
+pub(crate) fn role_label_keys_for_shape(
+    role: &crate::kubelet::node_config::KubeletNodeRole,
+    shape: Option<&klights_cluster_core::RaftShape>,
 ) -> Vec<&'static str> {
-    use crate::bootstrap::NodeRole;
+    use crate::kubelet::node_config::KubeletNodeRole;
     // T1.7: a node participating as a raft learner emits the `replica`
     // label regardless of its CLI-declared role. Voter state is the
     // ground truth; learners do not count toward quorum.
@@ -37,7 +37,7 @@ pub fn role_label_keys_for_shape(
         return vec!["node-role.kubernetes.io/replica"];
     }
     match role {
-        NodeRole::Controlplane { .. } => {
+        KubeletNodeRole::Controlplane { .. } => {
             let Some(shape) = shape else {
                 return vec![node_role_label_key(role)];
             };
@@ -50,7 +50,7 @@ pub fn role_label_keys_for_shape(
                 (_, false) => vec!["node-role.kubernetes.io/controlplane"],
             }
         }
-        NodeRole::Leader { .. } => {
+        KubeletNodeRole::Leader => {
             let Some(shape) = shape else {
                 return vec![node_role_label_key(role)];
             };
@@ -65,26 +65,7 @@ pub fn role_label_keys_for_shape(
                 (_, false) => vec!["node-role.kubernetes.io/controlplane"],
             }
         }
-        NodeRole::Worker { .. } => vec!["node-role.kubernetes.io/worker"],
-    }
-}
-
-pub(crate) fn prune_klights_managed_node_role_labels(node: &mut serde_json::Value) {
-    let Some(labels) = node
-        .pointer_mut("/metadata/labels")
-        .and_then(|labels| labels.as_object_mut())
-    else {
-        return;
-    };
-    for key in [
-        "node-role.kubernetes.io/controlplane",
-        "node-role.kubernetes.io/control-plane",
-        "node-role.kubernetes.io/master",
-        "node-role.kubernetes.io/leader",
-        "node-role.kubernetes.io/replica",
-        "node-role.kubernetes.io/worker",
-    ] {
-        labels.remove(key);
+        KubeletNodeRole::Worker => vec!["node-role.kubernetes.io/worker"],
     }
 }
 
@@ -97,12 +78,7 @@ mod tests {
     #[test]
     fn role_label_keys_for_shape_solo_voter_is_controlplane_leader() {
         use crate::datastore::raft::types::RaftShape;
-        let role = crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints: vec![],
-            token: None,
-            skip_ca: true,
-            as_learner: false,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 1,
             is_leader: true,
@@ -122,12 +98,7 @@ mod tests {
     #[test]
     fn role_label_keys_for_shape_three_voter_leader_emits_both() {
         use crate::datastore::raft::types::RaftShape;
-        let role = crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints: vec![],
-            token: None,
-            skip_ca: true,
-            as_learner: false,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 3,
             is_leader: true,
@@ -148,12 +119,7 @@ mod tests {
     #[test]
     fn role_label_keys_for_shape_three_voter_follower_is_control_plane_only() {
         use crate::datastore::raft::types::RaftShape;
-        let role = crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints: vec!["https://10.99.0.10:7679".into()],
-            token: Some("tok".into()),
-            skip_ca: true,
-            as_learner: false,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 3,
             is_leader: false,
@@ -171,12 +137,7 @@ mod tests {
     #[test]
     fn role_label_keys_for_shape_unjoined_emits_nothing() {
         use crate::datastore::raft::types::RaftShape;
-        let role = crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints: vec!["https://10.99.0.10:7679".into()],
-            token: Some("tok".into()),
-            skip_ca: true,
-            as_learner: false,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 0,
             is_leader: false,
@@ -191,9 +152,7 @@ mod tests {
     /// boots remain stamp-correct.
     #[test]
     fn role_label_keys_for_shape_none_falls_back_to_static_label() {
-        let role = crate::bootstrap::NodeRole::Leader {
-            bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Seed,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Leader;
         assert_eq!(
             role_label_keys_for_shape(&role, None),
             vec!["node-role.kubernetes.io/leader"]
@@ -209,12 +168,7 @@ mod tests {
     #[test]
     fn role_label_keys_for_shape_learner_controlplane_emits_replica() {
         use crate::datastore::raft::types::RaftShape;
-        let role = crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints: vec!["https://10.99.0.10:7679".into()],
-            token: Some("tok".into()),
-            skip_ca: true,
-            as_learner: false,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false };
         let shape = RaftShape {
             voter_count: 3,
             is_leader: false,
@@ -233,9 +187,7 @@ mod tests {
     #[test]
     fn role_label_keys_for_shape_learner_overrides_leader_role() {
         use crate::datastore::raft::types::RaftShape;
-        let role = crate::bootstrap::NodeRole::Leader {
-            bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Seed,
-        };
+        let role = crate::kubelet::node_config::KubeletNodeRole::Leader;
         let shape = RaftShape {
             voter_count: 1,
             is_leader: false,
@@ -260,11 +212,7 @@ mod tests {
             is_leader: true,
             is_learner: false,
         };
-        let worker = crate::bootstrap::NodeRole::Worker {
-            leader_endpoints: vec![],
-            token: None,
-            skip_ca: true,
-        };
+        let worker = crate::kubelet::node_config::KubeletNodeRole::Worker;
         assert_eq!(
             role_label_keys_for_shape(&worker, Some(&shape)),
             vec!["node-role.kubernetes.io/worker"]

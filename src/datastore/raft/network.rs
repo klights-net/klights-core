@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::datastore::raft::types::RaftMemberNode;
+use super::types::RaftMemberNode;
 use async_trait::async_trait;
 use openraft::Raft;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
@@ -24,7 +24,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
-use crate::datastore::raft::types::{NodeId, StorageCommandPayload, TypeConfig};
+use super::types::{NodeId, StorageCommandPayload, TypeConfig};
 
 /// Trait used by `RaftNode::propose` to forward a write to the current
 /// Raft leader when this node is a follower. Implementations are

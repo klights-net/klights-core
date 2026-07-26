@@ -5,10 +5,16 @@
 
 mod cache;
 mod filter;
+mod replay;
 mod session;
 mod signal;
 
 pub use cache::{WatchCache, WatchCacheError};
+pub use klights_cluster_core::{PositionedWatchEvent, WatchReplayPosition};
+pub use replay::{
+    PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayRead, WatchTarget,
+    WatchTargetScope,
+};
 pub use session::{
     PositionedWatchService, ProjectedWatchBaselineRead, ProjectedWatchBaselineRequest,
     ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope, WatchScopeResolver,

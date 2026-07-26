@@ -22,8 +22,8 @@ pub async fn pod_portforward(
     }
 
     // Get pod from PodRepository to find pod IP
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -31,7 +31,7 @@ pub async fn pod_portforward(
     .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
     let _ = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Pod",
@@ -59,7 +59,7 @@ pub async fn pod_portforward(
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
     let node_request = NodePortForwardRequest::try_new(target, ports)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    let node_port_forward = state.node_port_forward.clone();
+    let node_port_forward = state.pod_node_subresources().node_port_forward.clone();
 
     // Check for WebSocket upgrade
     let upgrade_header = req
@@ -83,7 +83,7 @@ pub async fn pod_portforward(
         // Spawn WebSocket handler
         let on_upgrade = hyper::upgrade::on(req);
 
-        let task_supervisor = state.task_supervisor.clone();
+        let task_supervisor = state.operational().task_supervisor.clone();
         let relay_supervisor = task_supervisor.clone();
         if let Err(err) = task_supervisor
             .spawn_async(

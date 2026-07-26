@@ -4,8 +4,8 @@ pub async fn get_pod_status(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -36,7 +36,7 @@ pub async fn patch_pod_status_subresource(
 ) -> Result<Json<Value>, AppError> {
     // Content-type detection stays at the handler boundary; the repository
     // takes the strongly-typed enum.
-    let patch_type = crate::kubelet::pod_repository::content_type_to_patch_type(
+    let patch_type = klights_pod_api::PodStatusPatchKind::from_content_type(
         headers
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()),
@@ -46,21 +46,23 @@ pub async fn patch_pod_status_subresource(
         .map_err(|e| AppError::BadRequest(format!("Invalid patch body: {}", e)))?;
     let requested_rv = metadata_resource_version(&patch_value);
 
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
-    let updated = crate::kubelet::pod_repository::PodSubresourceWriter::patch_status_from_api(
-        state.pod_repository.as_ref(),
-        &namespace,
-        &name,
-        patch_value,
-        patch_type,
-        requested_rv.unwrap_or(pod.resource_version),
+    let updated = klights_pod_api::PodSubresourceMutation::patch_status(
+        state.resource_mutation().pod_repository.as_ref(),
+        klights_pod_api::PodStatusPatchRequest {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            patch: patch_value,
+            patch_kind: patch_type,
+            expected_resource_version: requested_rv.unwrap_or(pod.resource_version),
+        },
     )
     .await
     .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
@@ -75,8 +77,8 @@ pub async fn update_pod_status_subresource(
     Path((namespace, name)): Path<(String, String)>,
     crate::api::LenientJson(body): crate::api::LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -94,12 +96,14 @@ pub async fn update_pod_status_subresource(
         .unwrap_or(Value::Null);
     let requested_rv = metadata_resource_version(&body);
 
-    let updated = crate::kubelet::pod_repository::PodSubresourceWriter::replace_status_from_api(
-        state.pod_repository.as_ref(),
-        &namespace,
-        &name,
-        new_status,
-        requested_rv.unwrap_or(pod.resource_version),
+    let updated = klights_pod_api::PodSubresourceMutation::replace_status(
+        state.resource_mutation().pod_repository.as_ref(),
+        klights_pod_api::PodStatusReplaceRequest {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            status: new_status,
+            expected_resource_version: requested_rv.unwrap_or(pod.resource_version),
+        },
     )
     .await
     .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;

@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
-use klights_cluster_core::{
-    PositionedWatchEvent, Resource, ResourceVersionAssignment, WatchReplayPosition,
-};
+use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_cluster_store::{
     AllocatorStateError, AllocatorStateFuture, DurableAllocatorRead, DurableAllocatorState,
     DurableWatchEvent, DurableWatchHistoryRead, DurableWatchTarget, ResourceGetRequest,
@@ -165,11 +163,7 @@ async fn omitted_cursor_subscribes_before_atomic_anchor_and_replays_the_gap() {
         Arc::new(history),
         Arc::new(OrderedAllocator {
             subscribed: subscribed.clone(),
-            state: DurableAllocatorState::try_new(
-                ResourceVersionAssignment::CommittedApplyV1,
-                anchor,
-            )
-            .expect("allocator state"),
+            state: DurableAllocatorState::try_new(anchor).expect("allocator state"),
         }),
         Arc::new(OrderedSignals {
             subscribed: subscribed.clone(),

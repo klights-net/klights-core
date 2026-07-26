@@ -7,7 +7,9 @@ pub const LEADER_EPOCH_META_KEY: &str = "leader_epoch";
 
 mod committed_apply;
 mod durable_recovery;
+mod pod_uid_precondition;
 mod resource_read;
+mod topology;
 
 pub use committed_apply::{
     AppliedOutboxLookup, CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
@@ -26,9 +28,17 @@ pub use durable_recovery::{
     SnapshotPersistenceError, SnapshotPersistenceFuture, SnapshotReplayFloorCursor,
     WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
 };
+pub use pod_uid_precondition::{
+    PodUidPreconditionError, PodUidPreconditionFuture, PodUidPreconditionRead,
+    PodUidPreconditionRequest, PodUidPreconditionState,
+};
 pub use resource_read::{
     ClusterResourceRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
     ResourceGetRequest, ResourceListPage, ResourceListQuery, ResourceListRead, ResourceListRequest,
     ResourceListSnapshot, ResourceReadError, ResourceReadFuture, ResourceReadStatus,
     ResourceVersionMatch,
+};
+pub use topology::{
+    DataplaneEncryption, DataplaneMetadataError, DataplaneMode, DataplanePeerMetadata,
+    WireGuardPublicKey,
 };

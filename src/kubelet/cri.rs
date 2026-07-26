@@ -1,5 +1,4 @@
 use crate::kubelet::cri_events::{CriContainerEventCodec, CriContainerEventResponse};
-use crate::replication::grpc::transport_policy::{ChannelKind, GrpcTransportPolicy};
 use anyhow::{Context, Result};
 use k8s_cri::v1::{
     AttachRequest, AttachResponse, ContainerConfig, ContainerFilter, ContainerStatusRequest,
@@ -11,6 +10,7 @@ use k8s_cri::v1::{
     StopPodSandboxRequest, image_service_client::ImageServiceClient,
     runtime_service_client::RuntimeServiceClient,
 };
+use klights_node_api::CriTransportPolicy;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
@@ -20,19 +20,11 @@ use tower::service_fn;
 // the worker→leader channels.
 // CRI PullImage is a unary RPC that only returns once the whole image is
 // pulled, so the request timeout is effectively a TOTAL pull deadline. The
-// default stays conservative; environments with slow links or large
-// on-demand pulls raise it via KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS (the
-// multinode netns harness does this) and/or preload the image.
-const DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS: u64 = 30;
-const KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS: &str = "KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS";
-
-fn image_pull_response_timeout() -> std::time::Duration {
-    std::env::var(KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS))
-}
+// default stays conservative; root construction may inject a larger deadline
+// for slow links or large on-demand pulls.
+pub(crate) const DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS);
 
 #[derive(Clone)]
 pub struct CriClient {
@@ -42,6 +34,7 @@ pub struct CriClient {
     /// bug-grpc A1: message-size limit from the injected policy, retained so
     /// per-call client builders (e.g. `subscribe_container_events`) reuse it.
     max_message_bytes: usize,
+    image_pull_response_timeout: std::time::Duration,
 }
 
 /// Cloneable CRI handle for pod lifecycle work.
@@ -70,25 +63,27 @@ impl CriClient {
     /// Test helper that connects using the default transport policy.
     #[cfg(test)]
     pub async fn connect(socket_path: &str, namespace: &str) -> Result<Self> {
-        Self::connect_with_policy(socket_path, namespace, &GrpcTransportPolicy::default()).await
+        Self::connect_with_policy(
+            socket_path,
+            namespace,
+            &CriTransportPolicy::new(std::time::Duration::from_secs(10), 32 * 1024 * 1024),
+            DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+        )
+        .await
     }
 
     /// bug-grpc A1: connect to the containerd CRI Unix socket using the
-    /// injected [`GrpcTransportPolicy`]. The Unix-socket connector is
-    /// CRI-specific, but the message-size limits and dial tunables come from
-    /// the same policy object that the worker→leader and raft channels use.
+    /// injected [`CriTransportPolicy`].
     pub async fn connect_with_policy(
         socket_path: &str,
         _namespace: &str,
-        policy: &GrpcTransportPolicy,
+        policy: &CriTransportPolicy,
+        image_pull_response_timeout: std::time::Duration,
     ) -> Result<Self> {
         // Connect to containerd Unix socket
         let socket_path = socket_path.to_string();
-        let channel = policy
-            .configure_endpoint(
-                Endpoint::try_from("http://[::]:50051")?,
-                ChannelKind::ContainerdUds,
-            )
+        let channel = Endpoint::try_from("http://[::]:50051")?
+            .connect_timeout(policy.connect_timeout())
             .connect_with_connector(service_fn(move |_: Uri| {
                 let path = socket_path.clone();
                 async move {
@@ -98,7 +93,7 @@ impl CriClient {
             }))
             .await?;
 
-        let max_message_bytes = policy.max_message_bytes;
+        let max_message_bytes = policy.max_message_bytes();
         let runtime = RuntimeServiceClient::new(channel.clone())
             .max_decoding_message_size(max_message_bytes)
             .max_encoding_message_size(max_message_bytes);
@@ -111,6 +106,7 @@ impl CriClient {
             image,
             channel,
             max_message_bytes,
+            image_pull_response_timeout,
         })
     }
 
@@ -133,7 +129,7 @@ impl CriClient {
     }
 
     pub async fn pull_image(&mut self, image: &str) -> Result<String> {
-        let timeout = image_pull_response_timeout();
+        let timeout = self.image_pull_response_timeout;
         let mut request = tonic::Request::new(PullImageRequest {
             image: Some(ImageSpec {
                 image: image.to_string(),
@@ -398,24 +394,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_pull_timeout_is_env_overridable_for_slow_links() {
-        // The default stays conservative (pinned by check_kubelet_invariants),
-        // but slow-link environments raise it via the env override. CRI
-        // PullImage is unary, so this timeout is effectively a TOTAL pull
-        // deadline — a ~94 MB etcd image over the harness link takes ~36s.
-        let _lock = crate::TEST_ENV_LOCK.lock().unwrap();
-        // SAFETY: env mutation serialized by TEST_ENV_LOCK for the test body.
-        unsafe { std::env::remove_var(KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS) };
+    fn image_pull_timeout_default_remains_conservative() {
         assert_eq!(
-            image_pull_response_timeout(),
-            std::time::Duration::from_secs(DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT_SECS)
+            DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+            std::time::Duration::from_secs(30)
         );
-        unsafe { std::env::set_var(KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS, "600") };
-        assert_eq!(
-            image_pull_response_timeout(),
-            std::time::Duration::from_secs(600)
-        );
-        unsafe { std::env::remove_var(KLIGHTS_IMAGE_PULL_RESPONSE_TIMEOUT_SECS) };
     }
 
     #[tokio::test]

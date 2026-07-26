@@ -31,7 +31,9 @@ async fn get_categories(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TaskCategoryStatus>>, AppError> {
     ensure_admin(&headers)?;
-    Ok(Json(state.task_supervisor.category_statuses()))
+    Ok(Json(
+        state.operational().task_supervisor.category_statuses(),
+    ))
 }
 
 async fn get_tasks(
@@ -39,7 +41,7 @@ async fn get_tasks(
     headers: HeaderMap,
 ) -> Result<Json<Vec<ActiveTaskStatus>>, AppError> {
     ensure_admin(&headers)?;
-    Ok(Json(state.task_supervisor.active_tasks(None)))
+    Ok(Json(state.operational().task_supervisor.active_tasks(None)))
 }
 
 async fn get_tasks_by_category(
@@ -49,7 +51,12 @@ async fn get_tasks_by_category(
 ) -> Result<Json<Vec<ActiveTaskStatus>>, AppError> {
     ensure_admin(&headers)?;
     let category = parse_category(&category)?;
-    Ok(Json(state.task_supervisor.active_tasks(Some(category))))
+    Ok(Json(
+        state
+            .operational()
+            .task_supervisor
+            .active_tasks(Some(category)),
+    ))
 }
 
 async fn get_db_query_logging(
@@ -57,7 +64,12 @@ async fn get_db_query_logging(
     headers: HeaderMap,
 ) -> Result<Json<DbQueryLoggingStatus>, AppError> {
     ensure_admin(&headers)?;
-    Ok(Json(state.task_supervisor.db_query_logging_status()))
+    Ok(Json(
+        state
+            .operational()
+            .task_supervisor
+            .db_query_logging_status(),
+    ))
 }
 
 async fn put_db_query_logging(
@@ -67,7 +79,10 @@ async fn put_db_query_logging(
 ) -> Result<Json<DbQueryLoggingStatus>, AppError> {
     ensure_admin(&headers)?;
     Ok(Json(
-        state.task_supervisor.set_db_query_logging(payload.enabled),
+        state
+            .operational()
+            .task_supervisor
+            .set_db_query_logging(payload.enabled),
     ))
 }
 

@@ -65,26 +65,24 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
     };
 
     let db = Datastore::new_in_memory().await.unwrap();
-    let commit = LogApplyCommit {
-        resource_version: 50,
-        resource_version_assignment:
-            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-        outbox_watermark: Some(OutboxStreamWatermark {
-            client_id: "worker-a".to_string(),
-            stream_id: 7,
-            stream_seq: 1,
-        }),
-        mutations: vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+    let commit = LogApplyCommit::try_new_with_watermark(
+        vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
             name: "dup-watermark".to_string(),
             uid: "dup-watermark-uid".to_string(),
-            resource_version: 50,
+            resource_version: 0,
             data: json!({
                 "apiVersion": "v1",
                 "kind": "Namespace",
                 "metadata": {"name": "dup-watermark", "uid": "dup-watermark-uid"}
             }),
         })],
-    };
+        Some(OutboxStreamWatermark {
+            client_id: "worker-a".to_string(),
+            stream_id: 7,
+            stream_seq: 1,
+        }),
+    )
+    .unwrap();
 
     db.db_call("test_duplicate_outbox_watermark_noop", move |conn| {
         let tx = conn.transaction()?;
@@ -100,13 +98,13 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
     .unwrap();
 
     let namespace = db.get_namespace("dup-watermark").await.unwrap().unwrap();
-    assert_eq!(namespace.resource_version, 50);
+    assert!(namespace.resource_version > 0);
 }
 
 #[tokio::test]
 async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
-    use crate::datastore::sqlite::BuildOutboxOutcome;
     use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
+    use klights_cluster_core::BuildOutboxOutcome;
 
     let db = Datastore::new_in_memory().await.unwrap();
     let command = StorageCommand::create_namespace(
@@ -117,7 +115,7 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
             "metadata": {"name": "watermarked-no-ledger"}
         }),
     );
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let rv_before = db.get_current_resource_version().await.unwrap();
@@ -140,13 +138,10 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
         panic!("expected a watermarked commit to propose");
     };
 
-    assert!(commit.outbox_watermark.is_some());
-    assert!(commit.resource_version > rv_before);
-    assert_eq!(
-        db.get_current_resource_version().await.unwrap(),
-        commit.resource_version
-    );
-    assert!(commit.mutations.iter().any(|mutation| {
+    assert!(commit.outbox_watermark().is_some());
+    assert_eq!(commit.resource_version(), 0);
+    assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+    assert!(commit.mutations().iter().any(|mutation| {
         matches!(mutation, LogApplyMutation::PutAppliedOutbox(row)
             if row.idempotency_key == "legacy-key-ignored-for-watermark"
                 && row.operation == "PodMetadata"
@@ -158,17 +153,10 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
 #[tokio::test]
 async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit() {
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::sqlite::BuildOutboxOutcome;
-    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark, ResourceVersionAssignment};
+    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
+    use klights_cluster_core::BuildOutboxOutcome;
 
     let db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
@@ -182,7 +170,7 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
         },
         observed_status_stamp: Some(42),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -204,25 +192,21 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
     let BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected stale UID-bound Pod row to consume its stream watermark");
     };
-    assert_eq!(commit.mutations.len(), 1);
-    assert!(commit.mutations.iter().any(|mutation| {
+    assert_eq!(commit.mutations().len(), 1);
+    assert!(commit.mutations().iter().any(|mutation| {
         matches!(mutation, LogApplyMutation::PutAppliedOutbox(row)
             if row.idempotency_key == "missing-pod-status"
                 && row.operation == "PodStatus"
                 && row.status_stamp == Some(42)
                 && row.applied_rv.is_none())
     }));
-    assert_eq!(
-        commit.resource_version_assignment,
-        ResourceVersionAssignment::CommittedApplyV1
-    );
-    assert_eq!(commit.resource_version, 0);
-    assert_eq!(commit.outbox_watermark.unwrap().stream_seq, 1);
+    assert_eq!(commit.resource_version(), 0);
+    assert_eq!(commit.outbox_watermark().unwrap().stream_seq, 1);
 }
 
 #[tokio::test]
 async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fields() {
-    use crate::datastore::sqlite::BuildOutboxOutcome;
+    use klights_cluster_core::BuildOutboxOutcome;
 
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db.create_resource("v1", "Pod", Some("default"), "stamped-status", json!({"metadata":{"name":"stamped-status","namespace":"default","uid":"stamped-status-uid"},"spec":{"nodeName":"node-a"},"status":{"phase":"Pending"}})).await.unwrap();
@@ -240,7 +224,7 @@ async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fi
         },
         observed_status_stamp: Some(7),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let BuildOutboxOutcome::NeedsPropose { commit, .. } = db
@@ -305,7 +289,7 @@ async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
     );
     assert!(
         commit
-            .mutations
+            .mutations()
             .iter()
             .all(|mutation| !matches!(mutation, LogApplyMutation::PutAppliedOutbox(_))),
         "generic builder should never emit OutboxLedger mutations"
@@ -352,7 +336,7 @@ async fn raft_status_command_materialization_skips_unchanged_merged_status() {
 
     assert!(
         commit
-            .mutations
+            .mutations()
             .iter()
             .all(|mutation| !matches!(mutation, LogApplyMutation::PutResource(_))),
         "an unchanged post-merge status must not allocate an RV or emit a watch mutation"
@@ -360,60 +344,9 @@ async fn raft_status_command_materialization_skips_unchanged_merged_status() {
 }
 
 #[tokio::test]
-async fn ordinary_raft_command_materialization_uses_persisted_rv_assignment_mode() {
-    use crate::datastore::command::StorageCommand;
-    use crate::log_apply::ResourceVersionAssignment;
-
-    let db = Datastore::new_in_memory().await.unwrap();
-    let command = || StorageCommand::CreateResource {
-        api_version: "v1".to_string(),
-        kind: "ConfigMap".to_string(),
-        namespace: Some("default".to_string()),
-        name: "mode-test".to_string(),
-        data: serde_json::json!({"metadata": {"name": "mode-test", "namespace": "default"}}),
-    };
-    let before_legacy = db.get_current_resource_version().await.unwrap();
-    let legacy = db
-        .build_log_apply_commit_for_command(command(), "CreateResource", "test-node")
-        .await
-        .unwrap();
-    assert_eq!(
-        legacy.resource_version_assignment,
-        ResourceVersionAssignment::LegacyLeaderAssigned
-    );
-    assert!(legacy.resource_version > before_legacy);
-    assert_eq!(
-        db.get_current_resource_version().await.unwrap(),
-        legacy.resource_version
-    );
-
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
-    let before_v1 = db.get_current_resource_version().await.unwrap();
-    let v1 = db
-        .build_log_apply_commit_for_command(command(), "CreateResource", "test-node")
-        .await
-        .unwrap();
-    assert_eq!(
-        v1.resource_version_assignment,
-        ResourceVersionAssignment::CommittedApplyV1
-    );
-    assert_eq!(v1.resource_version, 0);
-    assert_eq!(db.get_current_resource_version().await.unwrap(), before_v1);
-
-    let applied = db.apply_raft_log_apply_commit(v1).await.unwrap();
-    assert!(applied.applied_rv.unwrap() > before_v1);
-}
-
-#[tokio::test]
 async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
-    use crate::datastore::sqlite::BuildOutboxOutcome;
-    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark, ResourceVersionAssignment};
+    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
+    use klights_cluster_core::BuildOutboxOutcome;
 
     let command = || StorageCommand::CreateResource {
         api_version: "v1".to_string(),
@@ -425,48 +358,12 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         }),
     };
     let payload = || {
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(command())
+        crate::node_outbox::payload::OutboxPayload::from_command(command())
             .encode_protobuf()
             .unwrap()
     };
 
-    let legacy_db = Datastore::new_in_memory().await.unwrap();
-    let legacy_rv_before = legacy_db.get_current_resource_version().await.unwrap();
-    let legacy_payload = payload();
-    let BuildOutboxOutcome::NeedsPropose { commit: legacy, .. } = legacy_db
-        .build_log_apply_commit_for_outbox(
-            "legacy-outbox-template",
-            "CreateResource",
-            legacy_payload.as_ref(),
-            "worker-a",
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("expected legacy outbox commit");
-    };
-    assert_eq!(
-        legacy.resource_version_assignment,
-        ResourceVersionAssignment::LegacyLeaderAssigned
-    );
-    assert!(legacy.resource_version > 0);
-    assert!(legacy.resource_version > legacy_rv_before);
-    assert_eq!(
-        legacy_db.get_current_resource_version().await.unwrap(),
-        legacy.resource_version
-    );
-    assert!(legacy.mutations.iter().any(|mutation| {
-        matches!(mutation, LogApplyMutation::PutResource(row) if row.resource_version > 0)
-    }));
-
     let v1_db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &v1_db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let v1_rv_before = v1_db.get_current_resource_version().await.unwrap();
     let v1_payload = payload();
     let BuildOutboxOutcome::NeedsPropose { commit: v1, .. } = v1_db
@@ -481,30 +378,19 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
     else {
         panic!("expected V1 outbox commit");
     };
-    assert_eq!(
-        v1.resource_version_assignment,
-        ResourceVersionAssignment::CommittedApplyV1
-    );
-    assert_eq!(v1.resource_version, 0);
+    assert_eq!(v1.resource_version(), 0);
     assert_eq!(
         v1_db.get_current_resource_version().await.unwrap(),
         v1_rv_before
     );
-    assert!(v1.mutations.iter().any(|mutation| {
+    assert!(v1.mutations().iter().any(|mutation| {
         matches!(mutation, LogApplyMutation::PutResource(row) if row.resource_version == 0)
     }));
-    assert!(v1.mutations.iter().any(|mutation| {
+    assert!(v1.mutations().iter().any(|mutation| {
         matches!(mutation, LogApplyMutation::PutAppliedOutbox(row) if row.applied_rv.is_none())
     }));
 
     let watermarked_db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &watermarked_db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let watermarked_v1_rv_before = watermarked_db.get_current_resource_version().await.unwrap();
     let watermarked_payload = payload();
     let BuildOutboxOutcome::NeedsPropose {
@@ -527,19 +413,15 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
     else {
         panic!("expected V1 watermarked outbox commit");
     };
-    assert_eq!(
-        watermarked.resource_version_assignment,
-        ResourceVersionAssignment::CommittedApplyV1
-    );
-    assert_eq!(watermarked.resource_version, 0);
+    assert_eq!(watermarked.resource_version(), 0);
     assert_eq!(
         watermarked_db.get_current_resource_version().await.unwrap(),
         watermarked_v1_rv_before
     );
-    assert!(watermarked.mutations.iter().any(|mutation| {
+    assert!(watermarked.mutations().iter().any(|mutation| {
         matches!(mutation, LogApplyMutation::PutResource(row) if row.resource_version == 0)
     }));
-    assert!(watermarked.mutations.iter().any(|mutation| {
+    assert!(watermarked.mutations().iter().any(|mutation| {
         matches!(mutation, LogApplyMutation::PutAppliedOutbox(row) if row.applied_rv.is_none())
     }));
 }
@@ -551,26 +433,24 @@ async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
     };
 
     let db = Datastore::new_in_memory().await.unwrap();
-    let commit = LogApplyCommit {
-        resource_version: 60,
-        resource_version_assignment:
-            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-        outbox_watermark: Some(OutboxStreamWatermark {
-            client_id: "worker-a".to_string(),
-            stream_id: 8,
-            stream_seq: 2,
-        }),
-        mutations: vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+    let commit = LogApplyCommit::try_new_with_watermark(
+        vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
             name: "gap-watermark".to_string(),
             uid: "gap-watermark-uid".to_string(),
-            resource_version: 60,
+            resource_version: 0,
             data: json!({
                 "apiVersion": "v1",
                 "kind": "Namespace",
                 "metadata": {"name": "gap-watermark", "uid": "gap-watermark-uid"}
             }),
         })],
-    };
+        Some(OutboxStreamWatermark {
+            client_id: "worker-a".to_string(),
+            stream_id: 8,
+            stream_seq: 2,
+        }),
+    )
+    .unwrap();
 
     let result = db
         .db_call("test_outbox_watermark_gap_rejects", move |conn| {
@@ -638,18 +518,19 @@ async fn apply_resource_batch_command_builds_one_commit_with_two_puts() {
                 "test-node",
                 None,
             )?;
-            assert_eq!(rv, commit.resource_version);
+            assert!(rv > 0);
+            assert_eq!(commit.resource_version(), 0);
             tx.commit()?;
             Ok(commit)
         })
         .await
         .unwrap();
 
-    assert_eq!(commit.mutations.len(), 2);
-    assert!(commit.mutations.iter().all(|mutation| matches!(
+    assert_eq!(commit.mutations().len(), 2);
+    assert!(commit.mutations().iter().all(|mutation| matches!(
         mutation,
         crate::log_apply::LogApplyMutation::PutResource(row)
-            if row.resource_version == commit.resource_version
+            if row.resource_version == 0
     )));
 }
 
@@ -841,14 +722,14 @@ async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
 
     let mut tombstone_events = 0usize;
     let mut delete_mutations = 0usize;
-    for mutation in &commit.mutations {
+    for mutation in commit.mutations() {
         match mutation {
             crate::log_apply::LogApplyMutation::PutWatchEvent(row) => {
                 tombstone_events += 1;
                 assert_eq!(row.event_type, "DELETED");
                 assert_eq!(row.namespace.as_deref(), Some("default"));
                 assert_eq!(row.name, "tombstone-mark");
-                assert_eq!(row.resource_version, commit.resource_version);
+                assert_eq!(row.resource_version, 0);
             }
             crate::log_apply::LogApplyMutation::DeleteResource(_) => delete_mutations += 1,
             other => panic!("unexpected mutation in tombstone delete command: {other:?}"),
@@ -857,7 +738,8 @@ async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
     assert_eq!(tombstone_events, 1);
     assert_eq!(delete_mutations, 1);
 
-    db.apply_raft_log_apply_commit(commit.clone())
+    let applied = db
+        .apply_raft_log_apply_commit(commit.clone())
         .await
         .unwrap();
 
@@ -870,7 +752,7 @@ async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
         "tombstone delete must remove resource row"
     );
 
-    let commit_rv = commit.resource_version;
+    let commit_rv = applied.applied_rv.expect("delete allocates a public RV");
     let row_count: i64 = db
         .db_call("test_select_tombstone_watch_events", move |conn| {
             Ok(conn.query_row(
@@ -1092,7 +974,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1119,7 +1001,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
 }
 
 #[tokio::test]
-async fn raft_committed_pv_bind_update_preserves_concurrent_user_labels() {
+async fn stale_raft_pv_bind_is_rejected_and_preserves_concurrent_user_labels() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
@@ -1169,7 +1051,7 @@ async fn raft_committed_pv_bind_update_preserves_concurrent_user_labels() {
         "uid": "pvc-label-race-uid"
     });
     stale_bind["status"] = json!({"phase": "Bound"});
-    let committed = crate::log_apply::LogApplyCommit::new(
+    let committed = crate::log_apply::test_live_commit(
         created.resource_version + 2,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
@@ -1194,8 +1076,8 @@ async fn raft_committed_pv_bind_update_preserves_concurrent_user_labels() {
         .await
         .expect("committed PV bind row applies authoritatively");
     assert!(
-        result.error_message.is_none(),
-        "committed PV bind must not be rejected: {result:?}"
+        result.error_message.is_some(),
+        "stale committed PV bind must fail strict RV validation: {result:?}"
     );
 
     let live = db
@@ -1214,21 +1096,14 @@ async fn raft_committed_pv_bind_update_preserves_concurrent_user_labels() {
     );
     assert_eq!(
         live.data.pointer("/spec/claimRef/name"),
-        Some(&json!("pvc-label-race")),
-        "controller bind change still applies"
+        None,
+        "rejected stale controller bind must not modify the PV"
     );
 }
 
 #[tokio::test]
 async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid() {
     let db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let created = db
         .create_resource(
             "v1",
@@ -1291,7 +1166,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         preconditions: ResourcePreconditions::from_resource(&created),
         observed_status_stamp: Some(1),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1304,16 +1179,12 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         )
         .await
         .expect("stale-RV PodStatus must build a raft commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
-    assert_eq!(commit.resource_version, 0);
-    assert_eq!(
-        commit.resource_version_assignment,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
-    );
+    assert_eq!(commit.resource_version(), 0);
     let put = commit
-        .mutations
+        .mutations()
         .iter()
         .find_map(|mutation| match mutation {
             crate::log_apply::LogApplyMutation::PutResource(row) => Some(row),
@@ -1354,7 +1225,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
 }
 
 #[tokio::test]
-async fn raft_commit_builder_reserves_leader_resource_version_without_applying_resource() {
+async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
     let db = Datastore::new_in_memory().await.unwrap();
     let before_rv = db.get_current_resource_version().await.unwrap();
     let command = StorageCommand::CreateResource {
@@ -1373,7 +1244,7 @@ async fn raft_commit_builder_reserves_leader_resource_version_without_applying_r
             "data": {"k": "v"}
         }),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -1386,22 +1257,22 @@ async fn raft_commit_builder_reserves_leader_resource_version_without_applying_r
         )
         .await
         .expect("build raft commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
 
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
-        before_rv + 1,
-        "building a raft entry must reserve the leader's committed resourceVersion"
+        before_rv,
+        "building a raft entry must not reserve a public resourceVersion"
     );
     assert_eq!(
-        commit.resource_version,
-        before_rv + 1,
-        "builder should encode the leader's committed RV into the raft payload"
+        commit.resource_version(),
+        0,
+        "builder must encode an RV-zero live template"
     );
     let put = commit
-        .mutations
+        .mutations()
         .iter()
         .find_map(|mutation| match mutation {
             crate::log_apply::LogApplyMutation::PutResource(row) => Some(row),
@@ -1409,9 +1280,8 @@ async fn raft_commit_builder_reserves_leader_resource_version_without_applying_r
         })
         .expect("create must produce a resource row");
     assert_eq!(
-        put.resource_version,
-        before_rv + 1,
-        "resource rows must carry the leader's committed RV before apply"
+        put.resource_version, 0,
+        "resource rows must remain RV-zero before committed apply"
     );
     assert!(
         db.get_resource("v1", "ConfigMap", Some("default"), "deferred-rv")
@@ -1436,7 +1306,7 @@ async fn raft_commit_builder_reserves_leader_resource_version_without_applying_r
 }
 
 #[tokio::test]
-async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() {
+async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
@@ -1465,10 +1335,9 @@ async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() 
             "status": {"phase": "Pending"}
         }),
     };
-    let create_payload =
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(create_command)
-            .encode_protobuf()
-            .unwrap();
+    let create_payload = crate::node_outbox::payload::OutboxPayload::from_command(create_command)
+        .encode_protobuf()
+        .unwrap();
     let create_outcome = leader
         .build_log_apply_commit_for_outbox(
             "raft-leader-create-scheduled-later",
@@ -1478,7 +1347,7 @@ async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() 
         )
         .await
         .expect("build create commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: create_commit,
         ..
     } = create_outcome
@@ -1511,10 +1380,9 @@ async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() 
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let update_payload =
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(update_command)
-            .encode_protobuf()
-            .unwrap();
+    let update_payload = crate::node_outbox::payload::OutboxPayload::from_command(update_command)
+        .encode_protobuf()
+        .unwrap();
     let update_outcome = leader
         .build_log_apply_commit_for_outbox(
             "raft-leader-bind-scheduled-later",
@@ -1524,7 +1392,7 @@ async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() 
         )
         .await
         .expect("build update commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: update_commit,
         ..
     } = update_outcome
@@ -1540,8 +1408,8 @@ async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() 
         .await
         .expect("follower applies update transaction");
     assert!(
-        follower_result.error_message.is_none(),
-        "follower must not reject a leader-committed update because its local RV counter was skewed: {follower_result:?}"
+        follower_result.error_message.is_some(),
+        "strict apply must expose follower divergence: {follower_result:?}"
     );
 
     let follower_pod = follower
@@ -1554,13 +1422,12 @@ async fn raft_commits_apply_with_leader_resource_versions_on_skewed_followers() 
             .data
             .pointer("/spec/nodeName")
             .and_then(|value| value.as_str()),
-        Some("mn-replica"),
-        "follower must materialize the scheduler bind"
+        None,
+        "a divergent follower must not materialize the scheduler bind"
     );
     assert_eq!(
-        follower_pod.resource_version,
-        created.resource_version + 1,
-        "follower must store the leader's committed update RV, not allocate a local one"
+        follower_pod.resource_version, 7,
+        "rejected apply must preserve the follower's current RV"
     );
 }
 
@@ -1587,7 +1454,7 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
                     "data": {"uid": uid}
                 }),
             };
-            let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+            let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                 .encode_protobuf()
                 .unwrap();
             let outcome = db
@@ -1599,7 +1466,7 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
                 )
                 .await
                 .expect("build duplicate create");
-            let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome
+            let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome
             else {
                 panic!("expected a fresh commit");
             };
@@ -1634,13 +1501,6 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
 #[tokio::test]
 async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
     let db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let created = db
         .create_resource(
             "v1",
@@ -1676,7 +1536,7 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 expected_rv: created.resource_version,
                 preconditions: ResourcePreconditions::resource_version(created.resource_version),
             };
-            let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+            let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                 .encode_protobuf()
                 .unwrap();
             let outcome = db
@@ -1688,7 +1548,7 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 )
                 .await
                 .expect("build update");
-            let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome
+            let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome
             else {
                 panic!("expected a fresh commit");
             };
@@ -1764,7 +1624,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
         },
         observed_status_stamp: None,
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -1776,7 +1636,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
         )
         .await
         .expect("build stale status commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh status commit");
     };
 
@@ -1842,7 +1702,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
 }
 
 #[tokio::test]
-async fn stale_status_only_apply_preserves_live_job_status_scalars() {
+async fn stale_status_only_apply_rejects_and_preserves_live_job_status_scalars() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
@@ -1866,8 +1726,8 @@ async fn stale_status_only_apply_preserves_live_job_status_scalars() {
         .await
         .unwrap();
 
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
-        StorageCommand::UpdateStatus {
+    let payload =
+        crate::node_outbox::payload::OutboxPayload::from_command(StorageCommand::UpdateStatus {
             api_version: "batch/v1".into(),
             kind: "Job".into(),
             namespace: Some("default".into()),
@@ -1884,10 +1744,9 @@ async fn stale_status_only_apply_preserves_live_job_status_scalars() {
                 resource_version: Some(created.resource_version),
             },
             observed_status_stamp: None,
-        },
-    )
-    .encode_protobuf()
-    .unwrap();
+        })
+        .encode_protobuf()
+        .unwrap();
 
     let outcome = db
         .build_log_apply_commit_for_outbox(
@@ -1898,7 +1757,7 @@ async fn stale_status_only_apply_preserves_live_job_status_scalars() {
         )
         .await
         .expect("build stale status commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected status commit");
     };
 
@@ -1923,7 +1782,7 @@ async fn stale_status_only_apply_preserves_live_job_status_scalars() {
 
     db.apply_log_apply_commit(commit)
         .await
-        .expect("stale commit must apply by rebasing");
+        .expect_err("strict committed apply must reject the stale status precondition");
 
     let live = db
         .get_resource("batch/v1", "Job", Some("default"), "stale-job-status")
@@ -1944,7 +1803,7 @@ async fn stale_status_only_apply_preserves_live_job_status_scalars() {
 }
 
 #[tokio::test]
-async fn stale_status_only_apply_uses_incoming_nonterminal_job_condition_values() {
+async fn stale_status_only_apply_rejects_incoming_nonterminal_job_condition_values() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
@@ -1974,8 +1833,8 @@ async fn stale_status_only_apply_uses_incoming_nonterminal_job_condition_values(
         .await
         .unwrap();
 
-    let committed_status = crate::log_apply::LogApplyCommit::new(
-        created.resource_version + 2,
+    let committed_status = crate::log_apply::test_live_commit(
+        0,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
                 api_version: "batch/v1".to_string(),
@@ -1983,15 +1842,14 @@ async fn stale_status_only_apply_uses_incoming_nonterminal_job_condition_values(
                 namespace: Some("default".to_string()),
                 name: "stale-job-status-update".to_string(),
                 uid: "stale-job-status-update-uid".to_string(),
-                resource_version: created.resource_version + 2,
+                resource_version: 0,
                 data: json!({
                     "apiVersion": "batch/v1",
                     "kind": "Job",
                     "metadata": {
                         "name": "stale-job-status-update",
                         "namespace": "default",
-                        "uid": "stale-job-status-update-uid",
-                        "resourceVersion": (created.resource_version + 2).to_string()
+                        "uid": "stale-job-status-update-uid"
                     },
                     "spec": {},
                     "status": {
@@ -2039,9 +1897,12 @@ async fn stale_status_only_apply_uses_incoming_nonterminal_job_condition_values(
     .await
     .expect("user status patch applies before committed status update");
 
-    db.apply_raft_log_apply_commit(committed_status)
+    let rejected = db
+        .apply_raft_log_apply_commit(committed_status)
         .await
-        .expect("stale committed nonterminal Job status should merge onto live resource");
+        .expect("strict rejection is a committed apply outcome");
+    assert!(rejected.error_message.is_some());
+    assert_eq!(rejected.applied_rv, None);
 
     let live = db
         .get_resource(
@@ -2064,11 +1925,11 @@ async fn stale_status_only_apply_uses_incoming_nonterminal_job_condition_values(
                 && condition
                     .get("lastTransitionTime")
                     .and_then(|value| value.as_str())
-                    == Some("2026-07-01T04:05:03Z")
+                    == Some("2026-07-01T04:05:02Z")
                 && condition.get("reason").and_then(|value| value.as_str())
-                    == Some("E2E updateStatus")
+                    == Some("E2E patchStatus")
         }),
-        "incoming nonterminal Job condition must replace the live patched value: {conditions:?}"
+        "rejected stale Job status must preserve the live patched value: {conditions:?}"
     );
     assert!(
         conditions.iter().any(|condition| {
@@ -2117,7 +1978,7 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let bind_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(bind_command)
+    let bind_payload = crate::node_outbox::payload::OutboxPayload::from_command(bind_command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -2129,7 +1990,7 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         )
         .await
         .expect("build stale bind commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: bind_commit,
         ..
     } = outcome
@@ -2162,8 +2023,8 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         .await
         .expect("stale committed bind applies authoritatively");
     assert!(
-        apply_result.error_message.is_none(),
-        "stale bind apply must not become a terminal conflict: {apply_result:?}"
+        apply_result.error_message.is_some(),
+        "stale bind apply must fail strict RV validation: {apply_result:?}"
     );
 
     let live = db
@@ -2175,8 +2036,8 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         live.data
             .pointer("/spec/nodeName")
             .and_then(|value| value.as_str()),
-        Some("mn-worker"),
-        "stale committed scheduler bind must still apply nodeName"
+        None,
+        "rejected stale scheduler bind must not apply nodeName"
     );
     assert_eq!(
         live.data
@@ -2240,7 +2101,7 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::from_resource(&created),
     };
-    let bind_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(bind_command)
+    let bind_payload = crate::node_outbox::payload::OutboxPayload::from_command(bind_command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -2252,7 +2113,7 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         )
         .await
         .expect("build stale bind commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: bind_commit,
         ..
     } = outcome
@@ -2293,8 +2154,8 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         .await
         .expect("stale committed bind applies authoritatively");
     assert!(
-        apply_result.error_message.is_none(),
-        "stale bind apply must not become a terminal conflict: {apply_result:?}"
+        apply_result.error_message.is_some(),
+        "stale bind apply must fail strict RV validation: {apply_result:?}"
     );
 
     let live = db
@@ -2311,8 +2172,8 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         live.data
             .pointer("/spec/nodeName")
             .and_then(|value| value.as_str()),
-        Some("mn-worker"),
-        "stale committed scheduler bind must still apply nodeName"
+        None,
+        "rejected stale scheduler bind must not apply nodeName"
     );
     assert_eq!(
         owner_refs.len(),
@@ -2373,7 +2234,7 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_same_node_payload =
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(stale_same_node_command)
+        crate::node_outbox::payload::OutboxPayload::from_command(stale_same_node_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
@@ -2385,7 +2246,7 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         )
         .await
         .expect("build stale same-node commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: stale_same_node_commit,
         ..
     } = outcome
@@ -2427,8 +2288,8 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         .await
         .expect("stale same-node commit applies authoritatively");
     assert!(
-        apply_result.error_message.is_none(),
-        "stale same-node apply must not become a terminal conflict: {apply_result:?}"
+        apply_result.error_message.is_some(),
+        "stale same-node apply must fail strict RV validation: {apply_result:?}"
     );
 
     let live = db
@@ -2499,7 +2360,7 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_clear_payload =
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(stale_clear_command)
+        crate::node_outbox::payload::OutboxPayload::from_command(stale_clear_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
@@ -2511,7 +2372,7 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         )
         .await
         .expect("build stale explicit owner clear commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: stale_clear_commit,
         ..
     } = outcome
@@ -2537,8 +2398,8 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         .await
         .expect("stale explicit owner clear applies authoritatively");
     assert!(
-        apply_result.error_message.is_none(),
-        "stale explicit owner clear must not become a terminal conflict: {apply_result:?}"
+        apply_result.error_message.is_some(),
+        "stale explicit owner clear must fail strict RV validation: {apply_result:?}"
     );
 
     let live = db
@@ -2551,8 +2412,8 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         .pointer("/metadata/ownerReferences")
         .and_then(|value| value.as_array());
     assert!(
-        owner_refs.is_none_or(|refs| refs.is_empty()),
-        "explicit empty ownerReferences update must be allowed to clear live owners"
+        owner_refs.is_some_and(|refs| !refs.is_empty()),
+        "rejected stale ownerReferences update must preserve live owners"
     );
 }
 
@@ -2594,7 +2455,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         preconditions: ResourcePreconditions::from_resource(&created),
     };
     let stale_bind_payload =
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(stale_bind_command)
+        crate::node_outbox::payload::OutboxPayload::from_command(stale_bind_command)
             .encode_protobuf()
             .unwrap();
     let outcome = db
@@ -2606,7 +2467,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         )
         .await
         .expect("build stale bind commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: stale_bind_commit,
         ..
     } = outcome
@@ -2632,8 +2493,8 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         .await
         .expect("stale committed bind applies authoritatively");
     assert!(
-        apply_result.error_message.is_none(),
-        "stale bind apply must not become a terminal conflict: {apply_result:?}"
+        apply_result.error_message.is_some(),
+        "stale bind apply must fail strict RV validation: {apply_result:?}"
     );
 
     let live = db
@@ -2651,7 +2512,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
 }
 
 #[tokio::test]
-async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
+async fn stale_status_only_committed_pvc_apply_is_rejected_without_losing_live_conditions() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
         .create_resource(
@@ -2677,7 +2538,7 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
         .await
         .unwrap();
 
-    let committed_status = crate::log_apply::LogApplyCommit::new(
+    let committed_status = crate::log_apply::test_live_commit(
         created.resource_version + 2,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
@@ -2738,8 +2599,9 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
     let result = db
         .apply_raft_log_apply_commit(committed_status)
         .await
-        .expect("committed status-only row should merge onto live PVC");
-    assert_eq!(result.applied_rv, Some(created.resource_version + 2));
+        .expect("stale status-only row returns a deterministic outcome");
+    assert!(result.error_message.is_some());
+    assert_eq!(result.applied_rv, None);
 
     let live = db
         .get_resource(
@@ -2756,10 +2618,7 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
         Some(&json!("Pending")),
         "stale controller status must not overwrite a newer live phase"
     );
-    assert_eq!(
-        live.data.pointer("/status/volumeName"),
-        Some(&json!("pv-status-condition-race"))
-    );
+    assert_eq!(live.data.pointer("/status/volumeName"), None);
     assert_eq!(
         live.data.pointer("/status/conditions/0/type"),
         Some(&json!("StatusPatched")),
@@ -2768,7 +2627,7 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
 }
 
 #[tokio::test]
-async fn stale_status_only_apply_preserves_newer_pv_and_pvc_condition_values() {
+async fn stale_status_only_apply_rejects_and_preserves_newer_pv_and_pvc_condition_values() {
     for (kind, namespace) in [
         ("PersistentVolumeClaim", Some("default")),
         ("PersistentVolume", None),
@@ -2802,8 +2661,8 @@ async fn stale_status_only_apply_preserves_newer_pv_and_pvc_condition_values() {
             .await
             .unwrap();
 
-        let committed_status = crate::log_apply::LogApplyCommit::new(
-            created.resource_version + 2,
+        let committed_status = crate::log_apply::test_live_commit(
+            0,
             vec![crate::log_apply::LogApplyMutation::PutResource(
                 crate::log_apply::LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -2811,15 +2670,14 @@ async fn stale_status_only_apply_preserves_newer_pv_and_pvc_condition_values() {
                     namespace: namespace.map(str::to_string),
                     name: name.clone(),
                     uid: uid.clone(),
-                    resource_version: created.resource_version + 2,
+                    resource_version: 0,
                     data: json!({
                         "apiVersion": "v1",
                         "kind": kind,
                         "metadata": {
                             "name": name,
                             "namespace": namespace,
-                            "uid": uid,
-                            "resourceVersion": (created.resource_version + 2).to_string()
+                            "uid": uid
                         },
                         "spec": {},
                         "status": {
@@ -2871,9 +2729,12 @@ async fn stale_status_only_apply_preserves_newer_pv_and_pvc_condition_values() {
         .await
         .expect("user status patch applies before committed status update");
 
-        db.apply_raft_log_apply_commit(committed_status)
+        let rejected = db
+            .apply_raft_log_apply_commit(committed_status)
             .await
-            .expect("stale committed status update should merge onto live resource");
+            .expect("strict rejection is a committed apply outcome");
+        assert!(rejected.error_message.is_some());
+        assert_eq!(rejected.applied_rv, None);
 
         let live = db
             .get_resource("v1", kind, namespace, &name)
@@ -2972,7 +2833,7 @@ async fn raft_status_apply_built_before_preemption_preserves_disruption_target()
         },
         observed_status_stamp: None,
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -2984,7 +2845,7 @@ async fn raft_status_apply_built_before_preemption_preserves_disruption_target()
         )
         .await
         .expect("build stale status commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh status commit");
     };
 
@@ -3086,7 +2947,7 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3098,7 +2959,7 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         )
         .await
         .expect("build scale patch commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
 
@@ -3191,7 +3052,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3203,7 +3064,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         )
         .await
         .expect("build pod delete-mark patch commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
 
@@ -3320,7 +3181,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         strict_resource_version: false,
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = leader
@@ -3332,20 +3193,22 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         )
         .await
         .expect("build zero-grace delete-mark commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected zero-grace delete-mark proposal");
     };
-    let rv = commit.resource_version;
-
-    leader
+    let leader_result = leader
         .apply_raft_log_apply_commit(commit.clone())
         .await
         .expect("leader applies delete-mark patch");
+    let rv = leader_result
+        .applied_rv
+        .expect("delete-mark patch allocates an RV");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    follower
+    let follower_result = follower
         .apply_raft_log_apply_commit(commit)
         .await
         .expect("follower applies same delete-mark patch");
+    assert_eq!(follower_result.applied_rv, Some(rv));
 
     let leader_event = leader
         .list_watch_events_since(
@@ -3439,7 +3302,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
     let mut leader_terminating = (*leader_created.data).clone();
     leader_terminating["metadata"]["deletionTimestamp"] = json!("2026-06-21T00:00:10Z");
     leader_terminating["metadata"]["deletionGracePeriodSeconds"] = json!(0);
-    leader
+    let leader_terminating = leader
         .update_resource(
             "v1",
             "Pod",
@@ -3453,7 +3316,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
     let mut follower_terminating = (*follower_created.data).clone();
     follower_terminating["metadata"]["deletionTimestamp"] = json!("2026-06-21T00:00:10Z");
     follower_terminating["metadata"]["deletionGracePeriodSeconds"] = json!(0);
-    follower
+    let follower_terminating = follower
         .update_resource(
             "v1",
             "Pod",
@@ -3464,6 +3327,10 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         )
         .await
         .expect("follower live pod is terminating before stale committed put");
+    assert_eq!(
+        leader_terminating.resource_version,
+        follower_terminating.resource_version
+    );
 
     let committed_rv = leader_created.resource_version + 10;
     let mut committed_pod = (*leader_created.data).clone();
@@ -3475,7 +3342,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"},
         {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"}
     ]);
-    let commit = crate::log_apply::LogApplyCommit::new(
+    let commit = crate::log_apply::test_live_commit(
         committed_rv,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
@@ -3489,21 +3356,23 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
                 require_absent: false,
                 require_existing: true,
                 precondition_uid: Some("terminating-stale-put-uid".to_string()),
-                precondition_resource_version: Some(leader_created.resource_version),
+                precondition_resource_version: Some(leader_terminating.resource_version),
                 status_only: false,
             },
         )],
     );
 
-    leader
+    let leader_result = leader
         .apply_raft_log_apply_commit(commit.clone())
         .await
         .expect("leader applies stale committed put");
+    let applied_rv = leader_result.applied_rv.expect("put allocates an RV");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    follower
+    let follower_result = follower
         .apply_raft_log_apply_commit(commit)
         .await
         .expect("follower applies same stale committed put");
+    assert_eq!(follower_result.applied_rv, Some(applied_rv));
 
     let leader_event = leader
         .list_watch_events_since(
@@ -3515,7 +3384,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         .await
         .unwrap()
         .into_iter()
-        .find(|event| event.resource.resource_version == committed_rv)
+        .find(|event| event.resource.resource_version == applied_rv)
         .expect("leader stale put watch event");
     let follower_event = follower
         .list_watch_events_since(
@@ -3527,7 +3396,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         .await
         .unwrap()
         .into_iter()
-        .find(|event| event.resource.resource_version == committed_rv)
+        .find(|event| event.resource.resource_version == applied_rv)
         .expect("follower stale put watch event");
 
     assert_eq!(leader_event.event_type, "MODIFIED");
@@ -3563,7 +3432,7 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
         },
         "data": {"hello": "derived"},
     });
-    let commit = crate::log_apply::LogApplyCommit::new(
+    let commit = crate::log_apply::test_live_commit(
         41,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
@@ -3583,7 +3452,8 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
         )],
     );
 
-    ds.apply_log_apply_commit(commit).await.unwrap();
+    let applied = ds.apply_raft_log_apply_commit(commit).await.unwrap();
+    let applied_rv = applied.applied_rv.expect("resource put allocates an RV");
 
     let resource_row_bytes: Vec<u8> = ds
         .db_call("test_resource_put_row_bytes", |conn| {
@@ -3597,10 +3467,10 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
         .unwrap();
 
     let watch_row_bytes: Vec<u8> = ds
-        .db_call("test_resource_watch_row_bytes", |conn| {
+        .db_call("test_resource_watch_row_bytes", move |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "ConfigMap", "default", "co-derived", 41],
+                rusqlite::params!["v1", "ConfigMap", "default", "co-derived", applied_rv],
                 |row| row.get(0),
             )?)
         })
@@ -3669,7 +3539,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
         strict_resource_version: false,
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3681,7 +3551,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         )
         .await
         .expect("build stale patch commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
 
@@ -3699,21 +3569,17 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     .await
     .expect("client scale update applies before stale patch commit");
 
-    // Raft-authoritative apply must still commit the log entry and advance the materialized
-    // resourceVersion, but a same-UID PUT built from a stale base must not roll back newer
-    // client-owned state that is already present locally.
+    // Strict committed apply rejects the stale raw RV before normalization and
+    // must not roll back newer client-owned state.
     let apply_result = db
         .apply_raft_log_apply_commit(commit)
         .await
-        .expect("raft authoritative apply must succeed even with stale precondition_rv");
+        .expect("stale committed apply returns a deterministic outcome");
     assert!(
-        apply_result.error_message.is_none(),
-        "raft authoritative apply must bypass staleness precondition_rv and commit: {apply_result:?}"
+        apply_result.error_message.is_some(),
+        "stale committed apply must fail strict RV validation: {apply_result:?}"
     );
-    assert!(
-        apply_result.applied_rv.is_some(),
-        "raft authoritative apply must return applied_rv: {apply_result:?}"
-    );
+    assert_eq!(apply_result.applied_rv, None);
 
     let live = db
         .get_resource("apps/v1", "Deployment", Some("default"), "web")
@@ -3735,11 +3601,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         Some("2"),
         "stale raft patch may apply its metadata annotation while preserving newer spec state"
     );
-    assert_eq!(
-        live.resource_version,
-        apply_result.applied_rv.unwrap(),
-        "stale raft PUT still advances the materialized resourceVersion"
-    );
+    assert_eq!(apply_result.applied_rv, None);
 }
 
 #[tokio::test]
@@ -3761,7 +3623,7 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
             "data": {"applied": "once"}
         }),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
@@ -3773,7 +3635,7 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
         )
         .await
         .expect("build create");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
 
@@ -3824,11 +3686,11 @@ async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_le
         .unwrap();
 
     assert_eq!(
-        commit.mutations.len(),
+        commit.mutations().len(),
         1,
         "GC command should map to one outbox mutation"
     );
-    let mutation = &commit.mutations[0];
+    let mutation = &commit.mutations()[0];
     match mutation {
         crate::log_apply::LogApplyMutation::GcAppliedOutbox {
             cutoff_ms,
@@ -3842,7 +3704,7 @@ async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_le
 }
 
 #[tokio::test]
-async fn raft_outbox_build_treats_fresh_placeholder_as_retryable_inflight() {
+async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
@@ -3893,7 +3755,7 @@ async fn raft_outbox_build_treats_fresh_placeholder_as_retryable_inflight() {
             resource_version: None,
         },
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -3906,23 +3768,25 @@ async fn raft_outbox_build_treats_fresh_placeholder_as_retryable_inflight() {
         )
         .await;
 
-    match result {
-        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(_)) => {}
-        Err(err) => panic!("fresh raft outbox placeholder must be retryable, got: {err:?}"),
-        Ok(_) => panic!("fresh placeholder is still in-flight and must retry"),
-    }
+    assert!(
+        matches!(
+            result,
+            Err(klights_cluster_core::OutboxApplyError::Retryable(_))
+        ),
+        "unsupported durable rows must fail closed rather than be reclaimed"
+    );
+    let row = db
+        .get_applied_outbox("fresh-raft-placeholder-key")
+        .await
+        .unwrap()
+        .expect("incomplete durable row remains for operator recovery");
+    assert!(row.applied_rv.is_none());
+    assert!(row.result_proto.is_empty());
 }
 
 #[tokio::test]
 async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
     let db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -3950,7 +3814,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
             "data": {"winner": "second"}
         }),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let idempotency_key = "raft-duplicate-retry-key";
@@ -3964,7 +3828,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         )
         .await
         .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected initial duplicate create to need proposal");
     };
     let rejected = db.apply_raft_log_apply_commit(commit).await.unwrap();
@@ -3985,7 +3849,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         )
         .await;
     match retry {
-        Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(msg))
+        Err(crate::node_outbox::OutboxApplyError::ConflictTerminal(msg))
             if msg.contains("already exists") && msg.contains("409 Conflict") => {}
         Err(err) => panic!(
             "retrying the same rejected key must return the cached terminal rejection, got error {err}"
@@ -4007,13 +3871,6 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
 #[tokio::test]
 async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() {
     let db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -4028,7 +3885,7 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
     .unwrap();
     let before_rv = db.get_current_resource_version().await.unwrap();
 
-    let commit = crate::log_apply::LogApplyCommit::new(
+    let commit = crate::log_apply::test_live_commit(
         0,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
@@ -4055,8 +3912,7 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
                 status_only: false,
             },
         )],
-    )
-    .into_committed_apply_v1_template();
+    );
 
     let rejected = db
         .apply_raft_log_apply_commit(commit)
@@ -4128,7 +3984,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let initial_put = crate::log_apply::LogApplyCommit::new(
+    let initial_put = crate::log_apply::test_live_commit(
         1,
         vec![
             crate::log_apply::LogApplyMutation::PutAppliedOutbox(
@@ -4168,7 +4024,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
             "v1:Pod:default:new-pod:uid-2".to_string(),
             "PodStatus".to_string(),
             20_000,
-            Some(12),
+            Some(0),
             vec![0x03, 0x04],
             None,
         ),
@@ -4177,7 +4033,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
             "v1:Pod:default:old-pod:uid-1".to_string(),
             "PodMetadata".to_string(),
             10_000,
-            Some(11),
+            Some(0),
             vec![0x01, 0x02],
             Some(21_000),
         ),
@@ -4193,7 +4049,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         "initial put rows must match expected snapshot"
     );
 
-    let delete = crate::log_apply::LogApplyCommit::new(
+    let delete = crate::log_apply::test_live_commit(
         2,
         vec![crate::log_apply::LogApplyMutation::DeleteAppliedOutbox {
             idempotency_key: "outbox-old".to_string(),
@@ -4207,7 +4063,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         "v1:Pod:default:new-pod:uid-2".to_string(),
         "PodStatus".to_string(),
         20_000,
-        Some(12),
+        Some(0),
         vec![0x03, 0x04],
         None,
     )];
@@ -4219,7 +4075,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     );
     assert_eq!(leader_rows, after_delete_expected);
 
-    let follow_up_put = crate::log_apply::LogApplyCommit::new(
+    let follow_up_put = crate::log_apply::test_live_commit(
         3,
         vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
             crate::log_apply::LogApplyAppliedOutboxRow {
@@ -4242,7 +4098,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         .await
         .unwrap();
 
-    let gc = crate::log_apply::LogApplyCommit::new(
+    let gc = crate::log_apply::test_live_commit(
         4,
         vec![crate::log_apply::LogApplyMutation::GcAppliedOutbox {
             cutoff_ms: 10_000,
@@ -4257,7 +4113,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         "v1:Pod:default:new-pod:uid-2".to_string(),
         "PodStatus".to_string(),
         20_000,
-        Some(12),
+        Some(0),
         vec![0x03, 0x04],
         None,
     )];
@@ -4311,7 +4167,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         expected_rv: created.resource_version,
         preconditions: ResourcePreconditions::resource_version(created.resource_version),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
 
@@ -4324,11 +4180,11 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         )
         .await
         .expect("direct API Node update should build a commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
     let put = commit
-        .mutations
+        .mutations()
         .iter()
         .find_map(|mutation| match mutation {
             crate::log_apply::LogApplyMutation::PutResource(row) => Some(row),
@@ -4464,7 +4320,7 @@ async fn pod_cleanup_intents_schema_is_cluster_uid_and_reason_bound() {
 #[tokio::test]
 async fn log_apply_replays_pod_cleanup_intents() {
     let db = Datastore::new_in_memory().await.unwrap();
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
         7,
         vec![crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
             crate::log_apply::LogApplyPodCleanupIntentRow {
@@ -4499,7 +4355,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
     assert_eq!(rows[0].pod_uid, "lost-uid");
     assert_eq!(rows[0].reason, "NodeLost");
 
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
         8,
         vec![crate::log_apply::LogApplyMutation::DeletePodCleanupIntent(
             crate::log_apply::LogApplyPodCleanupIntentKey {
@@ -4522,7 +4378,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
     );
 
     for pod_name in ["lost-pod-a", "lost-pod-b"] {
-        db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
             9,
             vec![crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
                 crate::log_apply::LogApplyPodCleanupIntentRow {
@@ -4558,7 +4414,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
         2
     );
 
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
         10,
         vec![
             crate::log_apply::LogApplyMutation::DeletePodCleanupIntentsForNode {
@@ -4668,7 +4524,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .await
         .unwrap();
 
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(
         StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
@@ -4679,7 +4535,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     )
     .encode_protobuf()
     .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
             "actor-finalize-finalizer-race",
             "PodMetadata",
@@ -4691,7 +4547,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     else {
         panic!("expected a new actor-finalization outbox commit");
     };
-    assert!(commit.mutations.iter().any(|mutation| matches!(
+    assert!(commit.mutations().iter().any(|mutation| matches!(
         mutation,
         crate::log_apply::LogApplyMutation::FinalizeBoundPod(finalization)
             if finalization.pod_uid == "finalizer-race-uid"
@@ -4770,7 +4626,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     );
 
     let before_fresh_finalize_rv = db.get_current_resource_version().await.unwrap();
-    let fresh_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+    let fresh_payload = crate::node_outbox::payload::OutboxPayload::from_command(
         StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
@@ -4781,7 +4637,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     )
     .encode_protobuf()
     .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: fresh_commit,
         ..
     } = db
@@ -4796,7 +4652,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     else {
         panic!("expected fresh actor finalization commit");
     };
-    assert!(fresh_commit.mutations.iter().any(|mutation| matches!(
+    assert!(fresh_commit.mutations().iter().any(|mutation| matches!(
         mutation,
         crate::log_apply::LogApplyMutation::FinalizeBoundPod(finalization)
             if finalization.pod_uid == "finalizer-race-uid"
@@ -4819,7 +4675,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
 
     let missing_rv = db.get_current_resource_version().await.unwrap();
     let missing_watch_count = watch_event_count(&db).await;
-    let missing_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+    let missing_payload = crate::node_outbox::payload::OutboxPayload::from_command(
         StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
@@ -4830,7 +4686,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     )
     .encode_protobuf()
     .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: missing_commit,
         ..
     } = db
@@ -4845,7 +4701,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     else {
         panic!("missing Pod actor finalization must still reach proposal");
     };
-    assert!(missing_commit.mutations.iter().all(|mutation| matches!(
+    assert!(missing_commit.mutations().iter().all(|mutation| matches!(
         mutation,
         crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
     )));
@@ -4879,7 +4735,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     .unwrap();
     let replacement_rv = db.get_current_resource_version().await.unwrap();
     let replacement_watch_count = watch_event_count(&db).await;
-    let stale_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+    let stale_payload = crate::node_outbox::payload::OutboxPayload::from_command(
         StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
@@ -4890,7 +4746,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     )
     .encode_protobuf()
     .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit: replacement_commit,
         ..
     } = db
@@ -4905,10 +4761,15 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     else {
         panic!("same-name replacement must still reach ledger-only proposal");
     };
-    assert!(replacement_commit.mutations.iter().all(|mutation| matches!(
-        mutation,
-        crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
-    )));
+    assert!(
+        replacement_commit
+            .mutations()
+            .iter()
+            .all(|mutation| matches!(
+                mutation,
+                crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+            ))
+    );
     db.apply_raft_log_apply_commit(replacement_commit)
         .await
         .unwrap();
@@ -4926,7 +4787,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         "replacement-uid"
     );
 
-    let eligible_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+    let eligible_payload = crate::node_outbox::payload::OutboxPayload::from_command(
         StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalizer-race".to_string(),
@@ -4937,61 +4798,11 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     )
     .encode_protobuf()
     .unwrap();
-    let mut reserved_rvs = Vec::new();
-    for idempotency_key in ["actor-finalize-concurrent-a", "actor-finalize-concurrent-b"] {
-        let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
-            commit, applied_rv, ..
-        } = db
-            .build_log_apply_commit_for_outbox(
-                idempotency_key,
-                "PodMetadata",
-                eligible_payload.as_ref(),
-                "worker-a",
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("eligible actor finalization must reserve a proposal RV");
-        };
-        assert!(commit.mutations.iter().any(|mutation| matches!(
-            mutation,
-            crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
-        )));
-        assert!(commit.resource_version > 0);
-        assert_eq!(applied_rv, commit.resource_version);
-        let key = idempotency_key.to_string();
-        let placeholder_rv = db
-            .db_call("test_actor_finalize_placeholder_rv", move |conn| {
-                Ok(conn.query_row(
-                    "SELECT reserved_rv FROM applied_outbox WHERE idempotency_key = ?1",
-                    [key],
-                    |row| row.get::<_, i64>(0),
-                )?)
-            })
-            .await
-            .unwrap();
-        assert_eq!(placeholder_rv, commit.resource_version);
-        reserved_rvs.push(commit.resource_version);
-    }
-    assert_ne!(
-        reserved_rvs[0], reserved_rvs[1],
-        "concurrent eligible legacy actor-finalization proposals need unique reserved RVs"
-    );
-
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
-        commit: v1_commit,
-        applied_rv: v1_applied_rv,
-        ..
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
+        commit, applied_rv, ..
     } = db
         .build_log_apply_commit_for_outbox(
-            "actor-finalize-committed-v1",
+            "actor-finalize-fixed-contract",
             "PodMetadata",
             eligible_payload.as_ref(),
             "worker-a",
@@ -4999,38 +4810,31 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .await
         .unwrap()
     else {
-        panic!("eligible V1 actor finalization must produce a template");
+        panic!("eligible actor finalization must produce a template");
     };
-    assert_eq!(
-        v1_commit.resource_version_assignment,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
-    );
-    assert_eq!(v1_commit.resource_version, 0);
-    assert!(v1_applied_rv > 0);
-    let v1_placeholder_count = db
-        .db_call("test_actor_finalize_v1_placeholder", |conn| {
+    assert_eq!(commit.resource_version(), 0);
+    assert!(applied_rv > 0);
+    assert!(commit.mutations().iter().any(|mutation| matches!(
+        mutation,
+        crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
+    )));
+    let placeholder_count = db
+        .db_call("test_actor_finalize_fixed_placeholder", |conn| {
             Ok(conn.query_row(
                 "SELECT COUNT(*) FROM applied_outbox \
-                 WHERE idempotency_key = 'actor-finalize-committed-v1'",
+                 WHERE idempotency_key = 'actor-finalize-fixed-contract'",
                 [],
                 |row| row.get::<_, i64>(0),
             )?)
         })
         .await
         .unwrap();
-    assert_eq!(v1_placeholder_count, 0);
+    assert_eq!(placeholder_count, 0);
 }
 
 #[tokio::test]
 async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build() {
     let db = Datastore::new_in_memory().await.unwrap();
-    crate::datastore::DatastoreBackend::set_klights_meta(
-        &db,
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let observed = db
         .create_resource(
             "v1",
@@ -5056,7 +4860,7 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
         .await
         .unwrap();
 
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(
         StorageCommand::FinalizeBoundPod {
             namespace: "default".to_string(),
             name: "finalize-rv-race".to_string(),
@@ -5068,7 +4872,7 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
     .encode_protobuf()
     .unwrap();
 
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = db
         .build_log_apply_commit_for_outbox(
             "actor-finalize-rv-race",
             "PodMetadata",
@@ -5119,47 +4923,25 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
 }
 
 #[tokio::test]
-async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibility() {
+async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
     struct Case {
         name: &'static str,
-        assignment: crate::log_apply::ResourceVersionAssignment,
         eligible: bool,
     }
 
     let cases = [
         Case {
-            name: "legacy-eligible",
-            assignment: crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+            name: "fixed-eligible",
             eligible: true,
         },
         Case {
-            name: "legacy-noop",
-            assignment: crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-            eligible: false,
-        },
-        Case {
-            name: "v1-eligible",
-            assignment: crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
-            eligible: true,
-        },
-        Case {
-            name: "v1-noop",
-            assignment: crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+            name: "fixed-noop",
             eligible: false,
         },
     ];
 
     for case in cases {
         let db = Datastore::new_in_memory().await.unwrap();
-        if case.assignment == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
-            crate::datastore::DatastoreBackend::set_klights_meta(
-                &db,
-                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-                case.assignment.as_metadata_value(),
-            )
-            .await
-            .unwrap();
-        }
         let mut pod = json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -5184,7 +4966,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibi
         let before_rv = db.get_current_resource_version().await.unwrap();
         let before_watch_count = watch_event_count(&db).await;
         let idempotency_key = format!("watermarked-finalize-{}", case.name);
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
             StorageCommand::FinalizeBoundPod {
                 namespace: "default".to_string(),
                 name: case.name.to_string(),
@@ -5195,7 +4977,7 @@ async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibi
         )
         .encode_protobuf()
         .unwrap();
-        let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
             commit, applied_rv, ..
         } = db
             .build_log_apply_commit_for_outbox_with_watermark(
@@ -5215,13 +4997,13 @@ async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibi
             panic!("{} must produce a fresh proposal", case.name);
         };
 
-        assert_eq!(commit.resource_version_assignment, case.assignment);
-        assert!(commit.mutations.iter().any(|mutation| matches!(
+        assert_eq!(commit.resource_version(), 0);
+        assert!(commit.mutations().iter().any(|mutation| matches!(
             mutation,
             crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
         )));
         assert_eq!(
-            commit.mutations.iter().any(|mutation| matches!(
+            commit.mutations().iter().any(|mutation| matches!(
                 mutation,
                 crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
             )),
@@ -5243,25 +5025,9 @@ async fn watermarked_actor_finalize_bound_pod_covers_assignment_mode_and_eligibi
             .await
             .unwrap();
 
-        match case.assignment {
-            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned => {
-                assert!(commit.resource_version > 0);
-                assert_eq!(applied_rv, commit.resource_version);
-                assert_eq!(placeholder_count, 1);
-                assert_eq!(
-                    reserved_rv,
-                    case.eligible.then_some(commit.resource_version),
-                    "{} legacy reservation mismatch",
-                    case.name
-                );
-            }
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 => {
-                assert_eq!(commit.resource_version, 0);
-                assert!(applied_rv > 0);
-                assert_eq!(placeholder_count, 0);
-                assert_eq!(reserved_rv, None);
-            }
-        }
+        assert!(applied_rv > 0);
+        assert_eq!(placeholder_count, 0);
+        assert_eq!(reserved_rv, None);
 
         db.apply_raft_log_apply_commit(commit).await.unwrap();
         let live = db
@@ -5405,7 +5171,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     }))
     .unwrap();
 
-    let initial_put = crate::log_apply::LogApplyCommit::new(
+    let initial_put = crate::log_apply::test_live_commit(
         11,
         vec![
             crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
@@ -5460,7 +5226,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
             "lost-pod-a".to_string(),
             "lost-pod-a-uid".to_string(),
             "NodeLost".to_string(),
-            11,
+            1,
             1_700_000_000_100,
             pod_a_data.clone(),
         ),
@@ -5470,7 +5236,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
             "lost-pod-b".to_string(),
             "lost-pod-b-uid".to_string(),
             "NodeLost".to_string(),
-            11,
+            1,
             1_700_000_000_200,
             pod_b_data.clone(),
         ),
@@ -5480,7 +5246,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
             "lost-pod-c".to_string(),
             "lost-pod-c-uid".to_string(),
             "NodeLost".to_string(),
-            11,
+            1,
             1_700_000_000_300,
             pod_c_data.clone(),
         ),
@@ -5491,7 +5257,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, expected_after_put);
 
-    let delete = crate::log_apply::LogApplyCommit::new(
+    let delete = crate::log_apply::test_live_commit(
         12,
         vec![crate::log_apply::LogApplyMutation::DeletePodCleanupIntent(
             crate::log_apply::LogApplyPodCleanupIntentKey {
@@ -5514,7 +5280,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
             "lost-pod-b".to_string(),
             "lost-pod-b-uid".to_string(),
             "NodeLost".to_string(),
-            11,
+            1,
             1_700_000_000_200,
             pod_b_data.clone(),
         ),
@@ -5524,7 +5290,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
             "lost-pod-c".to_string(),
             "lost-pod-c-uid".to_string(),
             "NodeLost".to_string(),
-            11,
+            1,
             1_700_000_000_300,
             pod_c_data.clone(),
         ),
@@ -5534,7 +5300,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, after_delete_expected);
 
-    let delete_node = crate::log_apply::LogApplyCommit::new(
+    let delete_node = crate::log_apply::test_live_commit(
         13,
         vec![
             crate::log_apply::LogApplyMutation::DeletePodCleanupIntentsForNode {
@@ -5555,7 +5321,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
         "lost-pod-b".to_string(),
         "lost-pod-b-uid".to_string(),
         "NodeLost".to_string(),
-        11,
+        1,
         1_700_000_000_200,
         pod_b_data,
     )];
@@ -5570,7 +5336,7 @@ async fn raft_cluster_meta_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let commit = crate::log_apply::LogApplyCommit::new(
+    let commit = crate::log_apply::test_live_commit(
         1,
         vec![
             crate::log_apply::LogApplyMutation::PutKlightsMeta {
@@ -6299,19 +6065,19 @@ async fn build_reserved_rv_commit(
         min_rv: before,
         new_rv: before + 1,
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             idempotency_key,
-            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
             payload.as_ref(),
             "mn-controlplane1",
         )
         .await
         .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit, applied_rv, ..
     } = outcome
     else {
@@ -6321,62 +6087,48 @@ async fn build_reserved_rv_commit(
 }
 
 #[tokio::test]
-async fn rejected_materialized_commit_cleanup_rolls_back_single_reserved_rv() {
+async fn rejected_materialized_commit_does_not_reserve_resource_version_or_ledger_row() {
     let db = Datastore::new_in_memory().await.unwrap();
     let before = db.get_current_resource_version().await.unwrap();
-    let (_commit, reserved_rv) = build_reserved_rv_commit(&db, "rejected-rv-1").await;
+    let (_commit, candidate_rv) = build_reserved_rv_commit(&db, "rejected-rv-1").await;
 
-    assert_eq!(
-        db.get_current_resource_version().await.unwrap(),
-        reserved_rv,
-        "materialization reserves the leader RV before raft accepts the entry"
-    );
-
-    assert!(
-        db.delete_uncommitted_applied_outbox_placeholder("rejected-rv-1", reserved_rv)
-            .await
-            .unwrap()
-    );
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
         before,
-        "rejected materialized raft entries must not leave leader-only RV drift"
+        "materialization must not reserve a public RV before raft accepts the entry"
+    );
+    assert_eq!(
+        candidate_rv,
+        before + 1,
+        "materialization may carry only a non-durable candidate hint"
+    );
+    assert!(
+        db.get_applied_outbox("rejected-rv-1")
+            .await
+            .unwrap()
+            .is_none(),
+        "materialization must not create a durable outbox placeholder"
     );
 }
 
 #[tokio::test]
-async fn rejected_materialized_commit_cleanup_handles_out_of_order_reservations() {
+async fn multiple_materialized_commits_do_not_advance_public_resource_version() {
     let db = Datastore::new_in_memory().await.unwrap();
     let before = db.get_current_resource_version().await.unwrap();
     let (_first_commit, first_rv) = build_reserved_rv_commit(&db, "rejected-rv-first").await;
     let (_second_commit, second_rv) = build_reserved_rv_commit(&db, "rejected-rv-second").await;
 
-    assert_eq!(second_rv, first_rv + 1);
-    assert!(
-        db.delete_uncommitted_applied_outbox_placeholder("rejected-rv-first", first_rv)
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        db.get_current_resource_version().await.unwrap(),
-        second_rv,
-        "cleaning an older rejected reservation must not roll back a later reservation"
-    );
-
-    assert!(
-        db.delete_uncommitted_applied_outbox_placeholder("rejected-rv-second", second_rv)
-            .await
-            .unwrap()
-    );
+    assert_eq!(first_rv, before + 1);
+    assert_eq!(second_rv, before + 1);
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
         before,
-        "out-of-order rejected reservations should settle at the last committed RV"
+        "uncommitted materializations must not consume public RVs"
     );
 }
 
 #[tokio::test]
-async fn raft_terminal_conflict_rolls_back_materialized_reserved_rv() {
+async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
@@ -6395,19 +6147,19 @@ async fn raft_terminal_conflict_rolls_back_materialized_reserved_rv() {
         name: "mn-controlplane2".to_string(),
         data: json!({"metadata": {"name": "mn-controlplane2"}}),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "conflicting-node-registration",
-            crate::kubelet::outbox::payload::OutboxOperation::NodeRegistration.as_str(),
+            crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
             payload.as_ref(),
             "mn-controlplane2",
         )
         .await
         .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit, applied_rv, ..
     } = outcome
     else {
@@ -6415,9 +6167,10 @@ async fn raft_terminal_conflict_rolls_back_materialized_reserved_rv() {
     };
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
-        applied_rv,
-        "commit materialization reserves the next RV on the leader"
+        before,
+        "commit materialization must not reserve the candidate RV on the leader"
     );
+    assert_eq!(applied_rv, before + 1);
 
     let result = db.apply_raft_log_apply_commit(commit).await.unwrap();
     assert!(
@@ -6427,7 +6180,7 @@ async fn raft_terminal_conflict_rolls_back_materialized_reserved_rv() {
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
         before,
-        "terminal raft conflicts must roll back the leader-only materialized RV"
+        "terminal raft conflicts must not consume the candidate RV"
     );
 }
 
@@ -6562,8 +6315,8 @@ async fn raft_allocate_node_subnet_resolves_lowest_free_24_at_apply_time() {
                         None,
                     )?;
                     assert!(
-                        commit.resource_version > 0,
-                        "allocate subnet commits must carry the leader's committed RV"
+                        commit.resource_version() == 0,
+                        "allocate subnet commits must remain RV-zero before apply"
                     );
                     commits.push(commit);
                 }

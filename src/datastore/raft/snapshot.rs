@@ -29,9 +29,9 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-use crate::datastore::DatastoreHandle;
-use crate::datastore::DurableRecoveryStore;
-use crate::datastore::raft::types::{NodeId, TypeConfig};
+use super::super::DatastoreHandle;
+use super::super::DurableRecoveryStore;
+use super::types::{NodeId, TypeConfig};
 
 /// Self-describing snapshot envelope. Carries the `last_applied`
 /// log-id, the membership configuration, and an ordered list of
@@ -41,35 +41,77 @@ use crate::datastore::raft::types::{NodeId, TypeConfig};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RaftSnapshotData {
     pub last_applied: Option<LogId<NodeId>>,
-    pub membership: StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+    pub membership: StoredMembership<NodeId, super::types::RaftMemberNode>,
     #[serde(default)]
     pub current_rv: i64,
-    /// Persisted assignment protocol. Missing from legacy envelopes means the
-    /// historical leader-assigned RV behavior.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::datastore::resource_version_assignment::SnapshotAssignmentMode::is_absent_legacy"
-    )]
-    pub resource_version_assignment_mode:
-        crate::datastore::resource_version_assignment::SnapshotAssignmentMode,
     /// Exact-v3 activation proof captured from the same immutable backend
-    /// view as the allocator and resource state. Absent legacy snapshots are
-    /// deliberately fail-closed.
+    /// view as the allocator and resource state. A missing proof is rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_codec_activation_version: Option<u32>,
-    /// Durable watch-log allocator boundary. `None` identifies snapshots
-    /// written by peers predating apply-order event IDs.
+    /// Durable watch-log allocator boundary. `None` means no boundary was
+    /// captured and is rejected where an authoritative boundary is required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch_event_high_water: Option<i64>,
-    /// Authoritative watch-compaction boundaries. `None` is reserved for
-    /// snapshots from peers predating replay-floor transfer.
+    /// Authoritative watch-compaction boundaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
+    pub watch_replay_floors: Option<Vec<super::super::WatchReplayFloor>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_metadata: Option<klights_cluster_core::ClusterMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_membership: Option<RaftSnapshotMembership>,
-    pub commits: Vec<crate::log_apply::LogApplyCommit>,
+    #[serde(default, alias = "commits", with = "snapshot_operations_serde")]
+    pub operations: Vec<crate::log_apply::SnapshotRestoreOperation>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotOperationWire {
+    resource_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outbox_watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    mutations: Vec<crate::log_apply::LogApplyMutation>,
+}
+
+mod snapshot_operations_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::SnapshotOperationWire;
+    use crate::log_apply::SnapshotRestoreOperation;
+
+    pub(super) fn serialize<S>(
+        operations: &[SnapshotRestoreOperation],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        operations
+            .iter()
+            .map(|operation| SnapshotOperationWire {
+                resource_version: operation.resource_version(),
+                outbox_watermark: operation.outbox_watermark().cloned(),
+                mutations: operation.mutations().to_vec(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Vec<SnapshotRestoreOperation>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Vec::<SnapshotOperationWire>::deserialize(deserializer)?
+            .into_iter()
+            .map(|wire| {
+                SnapshotRestoreOperation::new(
+                    wire.resource_version,
+                    wire.outbox_watermark,
+                    wire.mutations,
+                )
+            })
+            .collect())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -80,18 +122,18 @@ pub(crate) enum RaftSnapshotMembership {
 
 impl RaftSnapshotData {
     pub(crate) fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self> {
-        crate::datastore::raft::compressed::decode_json(bytes)
+        super::compressed::decode_json(bytes)
     }
 
     #[cfg(test)]
     pub async fn serialize_from_backend_to_cursor(
         db: DatastoreHandle,
         last_applied: Option<LogId<NodeId>>,
-        membership: &StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+        membership: &StoredMembership<NodeId, super::types::RaftMemberNode>,
     ) -> Result<Cursor<Vec<u8>>> {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         let (snapshot, _, _) = Self::serialize_from_backend_to_cursor_inner(
-            Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(db)),
+            Arc::new(super::super::DatastoreDurableRecoveryPort::new(db)),
             RaftSnapshotAppliedStateSource::Fixed {
                 last_applied,
                 membership: membership.clone(),
@@ -109,7 +151,7 @@ impl RaftSnapshotData {
     ) -> Result<(
         Cursor<Vec<u8>>,
         Option<LogId<NodeId>>,
-        StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+        StoredMembership<NodeId, super::types::RaftMemberNode>,
     )> {
         let anchor = RaftSnapshotCaptureAnchor::new(applied_state_source);
         let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
@@ -219,18 +261,14 @@ async fn encode_pristine_bootstrap_snapshot(
                     last_applied: captured.0,
                     membership: captured.1,
                     current_rv: 0,
-                    resource_version_assignment_mode:
-                        crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
-                            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                        ),
                     command_codec_activation_version: None,
                     watch_event_high_water: Some(0),
                     watch_replay_floors: Some(Vec::new()),
                     cluster_metadata: None,
                     cluster_membership: None,
-                    commits: Vec::new(),
+                    operations: Vec::new(),
                 };
-                crate::datastore::raft::compressed::encode(&serde_json::to_vec(&data)?)
+                super::compressed::encode(&serde_json::to_vec(&data)?)
             },
         )
         .await
@@ -242,7 +280,7 @@ fn encode_snapshot_pages(
     captured: CapturedRaftAppliedState,
     pages: &mut tokio::sync::mpsc::Receiver<SnapshotCapturePage>,
 ) -> Result<Vec<u8>> {
-    let mut framed = vec![crate::datastore::raft::compressed::TAG_ZSTD];
+    let mut framed = vec![super::compressed::TAG_ZSTD];
     let mut encoder = zstd::Encoder::new(&mut framed, 3)?;
     let mut writer = RaftJsonSnapshotEncoder::new(&mut encoder);
     writer.begin_capture(&header, captured)?;
@@ -259,14 +297,14 @@ enum RaftSnapshotAppliedStateSource {
     #[cfg(test)]
     Fixed {
         last_applied: Option<LogId<NodeId>>,
-        membership: StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+        membership: StoredMembership<NodeId, super::types::RaftMemberNode>,
     },
     Durable(Arc<dyn RaftAppliedStateDurability>),
 }
 
 type CapturedRaftAppliedState = (
     Option<LogId<NodeId>>,
-    StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+    StoredMembership<NodeId, super::types::RaftMemberNode>,
 );
 
 impl RaftSnapshotAppliedStateSource {
@@ -323,7 +361,7 @@ impl RaftSnapshotCaptureAnchor {
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::backend::SnapshotCaptureAnchor for RaftSnapshotCaptureAnchor {
+impl super::super::backend::SnapshotCaptureAnchor for RaftSnapshotCaptureAnchor {
     async fn pin_under_snapshot_fence(&self) -> anyhow::Result<()> {
         let captured = self.source.load().await?;
         *self.captured.lock().unwrap() = Some(captured);
@@ -386,9 +424,9 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
             .map_err(|error| SnapshotPersistenceError::persistence_failed(error.to_string()))
     }
 
-    fn write_commit(
+    fn write_operation(
         &mut self,
-        commit: &crate::log_apply::LogApplyCommit,
+        operation: &crate::log_apply::SnapshotRestoreOperation,
     ) -> Result<(), SnapshotPersistenceError> {
         if self.floors_open {
             return Err(SnapshotPersistenceError::persistence_failed(
@@ -399,7 +437,11 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
             self.write_bytes(b",")?;
         }
         self.first_commit = false;
-        self.write_json(commit)
+        self.write_json(&SnapshotOperationWire {
+            resource_version: operation.resource_version(),
+            outbox_watermark: operation.outbox_watermark().cloned(),
+            mutations: operation.mutations().to_vec(),
+        })
     }
 
     fn open_floors(&mut self) -> Result<(), SnapshotPersistenceError> {
@@ -440,7 +482,7 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
                 namespace,
             } => (api_version, kind, namespace),
         };
-        self.write_json(&crate::datastore::WatchReplayFloor {
+        self.write_json(&super::super::WatchReplayFloor {
             api_version,
             kind,
             namespace_key,
@@ -457,7 +499,6 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
             .ok_or_else(|| anyhow::anyhow!("snapshot capture omitted header"))?;
         anyhow::ensure!(
             begun.position() == returned.position()
-                && begun.resource_version_assignment() == returned.resource_version_assignment()
                 && begun.command_codec_activation_version()
                     == returned.command_codec_activation_version()
                 && begun.metadata() == returned.metadata()
@@ -487,18 +528,8 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
         self.captured_applied_state = Some((last_applied, membership));
         self.header = Some(header.clone());
         let position = header.position();
-        let assignment = match header.resource_version_assignment() {
-            Some(mode) => {
-                crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
-                    mode,
-                )
-            }
-            None => crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot,
-        };
         self.write_bytes(b",\"current_rv\":")?;
         self.write_json(&position.resource_version)?;
-        self.write_bytes(b",\"resource_version_assignment_mode\":")?;
-        self.write_json(&assignment)?;
         self.write_bytes(b",\"command_codec_activation_version\":")?;
         self.write_json(&header.command_codec_activation_version())?;
         self.write_bytes(b",\"watch_event_high_water\":")?;
@@ -516,7 +547,7 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
             }
         };
         self.write_json(&membership)?;
-        self.write_bytes(b",\"commits\":[")
+        self.write_bytes(b",\"operations\":[")
     }
 
     fn push_page(&mut self, page: SnapshotCapturePage) -> Result<(), SnapshotPersistenceError> {
@@ -532,27 +563,26 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
             .resource_version;
         match page.kind() {
             SnapshotCapturePageKind::Commits => {
-                for commit in page.into_commits().expect("page kind checked") {
-                    self.write_commit(&commit)?;
+                for operation in page.into_operations().expect("page kind checked") {
+                    self.write_operation(&operation)?;
                 }
             }
             SnapshotCapturePageKind::AppliedOutbox => {
                 for row in page.into_applied_outbox().expect("page kind checked") {
-                    self.write_commit(&crate::log_apply::LogApplyCommit::new(
+                    self.write_operation(&crate::log_apply::SnapshotRestoreOperation::new(
                         current_rv,
+                        None,
                         vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)],
                     ))?;
                 }
             }
             SnapshotCapturePageKind::OutboxWatermarks => {
                 for outbox_watermark in page.into_outbox_watermarks().expect("page kind checked") {
-                    self.write_commit(&crate::log_apply::LogApplyCommit {
-                        resource_version: current_rv,
-                        resource_version_assignment:
-                            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                        outbox_watermark: Some(outbox_watermark),
-                        mutations: Vec::new(),
-                    })?;
+                    self.write_operation(&crate::log_apply::SnapshotRestoreOperation::new(
+                        current_rv,
+                        Some(outbox_watermark),
+                        Vec::new(),
+                    ))?;
                 }
             }
             SnapshotCapturePageKind::ReplayFloors => {
@@ -677,7 +707,7 @@ mod tests {
         assert_eq!(decoded.watch_replay_floors, Some(Vec::new()));
         assert_eq!(decoded.cluster_metadata, None);
         assert_eq!(decoded.cluster_membership, None);
-        assert!(decoded.commits.is_empty());
+        assert!(decoded.operations.is_empty());
     }
 
     #[tokio::test]
@@ -834,57 +864,19 @@ mod tests {
             decoded.watch_event_high_water,
             Some(db.current_watch_replay_position().await.unwrap().event_id)
         );
-        assert!(!decoded.commits.is_empty(), "snapshot must contain commits");
         assert!(
-            decoded.commits.iter().any(|c| c.mutations.iter().any(|m| {
-                matches!(m, crate::log_apply::LogApplyMutation::PutResource(row)
+            !decoded.operations.is_empty(),
+            "snapshot must contain restore operations"
+        );
+        assert!(
+            decoded
+                .operations
+                .iter()
+                .any(|operation| operation.mutations().iter().any(|m| {
+                    matches!(m, crate::log_apply::LogApplyMutation::PutResource(row)
                     if row.name == "cm-stream-test")
-            })),
+                })),
             "snapshot must contain the ConfigMap"
-        );
-    }
-
-    #[tokio::test]
-    async fn snapshot_serialization_preserves_v1_assignment_mode() {
-        let db = test_support::in_memory().await;
-        seed_cluster_metadata(&db).await;
-        crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
-            &db,
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
-        )
-        .await
-        .unwrap();
-        let membership =
-            StoredMembership::<NodeId, crate::datastore::raft::types::RaftMemberNode>::default();
-        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
-            Arc::new(db.clone()),
-            None,
-            &membership,
-        )
-        .await
-        .unwrap();
-        let decoded = RaftSnapshotData::deserialize_from_bytes(&snapshot.into_inner()).unwrap();
-        assert_eq!(
-            decoded.resource_version_assignment_mode,
-            crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
-                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
-            )
-        );
-
-        let restored = test_support::in_memory().await;
-        crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
-            &restored,
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                &restored
-            )
-            .await
-            .unwrap(),
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
         );
     }
 
@@ -906,15 +898,13 @@ mod tests {
             stream_seq: 1,
         };
         db.replace_replicated_resource_state(
-            vec![crate::log_apply::LogApplyCommit {
-                resource_version: 7,
-                resource_version_assignment:
-                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                outbox_watermark: Some(watermark.clone()),
-                mutations: vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
+            vec![crate::log_apply::SnapshotRestoreOperation::new(
+                7,
+                Some(watermark.clone()),
+                vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
                     outbox.clone(),
                 )],
-            }],
+            )],
             7,
             Some(11),
             Some(vec![crate::datastore::WatchReplayFloor {
@@ -929,11 +919,7 @@ mod tests {
                 cluster_id: "snapshot-exact-cluster".into(),
                 leader_epoch: 3,
                 membership: crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent,
-                resource_version_assignment_mode: Some(
-                    crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
-                ),
                 command_codec_activation_version: None,
-                snapshot_assignment_mode: None,
             }),
         )
         .await
@@ -962,24 +948,18 @@ mod tests {
             decoded.cluster_membership,
             Some(RaftSnapshotMembership::AuthoritativeAbsent)
         );
-        assert_eq!(
-            decoded.resource_version_assignment_mode,
-            crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
-                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
-            )
-        );
         let floors = decoded.watch_replay_floors.unwrap();
         assert_eq!(floors.len(), 1);
         assert_eq!(floors[0].floor_resource_version, 6);
         assert_eq!(floors[0].floor_event_id, 10);
         assert!(
             decoded
-                .commits
+                .operations
                 .iter()
-                .any(|commit| { commit.outbox_watermark.as_ref() == Some(&watermark) })
+                .any(|operation| { operation.outbox_watermark() == Some(&watermark) })
         );
-        assert!(decoded.commits.iter().any(|commit| {
-            commit.mutations.iter().any(|mutation| {
+        assert!(decoded.operations.iter().any(|operation| {
+            operation.mutations().iter().any(|mutation| {
                 matches!(
                     mutation,
                     crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)
@@ -1006,9 +986,6 @@ mod tests {
         assert_eq!(decoded.current_rv, 7);
         assert_eq!(decoded.watch_event_high_water, None);
         assert_eq!(decoded.watch_replay_floors, None);
-        assert_eq!(
-            decoded.resource_version_assignment_mode,
-            crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot
-        );
+        assert!(decoded.operations.is_empty());
     }
 }

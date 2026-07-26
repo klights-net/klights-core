@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::datastore::node_local::PodRuntimeRow;
 use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
@@ -48,7 +47,7 @@ pub enum CriInventoryAction {
 
 pub fn diff_cri_inventory(
     cache_primed: bool,
-    runtime_rows: &[PodRuntimeRow],
+    runtime_rows: &[klights_node_store::PodRuntimeRecord],
     leader_pods: &[serde_json::Value],
     cri_sandboxes: &[CriPodSandboxSummary],
     cri_containers: &[CriContainerInventory],
@@ -80,7 +79,7 @@ pub fn diff_cri_inventory(
         .collect::<HashSet<_>>();
     let runtime_sandboxes = runtime_rows
         .iter()
-        .filter_map(|row| row.sandbox_id.clone())
+        .filter_map(|row| row.sandbox_id().map(str::to_string))
         .collect::<HashSet<_>>();
     let dirty_sandboxes = cri_containers
         .iter()
@@ -90,9 +89,10 @@ pub fn diff_cri_inventory(
     let mut actions = Vec::new();
 
     for row in runtime_rows {
-        let key = PodLifecycleKey::new(&row.namespace, &row.pod_name, &row.pod_uid);
-        match leader_by_slot.get(&(row.namespace.clone(), row.pod_name.clone())) {
-            Some((uid, pod)) if uid == &row.pod_uid => match row.sandbox_id.as_deref() {
+        let identity = row.pod();
+        let key = PodLifecycleKey::new(&identity.namespace, &identity.name, &identity.uid);
+        match leader_by_slot.get(&(identity.namespace.clone(), identity.name.clone())) {
+            Some((uid, pod)) if uid == &identity.uid => match row.sandbox_id() {
                 Some(sandbox_id) if cri_sandbox_ids.contains(sandbox_id) => {
                     actions.push(CriInventoryAction::ReattachExistingSandbox {
                         key: key.clone(),
@@ -113,8 +113,7 @@ pub fn diff_cri_inventory(
                 reason: OrphanReason::UidChangedWhileDown,
             }),
             None if row
-                .sandbox_id
-                .as_ref()
+                .sandbox_id()
                 .is_some_and(|id| cri_sandbox_ids.contains(id)) =>
             {
                 actions.push(CriInventoryAction::FinalizeOrphan {
@@ -244,10 +243,9 @@ pub fn orphaned_pod_dir_ids(
 /// Returns the number of orphan dirs removed.
 pub async fn sweep_orphan_pod_artifacts(
     file_process: &klights_supervisor::FileProcessExecutor,
-    containerd_ns: &str,
+    pods_root: std::path::PathBuf,
     live_owners: &HashSet<(String, String, String)>,
 ) -> anyhow::Result<usize> {
-    let pods_root = crate::paths::volumes_root_path(containerd_ns);
     let dir_ids =
         crate::kubelet::pod_fs::PodFs::list_subdir_names(file_process, pods_root.clone()).await?;
 
@@ -312,17 +310,16 @@ pub mod tests {
         namespace: &str,
         name: &str,
         sandbox_id: Option<&str>,
-    ) -> PodRuntimeRow {
-        PodRuntimeRow {
-            pod_uid: uid.to_string(),
-            namespace: namespace.to_string(),
-            pod_name: name.to_string(),
-            node_name: "worker-a".to_string(),
-            sandbox_id: sandbox_id.map(str::to_string),
-            cgroup_path: None,
-            created_ms: 1,
-            started_ms: Some(2),
-        }
+    ) -> klights_node_store::PodRuntimeRecord {
+        klights_node_store::PodRuntimeRecord::try_new(
+            klights_types::PodIdentity::new(namespace, name, uid),
+            "worker-a",
+            sandbox_id.map(str::to_string),
+            None,
+            1,
+            Some(2),
+        )
+        .unwrap()
     }
 
     pub fn sandbox(id: &str, namespace: &str, name: &str, uid: &str) -> CriPodSandboxSummary {

@@ -109,7 +109,6 @@ pub fn validate_uid_immutable(incoming: &Value, current: &Value) -> Result<()> {
         return Ok(());
     };
     klights_cluster_core::validate_apply_preconditions(
-        klights_cluster_core::ApplyPreconditionPolicy::Strict,
         klights_cluster_core::ApplyPreconditions {
             uid: Some(incoming_uid),
             ..klights_cluster_core::ApplyPreconditions::default()
@@ -131,7 +130,6 @@ pub fn validate_resource_preconditions(
     current_rv: i64,
 ) -> Result<()> {
     klights_cluster_core::validate_apply_preconditions(
-        klights_cluster_core::ApplyPreconditionPolicy::Strict,
         klights_cluster_core::ApplyPreconditions {
             uid: preconditions.uid.as_deref(),
             resource_version: preconditions.resource_version,

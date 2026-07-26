@@ -1,4 +1,3 @@
-use crate::kubelet::node_status_merge::set_node_external_ip;
 use crate::utils::k8s_time_now;
 
 /// The two network-related Node conditions (`Ready` + `NetworkUnavailable`)
@@ -15,11 +14,11 @@ pub(super) struct NodeNetworkConditions {
 
 impl NodeNetworkConditions {
     pub(super) fn from_health(
-        dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
+        dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     ) -> Self {
-        use crate::networking::dataplane_health::DataplaneHealthStatus;
-        match dataplane_health.map(|health| health.status()) {
-            None | Some(DataplaneHealthStatus::Healthy) => Self {
+        use klights_network_api::DataplaneHealthSnapshot;
+        match dataplane_health {
+            None | Some(DataplaneHealthSnapshot::Healthy) => Self {
                 ready_status: "True",
                 ready_reason: "KubeletReady",
                 ready_message: "klights is ready".to_string(),
@@ -27,13 +26,13 @@ impl NodeNetworkConditions {
                 net_unavail_reason: "RouteCreated",
                 net_unavail_message: "RouteController created a route".to_string(),
             },
-            Some(DataplaneHealthStatus::Unavailable { reason }) => Self {
+            Some(DataplaneHealthSnapshot::Unavailable { reason }) => Self {
                 ready_status: "False",
                 ready_reason: "NetworkUnavailable",
                 ready_message: reason.clone(),
                 net_unavail_status: "True",
                 net_unavail_reason: "DataplaneNotReady",
-                net_unavail_message: reason,
+                net_unavail_message: reason.clone(),
             },
         }
     }
@@ -109,126 +108,31 @@ pub(super) fn apply_network_conditions(
 }
 
 pub fn set_node_external_ip_from_dataplane_annotation(node: &mut serde_json::Value) -> bool {
-    let endpoint = node
-        .pointer("/metadata/annotations")
-        .and_then(|value| value.as_object())
-        .and_then(|annotations| {
-            annotations
-                .get(klights_network_api::DATAPLANE_ENDPOINT_ANNOTATION)
-                .and_then(|value| value.as_str())
-        })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let Some(endpoint) = endpoint else {
-        return false;
-    };
-    set_node_external_ip(node, &endpoint)
+    klights_cluster_core::set_node_external_ip_from_dataplane_annotation(node)
 }
 
 pub fn set_node_pod_cidr(node: &mut serde_json::Value, pod_cidr: &str) -> bool {
-    let pod_cidr = pod_cidr.trim();
-    if pod_cidr.is_empty() {
-        return false;
-    }
-    let Some(node_object) = node.as_object_mut() else {
-        return false;
-    };
-    let spec = node_object
-        .entry("spec")
-        .or_insert_with(|| serde_json::json!({}));
-    if !spec.is_object() {
-        *spec = serde_json::json!({});
-    }
-    let Some(spec_object) = spec.as_object_mut() else {
-        return false;
-    };
-
-    let mut changed = set_json_string_field(spec_object, "podCIDR", pod_cidr);
-    let desired = serde_json::json!([pod_cidr]);
-    if spec_object.get("podCIDRs") != Some(&desired) {
-        spec_object.insert("podCIDRs".to_string(), desired);
-        changed = true;
-    }
-    changed
+    klights_cluster_core::set_node_pod_cidr(node, pod_cidr)
 }
 
 pub fn set_node_dataplane_annotations(
     node: &mut serde_json::Value,
-    metadata: &crate::networking::wireguard::DataplanePeerMetadata,
+    metadata: &klights_leader_api::NetworkDataplane,
 ) -> bool {
-    use klights_network_api::{
-        DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION, DATAPLANE_MODE_ANNOTATION,
-        DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION,
-    };
-
-    let Some(node_object) = node.as_object_mut() else {
-        return false;
-    };
-    let metadata_object = node_object
-        .entry("metadata")
-        .or_insert_with(|| serde_json::json!({}));
-    if !metadata_object.is_object() {
-        *metadata_object = serde_json::json!({});
-    }
-    let Some(metadata_object) = metadata_object.as_object_mut() else {
-        return false;
-    };
-    let annotations = metadata_object
-        .entry("annotations")
-        .or_insert_with(|| serde_json::json!({}));
-    if !annotations.is_object() {
-        *annotations = serde_json::json!({});
-    }
-    let Some(annotations) = annotations.as_object_mut() else {
-        return false;
-    };
-
-    let mut changed = false;
-    changed |= set_json_string_field(
-        annotations,
-        DATAPLANE_ENDPOINT_ANNOTATION,
-        &metadata.endpoint.to_string(),
-    );
-    changed |= set_json_string_field(
-        annotations,
-        DATAPLANE_MODE_ANNOTATION,
-        metadata.mode.as_str(),
-    );
-    changed |= set_json_string_field(
-        annotations,
-        DATAPLANE_ENCRYPTION_ANNOTATION,
-        metadata.encryption.as_str(),
-    );
-    if let Some(port) = metadata.port {
-        changed |= set_json_string_field(annotations, DATAPLANE_PORT_ANNOTATION, &port.to_string());
-    } else {
-        changed |= annotations.remove(DATAPLANE_PORT_ANNOTATION).is_some();
-    }
-    if let Some(public_key) = metadata.public_key.as_ref() {
-        changed |= set_json_string_field(
-            annotations,
-            DATAPLANE_PUBLIC_KEY_ANNOTATION,
-            &public_key.to_string(),
-        );
-    } else {
-        changed |= annotations
-            .remove(DATAPLANE_PUBLIC_KEY_ANNOTATION)
-            .is_some();
-    }
-    changed
-}
-
-fn set_json_string_field(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: &str,
-) -> bool {
-    if object.get(key).and_then(|existing| existing.as_str()) == Some(value) {
-        return false;
-    }
-    object.insert(key.to_string(), serde_json::json!(value));
-    true
+    klights_types::set_node_dataplane_annotations(
+        node,
+        &metadata.endpoint().to_string(),
+        match metadata.mode() {
+            klights_leader_api::NetworkNodeMode::Root => "root",
+            klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+        },
+        match metadata.encryption() {
+            klights_leader_api::DataplaneEncryption::WireGuard => "wireguard",
+            klights_leader_api::DataplaneEncryption::Direct => "disabled",
+        },
+        metadata.public_key(),
+        metadata.port(),
+    )
 }
 
 #[cfg(test)]
@@ -276,9 +180,7 @@ mod tests {
         DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION, DATAPLANE_MODE_ANNOTATION,
         DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION, GIT_COMMIT_ANNOTATION,
     };
-    use crate::networking::wireguard::{
-        DataplaneEncryption, DataplaneMode, DataplanePeerMetadata, WireGuardPublicKey,
-    };
+    use klights_leader_api::{DataplaneEncryption, NetworkDataplane, NetworkNodeMode};
     use std::net::IpAddr;
 
     #[test]
@@ -309,14 +211,15 @@ mod tests {
                 }
             }
         });
-        let metadata = DataplanePeerMetadata {
-            node_name: "node-a".to_string(),
-            endpoint: "192.0.2.15".parse::<IpAddr>().expect("endpoint"),
-            port: None,
-            public_key: None,
-            mode: DataplaneMode::Root,
-            encryption: DataplaneEncryption::Enabled,
-        };
+        let metadata = NetworkDataplane::try_new(
+            "node-a",
+            NetworkNodeMode::Root,
+            DataplaneEncryption::Direct,
+            None,
+            "192.0.2.15".parse::<IpAddr>().expect("endpoint"),
+            None,
+        )
+        .expect("direct dataplane");
 
         assert!(set_node_dataplane_annotations(&mut node, &metadata));
         let annotations = node
@@ -339,7 +242,7 @@ mod tests {
             annotations
                 .get(DATAPLANE_ENCRYPTION_ANNOTATION)
                 .and_then(|value| value.as_str()),
-            Some("enabled")
+            Some("disabled")
         );
         assert!(!annotations.contains_key(DATAPLANE_PORT_ANNOTATION));
         assert!(!annotations.contains_key(DATAPLANE_PUBLIC_KEY_ANNOTATION));
@@ -349,17 +252,15 @@ mod tests {
     #[test]
     fn node_status_projection_sets_dataplane_optional_annotation_fields() {
         let mut node = serde_json::json!({});
-        let metadata = DataplanePeerMetadata {
-            node_name: "node-a".to_string(),
-            endpoint: "192.0.2.20".parse::<IpAddr>().expect("endpoint"),
-            port: Some(51821),
-            public_key: Some(
-                WireGuardPublicKey::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-                    .expect("public key"),
-            ),
-            mode: DataplaneMode::Rootless,
-            encryption: DataplaneEncryption::Disabled,
-        };
+        let metadata = NetworkDataplane::try_new(
+            "node-a",
+            NetworkNodeMode::Rootless,
+            DataplaneEncryption::WireGuard,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "192.0.2.20".parse::<IpAddr>().expect("endpoint"),
+            Some(51821),
+        )
+        .expect("wireguard dataplane");
 
         assert!(set_node_dataplane_annotations(&mut node, &metadata));
         let annotations = node

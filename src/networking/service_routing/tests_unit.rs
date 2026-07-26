@@ -959,26 +959,24 @@ impl klights_leader_api::LeaderResourceQuery for FreshServiceInventoryClient {
     }
 }
 
-impl crate::control_plane::client::LeaderWatch for FreshServiceInventoryClient {
+impl klights_leader_api::LeaderWatch for FreshServiceInventoryClient {
     fn watch_resources(
         &self,
-        _req: crate::control_plane::client::WatchRequest,
-    ) -> crate::control_plane::client::LeaderWatchFuture<'_> {
+        _req: klights_leader_api::WatchRequest,
+    ) -> klights_leader_api::LeaderWatchFuture<'_> {
         Box::pin(async {
-            Ok(
-                crate::control_plane::client::WatchStream::unpositioned_test_stream(
-                    futures::stream::empty(),
-                ),
-            )
+            Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                futures::stream::empty(),
+            ))
         })
     }
 }
 
-impl crate::control_plane::client::LeaderCacheReadiness for FreshServiceInventoryClient {
+impl klights_leader_api::LeaderCacheReadiness for FreshServiceInventoryClient {
     fn wait_cache_ready(
         &self,
-        _scope: crate::control_plane::client::CacheReadinessRequest,
-    ) -> crate::control_plane::client::CacheReadinessFuture<'_> {
+        _scope: klights_leader_api::CacheReadinessRequest,
+    ) -> klights_leader_api::CacheReadinessFuture<'_> {
         Box::pin(async { Ok(()) })
     }
 }

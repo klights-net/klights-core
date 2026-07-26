@@ -24,9 +24,9 @@ use openraft::{
     StoredMembership,
 };
 
-use crate::datastore::raft::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
-use crate::datastore::raft::types::{NodeId, StorageCommandResult, TypeConfig};
-use crate::datastore::{BackendLifecycleStore, DatastoreBackend, DurableRecoveryStore};
+use super::super::{BackendLifecycleStore, DatastoreBackend, DurableRecoveryStore};
+use super::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
+use super::types::{NodeId, StorageCommandResult, TypeConfig};
 
 #[derive(Clone)]
 pub struct SqliteRaftStateMachine {
@@ -59,10 +59,10 @@ impl SqliteRaftStateMachine {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         command_codec_v3_activation: Arc<super::node::CommandCodecV3Activation>,
     ) -> Self {
-        let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+        let recovery = Arc::new(super::super::DatastoreDurableRecoveryPort::new(
             backend.clone(),
         ));
-        let lifecycle = Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+        let lifecycle = Arc::new(super::super::DatastoreBackendLifecyclePort::new(
             backend.clone(),
         ));
         Self {
@@ -77,7 +77,7 @@ impl SqliteRaftStateMachine {
 }
 
 fn commit_activates_command_codec_v3(commit: &crate::log_apply::LogApplyCommit) -> bool {
-    commit.mutations.iter().any(|mutation| {
+    commit.mutations().iter().any(|mutation| {
         matches!(
             mutation,
             crate::log_apply::LogApplyMutation::PutKlightsMeta { key, value }
@@ -111,7 +111,7 @@ impl SqliteRaftStateMachine {
     ) -> Result<
         (
             Option<LogId<NodeId>>,
-            StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+            StoredMembership<NodeId, super::types::RaftMemberNode>,
         ),
         StorageError<NodeId>,
     > {
@@ -141,9 +141,7 @@ impl SqliteRaftStateMachine {
     async fn write_applied_state(
         &self,
         id: Option<LogId<NodeId>>,
-        membership: Option<
-            &StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
-        >,
+        membership: Option<&StoredMembership<NodeId, super::types::RaftMemberNode>>,
     ) -> Result<(), StorageError<NodeId>> {
         let last = id
             .map(|value| serde_json::to_vec(&Some(value)))
@@ -177,7 +175,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
     ) -> Result<
         (
             Option<LogId<NodeId>>,
-            StoredMembership<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+            StoredMembership<NodeId, super::types::RaftMemberNode>,
         ),
         StorageError<NodeId>,
     > {
@@ -242,7 +240,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                         .map_err(|e| apply_err(log_id, e))?;
                     let activates_command_codec_v3 = commit_activates_command_codec_v3(&commit);
                     let port =
-                        crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
+                        super::super::cluster_store_adapter::DatastoreCommittedRaftApply::new(
                             self.backend.clone(),
                             super::authority::committed_apply(),
                         );
@@ -294,7 +292,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, crate::datastore::raft::types::RaftMemberNode>,
+        meta: &SnapshotMeta<NodeId, super::types::RaftMemberNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
@@ -323,11 +321,11 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         // authoritative replace primitive, which deletes all replicated
         // tables first, then replays the snapshot commits and restores the
         // leader RV. (finding.md H1 / P0 cluster.db divergence.)
-        crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new(
+        super::super::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new(
             self.backend.clone(),
             super::authority::snapshot_install(),
         )
-        .restore_legacy_raft_snapshot(data)
+        .restore_authoritative_raft_snapshot(data)
         .await
         .map_err(|e| StorageError::IO {
             source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
@@ -527,11 +525,7 @@ mod tests {
                     membership: crate::datastore::ReplicatedMembershipState::Present(
                         leader_membership.clone(),
                     ),
-                    resource_version_assignment_mode: Some(
-                        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
-                    ),
                     command_codec_activation_version: Some(3),
-                    snapshot_assignment_mode: None,
                 }),
             )
             .await
@@ -594,11 +588,7 @@ mod tests {
                             leader_hint: Some("stale-cp".into()),
                         },
                     ),
-                    resource_version_assignment_mode: Some(
-                        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
-                    ),
                     command_codec_activation_version: None,
-                    snapshot_assignment_mode: None,
                 }),
             )
             .await
@@ -736,25 +726,29 @@ mod tests {
         seed_snapshot_identity(&backend).await;
         let entries = (1..=crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE as i64)
             .map(|event_id| {
-                crate::log_apply::LogApplyCommit::put_watch_event(
-                    crate::log_apply::LogApplyWatchEventRow {
-                        event_id: Some(event_id),
-                        api_version: "v1".to_string(),
-                        kind: "ConfigMap".to_string(),
-                        namespace: Some("default".to_string()),
-                        name: format!("seed-{event_id}"),
-                        resource_version: 1_000 + event_id,
-                        event_type: "ADDED".to_string(),
-                        data: serde_json::json!({
-                            "apiVersion": "v1",
-                            "kind": "ConfigMap",
-                            "metadata": {
-                                "name": format!("seed-{event_id}"),
-                                "namespace": "default",
-                                "resourceVersion": (1_000 + event_id).to_string()
-                            }
-                        }),
-                    },
+                crate::log_apply::SnapshotRestoreOperation::new(
+                    1_000 + event_id,
+                    None,
+                    vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
+                        crate::log_apply::LogApplyWatchEventRow {
+                            event_id: Some(event_id),
+                            api_version: "v1".to_string(),
+                            kind: "ConfigMap".to_string(),
+                            namespace: Some("default".to_string()),
+                            name: format!("seed-{event_id}"),
+                            resource_version: 1_000 + event_id,
+                            event_type: "ADDED".to_string(),
+                            data: serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "ConfigMap",
+                                "metadata": {
+                                    "name": format!("seed-{event_id}"),
+                                    "namespace": "default",
+                                    "resourceVersion": (1_000 + event_id).to_string()
+                                }
+                            }),
+                        },
+                    )],
                 )
             })
             .collect();
@@ -778,43 +772,40 @@ mod tests {
             "metadata": {
                 "name": "late-resource",
                 "namespace": "default",
-                "uid": "late-resource-uid",
-                "resourceVersion": "2001"
+                "uid": "late-resource-uid"
             }
         });
-        let commit = crate::log_apply::LogApplyCommit::new(
-            2_001,
-            vec![
-                crate::log_apply::LogApplyMutation::PutResource(
-                    crate::log_apply::LogApplyResourceRow {
-                        api_version: "v1".to_string(),
-                        kind: "ConfigMap".to_string(),
-                        namespace: Some("default".to_string()),
-                        name: "late-resource".to_string(),
-                        uid: "late-resource-uid".to_string(),
-                        resource_version: 2_001,
-                        data: late_resource.clone(),
-                        require_absent: false,
-                        require_existing: false,
-                        precondition_uid: None,
-                        precondition_resource_version: None,
-                        status_only: false,
-                    },
-                ),
-                crate::log_apply::LogApplyMutation::PutWatchEvent(
-                    crate::log_apply::LogApplyWatchEventRow {
-                        event_id: Some(513),
-                        api_version: "v1".to_string(),
-                        kind: "ConfigMap".to_string(),
-                        namespace: Some("default".to_string()),
-                        name: "late-resource".to_string(),
-                        resource_version: 2_001,
-                        event_type: "ADDED".to_string(),
-                        data: late_resource,
-                    },
-                ),
-            ],
-        );
+        let commit = crate::log_apply::LogApplyCommit::try_new(vec![
+            crate::log_apply::LogApplyMutation::PutResource(
+                crate::log_apply::LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "late-resource".to_string(),
+                    uid: "late-resource-uid".to_string(),
+                    resource_version: 0,
+                    data: late_resource.clone(),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: None,
+                    precondition_resource_version: None,
+                    status_only: false,
+                },
+            ),
+            crate::log_apply::LogApplyMutation::PutWatchEvent(
+                crate::log_apply::LogApplyWatchEventRow {
+                    event_id: Some(513),
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "late-resource".to_string(),
+                    resource_version: 0,
+                    event_type: "ADDED".to_string(),
+                    data: late_resource,
+                },
+            ),
+        ])
+        .expect("post-anchor live commit must be an RV-zero template");
         let payload = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
         let apply_task = tokio::spawn(async move {
             state_machine
@@ -836,8 +827,8 @@ mod tests {
             RaftSnapshotData::deserialize_from_bytes(snapshot.snapshot.get_ref()).unwrap();
         assert_eq!(decoded.watch_event_high_water, Some(512));
         assert!(
-            !decoded.commits.iter().any(|commit| {
-                commit.mutations.iter().any(|mutation| match mutation {
+            !decoded.operations.iter().any(|operation| {
+                operation.mutations().iter().any(|mutation| match mutation {
                     crate::log_apply::LogApplyMutation::PutResource(row) => {
                         row.name == "late-resource"
                     }
@@ -869,8 +860,11 @@ mod tests {
         seed_snapshot_identity(&destination).await;
         let entries = (1..=crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE as i64)
             .map(|event_id| {
-                crate::log_apply::LogApplyCommit::put_watch_event(
-                    crate::log_apply::LogApplyWatchEventRow {
+                crate::log_apply::SnapshotRestoreOperation::new(
+                    event_id,
+                    None,
+                    vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
+                        crate::log_apply::LogApplyWatchEventRow {
                         event_id: Some(event_id),
                         api_version: "v1".to_string(),
                         kind: "ConfigMap".to_string(),
@@ -879,7 +873,8 @@ mod tests {
                         resource_version: event_id,
                         event_type: "ADDED".to_string(),
                         data: serde_json::json!({"metadata": {"name": format!("seed-{event_id}")}}),
-                    },
+                        },
+                    )],
                 )
             })
             .collect();
@@ -1335,9 +1330,9 @@ mod tests {
         let data = RaftSnapshotData::deserialize_from_bytes(&snapshot_bytes)
             .expect("deserialize snapshot");
         let max_emitted_rv = data
-            .commits
+            .operations
             .iter()
-            .map(|commit| commit.resource_version)
+            .map(crate::log_apply::SnapshotRestoreOperation::resource_version)
             .max()
             .unwrap_or(0);
         assert!(
@@ -1467,7 +1462,7 @@ mod tests {
             Arc::new(crate::datastore::test_support::in_memory().await);
         let mut sm = build_sm_with_backend(backend.clone()).await;
 
-        let commit = crate::log_apply::LogApplyCommit::new(
+        let commit = crate::log_apply::test_live_commit(
             1,
             vec![crate::log_apply::LogApplyMutation::PutResource(
                 crate::log_apply::LogApplyResourceRow {
@@ -1528,19 +1523,12 @@ mod tests {
     async fn apply_normal_entry_stamps_provisional_rv_after_current_store_rv() {
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
-        backend
-            .set_klights_meta(
-                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-            )
-            .await
-            .unwrap();
         let snapshot_rv = backend
             .advance_resource_version_after(100)
             .await
             .expect("establish a list snapshot rv above the raft log index");
 
-        let mut commit = crate::log_apply::LogApplyCommit::new(
+        let commit = crate::log_apply::test_live_commit(
             0,
             vec![crate::log_apply::LogApplyMutation::PutResource(
                 crate::log_apply::LogApplyResourceRow {
@@ -1568,8 +1556,6 @@ mod tests {
                 },
             )],
         );
-        commit.resource_version_assignment =
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1;
         let payload_bytes =
             crate::log_apply::encode_commit_protobuf(&commit).expect("encode LogApplyCommit");
         let entry = Entry::<TypeConfig> {
@@ -1615,13 +1601,6 @@ mod tests {
             .await
             .unwrap();
         backend.advance_resource_version_after(100).await.unwrap();
-        backend
-            .set_klights_meta(
-                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-            )
-            .await
-            .unwrap();
         let list = backend
             .list_resources(
                 "v1",
@@ -1639,7 +1618,7 @@ mod tests {
             Some("Pending")
         );
 
-        let mut commit = crate::log_apply::LogApplyCommit::new(
+        let commit = crate::log_apply::test_live_commit(
             0,
             vec![crate::log_apply::LogApplyMutation::PutResource(
                 crate::log_apply::LogApplyResourceRow {
@@ -1658,8 +1637,6 @@ mod tests {
                 },
             )],
         );
-        commit.resource_version_assignment =
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1;
         let payload = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
         let mut sm = build_sm_with_backend(backend.clone()).await;
         let result = sm

@@ -1,12 +1,16 @@
 use super::*;
 use crate::api::AdmissionContextRequest;
-pub use crate::kubelet::cri_exec::{
-    AttachRequest, ExecRequest, ExecStreamOptions, attach_with_created_state_retry,
-    exec_sync_with_created_state_retry, exec_with_created_state_retry,
-};
 use klights_node_api::{
     ExecStreamOptions as NodeExecStreamOptions, NodeExec, NodeExecRequest, NodeExecTarget,
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExecStreamOptions {
+    pub stdin: bool,
+    pub stdout: bool,
+    pub stderr: bool,
+    pub tty: bool,
+}
 
 /// Build a K8s metav1.Status JSON for exec exit code (v4/v5 compatible).
 /// v5 requires `metadata` and `details` fields; v4 tolerates them.
@@ -41,16 +45,9 @@ pub struct ExecTarget {
     pub command: Vec<String>,
 }
 
-struct LocalPodExecSpdyStreamRequest {
-    req: Request,
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    target: ExecTarget,
-    stream_options: ExecStreamOptions,
-    attach: bool,
-}
-
 struct RemotePodExecStreamRequest {
     req: Request,
+    node_exec: Arc<dyn NodeExec>,
     node_name: String,
     target: ExecTarget,
     stream_options: ExecStreamOptions,
@@ -59,6 +56,7 @@ struct RemotePodExecStreamRequest {
 
 struct RemotePodExecSyncRequest {
     req: Request,
+    node_exec: Arc<dyn NodeExec>,
     node_name: String,
     target: ExecTarget,
 }
@@ -80,8 +78,8 @@ pub async fn pod_exec(
     };
 
     // Get pod from PodRepository to find container ID
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -89,7 +87,7 @@ pub async fn pod_exec(
     .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
     let _ = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Pod",
@@ -107,7 +105,7 @@ pub async fn pod_exec(
 
     // Extract container ID from pod status
     let container_id = extract_container_id(&pod.data, container.as_deref())?;
-    let remote_node = remote_pod_node_name(&pod.data, &state.config.node_name);
+    let remote_node = remote_pod_node_name(&pod.data, &state.operational().config.node_name);
 
     // Check for WebSocket upgrade (kubectl v1.29+ uses WebSocket with v5 subprotocol)
     let upgrade_header = req
@@ -117,11 +115,22 @@ pub async fn pod_exec(
         .unwrap_or("");
 
     if let Some(node_name) = remote_node {
+        let node_exec = state
+            .operational()
+            .replication
+            .as_ref()
+            .map(|services| services.exec.clone())
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "replication service not available for remote pod exec".to_string(),
+                )
+            })?;
         if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
             return pod_exec_remote_spdy_stream(
                 state,
                 RemotePodExecStreamRequest {
                     req,
+                    node_exec,
                     node_name,
                     target: ExecTarget {
                         namespace,
@@ -146,6 +155,7 @@ pub async fn pod_exec(
                 state,
                 RemotePodExecSyncRequest {
                     req,
+                    node_exec,
                     node_name,
                     target: ExecTarget {
                         namespace,
@@ -161,6 +171,7 @@ pub async fn pod_exec(
             state,
             RemotePodExecStreamRequest {
                 req,
+                node_exec,
                 node_name,
                 target: ExecTarget {
                     namespace,
@@ -175,120 +186,67 @@ pub async fn pod_exec(
         .await;
     }
 
-    // Check if CRI is available for local pod exec.
-    let cri_arc = state.cri.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal("CRI client not available (containerd not running)".to_string())
-    })?;
+    let spdy_upgrade = crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers());
+    if !spdy_upgrade && !upgrade_header.eq_ignore_ascii_case("websocket") {
+        return Err(AppError::BadRequest(
+            "Pod exec requires SPDY or WebSocket upgrade".to_string(),
+        ));
+    }
 
-    if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
-        pod_exec_local_spdy_stream(
+    let node_exec = state
+        .pod_node_subresources()
+        .local_node_exec
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Internal("local node exec runtime is not available".to_string())
+        })?;
+    let node_name = state.operational().config.node_name.clone();
+    let target = ExecTarget {
+        namespace,
+        pod_name: name,
+        container_id,
+        command,
+    };
+    if spdy_upgrade {
+        pod_exec_remote_spdy_stream(
             state,
-            LocalPodExecSpdyStreamRequest {
+            RemotePodExecStreamRequest {
                 req,
-                cri: cri_arc.clone(),
-                target: ExecTarget {
-                    namespace,
-                    pod_name: name,
-                    container_id,
-                    command,
-                },
+                node_exec,
+                node_name,
+                target,
                 stream_options,
                 attach: false,
             },
         )
         .await
     } else if upgrade_header.eq_ignore_ascii_case("websocket") {
-        // Handle WebSocket upgrade (modern kubectl)
-        // kubectl sends POST with Upgrade: websocket, which axum::extract::ws::WebSocketUpgrade
-        // rejects because WebSocket spec requires GET. We manually upgrade here.
-
-        // Extract WebSocket key for handshake
-        let ws_key = req
-            .headers()
-            .get(header::SEC_WEBSOCKET_KEY)
-            .ok_or_else(|| AppError::BadRequest("Missing Sec-WebSocket-Key header".to_string()))?
-            .clone();
-
-        let subprotocol = negotiate_websocket_subprotocol(req.headers()).ok_or_else(|| {
-            AppError::BadRequest("Missing or unsupported Sec-WebSocket-Protocol".to_string())
-        })?;
-        let selected_subprotocol = subprotocol.clone();
-
-        // Clone what we need for the WebSocket handler
-        let cri_clone = cri_arc.clone();
-        let task_supervisor = state.task_supervisor.clone();
-        let target = ExecTarget {
-            namespace,
-            pod_name: name,
-            container_id,
-            command,
-        };
-
-        // Perform WebSocket handshake manually
-        let on_upgrade = hyper::upgrade::on(req);
-
-        if let Err(err) = state
-            .task_supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Others,
-                "pod_exec_ws_upgrade",
-                async move {
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            // Wrap hyper::Upgraded in TokioIo for AsyncRead/AsyncWrite compatibility
-                            use hyper_util::rt::TokioIo;
-                            let io = TokioIo::new(upgraded);
-
-                            // Use tokio_tungstenite to wrap the upgraded connection
-                            use tokio_tungstenite::WebSocketStream;
-                            let ws_stream = WebSocketStream::from_raw_socket(
-                                io,
-                                tokio_tungstenite::tungstenite::protocol::Role::Server,
-                                None, // Use default config
-                            )
-                            .await;
-
-                            // Handle exec using tungstenite WebSocket
-                            handle_exec_websocket_tungstenite(
-                                ws_stream,
-                                ExecWebSocketRequest {
-                                    cri: cri_clone,
-                                    task_supervisor,
-                                    target,
-                                    subprotocol: selected_subprotocol,
-                                    stream_options,
-                                    attach: false,
-                                },
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::error!("WebSocket upgrade failed: {}", e);
-                        }
-                    }
+        if !stdin && !tty {
+            pod_exec_remote_websocket_sync(
+                state,
+                RemotePodExecSyncRequest {
+                    req,
+                    node_exec,
+                    node_name,
+                    target,
                 },
             )
             .await
-        {
-            tracing::warn!("Failed to spawn pod exec WebSocket upgrade task: {}", err);
-        }
-
-        // Build 101 Switching Protocols response
-        let response = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .header(header::UPGRADE, "websocket")
-            .header(header::CONNECTION, "Upgrade")
-            .header(
-                header::SEC_WEBSOCKET_ACCEPT,
-                derive_websocket_accept_key(&ws_key),
+        } else {
+            pod_exec_remote_websocket_stream(
+                state,
+                RemotePodExecStreamRequest {
+                    req,
+                    node_exec,
+                    node_name,
+                    target,
+                    stream_options,
+                    attach: false,
+                },
             )
-            .header(header::SEC_WEBSOCKET_PROTOCOL, subprotocol)
-            .body(axum::body::Body::empty())
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to build WebSocket response: {}", e))
-            })?;
-
-        Ok(response)
+            .await
+        }
     } else {
         Err(AppError::BadRequest(format!(
             "Invalid Upgrade header: {}. WebSocket upgrade required",
@@ -297,89 +255,18 @@ pub async fn pod_exec(
     }
 }
 
-async fn pod_exec_local_spdy_stream(
-    state: Arc<AppState>,
-    request: LocalPodExecSpdyStreamRequest,
-) -> Result<Response, AppError> {
-    let LocalPodExecSpdyStreamRequest {
-        req,
-        cri,
-        target,
-        stream_options,
-        attach,
-    } = request;
-
-    if stream_options.stdin || stream_options.tty {
-        return Err(AppError::BadRequest(format!(
-            "SPDY {} currently supports non-interactive streams; use WebSocket for stdin/tty",
-            if attach { "attach" } else { "exec" }
-        )));
-    }
-
-    let selected_subprotocol =
-        crate::api_pod_subresources::exec_spdy::negotiate_spdy_subprotocol(req.headers());
-    let on_upgrade = hyper::upgrade::on(req);
-    let task_supervisor = state.task_supervisor.clone();
-    let task_supervisor_for_handler = task_supervisor.clone();
-    let request = crate::api_pod_subresources::exec_spdy::SpdyExecStreamRequest {
-        stdin: stream_options.stdin,
-        stdout: stream_options.stdout,
-        stderr: stream_options.stderr,
-        tty: stream_options.tty,
-        attach,
-    };
-
-    if let Err(err) = task_supervisor
-        .spawn_async(
-            klights_supervisor::TaskCategory::Others,
-            "pod_exec_spdy_upgrade",
-            async move {
-                match on_upgrade.await {
-                    Ok(upgraded) => {
-                        let io = hyper_util::rt::TokioIo::new(upgraded);
-                        crate::api_pod_subresources::exec_spdy::handle_local_exec_spdy(
-                            io,
-                            crate::api_pod_subresources::exec_spdy::LocalExecSpdyRequest {
-                                cri,
-                                task_supervisor: task_supervisor_for_handler,
-                                target,
-                                stream_request: request,
-                            },
-                        )
-                        .await;
-                    }
-                    Err(err) => {
-                        tracing::error!("SPDY exec upgrade failed: {}", err);
-                    }
-                }
-            },
-        )
-        .await
-    {
-        tracing::warn!("Failed to spawn pod exec SPDY task: {}", err);
-    }
-
-    crate::api_pod_subresources::exec_spdy::spdy_switching_protocols_response(selected_subprotocol)
-}
-
 async fn pod_exec_remote_websocket_stream(
     state: Arc<AppState>,
     request: RemotePodExecStreamRequest,
 ) -> Result<Response, AppError> {
     let RemotePodExecStreamRequest {
         req,
+        node_exec,
         node_name,
         target,
         stream_options,
         attach,
     } = request;
-    let replication = state.replication.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal(format!(
-            "replication service not available for remote pod {}",
-            if attach { "attach" } else { "exec" }
-        ))
-    })?;
-    let node_exec: Arc<dyn NodeExec> = replication;
     let handler_target = target.clone();
     let ExecTarget {
         namespace,
@@ -411,10 +298,11 @@ async fn pod_exec_remote_websocket_stream(
         AppError::BadRequest("Missing or unsupported Sec-WebSocket-Protocol".to_string())
     })?;
     let selected_subprotocol = subprotocol.clone();
-    let task_supervisor = state.task_supervisor.clone();
+    let task_supervisor = state.operational().task_supervisor.clone();
 
     let on_upgrade = hyper::upgrade::on(req);
     if let Err(err) = state
+        .operational()
         .task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Others,
@@ -489,6 +377,7 @@ async fn pod_exec_remote_spdy_stream(
 ) -> Result<Response, AppError> {
     let RemotePodExecStreamRequest {
         req,
+        node_exec,
         node_name,
         target,
         stream_options,
@@ -503,16 +392,9 @@ async fn pod_exec_remote_spdy_stream(
         )));
     }
 
-    let replication = state.replication.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal(format!(
-            "replication service not available for remote pod {}",
-            if attach { "attach" } else { "exec" }
-        ))
-    })?;
-    let node_exec: Arc<dyn NodeExec> = replication;
     let selected_subprotocol =
         crate::api_pod_subresources::exec_spdy::negotiate_spdy_subprotocol(req.headers());
-    let task_supervisor = state.task_supervisor.clone();
+    let task_supervisor = state.operational().task_supervisor.clone();
     let task_supervisor_for_handler = task_supervisor.clone();
     let request = crate::api_pod_subresources::exec_spdy::SpdyExecStreamRequest {
         stdin: stream_options.stdin,
@@ -563,13 +445,10 @@ async fn pod_exec_remote_websocket_sync(
 ) -> Result<Response, AppError> {
     let RemotePodExecSyncRequest {
         req,
+        node_exec,
         node_name,
         target,
     } = request;
-    let replication = state.replication.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal("replication service not available for remote pod exec".to_string())
-    })?;
-    let node_exec: Arc<dyn NodeExec> = replication;
 
     let ws_key = req
         .headers()
@@ -581,10 +460,11 @@ async fn pod_exec_remote_websocket_sync(
         AppError::BadRequest("Missing or unsupported Sec-WebSocket-Protocol".to_string())
     })?;
     let selected_subprotocol = subprotocol.clone();
-    let task_supervisor = state.task_supervisor.clone();
+    let task_supervisor = state.operational().task_supervisor.clone();
 
     let on_upgrade = hyper::upgrade::on(req);
     if let Err(err) = state
+        .operational()
         .task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Others,
@@ -650,8 +530,8 @@ pub async fn pod_attach(
     let query_str = query.unwrap_or_default();
     let (container, stdin, stdout, stderr, tty) = parse_attach_query(&query_str);
 
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -673,7 +553,7 @@ pub async fn pod_attach(
     }
 
     let _ = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Pod",
@@ -696,7 +576,7 @@ pub async fn pod_attach(
         stderr,
         tty,
     };
-    let remote_node = remote_pod_node_name(&pod.data, &state.config.node_name);
+    let remote_node = remote_pod_node_name(&pod.data, &state.operational().config.node_name);
     let target = ExecTarget {
         namespace,
         pod_name: name,
@@ -711,11 +591,22 @@ pub async fn pod_attach(
         .unwrap_or("");
 
     if let Some(node_name) = remote_node {
+        let node_exec = state
+            .operational()
+            .replication
+            .as_ref()
+            .map(|services| services.exec.clone())
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "replication service not available for remote pod attach".to_string(),
+                )
+            })?;
         if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
             return pod_exec_remote_spdy_stream(
                 state,
                 RemotePodExecStreamRequest {
                     req,
+                    node_exec,
                     node_name,
                     target,
                     stream_options,
@@ -734,6 +625,7 @@ pub async fn pod_attach(
             state,
             RemotePodExecStreamRequest {
                 req,
+                node_exec,
                 node_name,
                 target,
                 stream_options,
@@ -743,15 +635,29 @@ pub async fn pod_attach(
         .await;
     }
 
-    if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
-        let cri_arc = state.cri.as_ref().cloned().ok_or_else(|| {
-            AppError::Internal("CRI client not available (containerd not running)".to_string())
+    let spdy_upgrade = crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers());
+    if !spdy_upgrade && !upgrade_header.eq_ignore_ascii_case("websocket") {
+        return Err(AppError::BadRequest(
+            "Pod attach requires SPDY or WebSocket upgrade".to_string(),
+        ));
+    }
+
+    let node_exec = state
+        .pod_node_subresources()
+        .local_node_exec
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Internal("local node exec runtime is not available".to_string())
         })?;
-        pod_exec_local_spdy_stream(
+    let node_name = state.operational().config.node_name.clone();
+    if spdy_upgrade {
+        pod_exec_remote_spdy_stream(
             state,
-            LocalPodExecSpdyStreamRequest {
+            RemotePodExecStreamRequest {
                 req,
-                cri: cri_arc,
+                node_exec,
+                node_name,
                 target,
                 stream_options,
                 attach: true,
@@ -759,76 +665,18 @@ pub async fn pod_attach(
         )
         .await
     } else if upgrade_header.eq_ignore_ascii_case("websocket") {
-        let cri_arc = state.cri.as_ref().cloned().ok_or_else(|| {
-            AppError::Internal("CRI client not available (containerd not running)".to_string())
-        })?;
-        let ws_key = req
-            .headers()
-            .get(header::SEC_WEBSOCKET_KEY)
-            .ok_or_else(|| AppError::BadRequest("Missing Sec-WebSocket-Key header".to_string()))?
-            .clone();
-
-        let subprotocol = negotiate_websocket_subprotocol(req.headers()).ok_or_else(|| {
-            AppError::BadRequest("Missing or unsupported Sec-WebSocket-Protocol".to_string())
-        })?;
-        let selected_subprotocol = subprotocol.clone();
-        let task_supervisor = state.task_supervisor.clone();
-        let on_upgrade = hyper::upgrade::on(req);
-
-        if let Err(err) = state
-            .task_supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Others,
-                "pod_attach_ws_upgrade",
-                async move {
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            use hyper_util::rt::TokioIo;
-                            use tokio_tungstenite::WebSocketStream;
-
-                            let io = TokioIo::new(upgraded);
-                            let ws_stream = WebSocketStream::from_raw_socket(
-                                io,
-                                tokio_tungstenite::tungstenite::protocol::Role::Server,
-                                None,
-                            )
-                            .await;
-
-                            handle_exec_websocket_tungstenite(
-                                ws_stream,
-                                ExecWebSocketRequest {
-                                    cri: cri_arc,
-                                    task_supervisor,
-                                    target,
-                                    subprotocol: selected_subprotocol,
-                                    stream_options,
-                                    attach: true,
-                                },
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            tracing::error!("WebSocket attach upgrade failed: {}", e);
-                        }
-                    }
-                },
-            )
-            .await
-        {
-            tracing::warn!("Failed to spawn pod attach WebSocket upgrade task: {}", err);
-        }
-
-        Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .header(header::UPGRADE, "websocket")
-            .header(header::CONNECTION, "Upgrade")
-            .header(
-                header::SEC_WEBSOCKET_ACCEPT,
-                derive_websocket_accept_key(&ws_key),
-            )
-            .header(header::SEC_WEBSOCKET_PROTOCOL, subprotocol)
-            .body(axum::body::Body::empty())
-            .map_err(|e| AppError::Internal(format!("Failed to build WebSocket response: {}", e)))
+        pod_exec_remote_websocket_stream(
+            state,
+            RemotePodExecStreamRequest {
+                req,
+                node_exec,
+                node_name,
+                target,
+                stream_options,
+                attach: true,
+            },
+        )
+        .await
     } else {
         Err(AppError::BadRequest(format!(
             "Invalid Upgrade header: {}. WebSocket upgrade required",
@@ -1026,89 +874,3 @@ pub fn extract_container_id(
 
     Ok(container_id)
 }
-
-// Handle WebSocket connection for exec (GET upgrade path - currently unused, kept for future use)
-pub async fn handle_exec_websocket(
-    socket: WebSocket,
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    container_id: String,
-    command: Vec<String>,
-    namespace: String,
-    pod_name: String,
-) {
-    tracing::info!(
-        "kubectl exec: pod={}/{}, container={}, command={:?}",
-        namespace,
-        pod_name,
-        container_id,
-        command
-    );
-
-    let (mut ws_sender, mut _ws_receiver) = socket.split();
-
-    // Call CRI ExecSync (non-interactive)
-    let result = {
-        let mut cri_client = cri.lock().await;
-        exec_sync_with_created_state_retry(
-            &mut cri_client,
-            task_supervisor,
-            &container_id,
-            &command,
-            60,
-        )
-        .await
-    };
-
-    match result {
-        Ok(exec_response) => {
-            // Send stdout on channel 1
-            if !exec_response.stdout.is_empty() {
-                let mut frame = vec![1u8]; // Channel 1 = stdout
-                frame.extend_from_slice(&exec_response.stdout);
-                if let Err(e) = ws_sender.send(Message::Binary(Bytes::from(frame))).await {
-                    tracing::error!("Failed to send stdout: {}", e);
-                }
-            }
-
-            // Send stderr on channel 2
-            if !exec_response.stderr.is_empty() {
-                let mut frame = vec![2u8]; // Channel 2 = stderr
-                frame.extend_from_slice(&exec_response.stderr);
-                if let Err(e) = ws_sender.send(Message::Binary(Bytes::from(frame))).await {
-                    tracing::error!("Failed to send stderr: {}", e);
-                }
-            }
-
-            // Send exit code on channel 3 (error channel)
-            let exit_msg = exec_exit_status(exec_response.exit_code);
-            let mut frame = vec![3u8]; // Channel 3 = error/status
-            frame.extend_from_slice(exit_msg.to_string().as_bytes());
-            let _ = ws_sender.send(Message::Binary(Bytes::from(frame))).await;
-        }
-        Err(e) => {
-            tracing::error!("ExecSync failed: {}", e);
-            // Send error on channel 3
-            let error_msg = serde_json::json!({
-                "metadata": {},
-                "status": "Failure",
-                "message": format!("exec failed: {}", e),
-                "details": {"causes": []}
-            });
-            let mut frame = vec![3u8];
-            frame.extend_from_slice(error_msg.to_string().as_bytes());
-            let _ = ws_sender.send(Message::Binary(Bytes::from(frame))).await;
-        }
-    }
-
-    // Close WebSocket with proper 1000 Normal Closure
-    let _ = ws_sender
-        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-            code: axum::extract::ws::close_code::NORMAL,
-            reason: "".into(),
-        })))
-        .await;
-    tracing::info!("kubectl exec completed: pod={}/{}", namespace, pod_name);
-}
-
-// Handle WebSocket connection for exec using tokio_tungstenite (for POST upgrade)

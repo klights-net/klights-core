@@ -7,15 +7,30 @@ use crate::{KlightsConfig, kubelet, networking, paths, shutdown};
 
 use super::cleanup::stop_namespace_containerd_after_cleanup;
 
+pub struct StartupRecoveryContext<'a> {
+    pub config: &'a KlightsConfig,
+    pub node_mode: &'a NodeMode,
+    pub network_cleanup: &'a networking::NetworkCleanup,
+    pub containerd_state_dir: &'a str,
+    pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub task_supervisor: &'a klights_supervisor::TaskSupervisor,
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
+    pub grpc_transport_policy: &'a crate::replication::grpc::transport_policy::GrpcTransportPolicy,
+}
+
 pub async fn run_startup_resource_recovery(
-    config: &KlightsConfig,
-    node_mode: &NodeMode,
-    network_cleanup: &networking::NetworkCleanup,
-    containerd_state_dir: &str,
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    file_process: &klights_supervisor::FileProcessExecutor,
-    grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
+    context: StartupRecoveryContext<'_>,
 ) -> anyhow::Result<()> {
+    let StartupRecoveryContext {
+        config,
+        node_mode,
+        network_cleanup,
+        containerd_state_dir,
+        runtime_paths,
+        task_supervisor,
+        file_process,
+        grpc_transport_policy,
+    } = context;
     if config.containerd_socket.is_some() {
         tracing::debug!(
             "Skipping embedded startup recovery because KLIGHTS_CONTAINERD_SOCKET is set"
@@ -25,11 +40,17 @@ pub async fn run_startup_resource_recovery(
 
     let namespace = &config.containerd_namespace;
     let rootless = matches!(node_mode, NodeMode::Rootless { .. });
+    let cri_transport_policy = klights_node_api::CriTransportPolicy::new(
+        grpc_transport_policy.connect_timeout,
+        grpc_transport_policy.max_message_bytes,
+    );
     match kubelet::ContainerdManager::namespace_containerd_is_reusable(
         file_process,
         namespace,
         rootless,
-        grpc_transport_policy,
+        &cri_transport_policy,
+        crate::kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
+        runtime_paths,
     )
     .await
     {
@@ -55,7 +76,13 @@ pub async fn run_startup_resource_recovery(
         }
     }
 
-    stop_namespace_containerd_after_cleanup(namespace, task_supervisor, file_process).await;
+    stop_namespace_containerd_after_cleanup(
+        namespace,
+        task_supervisor,
+        file_process,
+        runtime_paths,
+    )
+    .await;
     network_cleanup.cleanup_startup_network_best_effort().await;
 
     if let Err(e) = shutdown::cleanup_shm_mounts(file_process, containerd_state_dir).await {

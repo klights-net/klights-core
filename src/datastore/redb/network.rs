@@ -10,13 +10,13 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::controllers::annotations::NodePeerMode;
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
-use crate::networking::types::HostPortRange;
-use crate::networking::{ClusterCidr, NodeName, PodSubnet};
+use klights_types::HostPortRange;
+use klights_types::NodePeerMode;
+use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
 pub struct RedbNetworkStore {
     pub accessor: Arc<RedbAccessor>,
@@ -384,7 +384,7 @@ impl RedbNetworkStore {
 
     pub async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         self.db_call("update_node_dataplane_impl", move |db| {
             let value = serde_json::json!({
@@ -410,7 +410,7 @@ impl RedbNetworkStore {
     pub async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         let node_name_owned = node_name.to_string();
         self.db_call("get_node_dataplane_impl", move |db| {
             let r = db.begin_read()?;
@@ -431,18 +431,14 @@ impl RedbNetworkStore {
                         optional_persisted_string(&body, "node dataplane", "public_key")?;
                     let endpoint = optional_persisted_string(&body, "node dataplane", "endpoint")?;
                     let port = optional_persisted_port(&body, "port")?;
-                    Ok(Some(
-                        crate::networking::wireguard::DataplanePeerMetadata::try_new(
-                            node_name_owned,
-                            crate::networking::wireguard::DataplaneMode::parse(mode)?,
-                            crate::networking::wireguard::DataplaneEncryption::parse(Some(
-                                encryption,
-                            ))?,
-                            public_key,
-                            endpoint,
-                            port,
-                        )?,
-                    ))
+                    Ok(Some(klights_cluster_store::DataplanePeerMetadata::try_new(
+                        node_name_owned,
+                        klights_cluster_store::DataplaneMode::parse(mode)?,
+                        klights_cluster_store::DataplaneEncryption::parse(Some(encryption))?,
+                        public_key,
+                        endpoint,
+                        port,
+                    )?))
                 }
                 None => Ok(None),
             }

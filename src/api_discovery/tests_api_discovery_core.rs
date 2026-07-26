@@ -257,7 +257,10 @@ async fn test_openapi_v2_multiple_crds_same_group_different_versions() {
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = response["definitions"].as_object().unwrap();
 
     // Both CRDs must appear with their own definitions
@@ -337,7 +340,10 @@ async fn test_openapi_v2_multiversion_crd_both_versions_appear() {
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = response["definitions"].as_object().unwrap();
 
     // Both versions of the same CRD must appear
@@ -394,7 +400,10 @@ async fn test_openapi_v2_schema_less_crd_publishes_definition() {
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = response["definitions"].as_object().unwrap();
 
     assert!(
@@ -439,7 +448,10 @@ async fn test_openapi_v3_discovery_lists_crd_groups() {
     .await
     .unwrap();
 
-    let discovery = openapi_v3_discovery_with_crds(&db).await;
+    let discovery = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let paths = discovery["paths"].as_object().unwrap();
 
     assert!(
@@ -493,7 +505,10 @@ async fn test_openapi_v2_crd_with_schema_still_works() {
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = response["definitions"].as_object().unwrap();
     assert!(definitions.contains_key("io.cert-manager.v1.Certificate"));
     assert_eq!(
@@ -545,7 +560,10 @@ async fn test_openapi_v2_crd_schema_includes_kubernetes_top_level_fields_for_exp
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = response["definitions"].as_object().unwrap();
     let def = &definitions["com.example.explain.v1.Foo"];
 
@@ -588,7 +606,10 @@ async fn test_openapi_v3_api_v1_has_patch_with_field_validation() {
     // x-kubernetes-group-version-kind and a fieldValidation query parameter.
     // Without patch ops, kubectl falls back to OpenAPI v2 protobuf which fails.
     let db = crate::datastore::test_support::in_memory().await;
-    let v3 = build_openapi_v3_api_v1(&db).await;
+    let v3 = build_openapi_v3_api_v1(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
 
     let paths = v3["paths"].as_object().expect("paths must be object");
     // Find a path for ConfigMap
@@ -656,7 +677,12 @@ async fn test_openapi_v3_group_version_has_patch_with_field_validation() {
     .await
     .unwrap();
 
-    let v3 = build_openapi_v3_group_version(&db, "example.com", "v1").await;
+    let v3 = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "example.com",
+        "v1",
+    )
+    .await;
     let paths = v3["paths"].as_object().expect("paths must be object");
 
     // Must have at least one path with a patch operation for the CRD
@@ -681,7 +707,10 @@ async fn test_openapi_v3_group_version_has_patch_with_field_validation() {
 #[tokio::test]
 async fn test_openapi_v3_discovery_advertises_apps_v1() {
     let db = crate::datastore::test_support::in_memory().await;
-    let discovery = openapi_v3_discovery_with_crds(&db).await;
+    let discovery = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
 
     assert_eq!(
         discovery.pointer("/paths/apis~1apps~1v1/serverRelativeURL"),
@@ -693,7 +722,12 @@ async fn test_openapi_v3_discovery_advertises_apps_v1() {
 #[tokio::test]
 async fn test_openapi_v3_apps_v1_includes_deployment_create_schema() {
     let db = crate::datastore::test_support::in_memory().await;
-    let spec = build_openapi_v3_group_version(&db, "apps", "v1").await;
+    let spec = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "apps",
+        "v1",
+    )
+    .await;
     let deployment_path = spec
         .pointer("/paths/~1apis~1apps~1v1~1namespaces~1{namespace}~1deployments")
         .expect("apps/v1 OpenAPI must include deployments collection path");

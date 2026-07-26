@@ -4,13 +4,43 @@
 //! Endpoints objects so the apiregistration API behaves like a small
 //! kube-aggregator control plane instead of a passive proxy registry.
 
-use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePreconditions};
 use anyhow::{Context as _, Result};
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
 
 const MAX_RETRIES: u32 = 5;
 
-pub async fn reconcile_apiservice(db: &dyn DatastoreBackend, apiservice: &Value) -> Result<()> {
+pub(crate) enum ApiServiceStatusWriteError {
+    Conflict(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+#[async_trait]
+pub(crate) trait ApiServiceStore: Send + Sync {
+    async fn get_apiservice(&self, name: &str) -> Result<Option<Resource>>;
+
+    async fn service_exists(&self, namespace: &str, name: &str) -> Result<bool>;
+
+    async fn list_endpoint_slices(
+        &self,
+        namespace: &str,
+        service_name: &str,
+    ) -> Result<Vec<Resource>>;
+
+    async fn get_endpoints(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+
+    async fn update_apiservice_status(
+        &self,
+        current: &Resource,
+        status: Value,
+    ) -> std::result::Result<(), ApiServiceStatusWriteError>;
+}
+
+pub(crate) async fn reconcile_apiservice<S: ApiServiceStore + ?Sized>(
+    store: &S,
+    apiservice: &Value,
+) -> Result<()> {
     let name = apiservice
         .pointer("/metadata/name")
         .and_then(|v| v.as_str())
@@ -18,32 +48,22 @@ pub async fn reconcile_apiservice(db: &dyn DatastoreBackend, apiservice: &Value)
 
     let mut last_conflict = None;
     for _ in 0..MAX_RETRIES {
-        let current = db
-            .get_resource("apiregistration.k8s.io/v1", "APIService", None, name)
+        let current = store
+            .get_apiservice(name)
             .await?
             .context("APIService not found")?;
-        let status = evaluate_apiservice_status(db, &current.data).await?;
+        let status = evaluate_apiservice_status(store, &current.data).await?;
         if current.data.get("status") == Some(&status) {
             return Ok(());
         }
 
-        match db
-            .update_status_only_with_preconditions(
-                "apiregistration.k8s.io/v1",
-                "APIService",
-                None,
-                name,
-                status,
-                ResourcePreconditions::from_resource(&current),
-            )
-            .await
-        {
+        match store.update_apiservice_status(&current, status).await {
             Ok(_) => return Ok(()),
-            Err(err) if crate::datastore::errors::is_conflict_error(&err) => {
+            Err(ApiServiceStatusWriteError::Conflict(err)) => {
                 last_conflict = Some(err);
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(ApiServiceStatusWriteError::Other(err)) => return Err(err),
         }
     }
 
@@ -53,8 +73,8 @@ pub async fn reconcile_apiservice(db: &dyn DatastoreBackend, apiservice: &Value)
     }
 }
 
-async fn evaluate_apiservice_status(
-    db: &dyn DatastoreBackend,
+async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
+    store: &S,
     apiservice: &Value,
 ) -> Result<Value> {
     let Some(service) = apiservice
@@ -81,11 +101,7 @@ async fn evaluate_apiservice_status(
         ));
     };
 
-    if db
-        .get_resource("v1", "Service", Some(namespace), name)
-        .await?
-        .is_none()
-    {
+    if !store.service_exists(namespace, name).await? {
         return Ok(status_with_available(
             apiservice,
             "False",
@@ -94,18 +110,9 @@ async fn evaluate_apiservice_status(
         ));
     }
 
-    let endpoint_slice_selector = format!("kubernetes.io/service-name={name}");
-    let endpoint_slices = db
-        .list_resources(
-            "discovery.k8s.io/v1",
-            "EndpointSlice",
-            Some(namespace),
-            ResourceListQuery::new(Some(&endpoint_slice_selector), None, None, None),
-        )
-        .await?;
-    if !endpoint_slices.items.is_empty() {
+    let endpoint_slices = store.list_endpoint_slices(namespace, name).await?;
+    if !endpoint_slices.is_empty() {
         let slice_refs: Vec<&Value> = endpoint_slices
-            .items
             .iter()
             .map(|slice| slice.data.as_ref())
             .collect();
@@ -126,10 +133,7 @@ async fn evaluate_apiservice_status(
         ));
     }
 
-    let Some(endpoints) = db
-        .get_resource("v1", "Endpoints", Some(namespace), name)
-        .await?
-    else {
+    let Some(endpoints) = store.get_endpoints(namespace, name).await? else {
         return Ok(status_with_available(
             apiservice,
             "False",

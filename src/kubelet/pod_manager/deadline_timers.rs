@@ -1,10 +1,17 @@
 use super::*;
 
-pub(super) fn deadline_timer_schedule_set()
--> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static SCHEDULED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    SCHEDULED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+#[derive(Clone, Default)]
+pub(super) struct DeadlineTimerRegistry {
+    scheduled: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl DeadlineTimerRegistry {
+    fn remove(&self, key: &str) {
+        self.scheduled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
 }
 
 pub(super) fn parse_deadline_timer_delay_secs(
@@ -57,6 +64,7 @@ pub(super) fn parse_deadline_timer_delay_secs(
 
 pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
     pod: &serde_json::Value,
+    registry: DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
@@ -74,9 +82,11 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
         return;
     };
 
-    let schedule_set = deadline_timer_schedule_set();
     {
-        let mut guard = schedule_set.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = registry
+            .scheduled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.contains(&schedule_key) {
             return;
         }
@@ -84,6 +94,7 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
     }
 
     let schedule_key_for_timer = schedule_key.clone();
+    let timer_registry = registry.clone();
     if let Err(err) = task_supervisor
         .spawn_delay(
             "pod_active_deadline_timer",
@@ -92,10 +103,7 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
                 let _ = pod_lifecycle_router
                     .route(LifecycleMessage::ActiveDeadlineDue { key })
                     .await;
-                let mut guard = deadline_timer_schedule_set()
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                guard.remove(&schedule_key_for_timer);
+                timer_registry.remove(&schedule_key_for_timer);
             },
         )
         .await
@@ -106,9 +114,6 @@ pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
             pod_name,
             err
         );
-        let mut guard = deadline_timer_schedule_set()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        guard.remove(&schedule_key);
+        registry.remove(&schedule_key);
     }
 }

@@ -10,8 +10,8 @@ async fn test_put_node_status_preserves_extended_resource_capacity() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let node_name = state.config.node_name.clone();
-    let db = state.db.clone();
+    let node_name = state.operational().config.node_name.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -43,7 +43,6 @@ async fn test_put_node_status_preserves_extended_resource_capacity() {
     )
     .await
     .unwrap();
-
     let put = json!({
         "apiVersion": "v1",
         "kind": "Node",
@@ -86,8 +85,8 @@ async fn test_patch_node_status_preserves_extended_resource_capacity() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let node_name = state.config.node_name.clone();
-    let db = state.db.clone();
+    let node_name = state.operational().config.node_name.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -148,8 +147,8 @@ async fn test_json_patch_node_status_preserves_extended_resource_capacity() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let node_name = state.config.node_name.clone();
-    let db = state.db.clone();
+    let node_name = state.operational().config.node_name.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -440,7 +439,7 @@ async fn test_resourcequota_requests_storage_counts_pvc_requests() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -530,7 +529,7 @@ async fn test_resourcequota_requests_storage_denies_pvc_create_and_expand_over_h
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     db.create_namespace(
         "rq-pvc-deny",
@@ -1411,7 +1410,7 @@ async fn test_patch_pvc_status_merge_patch_returns_conditions() {
 }
 
 #[tokio::test]
-async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit() {
+async fn test_patch_pvc_status_condition_survives_rejected_stale_controller_commit() {
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -1419,7 +1418,7 @@ async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     let ns_body = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pvc-status-race"}}"#;
@@ -1469,7 +1468,7 @@ async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let patched = db
+    let _patched = db
         .get_resource(
             "v1",
             "PersistentVolumeClaim",
@@ -1480,49 +1479,48 @@ async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit
         .unwrap()
         .expect("PVC should exist after status patch");
 
-    let committed_status = crate::log_apply::LogApplyCommit::new(
-        patched.resource_version + 1,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
-                api_version: "v1".to_string(),
-                kind: "PersistentVolumeClaim".to_string(),
-                namespace: Some("pvc-status-race".to_string()),
-                name: "pvc1".to_string(),
-                uid: created.uid.clone(),
-                resource_version: patched.resource_version + 1,
-                data: json!({
-                    "apiVersion": "v1",
-                    "kind": "PersistentVolumeClaim",
-                    "metadata": {
-                        "name": "pvc1",
-                        "namespace": "pvc-status-race",
-                        "uid": created.uid.clone(),
-                        "resourceVersion": (patched.resource_version + 1).to_string()
-                    },
-                    "spec": {
-                        "accessModes": ["ReadWriteOnce"],
-                        "resources": {"requests": {"storage": "1Gi"}}
-                    },
-                    "status": {
-                        "phase": "Bound",
-                        "accessModes": ["ReadWriteOnce"],
-                        "capacity": {"storage": "1Gi"},
-                        "volumeName": "pv-pvc-status-race"
-                    }
-                }),
-                require_absent: false,
-                require_existing: true,
-                precondition_uid: Some(created.uid.clone()),
-                precondition_resource_version: Some(created.resource_version),
-                status_only: true,
-            },
-        )],
-    );
+    let committed_status = crate::log_apply::LogApplyCommit::try_new(vec![
+        crate::log_apply::LogApplyMutation::PutResource(crate::log_apply::LogApplyResourceRow {
+            api_version: "v1".to_string(),
+            kind: "PersistentVolumeClaim".to_string(),
+            namespace: Some("pvc-status-race".to_string()),
+            name: "pvc1".to_string(),
+            uid: created.uid.clone(),
+            resource_version: 0,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "pvc1",
+                    "namespace": "pvc-status-race",
+                    "uid": created.uid.clone(),
+                    "resourceVersion": "0"
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "1Gi"}}
+                },
+                "status": {
+                    "phase": "Bound",
+                    "accessModes": ["ReadWriteOnce"],
+                    "capacity": {"storage": "1Gi"},
+                    "volumeName": "pv-pvc-status-race"
+                }
+            }),
+            require_absent: false,
+            require_existing: true,
+            precondition_uid: Some(created.uid.clone()),
+            precondition_resource_version: Some(created.resource_version),
+            status_only: true,
+        }),
+    ])
+    .expect("status-only live commit must have resourceVersion zero");
     let result = db
         .apply_raft_log_apply_commit(committed_status)
         .await
-        .expect("stale controller status commit should apply through raft");
-    assert_eq!(result.applied_rv, Some(patched.resource_version + 1));
+        .expect("stale controller status commit returns a deterministic outcome");
+    assert!(result.error_message.is_some());
+    assert_eq!(result.applied_rv, None);
 
     let req = Request::builder()
         .method("GET")
@@ -1540,8 +1538,8 @@ async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit
     );
     assert_eq!(
         body.pointer("/status/volumeName"),
-        Some(&json!("pv-pvc-status-race")),
-        "stale controller status commit may still fill fields omitted by the live patch"
+        None,
+        "a rejected stale status commit must not modify current status"
     );
     assert_eq!(
         body.pointer("/status/conditions/0/type"),
@@ -1745,7 +1743,7 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     }
 
     let state = crate::api::test_support::build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     let one_long = format!("0.{}1e5000", "0".repeat(4999));
 
@@ -2178,8 +2176,8 @@ async fn test_protobuf_pod_create_respects_non_matching_node_selector() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let node_name = state.config.node_name.clone();
-    let db = state.db.clone();
+    let node_name = state.operational().config.node_name.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2839,6 +2837,7 @@ async fn test_pod_log_websocket_upgrade_returns_switching_protocols() {
 
     let state = build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -2883,6 +2882,7 @@ async fn test_pod_attach_route_exists_and_requires_streaming_upgrade() {
 
     let state = build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -2982,6 +2982,7 @@ async fn test_pod_attach_validating_webhook_denies_before_stream_upgrade() {
 
     let state = build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -3139,7 +3140,7 @@ async fn test_pod_binding_validating_webhook_denies_before_bind() {
 
     let state = build_test_app_state().await;
     state
-        .db
+        .resource_mutation().db
         .create_resource(
             "v1",
             "Pod",
@@ -3242,6 +3243,7 @@ async fn test_pod_binding_validating_webhook_denies_before_bind() {
         "expected binding webhook denial message, got: {message}"
     );
     let pod = state
+        .resource_mutation()
         .db
         .get_resource("v1", "Pod", Some("default"), "bind-denied")
         .await
@@ -3259,7 +3261,7 @@ async fn test_pod_binding_subresource_binds_unassigned_pod() {
 
     let state = build_test_app_state().await;
     state
-        .db
+        .resource_mutation().db
         .create_resource(
             "v1",
             "Pod",
@@ -3303,6 +3305,7 @@ async fn test_pod_binding_subresource_binds_unassigned_pod() {
     assert_eq!(value["status"], "Success");
 
     let pod = state
+        .resource_mutation()
         .db
         .get_resource("v1", "Pod", Some("default"), "bind-target")
         .await
@@ -3851,6 +3854,11 @@ async fn test_check_cr_field_validation_strict_with_crd_schema() {
     )
     .await
     .unwrap();
+    let resource_query = crate::control_plane::client::local::LocalApiClient::new(
+        std::sync::Arc::new(db.clone()),
+        "test-node".to_string(),
+        crate::control_plane::client::local::always_leader_watch(),
+    );
 
     // CR with extra field should be rejected
     let invalid_body = serde_json::json!({
@@ -3864,7 +3872,7 @@ async fn test_check_cr_field_validation_strict_with_crd_schema() {
     });
 
     let result = crate::api::check_cr_field_validation_strict(
-        &db,
+        &resource_query,
         "stable.example.com",
         "v1",
         "Widget",
@@ -3885,7 +3893,7 @@ async fn test_check_cr_field_validation_strict_with_crd_schema() {
     });
 
     let result = crate::api::check_cr_field_validation_strict(
-        &db,
+        &resource_query,
         "stable.example.com",
         "v1",
         "Widget",
@@ -3906,7 +3914,7 @@ async fn test_patch_pod_status_merge_patch_updates_status_only() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     // Create namespace and pod
@@ -3991,7 +3999,7 @@ async fn test_patch_pod_status_with_stale_resource_version_returns_409() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4067,7 +4075,7 @@ async fn test_put_pod_status_with_stale_resource_version_returns_409() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4153,7 +4161,7 @@ async fn test_put_pod_with_stale_resource_version_preserves_concurrent_scheduler
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4245,7 +4253,7 @@ async fn test_list_configmaps_omits_continue_when_no_more_pages() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4304,7 +4312,7 @@ async fn test_list_configmaps_returns_continue_and_remaining_when_more_pages_exi
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4403,7 +4411,7 @@ async fn test_immutable_configmap_metadata_update_succeeds() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4448,7 +4456,7 @@ async fn test_immutable_configmap_flip_immutable_to_false_rejected() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(

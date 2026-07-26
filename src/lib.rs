@@ -2,9 +2,12 @@ pub mod admission;
 mod allocator;
 pub mod api;
 pub mod api_discovery;
+mod api_helpers_adapter;
 pub mod api_pod_subresources;
 pub mod api_priority_fairness;
+mod api_state_adapter;
 pub mod api_status;
+mod apiservice_side_effect_adapter;
 pub mod audit;
 pub mod auth;
 pub mod cli;
@@ -12,39 +15,80 @@ pub mod cni_plugin;
 pub mod control_plane;
 pub mod controller;
 pub mod controller_dispatcher;
+mod controller_pod_adapters;
+mod controller_store_adapters;
 pub mod controllers;
+mod coredns_bootstrap_adapter;
+pub(crate) mod crd_registry_adapter;
+pub(crate) mod cronjob_scheduler_adapter;
+mod custom_resource_read_adapter;
+mod daemonset_node_side_effect_adapter;
+mod daemonset_store_adapter;
 pub mod datastore;
+mod endpoint_mirror_side_effect_adapter;
+mod endpoint_reconcile_adapter;
+mod endpoint_slice_sync_side_effect_adapter;
 pub mod gc;
+mod gc_delete_adapter;
+mod gc_resource_store_adapter;
+mod generated_handler_adapter;
+mod hpa_controller_adapter;
+mod hpa_side_effect_adapter;
+mod job_side_effect_adapter;
+mod job_store_adapter;
 pub mod kubelet;
 pub mod leader_election;
 pub(crate) mod leader_tls_policy;
+mod list_query_adapter;
 pub mod log_apply;
 pub mod metrics;
 mod namespace_admission;
+mod namespace_termination_adapter;
 pub mod networking;
 pub mod node_admin;
 pub mod node_heartbeat;
 pub mod node_lease_tracker;
+mod node_lifecycle_controller_adapter;
+pub mod node_outbox;
+pub(crate) mod node_routing_metadata;
+mod node_subnet_controller_adapter;
+mod node_taint_manager_side_effect_adapter;
 pub mod paths;
+mod pdb_side_effect_adapter;
 pub mod pidfile;
 pub(crate) mod pod_api_service;
 pub(crate) mod pod_endpoint_state;
+pub(crate) mod pod_events;
 pub(crate) mod pod_readiness;
 pub(crate) mod pod_reconcile_adapter;
 pub(crate) mod pod_repository_composition;
 pub(crate) mod pod_subresource_service;
 pub mod portforward;
+mod replicaset_store_adapter;
 pub mod replication;
+mod replicationcontroller_store_adapter;
+mod resource_admission_adapter;
+mod resource_mutation_effects_adapter;
 mod resource_preconditions;
+mod resource_quota_admission_adapter;
+mod resource_quota_controller_adapter;
+mod resource_quota_side_effect_adapter;
 pub mod scheduler;
+mod service_account_defaults_side_effect_adapter;
 mod service_ips;
+mod service_pod_side_effect_adapter;
+mod service_reconcile_adapter;
 pub mod shutdown;
+mod side_effect_registry_composition;
 pub mod side_effects;
 pub mod spdy;
+mod statefulset_store_adapter;
 pub(crate) mod storage_wire_codec;
 pub mod utils;
 pub mod version;
 pub mod watch;
+mod watch_stream_adapter;
+mod workload_pod_side_effect_adapter;
 
 #[cfg(test)]
 mod api_handler_tests;
@@ -62,6 +106,7 @@ mod bound_pod_finalization_command;
 
 #[cfg(test)]
 mod deployment_replicaset_error_test;
+mod deployment_store_adapter;
 #[cfg(test)]
 mod node_conditions_tests;
 #[cfg(test)]
@@ -105,7 +150,12 @@ pub fn main_entry() {
         ))
     {
         let args = std::env::args_os().skip(2).collect();
-        std::process::exit(kubelet::rootless_runc_wrapper::run_from_args(args));
+        let config = kubelet::rootless_runc_wrapper::RootlessRuncWrapperConfig {
+            runc_binary: std::env::var_os("KLIGHTS_RUNC_BINARY")
+                .unwrap_or_else(|| std::ffi::OsString::from("runc")),
+            current_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+        };
+        std::process::exit(kubelet::rootless_runc_wrapper::run_from_args(args, config));
     }
 
     let cli = cli::Cli::from_args();

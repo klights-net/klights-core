@@ -174,12 +174,12 @@ pub struct ContainerdStartConfig<'a> {
     pub bridge_name: &'a str,
     pub pod_subnet: &'a str,
     pub pod_link_mtu: u32,
-    pub data_dir: &'a str,
-    pub state_dir: &'a str,
     pub rootless: bool,
+    pub executable_path: &'a Path,
+    pub image_pull_response_timeout: Duration,
+    pub paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    pub grpc_transport_policy:
-        crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
+    pub cri_transport_policy: klights_node_api::CriTransportPolicy,
 }
 
 enum ContainerdProcess {
@@ -211,10 +211,9 @@ impl ContainerdManager {
     async fn write_rootless_runc_wrapper(
         file_process: &klights_supervisor::FileProcessExecutor,
         data_dir: &str,
+        executable_path: &Path,
     ) -> Result<()> {
-        let current_exe =
-            std::env::current_exe().context("Failed to resolve current executable")?;
-        let current_exe = current_exe.to_string_lossy().into_owned();
+        let current_exe = executable_path.to_string_lossy().into_owned();
         let wrapper_path = Self::rootless_runc_wrapper_path(data_dir);
         let wrapper_parent = wrapper_path
             .parent()
@@ -310,9 +309,9 @@ impl ContainerdManager {
     async fn install_klights_cni_binary(
         file_process: &klights_supervisor::FileProcessExecutor,
         cni_bin_dir: &str,
+        executable_path: &Path,
     ) -> Result<()> {
-        let current_exe =
-            std::env::current_exe().context("Failed to resolve current executable")?;
+        let current_exe = executable_path.to_path_buf();
         let plugin_dir = std::path::Path::new(cni_bin_dir);
         let plugin_dir_path = plugin_dir.to_path_buf();
         let plugin_dir_key = plugin_dir.display().to_string();
@@ -447,11 +446,12 @@ state = "{state_dir}"
             bridge_name,
             pod_subnet,
             pod_link_mtu,
-            data_dir,
-            state_dir,
             rootless,
+            executable_path,
+            image_pull_response_timeout,
+            paths,
             task_supervisor,
-            grpc_transport_policy,
+            cri_transport_policy,
         } = config;
         let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
         // Ensure inotify limits are sufficient before starting containerd
@@ -466,18 +466,12 @@ state = "{state_dir}"
             });
 
         // Derive all paths from namespace for isolation
-        let socket_path = crate::paths::containerd_socket_path(namespace)
-            .to_string_lossy()
-            .into_owned();
-        let data_dir = data_dir.to_string();
-        let state_dir = state_dir.to_string();
+        let socket_path = paths.containerd_socket().to_string_lossy().into_owned();
+        let data_dir = paths.containerd_data_dir().to_string_lossy().into_owned();
+        let state_dir = paths.containerd_state_dir().to_string_lossy().into_owned();
         let config_path = format!("{}/config.toml", data_dir);
-        let cni_bin_dir = crate::paths::cni_bin_dir_path(namespace)
-            .to_string_lossy()
-            .into_owned();
-        let cni_conf_dir = crate::paths::cni_conf_dir_path(namespace)
-            .to_string_lossy()
-            .into_owned();
+        let cni_bin_dir = paths.cni_bin_dir().to_string_lossy().into_owned();
+        let cni_conf_dir = paths.cni_conf_dir(namespace).to_string_lossy().into_owned();
 
         // Create directories
         let state_dir_clone = state_dir.clone();
@@ -498,9 +492,9 @@ state = "{state_dir}"
             })
             .await?;
         if rootless {
-            Self::write_rootless_runc_wrapper(&file_process, &data_dir).await?;
+            Self::write_rootless_runc_wrapper(&file_process, &data_dir, executable_path).await?;
         }
-        Self::install_klights_cni_binary(&file_process, &cni_bin_dir).await?;
+        Self::install_klights_cni_binary(&file_process, &cni_bin_dir, executable_path).await?;
         Self::write_cni_config(
             &file_process,
             &cni_conf_dir,
@@ -535,7 +529,9 @@ state = "{state_dir}"
             &socket_path,
             namespace,
             rootless,
-            grpc_transport_policy.as_ref(),
+            &cri_transport_policy,
+            image_pull_response_timeout,
+            paths,
         )
         .await?
         {
@@ -618,7 +614,8 @@ state = "{state_dir}"
                 match super::cri::CriClient::connect_with_policy(
                     &socket_for_ready,
                     &ns_for_ready,
-                    grpc_transport_policy.as_ref(),
+                    &cri_transport_policy,
+                    image_pull_response_timeout,
                 )
                 .await
                 {
@@ -662,7 +659,9 @@ state = "{state_dir}"
         socket_path: &str,
         namespace: &str,
         rootless: bool,
-        grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
+        cri_transport_policy: &klights_node_api::CriTransportPolicy,
+        image_pull_response_timeout: Duration,
+        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         if !crate::utils::path_exists_async(file_process, socket_path).await? {
             return Ok(false);
@@ -673,7 +672,9 @@ state = "{state_dir}"
             socket_path,
             namespace,
             rootless,
-            grpc_transport_policy,
+            cri_transport_policy,
+            image_pull_response_timeout,
+            paths,
         )
         .await
         {
@@ -708,11 +709,11 @@ state = "{state_dir}"
         file_process: &klights_supervisor::FileProcessExecutor,
         namespace: &str,
         rootless: bool,
-        grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
+        cri_transport_policy: &klights_node_api::CriTransportPolicy,
+        image_pull_response_timeout: Duration,
+        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
-        let socket_path = crate::paths::containerd_socket_path(namespace)
-            .to_string_lossy()
-            .into_owned();
+        let socket_path = paths.containerd_socket().to_string_lossy().into_owned();
         if !crate::utils::path_exists_async(file_process, &socket_path).await? {
             return Ok(false);
         }
@@ -721,7 +722,9 @@ state = "{state_dir}"
             &socket_path,
             namespace,
             rootless,
-            grpc_transport_policy,
+            cri_transport_policy,
+            image_pull_response_timeout,
+            paths,
         )
         .await
     }
@@ -731,17 +734,20 @@ state = "{state_dir}"
         socket_path: &str,
         namespace: &str,
         rootless: bool,
-        grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
+        cri_transport_policy: &klights_node_api::CriTransportPolicy,
+        image_pull_response_timeout: Duration,
+        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         match super::cri::CriClient::connect_with_policy(
             socket_path,
             namespace,
-            grpc_transport_policy,
+            cri_transport_policy,
+            image_pull_response_timeout,
         )
         .await
         {
             Ok(_) if rootless => {
-                rootless_namespace_containerd_is_current(file_process, namespace).await
+                rootless_namespace_containerd_is_current(file_process, paths).await
             }
             Ok(_) => Ok(true),
             Err(e) => Err(e)
@@ -833,9 +839,10 @@ state = "{state_dir}"
         namespace: &str,
         task_supervisor: &klights_supervisor::TaskSupervisor,
         file_process: &klights_supervisor::FileProcessExecutor,
+        paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<usize> {
-        let config_path = crate::paths::containerd_data_dir_path(namespace).join("config.toml");
-        let socket_path = crate::paths::containerd_socket_path(namespace);
+        let config_path = paths.containerd_data_dir().join("config.toml");
+        let socket_path = paths.containerd_socket();
         let mut pids: BTreeSet<libc::pid_t> =
             find_containerd_pids_for_config(file_process, &config_path)
                 .await?
@@ -946,9 +953,9 @@ pub fn process_exists(pid: libc::pid_t) -> bool {
 
 async fn rootless_namespace_containerd_is_current(
     file_process: &klights_supervisor::FileProcessExecutor,
-    namespace: &str,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
 ) -> Result<bool> {
-    let config_path = crate::paths::containerd_data_dir_path(namespace).join("config.toml");
+    let config_path = paths.containerd_data_dir().join("config.toml");
     let pids = find_containerd_pids_for_config(file_process, &config_path).await?;
     rootless_containerd_pids_in_current_netns(Path::new("/proc"), &pids)
 }

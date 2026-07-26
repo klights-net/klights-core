@@ -3,6 +3,8 @@
 
 use crate::api::*;
 use crate::auth::identity::AuthenticatedIdentity;
+#[cfg(test)]
+use crate::datastore::DatastoreBackend;
 
 /// Extract the API group from a compound apiVersion string.
 ///
@@ -72,6 +74,7 @@ pub fn stamp_csr_identity(body: &mut Value, identity: &AuthenticatedIdentity) {
 /// namespace carrying a `deletionTimestamp`.
 ///
 /// Shared by every namespaced create handler (generic + Pod + event paths).
+#[cfg(test)]
 pub async fn reject_if_namespace_missing_or_terminating(
     db: &dyn DatastoreBackend,
     namespace: &str,
@@ -94,6 +97,7 @@ pub async fn reject_if_namespace_missing_or_terminating(
 ///
 /// Only meaningful for Pods; callers gate on $kind == "Pod" so the resource
 /// kind is also checked here defensively.
+#[cfg(test)]
 pub async fn maybe_hard_delete_pod_after_finalizers_drained(
     db: &dyn DatastoreBackend,
     api_version: &str,
@@ -144,6 +148,7 @@ pub async fn maybe_reconcile_service_after_controller_endpointslice_delete(
     };
 
     let Some(service) = state
+        .resource_mutation()
         .db
         .get_resource("v1", "Service", Some(namespace), service_name)
         .await?
@@ -161,7 +166,7 @@ pub async fn maybe_reconcile_service_after_controller_endpointslice_delete(
     }
 
     klights_reconcile_api::ServiceReconcileSink::enqueue_service_reconcile_batch(
-        state.controller_dispatcher.as_ref(),
+        state.controller_reconcile().controller_dispatcher.as_ref(),
         vec![klights_reconcile_api::ServiceReconcileKey::new(
             namespace,
             service_name,
@@ -177,8 +182,7 @@ pub fn initialize_statefulset_revision_status_on_create(name: &str, body: &mut V
     let Some(template) = body.pointer("/spec/template") else {
         return;
     };
-    let revision =
-        crate::controllers::statefulset::compute_statefulset_update_revision(name, template);
+    let revision = klights_reconcile_api::compute_statefulset_update_revision(name, template);
 
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -223,7 +227,7 @@ pub fn initialize_statefulset_revision_status_on_create(name: &str, body: &mut V
 
 pub async fn reconcile_owner_refs_after_mutation(
     state: &std::sync::Arc<AppState>,
-    resource: &crate::datastore::Resource,
+    resource: &klights_cluster_core::Resource,
     context: &'static str,
 ) {
     if resource
@@ -235,14 +239,14 @@ pub async fn reconcile_owner_refs_after_mutation(
         return;
     }
 
-    if let Err(e) = controllers::gc::reconcile_owner_references(
-        state.db.as_ref(),
+    if let Err(e) = crate::api::gc_ports::reconcile_owner_references(
+        state.resource_mutation().gc_owner_lifecycle.as_ref(),
         resource.clone(),
-        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {
         state
+            .controller_reconcile()
             .metrics
             .cascade_delete_failures_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

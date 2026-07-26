@@ -8,11 +8,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::controllers::annotations::NodePeerMode;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::sequenced::DatastoreApplier;
-use crate::networking::types::HostPortRange;
+use klights_types::HostPortRange;
+use klights_types::NodePeerMode;
 
 use super::RedbDatastore;
 
@@ -207,10 +207,10 @@ impl DatastoreApplier for RedbDatastore {
                 endpoint,
                 port,
             } => {
-                let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                let metadata = klights_cluster_store::DataplanePeerMetadata::try_new(
                     node_name,
-                    crate::networking::wireguard::DataplaneMode::parse(&mode)?,
-                    crate::networking::wireguard::DataplaneEncryption::parse(Some(&encryption))?,
+                    klights_cluster_store::DataplaneMode::parse(&mode)?,
+                    klights_cluster_store::DataplaneEncryption::parse(Some(&encryption))?,
                     public_key,
                     Some(endpoint),
                     port,

@@ -4,7 +4,6 @@ package klights.replication;
 
 service Replication {
   rpc Connect(stream FollowerMessage) returns (stream LeaderMessage);
-  rpc Snapshot(SnapshotRequest) returns (stream ReplicationEntry);
   rpc GetMetadata(MetadataRequest) returns (MetadataResponse);
   rpc GetResource(GetResourceRequest) returns (GetResourceResponse);
   rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
@@ -89,7 +88,7 @@ message JoinRequest {
   string dataplane_mode = 7;
   string dataplane_encryption = 8;
   reserved 9;
-  uint64 supported_features = 10;
+  uint32 command_codec_version = 10;
 }
 
 // Worker replication stream join role. Control-plane learners join through
@@ -236,10 +235,6 @@ message NodeMetricsContainerSample {
   uint64 memory_bytes = 3;
 }
 
-message SnapshotRequest {
-  int64 last_applied_rv = 1;
-}
-
 message MetadataRequest {}
 
 message MetadataResponse {
@@ -247,7 +242,7 @@ message MetadataResponse {
   int64 leader_epoch = 2;
   int64 current_rv = 3;
   int64 current_log_index = 4;
-  uint64 supported_features = 5;
+  uint32 command_codec_version = 5;
 }
 
 message ReplicationEntry {
@@ -502,7 +497,7 @@ message DeletePodCleanupIntentResponse {}
 message RaftAppendEntriesRequest {
   // Serde-encoded openraft::AppendEntriesRequest<TypeConfig>.
   bytes payload = 1;
-  uint64 supported_features = 2;
+  uint32 command_codec_version = 2;
   // JSON-encoded RaftMemberNode receiver admission proof captured by the
   // immutable OpenRaft replication worker.
   bytes receiver_admission = 3;
@@ -520,7 +515,7 @@ message RaftAppendEntriesResponse {
 message RaftVoteRequest {
   // Serde-encoded openraft::VoteRequest<NodeId>.
   bytes payload = 1;
-  uint64 supported_features = 2;
+  uint32 command_codec_version = 2;
   bytes receiver_admission = 3;
 }
 
@@ -534,7 +529,7 @@ message RaftVoteResponse {
 message RaftInstallSnapshotRequest {
   // Serde-encoded openraft::InstallSnapshotRequest<TypeConfig>.
   bytes payload = 1;
-  uint64 supported_features = 2;
+  uint32 command_codec_version = 2;
   bytes receiver_admission = 3;
 }
 
@@ -569,7 +564,7 @@ message JoinAsControlplaneRequest {
   // node_registration. New clients send git_commit inside the typed snapshot.
   string node_git_commit = 11;
   NodeRegistrationSnapshot node_registration = 12;
-  uint64 supported_features = 13;
+  uint32 command_codec_version = 13;
   // Durable identity of the joiner's node.db Raft store. Stable across a
   // healthy restart and regenerated when node.db is recreated, allowing the
   // leader to distinguish an idempotent Join from a wiped same-ID member.

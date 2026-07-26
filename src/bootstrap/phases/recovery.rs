@@ -5,22 +5,23 @@ use anyhow::{Context, Result};
 use super::config::ConfigPhase;
 use crate::bootstrap::NodeMode;
 use crate::bootstrap::init::host::discover_host_ip;
-use crate::bootstrap::init::recovery::run_startup_resource_recovery;
+use crate::bootstrap::init::recovery::{StartupRecoveryContext, run_startup_resource_recovery};
 
 pub struct RecoveryPhase {
     pub node_ip: String,
 }
 
 pub async fn run(cfg: &ConfigPhase) -> Result<RecoveryPhase> {
-    run_startup_resource_recovery(
-        &cfg.config,
-        &cfg.node_mode,
-        &cfg.network_cleanup,
-        &cfg.containerd_state_dir,
-        cfg.supervisor.as_ref(),
-        &cfg.file_process,
-        cfg.grpc_transport_policy.as_ref(),
-    )
+    run_startup_resource_recovery(StartupRecoveryContext {
+        config: &cfg.config,
+        node_mode: &cfg.node_mode,
+        network_cleanup: &cfg.network_cleanup,
+        containerd_state_dir: &cfg.containerd_state_dir,
+        runtime_paths: &cfg.runtime_paths,
+        task_supervisor: cfg.supervisor.as_ref(),
+        file_process: &cfg.file_process,
+        grpc_transport_policy: cfg.grpc_transport_policy.as_ref(),
+    })
     .await
     .context("failed to recover previous startup resources")?;
 

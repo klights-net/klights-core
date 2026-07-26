@@ -28,6 +28,7 @@ pub(crate) struct ProjectedSaTokenRefreshRequest {
     pub sources: Arc<dyn VolumeSourceReader>,
     pub volumes_root: String,
     pub key: PodRuntimeKey,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +51,7 @@ fn projected_service_account_token_ref(
         .and_then(|a| a.as_str())
         .filter(|a| !a.is_empty())
         .unwrap_or(DEFAULT_SERVICE_ACCOUNT_AUDIENCE);
-    let expiration_seconds = crate::auth::normalize_service_account_token_expiration_seconds(
+    let expiration_seconds = klights_types::normalize_service_account_token_expiration_seconds(
         sa_token.get("expirationSeconds").and_then(|v| v.as_i64()),
     );
     ProjectedServiceAccountTokenRef {
@@ -145,7 +146,7 @@ pub(crate) fn pod_has_projected_service_account_tokens(pod: &Value) -> bool {
 
 pub(crate) fn refresh_delay_for_expiration_seconds(expiration_seconds: i64) -> std::time::Duration {
     let expiration_seconds =
-        crate::auth::normalize_service_account_token_expiration_seconds(Some(expiration_seconds));
+        klights_types::normalize_service_account_token_expiration_seconds(Some(expiration_seconds));
     std::time::Duration::from_secs(((expiration_seconds * 80) / 100).max(1) as u64)
         .min(MAX_PROJECTED_TOKEN_REFRESH_DELAY)
 }
@@ -299,6 +300,7 @@ async fn recreate_projected_service_account_token_volume(
             default_mode,
             sources: &sources_for_write,
             token: None,
+            node_capacity: request.node_capacity,
         },
     )
     .await?;
@@ -444,9 +446,9 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
-    use crate::datastore::Resource;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
     use crate::kubelet::volume_sources::VolumeSourceReader;
+    use klights_cluster_core::Resource;
     use std::os::unix::fs::PermissionsExt;
 
     fn resource(
@@ -665,6 +667,7 @@ mod tests {
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
                 key,
+                node_capacity: crate::kubelet::node::NodeCapacity::default(),
             },
         )
         .await
@@ -773,6 +776,7 @@ mod tests {
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
                 key,
+                node_capacity: crate::kubelet::node::NodeCapacity::default(),
             },
         )
         .await

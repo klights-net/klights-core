@@ -46,6 +46,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     let service_ipam = std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
+    let nodeport_alloc = std::sync::Arc::new(crate::controllers::service::NodePortAllocator::new());
     let controller_dispatcher = std::sync::Arc::new(
         crate::controller_dispatcher::ControllerDispatcher::new(service_ipam.clone()),
     );
@@ -54,122 +55,158 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    let cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
-        std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
-            db_handle.clone(),
-            "test-node".to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        ));
-    let side_effects = std::sync::Arc::new(crate::side_effects::default_registry(
-        metrics.clone(),
-        None,
-        None,
-        None,
+    let local_api = std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+        db_handle.clone(),
+        "test-node".to_string(),
+        crate::control_plane::client::local::always_leader_watch(),
     ));
+    let resource_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+        local_api.clone();
+    let resource_command: std::sync::Arc<dyn klights_leader_api::LeaderResourceCommand> = local_api;
+    let side_effects =
+        std::sync::Arc::new(crate::side_effect_registry_composition::default_registry(
+            metrics.clone(),
+            None,
+            None,
+            Some(db_handle.clone()),
+        ));
     let pod_repository = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle.clone(),
         task_supervisor.clone(),
         side_effects.clone(),
         metrics.clone(),
     ));
-    crate::api::AppState {
-        db: db_handle.clone(),
-        bootstrap_token_authenticator: std::sync::Arc::new(
-            crate::api::auth_middleware::DatastoreBootstrapTokenAuthenticator::new(
+    let finalizer_lifecycle =
+        crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new(
+            db_handle.clone(),
+            pod_repository.clone(),
+            side_effects.clone(),
+            metrics.clone(),
+        );
+    let mutation_effects =
+        crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
+            side_effects.clone(),
+            metrics.clone(),
+        );
+    let list_resource_versions =
+        crate::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
+    let gc_owner_lifecycle = crate::gc_delete_adapter::GcOwnerLifecycleAdapter::new(
+        db_handle.clone(),
+        pod_repository.clone(),
+    );
+    let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
+        db_handle.clone(),
+        klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
+        task_supervisor.clone(),
+        crate::KlightsConfig::test_default().containerd_namespace,
+    );
+    let bootstrap_token_authenticator = std::sync::Arc::new(
+        crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
+            db_handle.clone(),
+        ),
+    );
+    let network = crate::networking::test_support::mock_network(db_handle.clone());
+    crate::api::AppState::new(
+        crate::api::ApiAuthPolicy::new(
+            std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
+            crate::audit::default_audit_sink(),
+            std::sync::Arc::new(crate::api_priority_fairness::ApiPriorityFairness::new()),
+            std::sync::Arc::new(
+                crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
+                    std::sync::Arc::new(
+                        crate::bootstrap::auth_adapters::DatastoreRbacResourceReader::new(
+                            db_handle.clone(),
+                        ),
+                    ),
+                ),
+            ),
+            crate::api::ApiAuthenticators::new(bootstrap_token_authenticator, None, None),
+            None,
+        ),
+        crate::api::ApiResourceMutationServices {
+            db: db_handle.clone(),
+            resource_query,
+            resource_command,
+            finalizer_lifecycle,
+            mutation_effects,
+            list_resource_versions,
+            namespace_lists: crate::list_query_adapter::DatastoreNamespaceListPort::new(
                 db_handle.clone(),
             ),
-        ),
-        cluster_api,
-        crd_registry: registry,
-        mode: crate::bootstrap::NodeMode::Root,
-        role: crate::bootstrap::NodeRole::Leader {
-            bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Seed,
+            quota_runtime:
+                crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
+                    db_handle.clone(),
+                ),
+            admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                db_handle.clone(),
+            ),
+            custom_resource_reads:
+                crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
+                    db_handle.clone(),
+                    task_supervisor.clone(),
+                ),
+            builtin_admission_defaults: generated_handler_adapter.clone(),
+            generated_lifecycle: generated_handler_adapter.clone(),
+            generated_mutations: generated_handler_adapter.clone(),
+            generated_watch: generated_handler_adapter,
+            gc_owner_lifecycle: std::sync::Arc::new(gc_owner_lifecycle),
+            pod_repository,
         },
-        replication: None,
-        network: crate::networking::test_support::mock_network(db_handle),
-        config: std::sync::Arc::new({
-            let ns = "klights-test";
-            crate::KlightsConfig {
-                bridge_name: ns.to_string(),
-                pod_subnet: "10.43.0.0/17".to_string(),
-                cluster_cidr: "10.42.0.0/16".to_string(),
-                service_cidr: "10.43.128.0/17".to_string(),
-                tls_port: 7443,
-                api_fqdn: None,
-                log_file: None,
-                containerd_namespace: ns.to_string(),
-                containerd_socket: None,
-                node_name: "test-node".to_string(),
-                node_ip: None,
-                anonymous_auth: true,
-                dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
-                external_endpoint: None,
-                worker_dataplane_no_ingress: false,
-                wireguard_device: crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE
-                    .to_string(),
-                wireguard_port: crate::networking::wireguard::DEFAULT_WIREGUARD_PORT,
-                cluster_db_path: crate::paths::test_data_root_path(ns)
-                    .join("db")
-                    .join("sqlite")
-                    .join("cluster.db"),
-                node_db_path: crate::paths::test_data_root_path(ns)
-                    .join("db")
-                    .join("sqlite")
-                    .join("node.db"),
-                in_memory: true,
-                db_encryption: crate::DbEncryption::Disabled,
-                db_key_file: None,
-                datastore_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
-                node_local_backend: crate::datastore::backend_kind::BackendKind::Sqlite,
-                oidc_issuer_url: None,
-                oidc_client_id: None,
-                oidc_username_claim: "sub".to_string(),
-                oidc_groups_claim: "groups".to_string(),
-                oidc_groups_prefix: String::new(),
-                oidc_ca_bundle: None,
-                webhook_auth_url: None,
-                webhook_auth_client_cert: None,
-                webhook_auth_client_key: None,
-                webhook_auth_audiences: String::new(),
-                webhook_auth_cache_authorized_ttl_secs: 300,
-                webhook_auth_cache_unauthorized_ttl_secs: 30,
-                webhook_auth_ca_bundle: None,
-            }
-        }),
-        service_ipam,
-        nodeport_alloc: std::sync::Arc::new(crate::controllers::service::NodePortAllocator::new()),
-        cri: None,
-        metrics_provider: std::sync::Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
-        node_port_forward: crate::portforward::local_node_port_forward(task_supervisor.clone()),
-        controller_dispatcher,
-        side_effects,
-        metrics,
-        apiservice_proxy_identity_cache: std::sync::Arc::new(tokio::sync::OnceCell::new()),
-        apiservice_proxy_cache: std::sync::Arc::new(
-            crate::api::apiservice_proxy::ApiServiceProxyCache::default(),
+        crate::api::ApiDiscoveryAggregationServices::new(
+            registry,
+            std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            std::sync::Arc::new(crate::api::apiservice_proxy::ApiServiceProxyCache::default()),
         ),
-        file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
-        task_supervisor,
-        pod_repository,
-        outbox: std::sync::Arc::new(crate::kubelet::outbox::Outbox::test_outbox().await),
-        node_lease_tracker: std::sync::Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
-        pod_lifecycle_router: None,
-        pod_probe_manager: None,
-        pod_lifecycle_rx: None,
-        pod_start_retry_state: None,
-        is_raft_leader_rx: None,
-        authorizer: std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
-        audit_sink: crate::audit::default_audit_sink(),
-        api_priority_fairness: std::sync::Arc::new(
-            crate::api_priority_fairness::ApiPriorityFairness::new(),
+        crate::api::ApiControllerReconcileServices::new(
+            crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
+                db_handle.clone(),
+                service_ipam.clone(),
+                nodeport_alloc.clone(),
+            ),
+            service_ipam,
+            nodeport_alloc,
+            controller_dispatcher,
+            metrics,
+            std::sync::Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
         ),
-        rbac_policy_store: std::sync::Arc::new(
-            crate::auth::rbac_policy_store::InMemoryRbacPolicyStore::empty(),
+        crate::api::ApiPodNodeSubresourceServices::new(
+            std::sync::Arc::new(
+                crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(
+                    network.services().clone(),
+                ),
+            ),
+            crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
+                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
+                    crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+                )),
+            )),
+            None,
+            std::sync::Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
+            crate::portforward::local_node_port_forward(task_supervisor.clone()),
+            None,
+            None,
+            None,
         ),
-        oidc_authenticator: None,
-        webhook_authenticator: None,
-        cluster_ca_pem: None,
-    }
+        crate::api::ApiOperationalServices::new(
+            crate::api::ApiNodeRole::Leader,
+            None,
+            {
+                let config = crate::KlightsConfig::test_default();
+                std::sync::Arc::new(crate::api::ApiOperationalConfig::new(
+                    config.node_name,
+                    config.containerd_namespace,
+                    config.anonymous_auth,
+                    config.cluster_cidr,
+                ))
+            },
+            crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
+                db_handle.clone(),
+            ),
+            task_supervisor.clone(),
+            klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            None,
+        ),
+    )
 }
 
 pub async fn build_test_router(db: Datastore, registry: CrdRegistry) -> axum::Router {

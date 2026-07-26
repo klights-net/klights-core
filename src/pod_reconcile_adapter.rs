@@ -6,9 +6,10 @@
 
 use klights_cluster_core::Resource;
 use klights_reconcile_api::{
-    GcPodDeleteSink, NamespaceTerminationFuture, NamespaceTerminationOutcome,
-    NamespaceTerminationRequest, NamespaceTerminationSink, PodGcReconcileSink,
-    PodMutationReconcileRequest, PodMutationReconcileSink, PodPdbReconcileSink,
+    GcPodDeleteSink, NamespaceBootstrapSink, NamespaceTerminationFuture,
+    NamespaceTerminationOutcome, NamespaceTerminationRequest, NamespaceTerminationSink,
+    PodEvictionAdmissionFuture, PodEvictionAdmissionRequest, PodEvictionAdmissionSink,
+    PodGcReconcileSink, PodMutationReconcileRequest, PodMutationReconcileSink, PodPdbReconcileSink,
     PodServiceReconcileSink, PvcReconcileFuture, PvcReconcileOutcome, PvcReconcileSink,
     ReconcileSinkError, ReconcileSinkFuture,
 };
@@ -23,6 +24,7 @@ pub(crate) struct PodReconcileAdapter {
     metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics>,
     side_effects: std::sync::Arc<crate::side_effects::SideEffectRegistry>,
     pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+    non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter,
 }
 
 impl PodReconcileAdapter {
@@ -34,6 +36,9 @@ impl PodReconcileAdapter {
         pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
     ) -> Self {
         Self {
+            non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
+                db.clone(),
+            ),
             db,
             dispatcher,
             metrics,
@@ -56,20 +61,18 @@ impl PodMutationReconcileSink for PodReconcileAdapter {
                     context,
                 } => {
                     if let Some(hook_name) = named_hook {
-                        crate::side_effects::run_named_hook_logged(
+                        crate::side_effect_registry_composition::run_named_hook_logged(
                             &self.side_effects,
                             &pod.data,
-                            self.db.as_ref(),
                             &self.metrics,
                             hook_name,
                             context,
                         )
                         .await;
                     } else {
-                        crate::side_effects::run_hooks_logged(
+                        crate::side_effect_registry_composition::run_hooks_logged(
                             &self.side_effects,
                             &pod.data,
-                            self.db.as_ref(),
                             &self.metrics,
                             context,
                         )
@@ -246,6 +249,35 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
     }
 }
 
+impl NamespaceBootstrapSink for PodReconcileAdapter {
+    fn create_default_service_account(&self, namespace: String) -> ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            crate::controllers::namespace::create_default_service_account(
+                self.db.as_ref(),
+                &namespace,
+            )
+            .await
+            .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
+        })
+    }
+
+    fn create_root_ca_config_map(
+        &self,
+        namespace: String,
+        ca_certificate: String,
+    ) -> ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            crate::controllers::namespace::create_kube_root_ca_configmap(
+                self.db.as_ref(),
+                &namespace,
+                &ca_certificate,
+            )
+            .await
+            .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
+        })
+    }
+}
+
 impl PodGcReconcileSink for PodReconcileAdapter {
     fn reconcile_owner_references<'a>(
         &'a self,
@@ -257,6 +289,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
                 self.db.as_ref(),
                 pod,
                 pod_delete_sink,
+                &self.non_pod_finalization,
             )
             .await
             .map(|_| ())
@@ -278,6 +311,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
                 "Pod",
                 Some(owner.namespace),
                 pod_delete_sink,
+                &self.non_pod_finalization,
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
@@ -294,6 +328,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
                 self.db.as_ref(),
                 &deleted_dependent,
                 pod_delete_sink,
+                &self.non_pod_finalization,
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
@@ -311,6 +346,33 @@ impl PodPdbReconcileSink for PodReconcileAdapter {
             )
             .await;
             Ok(())
+        })
+    }
+}
+
+impl PodEvictionAdmissionSink for PodReconcileAdapter {
+    fn admit_pod_eviction(
+        &self,
+        request: PodEvictionAdmissionRequest,
+    ) -> PodEvictionAdmissionFuture<'_> {
+        Box::pin(async move {
+            let namespace = request.pod.namespace.as_deref().ok_or_else(|| {
+                ReconcileSinkError::unavailable("stored Pod is missing metadata.namespace")
+            })?;
+            crate::controllers::pdb::reconcile_pdbs_for_namespace_checked(
+                self.db.as_ref(),
+                self.pod_reader.as_ref(),
+                namespace,
+            )
+            .await
+            .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
+            crate::controllers::pdb::admit_pod_eviction(
+                self.db.as_ref(),
+                &request.pod,
+                request.dry_run,
+            )
+            .await
+            .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
         })
     }
 }

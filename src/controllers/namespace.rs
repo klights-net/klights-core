@@ -1,13 +1,42 @@
+#[cfg(test)]
 use crate::datastore::DatastoreBackend;
 use anyhow::Result;
+use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Namespace, NamespaceSpec, NamespaceStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use klights_cluster_core::Resource;
 
 const DEFAULT_NAMESPACES: [&str; 4] = ["default", "kube-system", "kube-public", "kube-node-lease"];
 
-pub async fn init_default_namespaces(
+#[async_trait]
+pub trait NamespaceBootstrapStore: Send + Sync {
+    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;
+    async fn create_namespace(&self, name: &str, value: serde_json::Value) -> Result<Resource>;
+    async fn get_default_service_account(&self, namespace: &str) -> Result<Option<Resource>>;
+    async fn create_default_service_account(
+        &self,
+        namespace: &str,
+        value: serde_json::Value,
+    ) -> Result<Resource>;
+    async fn get_configmap(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn create_configmap(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+    ) -> Result<Resource>;
+    async fn update_configmap(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> Result<Resource>;
+}
+
+pub async fn init_default_namespaces<S: NamespaceBootstrapStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    store: &S,
 ) -> Result<()> {
     // Read CA cert once (will be used for all namespaces)
     let containerd_ns =
@@ -19,7 +48,7 @@ pub async fn init_default_namespaces(
 
     for ns_name in DEFAULT_NAMESPACES {
         // Check if namespace already exists (use new get_namespace method)
-        let exists = db.get_namespace(ns_name).await?.is_some();
+        let exists = store.get_namespace(ns_name).await?.is_some();
 
         if !exists {
             let namespace = Namespace {
@@ -42,22 +71,24 @@ pub async fn init_default_namespaces(
 
             let namespace_json = serde_json::to_value(&namespace)?;
             // Use new create_namespace method (handles PRIMARY KEY uniqueness)
-            db.create_namespace(ns_name, namespace_json).await?;
+            store.create_namespace(ns_name, namespace_json).await?;
             tracing::info!("Created default namespace: {}", ns_name);
 
             // Create default ServiceAccount in the namespace
-            create_default_service_account(db, ns_name).await?;
+            create_default_service_account(store, ns_name).await?;
         }
 
         // Create kube-root-ca.crt ConfigMap in the namespace (whether new or existing)
         if let Some(ref ca_pem) = ca_cert_pem {
             // Check if ConfigMap already exists
-            let cm_exists = db
-                .get_resource("v1", "ConfigMap", Some(ns_name), "kube-root-ca.crt")
+            let cm_exists = store
+                .get_configmap(ns_name, "kube-root-ca.crt")
                 .await?
                 .is_some();
 
-            if !cm_exists && let Err(e) = create_kube_root_ca_configmap(db, ns_name, ca_pem).await {
+            if !cm_exists
+                && let Err(e) = create_kube_root_ca_configmap(store, ns_name, ca_pem).await
+            {
                 tracing::warn!(
                     "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
                     ns_name,
@@ -68,7 +99,7 @@ pub async fn init_default_namespaces(
             // The aggregator auth ConfigMap is expected in kube-system for extension API servers.
             if ns_name == "kube-system"
                 && let Err(e) =
-                    reconcile_extension_apiserver_authentication_configmap(db, ca_pem).await
+                    reconcile_extension_apiserver_authentication_configmap(store, ca_pem).await
             {
                 tracing::warn!(
                     "Failed to reconcile extension-apiserver-authentication ConfigMap: {:#}",
@@ -86,8 +117,8 @@ pub async fn init_default_namespaces(
     Ok(())
 }
 
-pub async fn create_default_service_account(
-    db: &dyn DatastoreBackend,
+pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
     namespace: &str,
 ) -> Result<()> {
     let sa = serde_json::json!({
@@ -102,8 +133,7 @@ pub async fn create_default_service_account(
         "secrets": []
     });
 
-    db.create_resource("v1", "ServiceAccount", Some(namespace), "default", sa)
-        .await?;
+    store.create_default_service_account(namespace, sa).await?;
 
     tracing::info!("Created default ServiceAccount in namespace: {}", namespace);
     Ok(())
@@ -114,25 +144,25 @@ pub async fn create_default_service_account(
 /// This is event-driven maintenance for active namespaces only. It deliberately
 /// skips missing or terminating namespaces so namespace finalization can delete
 /// ServiceAccounts without racing a recreate.
-pub async fn reconcile_default_service_account(
-    db: &dyn DatastoreBackend,
+pub async fn reconcile_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
     namespace: &str,
 ) -> Result<()> {
-    if namespace_absent_or_terminating(db, namespace).await? {
+    if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
     }
-    if db
-        .get_resource("v1", "ServiceAccount", Some(namespace), "default")
+    if store
+        .get_default_service_account(namespace)
         .await?
         .is_some()
     {
         return Ok(());
     }
-    create_default_service_account(db, namespace).await
+    create_default_service_account(store, namespace).await
 }
 
-pub async fn create_kube_root_ca_configmap(
-    db: &dyn DatastoreBackend,
+pub async fn create_kube_root_ca_configmap<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
     namespace: &str,
     ca_cert_pem: &str,
 ) -> Result<()> {
@@ -150,7 +180,8 @@ pub async fn create_kube_root_ca_configmap(
         }
     });
 
-    db.create_resource("v1", "ConfigMap", Some(namespace), "kube-root-ca.crt", cm)
+    store
+        .create_configmap(namespace, "kube-root-ca.crt", cm)
         .await?;
 
     tracing::info!(
@@ -161,11 +192,11 @@ pub async fn create_kube_root_ca_configmap(
 }
 
 /// Check if a namespace is absent or terminating.
-async fn namespace_absent_or_terminating(
-    db: &dyn DatastoreBackend,
+async fn namespace_absent_or_terminating<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
     namespace: &str,
 ) -> Result<bool> {
-    let Some(ns) = db.get_namespace(namespace).await? else {
+    let Some(ns) = store.get_namespace(namespace).await? else {
         return Ok(true);
     };
     Ok(ns
@@ -178,18 +209,18 @@ async fn namespace_absent_or_terminating(
 /// Reconcile `kube-root-ca.crt` in a namespace: read the CA from the
 /// bootstrap file and create the ConfigMap if it does not exist.
 /// Skips if the namespace is terminating.
-pub async fn reconcile_kube_root_ca(
+pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    store: &S,
     namespace: &str,
 ) -> Result<()> {
-    if namespace_absent_or_terminating(db, namespace).await? {
+    if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
     }
 
     // Skip if it already exists
-    if db
-        .get_resource("v1", "ConfigMap", Some(namespace), "kube-root-ca.crt")
+    if store
+        .get_configmap(namespace, "kube-root-ca.crt")
         .await?
         .is_some()
     {
@@ -208,19 +239,19 @@ pub async fn reconcile_kube_root_ca(
         }
     };
 
-    create_kube_root_ca_configmap(db, namespace, &ca_pem).await
+    create_kube_root_ca_configmap(store, namespace, &ca_pem).await
 }
 
 /// Reconcile `kube-root-ca.crt` data in a namespace: read the CA from
 /// the bootstrap file and update the existing ConfigMap's `ca.crt` key.
 /// Used when the data is cleared or modified by a user.
 /// Skips if the namespace is terminating.
-pub async fn reconcile_kube_root_ca_data(
+pub async fn reconcile_kube_root_ca_data<S: NamespaceBootstrapStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    store: &S,
     namespace: &str,
 ) -> Result<()> {
-    if namespace_absent_or_terminating(db, namespace).await? {
+    if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
     }
 
@@ -237,12 +268,9 @@ pub async fn reconcile_kube_root_ca_data(
     };
 
     // Get current CM and update its data
-    let Some(cm) = db
-        .get_resource("v1", "ConfigMap", Some(namespace), "kube-root-ca.crt")
-        .await?
-    else {
+    let Some(cm) = store.get_configmap(namespace, "kube-root-ca.crt").await? else {
         // CM doesn't exist, use the create path
-        return create_kube_root_ca_configmap(db, namespace, &ca_pem).await;
+        return create_kube_root_ca_configmap(store, namespace, &ca_pem).await;
     };
 
     // Check if data already matches
@@ -260,15 +288,9 @@ pub async fn reconcile_kube_root_ca_data(
         *data = serde_json::Value::String(ca_pem);
     }
 
-    db.update_resource(
-        "v1",
-        "ConfigMap",
-        Some(namespace),
-        "kube-root-ca.crt",
-        updated,
-        cm.resource_version,
-    )
-    .await?;
+    store
+        .update_configmap(namespace, "kube-root-ca.crt", updated, cm.resource_version)
+        .await?;
 
     tracing::info!(
         "Reconciled kube-root-ca.crt data in namespace: {}",
@@ -277,48 +299,37 @@ pub async fn reconcile_kube_root_ca_data(
     Ok(())
 }
 
-pub async fn create_extension_apiserver_authentication_configmap(
-    db: &dyn DatastoreBackend,
+pub async fn create_extension_apiserver_authentication_configmap<
+    S: NamespaceBootstrapStore + ?Sized,
+>(
+    store: &S,
     ca_cert_pem: &str,
 ) -> Result<()> {
     let cm = extension_apiserver_authentication_configmap(ca_cert_pem);
 
-    db.create_resource(
-        "v1",
-        "ConfigMap",
-        Some("kube-system"),
-        "extension-apiserver-authentication",
-        cm,
-    )
-    .await?;
+    store
+        .create_configmap("kube-system", "extension-apiserver-authentication", cm)
+        .await?;
 
     tracing::info!("Created extension-apiserver-authentication ConfigMap in kube-system");
     Ok(())
 }
 
-async fn reconcile_extension_apiserver_authentication_configmap(
-    db: &dyn DatastoreBackend,
+async fn reconcile_extension_apiserver_authentication_configmap<
+    S: NamespaceBootstrapStore + ?Sized,
+>(
+    store: &S,
     ca_cert_pem: &str,
 ) -> Result<()> {
     let desired = extension_apiserver_authentication_configmap(ca_cert_pem);
     let desired_data = desired["data"].clone();
-    let Some(existing) = db
-        .get_resource(
-            "v1",
-            "ConfigMap",
-            Some("kube-system"),
-            "extension-apiserver-authentication",
-        )
+    let Some(existing) = store
+        .get_configmap("kube-system", "extension-apiserver-authentication")
         .await?
     else {
-        db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("kube-system"),
-            "extension-apiserver-authentication",
-            desired,
-        )
-        .await?;
+        store
+            .create_configmap("kube-system", "extension-apiserver-authentication", desired)
+            .await?;
         tracing::info!("Created extension-apiserver-authentication ConfigMap in kube-system");
         return Ok(());
     };
@@ -331,15 +342,14 @@ async fn reconcile_extension_apiserver_authentication_configmap(
     if let Some(object) = updated.as_object_mut() {
         object.insert("data".to_string(), desired_data);
     }
-    db.update_resource(
-        "v1",
-        "ConfigMap",
-        Some("kube-system"),
-        "extension-apiserver-authentication",
-        updated,
-        existing.resource_version,
-    )
-    .await?;
+    store
+        .update_configmap(
+            "kube-system",
+            "extension-apiserver-authentication",
+            updated,
+            existing.resource_version,
+        )
+        .await?;
     tracing::info!("Updated extension-apiserver-authentication ConfigMap in kube-system");
     Ok(())
 }

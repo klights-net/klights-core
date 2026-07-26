@@ -1,6 +1,6 @@
-use crate::control_plane::client::LeaderApiClient;
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
+use klights_leader_api::LeaderResourceQuery;
 
 fn first_non_loopback_ip_from_iter<I>(iter: I) -> Option<String>
 where
@@ -57,12 +57,12 @@ pub async fn resolve_node_ip_from_db(db: &dyn DatastoreBackend, node_name: &str)
 }
 
 pub async fn resolve_node_ip_from_leader_api(
-    cluster_api: &dyn LeaderApiClient,
+    cluster_api: &dyn LeaderResourceQuery,
     node_name: &str,
 ) -> Option<String> {
-    let request = match crate::control_plane::client::node_get_request(
+    let request = match klights_leader_api::node_get_request(
         node_name,
-        crate::control_plane::client::ResourceQueryConsistency::Cached,
+        klights_leader_api::ResourceQueryConsistency::Cached,
     ) {
         Ok(request) => request,
         Err(err) => {
@@ -88,7 +88,7 @@ pub async fn resolve_node_ip_from_leader_api(
 }
 
 pub async fn resolve_node_ip_from_leader_api_or_hostname(
-    cluster_api: &dyn LeaderApiClient,
+    cluster_api: &dyn LeaderResourceQuery,
     node_name: &str,
 ) -> String {
     if let Some(ip) = resolve_node_ip_from_leader_api(cluster_api, node_name).await {

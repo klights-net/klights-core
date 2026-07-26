@@ -1,5 +1,4 @@
-use super::basics::volumes_root;
-use super::downward_api::{extract_field_ref, extract_resource_field_ref};
+use super::downward_api::{extract_field_ref, extract_resource_field_ref_with_capacity};
 use super::run_blocking_fs_keyed;
 use super::shared::{
     build_projection_paths, remove_stale_projection_files, resolve_projection_mode,
@@ -24,6 +23,7 @@ struct ProjectedRenderPlanRequest<'a> {
     default_mode: Option<u32>,
     sources: &'a serde_json::Value,
     token: Option<&'a str>,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 struct ProjectedVolumePathRequest<'a> {
@@ -38,10 +38,12 @@ struct ProjectedVolumePathRequest<'a> {
     default_mode: Option<u32>,
     sources: &'a serde_json::Value,
     token: Option<&'a str>,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 pub struct ProjectedVolumeNsRequest<'a> {
     pub file_process: &'a klights_supervisor::FileProcessExecutor,
+    pub volumes_root: &'a str,
     pub source_reader: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
     pub pod_dir_id: &'a str,
@@ -51,6 +53,7 @@ pub struct ProjectedVolumeNsRequest<'a> {
     pub default_mode: Option<u32>,
     pub sources: &'a serde_json::Value,
     pub token: Option<&'a str>,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 pub(crate) struct ProjectedVolumeRootRequest<'a> {
@@ -65,6 +68,7 @@ pub(crate) struct ProjectedVolumeRootRequest<'a> {
     pub default_mode: Option<u32>,
     pub sources: &'a serde_json::Value,
     pub token: Option<&'a str>,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 #[cfg(test)]
@@ -120,6 +124,7 @@ async fn build_projected_render_plan(
         default_mode,
         sources,
         token,
+        node_capacity,
     } = request;
     let sources_array = sources
         .as_array()
@@ -360,7 +365,12 @@ async fn build_projected_render_plan(
                         .and_then(|r| r.as_str())
                         .ok_or_else(|| anyhow::anyhow!("resourceFieldRef missing resource"))?;
                     let container_name = resource_ref.get("containerName").and_then(|c| c.as_str());
-                    extract_resource_field_ref(pod_data, container_name, resource)?
+                    extract_resource_field_ref_with_capacity(
+                        pod_data,
+                        container_name,
+                        resource,
+                        node_capacity,
+                    )?
                 } else {
                     anyhow::bail!("downwardAPI item must have fieldRef or resourceFieldRef");
                 };
@@ -394,6 +404,7 @@ async fn create_projected_volume_at_impl(
         default_mode,
         sources,
         token,
+        node_capacity,
     } = request;
     let volume_path = format!(
         "{}/{}/volumes/projected/{}",
@@ -407,6 +418,7 @@ async fn create_projected_volume_at_impl(
         default_mode,
         sources,
         token,
+        node_capacity,
     })
     .await?;
     render_projected_volume_keyed(
@@ -423,10 +435,9 @@ async fn create_projected_volume_at_impl(
 /// Like create_projected_volume but uses separate dir ID and DB name
 /// to avoid cross-namespace volume path collisions.
 pub async fn create_projected_volume_ns(request: ProjectedVolumeNsRequest<'_>) -> Result<String> {
-    let volumes_root = volumes_root();
     create_projected_volume_under_root(ProjectedVolumeRootRequest {
         file_process: request.file_process,
-        volumes_root: &volumes_root,
+        volumes_root: request.volumes_root,
         source_reader: request.source_reader,
         namespace: request.namespace,
         pod_dir_id: request.pod_dir_id,
@@ -436,6 +447,7 @@ pub async fn create_projected_volume_ns(request: ProjectedVolumeNsRequest<'_>) -
         default_mode: request.default_mode,
         sources: request.sources,
         token: request.token,
+        node_capacity: request.node_capacity,
     })
     .await
 }
@@ -455,6 +467,7 @@ pub(crate) async fn create_projected_volume_under_root(
         default_mode: request.default_mode,
         sources: request.sources,
         token: request.token,
+        node_capacity: request.node_capacity,
     })
     .await
 }
@@ -473,6 +486,7 @@ pub async fn create_projected_volume_at(request: ProjectedVolumeAtRequest<'_>) -
         default_mode: request.default_mode,
         sources: request.sources,
         token: request.token,
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
     })
     .await
 }

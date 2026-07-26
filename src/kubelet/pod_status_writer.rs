@@ -18,8 +18,6 @@ use crate::datastore::DatastoreBackend;
 #[cfg(test)]
 use crate::kubelet::pod_endpoints::reconcile_endpoints_for_pod;
 #[cfg(test)]
-use crate::kubelet::pod_manager::get_cached_host_ip;
-#[cfg(test)]
 use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
@@ -27,6 +25,11 @@ use crate::kubelet::pod_status_logic::{
 use anyhow::Result;
 #[cfg(test)]
 use serde_json::Value;
+
+#[cfg(test)]
+fn fixture_host_ip() -> &'static str {
+    "127.0.0.1"
+}
 
 /// Build a pod status condition Value with consistent shape:
 /// `type`, `status`, `lastTransitionTime` (carried over when status hasn't
@@ -229,8 +232,8 @@ pub async fn update_pod_status(
             "phase": phase,
             "podIP": pod_ip,
             "podIPs": [{ "ip": pod_ip }],
-            "hostIP": get_cached_host_ip(),
-            "hostIPs": [{ "ip": get_cached_host_ip() }],
+            "hostIP": fixture_host_ip(),
+            "hostIPs": [{ "ip": fixture_host_ip() }],
             "conditions": conditions,
             "containerStatuses": container_statuses,
         });

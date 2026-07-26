@@ -5,8 +5,12 @@
 //! hard-delete completion here: the Pod lifecycle actor owns Pod row removal.
 
 use crate::api::*;
-use crate::datastore::errors::is_conflict_error;
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::{
+    FinalizerEffectsRequest, FinalizerLifecycleError, FinalizerLifecyclePort,
+    FinalizerOrphanRequest, FinalizerResourceTarget, FinalizerTombstoneDeleteRequest,
+    FinalizerUpdateRequest,
+};
 use std::sync::Arc;
 
 const DELETE_MAX_CONFLICT_RETRIES: usize = 16;
@@ -144,7 +148,7 @@ struct DeletionMarkRequest<'a> {
 }
 
 async fn mark_deletion_with_retry(
-    db: &dyn DatastoreBackend,
+    lifecycle: &dyn FinalizerLifecyclePort,
     request: DeletionMarkRequest<'_>,
 ) -> Result<Resource, AppError> {
     let DeletionMarkRequest {
@@ -172,8 +176,13 @@ async fn mark_deletion_with_retry(
     for attempt in 0..=DELETE_MAX_CONFLICT_RETRIES {
         let resource = match candidate.take() {
             Some(resource) => resource,
-            None => db
-                .get_resource(api_version, kind, namespace, name)
+            None => lifecycle
+                .get_resource(FinalizerResourceTarget::try_new(
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
+                )?)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?,
         };
@@ -197,26 +206,23 @@ async fn mark_deletion_with_retry(
             &expected_uid,
             resource.resource_version,
         );
-        match db
-            .update_resource_with_preconditions(
-                api_version,
-                kind,
-                namespace,
-                name,
-                del_data,
-                update_preconditions,
-            )
+        match lifecycle
+            .update_resource(FinalizerUpdateRequest {
+                target: FinalizerResourceTarget::try_new(api_version, kind, namespace, name)?,
+                data: del_data,
+                preconditions: update_preconditions,
+            })
             .await
         {
             Ok(updated) => return Ok(updated),
             Err(err)
                 if explicit_rv.is_none()
-                    && is_conflict_error(&err)
+                    && matches!(err, FinalizerLifecycleError::Conflict(_))
                     && attempt < DELETE_MAX_CONFLICT_RETRIES =>
             {
                 continue;
             }
-            Err(err) => return Err(AppError::from(err)),
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -226,7 +232,7 @@ async fn mark_deletion_with_retry(
 }
 
 pub async fn mark_foreground_deletion_with_retry(
-    db: &dyn DatastoreBackend,
+    lifecycle: &dyn FinalizerLifecyclePort,
     api_version: &str,
     kind: &str,
     ns: Option<&str>,
@@ -235,7 +241,7 @@ pub async fn mark_foreground_deletion_with_retry(
     delete_preconditions: ResourcePreconditions,
 ) -> Result<Resource, AppError> {
     mark_deletion_with_retry(
-        db,
+        lifecycle,
         DeletionMarkRequest {
             target: ResourceDeleteTarget {
                 api_version,
@@ -263,7 +269,7 @@ pub struct NonForegroundDeleteRequest<'a> {
 }
 
 pub async fn complete_non_foreground_delete_with_live_recheck(
-    db: &dyn DatastoreBackend,
+    lifecycle: &dyn FinalizerLifecyclePort,
     request: NonForegroundDeleteRequest<'_>,
 ) -> Result<DeleteCompletion, AppError> {
     let NonForegroundDeleteRequest {
@@ -288,7 +294,15 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
         .unwrap_or_else(|| initial_resource.uid.clone());
 
     for attempt in 0..=DELETE_MAX_CONFLICT_RETRIES {
-        let Some(mut resource) = db.get_resource(api_version, kind, namespace, name).await? else {
+        let Some(mut resource) = lifecycle
+            .get_resource(FinalizerResourceTarget::try_new(
+                api_version,
+                kind,
+                namespace,
+                name,
+            )?)
+            .await?
+        else {
             return Ok(DeleteCompletion::GoneOrUidChanged);
         };
 
@@ -317,15 +331,17 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                     expected_uid.clone(),
                     resource.resource_version,
                 );
-                match db
-                    .update_resource_with_preconditions(
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        del_data,
-                        update_preconditions,
-                    )
+                match lifecycle
+                    .update_resource(FinalizerUpdateRequest {
+                        target: FinalizerResourceTarget::try_new(
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                        )?,
+                        data: del_data,
+                        preconditions: update_preconditions,
+                    })
                     .await
                 {
                     Ok(updated) => {
@@ -333,25 +349,26 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                     }
                     Err(err)
                         if explicit_rv.is_none()
-                            && is_conflict_error(&err)
+                            && matches!(err, FinalizerLifecycleError::Conflict(_))
                             && attempt < DELETE_MAX_CONFLICT_RETRIES =>
                     {
                         continue;
                     }
-                    Err(err) => return Err(AppError::from(err)),
+                    Err(err) => return Err(err.into()),
                 }
             }
 
-            controllers::gc::orphan_children(
-                db,
-                &resource.uid,
-                api_version,
-                &resource.name,
-                kind,
-                namespace.map(str::to_string),
-            )
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+            lifecycle
+                .orphan_children(FinalizerOrphanRequest {
+                    target: FinalizerResourceTarget::try_new(
+                        api_version,
+                        kind,
+                        namespace,
+                        &resource.name,
+                    )?,
+                    owner_uid: resource.uid.clone(),
+                })
+                .await?;
 
             if has_finalizer(&resource.data, ORPHAN_FINALIZER) {
                 let mut del_data: Value = (*resource.data).clone();
@@ -360,15 +377,17 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                     expected_uid.clone(),
                     resource.resource_version,
                 );
-                match db
-                    .update_resource_with_preconditions(
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        del_data,
-                        update_preconditions,
-                    )
+                match lifecycle
+                    .update_resource(FinalizerUpdateRequest {
+                        target: FinalizerResourceTarget::try_new(
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                        )?,
+                        data: del_data,
+                        preconditions: update_preconditions,
+                    })
                     .await
                 {
                     Ok(updated) => {
@@ -376,12 +395,12 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                     }
                     Err(err)
                         if explicit_rv.is_none()
-                            && is_conflict_error(&err)
+                            && matches!(err, FinalizerLifecycleError::Conflict(_))
                             && attempt < DELETE_MAX_CONFLICT_RETRIES =>
                     {
                         continue;
                     }
-                    Err(err) => return Err(AppError::from(err)),
+                    Err(err) => return Err(err.into()),
                 }
             }
         }
@@ -419,26 +438,23 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                 expected_uid.clone(),
                 resource.resource_version,
             );
-            match db
-                .update_resource_with_preconditions(
-                    api_version,
-                    kind,
-                    namespace,
-                    name,
-                    del_data,
-                    update_preconditions,
-                )
+            match lifecycle
+                .update_resource(FinalizerUpdateRequest {
+                    target: FinalizerResourceTarget::try_new(api_version, kind, namespace, name)?,
+                    data: del_data,
+                    preconditions: update_preconditions,
+                })
                 .await
             {
                 Ok(updated) => return Ok(DeleteCompletion::MarkedTerminating(updated)),
                 Err(err)
                     if explicit_rv.is_none()
-                        && is_conflict_error(&err)
+                        && matches!(err, FinalizerLifecycleError::Conflict(_))
                         && attempt < DELETE_MAX_CONFLICT_RETRIES =>
                 {
                     continue;
                 }
-                Err(err) => return Err(AppError::from(err)),
+                Err(err) => return Err(err.into()),
             }
         }
 
@@ -446,21 +462,18 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
             resource.uid.clone(),
             resource.resource_version,
         );
-        match db
-            .delete_resource_without_watch_with_tombstone(
-                api_version,
-                kind,
-                namespace,
-                name,
-                delete_preconditions,
+        match lifecycle
+            .delete_with_tombstone(FinalizerTombstoneDeleteRequest {
+                target: FinalizerResourceTarget::try_new(api_version, kind, namespace, name)?,
+                preconditions: delete_preconditions,
                 grace_seconds,
-            )
+            })
             .await
         {
             Ok(deleted) => return Ok(DeleteCompletion::HardDeleted(deleted)),
             Err(err) => {
                 if explicit_rv.is_none()
-                    && is_conflict_error(&err)
+                    && matches!(err, FinalizerLifecycleError::Conflict(_))
                     && attempt < DELETE_MAX_CONFLICT_RETRIES
                 {
                     continue;
@@ -511,27 +524,25 @@ pub async fn finalize_after_update_if_ready(
         updated.uid.clone(),
         updated.resource_version,
     );
-    match state
-        .db
-        .delete_resource_with_preconditions(api_version, kind, namespace, name, preconditions)
-        .await
+    match crate::api::resource_command_ports::delete_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        api_version,
+        kind,
+        namespace,
+        name,
+        preconditions,
+    )
+    .await
     {
-        Ok(()) => {}
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("Resource not found")
-                || msg.contains("precondition")
-                || msg.contains("Precondition")
-                || msg.contains("Conflict")
-            {
-                return;
-            }
+        Ok(_) => {}
+        Err(AppError::NotFound(_) | AppError::Conflict(_)) => return,
+        Err(error) => {
             tracing::warn!(
                 api_version = %api_version,
                 kind = %kind,
                 namespace = ?namespace,
                 name = %name,
-                error = %e,
+                error = ?error,
                 "finalizer-drained hard delete failed"
             );
             return;
@@ -546,46 +557,33 @@ pub async fn finalize_after_update_if_ready(
     .await;
 
     if api_version == "v1" && kind == "Service" {
-        crate::controllers::service::release_service_allocations_from_resource(
-            state.service_ipam.as_ref(),
-            state.nodeport_alloc.as_ref(),
-            &updated.data,
-        );
+        state
+            .controller_reconcile()
+            .service_allocations
+            .release_resource(&updated.data);
     }
 
-    if let Err(e) = controllers::gc::cascade_delete_with_uid(
-        state.db.as_ref(),
-        &updated.uid,
-        api_version,
-        &updated.name,
-        kind,
-        namespace.map(str::to_string),
-        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
-    )
-    .await
+    if let Err(error) = state
+        .resource_mutation()
+        .finalizer_lifecycle
+        .run_finalized_effects(FinalizerEffectsRequest {
+            resource: updated.clone(),
+        })
+        .await
     {
-        state
-            .metrics
-            .cascade_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
             namespace = ?namespace,
             name = %updated.name,
-            error = %e,
-            "cascade delete after finalizer-drained hard delete failed"
+            error = %error,
+            "finalizer-drained post-delete effects failed"
         );
     }
-
-    let _ = state
-        .side_effects
-        .run_hooks(&updated.data, state.db.as_ref())
-        .await;
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
@@ -594,8 +592,158 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::datastore::command::StorageCommand;
+    use crate::datastore::DatastoreBackend;
     use crate::watch::EventType;
+    use klights_cluster_core::StorageCommand;
+
+    #[derive(Default)]
+    struct RecordingFinalizerPort {
+        updates: Mutex<Vec<ResourcePreconditions>>,
+    }
+
+    impl FinalizerLifecyclePort for RecordingFinalizerPort {
+        fn get_resource(
+            &self,
+            _target: FinalizerResourceTarget,
+        ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Option<Resource>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn update_resource(
+            &self,
+            request: FinalizerUpdateRequest,
+        ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Resource> {
+            self.updates
+                .lock()
+                .expect("update record lock poisoned")
+                .push(request.preconditions.clone());
+            Box::pin(async move {
+                let uid = request
+                    .data
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(Resource {
+                    id: 1,
+                    api_version: request.target.api_version().to_string(),
+                    kind: request.target.kind().to_string(),
+                    namespace: request.target.namespace().map(str::to_string),
+                    name: request.target.name().to_string(),
+                    uid,
+                    resource_version: 8,
+                    data: Arc::new(request.data),
+                })
+            })
+        }
+
+        fn delete_with_tombstone(
+            &self,
+            _request: FinalizerTombstoneDeleteRequest,
+        ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, Resource> {
+            Box::pin(async {
+                Err(FinalizerLifecycleError::Internal(
+                    "unexpected tombstone delete".to_string(),
+                ))
+            })
+        }
+
+        fn orphan_children(
+            &self,
+            _request: FinalizerOrphanRequest,
+        ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, ()> {
+            Box::pin(async {
+                Err(FinalizerLifecycleError::Internal(
+                    "unexpected orphan request".to_string(),
+                ))
+            })
+        }
+
+        fn run_finalized_effects(
+            &self,
+            _request: FinalizerEffectsRequest,
+        ) -> klights_reconcile_api::FinalizerLifecycleFuture<'_, ()> {
+            Box::pin(async {
+                Err(FinalizerLifecycleError::Internal(
+                    "unexpected effects request".to_string(),
+                ))
+            })
+        }
+    }
+
+    fn finalizer_test_resource(api_version: &str, kind: &str) -> Resource {
+        Resource {
+            id: 1,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: Some("default".to_string()),
+            name: "owned".to_string(),
+            uid: "owned-uid".to_string(),
+            resource_version: 7,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": api_version,
+                "kind": kind,
+                "metadata": {
+                    "name": "owned",
+                    "namespace": "default",
+                    "uid": "owned-uid",
+                    "resourceVersion": "7"
+                }
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_port_foreground_mark_uses_exact_uid_and_resource_version() {
+        let port = RecordingFinalizerPort::default();
+        let updated = mark_foreground_deletion_with_retry(
+            &port,
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "owned",
+            finalizer_test_resource("apps/v1", "Deployment"),
+            ResourcePreconditions::uid("owned-uid"),
+        )
+        .await
+        .expect("foreground deletion mark should update through the port");
+
+        assert_eq!(updated.resource_version, 8);
+        assert_eq!(
+            port.updates
+                .lock()
+                .expect("update record lock poisoned")
+                .as_slice(),
+            &[ResourcePreconditions::uid_and_resource_version(
+                "owned-uid",
+                7
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_port_rejects_pod_before_adapter_dispatch() {
+        let port = RecordingFinalizerPort::default();
+        let error = mark_foreground_deletion_with_retry(
+            &port,
+            "v1",
+            "Pod",
+            Some("default"),
+            "owned",
+            finalizer_test_resource("v1", "Pod"),
+            ResourcePreconditions::uid("owned-uid"),
+        )
+        .await
+        .expect_err("generic finalizer lifecycle must reject Pods");
+
+        assert!(matches!(error, AppError::Forbidden(_)));
+        assert!(
+            port.updates
+                .lock()
+                .expect("update record lock poisoned")
+                .is_empty()
+        );
+    }
 
     struct OrphanFinalizerReinjectingProposer {
         inner: crate::datastore::backend::DatastoreHandle,
@@ -642,19 +790,19 @@ mod tests {
                     .inner
                     .build_log_apply_commit_for_command(
                         command,
-                        crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                        crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                         "orphan-race-proposer",
                     )
                     .await?;
                 return self.inner.apply_raft_log_apply_commit(commit).await;
             }
-            let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+            let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                 .encode_protobuf()?;
             let key = format!("orphan-race-{}", uuid::Uuid::new_v4());
             let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                 self.inner.as_ref(),
                 &key,
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                crate::node_outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::from(payload),
                 "orphan-race-proposer",
             )
@@ -719,20 +867,18 @@ mod tests {
             _authoring_node: &str,
             _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
         ) -> std::result::Result<
-            crate::kubelet::outbox::OutboxApplyResult,
-            crate::kubelet::outbox::OutboxApplyError,
+            crate::node_outbox::OutboxApplyResult,
+            crate::node_outbox::OutboxApplyError,
         > {
-            self.propose_command(command).await.map_err(|err| {
-                crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
-            })?;
+            self.propose_command(command)
+                .await
+                .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
             let applied_rv = self
                 .inner
                 .get_current_resource_version()
                 .await
-                .map_err(|err| {
-                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
-                })?;
-            Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv })
+                .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
+            Ok(crate::node_outbox::OutboxApplyResult::Applied { applied_rv })
         }
     }
 
@@ -820,8 +966,12 @@ mod tests {
             .await
             .unwrap()
             .expect("deployment exists");
+        let lifecycle =
+            crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
+                &db,
+            );
         let outcome = complete_non_foreground_delete_with_live_recheck(
-            &db,
+            &lifecycle,
             NonForegroundDeleteRequest {
                 target: ResourceDeleteTarget {
                     api_version: "apps/v1",
@@ -956,9 +1106,13 @@ mod tests {
             owner.api_version.as_str(),
             owner.kind.as_str(),
         ));
+        let lifecycle =
+            crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
+                &db,
+            );
 
         let outcome = complete_non_foreground_delete_with_live_recheck(
-            &db,
+            &lifecycle,
             NonForegroundDeleteRequest {
                 target: ResourceDeleteTarget {
                     api_version: "apps/v1",
@@ -1093,9 +1247,13 @@ mod tests {
             owner.api_version.as_str(),
             owner.kind.as_str(),
         ));
+        let lifecycle =
+            crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(
+                &db,
+            );
 
         let outcome = complete_non_foreground_delete_with_live_recheck(
-            &db,
+            &lifecycle,
             NonForegroundDeleteRequest {
                 target: ResourceDeleteTarget {
                     api_version: "apps/v1",

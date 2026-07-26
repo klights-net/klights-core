@@ -27,7 +27,7 @@ impl HostPortSpec {
     /// treated as "any IP".
     #[cfg(test)]
     pub(crate) fn from_pod(pod: &serde_json::Value) -> Vec<HostPortSpec> {
-        crate::networking::hostport_resource::bindings_from_pod(pod)
+        klights_network_api::host_port_bindings_from_specs(klights_types::pod_host_port_specs(pod))
             .into_iter()
             .map(Into::into)
             .collect()

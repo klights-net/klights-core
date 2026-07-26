@@ -18,6 +18,47 @@ use crate::replication::grpc::server::{
     ReplicationPeerAuthenticator, ReplicationPeerIdentity,
 };
 
+/// Root-owned bridge from bootstrap token Secrets to the API authentication
+/// policy port. The HTTP/API owner receives only the auth-domain capability.
+pub(crate) struct DatastoreBootstrapTokenAuthenticator {
+    db: DatastoreHandle,
+}
+
+impl DatastoreBootstrapTokenAuthenticator {
+    pub(crate) fn new(db: DatastoreHandle) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl crate::auth::middleware::BootstrapTokenAuthenticator for DatastoreBootstrapTokenAuthenticator {
+    async fn authenticate_bootstrap_token(
+        &self,
+        token: &str,
+    ) -> Result<crate::auth::identity::AuthenticatedIdentity, klights_auth::AuthenticationError>
+    {
+        crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
+            .await
+            .map(|identity| {
+                crate::auth::identity::AuthenticatedIdentity::bootstrap(
+                    &identity.token_id,
+                    &identity.extra_groups,
+                )
+            })
+            .map_err(|error| match error {
+                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::Rejected {
+                    message,
+                } => klights_auth::AuthenticationError::unauthenticated(message),
+                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::DependencyFailure {
+                    message,
+                } => klights_auth::AuthenticationError::dependency_failure(message),
+                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::InternalFailure {
+                    message,
+                } => klights_auth::AuthenticationError::internal_failure(message),
+            })
+    }
+}
+
 const RBAC_API_VERSION: &str = "rbac.authorization.k8s.io/v1";
 
 /// Root adapter joining auth-owned CSR policy, key signing, and wall-clock
@@ -405,8 +446,9 @@ mod tests {
 
     use super::{PodRepositoryNodePolicyStore, extract_referenced_objects};
     use crate::auth::node_policy_store::NodePolicyStore;
-    use crate::datastore::{Resource, ResourceList};
+    use crate::datastore::Resource;
     use crate::kubelet::pod_repository::PodReader;
+    use crate::kubelet::pod_repository::PodResourceList as ResourceList;
 
     struct FakePodReader {
         pods: Vec<Resource>,
@@ -450,7 +492,6 @@ mod tests {
             Ok(ResourceList {
                 items: self.pods.clone(),
                 resource_version: 1,
-                watch_replay_position: None,
                 continue_token: None,
                 remaining_item_count: None,
             })

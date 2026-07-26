@@ -1,7 +1,7 @@
 //! Dataplane metadata helpers extracted from runtime.rs (R3 refactor).
 
 use crate::bootstrap::NodeMode;
-use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::{KlightsConfig, datastore, paths};
 
 use super::leader_control_stream::runtime_epoch_ms;
@@ -47,7 +47,7 @@ pub async fn local_dataplane_peer_metadata_with_endpoint(
     node_mode: &NodeMode,
     endpoint: &str,
     supervisor: &klights_supervisor::TaskSupervisor,
-) -> anyhow::Result<crate::networking::wireguard::DataplanePeerMetadata> {
+) -> anyhow::Result<klights_cluster_store::DataplanePeerMetadata> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         anyhow::bail!(
@@ -55,14 +55,29 @@ pub async fn local_dataplane_peer_metadata_with_endpoint(
         );
     }
     let identity = local_dataplane_identity(config, node_mode, supervisor).await?;
-    crate::networking::wireguard::DataplanePeerMetadata::try_new(
+    klights_cluster_store::DataplanePeerMetadata::try_new(
         config.node_name.clone(),
-        identity.mode,
-        identity.encryption,
+        match identity.mode {
+            crate::networking::wireguard::DataplaneMode::Root => {
+                klights_cluster_store::DataplaneMode::Root
+            }
+            crate::networking::wireguard::DataplaneMode::Rootless => {
+                klights_cluster_store::DataplaneMode::Rootless
+            }
+        },
+        match identity.encryption {
+            crate::networking::wireguard::DataplaneEncryption::Enabled => {
+                klights_cluster_store::DataplaneEncryption::Enabled
+            }
+            crate::networking::wireguard::DataplaneEncryption::Disabled => {
+                klights_cluster_store::DataplaneEncryption::Disabled
+            }
+        },
         identity.public_key,
         Some(endpoint.to_string()),
         identity.port,
     )
+    .map_err(anyhow::Error::new)
 }
 
 struct LocalDataplaneIdentity {
@@ -219,7 +234,7 @@ pub async fn enqueue_worker_dataplane_metadata_outbox(
     OutboxSendPlanner::new(outbox)
         .route(OutboxCommand {
             idempotency_key: format!("NodeDataplane:{subject_key}:{}", uuid::Uuid::new_v4()),
-            operation: crate::kubelet::outbox::payload::OutboxOperation::NodeDataplane,
+            operation: crate::node_outbox::payload::OutboxOperation::NodeDataplane,
             subject: OutboxSubject {
                 key: subject_key,
                 namespace: None,
@@ -479,10 +494,10 @@ mod tests {
 
         // Pre-existing row written from an authoritative endpoint.
         db.update_node_dataplane(
-            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            klights_cluster_store::DataplanePeerMetadata::try_new(
                 "leader-a".to_string(),
-                crate::networking::wireguard::DataplaneMode::Root,
-                crate::networking::wireguard::DataplaneEncryption::Disabled,
+                klights_cluster_store::DataplaneMode::Root,
+                klights_cluster_store::DataplaneEncryption::Disabled,
                 None,
                 Some("203.0.113.99".to_string()),
                 None,

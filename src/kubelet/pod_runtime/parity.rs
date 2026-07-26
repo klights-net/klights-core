@@ -187,7 +187,7 @@ impl ClusterRuntimeView for RecordingClusterRuntimeView {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         self.calls
             .lock()
             .unwrap()
@@ -202,7 +202,7 @@ impl ClusterRuntimeView for RecordingClusterRuntimeView {
         &self,
         key: &PodRuntimeKey,
         status: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
         self.calls
             .lock()
             .unwrap()
@@ -212,7 +212,7 @@ impl ClusterRuntimeView for RecordingClusterRuntimeView {
                 uid: key.uid.clone(),
                 status,
             });
-        Ok(crate::datastore::Resource {
+        Ok(klights_cluster_core::Resource {
             id: 0,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -259,7 +259,7 @@ impl ReplicationRuntime for RecordingReplicationRuntime {
     async fn enqueue_storage_command(
         &self,
         key: &PodRuntimeKey,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::StorageCommand,
     ) -> anyhow::Result<()> {
         self.calls
             .lock()
@@ -505,12 +505,12 @@ mod tests {
             .replication
             .enqueue_storage_command(
                 &key,
-                crate::datastore::command::StorageCommand::DeleteResource {
+                klights_cluster_core::StorageCommand::DeleteResource {
                     api_version: "v1".to_string(),
                     kind: "Pod".to_string(),
                     namespace: Some("default".to_string()),
                     name: "test-pod".to_string(),
-                    preconditions: crate::datastore::ResourcePreconditions {
+                    preconditions: klights_cluster_core::ResourcePreconditions {
                         uid: Some("uid-1".to_string()),
                         resource_version: None,
                     },

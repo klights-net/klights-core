@@ -8,7 +8,8 @@ use crate::api::AppError;
 use crate::api::request_info::{ResolvedAuthz, resolve_request_info};
 use crate::auth::AuthenticatedIdentity;
 use crate::auth::request_attributes::AuthorizationRequest;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
+#[cfg(test)]
+use crate::datastore::DatastoreBackend;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
@@ -54,7 +55,7 @@ pub async fn admit_request(
     match state
         .api_priority_fairness
         .admit(
-            state.db.as_ref(),
+            state.resource_mutation().resource_query.as_ref(),
             &identity,
             request.method(),
             request.uri().path(),
@@ -74,14 +75,15 @@ impl ApiPriorityFairness {
 
     pub async fn admit(
         &self,
-        db: &dyn DatastoreBackend,
+        resource_query: &dyn klights_leader_api::LeaderResourceQuery,
         identity: &AuthenticatedIdentity,
         method: &Method,
         path: &str,
         query: Option<&str>,
     ) -> Result<ApfAdmission, axum::response::Response> {
         let ResolvedAuthz::Authorize(authz) = resolve_request_info(method, path, query);
-        let Some(flow_schema) = select_matching_flow_schema(db, identity, &authz).await else {
+        let Some(flow_schema) = select_matching_flow_schema(resource_query, identity, &authz).await
+        else {
             return Ok(ApfAdmission::Exempt);
         };
         let Some(priority_level_name) = flow_schema
@@ -92,14 +94,14 @@ impl ApiPriorityFairness {
             return Ok(ApfAdmission::Exempt);
         };
 
-        let priority_level = match db
-            .get_resource(
-                FLOWCONTROL_API_VERSION,
-                "PriorityLevelConfiguration",
-                None,
-                priority_level_name,
-            )
-            .await
+        let priority_level = match crate::api::resource_query_ports::get_resource(
+            resource_query,
+            FLOWCONTROL_API_VERSION,
+            "PriorityLevelConfiguration",
+            None,
+            priority_level_name,
+        )
+        .await
         {
             Ok(Some(resource)) => resource.data,
             _ => return Ok(ApfAdmission::Exempt),
@@ -723,21 +725,20 @@ fn flow_schema_name(flow_schema: &Value) -> String {
 }
 
 async fn select_matching_flow_schema(
-    db: &dyn DatastoreBackend,
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
     identity: &AuthenticatedIdentity,
     request: &AuthorizationRequest,
 ) -> Option<Arc<Value>> {
-    let list = db
-        .list_resources(
-            FLOWCONTROL_API_VERSION,
-            "FlowSchema",
-            None,
-            ResourceListQuery::all(),
-        )
-        .await
-        .ok()?;
+    let list = crate::api::resource_query_ports::list_all_resources(
+        resource_query,
+        FLOWCONTROL_API_VERSION,
+        "FlowSchema",
+        None,
+    )
+    .await
+    .ok()?;
     let mut matches = list
-        .items
+        .into_items()
         .into_iter()
         .filter(|resource| flow_schema_matches(&resource.data, identity, request))
         .collect::<Vec<_>>();
@@ -1036,7 +1037,12 @@ mod tests {
         let identity = AuthenticatedIdentity::client_cert("alice".into(), vec![]);
         let request =
             AuthorizationRequest::resource("list", "", "v1", "namespaces", None, None, None);
-        let selected = select_matching_flow_schema(&db, &identity, &request)
+        let resource_query = crate::control_plane::client::local::LocalApiClient::new(
+            std::sync::Arc::new(db.clone()),
+            "test-node".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        let selected = select_matching_flow_schema(&resource_query, &identity, &request)
             .await
             .expect("a matching FlowSchema must exist");
 

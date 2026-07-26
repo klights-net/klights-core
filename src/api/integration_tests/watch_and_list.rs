@@ -1297,14 +1297,13 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
 
     // Apply the patch as a PatchResourceLatest merge mutation, exactly the
     // conformance strategic-merge body.
-    let patch_rv = create_rv + 10;
     let patch_mutation = crate::log_apply::LogApplyMutation::PatchResourceLatest(
         crate::log_apply::LogApplyResourcePatch {
             api_version: "v1".into(),
             kind: "ServiceAccount".into(),
             namespace: Some("svcaccounts-patch".into()),
             name: "testserviceaccount".into(),
-            resource_version: patch_rv,
+            resource_version: 0,
             patch_kind: crate::datastore::PatchKind::Merge,
             patch: json!({"metadata":{"creationTimestamp":null},"automountServiceAccountToken":false}),
             require_existing: true,
@@ -1313,10 +1312,9 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
             terminating_pod_unready_timestamp: None,
         },
     );
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
-        patch_rv,
-        vec![patch_mutation],
-    ))
+    db.apply_log_apply_commit(
+        crate::log_apply::LogApplyCommit::try_new(vec![patch_mutation]).unwrap(),
+    )
     .await
     .expect("replicated patch-latest apply");
 
@@ -2945,7 +2943,7 @@ async fn test_namespaced_crd_watch_field_selector_accepts_declared_selectable_fi
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let registry = state.crd_registry.clone();
+    let registry = state.discovery().crd_registry.clone();
     let app = crate::api::build_router(state);
 
     let crd_name = "e2e-test-crd-selectable-fields-unit-crds.stable.example.com";
@@ -3550,7 +3548,7 @@ async fn test_delete_collection_csinodes_removes_all() {
 #[tokio::test]
 async fn test_get_table_columns_for_cluster_and_namespaced_resources() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     // Cluster-scoped: ClusterRole -> list_inner path. Default columns.
@@ -3693,7 +3691,7 @@ async fn test_cluster_delete_collection_persistentvolume_with_finalizer_marks_te
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -6766,32 +6764,22 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
         preconditions: crate::datastore::ResourcePreconditions::from_resource(&created),
         observed_status_stamp: Some(1),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
-    db.set_klights_meta(
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-    )
-    .await
-    .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "guestbook-watch-raft-status",
-            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
             payload.as_ref(),
             node,
         )
         .await
         .expect("outbox status commit must build");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a raft commit for PodStatus");
     };
-    assert_eq!(
-        commit.resource_version_assignment,
-        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
-    );
-    assert_eq!(commit.resource_version, 0);
+    assert_eq!(commit.resource_version(), 0);
     let apply = db.apply_raft_log_apply_commit(commit).await.unwrap();
     assert!(
         apply.error_message.is_none(),
@@ -8273,19 +8261,21 @@ async fn test_selector_watch_from_list_rv_delivers_baseline_delete_below_floor()
         delete_rv > create_rv,
         "test setup requires delete rv above object rv but below list rv"
     );
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
-        delete_rv,
-        vec![crate::log_apply::LogApplyMutation::DeleteResource(
-            crate::log_apply::LogApplyResourceKey {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: Some(namespace.to_string()),
-                name: "watched".to_string(),
-                uid: "cm-low-rv-delete".to_string(),
-                precondition_resource_version: None,
-            },
-        )],
-    ))
+    db.apply_log_apply_commit(
+        crate::log_apply::LogApplyCommit::try_new(vec![
+            crate::log_apply::LogApplyMutation::DeleteResource(
+                crate::log_apply::LogApplyResourceKey {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some(namespace.to_string()),
+                    name: "watched".to_string(),
+                    uid: "cm-low-rv-delete".to_string(),
+                    precondition_resource_version: None,
+                },
+            ),
+        ])
+        .unwrap(),
+    )
     .await
     .expect("replicated delete below list rv");
 
@@ -9236,13 +9226,12 @@ async fn test_crd_live_replay_failure_emits_terminal_error() {
 
     // Redb has a deterministic close boundary used to inject the replay read
     // failure; the default SQLite test handle remains callable after close.
-    let mut state = build_test_app_state().await;
     let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
         crate::datastore::redb::RedbDatastore::new_in_memory()
             .await
             .unwrap(),
     );
-    state.db = db.clone();
+    let state = crate::api::test_support::build_test_app_state_with_db(db.clone()).await;
     let app = crate::api::build_router(state);
     register_selw_crd(&app).await;
     let create = |name: &str| {
@@ -9739,19 +9728,21 @@ async fn test_rv_selector_cr_watch_delivers_baseline_delete_below_floor() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let delete_rv = list_rv - 1;
     assert!(delete_rv > create_rv);
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
-        delete_rv,
-        vec![crate::log_apply::LogApplyMutation::DeleteResource(
-            crate::log_apply::LogApplyResourceKey {
-                api_version: "selwatch.example.com/v1".to_string(),
-                kind: "Selw".to_string(),
-                namespace: Some(namespace.to_string()),
-                name: "watched".to_string(),
-                uid: "selw-low-rv-delete".to_string(),
-                precondition_resource_version: None,
-            },
-        )],
-    ))
+    db.apply_log_apply_commit(
+        crate::log_apply::LogApplyCommit::try_new(vec![
+            crate::log_apply::LogApplyMutation::DeleteResource(
+                crate::log_apply::LogApplyResourceKey {
+                    api_version: "selwatch.example.com/v1".to_string(),
+                    kind: "Selw".to_string(),
+                    namespace: Some(namespace.to_string()),
+                    name: "watched".to_string(),
+                    uid: "selw-low-rv-delete".to_string(),
+                    precondition_resource_version: None,
+                },
+            ),
+        ])
+        .unwrap(),
+    )
     .await
     .expect("replicated CR delete below list rv");
 

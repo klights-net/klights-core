@@ -1,6 +1,8 @@
 //! Shared lifecycle message types — moved from `pod_lifecycle_actor` to
 //! prevent `pod_lifecycle_actor` ↔ `pod_lifecycle_router` dependency cycles.
 
+pub const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PodLifecycleKey {
     pub namespace: String,
@@ -104,7 +106,6 @@ pub enum LifecycleMessage {
         operation_id: u64,
         blocking_uid: String,
         blocking_node: String,
-        state: crate::datastore::PodSlotAdmissionState,
     },
     SlotAdmissionWake {
         key: PodLifecycleKey,

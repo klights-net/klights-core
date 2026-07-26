@@ -22,8 +22,8 @@ pub struct ConfigPhase {
     pub network_cleanup: NetworkCleanup,
     pub shutdown_token: CancellationToken,
     pub etc_dir: String,
-    pub containerd_data_dir: String,
     pub containerd_state_dir: String,
+    pub runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
@@ -67,12 +67,13 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
     let etc_dir = paths::etc_dir_path(&config.containerd_namespace)
         .to_string_lossy()
         .into_owned();
-    let containerd_data_dir = paths::containerd_data_dir_path(&config.containerd_namespace)
-        .to_string_lossy()
-        .into_owned();
     let containerd_state_dir = paths::containerd_state_dir_path(&config.containerd_namespace)
         .to_string_lossy()
         .into_owned();
+    let runtime_paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+        paths::data_root_path(&config.containerd_namespace),
+    )
+    .context("invalid kubelet runtime path layout")?;
 
     Ok(ConfigPhase {
         config,
@@ -83,7 +84,7 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         network_cleanup,
         shutdown_token,
         etc_dir,
-        containerd_data_dir,
         containerd_state_dir,
+        runtime_paths,
     })
 }

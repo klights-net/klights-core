@@ -2026,10 +2026,10 @@ async fn redb_node_subnet() {
 }
 
 parametrize_backends!(node_dataplane_metadata_round_trip, |db| {
-    let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+    let metadata = klights_cluster_store::DataplanePeerMetadata::try_new(
         "node1".to_string(),
-        crate::networking::wireguard::DataplaneMode::Root,
-        crate::networking::wireguard::DataplaneEncryption::Enabled,
+        klights_cluster_store::DataplaneMode::Root,
+        klights_cluster_store::DataplaneEncryption::Enabled,
         Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
         Some("192.0.2.10".to_string()),
         Some(51_820),

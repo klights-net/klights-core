@@ -389,6 +389,18 @@ async fn test_nonindexed_job_deletes_excess_active_pods_above_parallelism() {
         active_pods, 2,
         "job controller must cap active pods at parallelism"
     );
+    assert_eq!(
+        pods.len(),
+        3,
+        "Job parallelism scale-down must leave actor-owned Pod rows in place"
+    );
+    assert_eq!(
+        pods.iter()
+            .filter(|pod| pod.data.pointer("/metadata/deletionTimestamp").is_some())
+            .count(),
+        1,
+        "Job parallelism scale-down must mark the surplus Pod UID terminating"
+    );
     assert_eq!(result["status"]["active"].as_i64(), Some(2));
 }
 
@@ -1328,6 +1340,7 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
 
     let state = crate::api::test_support::build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "batch/v1",
@@ -1359,22 +1372,25 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         .unwrap();
 
     let job = state
+        .resource_mutation()
         .db
         .get_resource("batch/v1", "Job", Some("default"), "ttl-success-job")
         .await
         .unwrap()
         .unwrap();
     state
+        .controller_reconcile()
         .controller_dispatcher
         .reconcile(
             &crate::api::inject_resource_version(job.data, job.resource_version),
-            &state.db,
-            &state.config.node_name,
+            &state.resource_mutation().db,
+            &state.operational().config.node_name,
         )
         .await
         .unwrap();
 
     let pods = state
+        .resource_mutation()
         .db
         .list_resources_by_owner_uid("v1", "Pod", Some("default"), "uid-ttl-success-job")
         .await
@@ -1390,6 +1406,7 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
     );
 
     state
+        .resource_mutation()
         .pod_repository
         .replace_status_from_api(
             "default",
@@ -1440,6 +1457,7 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         .unwrap();
 
     let updated_pod = state
+        .resource_mutation()
         .db
         .get_resource("v1", "Pod", Some("default"), &pod.name)
         .await
@@ -1454,6 +1472,7 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         "test precondition: status update must preserve Pod ownerReferences"
     );
     let queued = state
+        .controller_reconcile()
         .controller_dispatcher
         .queued_reconcile_keys_for_test()
         .await;
@@ -1468,22 +1487,25 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
     );
 
     let job = state
+        .resource_mutation()
         .db
         .get_resource("batch/v1", "Job", Some("default"), "ttl-success-job")
         .await
         .unwrap()
         .expect("Job must still exist after the Pod reaches Succeeded");
     state
+        .controller_reconcile()
         .controller_dispatcher
         .reconcile(
             &crate::api::inject_resource_version(job.data, job.resource_version),
-            &state.db,
-            &state.config.node_name,
+            &state.resource_mutation().db,
+            &state.operational().config.node_name,
         )
         .await
         .unwrap();
 
     let completed = state
+        .resource_mutation()
         .db
         .get_resource("batch/v1", "Job", Some("default"), "ttl-success-job")
         .await

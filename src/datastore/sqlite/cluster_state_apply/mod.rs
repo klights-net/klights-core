@@ -40,8 +40,6 @@ pub(super) struct RaftClusterStateApplier<'tx, 'conn> {
     watch_history: watch_history::WatchHistoryStateApplier<'tx, 'conn>,
 }
 
-pub(crate) use resource::ResourcePreconditionMode;
-
 impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
     pub(super) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
         Self {
@@ -94,7 +92,6 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
         commit_resource_version: i64,
         mutation: ClusterMutation,
         emit_watch_events: bool,
-        resource_precondition_mode: resource::ResourcePreconditionMode,
         effects: &mut ApplyEffects,
     ) -> tokio_rusqlite::Result<()> {
         match mutation {
@@ -105,11 +102,10 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
                             "resource row RV does not match commit RV",
                         ));
                     }
-                    if let Some(event) = self.resource_mut().apply_put_resource(
-                        row,
-                        emit_watch_events,
-                        resource_precondition_mode,
-                    )? {
+                    if let Some(event) = self
+                        .resource_mut()
+                        .apply_put_resource(row, emit_watch_events)?
+                    {
                         effects.push_watch_event(event);
                     }
                 }
@@ -119,11 +115,10 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
                             "resource patch RV does not match commit RV",
                         ));
                     }
-                    if let Some(event) = self.resource_mut().apply_patch_resource_latest(
-                        patch,
-                        emit_watch_events,
-                        resource_precondition_mode,
-                    )? {
+                    if let Some(event) = self
+                        .resource_mut()
+                        .apply_patch_resource_latest(patch, emit_watch_events)?
+                    {
                         effects.push_watch_event(event);
                     }
                 }
@@ -132,7 +127,6 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
                         commit_resource_version,
                         key,
                         emit_watch_events,
-                        resource_precondition_mode,
                     )? {
                         effects.push_watch_event(event);
                     }

@@ -1,6 +1,6 @@
 use klights_cluster_core::{
-    ClusterMembership, ClusterMetadata, LogApplyCommit, OutboxStreamWatermark,
-    ResourceVersionAssignment, WatchReplayPosition,
+    ClusterMembership, ClusterMetadata, OutboxStreamWatermark, SnapshotRestoreOperation,
+    WatchReplayPosition,
 };
 use klights_cluster_store::{
     AllocatorStateError, AllocatorStateFuture, AuthoritativeSnapshot, AuthoritativeSnapshotCapture,
@@ -61,14 +61,11 @@ impl DurableWatchHistoryRead for FakeRecoveryStore {
 impl DurableAllocatorRead for FakeRecoveryStore {
     fn read_allocator_state(&self) -> AllocatorStateFuture<'_, DurableAllocatorState> {
         Box::pin(async {
-            DurableAllocatorState::try_new(
-                ResourceVersionAssignment::CommittedApplyV1,
-                WatchReplayPosition {
-                    resource_version: 17,
-                    event_id: 23,
-                    resource_version_filter_through_event_id: 0,
-                },
-            )
+            DurableAllocatorState::try_new(WatchReplayPosition {
+                resource_version: 17,
+                event_id: 23,
+                resource_version_filter_through_event_id: 0,
+            })
         })
     }
 }
@@ -227,19 +224,13 @@ fn watch_history_values_preserve_position_scope_and_floor_exactly() {
 }
 
 #[test]
-fn allocator_state_preserves_canonical_mode_position_and_exact_next_values() {
+fn allocator_state_preserves_position_and_exact_next_values() {
     let position = WatchReplayPosition {
         resource_version: 17,
         event_id: 23,
         resource_version_filter_through_event_id: 0,
     };
-    let state =
-        DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, position)
-            .unwrap();
-    assert_eq!(
-        state.resource_version_assignment(),
-        ResourceVersionAssignment::CommittedApplyV1
-    );
+    let state = DurableAllocatorState::try_new(position).unwrap();
     assert_eq!(state.position(), position);
     assert_eq!(state.next_resource_version(), 18);
     assert_eq!(state.next_event_id(), 24);
@@ -247,7 +238,7 @@ fn allocator_state_preserves_canonical_mode_position_and_exact_next_values() {
 
 #[test]
 fn authoritative_snapshot_preserves_canonical_state_without_shadow_values() {
-    let commits = vec![LogApplyCommit::new(17, Vec::new())];
+    let operations = vec![SnapshotRestoreOperation::new(17, None, Vec::new())];
     let position = WatchReplayPosition {
         resource_version: 17,
         event_id: 23,
@@ -256,8 +247,7 @@ fn authoritative_snapshot_preserves_canonical_state_without_shadow_values() {
     let floors =
         vec![DurableReplayFloor::namespaced("v1", "ConfigMap", "default", 11, 13, true).unwrap()];
     let snapshot = AuthoritativeSnapshot::try_new(
-        commits.clone(),
-        Some(ResourceVersionAssignment::CommittedApplyV1),
+        operations.clone(),
         Some(position),
         Some(floors.clone()),
         metadata(17),
@@ -265,11 +255,7 @@ fn authoritative_snapshot_preserves_canonical_state_without_shadow_values() {
     )
     .unwrap();
 
-    assert_eq!(snapshot.commits(), commits.as_slice());
-    assert_eq!(
-        snapshot.resource_version_assignment(),
-        Some(ResourceVersionAssignment::CommittedApplyV1)
-    );
+    assert_eq!(snapshot.operations(), operations.as_slice());
     assert_eq!(snapshot.position(), Some(position));
     assert_eq!(snapshot.replay_floors(), Some(floors.as_slice()));
     assert_eq!(snapshot.metadata(), &metadata(17));
@@ -300,28 +286,21 @@ fn snapshot_presence_distinguishes_legacy_absence_from_explicit_empty_state() {
         Vec::new(),
         None,
         None,
-        None,
         metadata(0),
         SnapshotMembership::LegacyOmitted,
     )
     .unwrap();
-    assert_eq!(absent.resource_version_assignment(), None);
     assert_eq!(absent.position(), None);
     assert_eq!(absent.replay_floors(), None);
 
     let explicit = AuthoritativeSnapshot::try_new(
         Vec::new(),
-        Some(ResourceVersionAssignment::LegacyLeaderAssigned),
         Some(WatchReplayPosition::default()),
         Some(Vec::new()),
         metadata(0),
         SnapshotMembership::AuthoritativeAbsent,
     )
     .unwrap();
-    assert_eq!(
-        explicit.resource_version_assignment(),
-        Some(ResourceVersionAssignment::LegacyLeaderAssigned)
-    );
     assert_eq!(explicit.position(), Some(WatchReplayPosition::default()));
     assert_eq!(explicit.replay_floors(), Some([].as_slice()));
 }
@@ -337,14 +316,11 @@ fn recovery_values_reject_inexact_or_internally_inconsistent_state() {
         Err(WatchHistoryError::InvalidReplayFloor { .. })
     ));
     assert_eq!(
-        DurableAllocatorState::try_new(
-            ResourceVersionAssignment::LegacyLeaderAssigned,
-            WatchReplayPosition {
-                resource_version: i64::MAX,
-                event_id: 0,
-                resource_version_filter_through_event_id: 0,
-            }
-        ),
+        DurableAllocatorState::try_new(WatchReplayPosition {
+            resource_version: i64::MAX,
+            event_id: 0,
+            resource_version_filter_through_event_id: 0,
+        }),
         Err(AllocatorStateError::AllocatorExhausted {
             allocator: "resourceVersion",
             current: i64::MAX,
@@ -353,7 +329,6 @@ fn recovery_values_reject_inexact_or_internally_inconsistent_state() {
 
     let mismatch = AuthoritativeSnapshot::try_new(
         Vec::new(),
-        Some(ResourceVersionAssignment::LegacyLeaderAssigned),
         Some(WatchReplayPosition::from_resource_version(9)),
         Some(Vec::new()),
         metadata(8),
@@ -365,7 +340,6 @@ fn recovery_values_reject_inexact_or_internally_inconsistent_state() {
     ));
 
     let invalid_capture = SnapshotCaptureHeader::try_new(
-        Some(ResourceVersionAssignment::CommittedApplyV1),
         None,
         WatchReplayPosition {
             resource_version: 1,
@@ -398,7 +372,6 @@ fn snapshot_capture_header_preserves_only_exact_v3_activation_proof() {
         resource_version_filter_through_event_id: 0,
     };
     let header = SnapshotCaptureHeader::try_new(
-        Some(ResourceVersionAssignment::CommittedApplyV1),
         Some(3),
         position,
         metadata(7),
@@ -409,7 +382,6 @@ fn snapshot_capture_header_preserves_only_exact_v3_activation_proof() {
 
     assert!(matches!(
         SnapshotCaptureHeader::try_new(
-            Some(ResourceVersionAssignment::CommittedApplyV1),
             Some(2),
             position,
             metadata(7),
@@ -539,7 +511,6 @@ fn exact_floor_requires_snapshot_position_and_duplicate_targets_fail_closed() {
     let missing_position = AuthoritativeSnapshot::try_new(
         Vec::new(),
         None,
-        None,
         Some(vec![exact]),
         metadata(0),
         SnapshotMembership::AuthoritativeAbsent,
@@ -553,7 +524,6 @@ fn exact_floor_requires_snapshot_position_and_duplicate_targets_fail_closed() {
     let duplicate = AuthoritativeSnapshot::try_new(
         Vec::new(),
         None,
-        None,
         Some(vec![floor.clone(), floor]),
         metadata(0),
         SnapshotMembership::AuthoritativeAbsent,
@@ -566,28 +536,32 @@ fn exact_floor_requires_snapshot_position_and_duplicate_targets_fail_closed() {
 
 #[test]
 fn capture_pages_are_nonempty_and_strictly_bounded() {
-    assert!(SnapshotCapturePage::try_commits(Vec::new()).is_err());
+    assert!(SnapshotCapturePage::try_operations(Vec::new()).is_err());
     assert!(
-        SnapshotCapturePage::try_commits(
+        SnapshotCapturePage::try_operations(
             (0..=MAX_SNAPSHOT_CAPTURE_PAGE)
-                .map(|index| LogApplyCommit::new(index as i64 + 1, Vec::new()))
+                .map(|index| SnapshotRestoreOperation::new(index as i64 + 1, None, Vec::new()))
                 .collect()
         )
         .is_err()
     );
     assert_eq!(
-        SnapshotCapturePage::try_commits(vec![LogApplyCommit::new(1, Vec::new())])
-            .unwrap()
-            .len(),
+        SnapshotCapturePage::try_operations(vec![SnapshotRestoreOperation::new(
+            1,
+            None,
+            Vec::new(),
+        )])
+        .unwrap()
+        .len(),
         1
     );
 }
 
 #[test]
 fn capture_pages_offer_narrow_consuming_handoff_by_family() {
-    let commits = vec![LogApplyCommit::new(1, Vec::new())];
-    let page = SnapshotCapturePage::try_commits(commits.clone()).unwrap();
-    assert_eq!(page.into_commits(), Some(commits));
+    let operations = vec![SnapshotRestoreOperation::new(1, None, Vec::new())];
+    let page = SnapshotCapturePage::try_operations(operations.clone()).unwrap();
+    assert_eq!(page.into_operations(), Some(operations));
 
     let floor = DurableReplayFloor::all(0, 0, false).unwrap();
     let page = SnapshotCapturePage::try_replay_floors(vec![floor.clone()]).unwrap();
@@ -600,7 +574,6 @@ fn snapshot_parts_expose_consuming_accessors_not_public_fields() {
         Vec::new(),
         None,
         None,
-        None,
         metadata(0),
         SnapshotMembership::LegacyOmitted,
     )
@@ -608,9 +581,9 @@ fn snapshot_parts_expose_consuming_accessors_not_public_fields() {
     .into_parts();
     assert_eq!(parts.metadata(), &metadata(0));
     assert_eq!(parts.membership(), &SnapshotMembership::LegacyOmitted);
-    let commits = parts.take_commits();
+    let operations = parts.take_operations();
     let (_, membership) = parts.into_metadata_and_membership();
-    assert!(commits.is_empty());
+    assert!(operations.is_empty());
     assert_eq!(membership, SnapshotMembership::LegacyOmitted);
 }
 

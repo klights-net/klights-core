@@ -20,23 +20,54 @@ use serde_json::Value;
 #[cfg(test)]
 use tokio::sync::broadcast;
 
-use crate::control_plane::client::{
-    LeaderApiClient, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
-    legacy_list_response,
-};
+#[cfg(test)]
 use crate::datastore::DatastoreHandle;
-use crate::datastore::{Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
+#[cfg(test)]
 use crate::side_effects::SideEffectMetrics;
 #[cfg(test)]
 use crate::side_effects::SideEffectRegistry;
 #[cfg(test)]
 use crate::watch::WatchEvent;
+use klights_cluster_core::Resource;
+use klights_leader_api::LeaderResourceQuery;
+use klights_leader_api::{ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency};
 use klights_pod_api::{PodDeleteOptions, PodRepositoryError};
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_supervisor::TaskSupervisor;
 use klights_types::{PodIdentity, ResourceKey};
+
+#[derive(Clone, Debug)]
+pub struct PodResourceList {
+    pub items: Vec<Resource>,
+    pub resource_version: i64,
+    pub continue_token: Option<String>,
+    pub remaining_item_count: Option<i64>,
+}
+
+#[cfg(test)]
+impl From<crate::datastore::ResourceList> for PodResourceList {
+    fn from(list: crate::datastore::ResourceList) -> Self {
+        Self {
+            items: list.items,
+            resource_version: list.resource_version,
+            continue_token: list.continue_token,
+            remaining_item_count: list.remaining_item_count,
+        }
+    }
+}
+
+fn resource_list_from_leader(result: klights_leader_api::ResourceListResult) -> PodResourceList {
+    let (items, resource_version, _position, continue_token, remaining_item_count) =
+        result.into_parts();
+    PodResourceList {
+        items,
+        resource_version,
+        continue_token,
+        remaining_item_count,
+    }
+}
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
@@ -191,7 +222,7 @@ pub use types::{
 
 use background::PodRepositoryBackground;
 use delete_coordinator::PodDeleteCoordinator;
-use klights_reconcile_api::{PodGcReconcileSink, PodPdbReconcileSink};
+use klights_reconcile_api::{PodEvictionAdmissionSink, PodGcReconcileSink, PodPdbReconcileSink};
 use network::PodNetworkService;
 use objects::PodObjectService;
 use state_only_writer::{StateOnlyWriter, StatusOnlyWriterService};
@@ -264,7 +295,7 @@ pub(crate) trait PodSubresourcePort: Send + Sync {
         pod_uid: Option<&str>,
         status: Value,
         expected_rv: i64,
-    ) -> Result<Resource>;
+    ) -> std::result::Result<Resource, PodRepositoryError>;
     async fn patch_status(
         &self,
         ns: &str,
@@ -272,14 +303,14 @@ pub(crate) trait PodSubresourcePort: Send + Sync {
         patch: Value,
         patch_type: PodStatusPatchType,
         expected_rv: i64,
-    ) -> Result<Resource>;
+    ) -> std::result::Result<Resource, PodRepositoryError>;
     async fn update_ephemeral_containers(
         &self,
         ns: &str,
         name: &str,
         containers: Vec<Value>,
         expected_rv: i64,
-    ) -> Result<Resource>;
+    ) -> std::result::Result<Resource, PodRepositoryError>;
 }
 
 pub(crate) struct PodRepositoryAdapterDependencies {
@@ -291,7 +322,7 @@ pub(crate) struct PodRepositoryAdapterDependencies {
 
 pub(crate) struct PodRepositoryRuntimeDependencies {
     pub supervisor: Arc<TaskSupervisor>,
-    pub metrics: Arc<SideEffectMetrics>,
+    pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
 }
 
 pub(crate) struct PodRepositoryNetworkDependencies {
@@ -300,8 +331,8 @@ pub(crate) struct PodRepositoryNetworkDependencies {
 }
 
 pub(crate) struct PodRepositoryDeliveryDependencies {
-    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
-    pub cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    pub outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
 }
 
 pub(crate) struct PodRepositoryAdapters {
@@ -310,6 +341,8 @@ pub(crate) struct PodRepositoryAdapters {
     pub gc_delete: Arc<dyn GcPodDeleteSink>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
+    pub eviction_admission: Arc<dyn PodEvictionAdmissionSink>,
+    pub namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     #[cfg(test)]
@@ -331,7 +364,7 @@ pub trait PodReader: Send + Sync {
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> Result<ResourceList>;
+    ) -> Result<PodResourceList>;
     async fn list_pods_by_owner_uid(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>>;
 }
 
@@ -703,16 +736,39 @@ pub struct PodRepository {
     _watch: PodWatchService,
     api: Arc<dyn PodApiPort>,
     gc_delete: Arc<dyn GcPodDeleteSink>,
+    eviction_admission: Arc<dyn PodEvictionAdmissionSink>,
+    namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
     workqueue: Arc<PodWorkqueue>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     supervisor: Arc<TaskSupervisor>,
-    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
-    cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    outbox: Option<Arc<crate::node_outbox::Outbox>>,
+    cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    host_ip: crate::kubelet::context::HostIpState,
     #[cfg(test)]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
     #[cfg(test)]
     api_for_test: Arc<crate::pod_api_service::PodApiService>,
+}
+
+impl PodRepository {
+    pub(crate) fn mutation_reconcile_port(
+        &self,
+    ) -> Arc<dyn klights_reconcile_api::PodMutationReconcileSink> {
+        self.mutation_reconcile.clone()
+    }
+
+    pub(crate) fn eviction_admission_port(
+        &self,
+    ) -> Arc<dyn klights_reconcile_api::PodEvictionAdmissionSink> {
+        self.eviction_admission.clone()
+    }
+
+    pub(crate) fn namespace_bootstrap_port(
+        &self,
+    ) -> Arc<dyn klights_reconcile_api::NamespaceBootstrapSink> {
+        self.namespace_bootstrap.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -722,10 +778,10 @@ struct PodDeletionFinalizerDependencies {
     gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
-    cluster_api: Option<Arc<dyn LeaderApiClient>>,
-    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    outbox: Option<Arc<crate::node_outbox::Outbox>>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
-    metrics: Arc<SideEffectMetrics>,
+    metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     supervisor: Arc<TaskSupervisor>,
     deferred_runtime: status::DeferredRuntimeReducerHandle,
 }
@@ -792,9 +848,9 @@ impl PodDeletionFinalizer for DeferredRuntimeCleanupFinalizer {
 }
 
 #[derive(Debug)]
-struct PodUidMismatch {
-    expected: String,
-    actual: String,
+pub(crate) struct PodUidMismatch {
+    pub(crate) expected: String,
+    pub(crate) actual: String,
     namespace: String,
     name: String,
 }
@@ -862,7 +918,11 @@ impl PodRepository {
         self.store.sandbox_gc_dirty.clone()
     }
 
-    pub fn outbox(&self) -> Option<&crate::kubelet::outbox::Outbox> {
+    pub(crate) fn host_ip_state(&self) -> crate::kubelet::context::HostIpState {
+        self.host_ip.clone()
+    }
+
+    pub fn outbox(&self) -> Option<&crate::node_outbox::Outbox> {
         self.outbox.as_deref()
     }
 
@@ -891,7 +951,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+        outbox: Option<Arc<crate::node_outbox::Outbox>>,
     ) -> Self {
         let network_cache = test_pod_network_cache(db.clone());
         let assignment_bus = test_assignment_bus();
@@ -914,8 +974,8 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
-        cluster_api: Arc<dyn LeaderApiClient>,
+        outbox: Option<Arc<crate::node_outbox::Outbox>>,
+        cluster_api: Arc<dyn LeaderResourceQuery>,
     ) -> Self {
         let pod_network_cache = test_pod_network_cache(db.clone());
         let assignment_waiter = test_assignment_bus();
@@ -941,7 +1001,7 @@ impl PodRepository {
         pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
         assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+        outbox: Option<Arc<crate::node_outbox::Outbox>>,
     ) -> Self {
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
@@ -972,7 +1032,8 @@ impl PodRepository {
     }
 
     pub(crate) fn build_parts_with_adapters(
-        db: DatastoreHandle,
+        pod_persistence: Arc<dyn store::PodPersistence>,
+        workqueue_persistence: impl workqueue::PodWorkqueuePersistence + Clone + 'static,
         runtime: PodRepositoryRuntimeDependencies,
         network: PodRepositoryNetworkDependencies,
         delivery: PodRepositoryDeliveryDependencies,
@@ -991,11 +1052,11 @@ impl PodRepository {
             outbox,
             cluster_api,
         } = delivery;
-        let store = Arc::new(PodStore::new(db.clone()));
+        let store = Arc::new(PodStore::from_persistence(pod_persistence));
         let workqueue = if let Some(leadership) = leadership {
             PodWorkqueue::new_leader(
                 store.clone(),
-                db.clone(),
+                workqueue_persistence.clone(),
                 supervisor.clone(),
                 metrics.clone(),
                 leadership,
@@ -1003,7 +1064,7 @@ impl PodRepository {
         } else {
             PodWorkqueue::new(
                 store.clone(),
-                db.clone(),
+                workqueue_persistence,
                 supervisor.clone(),
                 metrics.clone(),
             )
@@ -1025,14 +1086,18 @@ impl PodRepository {
         let api = adapters.api;
         let gc_reconcile = adapters.gc_reconcile;
         let pdb_reconcile = adapters.pdb_reconcile;
+        let eviction_admission = adapters.eviction_admission;
+        let namespace_bootstrap = adapters.namespace_bootstrap;
         let namespace_termination = adapters.namespace_termination;
         let mutation_reconcile = adapters.mutation_reconcile;
+        let host_ip = crate::kubelet::context::HostIpState::default();
         let status = PodStatusService::new(
             store.clone(),
             status_only.clone(),
             mutation_reconcile.clone(),
             outbox.clone(),
             cluster_api.clone(),
+            host_ip.clone(),
         );
         let objects = PodObjectService::new(
             store.clone(),
@@ -1042,8 +1107,12 @@ impl PodRepository {
             cluster_api.clone(),
         );
         let subresource = adapters.subresource;
-        let network_svc =
-            PodNetworkService::new(pod_network_cache, supervisor.clone(), assignment_waiter);
+        let network_svc = PodNetworkService::new(
+            pod_network_cache,
+            supervisor.clone(),
+            assignment_waiter,
+            host_ip.clone(),
+        );
         let watch = PodWatchService::new(store.clone());
         let gc_pod_delete_sink = adapters.gc_delete.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
@@ -1052,7 +1121,7 @@ impl PodRepository {
             store: store.clone(),
             gc_pod_delete_sink,
             gc_reconcile,
-            pdb_reconcile,
+            pdb_reconcile: pdb_reconcile.clone(),
             namespace_termination: namespace_termination.clone(),
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
@@ -1074,12 +1143,15 @@ impl PodRepository {
             _watch: watch,
             api,
             gc_delete: adapters.gc_delete,
+            eviction_admission,
+            namespace_bootstrap,
             workqueue: workqueue.clone(),
             namespace_termination: namespace_termination.clone(),
             mutation_reconcile,
             supervisor,
             outbox,
             cluster_api,
+            host_ip,
             #[cfg(test)]
             deletion_finalizer,
             #[cfg(test)]
@@ -1339,7 +1411,7 @@ impl PodReader for PodRepository {
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> Result<ResourceList> {
+    ) -> Result<PodResourceList> {
         if let Some(cluster_api) = &self.cluster_api {
             let list = cluster_api
                 .list_resources(ResourceListRequest::try_new(
@@ -1353,7 +1425,7 @@ impl PodReader for PodRepository {
                     ResourceQueryConsistency::LeaderFresh,
                 )?)
                 .await?;
-            return Ok(legacy_list_response(list));
+            return Ok(resource_list_from_leader(list));
         }
         self.store
             .list(ns, label_selector, field_selector, limit, continue_token)
@@ -1826,6 +1898,88 @@ impl PodSubresourceWriter for PodRepository {
         self.subresource
             .update_ephemeral_containers(ns, name, containers, expected_rv)
             .await
+            .map_err(Into::into)
+    }
+}
+
+impl klights_pod_api::PodSubresourceMutation for PodRepository {
+    fn replace_status(
+        &self,
+        request: klights_pod_api::PodStatusReplaceRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            let klights_pod_api::PodStatusReplaceRequest {
+                namespace,
+                name,
+                status,
+                expected_resource_version,
+            } = request;
+            PodSubresourceWriter::replace_status_from_api(
+                self,
+                &namespace,
+                &name,
+                status,
+                expected_resource_version,
+            )
+            .await
+            .map_err(|error| ordinary_access::map_repository_error(error, &namespace, &name))
+        })
+    }
+
+    fn patch_status(
+        &self,
+        request: klights_pod_api::PodStatusPatchRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        let klights_pod_api::PodStatusPatchRequest {
+            namespace,
+            name,
+            patch,
+            patch_kind,
+            expected_resource_version,
+        } = request;
+        let patch_type = match patch_kind {
+            klights_pod_api::PodStatusPatchKind::JsonPatch => PodStatusPatchType::JsonPatch,
+            klights_pod_api::PodStatusPatchKind::MergePatch => PodStatusPatchType::MergePatch,
+            klights_pod_api::PodStatusPatchKind::StrategicMerge => {
+                PodStatusPatchType::StrategicMerge
+            }
+            klights_pod_api::PodStatusPatchKind::ApplyPatch => PodStatusPatchType::ApplyPatch,
+        };
+        Box::pin(async move {
+            PodSubresourceWriter::patch_status_from_api(
+                self,
+                &namespace,
+                &name,
+                patch,
+                patch_type,
+                expected_resource_version,
+            )
+            .await
+            .map_err(|error| ordinary_access::map_repository_error(error, &namespace, &name))
+        })
+    }
+
+    fn update_ephemeral_containers(
+        &self,
+        request: klights_pod_api::PodEphemeralContainersRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            let klights_pod_api::PodEphemeralContainersRequest {
+                namespace,
+                name,
+                containers,
+                expected_resource_version,
+            } = request;
+            PodSubresourceWriter::update_ephemeral_containers(
+                self,
+                &namespace,
+                &name,
+                containers,
+                expected_resource_version,
+            )
+            .await
+            .map_err(|error| ordinary_access::map_repository_error(error, &namespace, &name))
+        })
     }
 }
 

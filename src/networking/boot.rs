@@ -12,7 +12,8 @@ use anyhow::Result;
 use std::sync::Arc;
 
 use crate::networking::dataplane_health::DataplaneHealth;
-use crate::networking::{NetworkPlane, PodSubnet, RootlessNetworkPlane};
+use crate::networking::{NetworkPlane, RootlessNetworkPlane};
+use klights_types::PodSubnet;
 
 pub(crate) struct NetworkBootStores {
     pub(crate) subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,

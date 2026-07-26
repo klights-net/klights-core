@@ -7,6 +7,49 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+fn non_pod_finalization(
+    db: &crate::datastore::sqlite::Datastore,
+) -> crate::gc_delete_adapter::GcNonPodFinalizationAdapter {
+    crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone()))
+}
+
+#[derive(Clone)]
+enum FakeNonPodResult {
+    Outcome(klights_reconcile_api::GcNonPodFinalizationOutcome),
+    Error(&'static str),
+}
+
+struct RecordingNonPodFinalization {
+    result: FakeNonPodResult,
+    requests: Mutex<Vec<klights_reconcile_api::GcNonPodFinalizationRequest>>,
+}
+
+impl RecordingNonPodFinalization {
+    fn new(result: FakeNonPodResult) -> Self {
+        Self {
+            result,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl klights_reconcile_api::GcNonPodFinalizationPort for RecordingNonPodFinalization {
+    fn finalize_non_pod(
+        &self,
+        request: klights_reconcile_api::GcNonPodFinalizationRequest,
+    ) -> klights_reconcile_api::GcNonPodFinalizationFuture<'_> {
+        Box::pin(async move {
+            self.requests.lock().unwrap().push(request);
+            match &self.result {
+                FakeNonPodResult::Outcome(outcome) => Ok(outcome.clone()),
+                FakeNonPodResult::Error(message) => Err(
+                    klights_reconcile_api::ReconcileSinkError::unavailable(*message),
+                ),
+            }
+        })
+    }
+}
+
 /// Test sink that records every Pod delete request without touching the datastore.
 struct RecordingGcPodDeleteSink {
     requests: Mutex<Vec<(String, String, String)>>, // (namespace, name, uid)
@@ -56,6 +99,136 @@ impl GcPodDeleteSink for NoOpGcPodDeleteSink {
             ))
         })
     }
+}
+
+#[tokio::test]
+async fn non_pod_finalization_port_maps_all_outcomes_and_orphan_intent() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let resource = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "gc-port-outcomes",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "gc-port-outcomes",
+                    "uid": "gc-port-outcomes-uid",
+                    "finalizers": ["orphan"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    for (port_outcome, expected) in [
+        (
+            klights_reconcile_api::GcNonPodFinalizationOutcome::HardDeleted,
+            GcDeleteOutcome::HardDeleted,
+        ),
+        (
+            klights_reconcile_api::GcNonPodFinalizationOutcome::MarkedTerminating,
+            GcDeleteOutcome::MarkedTerminating,
+        ),
+        (
+            klights_reconcile_api::GcNonPodFinalizationOutcome::Gone,
+            GcDeleteOutcome::Gone,
+        ),
+    ] {
+        let port = RecordingNonPodFinalization::new(FakeNonPodResult::Outcome(port_outcome));
+        let outcome = delete_resource_for_gc(&db, &resource, &NoOpGcPodDeleteSink, &port)
+            .await
+            .unwrap();
+        assert_eq!(outcome, expected);
+        let requests = port.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].orphan_children);
+        assert_eq!(requests[0].resource.uid, resource.uid);
+    }
+}
+
+#[tokio::test]
+async fn non_pod_finalization_port_propagates_conflict_like_errors() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let resource = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "gc-port-error",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "gc-port-error",
+                    "uid": "gc-port-error-uid"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let port =
+        RecordingNonPodFinalization::new(FakeNonPodResult::Error("resourceVersion conflict"));
+
+    let error = delete_resource_for_gc(&db, &resource, &NoOpGcPodDeleteSink, &port)
+        .await
+        .expect_err("port failure must abort GC");
+
+    assert!(error.to_string().contains("resourceVersion conflict"));
+    assert!(!port.requests.lock().unwrap()[0].orphan_children);
+}
+
+#[tokio::test]
+async fn bound_pod_delete_routes_only_to_uid_bound_actor_sink() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "bound-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "bound-pod",
+                    "uid": "bound-pod-uid"
+                },
+                "spec": {"nodeName": "worker-a"}
+            }),
+        )
+        .await
+        .unwrap();
+    let pod_sink = RecordingGcPodDeleteSink::new();
+    let non_pod_port =
+        RecordingNonPodFinalization::new(FakeNonPodResult::Error("must not be called for Pod"));
+
+    let outcome = delete_resource_for_gc(&db, &pod, &pod_sink, &non_pod_port)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, GcDeleteOutcome::MarkedTerminating);
+    assert_eq!(
+        pod_sink.recorded_requests(),
+        vec![(
+            "default".to_string(),
+            "bound-pod".to_string(),
+            "bound-pod-uid".to_string()
+        )]
+    );
+    assert!(non_pod_port.requests.lock().unwrap().is_empty());
+    assert!(
+        db.get_resource("v1", "Pod", Some("default"), "bound-pod")
+            .await
+            .unwrap()
+            .is_some(),
+        "GC must not hard-delete a picked-up Pod row"
+    );
 }
 
 struct ConcurrentBlockingGcPodDeleteSink {
@@ -163,6 +336,7 @@ async fn test_cascade_delete_three_level_chain() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -228,6 +402,7 @@ async fn test_cascade_delete_single_level() {
         "ReplicaSet",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -311,6 +486,7 @@ async fn test_cascade_delete_marks_finalizer_held_child_without_recursing() {
         "ReplicaSet",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -424,6 +600,7 @@ async fn test_cascade_delete_preserves_dependents_with_another_live_owner() {
         "ReplicationController",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -688,7 +865,9 @@ async fn test_reconcile_owner_references_deletes_dangling_dependent_and_cascades
 
     let sink = NoOpGcPodDeleteSink;
 
-    let outcome = reconcile_owner_references(&db, rs, &sink).await.unwrap();
+    let outcome = reconcile_owner_references(&db, rs, &sink, &non_pod_finalization(&db))
+        .await
+        .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::Deleted);
 
     assert!(
@@ -760,7 +939,9 @@ async fn test_reconcile_owner_references_preserves_live_owner_and_removes_dangli
 
     let sink = NoOpGcPodDeleteSink;
 
-    let outcome = reconcile_owner_references(&db, cm, &sink).await.unwrap();
+    let outcome = reconcile_owner_references(&db, cm, &sink, &non_pod_finalization(&db))
+        .await
+        .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::OwnerReferencesUpdated);
 
     let cm = db
@@ -828,7 +1009,9 @@ async fn test_reconcile_owner_references_treats_non_foreground_deleting_owner_as
         .unwrap();
 
     let sink = NoOpGcPodDeleteSink;
-    let outcome = reconcile_owner_references(&db, rs, &sink).await.unwrap();
+    let outcome = reconcile_owner_references(&db, rs, &sink, &non_pod_finalization(&db))
+        .await
+        .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::HasLiveOwner);
     assert!(
         db.get_resource("apps/v1", "ReplicaSet", Some("default"), "preserved-rs")
@@ -887,7 +1070,9 @@ async fn test_reconcile_owner_references_treats_foreground_deleting_owner_as_col
         .unwrap();
 
     let sink = NoOpGcPodDeleteSink;
-    let outcome = reconcile_owner_references(&db, rs, &sink).await.unwrap();
+    let outcome = reconcile_owner_references(&db, rs, &sink, &non_pod_finalization(&db))
+        .await
+        .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::Deleted);
     assert!(
         db.get_resource("apps/v1", "ReplicaSet", Some("default"), "foreground-child")
@@ -966,9 +1151,10 @@ async fn test_reconcile_owner_references_preserves_cluster_dependent_with_namesp
         .unwrap();
 
     let sink = NoOpGcPodDeleteSink;
-    let outcome = reconcile_owner_references(&db, cluster_dependent, &sink)
-        .await
-        .unwrap();
+    let outcome =
+        reconcile_owner_references(&db, cluster_dependent, &sink, &non_pod_finalization(&db))
+            .await
+            .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::HasLiveOwner);
     assert!(
         db.get_resource(
@@ -1009,6 +1195,7 @@ async fn test_cascade_delete_no_owned_resources() {
         "Pod",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1038,9 +1225,18 @@ async fn test_cascade_delete_empty_uid() {
 
     // Empty UID and empty name should be a no-op (guard clause)
     let sink = NoOpGcPodDeleteSink;
-    cascade_delete_with_uid(&db, "", "", "", "", Some("default".to_string()), &sink)
-        .await
-        .unwrap();
+    cascade_delete_with_uid(
+        &db,
+        "",
+        "",
+        "",
+        "",
+        Some("default".to_string()),
+        &sink,
+        &non_pod_finalization(&db),
+    )
+    .await
+    .unwrap();
 
     // Pod should still exist
     let pod = db
@@ -1243,6 +1439,7 @@ async fn test_foreground_deletion_deletes_children_first() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1269,6 +1466,7 @@ async fn test_foreground_deletion_deletes_children_first() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1346,9 +1544,10 @@ async fn foreground_delete_finalizes_owner_after_shared_dependents_are_unblocked
     .unwrap();
 
     let sink = NoOpGcPodDeleteSink;
-    let finalized = finalize_foreground_owner_if_ready(&db, &owner, &sink)
-        .await
-        .unwrap();
+    let finalized =
+        finalize_foreground_owner_if_ready(&db, &owner, &sink, &non_pod_finalization(&db))
+            .await
+            .unwrap();
 
     assert!(
         finalized,
@@ -1484,7 +1683,7 @@ async fn foreground_owner_ready_after_hard_deleted_child_and_shared_dependents_o
         .expect("owner must exist");
 
     let sink = NoOpGcPodDeleteSink;
-    let ready = finalize_foreground_owner_if_ready(&db, &owner, &sink)
+    let ready = finalize_foreground_owner_if_ready(&db, &owner, &sink, &non_pod_finalization(&db))
         .await
         .unwrap();
 
@@ -1623,6 +1822,7 @@ async fn gc_foreground_owner_with_mixed_pods_waits_for_pod_cleanup() {
         "ReplicationController",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1690,9 +1890,10 @@ async fn gc_foreground_owner_with_mixed_pods_waits_for_pod_cleanup() {
             .unwrap();
     }
 
-    let finalized = finalize_foreground_owner_if_ready(&db, &owner, &sink)
-        .await
-        .unwrap();
+    let finalized =
+        finalize_foreground_owner_if_ready(&db, &owner, &sink, &non_pod_finalization(&db))
+            .await
+            .unwrap();
 
     assert!(
         finalized,
@@ -1795,6 +1996,7 @@ async fn foreground_gc_requests_independent_pod_deletes_concurrently() {
             "ReplicationController",
             Some("default".to_string()),
             sink.as_ref(),
+            &non_pod_finalization(&db),
         ),
     )
     .await
@@ -1876,6 +2078,7 @@ async fn foreground_gc_skips_duplicate_pod_delete_requests_across_retries() {
         "ReplicationController",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1900,6 +2103,7 @@ async fn foreground_gc_skips_duplicate_pod_delete_requests_across_retries() {
         "ReplicationController",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1976,6 +2180,7 @@ async fn test_cascade_delete_circular_empty_uid_ownerrefs() {
         "ConfigMap",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2046,6 +2251,7 @@ async fn cascade_delete_pod_owner_cycle_marks_each_dependent_once() {
         "Pod",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2118,6 +2324,7 @@ async fn test_cascade_delete_matches_owner_uid_in_nonzero_ownerref_position() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2191,6 +2398,7 @@ async fn gc_cascade_pod_child_uses_actor_delete_sink() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2280,6 +2488,7 @@ async fn gc_foreground_pod_child_uses_actor_delete_sink() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2358,6 +2567,7 @@ async fn gc_foreground_pod_child_already_terminating_is_not_redeleted() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2427,6 +2637,7 @@ async fn gc_foreground_pod_child_already_terminating_allows_owner_finalization_a
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2439,9 +2650,10 @@ async fn gc_foreground_pod_child_already_terminating_allows_owner_finalization_a
         .await
         .unwrap();
 
-    let ready_after_cleanup = finalize_foreground_owner_if_ready(&db, &owner, &sink)
-        .await
-        .unwrap();
+    let ready_after_cleanup =
+        finalize_foreground_owner_if_ready(&db, &owner, &sink, &non_pod_finalization(&db))
+            .await
+            .unwrap();
     assert!(
         ready_after_cleanup,
         "Owner should become ready once terminating child is gone"
@@ -2482,7 +2694,9 @@ async fn gc_reconcile_dangling_pod_owner_uses_actor_delete_sink() {
         .await
         .unwrap();
 
-    let outcome = reconcile_owner_references(&db, pod, &sink).await.unwrap();
+    let outcome = reconcile_owner_references(&db, pod, &sink, &non_pod_finalization(&db))
+        .await
+        .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::Deleted);
 
     // Pod should still exist (not hard-deleted)
@@ -2581,9 +2795,10 @@ async fn gc_pod_delete_is_uid_guarded_against_same_name_replacement() {
         resource_version: 1,
     };
 
-    let outcome = reconcile_owner_references(&db, stale_resource, &sink)
-        .await
-        .unwrap();
+    let outcome =
+        reconcile_owner_references(&db, stale_resource, &sink, &non_pod_finalization(&db))
+            .await
+            .unwrap();
     assert_eq!(outcome, OwnerReferenceReconcile::Deleted);
 
     // The sink should have received a request with the OLD UID
@@ -2649,6 +2864,7 @@ async fn gc_cascade_non_pod_child_still_hard_deletes() {
         "Deployment",
         Some("default".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2734,6 +2950,7 @@ async fn owner_cascade_sweep_marks_all_children_and_self_extinguishes() {
         "ReplicationController",
         Some("ed".to_string()),
         repo.as_ref() as &dyn GcPodDeleteSink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2803,6 +3020,7 @@ async fn rc_background_delete_drives_all_running_children_to_finalization() {
         "ReplicationController",
         Some("ed-finalize".to_string()),
         repo.as_ref() as &dyn GcPodDeleteSink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2884,6 +3102,7 @@ async fn owner_cascade_sweep_signals_reschedule_when_child_not_yet_terminating()
         "ReplicationController",
         Some("ed".to_string()),
         &sink,
+        &non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -2949,6 +3168,7 @@ async fn burst_delete_of_many_rcs_leaves_no_orphan_pods() {
             "ReplicationController",
             Some("ed-burst".to_string()),
             repo.as_ref() as &dyn GcPodDeleteSink,
+            &non_pod_finalization(&db),
         )
         .await
         .unwrap();

@@ -21,10 +21,10 @@ async fn run_ephemeral_update_with_conflict_retry<P, F>(
     mut persist: P,
     supervisor: &klights_supervisor::TaskSupervisor,
     max_attempts: usize,
-) -> Result<crate::datastore::Resource, AppError>
+) -> Result<klights_cluster_core::Resource, AppError>
 where
     P: FnMut() -> F,
-    F: std::future::Future<Output = Result<crate::datastore::Resource, AppError>>,
+    F: std::future::Future<Output = Result<klights_cluster_core::Resource, AppError>>,
 {
     for attempt in 0..max_attempts {
         match persist().await {
@@ -53,8 +53,8 @@ pub async fn get_pod_ephemeral_containers(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -76,15 +76,15 @@ pub async fn update_pod_ephemeral_containers(
     // longer fails the stale-RV precondition.
     let ns_owned = namespace.clone();
     let name_owned = name.clone();
-    let supervisor = state.task_supervisor.clone();
+    let supervisor = state.operational().task_supervisor.clone();
     let persist = move || {
         let state = state.clone();
         let ns = ns_owned.clone();
         let name = name_owned.clone();
         let body = body.clone();
         Box::pin(async move {
-            let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-                state.pod_repository.as_ref(),
+            let pod = crate::api::pod_repository_ports::get_pod(
+                state.resource_mutation().pod_repository.as_ref(),
                 &ns,
                 &name,
             )
@@ -147,15 +147,15 @@ pub async fn patch_pod_ephemeral_containers(
     // the Pod (fresh resourceVersion) and re-applies the patch.
     let ns_owned = namespace.clone();
     let name_owned = name.clone();
-    let supervisor = state.task_supervisor.clone();
+    let supervisor = state.operational().task_supervisor.clone();
     let persist = move || {
         let state = state.clone();
         let ns = ns_owned.clone();
         let name = name_owned.clone();
         let patch_value = patch_value.clone();
         Box::pin(async move {
-            let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-                state.pod_repository.as_ref(),
+            let pod = crate::api::pod_repository_ports::get_pod(
+                state.resource_mutation().pod_repository.as_ref(),
                 &ns,
                 &name,
             )
@@ -260,9 +260,9 @@ async fn persist_ephemeral_containers(
     state: &Arc<AppState>,
     namespace: &str,
     name: &str,
-    pod: &crate::datastore::Resource,
+    pod: &klights_cluster_core::Resource,
     merged: Option<Vec<Value>>,
-) -> Result<crate::datastore::Resource, AppError> {
+) -> Result<klights_cluster_core::Resource, AppError> {
     let to_persist = match merged {
         Some(arr) => arr,
         // Empty request — keep the existing list verbatim so we still bump RV
@@ -275,22 +275,25 @@ async fn persist_ephemeral_containers(
             .unwrap_or_default(),
     };
 
-    crate::kubelet::pod_repository::PodSubresourceWriter::update_ephemeral_containers(
-        state.pod_repository.as_ref(),
-        namespace,
-        name,
-        to_persist,
-        pod.resource_version,
+    klights_pod_api::PodSubresourceMutation::update_ephemeral_containers(
+        state.resource_mutation().pod_repository.as_ref(),
+        klights_pod_api::PodEphemeralContainersRequest {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            containers: to_persist,
+            expected_resource_version: pod.resource_version,
+        },
     )
     .await
-    .map_err(|e| {
+    .map_err(|error| {
         // Surface optimistic-concurrency conflicts as Kubernetes 409 Conflict so
         // the bounded retry loop (and clients) can distinguish a transient
         // status-write race from a real internal failure.
-        if crate::datastore::errors::is_conflict_error(&e) {
-            AppError::Conflict(format!("ephemeralcontainers update conflict: {e}"))
-        } else {
-            AppError::InternalError(format!("ephemeralcontainers update failed: {e}"))
+        match error {
+            klights_pod_api::PodRepositoryError::Conflict { message } => {
+                AppError::Conflict(format!("ephemeralcontainers update conflict: {message}"))
+            }
+            other => AppError::from(other),
         }
     })
 }
@@ -361,8 +364,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn fake_resource() -> crate::datastore::Resource {
-        crate::datastore::Resource {
+    fn fake_resource() -> klights_cluster_core::Resource {
+        klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),

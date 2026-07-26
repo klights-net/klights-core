@@ -17,17 +17,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 use tokio::sync::broadcast;
 
+use super::PodResourceList;
 #[cfg(test)]
-use crate::datastore::DatastoreBackend;
-use crate::datastore::errors::DatastoreError;
-use crate::datastore::{
-    DatastoreHandle, PatchKind, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
-};
+use crate::datastore::DatastoreHandle;
 #[cfg(test)]
 use crate::watch::WatchEvent;
-
-const POD_API_VERSION: &str = "v1";
-const POD_KIND: &str = "Pod";
+use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
+use klights_pod_api::PodRepositoryError;
 
 /// Result of [`PodStore::delete_unscheduled_with_uid`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,45 +79,99 @@ fn pod_is_terminating_or_node_lost(pod: &Value) -> bool {
 
 /// A hard-delete that reports the row already vanished concurrently, rather
 /// than a precondition conflict.
-fn delete_error_means_gone(err: &anyhow::Error) -> bool {
-    if let Some(datastore_err) = err.downcast_ref::<DatastoreError>() {
-        return matches!(datastore_err, DatastoreError::NotFound { .. });
-    }
-    format!("{err:#}")
-        .to_ascii_lowercase()
-        .contains("not found")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PodDeleteCasOutcome {
+    Removed,
+    Conflict,
+    Gone,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait PodPersistence: Send + Sync {
+    async fn get(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn list(
+        &self,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> Result<PodResourceList>;
+    async fn snapshot_list(
+        &self,
+        request: klights_pod_api::PodSnapshotListRequest,
+    ) -> Result<klights_pod_api::PodSnapshotListOutcome>;
+    async fn list_by_owner(&self, namespace: &str, owner_uid: &str) -> Result<Vec<Resource>>;
+    async fn create(&self, namespace: &str, name: &str, body: Value) -> Result<Resource>;
+    async fn update(
+        &self,
+        namespace: &str,
+        name: &str,
+        body: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+    async fn patch_latest(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch_kind: PatchKind,
+        patch: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Option<Resource>>;
+    async fn update_status(
+        &self,
+        namespace: &str,
+        name: &str,
+        status: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+    async fn delete(
+        &self,
+        namespace: &str,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> Result<PodDeleteCasOutcome>;
+    fn log_status_noop(&self, namespace: &str, name: &str, resource: &Resource);
+    #[cfg(test)]
+    fn subscribe_watch(&self) -> tokio::sync::broadcast::Receiver<WatchEvent>;
+    #[cfg(test)]
+    fn legacy_db(&self) -> DatastoreHandle;
 }
 
 pub struct PodStore {
-    db: DatastoreHandle,
+    persistence: Arc<dyn PodPersistence>,
     /// Incremented on every pod create/delete to signal sandbox GC that a sweep may be needed.
     pub(super) sandbox_gc_dirty: Arc<AtomicUsize>,
 }
 
 impl PodStore {
-    pub(crate) fn new(db: DatastoreHandle) -> Self {
+    pub(crate) fn from_persistence(persistence: Arc<dyn PodPersistence>) -> Self {
         Self {
-            db,
+            persistence,
             sandbox_gc_dirty: Arc::new(AtomicUsize::new(1)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(db: DatastoreHandle) -> Self {
+        crate::pod_repository_composition::new_pod_store(db)
     }
 
     fn mark_sandbox_dirty(&self) {
         self.sandbox_gc_dirty.fetch_add(1, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> DatastoreHandle {
+        self.persistence.legacy_db()
+    }
+
     /// Borrow the underlying datastore handle. Reserved for the limited
     /// set of repository services that legitimately need a non-Pod DB
     /// surface (see `mod.rs` doc comment). Outside `pod_repository/`,
     /// callers must always go through the typed methods.
-    pub(crate) fn db(&self) -> &DatastoreHandle {
-        &self.db
-    }
-
     pub(crate) async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-        self.db
-            .get_resource(POD_API_VERSION, POD_KIND, Some(ns), name)
-            .await
+        self.persistence.get(ns, name).await
     }
 
     pub(crate) async fn list(
@@ -131,33 +181,26 @@ impl PodStore {
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> Result<ResourceList> {
-        self.db
-            .list_resources(
-                POD_API_VERSION,
-                POD_KIND,
-                ns,
-                crate::datastore::ResourceListQuery::new(
-                    label_selector,
-                    field_selector,
-                    limit,
-                    continue_token,
-                ),
-            )
+    ) -> Result<PodResourceList> {
+        self.persistence
+            .list(ns, label_selector, field_selector, limit, continue_token)
             .await
     }
 
+    pub(crate) async fn snapshot_list(
+        &self,
+        request: klights_pod_api::PodSnapshotListRequest,
+    ) -> Result<klights_pod_api::PodSnapshotListOutcome> {
+        self.persistence.snapshot_list(request).await
+    }
+
     pub(super) async fn list_by_owner(&self, ns: &str, owner_uid: &str) -> Result<Vec<Resource>> {
-        self.db
-            .list_resources_by_owner_uid(POD_API_VERSION, POD_KIND, Some(ns), owner_uid)
-            .await
+        self.persistence.list_by_owner(ns, owner_uid).await
     }
 
     pub(crate) async fn create(&self, ns: &str, name: &str, body: Value) -> Result<Resource> {
         self.mark_sandbox_dirty();
-        self.db
-            .create_resource(POD_API_VERSION, POD_KIND, Some(ns), name, body)
-            .await
+        self.persistence.create(ns, name, body).await
     }
 
     pub(crate) async fn update(
@@ -167,16 +210,15 @@ impl PodStore {
         mut body: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        let current = self.get(ns, name).await?.ok_or_else(|| {
-            DatastoreError::not_found(format!("Pod {ns}/{name} not found for update"))
-        })?;
+        let current = self
+            .get(ns, name)
+            .await?
+            .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
         preserve_status_from_current(&current.data, &mut body);
         self.mark_sandbox_dirty();
-        self.db
-            .update_resource_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+        self.persistence
+            .update(
+                ns,
                 name,
                 body,
                 ResourcePreconditions {
@@ -211,26 +253,19 @@ impl PodStore {
             }
         });
         self.mark_sandbox_dirty();
-        self.db
-            .patch_resource_latest_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+        self.persistence
+            .patch_latest(
+                ns,
                 name,
-                ResourcePatchRequest::new(
-                    PatchKind::Merge,
-                    patch,
-                    ResourcePreconditions {
-                        uid: Some(uid.to_string()),
-                        resource_version: None,
-                    },
-                ),
+                PatchKind::Merge,
+                patch,
+                ResourcePreconditions {
+                    uid: Some(uid.to_string()),
+                    resource_version: None,
+                },
             )
             .await?
-            .ok_or_else(|| {
-                DatastoreError::not_found(format!("Pod {ns}/{name} not found for delete mark"))
-                    .into()
-            })
+            .ok_or_else(|| PodRepositoryError::not_found(ns, name).into())
     }
 
     pub(super) async fn mark_deleting_at_resource_version(
@@ -242,11 +277,9 @@ impl PodStore {
         expected_rv: i64,
     ) -> Result<Resource> {
         self.mark_sandbox_dirty();
-        self.db
-            .update_resource_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+        self.persistence
+            .update(
+                ns,
                 name,
                 body,
                 ResourcePreconditions {
@@ -267,15 +300,14 @@ impl PodStore {
         body: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        let current = self.get(ns, name).await?.ok_or_else(|| {
-            DatastoreError::not_found(format!("Pod {ns}/{name} not found for scheduler update"))
-        })?;
+        let current = self
+            .get(ns, name)
+            .await?
+            .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
         self.mark_sandbox_dirty();
-        self.db
-            .update_resource_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+        self.persistence
+            .update(
+                ns,
                 name,
                 body,
                 ResourcePreconditions {
@@ -293,38 +325,26 @@ impl PodStore {
         status: Value,
         expected_rv: Option<i64>,
     ) -> Result<Resource> {
-        let current = self.get(ns, name).await?.ok_or_else(|| {
-            DatastoreError::not_found(format!("Pod {ns}/{name} not found for status update"))
-        })?;
+        let current = self
+            .get(ns, name)
+            .await?
+            .ok_or_else(|| PodRepositoryError::not_found(ns, name))?;
         if current.data.get("status") == Some(&status) {
             if let Some(expected) = expected_rv
                 && expected != current.resource_version
             {
-                return Err(DatastoreError::conflict(format!(
+                return Err(PodRepositoryError::conflict(format!(
                     "resourceVersion precondition failed: expected {} got {}",
                     expected, current.resource_version
                 ))
                 .into());
             }
-            crate::datastore::diagnostics::log_noop_resource_write(
-                crate::datastore::diagnostics::NoopResourceWrite {
-                    operation: "pod_store_update_status",
-                    api_version: POD_API_VERSION,
-                    kind: POD_KIND,
-                    namespace: Some(ns),
-                    name,
-                    uid: &current.uid,
-                    resource_version: current.resource_version,
-                    reason: "pod status unchanged",
-                },
-            );
+            self.persistence.log_status_noop(ns, name, &current);
             return Ok(current);
         }
-        self.db
-            .update_status_only_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+        self.persistence
+            .update_status(
+                ns,
                 name,
                 status,
                 ResourcePreconditions {
@@ -362,30 +382,23 @@ impl PodStore {
         };
 
         match self
-            .db
-            .delete_resource_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+            .persistence
+            .delete(
+                ns,
                 name,
                 ResourcePreconditions {
                     uid: Some(uid.to_string()),
                     resource_version: Some(observed_resource_version),
                 },
             )
-            .await
+            .await?
         {
-            Ok(()) => {
+            PodDeleteCasOutcome::Removed => {
                 self.mark_sandbox_dirty();
                 Ok(BoundPodDeleteOutcome::Removed)
             }
-            Err(error) if crate::datastore::errors::is_conflict_error(&error) => {
-                Ok(BoundPodDeleteOutcome::Retry)
-            }
-            Err(error) if delete_error_means_gone(&error) => {
-                Ok(BoundPodDeleteOutcome::IdentityChanged)
-            }
-            Err(error) => Err(error),
+            PodDeleteCasOutcome::Conflict => Ok(BoundPodDeleteOutcome::Retry),
+            PodDeleteCasOutcome::Gone => Ok(BoundPodDeleteOutcome::IdentityChanged),
         }
     }
 
@@ -500,11 +513,9 @@ impl PodStore {
 
         self.mark_sandbox_dirty();
         match self
-            .db
-            .delete_resource_with_preconditions(
-                POD_API_VERSION,
-                POD_KIND,
-                Some(ns),
+            .persistence
+            .delete(
+                ns,
                 name,
                 ResourcePreconditions {
                     uid: Some(uid.to_string()),
@@ -513,27 +524,21 @@ impl PodStore {
                     resource_version: Some(observed_resource_version),
                 },
             )
-            .await
+            .await?
         {
-            Ok(()) => Ok(UnscheduledPodDeleteOutcome::Removed),
+            PodDeleteCasOutcome::Removed => Ok(UnscheduledPodDeleteOutcome::Removed),
             // CAS lost: the row changed (almost always a scheduler bind setting
             // spec.nodeName). Retry from a fresh observation so an RV-only
             // race is not mistaken for an already-bound Pod.
-            Err(err) if crate::datastore::errors::is_conflict_error(&err) => {
-                Ok(UnscheduledPodDeleteOutcome::Retry)
-            }
+            PodDeleteCasOutcome::Conflict => Ok(UnscheduledPodDeleteOutcome::Retry),
             // Row vanished concurrently — treat as removed (idempotent).
-            Err(err) if delete_error_means_gone(&err) => Ok(UnscheduledPodDeleteOutcome::Removed),
-            Err(err) => Err(err),
+            PodDeleteCasOutcome::Gone => Ok(UnscheduledPodDeleteOutcome::Removed),
         }
     }
 
     #[cfg(test)]
     pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
-        DatastoreBackend::subscribe_watch(
-            self.db.as_ref(),
-            klights_watch::WatchTopic::new("v1", "Pod"),
-        )
+        self.persistence.subscribe_watch()
     }
 }
 
@@ -554,7 +559,7 @@ impl super::PodReader for PodStore {
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> Result<ResourceList> {
+    ) -> Result<PodResourceList> {
         self.list(ns, label_selector, field_selector, limit, continue_token)
             .await
     }

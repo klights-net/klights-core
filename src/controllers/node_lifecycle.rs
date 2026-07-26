@@ -2,32 +2,38 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-
-use crate::api::AppState;
-use crate::datastore::command::StorageCommand;
-use crate::datastore::raft::node::RaftNode;
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{
-    DatastoreBackend, POD_CLEANUP_REASON_NODE_LOST, Resource, ResourcePreconditions, WatchTarget,
-};
-use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
-use crate::kubelet::pod_lifecycle_router::{
-    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
-};
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader, PodSubresourceWriter};
 use crate::node_lease_tracker::{
     DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseObservation, NodeLeaseTracker,
 };
 use crate::utils::k8s_time_format;
-use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
-};
-use klights_watch::{WatchSignalReceiver, WatchTopic};
+use crate::watch::{EventType, WatchEvent};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
+use serde_json::{Value, json};
+
+#[cfg(test)]
+use crate::datastore::DatastoreBackend;
+
+const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
+
+#[async_trait]
+pub trait NodeLifecycleStore: Send + Sync {
+    async fn list_nodes(&self) -> Result<Vec<Resource>>;
+    async fn list_node_leases(&self) -> Result<Vec<Resource>>;
+}
+
+#[async_trait]
+pub trait NodeLifecyclePodStore: Send + Sync {
+    async fn list_pods_bound_to_node(&self, node_name: &str) -> Result<Vec<Resource>>;
+    async fn replace_pod_status_for_uid(&self, pod: &Resource, status: Value) -> Result<Resource>;
+}
+
+#[async_trait]
+pub trait NodeLostPodLifecycleSink: Send + Sync {
+    async fn enqueue_node_lost_cleanup(&self, pod: Resource) -> Result<()>;
+}
 
 #[cfg(test)]
 const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 =
@@ -96,28 +102,6 @@ impl klights_leader_api::LeaderNodeLifecycleStatus for TestNodeLifecycleStatus<'
     }
 }
 
-pub trait NodeLifecyclePodRepository: PodReader + PodSubresourceWriter + PodObjectWriter {}
-
-impl<T> NodeLifecyclePodRepository for T where
-    T: PodReader + PodSubresourceWriter + PodObjectWriter + Send + Sync
-{
-}
-
-pub async fn mark_all_nodes_unknown_on_startup(
-    state: &AppState,
-    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
-) -> Result<()> {
-    mark_all_nodes_unknown_at_with_pods(
-        state.db.as_ref(),
-        node_status,
-        state.pod_repository.as_ref(),
-        Some(state.side_effects.as_ref()),
-        state.pod_lifecycle_router.as_deref(),
-        Utc::now(),
-    )
-    .await
-}
-
 #[cfg(test)]
 pub async fn mark_all_nodes_unknown_at(
     db: &crate::datastore::sqlite::Datastore,
@@ -129,23 +113,17 @@ pub async fn mark_all_nodes_unknown_at(
         .await
 }
 
+#[cfg(test)]
 async fn mark_all_nodes_unknown_at_with_pods(
-    db: &dyn DatastoreBackend,
+    db: &(impl NodeLifecycleStore + ?Sized),
     node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
-    pod_repository: &dyn NodeLifecyclePodRepository,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    pod_lifecycle_router: Option<&PodLifecycleRouter>,
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
+    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let nodes = db
-        .list_resources(
-            "v1",
-            "Node",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    for node in nodes.items {
+    let nodes = db.list_nodes().await?;
+    for node in nodes {
         let mut data = Arc::unwrap_or_clone(node.data.clone());
         if mark_node_ready_unknown(&mut data, now) {
             update_node_status(node_status, &node, data).await?;
@@ -218,26 +196,19 @@ pub async fn reconcile_node_lifecycle_once_with_tracker_for_test(
     .await
 }
 
-async fn reconcile_node_lifecycle_once_with_tracker(
-    db: &dyn DatastoreBackend,
+pub(crate) async fn reconcile_node_lifecycle_once_with_tracker(
+    db: &(impl NodeLifecycleStore + ?Sized),
     node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
-    pod_repository: &dyn NodeLifecyclePodRepository,
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
     node_lease_tracker: &NodeLeaseTracker,
     now: DateTime<Utc>,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    pod_lifecycle_router: Option<&PodLifecycleRouter>,
+    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
 ) -> Result<Option<Duration>> {
-    let nodes = db
-        .list_resources(
-            "v1",
-            "Node",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let nodes = db.list_nodes().await?;
     let mut next_deadline: Option<Duration> = None;
 
-    for node in nodes.items {
+    for node in nodes {
         let lease_deadline = node_lease_tracker.deadline_for_node(&node.name).await;
         let deadline = lease_deadline.deadline;
         let observed = lease_deadline.observed.as_ref();
@@ -299,11 +270,11 @@ async fn reconcile_node_lifecycle_once_with_tracker(
     Ok(next_deadline)
 }
 
-async fn cleanup_pods_bound_to_deleted_node_event(
-    db: &dyn DatastoreBackend,
-    pod_repository: &dyn NodeLifecyclePodRepository,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    pod_lifecycle_router: Option<&PodLifecycleRouter>,
+pub(crate) async fn cleanup_pods_bound_to_deleted_node_event(
+    db: &(impl NodeLifecycleStore + ?Sized),
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
+    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     event: &WatchEvent,
 ) -> Result<bool> {
     let Some(node_name) = deleted_node_name(event) else {
@@ -338,18 +309,15 @@ fn deleted_node_name(event: &WatchEvent) -> Option<&str> {
 }
 
 async fn cleanup_pods_bound_to_deleted_node(
-    db: &dyn DatastoreBackend,
-    pod_repository: &dyn NodeLifecyclePodRepository,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    pod_lifecycle_router: Option<&PodLifecycleRouter>,
+    db: &(impl NodeLifecycleStore + ?Sized),
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
+    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     node_name: &str,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let field_selector = format!("spec.nodeName={node_name}");
-    let pods = pod_repository
-        .list_pods(None, None, Some(&field_selector), None, None)
-        .await?;
-    for pod in pods.items {
+    let pods = pod_repository.list_pods_bound_to_node(node_name).await?;
+    for pod in pods {
         mark_pod_node_lost_and_enqueue_actor_cleanup(
             db,
             pod_repository,
@@ -386,256 +354,13 @@ async fn node_lease_tracker_from_cluster_leases_for_test(
     Ok(tracker)
 }
 
-pub async fn run_node_lifecycle_controller(
-    state: Arc<AppState>,
-    node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
-    cancel: CancellationToken,
-    _startup_resource_version: i64,
-    mut is_leader_rx: watch::Receiver<bool>,
-    _raft_node: Option<Arc<RaftNode>>,
-) {
-    if let Err(err) = refresh_node_lease_tracker_from_cluster_leases(
-        state.db.as_ref(),
-        state.node_lease_tracker.as_ref(),
-    )
-    .await
-    {
-        tracing::warn!(
-            "node_lifecycle: failed to seed node lease tracker from persisted leases: {err:#}"
-        );
-    }
-
-    if *is_leader_rx.borrow() {
-        // Already leader at startup: reset the grace window here too, since the
-        // wait-based path below only fires when leadership is acquired by waiting.
-        state
-            .node_lease_tracker
-            .reset_grace_window(Utc::now())
-            .await;
-    } else if !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await {
-        return;
-    }
-
-    let db = state.db.clone();
-    let watch_topics = vec![
-        WatchTopic::new("v1", "Node"),
-        WatchTopic::new("coordination.k8s.io/v1", "Lease"),
-    ];
-    let signal_rx = WatchSignalReceiver::new(
-        watch_topics
-            .iter()
-            .cloned()
-            .map(|topic| db.subscribe_watch_signals(topic))
-            .collect(),
-    );
-    let mut cursor = SignalWatchCursor::new_many(
-        signal_rx,
-        DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                db.clone(),
-            )),
-            vec![
-                WatchTarget::cluster("v1", "Node"),
-                WatchTarget::cluster("coordination.k8s.io/v1", "Lease"),
-            ],
-        ),
-        watch_topics,
-        WatchDeliveryScope::Cluster,
-        db.get_current_resource_version().await.unwrap_or(0),
-        WindowPolicy::default_watch_delivery(),
-    );
-    if let Err(err) = cursor.prime_replay_or_expired().await {
-        tracing::warn!(?err, "node_lifecycle: initial replay failed");
-    }
-
-    let mut retry_attempt = 0u32;
-    'controller: loop {
-        if !*is_leader_rx.borrow() {
-            tracing::debug!("node_lifecycle: not leader, waiting before reconcile");
-            retry_attempt = 0;
-            if !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await {
-                return;
-            }
-        }
-
-        let next_deadline = match reconcile_node_lifecycle_once_with_tracker(
-            db.as_ref(),
-            node_status.as_ref(),
-            state.pod_repository.as_ref(),
-            state.node_lease_tracker.as_ref(),
-            Utc::now(),
-            Some(state.side_effects.as_ref()),
-            state.pod_lifecycle_router.as_deref(),
-        )
-        .await
-        {
-            Ok(next_deadline) => {
-                retry_attempt = 0;
-                next_deadline
-            }
-            Err(err) => {
-                tracing::warn!("node_lifecycle reconcile failed: {err:#}");
-                let attempt = retry_attempt;
-                retry_attempt = retry_attempt.saturating_add(1);
-                if wait_for_retry(&state, &cancel, attempt).await {
-                    continue;
-                }
-                break;
-            }
-        };
-
-        let maybe_event = if let Some(delay) = next_deadline {
-            tokio::select! {
-                _ = cancel.cancelled() => None,
-                _ = is_leader_rx.changed() => {
-                    if !*is_leader_rx.borrow() {
-                        tracing::debug!(
-                            "node_lifecycle: relinquished leadership, waiting for re-election"
-                        );
-                        if !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await {
-                            return;
-                        }
-                    }
-                    None
-                }
-                sleep = state.task_supervisor.sleep("node_lifecycle_lease_deadline", delay) => {
-                    if let Err(err) = sleep {
-                        tracing::warn!("node_lifecycle deadline timer failed: {err:#}");
-                    }
-                    None
-                }
-                _ = state.node_lease_tracker.wait_changed() => None,
-                event = cursor.next_event() => {
-                    Some(event)
-                },
-            }
-        } else {
-            tokio::select! {
-                _ = cancel.cancelled() => None,
-                _ = is_leader_rx.changed() => {
-                    if !*is_leader_rx.borrow() {
-                        tracing::debug!(
-                            "node_lifecycle: relinquished leadership, waiting for re-election"
-                        );
-                        if !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await {
-                            return;
-                        }
-                    }
-                    None
-                }
-                _ = state.node_lease_tracker.wait_changed() => None,
-                event = cursor.next_event() => {
-                    Some(event)
-                },
-            }
-        };
-        let watch_result = match maybe_event {
-            Some(watch_result) => watch_result,
-            None => {
-                if cancel.is_cancelled() {
-                    break;
-                }
-                continue;
-            }
-        };
-        match watch_result {
-            Ok(event) => {
-                if let Err(err) =
-                    track_lease_from_event(&event, state.node_lease_tracker.as_ref()).await
-                {
-                    tracing::warn!(
-                        "node_lifecycle: failed to refresh lease from watch event: {err:#}"
-                    );
-                }
-                if deleted_node_name(&event).is_some() {
-                    loop {
-                        match cleanup_pods_bound_to_deleted_node_event(
-                            db.as_ref(),
-                            state.pod_repository.as_ref(),
-                            Some(state.side_effects.as_ref()),
-                            state.pod_lifecycle_router.as_deref(),
-                            &event,
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                retry_attempt = 0;
-                                continue 'controller;
-                            }
-                            Ok(false) => break,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "node_lifecycle: failed to cleanup pods for deleted node event: {err:#}"
-                                );
-                                let attempt = retry_attempt;
-                                retry_attempt = retry_attempt.saturating_add(1);
-                                if !wait_for_retry(&state, &cancel, attempt).await {
-                                    break 'controller;
-                                }
-                            }
-                        }
-                    }
-                }
-                if node_lifecycle_event(&event) {
-                    continue;
-                }
-            }
-            Err(WatchCursorError::Closed) => break,
-            Err(err) => {
-                tracing::warn!("node_lifecycle watch error: {err:#?}");
-                let attempt = retry_attempt;
-                retry_attempt = retry_attempt.saturating_add(1);
-                if !wait_for_retry(&state, &cancel, attempt).await {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-async fn wait_for_leadership(
-    state: &AppState,
-    cancel: &CancellationToken,
-    is_leader_rx: &mut watch::Receiver<bool>,
-) -> bool {
-    loop {
-        if *is_leader_rx.borrow() {
-            // (Re)acquired leadership: give every node a fresh startup grace
-            // window before this term's first reconcile, so a blind new leader
-            // does not mass-evict on stale in-memory deadlines (T8).
-            state
-                .node_lease_tracker
-                .reset_grace_window(Utc::now())
-                .await;
-            return true;
-        }
-
-        tokio::select! {
-            _ = cancel.cancelled() => return false,
-            changed = is_leader_rx.changed() => {
-                if changed.is_err() {
-                    return false;
-                }
-                continue;
-            }
-        }
-    }
-}
-
-async fn refresh_node_lease_tracker_from_cluster_leases(
-    db: &dyn DatastoreBackend,
+pub(crate) async fn refresh_node_lease_tracker_from_cluster_leases(
+    db: &(impl NodeLifecycleStore + ?Sized),
     tracker: &NodeLeaseTracker,
 ) -> Result<()> {
-    let leases = db
-        .list_resources(
-            "coordination.k8s.io/v1",
-            "Lease",
-            Some("kube-node-lease"),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let leases = db.list_node_leases().await?;
 
-    for lease in leases.items {
+    for lease in leases {
         if let Err(err) = tracker
             .record_from_lease_object(&lease.name, lease.data.as_ref())
             .await
@@ -650,7 +375,10 @@ async fn refresh_node_lease_tracker_from_cluster_leases(
     Ok(())
 }
 
-async fn track_lease_from_event(event: &WatchEvent, tracker: &NodeLeaseTracker) -> Result<()> {
+pub(crate) async fn track_lease_from_event(
+    event: &WatchEvent,
+    tracker: &NodeLeaseTracker,
+) -> Result<()> {
     if event.event_type == EventType::Bookmark || event.event_type == EventType::Deleted {
         return Ok(());
     }
@@ -682,17 +410,9 @@ async fn track_lease_from_event(event: &WatchEvent, tracker: &NodeLeaseTracker) 
         .map(|_| ())
 }
 
-fn node_lifecycle_retry_delay(attempt: u32) -> Duration {
+pub(crate) fn node_lifecycle_retry_delay(attempt: u32) -> Duration {
     let steps = attempt.saturating_add(1).min(12);
     Duration::from_secs((steps * 5) as u64)
-}
-
-async fn wait_for_retry(state: &AppState, cancel: &CancellationToken, attempt: u32) -> bool {
-    let delay = node_lifecycle_retry_delay(attempt);
-    tokio::select! {
-        _ = cancel.cancelled() => false,
-        _ = state.task_supervisor.sleep("node_lifecycle_retry", delay) => true,
-    }
 }
 
 async fn update_node_status(
@@ -720,19 +440,16 @@ async fn update_node_status(
 }
 
 async fn mark_pods_unknown_on_node(
-    db: &dyn DatastoreBackend,
-    pod_repository: &dyn NodeLifecyclePodRepository,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    pod_lifecycle_router: Option<&PodLifecycleRouter>,
+    db: &(impl NodeLifecycleStore + ?Sized),
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
+    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     node_name: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<Duration>> {
-    let field_selector = format!("spec.nodeName={node_name}");
-    let pods = pod_repository
-        .list_pods(None, None, Some(&field_selector), None, None)
-        .await?;
+    let pods = pod_repository.list_pods_bound_to_node(node_name).await?;
     let mut next_deadline = None;
-    for pod in pods.items {
+    for pod in pods {
         let mut data = Arc::unwrap_or_clone(pod.data.clone());
         let status_changed = mark_pod_status_unknown(&mut data, now);
         if pod.data.pointer("/metadata/deletionTimestamp").is_none() {
@@ -760,15 +477,8 @@ async fn mark_pods_unknown_on_node(
         }
         if status_changed {
             let status = data.get("status").cloned().unwrap_or_else(|| json!({}));
-            let namespace = pod.namespace.as_deref().unwrap_or("default");
             pod_repository
-                .replace_status_from_api_for_uid(
-                    namespace,
-                    &pod.name,
-                    &pod.uid,
-                    status,
-                    pod.resource_version,
-                )
+                .replace_pod_status_for_uid(&pod, status)
                 .await?;
         }
     }
@@ -776,10 +486,10 @@ async fn mark_pods_unknown_on_node(
 }
 
 async fn mark_pod_node_lost_and_enqueue_actor_cleanup(
-    db: &dyn DatastoreBackend,
-    pod_repository: &dyn NodeLifecyclePodRepository,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    pod_lifecycle_router: Option<&PodLifecycleRouter>,
+    _db: &(impl NodeLifecycleStore + ?Sized),
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
+    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     node_name: &str,
     pod: Resource,
     now: DateTime<Utc>,
@@ -789,13 +499,7 @@ async fn mark_pod_node_lost_and_enqueue_actor_cleanup(
     mark_pod_status_node_lost(&mut data, now);
     let status = data.get("status").cloned().unwrap_or_else(|| json!({}));
     pod_repository
-        .replace_status_from_api_for_uid(
-            namespace,
-            &pod.name,
-            &pod.uid,
-            status,
-            pod.resource_version,
-        )
+        .replace_pod_status_for_uid(&pod, status)
         .await
         .with_context(|| {
             format!(
@@ -804,22 +508,18 @@ async fn mark_pod_node_lost_and_enqueue_actor_cleanup(
             )
         })?;
 
-    run_node_lost_pod_cleanup_side_effects(db, side_effects, namespace, &pod.name, &pod.uid, &data)
-        .await?;
+    run_node_lost_pod_cleanup_side_effects(side_effects, &data).await?;
 
-    if let Some(router) = pod_lifecycle_router {
-        enqueue_orphan_finalize(
-            router,
-            PodLifecycleKey::new(namespace, &pod.name, &pod.uid),
-            OrphanReason::NodeLost,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "enqueue actor-owned NodeLost cleanup for {}/{} uid={}",
-                namespace, pod.name, pod.uid
-            )
-        })?;
+    if let Some(lifecycle_sink) = pod_lifecycle_router {
+        lifecycle_sink
+            .enqueue_node_lost_cleanup(pod.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "enqueue actor-owned NodeLost cleanup for {}/{} uid={}",
+                    namespace, pod.name, pod.uid
+                )
+            })?;
     } else {
         tracing::debug!(
             node = node_name,
@@ -834,31 +534,32 @@ async fn mark_pod_node_lost_and_enqueue_actor_cleanup(
 }
 
 async fn run_node_lost_pod_cleanup_side_effects(
-    db: &dyn DatastoreBackend,
-    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
-    namespace: &str,
-    pod_name: &str,
-    pod_uid: &str,
+    mutation_reconcile: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
     pod_data: &Value,
 ) -> Result<()> {
-    let Some(side_effects) = side_effects else {
+    let Some(mutation_reconcile) = mutation_reconcile else {
         return Ok(());
     };
-    crate::side_effects::service_pod::enqueue_services_after_pod_delete(
-        pod_data,
-        db,
-        &side_effects.controller_dispatcher_slot(),
-    )
-    .await
-    .with_context(|| {
-        format!("enqueue Service reconcile after NodeLost cleanup for {namespace}/{pod_name} uid={pod_uid}")
-    })?;
-    side_effects
-        .run_hooks(pod_data, db)
+    let pod = Resource::try_from_data(std::sync::Arc::new(pod_data.clone()))
+        .map_err(|error| anyhow::anyhow!("invalid cleaned-up Pod identity: {error}"))?;
+    mutation_reconcile
+        .reconcile_pod_mutation(
+            klights_reconcile_api::PodMutationReconcileRequest::ServicesAfterDelete {
+                deleted: pod.clone(),
+            },
+        )
         .await
-        .with_context(|| {
-            format!("run NodeLost cleanup hooks for {namespace}/{pod_name} uid={pod_uid}")
-        })?;
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    mutation_reconcile
+        .reconcile_pod_mutation(
+            klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                pod,
+                named_hook: None,
+                context: "node_lost_pod_cleanup",
+            },
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(())
 }
 
@@ -869,7 +570,7 @@ fn merge_deadline(next_deadline: &mut Option<Duration>, candidate: Option<Durati
 }
 
 async fn reconcile_node_resources_after_ready(
-    pod_repository: &dyn NodeLifecyclePodRepository,
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
     node_name: &str,
     now: DateTime<Utc>,
 ) -> Result<()> {
@@ -877,35 +578,25 @@ async fn reconcile_node_resources_after_ready(
 }
 
 async fn reconcile_unknown_pods_after_node_ready(
-    pod_repository: &dyn NodeLifecyclePodRepository,
+    pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
     node_name: &str,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let field_selector = format!("spec.nodeName={node_name}");
-    let pods = pod_repository
-        .list_pods(None, None, Some(&field_selector), None, None)
-        .await?;
-    for pod in pods.items {
+    let pods = pod_repository.list_pods_bound_to_node(node_name).await?;
+    for pod in pods {
         let mut data = Arc::unwrap_or_clone(pod.data.clone());
         if !restore_pod_status_after_node_ready(&mut data, now) {
             continue;
         }
         let status = data.get("status").cloned().unwrap_or_else(|| json!({}));
-        let namespace = pod.namespace.as_deref().unwrap_or("default");
         pod_repository
-            .replace_status_from_api_for_uid(
-                namespace,
-                &pod.name,
-                &pod.uid,
-                status,
-                pod.resource_version,
-            )
+            .replace_pod_status_for_uid(&pod, status)
             .await?;
     }
     Ok(())
 }
 
-fn node_lifecycle_event(event: &WatchEvent) -> bool {
+pub(crate) fn node_lifecycle_event(event: &WatchEvent) -> bool {
     if event.event_type == EventType::Bookmark {
         return false;
     }
@@ -2129,6 +1820,7 @@ mod tests {
         let _grace = EnvVarGuard::set("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "30");
         let state = crate::api::test_support::build_test_app_state().await;
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "v1",
@@ -2154,6 +1846,7 @@ mod tests {
             .await
             .unwrap();
         state
+            .controller_reconcile()
             .node_lease_tracker
             .record_from_lease_object(
                 "worker-a",
@@ -2171,7 +1864,7 @@ mod tests {
             .await
             .unwrap();
         state
-            .db
+            .resource_mutation().db
             .create_resource(
                 "apps/v1",
                 "ReplicaSet",
@@ -2198,6 +1891,7 @@ mod tests {
             .await
             .unwrap();
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "v1",
@@ -2246,36 +1940,54 @@ mod tests {
             .unwrap();
 
         super::reconcile_node_lifecycle_once_with_tracker(
-            state.db.as_ref(),
-            &super::TestNodeLifecycleStatus(state.db.as_ref()),
-            state.pod_repository.as_ref(),
-            state.node_lease_tracker.as_ref(),
+            state.resource_mutation().db.as_ref(),
+            &super::TestNodeLifecycleStatus(state.resource_mutation().db.as_ref()),
+            state.resource_mutation().pod_repository.as_ref(),
+            state.controller_reconcile().node_lease_tracker.as_ref(),
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
-            Some(state.side_effects.as_ref()),
+            Some(
+                state
+                    .resource_mutation()
+                    .pod_repository
+                    .mutation_reconcile_port()
+                    .as_ref(),
+            ),
             None,
         )
         .await
         .unwrap();
-        let pre_cleanup_keys = state.controller_dispatcher.pending_reconcile_keys().await;
+        let pre_cleanup_keys = state
+            .controller_reconcile()
+            .controller_dispatcher
+            .pending_reconcile_keys()
+            .await;
         for _ in 0..pre_cleanup_keys.len() {
             let _ = state
+                .controller_reconcile()
                 .controller_dispatcher
                 .take_reconcile_key_for_test()
                 .await;
         }
         super::reconcile_node_lifecycle_once_with_tracker(
-            state.db.as_ref(),
-            &super::TestNodeLifecycleStatus(state.db.as_ref()),
-            state.pod_repository.as_ref(),
-            state.node_lease_tracker.as_ref(),
+            state.resource_mutation().db.as_ref(),
+            &super::TestNodeLifecycleStatus(state.resource_mutation().db.as_ref()),
+            state.resource_mutation().pod_repository.as_ref(),
+            state.controller_reconcile().node_lease_tracker.as_ref(),
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap(),
-            Some(state.side_effects.as_ref()),
+            Some(
+                state
+                    .resource_mutation()
+                    .pod_repository
+                    .mutation_reconcile_port()
+                    .as_ref(),
+            ),
             None,
         )
         .await
         .unwrap();
 
         let lost_pod = state
+            .resource_mutation()
             .db
             .get_resource("v1", "Pod", Some("default"), "lost-pod")
             .await
@@ -2283,7 +1995,11 @@ mod tests {
             .expect("controller must preserve the Pod row for actor-owned finalization");
         assert_eq!(lost_pod.data["status"]["phase"], "Failed");
         assert_eq!(lost_pod.data["status"]["reason"], "NodeLost");
-        let keys = state.controller_dispatcher.pending_reconcile_keys().await;
+        let keys = state
+            .controller_reconcile()
+            .controller_dispatcher
+            .pending_reconcile_keys()
+            .await;
         assert!(
             keys.iter().any(|key| {
                 key.api_version() == "apps/v1"
@@ -3041,7 +2757,7 @@ mod tests {
             Some("default"),
             "worker-pod",
             pod_data["status"].clone(),
-            crate::datastore::ResourcePreconditions::from_resource(&pod),
+            klights_cluster_core::ResourcePreconditions::from_resource(&pod),
         )
         .await
         .unwrap();

@@ -1,22 +1,24 @@
-use crate::datastore::command::StorageCommand;
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
-use crate::kubelet::outbox::payload::OutboxOperation;
+use crate::node_outbox::payload::OutboxOperation;
 #[cfg(test)]
-use crate::kubelet::outbox::payload::OutboxPayload;
-use crate::kubelet::outbox::{
+use crate::node_outbox::payload::OutboxPayload;
+use crate::node_outbox::{
     Outbox, OutboxCommand, OutboxSendPlanner, OutboxSendRoute, OutboxSubject,
 };
 #[cfg(test)]
 use anyhow::Context;
 use anyhow::Result;
+use klights_cluster_core::ResourcePreconditions;
+use klights_cluster_core::StorageCommand;
 
 pub(crate) use crate::kubelet::node_leader_labels::clear_leader_label_from_other_nodes;
-pub(crate) use crate::kubelet::node_registration::register_node_snapshot;
-pub use crate::kubelet::node_registration::{
-    NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot, register_node,
-    register_node_at_addresses, register_node_with_outbox, register_node_with_outbox_at_addresses,
+pub(crate) use crate::kubelet::node_registration::{
+    NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
 };
-pub use crate::kubelet::node_role_labels::role_label_keys_for_shape;
+#[cfg(test)]
+pub(crate) use crate::kubelet::node_registration::{
+    register_node_at_addresses, register_node_with_outbox,
+};
+pub(crate) use crate::kubelet::node_role_labels::role_label_keys_for_shape;
 pub(crate) use crate::kubelet::node_status_merge::preserve_existing_network_conditions;
 pub use crate::kubelet::node_status_merge::{
     merge_existing_node_mutable_fields, merge_node_status_for_update, set_node_external_ip,
@@ -32,17 +34,33 @@ pub use crate::kubelet::node_status_projection::{
 };
 pub use crate::node_heartbeat::run_heartbeat_with_lease_client;
 
-/// Get total memory in KiB from /proc/meminfo. Cached process-wide;
-/// total memory does not change during the kubelet's lifetime, and the
-/// previous per-call read was a sync FS hit on async pod startup paths.
-pub fn memory_ki() -> u64 {
-    static MEMORY_KI: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MEMORY_KI.get_or_init(|| {
-        crate::utils::read_utf8_file("/proc/meminfo")
-            .ok()
-            .and_then(|content| parse_memory_ki(&content))
-            .unwrap_or(8 * 1024 * 1024) // Default 8GB if unable to read
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeCapacity {
+    memory_ki: u64,
+    cpu_cores: u64,
+}
+
+impl NodeCapacity {
+    pub fn new(memory_ki: u64, cpu_cores: u64) -> Self {
+        Self {
+            memory_ki,
+            cpu_cores: cpu_cores.max(1),
+        }
+    }
+
+    pub fn memory_ki(self) -> u64 {
+        self.memory_ki
+    }
+
+    pub fn cpu_cores(self) -> u64 {
+        self.cpu_cores
+    }
+}
+
+impl Default for NodeCapacity {
+    fn default() -> Self {
+        Self::new(8 * 1024 * 1024, 1)
+    }
 }
 
 pub(super) fn parse_memory_ki(content: &str) -> Option<u64> {
@@ -162,7 +180,7 @@ pub async fn publish_node_network_conditions(
     query: &dyn klights_leader_api::LeaderResourceQuery,
     publisher: &dyn klights_leader_api::LeaderNodeSelfStatus,
     node_name: &str,
-    dataplane_health: &crate::networking::dataplane_health::DataplaneHealth,
+    dataplane_health: &klights_network_api::DataplaneHealthSnapshot,
 ) -> Result<NodeNetworkRefreshResult> {
     let get = klights_leader_api::node_get_request(
         node_name,
@@ -197,7 +215,7 @@ pub async fn publish_node_network_conditions(
 
 #[cfg(test)]
 pub async fn refresh_node_network_conditions(
-    db: &dyn DatastoreBackend,
+    db: &dyn crate::datastore::DatastoreBackend,
     outbox: Option<&Outbox>,
     node_name: &str,
     dataplane_health: &crate::networking::dataplane_health::DataplaneHealth,
@@ -205,7 +223,8 @@ pub async fn refresh_node_network_conditions(
     let Some(existing) = db.get_resource("v1", "Node", None, node_name).await? else {
         return Ok(NodeNetworkRefreshResult::Missing);
     };
-    let conditions = NodeNetworkConditions::from_health(Some(dataplane_health));
+    let dataplane_health = dataplane_health.snapshot();
+    let conditions = NodeNetworkConditions::from_health(Some(&dataplane_health));
     let mut node = existing.data.as_ref().clone();
     let commit_changed = stamp_current_git_commit_annotation(&mut node);
     let status_changed = apply_network_conditions(&mut node, &conditions);
@@ -281,7 +300,7 @@ pub async fn refresh_current_git_commit_annotation_via_leader(
 }
 
 fn current_git_commit_annotation_patch_command(
-    node: &crate::datastore::Resource,
+    node: &klights_cluster_core::Resource,
 ) -> StorageCommand {
     use klights_network_api::GIT_COMMIT_ANNOTATION;
     StorageCommand::PatchResource {
@@ -289,7 +308,7 @@ fn current_git_commit_annotation_patch_command(
         kind: "Node".to_string(),
         namespace: None,
         name: node.name.clone(),
-        patch_kind: crate::datastore::types::PatchKind::Merge,
+        patch_kind: klights_cluster_core::PatchKind::Merge,
         patch: serde_json::json!({
             "metadata": {
                 "annotations": {
@@ -376,41 +395,6 @@ pub async fn publish_node_external_ip_if_changed(
     Ok(())
 }
 
-pub async fn stamp_node_routing_metadata_from_store(
-    db: &dyn DatastoreBackend,
-    node_name: &str,
-    node: &mut serde_json::Value,
-) -> Result<bool> {
-    stamp_node_routing_metadata_from_store_impl(db, node_name, node, false).await
-}
-
-pub async fn stamp_node_routing_metadata_and_external_ip_from_store(
-    db: &dyn DatastoreBackend,
-    node_name: &str,
-    node: &mut serde_json::Value,
-) -> Result<bool> {
-    stamp_node_routing_metadata_from_store_impl(db, node_name, node, true).await
-}
-
-async fn stamp_node_routing_metadata_from_store_impl(
-    db: &dyn DatastoreBackend,
-    node_name: &str,
-    node: &mut serde_json::Value,
-    publish_external_ip: bool,
-) -> Result<bool> {
-    let mut changed = false;
-    if let Some(subnet) = db.get_node_subnet(node_name).await? {
-        changed |= set_node_pod_cidr(node, &subnet.subnet.to_string());
-    }
-    if let Some(metadata) = db.get_node_dataplane(node_name).await? {
-        if publish_external_ip {
-            changed |= set_node_external_ip(node, &metadata.endpoint.to_string());
-        }
-        changed |= set_node_dataplane_annotations(node, &metadata);
-    }
-    Ok(changed)
-}
-
 fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -430,6 +414,52 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex};
     use std::time::Duration;
 
+    fn registration_profile(
+        node_mode: &crate::bootstrap::NodeMode,
+        node_role: &crate::bootstrap::NodeRole,
+    ) -> crate::kubelet::node_config::NodeRegistrationProfile {
+        let peer_mode = match node_mode {
+            crate::bootstrap::NodeMode::Root => klights_network_api::NodePeerMode::Root,
+            crate::bootstrap::NodeMode::Rootless { .. } => {
+                klights_network_api::NodePeerMode::Rootless
+            }
+        };
+        let role = match node_role {
+            crate::bootstrap::NodeRole::Leader { .. } => {
+                crate::kubelet::node_config::KubeletNodeRole::Leader
+            }
+            crate::bootstrap::NodeRole::Controlplane { as_learner, .. } => {
+                crate::kubelet::node_config::KubeletNodeRole::Controlplane {
+                    as_learner: *as_learner,
+                }
+            }
+            crate::bootstrap::NodeRole::Worker { .. } => {
+                crate::kubelet::node_config::KubeletNodeRole::Worker
+            }
+        };
+        let publish_external_ip = match node_role {
+            crate::bootstrap::NodeRole::Leader {
+                bootstrap:
+                    crate::bootstrap::node_role::LeaderBootstrap::Seed
+                    | crate::bootstrap::node_role::LeaderBootstrap::Bootstrap { .. },
+            } => false,
+            crate::bootstrap::NodeRole::Controlplane {
+                leader_endpoints, ..
+            } if leader_endpoints.is_empty() => false,
+            crate::bootstrap::NodeRole::Worker { .. }
+            | crate::bootstrap::NodeRole::Controlplane { .. }
+            | crate::bootstrap::NodeRole::Leader {
+                bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Join { .. },
+            } => true,
+        };
+        crate::kubelet::node_config::NodeRegistrationProfile::new(
+            peer_mode,
+            role,
+            publish_external_ip,
+            "v1.34.6+klights-test".to_string(),
+        )
+    }
+
     async fn register_node(
         db: &dyn DatastoreBackend,
         node_name: &str,
@@ -439,13 +469,14 @@ mod tests {
         dataplane_external_ip: Option<&str>,
     ) -> Result<()> {
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let profile = registration_profile(node_mode, node_role);
+        let dataplane_health = dataplane_health.map(DataplaneHealth::snapshot);
         crate::kubelet::node_registration::register_node(
             &file_process,
             db,
             node_name,
-            node_mode,
-            node_role,
-            dataplane_health,
+            &profile,
+            dataplane_health.as_ref(),
             dataplane_external_ip,
         )
         .await
@@ -460,13 +491,14 @@ mod tests {
         addresses: &NodeRegistrationAddresses,
     ) -> Result<()> {
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let profile = registration_profile(node_mode, node_role);
+        let dataplane_health = dataplane_health.map(DataplaneHealth::snapshot);
         crate::kubelet::node_registration::register_node_at_addresses(
             &file_process,
             db,
             node_name,
-            node_mode,
-            node_role,
-            dataplane_health,
+            &profile,
+            dataplane_health.as_ref(),
             addresses,
         )
         .await
@@ -1116,9 +1148,8 @@ mod tests {
             .as_str()
             .unwrap();
         assert_eq!(
-            version,
-            crate::version::git_version(),
-            "root-mode kubeletVersion should use the shared klights version"
+            version, "v1.34.6+klights-test",
+            "root-mode kubeletVersion should use the injected registration profile"
         );
         assert_eq!(data["status"]["nodeInfo"]["operatingSystem"], "linux");
         assert!(
@@ -1147,12 +1178,10 @@ mod tests {
         let snapshot = NodeRegistrationSnapshot {
             node_name: "remote-cp".to_string(),
             node_mode: crate::controllers::annotations::NodePeerMode::Root,
-            node_role: crate::bootstrap::NodeRole::Controlplane {
-                leader_endpoints: vec!["https://192.0.2.10:7679".to_string()],
-                token: None,
-                skip_ca: false,
+            node_role: crate::kubelet::node_config::KubeletNodeRole::Controlplane {
                 as_learner: false,
             },
+            publish_external_ip: true,
             addresses: NodeRegistrationAddresses::new(
                 "172.31.50.2".to_string(),
                 Some("192.0.2.50".to_string()),
@@ -1176,9 +1205,11 @@ mod tests {
             },
         };
 
-        register_node_snapshot(&db, None, None, None, &snapshot)
-            .await
-            .unwrap();
+        crate::bootstrap::node_registration_adapter::register_node_snapshot(
+            &db, None, None, &snapshot,
+        )
+        .await
+        .unwrap();
 
         let node = db
             .get_resource("v1", "Node", None, "remote-cp")
@@ -1772,7 +1803,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_node_rootless_appends_rootless_to_kubelet_version() {
+    async fn test_register_node_rootless_uses_injected_kubelet_version_profile() {
         let db = crate::datastore::test_support::in_memory().await;
         let mode = crate::bootstrap::NodeMode::Rootless {
             rootlesskit_pid: 0,
@@ -1801,10 +1832,7 @@ mod tests {
         let version = node.data["status"]["nodeInfo"]["kubeletVersion"]
             .as_str()
             .unwrap();
-        assert_eq!(
-            version,
-            format!("{} (rootless)", crate::version::git_version())
-        );
+        assert_eq!(version, "v1.34.6+klights-test");
     }
 
     #[tokio::test]

@@ -171,7 +171,7 @@ impl Datastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotMutationResult> {
         let namespace = namespace.to_string();
         let pod_name = pod_name.to_string();
         let pod_uid = pod_uid.to_string();
@@ -179,7 +179,7 @@ impl Datastore {
         let event_namespace = namespace.clone();
         let event_pod_name = pod_name.clone();
         let event_pod_uid = pod_uid.clone();
-        let event = self
+        let (result, event) = self
             .node_db_call("db_pod_slot_mark_terminating", move |conn| {
                 let tx = conn.transaction()?;
                 let existing = tx
@@ -201,7 +201,12 @@ impl Datastore {
                             && row.node_name == node_name =>
                     {
                         tx.commit()?;
-                        Ok(None)
+                        Ok((
+                            PodSlotMutationResult::Unchanged {
+                                resource_version: row.resource_version,
+                            },
+                            None,
+                        ))
                     }
                     Some(_) => {
                         let rv = next_node_slot_resource_version(&tx)?;
@@ -218,13 +223,18 @@ impl Datastore {
                             ],
                         )?;
                         tx.commit()?;
-                        Ok(Some(PodSlotAdmissionEvent::Changed {
-                            namespace: event_namespace,
-                            pod_name: event_pod_name,
-                            pod_uid: event_pod_uid,
-                            state: PodSlotAdmissionState::Terminating,
-                            resource_version: rv,
-                        }))
+                        Ok((
+                            PodSlotMutationResult::Changed {
+                                resource_version: rv,
+                            },
+                            Some(PodSlotAdmissionEvent::Changed {
+                                namespace: event_namespace,
+                                pod_name: event_pod_name,
+                                pod_uid: event_pod_uid,
+                                state: PodSlotAdmissionState::Terminating,
+                                resource_version: rv,
+                            }),
+                        ))
                     }
                     None => {
                         let rv = next_node_slot_resource_version(&tx)?;
@@ -241,13 +251,18 @@ impl Datastore {
                             ],
                         )?;
                         tx.commit()?;
-                        Ok(Some(PodSlotAdmissionEvent::Changed {
-                            namespace: event_namespace,
-                            pod_name: event_pod_name,
-                            pod_uid: event_pod_uid,
-                            state: PodSlotAdmissionState::Terminating,
-                            resource_version: rv,
-                        }))
+                        Ok((
+                            PodSlotMutationResult::Changed {
+                                resource_version: rv,
+                            },
+                            Some(PodSlotAdmissionEvent::Changed {
+                                namespace: event_namespace,
+                                pod_name: event_pod_name,
+                                pod_uid: event_pod_uid,
+                                state: PodSlotAdmissionState::Terminating,
+                                resource_version: rv,
+                            }),
+                        ))
                     }
                 }
             })
@@ -257,7 +272,7 @@ impl Datastore {
         if let Some(event) = event {
             let _ = self.pod_slot_admission_sender().send(event);
         }
-        Ok(())
+        Ok(result)
     }
 
     pub async fn pod_slot_clear_if_uid(
@@ -266,14 +281,14 @@ impl Datastore {
         pod_name: &str,
         pod_uid: &str,
         _node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotClearResult> {
         let namespace = namespace.to_string();
         let pod_name = pod_name.to_string();
         let pod_uid = pod_uid.to_string();
         let event_namespace = namespace.clone();
         let event_pod_name = pod_name.clone();
         let event_pod_uid = pod_uid.clone();
-        let event = self
+        let (result, event) = self
             .node_db_call("db_pod_slot_clear_if_uid", move |conn| {
                 let tx = conn.transaction()?;
                 let existing = tx
@@ -285,11 +300,19 @@ impl Datastore {
                     .optional()?;
                 let Some(row) = existing else {
                     tx.commit()?;
-                    return Ok(None);
+                    return Ok((PodSlotClearResult::NotFound, None));
                 };
                 if row.pod_uid != pod_uid {
                     tx.commit()?;
-                    return Ok(None);
+                    return Ok((
+                        PodSlotClearResult::UidMismatch {
+                            blocking_uid: row.pod_uid,
+                            blocking_node: row.node_name,
+                            state: row.state,
+                            resource_version: row.resource_version,
+                        },
+                        None,
+                    ));
                 }
                 let rv = next_node_slot_resource_version(&tx)?;
                 tx.execute(
@@ -297,12 +320,17 @@ impl Datastore {
                     rusqlite::params![namespace, pod_name, pod_uid],
                 )?;
                 tx.commit()?;
-                Ok(Some(PodSlotAdmissionEvent::Cleared {
-                    namespace: event_namespace,
-                    pod_name: event_pod_name,
-                    pod_uid: event_pod_uid,
-                    resource_version: rv,
-                }))
+                Ok((
+                    PodSlotClearResult::Cleared {
+                        resource_version: rv,
+                    },
+                    Some(PodSlotAdmissionEvent::Cleared {
+                        namespace: event_namespace,
+                        pod_name: event_pod_name,
+                        pod_uid: event_pod_uid,
+                        resource_version: rv,
+                    }),
+                ))
             })
             .await
             .map_err(|err| anyhow!("pod_slot_clear_if_uid failed: {err}"))?;
@@ -310,6 +338,6 @@ impl Datastore {
         if let Some(event) = event {
             let _ = self.pod_slot_admission_sender().send(event);
         }
-        Ok(())
+        Ok(result)
     }
 }

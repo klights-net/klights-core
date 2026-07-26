@@ -30,6 +30,7 @@ macro_rules! namespaced_resource_handlers {
                     kind: $kind,
                     list_kind: $list_kind,
                     namespace: Some(namespace),
+                    namespaced: true,
                     query,
                     headers,
                 },
@@ -175,6 +176,7 @@ macro_rules! cluster_resource_handlers {
                     kind: $kind,
                     list_kind: $list_kind,
                     namespace: None,
+                    namespaced: false,
                     query,
                     headers,
                 },
@@ -1030,159 +1032,22 @@ macro_rules! cluster_wide_list_handler {
             State(state): State<Arc<AppState>>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
+            axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
         ) -> Result<Response, AppError> {
-            validate_builtin_field_selector(
-                $api_version,
-                $kind,
-                query.label_selector.as_deref(),
-                query.field_selector.as_deref(),
-                true,
-            )?;
-            // Watch streaming for cluster-wide list (all namespaces)
-            if query.watch == Some("true".to_string()) {
-                query.validate_send_initial_events_watch()?;
-                let kind = $kind.to_string();
-                let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
-                let table_format = wants_table_format(&headers)?;
-                let protobuf_supported = protobuf_watch_supported_for_request(
-                    $api_version,
-                    $kind,
-                    table_format,
-                    query.label_selector.as_deref(),
-                    query.field_selector.as_deref(),
-                );
-                let stream_format = negotiate_watch_stream_format(&headers, protobuf_supported)?;
-                let label_selector = query.label_selector.clone();
-                let field_selector = query.field_selector.clone();
-
-                let requested_rv: i64 = query.resource_version
-                    .as_ref()
-                    .and_then(|rv| rv.parse::<i64>().ok())
-                    .unwrap_or(0);
-                let explicit_resource_version_zero = query
-                    .resource_version
-                    .as_deref()
-                    .is_some_and(|rv| rv.trim() == "0");
-                let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-                let db = state.db.clone();
-                let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
-                    db,
-                    task_supervisor: state.task_supervisor.clone(),
+            list_inner(
+                state,
+                &identity,
+                GeneratedListInnerRequest {
                     api_version: $api_version,
-                    kind,
-                    watch_namespace: None,
-                    requested_rv,
-                    send_initial_events,
-                    send_bookmarks,
-                    label_selector,
-                    field_selector,
-                    table_format,
-                    stream_format,
-                    timeout_seconds: query.timeout_seconds,
-                    emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
-                }).await;
-                return Ok(Response::builder()
-                    .header("Content-Type", stream_format.content_type())
-                    .header("Transfer-Encoding", "chunked")
-                    .body(body)
-                    .unwrap());
-            }
-
-            let normalized_limit = query.normalized_limit()?;
-
-            let has_continue = query
-                .continue_token
-                .as_deref()
-                .is_some_and(|t| !t.is_empty());
-            let rv_match = query.resolve_resource_version_match(has_continue)?;
-
-            // Decode continue token: check TTL and extract name for DB filter.
-            let (db_continue_name, continue_resource_version) =
-                process_continue_token(query.continue_token)?;
-
-            let list_query = crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                query.field_selector.as_deref(),
-                normalized_limit,
-                db_continue_name.as_deref(),
-            );
-
-            // Cluster-wide (all-namespaces) collection: same consistent-snapshot
-            // path as the namespaced handler, with no namespace scope. Pages 2+
-            // are served from the pinned session snapshot, not current state.
-            // See `query::resolve_list_page`.
-            let db_for_snapshot = state.db.clone();
-            let db_for_live = state.db.clone();
-            let crate::api::query::ResolvedListPage {
-                list,
-                response_rv,
-                continue_resource_version,
-            } = crate::api::query::resolve_list_page(
-                state.db.as_ref(),
-                rv_match,
-                continue_resource_version,
-                |srv| async move {
-                    db_for_snapshot
-                        .snapshot_resources_at_rv($api_version, $kind, None, list_query, srv)
-                        .await
-                        .map_err(AppError::from)
-                },
-                || async move {
-                    db_for_live
-                        .list_resources($api_version, $kind, None, list_query)
-                        .await
-                        .map_err(AppError::from)
+                    kind: $kind,
+                    list_kind: $list_kind,
+                    namespace: None,
+                    namespaced: true,
+                    query,
+                    headers,
                 },
             )
-            .await?;
-
-            let items: Vec<Value> = list
-                .items
-                .into_iter()
-                .map(|r| inject_resource_version(r.data, r.resource_version))
-                .collect();
-            let resource_version = response_rv.to_string();
-
-            // Return Table format if requested by kubectl
-            if wants_table_format(&headers)? {
-                let table = match $kind {
-                    "Pod" => pod_list_to_table(items, resource_version),
-                    "Node" => node_list_to_table(items, resource_version),
-                    "ReplicaSet" => replicaset_list_to_table(items, resource_version),
-                    "Deployment" => deployment_list_to_table(items, resource_version),
-                    "StatefulSet" => statefulset_list_to_table(items, resource_version),
-                    // Resources without a dedicated converter use kubectl's
-                    // per-kind columns, falling back to the upstream default
-                    // (NAME + CREATED AT) for kinds with no custom printer.
-                    _ => generic_list_to_table($kind, items, resource_version),
-                };
-                return Ok(Json(table).into_response());
-            }
-
-            // Return normal List format
-            // Omit "continue" when None; include "remainingItemCount" only when paginating.
-            let mut metadata = serde_json::json!({
-                "resourceVersion": resource_version,
-            });
-            if let Some(ref name) = list.continue_token {
-                let token = crate::api::query::encode_response_continue_token(
-                    name,
-                    response_rv,
-                    continue_resource_version,
-                );
-                metadata["continue"] = serde_json::json!(token);
-            }
-            if let Some(remaining) = list.remaining_item_count {
-                metadata["remainingItemCount"] = serde_json::json!(remaining);
-            }
-            let response = serde_json::json!({
-                "apiVersion": $api_version,
-                "kind": $list_kind,
-                "metadata": metadata,
-                "items": items,
-            });
-
-            Ok(K8sResponse::new(response, &headers).into_response())
+            .await
         }
     };
 }

@@ -4,13 +4,13 @@ use serde_json::Value;
 use crate::datastore::DatastoreBackend;
 #[cfg(test)]
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::command::StorageCommand;
 #[cfg(test)]
 use crate::datastore::node_local::selector;
-use crate::kubelet::outbox::payload::OutboxOperation;
+use crate::node_outbox::payload::OutboxOperation;
 #[cfg(test)]
-use crate::kubelet::outbox::payload::OutboxPayload;
-use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use crate::node_outbox::payload::OutboxPayload;
+use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use klights_cluster_core::StorageCommand;
 #[cfg(test)]
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 

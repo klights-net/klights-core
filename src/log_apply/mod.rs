@@ -10,7 +10,6 @@ use anyhow::Result;
 // klights-cluster-core.
 use klights_internal_protobuf::log_apply::*;
 use prost::Message;
-use serde::Deserialize;
 
 use crate::datastore::types::{AppliedOutboxRecord, NodeSubnet, PatchKind, PodCleanupIntent};
 use crate::networking::wireguard::DataplanePeerMetadata;
@@ -60,13 +59,13 @@ where
 // the `log_apply_entries` table and its checkpoint are gone.
 
 pub use klights_cluster_core::{
-    ClusterMetaMutation, ClusterMutation, LogApplyAppliedOutboxRow, LogApplyCommit,
-    LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation,
-    LogApplyNodeSubnetRow, LogApplyPodActorFinalization, LogApplyPodCleanupIntentKey,
-    LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
-    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, OutboxLedgerMutation,
-    OutboxStreamWatermark, PodCleanupMutation, ResourceMutation, ResourceVersionAssignment,
-    VersionedClusterMutation, WatchHistoryMutation,
+    COMMAND_CODEC_VERSION, ClusterMetaMutation, ClusterMutation, LogApplyAppliedOutboxRow,
+    LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
+    LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow, LogApplyPodActorFinalization,
+    LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow, LogApplyResourceKey,
+    LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow, NamespaceMutation,
+    NetworkMutation, OutboxLedgerMutation, OutboxStreamWatermark, PodCleanupMutation,
+    ResourceMutation, SnapshotRestoreOperation, VersionedClusterMutation, WatchHistoryMutation,
 };
 
 impl From<&NodeSubnet> for LogApplyNodeSubnetRow {
@@ -99,20 +98,67 @@ impl From<&DataplanePeerMetadata> for LogApplyNodeDataplaneRow {
     }
 }
 
-pub fn put_node_subnet(resource_version: i64, row: &NodeSubnet) -> LogApplyCommit {
-    LogApplyCommit::put_node_subnet_row(resource_version, row.into())
+pub fn put_node_subnet(row: &NodeSubnet) -> LogApplyCommit {
+    LogApplyCommit::put_node_subnet_row(row.into())
 }
 
-pub fn put_node_dataplane(resource_version: i64, row: &DataplanePeerMetadata) -> LogApplyCommit {
-    LogApplyCommit::put_node_dataplane_row(resource_version, row.into())
+pub fn put_node_dataplane(row: &DataplanePeerMetadata) -> LogApplyCommit {
+    LogApplyCommit::put_node_dataplane_row(row.into())
 }
 
-pub fn put_applied_outbox(resource_version: i64, record: AppliedOutboxRecord) -> LogApplyCommit {
-    LogApplyCommit::put_applied_outbox_row(resource_version, record.into())
+pub fn put_applied_outbox(record: AppliedOutboxRecord) -> LogApplyCommit {
+    LogApplyCommit::put_applied_outbox_row(record.into())
 }
 
-pub fn put_pod_cleanup_intent(resource_version: i64, row: PodCleanupIntent) -> LogApplyCommit {
-    LogApplyCommit::put_pod_cleanup_intent_row(resource_version, row.into())
+pub fn put_pod_cleanup_intent(row: PodCleanupIntent) -> LogApplyCommit {
+    LogApplyCommit::put_pod_cleanup_intent_row(row.into())
+}
+
+#[cfg(test)]
+pub(crate) fn test_live_commit(
+    candidate_resource_version: i64,
+    mut mutations: Vec<LogApplyMutation>,
+) -> LogApplyCommit {
+    fn clear_nested_resource_version(data: &mut serde_json::Value) {
+        if let Some(metadata) = data
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("resourceVersion");
+        }
+    }
+
+    for mutation in &mut mutations {
+        match mutation {
+            LogApplyMutation::PutResource(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.data);
+            }
+            LogApplyMutation::PatchResourceLatest(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.patch);
+            }
+            LogApplyMutation::PutNamespace(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.data);
+            }
+            LogApplyMutation::PutWatchEvent(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.data);
+                if let Some(object) = row.data.get_mut("object") {
+                    clear_nested_resource_version(object);
+                }
+            }
+            LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
+            LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
+            LogApplyMutation::AdvanceResourceVersion { resource_version } => {
+                *resource_version = 0;
+            }
+            _ => {}
+        }
+    }
+    let _ = candidate_resource_version;
+    LogApplyCommit::try_new(mutations).expect("test live commit must be an RV-zero template")
 }
 
 impl From<PodCleanupIntent> for LogApplyPodCleanupIntentRow {
@@ -179,43 +225,16 @@ pub fn encode_commit_json(commit: &LogApplyCommit) -> Result<Vec<u8>> {
 
 pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
     let start = std::time::Instant::now();
-    if let Ok(commit) = serde_json::from_slice::<LogApplyCommit>(bytes) {
-        crate::datastore::diagnostics::log_slow_log_apply_decode(
-            "json",
-            start.elapsed(),
-            bytes.len(),
-            commit.resource_version,
-            commit.mutations.len(),
-        );
-        return Ok(commit);
-    }
-    let versioned: VersionedLogApplyCommit = serde_json::from_slice(bytes)?;
-    let mutations = versioned
-        .mutations
-        .into_iter()
-        .map(|mutation| LogApplyMutation::try_from(mutation).map_err(anyhow::Error::from))
-        .collect::<Result<Vec<_>>>()?;
-    let mut commit = LogApplyCommit::new(versioned.resource_version, mutations);
-    commit.resource_version_assignment = versioned.resource_version_assignment;
-    commit.outbox_watermark = versioned.outbox_watermark;
+    let commit = serde_json::from_slice::<LogApplyCommit>(bytes)?;
+    commit.validate_live_template()?;
     crate::datastore::diagnostics::log_slow_log_apply_decode(
-        "json_legacy",
+        "json",
         start.elapsed(),
         bytes.len(),
-        commit.resource_version,
-        commit.mutations.len(),
+        commit.resource_version(),
+        commit.mutations().len(),
     );
     Ok(commit)
-}
-
-#[derive(Deserialize)]
-struct VersionedLogApplyCommit {
-    resource_version: i64,
-    #[serde(default)]
-    resource_version_assignment: ResourceVersionAssignment,
-    #[serde(default)]
-    outbox_watermark: Option<OutboxStreamWatermark>,
-    mutations: Vec<VersionedClusterMutation>,
 }
 
 pub fn encode_commit_protobuf(commit: &LogApplyCommit) -> Result<Vec<u8>> {
@@ -231,8 +250,8 @@ pub fn decode_commit_protobuf(bytes: &[u8]) -> Result<LogApplyCommit> {
         "protobuf",
         start.elapsed(),
         bytes.len(),
-        commit.resource_version,
-        commit.mutations.len(),
+        commit.resource_version(),
+        commit.mutations().len(),
     );
     Ok(commit)
 }
@@ -259,22 +278,11 @@ impl WireFrom<ProtoOutboxStreamWatermark> for OutboxStreamWatermark {
 
 impl WireFrom<LogApplyCommit> for ProtoLogApplyCommit {
     fn wire_from(commit: LogApplyCommit) -> Self {
+        let (resource_version, outbox_watermark, mutations) = commit.into_parts();
         Self {
-            resource_version: commit.resource_version,
-            mutations: commit
-                .mutations
-                .into_iter()
-                .map(IntoWire::into_wire)
-                .collect(),
-            outbox_watermark: commit.outbox_watermark.map(IntoWire::into_wire),
-            resource_version_assignment: match commit.resource_version_assignment {
-                ResourceVersionAssignment::LegacyLeaderAssigned => {
-                    ProtoResourceVersionAssignment::LegacyLeaderAssigned as i32
-                }
-                ResourceVersionAssignment::CommittedApplyV1 => {
-                    ProtoResourceVersionAssignment::CommittedApplyV1 as i32
-                }
-            },
+            resource_version,
+            mutations: mutations.into_iter().map(IntoWire::into_wire).collect(),
+            outbox_watermark: outbox_watermark.map(IntoWire::into_wire),
         }
     }
 }
@@ -283,26 +291,22 @@ impl TryWireFrom<ProtoLogApplyCommit> for LogApplyCommit {
     type Error = anyhow::Error;
 
     fn try_wire_from(proto: ProtoLogApplyCommit) -> Result<Self> {
-        let resource_version_assignment =
-            ProtoResourceVersionAssignment::try_from(proto.resource_version_assignment)
-                .map_err(|value| anyhow::anyhow!("unknown resourceVersion assignment: {value}"))?;
-        Ok(Self {
-            resource_version: proto.resource_version,
-            resource_version_assignment: match resource_version_assignment {
-                ProtoResourceVersionAssignment::LegacyLeaderAssigned => {
-                    ResourceVersionAssignment::LegacyLeaderAssigned
-                }
-                ProtoResourceVersionAssignment::CommittedApplyV1 => {
-                    ResourceVersionAssignment::CommittedApplyV1
-                }
-            },
-            outbox_watermark: proto.outbox_watermark.map(IntoWire::into_wire),
-            mutations: proto
+        if proto.resource_version != 0 {
+            anyhow::bail!(
+                "live protobuf commit requires resourceVersion 0, got {}",
+                proto.resource_version
+            );
+        }
+        let commit = LogApplyCommit::try_new_with_watermark(
+            proto
                 .mutations
                 .into_iter()
                 .map(LogApplyMutation::try_wire_from)
                 .collect::<Result<Vec<_>>>()?,
-        })
+            proto.outbox_watermark.map(IntoWire::into_wire),
+        )?;
+        commit.validate_live_template()?;
+        Ok(commit)
     }
 }
 
@@ -1023,16 +1027,20 @@ mod parity_tests {
         names
     }
 
-    fn commit_for(mutation: LogApplyMutation) -> LogApplyCommit {
-        let rv = match &mutation {
-            LogApplyMutation::PutResource(row) => row.resource_version,
-            LogApplyMutation::PutNamespace(row) => row.resource_version,
-            LogApplyMutation::PutWatchEvent(row) => row.resource_version,
-            LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version,
-            LogApplyMutation::AdvanceResourceVersion { resource_version } => *resource_version,
-            _ => 1,
-        };
-        LogApplyCommit::new(rv, vec![mutation])
+    fn commit_for(mut mutation: LogApplyMutation) -> LogApplyCommit {
+        match &mut mutation {
+            LogApplyMutation::PutResource(row) => row.resource_version = 0,
+            LogApplyMutation::PatchResourceLatest(row) => row.resource_version = 0,
+            LogApplyMutation::PutNamespace(row) => row.resource_version = 0,
+            LogApplyMutation::PutWatchEvent(row) => row.resource_version = 0,
+            LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
+            LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
+            LogApplyMutation::AdvanceResourceVersion { resource_version } => {
+                *resource_version = 0;
+            }
+            _ => {}
+        }
+        LogApplyCommit::try_new(vec![mutation]).unwrap()
     }
 
     #[test]
@@ -1099,34 +1107,22 @@ mod parity_tests {
     }
 
     #[test]
-    fn old_json_and_protobuf_commits_default_to_legacy_assignment() {
-        let old_json = br#"{"resource_version":9,"mutations":[]}"#;
-        let from_json = decode_commit_json(old_json).expect("decode old JSON commit");
-        assert_eq!(
-            from_json.resource_version_assignment,
-            ResourceVersionAssignment::LegacyLeaderAssigned
-        );
+    fn positive_live_json_and_protobuf_commits_are_rejected() {
+        let positive_json = br#"{"resource_version":9,"mutations":[]}"#;
+        assert!(decode_commit_json(positive_json).is_err());
 
-        // The enum's zero value is omitted by protobuf, matching payloads
-        // written before tag 4 existed.
         let old_proto = ProtoLogApplyCommit {
             resource_version: 9,
             mutations: Vec::new(),
             outbox_watermark: None,
-            resource_version_assignment: 0,
         }
         .encode_to_vec();
-        let from_proto = decode_commit_protobuf(&old_proto).expect("decode old protobuf commit");
-        assert_eq!(
-            from_proto.resource_version_assignment,
-            ResourceVersionAssignment::LegacyLeaderAssigned
-        );
+        assert!(decode_commit_protobuf(&old_proto).is_err());
     }
 
     #[test]
     fn committed_apply_v1_round_trips_json_and_protobuf() {
-        let mut commit = LogApplyCommit::new(0, Vec::new());
-        commit.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
+        let commit = LogApplyCommit::try_new(Vec::new()).unwrap();
         assert_eq!(
             decode_commit_json(&encode_commit_json(&commit).unwrap()).unwrap(),
             commit
@@ -1139,17 +1135,17 @@ mod parity_tests {
 
     #[test]
     fn outbox_stream_watermark_round_trips_json_and_protobuf() {
-        let mut commit = LogApplyCommit::new(
-            77,
+        let commit = LogApplyCommit::try_new_with_watermark(
             vec![LogApplyMutation::AdvanceResourceVersion {
-                resource_version: 77,
+                resource_version: 0,
             }],
-        );
-        commit.outbox_watermark = Some(OutboxStreamWatermark {
-            client_id: "client-a".to_string(),
-            stream_id: 12,
-            stream_seq: 34,
-        });
+            Some(OutboxStreamWatermark {
+                client_id: "client-a".to_string(),
+                stream_id: 12,
+                stream_seq: 34,
+            }),
+        )
+        .unwrap();
 
         let from_json: LogApplyCommit =
             decode_commit_json(&encode_commit_json(&commit).unwrap()).unwrap();
@@ -1164,15 +1160,14 @@ mod parity_tests {
 
     #[test]
     fn status_only_resource_row_round_trips_json_and_protobuf() {
-        let commit = LogApplyCommit::new(
-            11,
-            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+        let commit =
+            LogApplyCommit::try_new(vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
                 name: "status-only".to_string(),
                 uid: "status-only-uid".to_string(),
-                resource_version: 11,
+                resource_version: 0,
                 data: json!({
                     "apiVersion": "v1",
                     "kind": "Pod",
@@ -1180,7 +1175,7 @@ mod parity_tests {
                         "namespace": "default",
                         "name": "status-only",
                         "uid": "status-only-uid",
-                        "resourceVersion": "11"
+                        "resourceVersion": "0"
                     },
                     "status": {"phase": "Running"}
                 }),
@@ -1189,8 +1184,8 @@ mod parity_tests {
                 precondition_uid: Some("status-only-uid".to_string()),
                 precondition_resource_version: None,
                 status_only: true,
-            })],
-        );
+            })])
+            .unwrap();
 
         let from_json: LogApplyCommit =
             decode_commit_json(&encode_commit_json(&commit).unwrap()).unwrap();
@@ -1239,7 +1234,7 @@ mod parity_tests {
             );
 
             // 2. ClusterMutation conversion preserves every mutation.
-            for (i, mutation) in decoded.mutations.iter().enumerate() {
+            for (i, mutation) in decoded.mutations().iter().enumerate() {
                 let cm: ClusterMutation = mutation.clone().into();
                 let back: LogApplyMutation = cm.into();
                 assert_eq!(
@@ -1273,75 +1268,5 @@ mod parity_tests {
             });
             assert_eq!(decoded, commit, "{label}: flat JSON decode changed value");
         }
-    }
-
-    #[test]
-    fn versioned_json_decodes_to_same_commit() {
-        for name in all_variant_names() {
-            let (label, mutation) = sample(name);
-            let original = commit_for(mutation);
-            let cm: ClusterMutation = original.mutations[0].clone().into();
-            let versioned = Vec::from([VersionedClusterMutation::new(cm)]);
-
-            // Build the versioned envelope manually
-            let envelope = serde_json::json!({
-                "resource_version": original.resource_version,
-                "mutations": versioned,
-            });
-            let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
-
-            let decoded: LogApplyCommit =
-                decode_commit_json(&envelope_bytes).unwrap_or_else(|err| {
-                    panic!("{label}: versioned JSON decode failed: {err:#}");
-                });
-            assert_eq!(decoded, original, "{label}: versioned decode changed value");
-        }
-    }
-
-    #[test]
-    fn versioned_decode_encode_cycle_is_stable() {
-        for name in all_variant_names() {
-            let (label, mutation) = sample(name);
-            let original = commit_for(mutation);
-            let cm: ClusterMutation = original.mutations[0].clone().into();
-            let versioned = Vec::from([VersionedClusterMutation::new(cm)]);
-            let envelope = serde_json::json!({
-                "resource_version": original.resource_version,
-                "mutations": versioned,
-            });
-            let bytes1 = serde_json::to_vec(&envelope).unwrap();
-            let decoded: LogApplyCommit = decode_commit_json(&bytes1).unwrap_or_else(|err| {
-                panic!("{label}: first versioned decode failed: {err:#}");
-            });
-            let re_encoded = encode_commit_json(&decoded).unwrap();
-            let decoded2: LogApplyCommit = decode_commit_json(&re_encoded).unwrap_or_else(|err| {
-                panic!("{label}: second decode (from re-encoded) failed: {err:#}");
-            });
-            assert_eq!(
-                decoded2, original,
-                "{label}: versioned decode/encode cycle not stable"
-            );
-            assert_eq!(decoded2, decoded, "{label}: re-decode changed value");
-        }
-    }
-
-    #[test]
-    fn versioned_wrong_version_errors() {
-        let mutation = sample(all_variant_names()[0]).1;
-        let cm: ClusterMutation = mutation.into();
-        let bad = serde_json::json!({
-            "version": 999,
-            "mutation": cm,
-        });
-        let envelope = serde_json::json!({
-            "resource_version": 1,
-            "mutations": [bad],
-        });
-        let bytes = serde_json::to_vec(&envelope).unwrap();
-        let result = decode_commit_json(&bytes);
-        assert!(
-            result.is_err(),
-            "unsupported version 999 must produce an error, got: {result:?}"
-        );
     }
 }

@@ -2,10 +2,11 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::{Result, anyhow};
 
-use crate::datastore::{
-    PositionedWatchEvent, PositionedWatchReplayRead, RawWatchEvent, WatchReplayPosition,
+use crate::datastore::RawWatchEvent;
+use klights_watch::{
+    PositionedWatchEvent, PositionedWatchReplayRead, WatchReplayPosition, WatchSignal,
+    WatchSignalReceiver, WatchTopic,
 };
-use klights_watch::{WatchSignal, WatchSignalReceiver, WatchTopic};
 
 use super::{WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WindowPolicy};
 

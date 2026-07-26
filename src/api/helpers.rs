@@ -3,6 +3,62 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::cmp::Ordering;
 
+#[async_trait::async_trait]
+pub trait NamespaceTerminationStore: Send + Sync {
+    async fn get_terminating_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<klights_cluster_core::Resource>, AppError>;
+    async fn list_namespace_pods(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<klights_cluster_core::Resource>, AppError>;
+    async fn mark_namespace_pod_terminating(
+        &self,
+        pod: &klights_cluster_core::Resource,
+        namespace: &str,
+        body: Value,
+    ) -> Result<(), AppError>;
+    async fn update_terminating_namespace(
+        &self,
+        namespace: &str,
+        body: Value,
+        expected_resource_version: i64,
+    ) -> Result<klights_cluster_core::Resource, AppError>;
+    async fn list_namespace_non_pod_resources(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<klights_cluster_core::Resource>, AppError>;
+    async fn delete_namespace_non_pod_resource(
+        &self,
+        resource: &klights_cluster_core::Resource,
+        namespace: &str,
+    ) -> Result<(), AppError>;
+    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64, AppError>;
+    async fn delete_terminating_namespace(&self, namespace: &str) -> anyhow::Result<()>;
+}
+
+pub trait NamespaceTerminationMetrics: Send + Sync {
+    fn record_namespace_delete_failure(&self);
+}
+
+#[async_trait::async_trait]
+pub trait AdmissionResourceStore: Send + Sync {
+    async fn get_admission_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<klights_cluster_core::Resource>, AppError>;
+    async fn list_admission_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<klights_cluster_core::Resource>, AppError>;
+}
+
 pub fn ensure_namespace_status_phase_active(data: &mut Value) {
     let Some(obj) = data.as_object_mut() else {
         return;
@@ -127,9 +183,9 @@ pub fn set_namespace_terminating_status(
 }
 
 pub async fn reconcile_namespace_termination(
-    db: &dyn DatastoreBackend,
+    db: &(impl NamespaceTerminationStore + ?Sized),
     namespace: &str,
-    metrics: &crate::side_effects::SideEffectMetrics,
+    metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<(), AppError> {
     reconcile_namespace_termination_inner(db, namespace, None, metrics).await
 }
@@ -159,10 +215,10 @@ pub enum NamespaceTerminationOutcome {
 /// have to perform its own forbidden DB query (the
 /// tests/source_guard_tests.py restricts it to workqueue CRUD only).
 pub async fn reconcile_namespace_termination_for_uid_with_outcome(
-    db: &dyn DatastoreBackend,
+    db: &(impl NamespaceTerminationStore + ?Sized),
     namespace: &str,
     expected_uid: &str,
-    metrics: &crate::side_effects::SideEffectMetrics,
+    metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<NamespaceTerminationOutcome, AppError> {
     let reconcile_result =
         reconcile_namespace_termination_inner(db, namespace, Some(expected_uid), metrics).await;
@@ -170,7 +226,7 @@ pub async fn reconcile_namespace_termination_for_uid_with_outcome(
     // Whether the inner reconcile returned Ok or a transient Err, look at
     // the post-state to decide whether the workqueue should schedule a
     // delayed retry.
-    let outcome = match db.get_namespace(namespace).await {
+    let outcome = match db.get_terminating_namespace(namespace).await {
         Ok(Some(ns)) => {
             let same_uid = ns
                 .data
@@ -200,10 +256,10 @@ pub async fn reconcile_namespace_termination_for_uid_with_outcome(
 }
 
 async fn reconcile_namespace_termination_inner(
-    db: &dyn DatastoreBackend,
+    db: &(impl NamespaceTerminationStore + ?Sized),
     namespace: &str,
     expected_uid: Option<&str>,
-    metrics: &crate::side_effects::SideEffectMetrics,
+    metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<(), AppError> {
     // Termination reconcile is triggered from many call sites under load:
     // the API delete handler, every Pod actor finalize, and any deferred
@@ -225,12 +281,12 @@ async fn reconcile_namespace_termination_inner(
 }
 
 async fn reconcile_namespace_termination_once(
-    db: &dyn DatastoreBackend,
+    db: &(impl NamespaceTerminationStore + ?Sized),
     namespace: &str,
     expected_uid: Option<&str>,
-    metrics: &crate::side_effects::SideEffectMetrics,
+    metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<(), AppError> {
-    let Some(current_ns) = db.get_namespace(namespace).await? else {
+    let Some(current_ns) = db.get_terminating_namespace(namespace).await? else {
         return Ok(());
     };
     if let Some(expected_uid) = expected_uid {
@@ -259,9 +315,7 @@ async fn reconcile_namespace_termination_once(
         return Ok(());
     }
 
-    let pods = db
-        .list_namespace_resources_of_kind(namespace, "Pod")
-        .await?;
+    let pods = db.list_namespace_pods(namespace).await?;
     let mut pod_blockers = false;
 
     for resource in &pods {
@@ -284,43 +338,29 @@ async fn reconcile_namespace_termination_once(
                     serde_json::json!(0),
                 );
             }
-            db.update_resource_with_preconditions(
-                &resource.api_version.clone(),
-                &resource.kind.clone(),
-                Some(namespace),
-                &resource.name.clone(),
-                pod,
-                crate::datastore::ResourcePreconditions::from_resource(resource),
-            )
-            .await?;
+            db.mark_namespace_pod_terminating(resource, namespace, pod)
+                .await?;
         }
     }
 
     let mut namespace_data: Value = (*current_ns.data).clone();
     set_namespace_terminating_status(&mut namespace_data, pod_blockers);
     let updated_ns = db
-        .update_namespace(namespace, namespace_data, current_ns.resource_version)
+        .update_terminating_namespace(namespace, namespace_data, current_ns.resource_version)
         .await?;
 
     if pod_blockers {
         return Ok(());
     }
 
-    let resources_after_pods = db
-        .list_namespace_resources_excluding_kind(namespace, "Pod")
-        .await?;
+    let resources_after_pods = db.list_namespace_non_pod_resources(namespace).await?;
     for resource in &resources_after_pods {
-        db.delete_resource(
-            &resource.api_version.clone(),
-            &resource.kind.clone(),
-            Some(namespace),
-            &resource.name.clone(),
-        )
-        .await?;
+        db.delete_namespace_non_pod_resource(resource, namespace)
+            .await?;
     }
 
     if db.count_namespace_resources(namespace).await? == 0
-        && let Err(e) = db.delete_namespace(&updated_ns.name).await
+        && let Err(e) = db.delete_terminating_namespace(&updated_ns.name).await
     {
         // A concurrent reconcile may have already deleted the namespace;
         // surface NotFound so the outer retry loop returns Ok.
@@ -328,9 +368,7 @@ async fn reconcile_namespace_termination_once(
         if msg.contains("not found") || msg.contains("Not found") {
             return Err(AppError::NotFound(msg));
         }
-        metrics
-            .namespace_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        metrics.record_namespace_delete_failure();
         tracing::error!(
             namespace = %updated_ns.name,
             error = %e,
@@ -835,7 +873,7 @@ pub fn apply_deployment_strategy_defaults(body: &mut Value) {
 }
 
 pub async fn apply_pod_runtimeclass_admission(
-    db: &dyn DatastoreBackend,
+    db: &(impl AdmissionResourceStore + ?Sized),
     body: &mut Value,
 ) -> Result<(), AppError> {
     let Some(runtime_class_name) = body
@@ -848,7 +886,7 @@ pub async fn apply_pod_runtimeclass_admission(
     };
 
     let rc_resource = db
-        .get_resource("node.k8s.io/v1", "RuntimeClass", None, &runtime_class_name)
+        .get_admission_resource("node.k8s.io/v1", "RuntimeClass", None, &runtime_class_name)
         .await?;
     let Some(rc_resource) = rc_resource else {
         return Err(AppError::Forbidden(format!(
@@ -877,7 +915,7 @@ pub async fn apply_pod_runtimeclass_admission(
 }
 
 pub async fn apply_limitrange_defaults_to_pod(
-    db: &dyn DatastoreBackend,
+    db: &(impl AdmissionResourceStore + ?Sized),
     namespace: &str,
     pod: &mut Value,
 ) -> Result<(), AppError> {
@@ -885,18 +923,13 @@ pub async fn apply_limitrange_defaults_to_pod(
     use std::collections::HashSet;
 
     let ranges = db
-        .list_resources(
-            "v1",
-            "LimitRange",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_admission_resources("v1", "LimitRange", Some(namespace))
         .await?;
 
     let mut default_limits: Map<String, Value> = Map::new();
     let mut default_requests: Map<String, Value> = Map::new();
 
-    for range in ranges.items {
+    for range in ranges {
         let Some(limit_items) = range
             .data
             .pointer("/spec/limits")
@@ -994,7 +1027,7 @@ pub async fn apply_limitrange_defaults_to_pod(
 
 pub fn parse_limitrange_quantity(resource_key: &str, raw: &Value) -> Option<i64> {
     let quantity = raw.as_str()?;
-    crate::controllers::resource_quota::parse_resource_quantity(resource_key, quantity)
+    klights_types::parse_resource_quantity(resource_key, quantity)
 }
 
 pub fn parse_limitrange_ratio(raw: &Value) -> Option<f64> {
@@ -1005,7 +1038,7 @@ pub fn container_quantity(container: &Value, bucket: &str, resource_key: &str) -
     let raw = container
         .pointer(&format!("/resources/{bucket}/{resource_key}"))
         .and_then(|v| v.as_str())?;
-    crate::controllers::resource_quota::parse_resource_quantity(resource_key, raw)
+    klights_types::parse_resource_quantity(resource_key, raw)
 }
 
 fn pod_effective_quantity(pod: &Value, bucket: &str, resource_key: &str) -> Option<i64> {
@@ -1024,13 +1057,11 @@ fn pod_effective_quantity(pod: &Value, bucket: &str, resource_key: &str) -> Opti
     if !has_quantity {
         return None;
     }
-    Some(
-        crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-            pod,
-            bucket,
-            resource_key,
-        ),
-    )
+    Some(klights_types::calculate_pod_effective_resource_for_key(
+        pod,
+        bucket,
+        resource_key,
+    ))
 }
 
 fn enforce_limitrange_pod_item(pod: &Value, item: &Value) -> Result<(), AppError> {
@@ -1076,17 +1107,12 @@ fn enforce_limitrange_pod_item(pod: &Value, item: &Value) -> Result<(), AppError
 }
 
 pub async fn enforce_limitrange_constraints_for_pod(
-    db: &dyn DatastoreBackend,
+    db: &(impl AdmissionResourceStore + ?Sized),
     namespace: &str,
     pod: &Value,
 ) -> Result<(), AppError> {
     let ranges = db
-        .list_resources(
-            "v1",
-            "LimitRange",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_admission_resources("v1", "LimitRange", Some(namespace))
         .await?;
 
     let Some(spec) = pod.get("spec").and_then(|v| v.as_object()) else {
@@ -1110,7 +1136,7 @@ pub async fn enforce_limitrange_constraints_for_pod(
         return Ok(());
     }
 
-    for range in ranges.items {
+    for range in ranges {
         let Some(limit_items) = range
             .data
             .pointer("/spec/limits")
@@ -1243,7 +1269,7 @@ fn pvc_requested_storage(pvc: &Value) -> Option<i64> {
 }
 
 pub async fn enforce_limitrange_constraints_for_pvc(
-    db: &dyn DatastoreBackend,
+    db: &(impl AdmissionResourceStore + ?Sized),
     namespace: &str,
     pvc: &Value,
 ) -> Result<(), AppError> {
@@ -1251,15 +1277,10 @@ pub async fn enforce_limitrange_constraints_for_pvc(
         return Ok(());
     };
     let ranges = db
-        .list_resources(
-            "v1",
-            "LimitRange",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_admission_resources("v1", "LimitRange", Some(namespace))
         .await?;
 
-    for range in ranges.items {
+    for range in ranges {
         let Some(limit_items) = range
             .data
             .pointer("/spec/limits")
@@ -1304,7 +1325,7 @@ pub async fn enforce_limitrange_constraints_for_pvc(
 }
 
 pub async fn apply_default_storage_class_admission(
-    db: &dyn DatastoreBackend,
+    db: &(impl AdmissionResourceStore + ?Sized),
     pvc: &mut Value,
 ) -> Result<(), AppError> {
     match pvc.pointer("/spec/storageClassName") {
@@ -1314,15 +1335,9 @@ pub async fn apply_default_storage_class_admission(
     }
 
     let storage_classes = db
-        .list_resources(
-            "storage.k8s.io/v1",
-            "StorageClass",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
+        .list_admission_resources("storage.k8s.io/v1", "StorageClass", None)
         .await?;
     let Some(default_class) = storage_classes
-        .items
         .iter()
         .filter(|resource| storage_class_is_default(&resource.data))
         .max_by(compare_storage_class_default_order)
@@ -1373,8 +1388,8 @@ fn storage_class_is_default(storage_class: &Value) -> bool {
 }
 
 fn compare_storage_class_default_order(
-    left: &&crate::datastore::Resource,
-    right: &&crate::datastore::Resource,
+    left: &&klights_cluster_core::Resource,
+    right: &&klights_cluster_core::Resource,
 ) -> Ordering {
     storage_class_creation_timestamp(&left.data)
         .cmp(storage_class_creation_timestamp(&right.data))

@@ -1,8 +1,8 @@
 use super::super::queries;
 use super::*;
-use crate::networking::ClusterCidr;
-use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use anyhow::Context;
+use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+use klights_types::ClusterCidr;
 use rusqlite::OptionalExtension;
 impl Datastore {
     // ---- node_subnets CRUD ----------------------------------------
@@ -80,7 +80,7 @@ impl Datastore {
                         subnet_base_int: base,
                         gateway_ip: gateway_ip_typed,
                         node_ip: node_ip_typed,
-                        mode: crate::controllers::annotations::NodePeerMode::Root,
+                        mode: klights_types::NodePeerMode::Root,
                         hostport_range: None,
                     });
                 }
@@ -133,13 +133,13 @@ impl Datastore {
     pub async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         let node_name = node_name.to_string();
         let mode_str = match mode {
-            crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
-            crate::controllers::annotations::NodePeerMode::Rootless => "rootless".to_string(),
+            klights_types::NodePeerMode::Root => "root".to_string(),
+            klights_types::NodePeerMode::Rootless => "rootless".to_string(),
         };
         let hostport_range_str = hostport_range.map(|r| r.to_string());
         self.db_call("db_query", move |conn| {
@@ -226,6 +226,6 @@ fn row_to_node_dataplane(row: &rusqlite::Row<'_>) -> rusqlite::Result<DataplaneP
     .map_err(to_sql_error)
 }
 
-fn to_sql_error(err: anyhow::Error) -> rusqlite::Error {
+fn to_sql_error(err: impl std::fmt::Display) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
 }

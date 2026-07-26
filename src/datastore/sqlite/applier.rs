@@ -204,17 +204,17 @@ impl DatastoreApplier for Datastore {
                 mode,
                 hostport_range,
             } => {
-                let peer_mode = crate::controllers::annotations::parse_node_peer_mode(Some(&mode))
-                    .unwrap_or_else(|_| {
+                let peer_mode =
+                    klights_types::parse_node_peer_mode(Some(&mode)).unwrap_or_else(|_| {
                         tracing::warn!(
                             "unknown peer mode '{}' in StorageCommand, defaulting to Root",
                             mode
                         );
-                        crate::controllers::annotations::NodePeerMode::Root
+                        klights_types::NodePeerMode::Root
                     });
                 let hpr = hostport_range
                     .as_deref()
-                    .and_then(|s| crate::networking::types::HostPortRange::parse(s).ok());
+                    .and_then(|s| klights_types::HostPortRange::parse(s).ok());
                 self.update_node_peer_attributes(&node_name, peer_mode, hpr)
                     .await?;
             }
@@ -353,13 +353,13 @@ fn dataplane_metadata_from_parts(
     public_key: Option<String>,
     endpoint: String,
     port: Option<u16>,
-) -> Result<crate::networking::wireguard::DataplanePeerMetadata> {
-    crate::networking::wireguard::DataplanePeerMetadata::try_new(
+) -> Result<klights_cluster_store::DataplanePeerMetadata> {
+    Ok(klights_cluster_store::DataplanePeerMetadata::try_new(
         node_name,
-        crate::networking::wireguard::DataplaneMode::parse(&mode)?,
-        crate::networking::wireguard::DataplaneEncryption::parse(Some(&encryption))?,
+        klights_cluster_store::DataplaneMode::parse(&mode)?,
+        klights_cluster_store::DataplaneEncryption::parse(Some(&encryption))?,
         public_key,
         Some(endpoint),
         port,
-    )
+    )?)
 }

@@ -75,7 +75,11 @@ async fn enqueue_post_status_reconcile(
         return;
     }
 
-    state.controller_dispatcher.enqueue(resource_data).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(resource_data)
+        .await;
 }
 
 /// Generic status subresource update handler for namespaced resources.
@@ -153,41 +157,14 @@ pub async fn patch_status_subresource(
         .await?;
 
     // ResourceQuota: the /status PATCH may diverge Status.Hard from Spec.Hard.
-    // Spawn an async reconcile so the controller re-syncs Status.Hard = Spec.Hard.
+    // Route the persisted resource through the normal supervised dispatcher so
+    // the ResourceQuota controller re-syncs Status.Hard = Spec.Hard.
     if kind == "ResourceQuota" {
-        let db = state.db.clone();
-        let pod_repository = state.pod_repository.clone();
-        let ns = namespace.clone();
-        if let Err(err) = state
-            .task_supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Others,
-                "resourcequota_post_status_reconcile",
-                async move {
-                    if let Err(e) =
-                        crate::controllers::resource_quota::reconcile_resource_quotas_for_namespace(
-                            db.as_ref(),
-                            pod_repository.as_ref(),
-                            &ns,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            "ResourceQuota post-status reconcile failed for {}: {}",
-                            ns,
-                            e
-                        );
-                    }
-                },
-            )
-            .await
-        {
-            tracing::warn!(
-                "Failed to spawn ResourceQuota post-status reconcile task for {}: {}",
-                namespace,
-                err
-            );
-        }
+        state
+            .controller_reconcile()
+            .controller_dispatcher
+            .enqueue(&outcome.response)
+            .await;
     }
 
     enqueue_post_status_reconcile(
@@ -211,6 +188,7 @@ pub async fn get_namespaced_status_subresource(
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
     let resource = state
+        .resource_mutation()
         .db
         .get_resource(&api_version, &kind, Some(&namespace), &name)
         .await?
@@ -229,6 +207,7 @@ pub async fn get_cluster_status_subresource(
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
     let resource = state
+        .resource_mutation()
         .db
         .get_resource(&api_version, &kind, None, &name)
         .await?

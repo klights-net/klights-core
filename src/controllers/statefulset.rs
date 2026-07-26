@@ -1,14 +1,26 @@
-use crate::datastore::{DatastoreBackend, Resource};
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_pod_api::{PodGetRequest, PodOwnerListRequest, PodQuery};
+use klights_reconcile_api::compute_statefulset_update_revision;
 use serde_json::{Value, json};
 
-pub fn compute_statefulset_update_revision(name: &str, template: &Value) -> String {
-    let canonical = serde_json::to_string(template).unwrap_or_default();
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    format!("{}-{:x}", name, hasher.finish())
+#[async_trait]
+pub trait StatefulSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+    async fn get_statefulset(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+
+    async fn update_statefulset_status(&self, resource: &Resource, status: Value) -> Result<()>;
+}
+
+#[async_trait]
+pub trait StatefulSetPodMutation: Send + Sync {
+    async fn create_statefulset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> Result<Resource>;
 }
 
 fn derive_current_revision_from_pods(
@@ -55,9 +67,15 @@ fn statefulset_pod_ordinal(pod: &Resource, statefulset_name: &str) -> Option<usi
 }
 
 /// Check if a pod is Ready by fetching it through the pod repository.
-async fn is_pod_ready(pod_reader: &dyn PodReader, namespace: &str, pod_name: &str) -> Result<bool> {
+async fn is_pod_ready(
+    pod_reader: &(impl PodQuery + ?Sized),
+    namespace: &str,
+    pod_name: &str,
+) -> Result<bool> {
     let common = crate::controllers::common::controller_common();
-    let pod = pod_reader.get_pod(namespace, pod_name).await?;
+    let pod = pod_reader
+        .get_pod(PodGetRequest::try_by_name(namespace, pod_name)?)
+        .await?;
 
     match pod {
         Some(p) => Ok(common.is_pod_ready(&p.data)),
@@ -66,14 +84,11 @@ async fn is_pod_ready(pod_reader: &dyn PodReader, namespace: &str, pod_name: &st
 }
 
 async fn live_statefulset_replicas(
-    db: &dyn DatastoreBackend,
+    db: &(impl StatefulSetStore + ?Sized),
     namespace: &str,
     name: &str,
 ) -> Result<Option<usize>> {
-    let Some(resource) = db
-        .get_resource("apps/v1", "StatefulSet", Some(namespace), name)
-        .await?
-    else {
+    let Some(resource) = db.get_statefulset(namespace, name).await? else {
         return Ok(None);
     };
     if resource
@@ -94,10 +109,11 @@ async fn live_statefulset_replicas(
 }
 
 pub async fn reconcile_statefulset(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    db: &(impl StatefulSetStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
+    pod_writer: &(impl StatefulSetPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     statefulset: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -114,10 +130,7 @@ pub async fn reconcile_statefulset(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
 
-    let live_resource = match db
-        .get_resource("apps/v1", "StatefulSet", Some(namespace), name)
-        .await?
-    {
+    let live_resource = match db.get_statefulset(namespace, name).await? {
         Some(resource) => resource,
         None => return Ok(()),
     };
@@ -125,23 +138,23 @@ pub async fn reconcile_statefulset(
         db,
         live_resource.clone(),
         pod_delete_sink,
+        non_pod_finalization,
     )
     .await?
     {
         crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
         crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
-            match db
-                .get_resource("apps/v1", "StatefulSet", Some(namespace), name)
-                .await?
-            {
+            match db.get_statefulset(namespace, name).await? {
                 Some(resource) => resource,
                 None => return Ok(()),
             }
         }
         _ => live_resource,
     };
-    let statefulset =
-        crate::api::inject_resource_version(live_resource.data, live_resource.resource_version);
+    let statefulset = crate::controllers::resource_projection::with_resource_version(
+        live_resource.data,
+        live_resource.resource_version,
+    );
 
     let metadata = statefulset
         .get("metadata")
@@ -176,7 +189,9 @@ pub async fn reconcile_statefulset(
     let update_revision = compute_statefulset_update_revision(name, template);
 
     // List existing pods owned by this StatefulSet
-    let owned_pods = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let owned_pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
 
     // Filter out pods that are being deleted (have deletionTimestamp set)
     // These pods still exist in the database but should not count toward current replicas
@@ -192,8 +207,15 @@ pub async fn reconcile_statefulset(
 
     for pod in &active_pods {
         if pod.data.pointer("/status/phase").and_then(|v| v.as_str()) == Some("Failed") {
-            if let Some(pod_name) = pod.data.pointer("/metadata/name").and_then(|v| v.as_str()) {
-                pod_writer.delete_pod(namespace, pod_name).await?;
+            if let (Some(pod_name), Some(pod_uid)) = (
+                pod.data.pointer("/metadata/name").and_then(|v| v.as_str()),
+                pod.data.pointer("/metadata/uid").and_then(|v| v.as_str()),
+            ) {
+                pod_delete_sink
+                    .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                        klights_types::PodIdentity::new(namespace, pod_name, pod_uid),
+                    ))
+                    .await?;
             }
             return Ok(());
         }
@@ -325,7 +347,7 @@ pub async fn reconcile_statefulset(
             }
 
             pod_writer
-                .create_controller_pod(namespace, &pod_name, node_name, pod)
+                .create_statefulset_pod(namespace, &pod_name, node_name, pod)
                 .await?;
         }
     }
@@ -435,13 +457,25 @@ pub async fn reconcile_statefulset(
             // Delete a single ordinal per reconcile. The replacement has the
             // same Pod name, so creation must wait until the lifecycle actor
             // finalizes the old UID and frees the datastore name slot.
-            pod_writer.delete_pod(namespace, pod_name).await?;
+            if let Some(pod_uid) = pod
+                .data
+                .pointer("/metadata/uid")
+                .and_then(|value| value.as_str())
+            {
+                pod_delete_sink
+                    .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                        klights_types::PodIdentity::new(namespace, pod_name, pod_uid),
+                    ))
+                    .await?;
+            }
             break;
         }
     }
 
     // Re-fetch active pods after potential rolling update changes
-    let owned_pods = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let owned_pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     let active_pods: Vec<&Resource> = owned_pods
         .iter()
         .filter(|pod| {
@@ -457,7 +491,7 @@ pub async fn reconcile_statefulset(
     // StatefulSet deletes in reverse ordinal order (highest first)
     if current_replicas > replicas {
         // Sort by ordinal and delete highest condemned ordinals first.
-        let mut pods_with_ordinal: Vec<(usize, String, String)> = active_pods
+        let mut pods_with_ordinal: Vec<(usize, String, String, String)> = active_pods
             .iter()
             .filter_map(|p| {
                 let pod_name = p
@@ -474,18 +508,23 @@ pub async fn reconcile_statefulset(
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string();
+                let pod_uid = p
+                    .data
+                    .pointer("/metadata/uid")
+                    .and_then(|uid| uid.as_str())?
+                    .to_string();
                 let ordinal = pod_name
                     .strip_prefix(&format!("{name}-"))
                     .and_then(|s| s.parse::<usize>().ok())?;
-                Some((ordinal, pod_name, pod_ns))
+                Some((ordinal, pod_name, pod_ns, pod_uid))
             })
             .collect();
 
         pods_with_ordinal.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
-        let condemned_pods: Vec<(usize, String, String)> = pods_with_ordinal
+        let condemned_pods: Vec<(usize, String, String, String)> = pods_with_ordinal
             .into_iter()
-            .filter(|(ordinal, _, _)| *ordinal >= replicas)
+            .filter(|(ordinal, _, _, _)| *ordinal >= replicas)
             .collect();
 
         if pod_management_policy != "Parallel"
@@ -499,7 +538,7 @@ pub async fn reconcile_statefulset(
                 name
             );
         } else if pod_management_policy == "Parallel" {
-            for (ordinal, pod_name, pod_ns) in
+            for (ordinal, pod_name, pod_ns, pod_uid) in
                 condemned_pods.iter().take(current_replicas - replicas)
             {
                 if !pod_name.is_empty() && !pod_ns.is_empty() {
@@ -511,10 +550,14 @@ pub async fn reconcile_statefulset(
                     if *ordinal < live_replicas {
                         continue;
                     }
-                    pod_writer.delete_pod(pod_ns, pod_name).await?;
+                    pod_delete_sink
+                        .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                            klights_types::PodIdentity::new(pod_ns, pod_name, pod_uid),
+                        ))
+                        .await?;
                 }
             }
-        } else if let Some((target_ordinal, pod_name, pod_ns)) = condemned_pods.first() {
+        } else if let Some((target_ordinal, pod_name, pod_ns, pod_uid)) = condemned_pods.first() {
             // OrderedReady scale-down only requires predecessors of the target
             // ordinal to be Ready; the target pod itself may be Pending or
             // otherwise unhealthy and still must be deleted.
@@ -534,7 +577,11 @@ pub async fn reconcile_statefulset(
                     if *target_ordinal < live_replicas {
                         return Ok(());
                     }
-                    pod_writer.delete_pod(pod_ns, pod_name).await?;
+                    pod_delete_sink
+                        .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                            klights_types::PodIdentity::new(pod_ns, pod_name, pod_uid),
+                        ))
+                        .await?;
                 }
             } else {
                 tracing::debug!(
@@ -558,7 +605,9 @@ pub async fn reconcile_statefulset(
         .unwrap_or_else(|| update_revision.clone());
 
     // Re-fetch pods for accurate counting after updates
-    let final_pods = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let final_pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     let final_active: Vec<&Resource> = final_pods
         .iter()
         .filter(|pod| {
@@ -636,23 +685,21 @@ pub async fn reconcile_statefulset(
     // Re-read the StatefulSet to get a fresh RV for status CAS. The
     // `statefulset` parameter was read at the top of reconcile and is
     // stale after pod create/delete operations.
-    let fresh_sts = match db
-        .get_resource("apps/v1", "StatefulSet", Some(namespace), name)
-        .await?
-    {
-        Some(r) => crate::api::inject_resource_version(r.data, r.resource_version),
+    let fresh_sts = match db.get_statefulset(namespace, name).await? {
+        Some(resource) => resource,
         None => return Ok(()),
     };
     // Update observedGeneration from the fresh read
     status["observedGeneration"] = json!(
         fresh_sts
+            .data
             .get("metadata")
             .and_then(|m| m.get("generation"))
             .and_then(|g| g.as_i64())
             .unwrap_or(0)
     );
 
-    crate::controllers::common::write_status(db, &fresh_sts, &status).await?;
+    db.update_statefulset_status(&fresh_sts, status).await?;
 
     Ok(())
 }

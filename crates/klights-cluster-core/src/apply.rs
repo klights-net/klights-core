@@ -2,15 +2,6 @@
 
 use serde_json::Value;
 
-/// Which preconditions an apply adapter must enforce.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApplyPreconditionPolicy {
-    /// Validate structural presence plus exact UID/resourceVersion CAS.
-    Strict,
-    /// Validate only create/update presence so legacy follower replay converges.
-    PresenceOnly,
-}
-
 /// Borrowed apply requirements from a resource mutation envelope.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ApplyPreconditions<'a> {
@@ -62,9 +53,8 @@ impl std::fmt::Display for ApplyPreconditionViolation {
 
 impl std::error::Error for ApplyPreconditionViolation {}
 
-/// Validate structural and, for strict apply, exact UID/resourceVersion CAS.
+/// Validate structural presence plus exact UID/resourceVersion CAS.
 pub fn validate_apply_preconditions(
-    policy: ApplyPreconditionPolicy,
     preconditions: ApplyPreconditions<'_>,
     current: Option<CurrentResourceState<'_>>,
 ) -> Result<(), ApplyPreconditionViolation> {
@@ -73,9 +63,6 @@ pub fn validate_apply_preconditions(
     }
     if preconditions.require_existing && current.is_none() {
         return Err(ApplyPreconditionViolation::NotFound);
-    }
-    if policy == ApplyPreconditionPolicy::PresenceOnly {
-        return Ok(());
     }
     let Some(current) = current else {
         return Ok(());
@@ -147,7 +134,6 @@ pub enum ResourceDeleteDecision {
 
 /// Decide delete no-op/CAS behavior without performing persistence effects.
 pub fn decide_resource_delete(
-    policy: ApplyPreconditionPolicy,
     requested_uid: Option<&str>,
     expected_resource_version: Option<i64>,
     current: Option<CurrentResourceState<'_>>,
@@ -159,7 +145,6 @@ pub fn decide_resource_delete(
         return Ok(ResourceDeleteDecision::NoOp);
     }
     validate_apply_preconditions(
-        policy,
         ApplyPreconditions {
             resource_version: expected_resource_version,
             ..ApplyPreconditions::default()
@@ -261,10 +246,9 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn strict_and_presence_preconditions_are_table_driven() {
+    fn strict_preconditions_are_table_driven() {
         struct Case<'a> {
             name: &'static str,
-            policy: ApplyPreconditionPolicy,
             preconditions: ApplyPreconditions<'a>,
             current: Option<CurrentResourceState<'a>>,
             expected: Option<ApplyPreconditionViolation>,
@@ -276,7 +260,6 @@ mod tests {
         let cases = [
             Case {
                 name: "strict match",
-                policy: ApplyPreconditionPolicy::Strict,
                 preconditions: ApplyPreconditions {
                     uid: Some("live"),
                     resource_version: Some(7),
@@ -287,7 +270,6 @@ mod tests {
             },
             Case {
                 name: "strict uid mismatch",
-                policy: ApplyPreconditionPolicy::Strict,
                 preconditions: ApplyPreconditions {
                     uid: Some("old"),
                     ..ApplyPreconditions::default()
@@ -300,7 +282,6 @@ mod tests {
             },
             Case {
                 name: "strict rv mismatch",
-                policy: ApplyPreconditionPolicy::Strict,
                 preconditions: ApplyPreconditions {
                     resource_version: Some(6),
                     ..ApplyPreconditions::default()
@@ -312,19 +293,7 @@ mod tests {
                 }),
             },
             Case {
-                name: "legacy ignores uid and rv",
-                policy: ApplyPreconditionPolicy::PresenceOnly,
-                preconditions: ApplyPreconditions {
-                    uid: Some("old"),
-                    resource_version: Some(6),
-                    ..ApplyPreconditions::default()
-                },
-                current: Some(current),
-                expected: None,
-            },
-            Case {
                 name: "required existing is absent",
-                policy: ApplyPreconditionPolicy::PresenceOnly,
                 preconditions: ApplyPreconditions {
                     require_existing: true,
                     ..ApplyPreconditions::default()
@@ -334,7 +303,6 @@ mod tests {
             },
             Case {
                 name: "required absent already exists",
-                policy: ApplyPreconditionPolicy::Strict,
                 preconditions: ApplyPreconditions {
                     require_absent: true,
                     ..ApplyPreconditions::default()
@@ -345,7 +313,7 @@ mod tests {
         ];
         for case in cases {
             assert_eq!(
-                validate_apply_preconditions(case.policy, case.preconditions, case.current).err(),
+                validate_apply_preconditions(case.preconditions, case.current).err(),
                 case.expected,
                 "{}",
                 case.name
@@ -398,28 +366,18 @@ mod tests {
             resource_version: 9,
         };
         assert_eq!(
-            decide_resource_delete(
-                ApplyPreconditionPolicy::Strict,
-                Some("old"),
-                Some(8),
-                Some(current)
-            ),
+            decide_resource_delete(Some("old"), Some(8), Some(current)),
             Ok(ResourceDeleteDecision::NoOp)
         );
         assert_eq!(
-            decide_resource_delete(
-                ApplyPreconditionPolicy::Strict,
-                Some("new"),
-                Some(8),
-                Some(current)
-            ),
+            decide_resource_delete(Some("new"), Some(8), Some(current)),
             Err(ApplyPreconditionViolation::ResourceVersion {
                 expected: 8,
                 actual: 9
             })
         );
         assert_eq!(
-            decide_resource_delete(ApplyPreconditionPolicy::PresenceOnly, None, Some(8), None),
+            decide_resource_delete(None, Some(8), None),
             Ok(ResourceDeleteDecision::NoOp)
         );
     }

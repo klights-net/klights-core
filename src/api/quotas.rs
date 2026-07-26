@@ -90,14 +90,17 @@ fn ensure_pod_specifies_quota_resource(
     Ok(())
 }
 
-fn pvc_requested_storage(pvc: &Value) -> Option<i64> {
+fn pvc_requested_storage(
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
+    pvc: &Value,
+) -> Option<i64> {
     pvc.pointer("/spec/resources/requests/storage")
         .and_then(Value::as_str)
-        .and_then(|raw| crate::controllers::resource_quota::parse_resource_quantity("storage", raw))
+        .and_then(|raw| runtime.parse_resource_quantity("storage", raw))
 }
 
 async fn check_pvc_storage_delta(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     delta: i64,
 ) -> Result<(), AppError> {
@@ -105,23 +108,16 @@ async fn check_pvc_storage_delta(
         return Ok(());
     }
 
-    let rq_list = match db
-        .list_resources(
-            "v1",
-            "ResourceQuota",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+    let rq_list = match runtime
+        .list_resources("v1", "ResourceQuota", namespace)
         .await
     {
         Ok(list) => list,
         Err(_) => return Ok(()),
     };
 
-    for rq_resource in rq_list.items {
-        if crate::controllers::resource_quota::resource_quota_has_pod_scope_constraints(
-            rq_resource.data.as_ref(),
-        ) {
+    for rq_resource in rq_list {
+        if runtime.resource_quota_has_pod_scope_constraints(rq_resource.data.as_ref()) {
             continue;
         }
         let Some(limit_raw) = rq_resource
@@ -131,9 +127,7 @@ async fn check_pvc_storage_delta(
         else {
             continue;
         };
-        let Some(limit) =
-            crate::controllers::resource_quota::parse_resource_quantity("storage", limit_raw)
-        else {
+        let Some(limit) = runtime.parse_resource_quantity("storage", limit_raw) else {
             continue;
         };
 
@@ -142,15 +136,13 @@ async fn check_pvc_storage_delta(
             .pointer("/status/used/requests.storage")
             .and_then(Value::as_str)
             .unwrap_or("0");
-        let used = crate::controllers::resource_quota::parse_resource_quantity("storage", used_raw)
+        let used = runtime
+            .parse_resource_quantity("storage", used_raw)
             .unwrap_or(0);
         if used + delta > limit {
-            let requested_fmt =
-                crate::controllers::resource_quota::format_resource_quantity("storage", delta);
-            let used_fmt =
-                crate::controllers::resource_quota::format_resource_quantity("storage", used);
-            let limit_fmt =
-                crate::controllers::resource_quota::format_resource_quantity("storage", limit);
+            let requested_fmt = runtime.format_resource_quantity("storage", delta);
+            let used_fmt = runtime.format_resource_quantity("storage", used);
+            let limit_fmt = runtime.format_resource_quantity("storage", limit);
             return Err(AppError::Forbidden(format!(
                 "exceeded quota: requests.storage, requested: {}, used: {}, limited: {}",
                 requested_fmt, used_fmt, limit_fmt
@@ -162,36 +154,31 @@ async fn check_pvc_storage_delta(
 }
 
 pub async fn check_resource_quota_for_pvc_update(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     old_pvc: &Value,
     new_pvc: &Value,
 ) -> Result<(), AppError> {
-    let old = pvc_requested_storage(old_pvc).unwrap_or(0);
-    let new = pvc_requested_storage(new_pvc).unwrap_or(0);
-    check_pvc_storage_delta(db, namespace, new.saturating_sub(old)).await
+    let old = pvc_requested_storage(runtime, old_pvc).unwrap_or(0);
+    let new = pvc_requested_storage(runtime, new_pvc).unwrap_or(0);
+    check_pvc_storage_delta(runtime, namespace, new.saturating_sub(old)).await
 }
 
 pub async fn check_resource_quota_for_pod_update(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     old_pod: &Value,
     new_pod: &Value,
 ) -> Result<(), AppError> {
-    let rq_list = match db
-        .list_resources(
-            "v1",
-            "ResourceQuota",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+    let rq_list = match runtime
+        .list_resources("v1", "ResourceQuota", namespace)
         .await
     {
         Ok(list) => list,
         Err(_) => return Ok(()),
     };
 
-    for rq_resource in rq_list.items {
+    for rq_resource in rq_list {
         let hard = match rq_resource
             .data
             .pointer("/spec/hard")
@@ -201,15 +188,9 @@ pub async fn check_resource_quota_for_pod_update(
             None => continue,
         };
         let old_matches_scope =
-            crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
-                old_pod,
-                rq_resource.data.as_ref(),
-            );
+            runtime.pod_matches_resource_quota_scopes(old_pod, rq_resource.data.as_ref());
         let new_matches_scope =
-            crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
-                new_pod,
-                rq_resource.data.as_ref(),
-            );
+            runtime.pod_matches_resource_quota_scopes(new_pod, rq_resource.data.as_ref());
         let used_map = rq_resource
             .data
             .pointer("/status/used")
@@ -222,10 +203,7 @@ pub async fn check_resource_quota_for_pod_update(
             let Some(limit_raw) = limit_value.as_str() else {
                 continue;
             };
-            let Some(limit) = crate::controllers::resource_quota::parse_resource_quantity(
-                resource_key,
-                limit_raw,
-            ) else {
+            let Some(limit) = runtime.parse_resource_quantity(resource_key, limit_raw) else {
                 continue;
             };
 
@@ -234,20 +212,12 @@ pub async fn check_resource_quota_for_pod_update(
             }
 
             let old_usage = if old_matches_scope {
-                crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-                    old_pod,
-                    bucket,
-                    resource_key,
-                )
+                runtime.calculate_pod_effective_resource_for_key(old_pod, bucket, resource_key)
             } else {
                 0
             };
             let new_usage = if new_matches_scope {
-                crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-                    new_pod,
-                    bucket,
-                    resource_key,
-                )
+                runtime.calculate_pod_effective_resource_for_key(new_pod, bucket, resource_key)
             } else {
                 0
             };
@@ -259,24 +229,17 @@ pub async fn check_resource_quota_for_pod_update(
                 .and_then(|map| map.get(quota_key))
                 .and_then(|v| v.as_str())
                 .unwrap_or("0");
-            let used =
-                crate::controllers::resource_quota::parse_resource_quantity(resource_key, used_raw)
-                    .unwrap_or(0);
+            let used = runtime
+                .parse_resource_quantity(resource_key, used_raw)
+                .unwrap_or(0);
             let adjusted_used = used.saturating_sub(old_usage).saturating_add(new_usage);
             if adjusted_used > limit {
                 let requested_delta = new_usage.saturating_sub(old_usage);
-                let requested_fmt = crate::controllers::resource_quota::format_resource_quantity(
-                    resource_key,
-                    requested_delta.max(0),
-                );
-                let used_fmt = crate::controllers::resource_quota::format_resource_quantity(
-                    resource_key,
-                    used.saturating_sub(old_usage),
-                );
-                let limit_fmt = crate::controllers::resource_quota::format_resource_quantity(
-                    resource_key,
-                    limit,
-                );
+                let requested_fmt =
+                    runtime.format_resource_quantity(resource_key, requested_delta.max(0));
+                let used_fmt =
+                    runtime.format_resource_quantity(resource_key, used.saturating_sub(old_usage));
+                let limit_fmt = runtime.format_resource_quantity(resource_key, limit);
                 return Err(AppError::Forbidden(format!(
                     "exceeded quota: {}, requested: {}, used: {}, limited: {}",
                     quota_key, requested_fmt, used_fmt, limit_fmt
@@ -288,94 +251,72 @@ pub async fn check_resource_quota_for_pod_update(
 }
 
 async fn count_nodeport_allocating_services(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
 ) -> i64 {
-    db.list_resources(
-        "v1",
-        "Service",
-        Some(namespace),
-        crate::datastore::ResourceListQuery::all(),
-    )
-    .await
-    .map(|list| {
-        list.items
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.data.pointer("/spec/type").and_then(|t| t.as_str()),
-                    Some("NodePort") | Some("LoadBalancer")
-                )
-            })
-            .count() as i64
-    })
-    .unwrap_or(0)
+    runtime
+        .list_resources("v1", "Service", namespace)
+        .await
+        .map(|resources| {
+            resources
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.data.pointer("/spec/type").and_then(|t| t.as_str()),
+                        Some("NodePort") | Some("LoadBalancer")
+                    )
+                })
+                .count() as i64
+        })
+        .unwrap_or(0)
 }
 
 async fn count_services_of_type(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     svc_type: &str,
 ) -> i64 {
-    db.list_resources(
-        "v1",
-        "Service",
-        Some(namespace),
-        crate::datastore::ResourceListQuery::all(),
-    )
-    .await
-    .map(|list| {
-        list.items
-            .iter()
-            .filter(|s| s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some(svc_type))
-            .count() as i64
-    })
-    .unwrap_or(0)
+    runtime
+        .list_resources("v1", "Service", namespace)
+        .await
+        .map(|resources| {
+            resources
+                .iter()
+                .filter(|s| s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some(svc_type))
+                .count() as i64
+        })
+        .unwrap_or(0)
 }
 
 async fn count_pods_matching_resource_quota(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     pod_kind: &str,
     resource_quota: &Value,
 ) -> i64 {
-    db.list_resources(
-        "v1",
-        pod_kind,
-        Some(namespace),
-        crate::datastore::ResourceListQuery::all(),
-    )
-    .await
-    .map(|list| {
-        list.items
-            .iter()
-            .filter(|pod| {
-                !crate::controllers::resource_quota::pod_has_deletion_timestamp(&pod.data)
-            })
-            .filter(|pod| {
-                crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
-                    &pod.data,
-                    resource_quota,
-                )
-            })
-            .count() as i64
-    })
-    .unwrap_or(0)
+    runtime
+        .list_resources("v1", pod_kind, namespace)
+        .await
+        .map(|resources| {
+            resources
+                .iter()
+                .filter(|pod| !runtime.pod_has_deletion_timestamp(pod.data.as_ref()))
+                .filter(|pod| {
+                    runtime.pod_matches_resource_quota_scopes(pod.data.as_ref(), resource_quota)
+                })
+                .count() as i64
+        })
+        .unwrap_or(0)
 }
 
 pub async fn check_resource_quota_for_creation(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     kind: &str,
     body: &Value,
 ) -> Result<(), AppError> {
-    let rq_list = match db
-        .list_resources(
-            "v1",
-            "ResourceQuota",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+    let rq_list = match runtime
+        .list_resources("v1", "ResourceQuota", namespace)
         .await
     {
         Ok(list) => list,
@@ -383,11 +324,11 @@ pub async fn check_resource_quota_for_creation(
     };
 
     if kind == "PersistentVolumeClaim" {
-        let requested = pvc_requested_storage(body).unwrap_or(0);
-        check_pvc_storage_delta(db, namespace, requested).await?;
+        let requested = pvc_requested_storage(runtime, body).unwrap_or(0);
+        check_pvc_storage_delta(runtime, namespace, requested).await?;
     }
 
-    for rq_resource in rq_list.items {
+    for rq_resource in rq_list {
         let hard = match rq_resource
             .data
             .pointer("/spec/hard")
@@ -398,15 +339,10 @@ pub async fn check_resource_quota_for_creation(
         };
 
         if kind == "Pod" {
-            if !crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
-                body,
-                rq_resource.data.as_ref(),
-            ) {
+            if !runtime.pod_matches_resource_quota_scopes(body, rq_resource.data.as_ref()) {
                 continue;
             }
-        } else if crate::controllers::resource_quota::resource_quota_has_pod_scope_constraints(
-            rq_resource.data.as_ref(),
-        ) {
+        } else if runtime.resource_quota_has_pod_scope_constraints(rq_resource.data.as_ref()) {
             continue;
         }
 
@@ -420,22 +356,18 @@ pub async fn check_resource_quota_for_creation(
                     .unwrap_or(i64::MAX);
                 let current_count = if kind == "Pod" {
                     count_pods_matching_resource_quota(
-                        db,
+                        runtime,
                         namespace,
                         kind,
                         rq_resource.data.as_ref(),
                     )
                     .await
                 } else {
-                    db.list_resources(
-                        "v1",
-                        kind,
-                        Some(namespace),
-                        crate::datastore::ResourceListQuery::all(),
-                    )
-                    .await
-                    .map(|list| list.items.len() as i64)
-                    .unwrap_or(0)
+                    runtime
+                        .list_resources("v1", kind, namespace)
+                        .await
+                        .map(|resources| resources.len() as i64)
+                        .unwrap_or(0)
                 };
                 if current_count >= limit {
                     return Err(AppError::Forbidden(format!(
@@ -462,22 +394,18 @@ pub async fn check_resource_quota_for_creation(
                 };
                 let current_count = if kind == "Pod" {
                     count_pods_matching_resource_quota(
-                        db,
+                        runtime,
                         namespace,
                         kind,
                         rq_resource.data.as_ref(),
                     )
                     .await
                 } else {
-                    db.list_resources(
-                        &api_version,
-                        kind,
-                        Some(namespace),
-                        crate::datastore::ResourceListQuery::all(),
-                    )
-                    .await
-                    .map(|list| list.items.len() as i64)
-                    .unwrap_or(0)
+                    runtime
+                        .list_resources(&api_version, kind, namespace)
+                        .await
+                        .map(|resources| resources.len() as i64)
+                        .unwrap_or(0)
                 };
                 if current_count >= limit {
                     return Err(AppError::Forbidden(format!(
@@ -500,19 +428,12 @@ pub async fn check_resource_quota_for_creation(
                 let Some(limit_raw) = limit_value.as_str() else {
                     continue;
                 };
-                let Some(limit) = crate::controllers::resource_quota::parse_resource_quantity(
-                    resource_key,
-                    limit_raw,
-                ) else {
+                let Some(limit) = runtime.parse_resource_quantity(resource_key, limit_raw) else {
                     continue;
                 };
                 ensure_pod_specifies_quota_resource(body, quota_key, bucket, resource_key)?;
                 let requested =
-                    crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
-                        body,
-                        bucket,
-                        resource_key,
-                    );
+                    runtime.calculate_pod_effective_resource_for_key(body, bucket, resource_key);
                 if requested <= 0 {
                     continue;
                 }
@@ -521,25 +442,13 @@ pub async fn check_resource_quota_for_creation(
                     .and_then(|map| map.get(quota_key))
                     .and_then(|v| v.as_str())
                     .unwrap_or("0");
-                let used = crate::controllers::resource_quota::parse_resource_quantity(
-                    resource_key,
-                    used_raw,
-                )
-                .unwrap_or(0);
+                let used = runtime
+                    .parse_resource_quantity(resource_key, used_raw)
+                    .unwrap_or(0);
                 if used + requested > limit {
-                    let requested_fmt =
-                        crate::controllers::resource_quota::format_resource_quantity(
-                            resource_key,
-                            requested,
-                        );
-                    let used_fmt = crate::controllers::resource_quota::format_resource_quantity(
-                        resource_key,
-                        used,
-                    );
-                    let limit_fmt = crate::controllers::resource_quota::format_resource_quantity(
-                        resource_key,
-                        limit,
-                    );
+                    let requested_fmt = runtime.format_resource_quantity(resource_key, requested);
+                    let used_fmt = runtime.format_resource_quantity(resource_key, used);
+                    let limit_fmt = runtime.format_resource_quantity(resource_key, limit);
                     return Err(AppError::Forbidden(format!(
                         "exceeded quota: {}, requested: {}, used: {}, limited: {}",
                         quota_key, requested_fmt, used_fmt, limit_fmt
@@ -560,7 +469,7 @@ pub async fn check_resource_quota_for_creation(
                     .as_str()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(i64::MAX);
-                let current_count = count_nodeport_allocating_services(db, namespace).await;
+                let current_count = count_nodeport_allocating_services(runtime, namespace).await;
                 if current_count >= limit {
                     return Err(AppError::Forbidden(format!(
                         "exceeded quota: services.nodeports, requested: 1, used: {}, limited: {}",
@@ -575,7 +484,8 @@ pub async fn check_resource_quota_for_creation(
                     .as_str()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(i64::MAX);
-                let current_count = count_services_of_type(db, namespace, "LoadBalancer").await;
+                let current_count =
+                    count_services_of_type(runtime, namespace, "LoadBalancer").await;
                 if current_count >= limit {
                     return Err(AppError::Forbidden(format!(
                         "exceeded quota: services.loadbalancers, requested: 1, used: {}, limited: {}",
@@ -590,7 +500,7 @@ pub async fn check_resource_quota_for_creation(
 }
 
 pub async fn check_service_type_quota(
-    db: &dyn crate::datastore::DatastoreBackend,
+    runtime: &dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime,
     namespace: &str,
     service_body: &Value,
 ) -> Result<(), AppError> {
@@ -604,23 +514,12 @@ pub async fn check_service_type_quota(
         return Ok(());
     }
 
-    let rq_list = db
-        .list_resources(
-            "v1",
-            "ResourceQuota",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+    let rq_list = runtime
+        .list_resources("v1", "ResourceQuota", namespace)
         .await
-        .unwrap_or_else(|_| crate::datastore::ResourceList {
-            items: vec![],
-            resource_version: 0,
-            watch_replay_position: None,
-            continue_token: None,
-            remaining_item_count: None,
-        });
+        .unwrap_or_default();
 
-    for rq_resource in rq_list.items {
+    for rq_resource in rq_list {
         let hard = match rq_resource
             .data
             .pointer("/spec/hard")
@@ -636,23 +535,11 @@ pub async fn check_service_type_quota(
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(i64::MAX);
-            let all_svcs = db
-                .list_resources(
-                    "v1",
-                    "Service",
-                    Some(namespace),
-                    crate::datastore::ResourceListQuery::all(),
-                )
+            let all_svcs = runtime
+                .list_resources("v1", "Service", namespace)
                 .await
-                .unwrap_or_else(|_| crate::datastore::ResourceList {
-                    items: vec![],
-                    resource_version: 0,
-                    watch_replay_position: None,
-                    continue_token: None,
-                    remaining_item_count: None,
-                });
+                .unwrap_or_default();
             let used = all_svcs
-                .items
                 .iter()
                 .filter(|s| {
                     matches!(
@@ -674,23 +561,11 @@ pub async fn check_service_type_quota(
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(i64::MAX);
-            let all_svcs = db
-                .list_resources(
-                    "v1",
-                    "Service",
-                    Some(namespace),
-                    crate::datastore::ResourceListQuery::all(),
-                )
+            let all_svcs = runtime
+                .list_resources("v1", "Service", namespace)
                 .await
-                .unwrap_or_else(|_| crate::datastore::ResourceList {
-                    items: vec![],
-                    resource_version: 0,
-                    watch_replay_position: None,
-                    continue_token: None,
-                    remaining_item_count: None,
-                });
+                .unwrap_or_default();
             let used = all_svcs
-                .items
                 .iter()
                 .filter(|s| {
                     s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some("LoadBalancer")

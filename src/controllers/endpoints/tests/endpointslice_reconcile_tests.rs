@@ -746,6 +746,9 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
         "Service",
         Some("test".to_string()),
         &crate::controllers::gc::NoOpGcPodDeleteSink,
+        &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
+            db.clone(),
+        )),
     )
     .await
     .unwrap();

@@ -544,7 +544,7 @@ async fn health_check() -> &'static str {
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
-    state.metrics.render_prometheus()
+    state.controller_reconcile().metrics.render_prometheus()
 }
 
 async fn version() -> Json<crate::version::VersionInfo> {
@@ -564,13 +564,17 @@ async fn openid_configuration(State(_state): State<Arc<AppState>>) -> Json<Value
 }
 
 async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
-    let signing_key_path =
-        crate::paths::service_account_signing_key_path(&state.config.containerd_namespace);
-    let signing_key_pem =
-        crate::auth::read_service_account_signing_key_async(&signing_key_path, &state.file_process)
-            .await
-            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
-    let crypto = klights_supervisor::CryptoExecutor::new(state.task_supervisor.clone());
+    let signing_key_path = crate::paths::service_account_signing_key_path(
+        &state.operational().config.containerd_namespace,
+    );
+    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+        &signing_key_path,
+        &state.operational().file_process,
+    )
+    .await
+    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+    let crypto =
+        klights_supervisor::CryptoExecutor::new(state.operational().task_supervisor.clone());
     let jwks = crypto
         .run_blocking("build-openid-jwks", move || {
             build_openid_jwks(&signing_key_pem)
@@ -645,34 +649,43 @@ fn build_openid_jwks(signing_key_pem: &str) -> Result<Value, AppError> {
 async fn klights_status_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, AppError> {
-    let metadata = crate::bootstrap::cluster_meta::read_cluster_metadata(state.db.as_ref())
+    let metadata = state
+        .operational()
+        .cluster_status
+        .cluster_status_metadata()
         .await
-        .map_err(|e| AppError::InternalError(format!("failed to read cluster metadata: {}", e)))?;
-    let role = match &state.role {
-        crate::bootstrap::NodeRole::Leader { .. } => "Leader",
-        crate::bootstrap::NodeRole::Controlplane {
+        .map_err(|error| {
+            AppError::InternalError(format!("failed to read cluster metadata: {error}"))
+        })?;
+    let role = match &state.operational().role {
+        crate::api::ApiNodeRole::Leader => "Leader",
+        crate::api::ApiNodeRole::Controlplane {
             leader_endpoints,
             as_learner: true,
-            ..
         } if !leader_endpoints.is_empty() => "Replica",
-        crate::bootstrap::NodeRole::Controlplane {
+        crate::api::ApiNodeRole::Controlplane {
             leader_endpoints, ..
         } if leader_endpoints.is_empty() => "ControlplaneSeed",
-        crate::bootstrap::NodeRole::Controlplane { .. } => "ControlplaneJoin",
-        crate::bootstrap::NodeRole::Worker { .. } => "Worker",
+        crate::api::ApiNodeRole::Controlplane { .. } => "ControlplaneJoin",
+        crate::api::ApiNodeRole::Worker { .. } => "Worker",
     };
-    let leader_endpoint = match &state.role {
-        crate::bootstrap::NodeRole::Worker {
+    let leader_endpoint = match &state.operational().role {
+        crate::api::ApiNodeRole::Worker {
             leader_endpoints, ..
         }
-        | crate::bootstrap::NodeRole::Controlplane {
+        | crate::api::ApiNodeRole::Controlplane {
             leader_endpoints, ..
         } => leader_endpoints.first().cloned(),
         _ => None,
     };
-    let follower_metrics = match &state.replication {
-        Some(replication) => replication.follower_metrics().await,
-        None => crate::replication::service::FollowerMetrics::default(),
+    let follower_metrics = match &state.operational().replication {
+        Some(services) => {
+            klights_leader_api::LeaderFollowerDiagnostics::follower_diagnostics(
+                services.diagnostics.as_ref(),
+            )
+            .await
+        }
+        None => klights_leader_api::FollowerDiagnostics::default(),
     };
     let followers: Vec<Value> = follower_metrics
         .followers
@@ -680,7 +693,7 @@ async fn klights_status_handler(
         .map(|follower| {
             serde_json::json!({
                 "nodeName": follower.node_name,
-                "appliedResourceVersion": follower.applied_rv,
+                "appliedResourceVersion": follower.applied_resource_version,
                 "lag": follower.lag,
                 "mode": follower.mode,
                 "encryption": follower.encryption,
@@ -694,11 +707,11 @@ async fn klights_status_handler(
         "leaderEndpoint": leader_endpoint,
         "clusterId": metadata.cluster_id,
         "leaderEpoch": metadata.leader_epoch,
-        "currentResourceVersion": metadata.current_rv,
+        "currentResourceVersion": metadata.current_resource_version,
         "replicaLastAppliedResourceVersion": serde_json::Value::Null,
         "streamState": if matches!(
-            state.role,
-            crate::bootstrap::NodeRole::Worker { .. }
+            state.operational().role,
+            crate::api::ApiNodeRole::Worker { .. }
         ) { "streaming" } else { "local" },
         "streamLag": serde_json::Value::Null,
         "followers": followers,
@@ -745,9 +758,11 @@ mod status_tests {
     #[tokio::test]
     async fn klights_status_route_requires_authorization() {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(state.db.as_ref())
-            .await
-            .unwrap();
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(
+            state.resource_mutation().db.as_ref(),
+        )
+        .await
+        .unwrap();
         state.authorizer = std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
         let app = crate::api::build_router(state);
 
@@ -786,7 +801,7 @@ mod status_tests {
         let mut state = crate::api::test_support::build_test_app_state().await;
         let mut config = crate::KlightsConfig::test_default();
         config.anonymous_auth = false;
-        state.config = std::sync::Arc::new(config);
+        state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
         state.authorizer =
             std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all());
         let app = crate::api::build_router(state);
@@ -955,14 +970,14 @@ mod status_tests {
     #[tokio::test]
     async fn worker_status_reports_streaming_state() {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        state.role = crate::bootstrap::NodeRole::Worker {
+        state.operational_mut().role = crate::api::ApiNodeRole::Worker {
             leader_endpoints: vec!["127.0.0.1:17443".to_string()],
-            token: Some("tok".to_string()),
-            skip_ca: false,
         };
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(state.db.as_ref())
-            .await
-            .unwrap();
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(
+            state.resource_mutation().db.as_ref(),
+        )
+        .await
+        .unwrap();
         let app = crate::api::build_router(state);
 
         let response = app
@@ -987,14 +1002,16 @@ mod status_tests {
     #[tokio::test]
     async fn leader_status_reports_follower_metrics() {
         let mut state = crate::api::test_support::build_test_app_state().await;
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(state.db.as_ref())
-            .await
-            .unwrap();
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(
+            state.resource_mutation().db.as_ref(),
+        )
+        .await
+        .unwrap();
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let replication = std::sync::Arc::new(crate::replication::ReplicationService::new(
-            state.db.clone(),
+            state.resource_mutation().db.clone(),
             supervisor,
         ));
         let (_follower_rx, _follower_session) = replication
@@ -1010,7 +1027,8 @@ mod status_tests {
                 .unwrap(),
             )
             .await;
-        state.replication = Some(replication);
+        state.operational_mut().replication =
+            Some(crate::api::ApiRemoteNodeServices::from_test(replication));
         let app = crate::api::build_router(state);
 
         let response = app

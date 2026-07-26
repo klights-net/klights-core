@@ -6,13 +6,13 @@ mod cases {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime;
     use crate::datastore::backend::DatastoreHandle;
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
     use crate::replication::grpc::client::{
-        ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, LocalNodeLogRuntime,
-        ReplicationGrpcClient,
+        ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };
     use crate::replication::grpc::client::{ConnectDispatchContext, dispatch_leader_message};
     use crate::replication::grpc::generated::{self, follower_message, leader_message};
@@ -21,10 +21,10 @@ mod cases {
     use futures::StreamExt as _;
     use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
     use klights_node_api::{
-        BoundedByteStream, ExecStreamChannel, ExecStreamOptions, NodeExec, NodeExecFrame,
-        NodeExecRequest, NodeExecRuntime, NodeExecRuntimeFuture, NodeExecSession,
-        NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogOptions, NodeLogRequest,
-        NodeLogRuntime, NodeLogTarget, NodeMetrics, NodeMetricsContainerSample, NodeMetricsFuture,
+        ExecStreamChannel, ExecStreamOptions, NodeExec, NodeExecFrame, NodeExecRequest,
+        NodeExecRuntime, NodeExecRuntimeFuture, NodeExecSession, NodeExecSyncRequest,
+        NodeExecSyncResult, NodeExecTarget, NodeLogOptions, NodeLogRequest, NodeLogRuntime,
+        NodeLogTarget, NodeMetrics, NodeMetricsContainerSample, NodeMetricsFuture,
         NodeMetricsNodeSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResult,
         NodeMetricsRuntime, NodeMetricsTarget,
     };
@@ -100,28 +100,6 @@ mod cases {
             port: None,
             mode: klights_leader_api::NetworkNodeMode::Root,
             encryption: klights_leader_api::DataplaneEncryption::Direct,
-        }
-    }
-
-    #[tokio::test]
-    async fn local_log_session_cancel_and_drop_stop_the_owned_producer() {
-        for explicit_cancel in [false, true] {
-            let (_tx, rx) = tokio::sync::mpsc::channel(1);
-            let producer_cancel = tokio_util::sync::CancellationToken::new();
-            let mut session = super::super::LocalPodLogStreamSession {
-                inbound_rx: tokio::sync::Mutex::new(rx),
-                producer_cancel: producer_cancel.clone(),
-                cancelled: std::sync::atomic::AtomicBool::new(false),
-            };
-
-            if explicit_cancel {
-                session.cancel().await.unwrap();
-                session.cancel().await.unwrap();
-                assert!(session.is_cancelled());
-            } else {
-                drop(session);
-            }
-            assert!(producer_cancel.is_cancelled());
         }
     }
 
@@ -549,7 +527,7 @@ mod cases {
         assert_eq!(event.resume_position().unwrap().event_id, 92);
         assert!(matches!(
             super::super::resource_event_from_proto(wire("RENAMED")),
-            Err(crate::control_plane::client::LeaderWatchError::UnknownEventType { .. })
+            Err(klights_leader_api::LeaderWatchError::UnknownEventType { .. })
         ));
     }
 
@@ -672,11 +650,10 @@ mod cases {
                 .contains_key(crate::replication::grpc::JOIN_TOKEN_METADATA_KEY)
         );
         assert_eq!(client.join_request().token, "");
-        assert!(
-            crate::replication::protocol::supports_command_codec_v3(
-                client.join_request().supported_features
-            ),
-            "every worker stream handshake must advertise codec v3"
+        assert_eq!(
+            client.join_request().command_codec_version,
+            crate::log_apply::COMMAND_CODEC_VERSION,
+            "every worker stream handshake must advertise exact codec v3"
         );
     }
 
@@ -1197,7 +1174,7 @@ mod cases {
 
         let mut stream = client
             .watch_resources_rpc(
-                crate::control_plane::client::WatchRequest::try_new(
+                klights_leader_api::WatchRequest::try_new(
                     "v1",
                     "Pod",
                     None,
@@ -1247,7 +1224,7 @@ mod cases {
             .expect("watch event should decode");
         assert_eq!(
             event.event_type(),
-            crate::control_plane::client::WatchEventType::Added
+            klights_leader_api::WatchEventType::Added
         );
         assert_eq!(
             event
@@ -1311,7 +1288,7 @@ mod cases {
         );
         let mut stream = client
             .watch_resources_rpc(
-                crate::control_plane::client::WatchRequest::try_new(
+                klights_leader_api::WatchRequest::try_new(
                     "v1",
                     "ConfigMap",
                     None,
@@ -1400,7 +1377,7 @@ mod cases {
         );
         let mut stream = client
             .watch_resources_rpc(
-                crate::control_plane::client::WatchRequest::try_new(
+                klights_leader_api::WatchRequest::try_new(
                     "v1",
                     "ConfigMap",
                     None,
@@ -1424,7 +1401,7 @@ mod cases {
 
         assert_eq!(
             heartbeat.event_type(),
-            crate::control_plane::client::WatchEventType::Bookmark
+            klights_leader_api::WatchEventType::Bookmark
         );
         assert_eq!(
             heartbeat.resource().resource_version,
@@ -1463,7 +1440,7 @@ mod cases {
 
         let result = client
             .watch_resources_rpc(
-                crate::control_plane::client::WatchRequest::try_new(
+                klights_leader_api::WatchRequest::try_new(
                     "v1",
                     "ConfigMap",
                     None,
@@ -1512,7 +1489,7 @@ mod cases {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             client.watch_resources_rpc(
-                crate::control_plane::client::WatchRequest::try_new(
+                klights_leader_api::WatchRequest::try_new(
                     "v1",
                     "ConfigMap",
                     None,
@@ -1611,7 +1588,7 @@ mod cases {
 
         let mut stream = client
             .watch_resources_rpc(
-                crate::control_plane::client::WatchRequest::try_new(
+                klights_leader_api::WatchRequest::try_new(
                     "v1",
                     "ConfigMap",
                     None,
@@ -1637,7 +1614,7 @@ mod cases {
             .expect_err("expired replay must surface as a stream error");
         assert!(matches!(
             err,
-            crate::control_plane::client::LeaderWatchError::ReplayExpired { .. }
+            klights_leader_api::LeaderWatchError::ReplayExpired { .. }
         ));
 
         stale_handle.abort();
@@ -1940,8 +1917,8 @@ mod cases {
         // as AlreadyApplied from the watermark — mutation applied exactly once,
         // never a second mutation.
         use crate::datastore::ResourcePreconditions;
-        use crate::kubelet::outbox::OutboxApplyResult;
-        use crate::kubelet::outbox::payload::OutboxPayload;
+        use crate::node_outbox::payload::OutboxPayload;
+        use klights_leader_api::OutboxDeliveryResult as OutboxApplyResult;
 
         let (client, _service, db, handle) = client_and_service().await;
 
@@ -2055,7 +2032,7 @@ mod cases {
         // stall where a worker's pod deletions never reach the leader. The
         // deadline must abort the wedged call, evict the lane, and surface
         // Retryable so the dispatcher re-sends on a fresh connection.
-        use crate::kubelet::outbox::OutboxApplyError;
+        use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -2231,13 +2208,11 @@ mod cases {
     fn controlplane_join_proto_preserves_joiner_owned_registration_snapshot() {
         let registration = crate::kubelet::node::NodeRegistrationSnapshot {
             node_name: "cp-remote".to_string(),
-            node_mode: crate::controllers::annotations::NodePeerMode::Rootless,
-            node_role: crate::bootstrap::NodeRole::Controlplane {
-                leader_endpoints: vec!["https://192.0.2.1:7679".to_string()],
-                token: None,
-                skip_ca: false,
+            node_mode: klights_network_api::NodePeerMode::Rootless,
+            node_role: crate::kubelet::node_config::KubeletNodeRole::Controlplane {
                 as_learner: true,
             },
+            publish_external_ip: true,
             addresses: crate::kubelet::node::NodeRegistrationAddresses::new(
                 "172.31.40.2".to_string(),
                 Some("192.0.2.40".to_string()),
@@ -2276,7 +2251,7 @@ mod cases {
         // tonic future. With every server path wedged far longer than the
         // per-call deadline, each unary RPC must still return within a
         // wall-clock bound — i.e. it routes through `unary_call`'s deadline.
-        use crate::control_plane::client::{ListRequest, ProjectedServiceAccountTokenRequest};
+        use klights_leader_api::ProjectedServiceAccountTokenRequest;
         use klights_types::ResourceKey;
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
@@ -2351,15 +2326,19 @@ mod cases {
         );
         assert_bounded!(
             "list_resources_rpc",
-            client.list_resources_rpc(ListRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
+            client.list_resources_rpc(
+                klights_leader_api::ResourceListRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+                )
+                .expect("valid list request"),
+            )
         );
         assert_bounded!(
             "projected_service_account_token_rpc",
@@ -2377,17 +2356,17 @@ mod cases {
                 .unwrap()
             )
         );
+        let profile = crate::kubelet::node_config::NodeRegistrationProfile::new(
+            klights_network_api::NodePeerMode::Root,
+            crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false },
+            true,
+            crate::version::git_version(),
+        );
         let controlplane_registration =
             crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
                 &crate::kubelet::file_blocking::test_file_process_executor(),
                 "cp2",
-                &crate::bootstrap::NodeMode::Root,
-                &crate::bootstrap::NodeRole::Controlplane {
-                    leader_endpoints: vec!["https://127.0.0.1:1".to_string()],
-                    token: None,
-                    skip_ca: false,
-                    as_learner: false,
-                },
+                &profile,
                 crate::kubelet::node::NodeRegistrationAddresses::new("127.0.0.1".to_string(), None),
                 None,
                 Some(7679),
@@ -2427,7 +2406,7 @@ mod cases {
         assert_bounded!(
             "allocate_node_subnet_rpc",
             client.allocate_node_subnet_rpc(
-                crate::control_plane::client::NodeSubnetAllocationRequest::try_new(
+                klights_leader_api::NodeSubnetAllocationRequest::try_new(
                     "worker-1",
                     "10.42.0.0/16",
                     "127.0.0.1",
@@ -2438,22 +2417,19 @@ mod cases {
         assert_bounded!(
             "get_node_subnet_rpc",
             client.get_node_subnet_rpc(
-                crate::control_plane::client::NodeSubnetQuery::try_new("worker-1")
-                    .expect("valid query"),
+                klights_leader_api::NodeSubnetQuery::try_new("worker-1").expect("valid query"),
             )
         );
         assert_bounded!(
             "list_peer_subnets_rpc",
             client.list_peer_subnets_rpc(
-                crate::control_plane::client::PeerSubnetsQuery::try_new("worker-1")
-                    .expect("valid query"),
+                klights_leader_api::PeerSubnetsQuery::try_new("worker-1").expect("valid query"),
             )
         );
         assert_bounded!(
             "get_node_dataplane_rpc",
             client.get_node_dataplane_rpc(
-                crate::control_plane::client::NodeDataplaneQuery::try_new("worker-1")
-                    .expect("valid query"),
+                klights_leader_api::NodeDataplaneQuery::try_new("worker-1").expect("valid query"),
             )
         );
         assert_bounded!(
@@ -2463,14 +2439,13 @@ mod cases {
         assert_bounded!(
             "list_pod_cleanup_intents_for_node_rpc",
             client.list_pod_cleanup_intents_for_node_rpc(
-                crate::control_plane::client::PodCleanupIntentListRequest::try_new("worker-1")
-                    .unwrap()
+                klights_leader_api::PodCleanupIntentListRequest::try_new("worker-1").unwrap()
             )
         );
         assert_bounded!(
             "delete_pod_cleanup_intent_rpc",
             client.delete_pod_cleanup_intent_rpc(
-                crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
+                klights_leader_api::PodCleanupIntentAckRequest::try_new(
                     "worker-1", "default", "p", "uid", "gone"
                 )
                 .unwrap()
@@ -2616,24 +2591,6 @@ mod cases {
             !client.lane_pool_present_for_test(ChannelLane::Raft).await,
             "install_snapshot must NOT touch the Raft (AppendEntries/Vote) lane"
         );
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn client_snapshot_decodes_entries() {
-        let (client, _service, db, handle) = client_and_service().await;
-        db.create_namespace(
-            "snap-client",
-            serde_json::json!({"metadata": {"name": "snap-client"}}),
-        )
-        .await
-        .unwrap();
-
-        let entries = client.snapshot(0).await.unwrap();
-        assert!(entries.iter().any(|entry| matches!(
-            entry.mutations.first(),
-            Some(crate::log_apply::LogApplyMutation::PutNamespace(row)) if row.name == "snap-client"
-        )));
         handle.abort();
     }
 
@@ -2786,7 +2743,9 @@ mod cases {
             crate::paths::pod_logs_root_path(&runtime_ns),
             supervisor.clone(),
             crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
-                crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),
+                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                    crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),
+                )),
             )),
         );
         let target =
@@ -3240,10 +3199,8 @@ mod cases {
             .unwrap();
 
         let watch_req = || {
-            crate::control_plane::client::WatchRequest::try_new(
-                "v1", "Pod", None, None, None, None, None,
-            )
-            .expect("valid Pod watch")
+            klights_leader_api::WatchRequest::try_new("v1", "Pod", None, None, None, None, None)
+                .expect("valid Pod watch")
         };
 
         // Warm the Read lane by opening a watch stream. The stream itself

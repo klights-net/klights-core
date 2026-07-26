@@ -2,6 +2,23 @@
 
 use std::sync::Arc;
 
+struct TestGcNonPodFinalizationPort;
+
+impl klights_reconcile_api::GcNonPodFinalizationPort for TestGcNonPodFinalizationPort {
+    fn finalize_non_pod(
+        &self,
+        _request: klights_reconcile_api::GcNonPodFinalizationRequest,
+    ) -> klights_reconcile_api::GcNonPodFinalizationFuture<'_> {
+        Box::pin(async { Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::Gone) })
+    }
+}
+
+pub fn non_pod_finalization_port_for_test()
+-> &'static dyn klights_reconcile_api::GcNonPodFinalizationPort {
+    static PORT: TestGcNonPodFinalizationPort = TestGcNonPodFinalizationPort;
+    &PORT
+}
+
 /// Store a resource in the DB and return it with resourceVersion injected,
 /// matching how the API server passes resources to reconcile.
 pub async fn store_and_prepare(
@@ -60,7 +77,7 @@ pub async fn deferred_outbox_pod_repository_for_test(
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
-    let outbox = Arc::new(crate::kubelet::outbox::Outbox::test_outbox().await);
+    let outbox = Arc::new(crate::node_outbox::Outbox::test_outbox().await);
     let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
     Arc::new(
         crate::kubelet::pod_repository::PodRepository::new_with_scheduling_mode_and_outbox(

@@ -16,7 +16,7 @@ pub fn pod_host_ports_from_resource(
     klights_network_api::PodHostPorts::try_new(
         klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
         pod_ip,
-        crate::networking::hostport_resource::bindings_from_pod(pod),
+        klights_network_api::host_port_bindings_from_specs(klights_types::pod_host_port_specs(pod)),
     )
 }
 
@@ -185,7 +185,9 @@ pub async fn reject_hostport_conflicts(
             continue;
         }
 
-        let existing_ports = crate::networking::hostport_resource::bindings_from_pod(existing_pod);
+        let existing_ports = klights_network_api::host_port_bindings_from_specs(
+            klights_types::pod_host_port_specs(existing_pod),
+        );
         for requested_port in requested {
             if existing_ports
                 .iter()

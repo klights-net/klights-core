@@ -12,8 +12,8 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 
 use klights_cluster_core::{
-    ClusterMembership, ClusterMetadata, LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation,
-    OutboxStreamWatermark, PositionedWatchEvent, Resource, ResourceVersionAssignment,
+    ClusterMembership, ClusterMetadata, LogApplyAppliedOutboxRow, LogApplyMutation,
+    OutboxStreamWatermark, PositionedWatchEvent, Resource, SnapshotRestoreOperation,
     WatchReplayPosition,
 };
 
@@ -649,17 +649,13 @@ impl std::error::Error for AllocatorStateError {}
 /// Exact persisted public-RV and event-ID allocator state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableAllocatorState {
-    resource_version_assignment: ResourceVersionAssignment,
     position: WatchReplayPosition,
     next_resource_version: i64,
     next_event_id: i64,
 }
 
 impl DurableAllocatorState {
-    pub fn try_new(
-        resource_version_assignment: ResourceVersionAssignment,
-        position: WatchReplayPosition,
-    ) -> Result<Self, AllocatorStateError> {
+    pub fn try_new(position: WatchReplayPosition) -> Result<Self, AllocatorStateError> {
         if position.resource_version < 0
             || position.event_id < 0
             || position.resource_version_filter_through_event_id != 0
@@ -685,15 +681,10 @@ impl DurableAllocatorState {
                     current: position.event_id,
                 })?;
         Ok(Self {
-            resource_version_assignment,
             position,
             next_resource_version,
             next_event_id,
         })
-    }
-
-    pub const fn resource_version_assignment(&self) -> ResourceVersionAssignment {
-        self.resource_version_assignment
     }
 
     pub const fn position(&self) -> WatchReplayPosition {
@@ -713,7 +704,7 @@ impl DurableAllocatorState {
 pub type AllocatorStateFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, AllocatorStateError>> + Send + 'a>>;
 
-/// Read-only access to public-RV assignment mode and exact allocator position.
+/// Read-only access to the exact public-RV and event-ID allocator position.
 pub trait DurableAllocatorRead: Send + Sync {
     fn read_allocator_state(&self) -> AllocatorStateFuture<'_, DurableAllocatorState>;
 }
@@ -769,8 +760,7 @@ impl std::error::Error for SnapshotPersistenceError {}
 /// backend table representations deliberately do not appear here.
 #[derive(Clone, Debug)]
 pub struct AuthoritativeSnapshot {
-    commits: Vec<LogApplyCommit>,
-    resource_version_assignment: Option<ResourceVersionAssignment>,
+    operations: Vec<SnapshotRestoreOperation>,
     position: Option<WatchReplayPosition>,
     replay_floors: Option<Vec<DurableReplayFloor>>,
     metadata: ClusterMetadata,
@@ -790,8 +780,7 @@ pub enum SnapshotMembership {
 /// Owned decomposition used by an adapter to persist one validated snapshot.
 #[derive(Clone, Debug)]
 pub struct AuthoritativeSnapshotParts {
-    commits: Vec<LogApplyCommit>,
-    resource_version_assignment: Option<ResourceVersionAssignment>,
+    operations: Vec<SnapshotRestoreOperation>,
     position: Option<WatchReplayPosition>,
     replay_floors: Option<Vec<DurableReplayFloor>>,
     metadata: ClusterMetadata,
@@ -799,11 +788,8 @@ pub struct AuthoritativeSnapshotParts {
 }
 
 impl AuthoritativeSnapshotParts {
-    pub fn take_commits(&mut self) -> Vec<LogApplyCommit> {
-        std::mem::take(&mut self.commits)
-    }
-    pub const fn resource_version_assignment(&self) -> Option<ResourceVersionAssignment> {
-        self.resource_version_assignment
+    pub fn take_operations(&mut self) -> Vec<SnapshotRestoreOperation> {
+        std::mem::take(&mut self.operations)
     }
     pub const fn position(&self) -> Option<WatchReplayPosition> {
         self.position
@@ -824,23 +810,21 @@ impl AuthoritativeSnapshotParts {
 
 impl AuthoritativeSnapshot {
     pub fn try_new(
-        commits: Vec<LogApplyCommit>,
-        resource_version_assignment: Option<ResourceVersionAssignment>,
+        operations: Vec<SnapshotRestoreOperation>,
         position: Option<WatchReplayPosition>,
         replay_floors: Option<Vec<DurableReplayFloor>>,
         metadata: ClusterMetadata,
         membership: SnapshotMembership,
     ) -> Result<Self, SnapshotPersistenceError> {
         validate_snapshot(
-            &commits,
+            &operations,
             position,
             replay_floors.as_deref(),
             &metadata,
             &membership,
         )?;
         Ok(Self {
-            commits,
-            resource_version_assignment,
+            operations,
             position,
             replay_floors,
             metadata,
@@ -848,12 +832,8 @@ impl AuthoritativeSnapshot {
         })
     }
 
-    pub fn commits(&self) -> &[LogApplyCommit] {
-        &self.commits
-    }
-
-    pub const fn resource_version_assignment(&self) -> Option<ResourceVersionAssignment> {
-        self.resource_version_assignment
+    pub fn operations(&self) -> &[SnapshotRestoreOperation] {
+        &self.operations
     }
 
     pub const fn position(&self) -> Option<WatchReplayPosition> {
@@ -874,8 +854,7 @@ impl AuthoritativeSnapshot {
 
     pub fn into_parts(self) -> AuthoritativeSnapshotParts {
         AuthoritativeSnapshotParts {
-            commits: self.commits,
-            resource_version_assignment: self.resource_version_assignment,
+            operations: self.operations,
             position: self.position,
             replay_floors: self.replay_floors,
             metadata: self.metadata,
@@ -885,7 +864,7 @@ impl AuthoritativeSnapshot {
 }
 
 fn validate_snapshot(
-    commits: &[LogApplyCommit],
+    operations: &[SnapshotRestoreOperation],
     position: Option<WatchReplayPosition>,
     replay_floors: Option<&[DurableReplayFloor]>,
     metadata: &ClusterMetadata,
@@ -909,14 +888,15 @@ fn validate_snapshot(
         }
     }
     let mut event_ids = HashSet::new();
-    for commit in commits {
-        if commit.resource_version <= 0 || commit.resource_version > metadata.current_rv {
+    for operation in operations {
+        if operation.resource_version() <= 0 || operation.resource_version() > metadata.current_rv {
             return Err(SnapshotPersistenceError::invalid(format!(
                 "snapshot commit resourceVersion {} is outside 1..={}",
-                commit.resource_version, metadata.current_rv
+                operation.resource_version(),
+                metadata.current_rv
             )));
         }
-        for mutation in &commit.mutations {
+        for mutation in operation.mutations() {
             if let LogApplyMutation::PutWatchEvent(row) = mutation {
                 let event_id = match (row.event_id, position) {
                     (None, Some(_)) => {
@@ -1091,7 +1071,6 @@ impl SnapshotReplayFloorCursor {
 /// has been released.
 #[derive(Clone, Debug)]
 pub struct SnapshotCaptureHeader {
-    resource_version_assignment: Option<ResourceVersionAssignment>,
     command_codec_activation_version: Option<u32>,
     position: WatchReplayPosition,
     metadata: ClusterMetadata,
@@ -1100,7 +1079,6 @@ pub struct SnapshotCaptureHeader {
 
 impl SnapshotCaptureHeader {
     pub fn try_new(
-        resource_version_assignment: Option<ResourceVersionAssignment>,
         command_codec_activation_version: Option<u32>,
         position: WatchReplayPosition,
         metadata: ClusterMetadata,
@@ -1119,15 +1097,11 @@ impl SnapshotCaptureHeader {
             ));
         }
         Ok(Self {
-            resource_version_assignment,
             command_codec_activation_version,
             position,
             metadata,
             membership,
         })
-    }
-    pub const fn resource_version_assignment(&self) -> Option<ResourceVersionAssignment> {
-        self.resource_version_assignment
     }
     pub const fn command_codec_activation_version(&self) -> Option<u32> {
         self.command_codec_activation_version
@@ -1153,7 +1127,7 @@ pub enum SnapshotCapturePageKind {
 
 #[derive(Clone, Debug)]
 enum SnapshotCapturePageContents {
-    Commits(Vec<LogApplyCommit>),
+    Operations(Vec<SnapshotRestoreOperation>),
     AppliedOutbox(Vec<LogApplyAppliedOutboxRow>),
     OutboxWatermarks(Vec<OutboxStreamWatermark>),
     ReplayFloors(Vec<DurableReplayFloor>),
@@ -1165,10 +1139,12 @@ pub struct SnapshotCapturePage {
 }
 
 impl SnapshotCapturePage {
-    pub fn try_commits(rows: Vec<LogApplyCommit>) -> Result<Self, SnapshotPersistenceError> {
+    pub fn try_operations(
+        rows: Vec<SnapshotRestoreOperation>,
+    ) -> Result<Self, SnapshotPersistenceError> {
         validate_capture_len(rows.len())?;
         Ok(Self {
-            contents: SnapshotCapturePageContents::Commits(rows),
+            contents: SnapshotCapturePageContents::Operations(rows),
         })
     }
     pub fn try_applied_outbox(
@@ -1197,7 +1173,7 @@ impl SnapshotCapturePage {
     }
     pub const fn kind(&self) -> SnapshotCapturePageKind {
         match self.contents {
-            SnapshotCapturePageContents::Commits(_) => SnapshotCapturePageKind::Commits,
+            SnapshotCapturePageContents::Operations(_) => SnapshotCapturePageKind::Commits,
             SnapshotCapturePageContents::AppliedOutbox(_) => SnapshotCapturePageKind::AppliedOutbox,
             SnapshotCapturePageContents::OutboxWatermarks(_) => {
                 SnapshotCapturePageKind::OutboxWatermarks
@@ -1205,9 +1181,9 @@ impl SnapshotCapturePage {
             SnapshotCapturePageContents::ReplayFloors(_) => SnapshotCapturePageKind::ReplayFloors,
         }
     }
-    pub fn commits(&self) -> Option<&[LogApplyCommit]> {
+    pub fn operations(&self) -> Option<&[SnapshotRestoreOperation]> {
         match &self.contents {
-            SnapshotCapturePageContents::Commits(rows) => Some(rows),
+            SnapshotCapturePageContents::Operations(rows) => Some(rows),
             _ => None,
         }
     }
@@ -1229,9 +1205,9 @@ impl SnapshotCapturePage {
             _ => None,
         }
     }
-    pub fn into_commits(self) -> Option<Vec<LogApplyCommit>> {
+    pub fn into_operations(self) -> Option<Vec<SnapshotRestoreOperation>> {
         match self.contents {
-            SnapshotCapturePageContents::Commits(rows) => Some(rows),
+            SnapshotCapturePageContents::Operations(rows) => Some(rows),
             _ => None,
         }
     }
@@ -1255,7 +1231,7 @@ impl SnapshotCapturePage {
     }
     pub fn len(&self) -> usize {
         match &self.contents {
-            SnapshotCapturePageContents::Commits(rows) => rows.len(),
+            SnapshotCapturePageContents::Operations(rows) => rows.len(),
             SnapshotCapturePageContents::AppliedOutbox(rows) => rows.len(),
             SnapshotCapturePageContents::OutboxWatermarks(rows) => rows.len(),
             SnapshotCapturePageContents::ReplayFloors(rows) => rows.len(),

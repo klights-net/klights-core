@@ -1,5 +1,4 @@
 use super::*;
-
 use crate::api::mutation::write::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
@@ -14,7 +13,7 @@ use axum::Extension;
 // backends during aggregation proxying (see lookup_crd_or_proxy).
 
 pub enum CrdLookup {
-    Found(crate::controllers::crd::CrdResourceInfo),
+    Found(klights_leader_api::CrdResourceInfo),
     Proxied(Response),
 }
 
@@ -49,7 +48,7 @@ impl<'a> CrdLookupRequest<'a> {
 
 #[derive(Clone, Copy)]
 struct CustomResourceType<'a> {
-    info: &'a crate::controllers::crd::CrdResourceInfo,
+    info: &'a klights_leader_api::CrdResourceInfo,
     group: &'a str,
     version: &'a str,
     plural: &'a str,
@@ -57,7 +56,7 @@ struct CustomResourceType<'a> {
 
 impl<'a> CustomResourceType<'a> {
     fn new(
-        info: &'a crate::controllers::crd::CrdResourceInfo,
+        info: &'a klights_leader_api::CrdResourceInfo,
         group: &'a str,
         version: &'a str,
         plural: &'a str,
@@ -154,6 +153,7 @@ pub async fn lookup_crd_or_proxy(
     body_for_proxy: impl FnOnce() -> Result<Bytes, AppError>,
 ) -> Result<CrdLookup, AppError> {
     if let Some(info) = state
+        .discovery()
         .crd_registry
         .get(request.group, request.version, request.plural)
         .await
@@ -196,34 +196,38 @@ pub async fn get_existing_custom_resource_for_write(
     name: &str,
 ) -> Result<(Resource, String), AppError> {
     let requested_api_version = format!("{group}/{version}");
-    if let Some(resource) = state
-        .db
-        .get_resource(
-            &requested_api_version,
-            kind,
-            namespace.clone().as_deref(),
-            name,
-        )
-        .await?
+    if let Some(resource) = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        &requested_api_version,
+        kind,
+        namespace.as_deref(),
+        name,
+    )
+    .await?
     {
         return Ok((resource, requested_api_version));
     }
 
-    if let Some(conversion) = load_crd_conversion_config(state.db.as_ref(), group, plural).await? {
+    if let Some(conversion) = load_crd_conversion_config(
+        state.resource_mutation().resource_query.as_ref(),
+        group,
+        plural,
+    )
+    .await?
+    {
         for served_version in &conversion.served_versions {
             if served_version == version {
                 continue;
             }
             let candidate_api_version = format!("{group}/{served_version}");
-            if let Some(resource) = state
-                .db
-                .get_resource(
-                    &candidate_api_version,
-                    kind,
-                    namespace.clone().as_deref(),
-                    name,
-                )
-                .await?
+            if let Some(resource) = crate::api::resource_query_ports::get_resource(
+                state.resource_mutation().resource_query.as_ref(),
+                &candidate_api_version,
+                kind,
+                namespace.as_deref(),
+                name,
+            )
+            .await?
             {
                 return Ok((resource, candidate_api_version));
             }
@@ -266,8 +270,8 @@ fn crd_watch_versions(
 }
 
 fn merge_custom_resource_watch_baseline(
-    resources: Vec<crate::datastore::Resource>,
-) -> Vec<crate::datastore::Resource> {
+    resources: Vec<klights_cluster_core::Resource>,
+) -> Vec<klights_cluster_core::Resource> {
     if resources.first().is_none_or(|first| {
         resources
             .iter()
@@ -277,7 +281,7 @@ fn merge_custom_resource_watch_baseline(
     }
     let mut merged: std::collections::HashMap<
         (Option<String>, String),
-        crate::datastore::Resource,
+        klights_cluster_core::Resource,
     > = std::collections::HashMap::with_capacity(resources.len());
     for resource in resources {
         let key = (resource.namespace.clone(), resource.name.clone());
@@ -306,120 +310,6 @@ fn crd_watch_topics(
         .collect()
 }
 
-struct CrdProjectedWatchBaseline {
-    db: crate::datastore::DatastoreHandle,
-}
-
-impl klights_watch::ProjectedWatchBaselineRead for CrdProjectedWatchBaseline {
-    fn read_baseline(
-        &self,
-        request: klights_watch::ProjectedWatchBaselineRequest,
-    ) -> futures::future::BoxFuture<
-        '_,
-        Result<klights_cluster_store::ResourceListRead, klights_leader_api::LeaderWatchError>,
-    > {
-        Box::pin(async move {
-            let targets = request
-                .targets()
-                .iter()
-                .map(durable_crd_target_to_datastore_target)
-                .collect::<Vec<_>>();
-            match self
-                .db
-                .snapshot_resources_at_position(
-                    &targets,
-                    request.label_selector(),
-                    None,
-                    request.position(),
-                )
-                .await
-                .map_err(|error| {
-                    klights_leader_api::LeaderWatchError::unavailable(format!("{error:?}"))
-                })? {
-                crate::datastore::SnapshotAtRv::List(list) => {
-                    let snapshot = klights_cluster_store::ResourceListSnapshot::try_new(
-                        list.watch_replay_position.ok_or_else(|| {
-                            klights_leader_api::LeaderWatchError::malformed_event(
-                                "CRD positioned baseline omitted its replay position",
-                            )
-                        })?,
-                    )
-                    .map_err(|error| {
-                        klights_leader_api::LeaderWatchError::malformed_event(error.to_string())
-                    })?;
-                    let page = klights_cluster_store::ResourceListPage::try_new(
-                        list.items,
-                        snapshot,
-                        None,
-                        list.remaining_item_count,
-                    )
-                    .map_err(|error| {
-                        klights_leader_api::LeaderWatchError::malformed_event(error.to_string())
-                    })?;
-                    Ok(klights_cluster_store::ResourceListRead::Historical(page))
-                }
-                crate::datastore::SnapshotAtRv::Expired => {
-                    Ok(klights_cluster_store::ResourceListRead::Expired {
-                        requested: request.position().resource_version,
-                        oldest_available: request.position().resource_version.saturating_add(1),
-                    })
-                }
-                crate::datastore::SnapshotAtRv::Current => {
-                    Err(klights_leader_api::LeaderWatchError::malformed_event(
-                        "CRD positioned baseline returned an unpinned Current sentinel",
-                    ))
-                }
-            }
-        })
-    }
-}
-
-fn durable_crd_target_to_datastore_target(
-    target: &klights_cluster_store::DurableWatchTarget,
-) -> crate::datastore::WatchTarget {
-    match target.scope() {
-        klights_cluster_store::DurableWatchScope::Cluster => {
-            crate::datastore::WatchTarget::cluster(target.api_version(), target.kind())
-        }
-        klights_cluster_store::DurableWatchScope::Namespaced(None) => {
-            crate::datastore::WatchTarget::namespaced(target.api_version(), target.kind())
-        }
-        klights_cluster_store::DurableWatchScope::Namespaced(Some(namespace)) => {
-            crate::datastore::WatchTarget::namespaced_in_namespace(
-                target.api_version(),
-                target.kind(),
-                namespace,
-            )
-        }
-    }
-}
-
-fn datastore_crd_target_to_durable_target(
-    target: &crate::datastore::WatchTarget,
-) -> klights_cluster_store::DurableWatchTarget {
-    match &target.scope {
-        crate::datastore::WatchTargetScope::Cluster => {
-            klights_cluster_store::DurableWatchTarget::cluster(
-                target.api_version.clone(),
-                target.kind.clone(),
-            )
-        }
-        crate::datastore::WatchTargetScope::Namespaced(None) => {
-            klights_cluster_store::DurableWatchTarget::namespaced(
-                target.api_version.clone(),
-                target.kind.clone(),
-            )
-        }
-        crate::datastore::WatchTargetScope::Namespaced(Some(namespace)) => {
-            klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
-                target.api_version.clone(),
-                target.kind.clone(),
-                namespace.clone(),
-            )
-        }
-    }
-}
-
 #[inline]
 fn canonical_crd_positioned_watch_enabled() -> bool {
     true
@@ -440,7 +330,7 @@ fn crd_watch_frame_response(
 }
 
 struct CrdWatchProjection {
-    db: crate::datastore::DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     conversion: Option<crate::api::crd_conversion::CrdConversionConfig>,
     group: String,
     plural: String,
@@ -458,9 +348,9 @@ impl klights_watch::WatchResourceProjection for CrdWatchProjection {
         Box::pin(async move {
             let mut projected = Vec::new();
             for resource in merge_custom_resource_watch_baseline(resources) {
-                let event = CatchUpResource::added(resource).into_watch_event();
+                let event = crate::api::custom_resource_ports::added_watch_event(resource);
                 let event = convert_custom_resource_watch_event_to_requested_version(
-                    self.db.as_ref(),
+                    self.resource_query.as_ref(),
                     self.conversion.as_ref(),
                     &self.group,
                     &self.plural,
@@ -523,7 +413,7 @@ mod crd_watch_topic_tests {
 
     #[test]
     fn conversion_watch_baseline_merges_same_object_across_served_versions() {
-        let resource = |api_version: &str, resource_version: i64| crate::datastore::Resource {
+        let resource = |api_version: &str, resource_version: i64| klights_cluster_core::Resource {
             id: 0,
             api_version: api_version.to_string(),
             kind: "Widget".to_string(),
@@ -553,7 +443,7 @@ mod crd_watch_topic_tests {
 }
 
 async fn normalize_custom_resource_response_data(
-    db: &dyn crate::datastore::DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: Option<&crate::api::crd_conversion::CrdConversionConfig>,
     group: &str,
     plural: &str,
@@ -567,7 +457,7 @@ async fn normalize_custom_resource_response_data(
         .expect("conversion.checked in branch above is equivalent; kept for type narrowing");
     let mut objects = vec![std::mem::take(&mut data)];
     let normalized = convert_crd_objects_to_requested_version(
-        db,
+        query,
         conversion,
         group,
         plural,
@@ -581,7 +471,7 @@ async fn normalize_custom_resource_response_data(
 }
 
 async fn normalize_custom_resource_storage_data(
-    db: &dyn crate::datastore::DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: Option<&crate::api::crd_conversion::CrdConversionConfig>,
     group: &str,
     plural: &str,
@@ -592,7 +482,7 @@ async fn normalize_custom_resource_storage_data(
         return Ok(data);
     };
     convert_crd_objects_to_requested_version(
-        db,
+        query,
         conversion,
         group,
         plural,
@@ -621,14 +511,14 @@ async fn reconcile_custom_resource_owner_refs(
         return;
     }
 
-    if let Err(e) = controllers::gc::reconcile_owner_references(
-        state.db.as_ref(),
+    if let Err(e) = crate::api::gc_ports::reconcile_owner_references(
+        state.resource_mutation().gc_owner_lifecycle.as_ref(),
         resource.clone(),
-        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {
         state
+            .controller_reconcile()
             .metrics
             .cascade_delete_failures_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -646,7 +536,7 @@ async fn reconcile_custom_resource_owner_refs(
 
 async fn get_cr_inner(
     state: &Arc<AppState>,
-    info: &crate::controllers::crd::CrdResourceInfo,
+    info: &klights_leader_api::CrdResourceInfo,
     group: &str,
     version: &str,
     plural: &str,
@@ -658,11 +548,20 @@ async fn get_cr_inner(
     }
 
     let api_version = format!("{}/{}", group, version);
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
-    let mut resource_opt = state
-        .db
-        .get_resource(&api_version, &info.kind, ns, name)
-        .await?;
+    let conversion = load_crd_conversion_config(
+        state.resource_mutation().resource_query.as_ref(),
+        group,
+        plural,
+    )
+    .await?;
+    let mut resource_opt = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        &api_version,
+        &info.kind,
+        ns,
+        name,
+    )
+    .await?;
     if resource_opt.is_none()
         && let Some(conversion) = conversion.as_ref()
     {
@@ -670,15 +569,14 @@ async fn get_cr_inner(
             if served_version == version {
                 continue;
             }
-            let candidate = state
-                .db
-                .get_resource(
-                    &format!("{}/{}", group, served_version),
-                    &info.kind,
-                    ns,
-                    name,
-                )
-                .await?;
+            let candidate = crate::api::resource_query_ports::get_resource(
+                state.resource_mutation().resource_query.as_ref(),
+                &format!("{}/{}", group, served_version),
+                &info.kind,
+                ns,
+                name,
+            )
+            .await?;
             if candidate.is_some() {
                 resource_opt = candidate;
                 break;
@@ -690,7 +588,7 @@ async fn get_cr_inner(
 
     let mut data = std::sync::Arc::unwrap_or_clone(resource.data);
     data = normalize_custom_resource_response_data(
-        state.db.as_ref(),
+        state.resource_mutation().resource_query.as_ref(),
         conversion.as_ref(),
         group,
         plural,
@@ -698,7 +596,14 @@ async fn get_cr_inner(
         data,
     )
     .await?;
-    apply_crd_defaults(state.db.as_ref(), group, version, &info.kind, &mut data).await;
+    apply_crd_defaults(
+        state.resource_mutation().resource_query.as_ref(),
+        group,
+        version,
+        &info.kind,
+        &mut data,
+    )
+    .await;
     Ok(Json(data).into_response())
 }
 
@@ -808,7 +713,7 @@ fn synthetic_cr_resource(
     kind: &str,
     data: Value,
     resource_version: i64,
-) -> crate::datastore::Resource {
+) -> klights_cluster_core::Resource {
     let name = data
         .pointer("/metadata/name")
         .and_then(|v| v.as_str())
@@ -819,13 +724,13 @@ fn synthetic_cr_resource(
         .and_then(|v| v.as_str())
         .map(str::to_string);
     let data = std::sync::Arc::new(data);
-    crate::datastore::Resource {
+    klights_cluster_core::Resource {
         id: 0,
         api_version: api_version.to_string(),
         kind: kind.to_string(),
         namespace,
         name,
-        uid: crate::datastore::Resource::uid_from_data(&data),
+        uid: klights_cluster_core::Resource::uid_from_data(&data),
         resource_version,
         data,
     }
@@ -860,7 +765,12 @@ async fn list_cr_inner(
         info.namespaced,
         &info.selectable_fields,
     )?;
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
+    let conversion = load_crd_conversion_config(
+        state.resource_mutation().resource_query.as_ref(),
+        group,
+        plural,
+    )
+    .await?;
 
     if query.watch == Some("true".to_string()) {
         query.validate_send_initial_events_watch()?;
@@ -885,7 +795,10 @@ async fn list_cr_inner(
                 .is_some_and(|s| !s.trim().is_empty());
 
         let watch_topics = crd_watch_topics(group, &kind, conversion.as_ref(), version);
-        let db = state.db.clone();
+        #[cfg(test)]
+        let db = state.resource_mutation().db.clone();
+        #[cfg(test)]
+        let resource_query = state.resource_mutation().resource_query.clone();
         #[cfg(test)]
         let watch_anchor = crate::api::watch_stream::watch_replay_anchor_from_backend(&db);
         #[cfg(test)]
@@ -906,7 +819,7 @@ async fn list_cr_inner(
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let stream_format =
             crate::api::watch_stream::negotiate_watch_stream_format(headers, false)?;
-        let task_supervisor = state.task_supervisor.clone();
+        let task_supervisor = state.operational().task_supervisor.clone();
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
         let timeout_seconds = query.timeout_seconds;
@@ -939,11 +852,14 @@ async fn list_cr_inner(
         let has_scope_filter = watch_ns.is_some() || has_selector;
         let watch_versions =
             crd_watch_versions(conversion_for_watch.as_ref(), &requested_version_for_watch);
-        let replay_targets = if is_cluster_scope {
+        let custom_watch_targets = if is_cluster_scope {
             watch_versions
                 .iter()
                 .map(|version| {
-                    WatchTarget::cluster(format!("{group_for_watch}/{version}"), kind.clone())
+                    crate::api::custom_resource_ports::CustomResourceWatchTarget::cluster(
+                        format!("{group_for_watch}/{version}"),
+                        kind.clone(),
+                    )
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -952,36 +868,58 @@ async fn list_cr_inner(
                 .map(|version| {
                     let api_version = format!("{group_for_watch}/{version}");
                     if let Some(ns) = watch_ns.as_ref() {
-                        WatchTarget::namespaced_in_namespace(api_version, kind.clone(), ns.clone())
+                        crate::api::custom_resource_ports::CustomResourceWatchTarget::namespaced_in_namespace(
+                            api_version,
+                            kind.clone(),
+                            ns.clone(),
+                        )
                     } else {
-                        WatchTarget::namespaced(api_version, kind.clone())
+                        crate::api::custom_resource_ports::CustomResourceWatchTarget::namespaced(
+                            api_version,
+                            kind.clone(),
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
         };
+        #[cfg(test)]
+        let replay_targets = custom_watch_targets
+            .iter()
+            .map(|target| match target {
+                crate::api::custom_resource_ports::CustomResourceWatchTarget::Cluster {
+                    api_version,
+                    kind,
+                } => WatchTarget::cluster(api_version, kind),
+                crate::api::custom_resource_ports::CustomResourceWatchTarget::Namespaced {
+                    api_version,
+                    kind,
+                    namespace: None,
+                } => WatchTarget::namespaced(api_version, kind),
+                crate::api::custom_resource_ports::CustomResourceWatchTarget::Namespaced {
+                    api_version,
+                    kind,
+                    namespace: Some(namespace),
+                } => WatchTarget::namespaced_in_namespace(api_version, kind, namespace),
+            })
+            .collect::<Vec<_>>();
 
         if canonical_crd_positioned_watch_enabled() {
-            let durable_targets = replay_targets
-                .iter()
-                .map(datastore_crd_target_to_durable_target)
-                .collect::<Vec<_>>();
-            let positioned_watch =
-                crate::control_plane::client::local::datastore_positioned_watch_service(db.clone());
+            let positioned_watch = state
+                .resource_mutation()
+                .custom_resource_reads
+                .positioned_watch_service();
             let projection = Arc::new(CrdWatchProjection {
-                db: db.clone(),
+                resource_query: state.resource_mutation().resource_query.clone(),
                 conversion: conversion_for_watch.clone(),
                 group: group_for_watch.clone(),
                 plural: plural_for_watch.clone(),
                 requested_api_version: av.clone(),
             });
-            let baseline = Arc::new(CrdProjectedWatchBaseline { db: db.clone() });
-            crate::api::watch_stream::wait_until_datastore_fresh(
-                &db,
-                requested_rv,
-                klights_watch::WatchTopic::new(&av, &kind),
-                &task_supervisor,
-            )
-            .await;
+            state
+                .resource_mutation()
+                .custom_resource_reads
+                .wait_until_fresh(requested_rv, klights_watch::WatchTopic::new(&av, &kind))
+                .await;
             let emit_baseline = send_initial_events
                 || requested_rv <= 0
                     && (has_selector || emit_initial_state_for_resource_version_zero);
@@ -989,13 +927,18 @@ async fn list_cr_inner(
             let mut last_rv = requested_rv;
             let mut initial_frames = Vec::new();
             if emit_baseline {
-                let list = match db
-                    .list_resources_for_watch_targets(&replay_targets, label_selector.as_deref())
+                let list = match state
+                    .resource_mutation()
+                    .custom_resource_reads
+                    .list_resources_for_watch_targets(
+                        custom_watch_targets.clone(),
+                        label_selector.clone(),
+                    )
                     .await
                 {
                     Ok(list) => list,
                     Err(error) => {
-                        tracing::warn!(%error, "canonical CRD watch baseline LIST failed");
+                        tracing::warn!(?error, "canonical CRD watch baseline LIST failed");
                         return Ok(crd_watch_frame_response(
                             stream_format,
                             crate::api::watch_stream::serialize_watch_status_line(
@@ -1006,7 +949,7 @@ async fn list_cr_inner(
                         ));
                     }
                 };
-                let Some(position) = list.watch_replay_position else {
+                let Some(position) = list.watch_replay_position() else {
                     return Ok(crd_watch_frame_response(
                         stream_format,
                         crate::api::watch_stream::serialize_watch_status_line(
@@ -1017,10 +960,10 @@ async fn list_cr_inner(
                     ));
                 };
                 start_position = Some(position);
-                last_rv = last_rv.max(list.resource_version);
+                last_rv = last_rv.max(list.resource_version());
                 let projected = match klights_watch::WatchResourceProjection::project_resources(
                     projection.as_ref(),
-                    list.items,
+                    list.into_items(),
                 )
                 .await
                 {
@@ -1050,7 +993,7 @@ async fn list_cr_inner(
                             .as_ref()
                             .is_none_or(|selector| selector.matches_resource(&resource.data))
                 }) {
-                    let event = CatchUpResource::added(resource).into_watch_event();
+                    let event = crate::api::custom_resource_ports::added_watch_event(resource);
                     initial_frames.push(crate::api::watch_stream::serialize_watch_event_line(
                         event, &kind, false,
                     ));
@@ -1092,18 +1035,20 @@ async fn list_cr_inner(
                     ));
                 }
             };
-            let plan = match klights_watch::ProjectedWatchPlan::try_new(
-                request,
-                durable_targets,
-                watch_topics,
-                if is_cluster_scope {
-                    klights_watch::WatchResourceScope::Cluster
-                } else {
-                    klights_watch::WatchResourceScope::Namespaced
-                },
-                baseline,
-                projection,
-            ) {
+            let plan = match state
+                .resource_mutation()
+                .custom_resource_reads
+                .projected_watch_plan(
+                    request,
+                    custom_watch_targets,
+                    watch_topics,
+                    if is_cluster_scope {
+                        klights_watch::WatchResourceScope::Cluster
+                    } else {
+                        klights_watch::WatchResourceScope::Namespaced
+                    },
+                    projection,
+                ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     return Ok(crd_watch_frame_response(
@@ -1144,6 +1089,7 @@ async fn list_cr_inner(
                     ));
                 }
             };
+            let bookmark_reads = state.resource_mutation().custom_resource_reads.clone();
             let stream = async_stream::stream! {
                 for frame in initial_frames {
                     yield Ok::<_, std::convert::Infallible>(frame);
@@ -1179,27 +1125,28 @@ async fn list_cr_inner(
                             last_rv = last_rv.max(event.resource().resource_version);
                             yield Ok::<_, std::convert::Infallible>(
                                 crate::api::watch_stream::serialize_watch_event_line(
-                                    crate::control_plane::client::legacy_watch_event(&event),
+                                    crate::api::custom_resource_ports::resource_event_to_watch_event(&event),
                                     &kind,
                                     false,
                                 ),
                             );
                         }
                         Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                            let rv = crate::api::watch_stream::resolve_periodic_bookmark_rv(
-                                crate::api::watch_stream::PeriodicBookmarkContext {
-                                    db: &db,
-                                    api_version: &av,
-                                    kind: &kind,
-                                    watch_namespace: watch_ns.as_deref(),
-                                    label_selector: label_selector.as_deref(),
-                                    field_selector: field_selector.as_deref(),
-                                    requested_rv,
-                                    has_scope_filter,
-                                    cursor_high_water_rv: last_rv,
-                                    last_delivered_scoped_rv: last_rv,
-                                },
-                            ).await;
+                            let mut rv = crate::api::watch_stream::bookmark_rv_for_watch_scope(
+                                has_scope_filter,
+                                last_rv,
+                                last_rv,
+                            );
+                            if rv <= 0 && !has_scope_filter {
+                                rv = bookmark_reads
+                                    .current_collection_resource_version(
+                                        av.clone(),
+                                        kind.clone(),
+                                        watch_ns.clone(),
+                                    )
+                                    .await
+                                    .unwrap_or(0);
+                            }
                             yield Ok::<_, std::convert::Infallible>(
                                 crate::api::watch_stream::serialize_watch_event_line(
                                     WatchEvent::bookmark_typed(rv, &av, &kind),
@@ -1269,7 +1216,7 @@ async fn list_cr_inner(
                     for resource in merge_custom_resource_watch_baseline(list.items) {
                         let event = CatchUpResource::added(resource).into_watch_event();
                         let event = match convert_custom_resource_watch_event_to_requested_version(
-                            db.as_ref(),
+                            resource_query.as_ref(),
                             conversion_for_watch.as_ref(),
                             &group_for_watch,
                             &plural_for_watch,
@@ -1346,7 +1293,7 @@ async fn list_cr_inner(
                     for resource in merge_custom_resource_watch_baseline(baseline.items) {
                             let event = CatchUpResource::added(resource).into_watch_event();
                             let event = match convert_custom_resource_watch_event_to_requested_version(
-                                db.as_ref(),
+                                resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),
                                 &group_for_watch,
                                 &plural_for_watch,
@@ -1445,7 +1392,7 @@ async fn list_cr_inner(
                     for resource in merge_custom_resource_watch_baseline(membership.items) {
                             let event = CatchUpResource::added(resource).into_watch_event();
                             let event = match convert_custom_resource_watch_event_to_requested_version(
-                                db.as_ref(),
+                                resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),
                                 &group_for_watch,
                                 &plural_for_watch,
@@ -1565,7 +1512,7 @@ async fn list_cr_inner(
                                 continue;
                             }
                             let event = match convert_custom_resource_watch_event_to_requested_version(
-                                db.as_ref(),
+                                resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),
                                 &group_for_watch,
                                 &plural_for_watch,
@@ -1664,12 +1611,9 @@ async fn list_cr_inner(
         .as_ref()
         .is_some_and(|c| c.served_versions.len() > 1 || c.strategy.as_deref() == Some("Webhook"));
 
-    let list_query = crate::datastore::ResourceListQuery::new(
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
-        normalized_limit,
-        db_continue_name.as_deref(),
-    );
+    let list_label_selector = query.label_selector.clone();
+    let list_field_selector = query.field_selector.clone();
+    let list_continue_name = db_continue_name.clone();
 
     // Shared consistent-snapshot selection. Non-conversion CRDs live in the
     // generic resource table and pin a real historical snapshot just like the
@@ -1691,18 +1635,20 @@ async fn list_cr_inner(
         let api_version_owned = api_version.clone();
         let kind_owned = info.kind.clone();
         crate::api::query::resolve_list_page(
-            state.db.as_ref(),
+            state.resource_mutation().list_resource_versions.as_ref(),
             rv_match,
             continue_resource_version,
-            |_srv| async { Ok(crate::datastore::SnapshotAtRv::Expired) },
+            |_srv| async {
+                Ok(crate::api::custom_resource_ports::CustomResourceListSnapshot::Expired)
+            },
             || async move {
                 let (resources, rv) = gather_custom_resources_across_served_versions(
-                    state_conv.db.as_ref(),
+                    state_conv.resource_mutation().resource_query.as_ref(),
                     &conv,
                     &group_owned,
                     &kind_owned,
                     ns.map(str::to_string),
-                    list_query.label_selector.map(str::to_string),
+                    list_label_selector.clone(),
                 )
                 .await?;
 
@@ -1711,7 +1657,7 @@ async fn list_cr_inner(
                     .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
                     .collect();
                 objects = convert_crd_objects_to_requested_version(
-                    state_conv.db.as_ref(),
+                    state_conv.resource_mutation().resource_query.as_ref(),
                     &conv,
                     &group_owned,
                     &plural_owned,
@@ -1720,7 +1666,7 @@ async fn list_cr_inner(
                 )
                 .await?;
                 objects.retain(|object| {
-                    object_matches_field_selector(object, list_query.field_selector)
+                    object_matches_field_selector(object, list_field_selector.as_deref())
                 });
 
                 // Conversion-backed CRDs: stable sort by name, then apply
@@ -1738,7 +1684,7 @@ async fn list_cr_inner(
                 });
 
                 // Apply continue token offset by name.
-                let start_offset = match list_query.continue_token {
+                let start_offset = match list_continue_name.as_deref() {
                     Some(name) => objects.partition_point(|o| {
                         o.pointer("/metadata/name")
                             .and_then(|v| v.as_str())
@@ -1753,7 +1699,7 @@ async fn list_cr_inner(
                     &[]
                 };
 
-                let (page, cont, remaining) = if let Some(lim) = list_query.limit {
+                let (page, cont, remaining) = if let Some(lim) = normalized_limit {
                     if sliced.len() > lim as usize {
                         let last_name = sliced[lim as usize - 1]
                             .pointer("/metadata/name")
@@ -1775,38 +1721,59 @@ async fn list_cr_inner(
                     .into_iter()
                     .map(|data| synthetic_cr_resource(&api_version_owned, &kind_owned, data, rv))
                     .collect();
-                Ok(crate::datastore::ResourceList {
-                    items,
-                    resource_version: rv,
-                    watch_replay_position: None,
-                    continue_token: cont,
-                    remaining_item_count: remaining,
-                })
+                klights_leader_api::ResourceListResult::try_new(items, rv, None, cont, remaining)
+                    .map_err(AppError::from)
             },
         )
         .await?
     } else {
-        let db_for_snapshot = state.db.clone();
-        let db_for_live = state.db.clone();
+        let reads_for_snapshot = state.resource_mutation().custom_resource_reads.clone();
+        let query_for_live = state.resource_mutation().resource_query.clone();
         let av_snap = api_version.clone();
         let av_live = api_version.clone();
         let kind_snap = info.kind.clone();
         let kind_live = info.kind.clone();
+        let namespace = ns.map(str::to_string);
+        let snapshot_namespace = namespace.clone();
+        let live_namespace = namespace;
+        let snapshot_label_selector = list_label_selector.clone();
+        let live_label_selector = list_label_selector;
+        let snapshot_field_selector = list_field_selector.clone();
+        let live_field_selector = list_field_selector;
+        let snapshot_continue_name = list_continue_name.clone();
+        let live_continue_name = list_continue_name;
         crate::api::query::resolve_list_page(
-            state.db.as_ref(),
+            state.resource_mutation().list_resource_versions.as_ref(),
             rv_match,
             continue_resource_version,
             |srv| async move {
-                db_for_snapshot
-                    .snapshot_resources_at_rv(&av_snap, &kind_snap, ns, list_query, srv)
+                reads_for_snapshot
+                    .snapshot_resources_at_rv(
+                        crate::api::custom_resource_ports::CustomResourceSnapshotRequest {
+                            api_version: av_snap,
+                            kind: kind_snap,
+                            namespace: snapshot_namespace,
+                            label_selector: snapshot_label_selector,
+                            field_selector: snapshot_field_selector,
+                            limit: normalized_limit,
+                            continue_token: snapshot_continue_name,
+                            resource_version: srv,
+                        },
+                    )
                     .await
-                    .map_err(AppError::from)
             },
             || async move {
-                db_for_live
-                    .list_resources(&av_live, &kind_live, ns, list_query)
-                    .await
-                    .map_err(AppError::from)
+                crate::api::resource_query_ports::list_resources(
+                    query_for_live.as_ref(),
+                    &av_live,
+                    &kind_live,
+                    live_namespace.as_deref(),
+                    live_label_selector.as_deref(),
+                    live_field_selector.as_deref(),
+                    normalized_limit,
+                    live_continue_name.as_deref(),
+                )
+                .await
             },
         )
         .await?
@@ -1814,14 +1781,20 @@ async fn list_cr_inner(
 
     // Unified item rendering: CRD defaults are applied to every served object,
     // whether it came from a live list, a pinned snapshot, or a converted view.
-    let mut items: Vec<Value> = Vec::with_capacity(list.items.len());
-    for r in list.items {
+    let (listed_resources, _, _, continue_token, remaining_item_count) = list.into_parts();
+    let mut items: Vec<Value> = Vec::with_capacity(listed_resources.len());
+    for r in listed_resources {
         let mut data = std::sync::Arc::unwrap_or_clone(r.data);
-        apply_crd_defaults(state.db.as_ref(), group, version, &info.kind, &mut data).await;
+        apply_crd_defaults(
+            state.resource_mutation().resource_query.as_ref(),
+            group,
+            version,
+            &info.kind,
+            &mut data,
+        )
+        .await;
         items.push(data);
     }
-    let continue_token = list.continue_token;
-    let remaining_item_count = list.remaining_item_count;
     let mut metadata = serde_json::json!({
         "resourceVersion": response_rv.to_string()
     });
@@ -1914,12 +1887,17 @@ async fn delete_collection_cr_inner(
         &info.selectable_fields,
     )?;
 
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
+    let conversion = load_crd_conversion_config(
+        state.resource_mutation().resource_query.as_ref(),
+        group,
+        plural,
+    )
+    .await?;
 
     let mut names = Vec::new();
     if let Some(conversion) = conversion.as_ref() {
         let (resources, _) = gather_custom_resources_across_served_versions(
-            state.db.as_ref(),
+            state.resource_mutation().resource_query.as_ref(),
             conversion,
             group,
             &info.kind,
@@ -1932,7 +1910,7 @@ async fn delete_collection_cr_inner(
             .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
             .collect();
         objects = convert_crd_objects_to_requested_version(
-            state.db.as_ref(),
+            state.resource_mutation().resource_query.as_ref(),
             conversion,
             group,
             plural,
@@ -1953,21 +1931,18 @@ async fn delete_collection_cr_inner(
             }
         }
     } else {
-        let list = state
-            .db
-            .list_resources(
-                &api_version,
-                &info.kind,
-                ns,
-                crate::datastore::ResourceListQuery::new(
-                    query.label_selector.as_deref(),
-                    query.field_selector.as_deref(),
-                    None,
-                    None,
-                ),
-            )
-            .await?;
-        names.extend(list.items.into_iter().map(|resource| resource.name));
+        let list = crate::api::resource_query_ports::list_resources(
+            state.resource_mutation().resource_query.as_ref(),
+            &api_version,
+            &info.kind,
+            ns,
+            query.label_selector.as_deref(),
+            query.field_selector.as_deref(),
+            None,
+            None,
+        )
+        .await?;
+        names.extend(list.into_items().into_iter().map(|resource| resource.name));
     }
 
     let delete_intent =
@@ -2013,7 +1988,8 @@ async fn delete_collection_cr_inner(
     }
 
     let strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
-        db: state.db.as_ref(),
+        resource_query: state.resource_mutation().resource_query.as_ref(),
+        lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
     };
     let results =
         crate::api::mutation::delete::delete_collection_items(&strategy, items, &delete_intent)
@@ -2029,19 +2005,20 @@ async fn delete_collection_cr_inner(
                 )
                 .await;
                 if !delete_intent.orphan_children
-                    && let Err(e) = controllers::gc::cascade_delete_with_uid(
-                        state.db.as_ref(),
-                        &deleted.uid,
-                        &deleted.api_version,
-                        &deleted.name,
-                        &deleted.kind,
-                        deleted.namespace.clone(),
-                        state.pod_repository.as_ref()
-                            as &dyn klights_reconcile_api::GcPodDeleteSink,
+                    && let Err(e) = crate::api::gc_ports::cascade_delete(
+                        state.resource_mutation().gc_owner_lifecycle.as_ref(),
+                        klights_reconcile_api::GcOwnerIdentity::new(
+                            &deleted.api_version,
+                            &deleted.kind,
+                            deleted.namespace.clone(),
+                            &deleted.name,
+                            &deleted.uid,
+                        ),
                     )
                     .await
                 {
                     state
+                        .controller_reconcile()
                         .metrics
                         .cascade_delete_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2110,9 +2087,7 @@ async fn dispatch_custom_resource_mutation_event(
     context: &'static str,
 ) {
     crate::api::mutation::dispatch_mutation_event(
-        &state.side_effects,
-        state.db.as_ref(),
-        &state.metrics,
+        state.resource_mutation().mutation_effects.as_ref(),
         crate::api::mutation::MutationEvent {
             operation,
             resource,
@@ -2154,7 +2129,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
         } = self.scope.resource_type;
         let mut body = body;
         apply_crd_defaults(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             group,
             version,
             &info.kind,
@@ -2163,7 +2138,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
         .await;
         if self.query.field_validation.as_deref() == Some("Strict") {
             check_cr_field_validation_strict(
-                self.state.db.as_ref(),
+                self.state.resource_mutation().resource_query.as_ref(),
                 group,
                 version,
                 &info.kind,
@@ -2187,12 +2162,14 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
             .map(ToString::to_string);
-        let mut body = crate::api::mutation::write::run_admission(
-            self.state.db.as_ref(),
-            AdmissionContextRequest {
-                api_version: &api_version,
-                kind: &info.kind,
-                operation: "CREATE",
+        let mut body = self
+            .state
+            .resource_mutation()
+            .admission
+            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                api_version,
+                kind: info.kind.clone(),
+                operation: "CREATE".to_string(),
                 namespace,
                 name,
                 object: body,
@@ -2200,12 +2177,11 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
                 dry_run: dry_run.is_all(),
                 subresource: None,
                 options: None,
-            },
-        )
-        .await?;
+            })
+            .await?;
         let CustomResourceType { group, version, .. } = self.scope.resource_type;
         apply_crd_pruning(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             group,
             version,
             &info.kind,
@@ -2235,7 +2211,12 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             .as_str()
             .ok_or_else(|| AppError::BadRequest("metadata.name required".to_string()))?
             .to_string();
-        let conversion = load_crd_conversion_config(self.state.db.as_ref(), group, plural).await?;
+        let conversion = load_crd_conversion_config(
+            self.state.resource_mutation().resource_query.as_ref(),
+            group,
+            plural,
+        )
+        .await?;
         let storage_api_version =
             storage_api_version_for_request(group, version, conversion.as_ref());
         if get_existing_custom_resource_for_write(
@@ -2253,7 +2234,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             return Err(AppError::Conflict(format!("{} already exists", name)));
         }
         let storage_body = normalize_custom_resource_storage_data(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
@@ -2261,11 +2242,15 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             body,
         )
         .await?;
-        let resource = self
-            .state
-            .db
-            .create_resource(&storage_api_version, &info.kind, ns, &name, storage_body)
-            .await?;
+        let resource = crate::api::resource_command_ports::create_non_pod_resource(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &storage_api_version,
+            &info.kind,
+            ns,
+            &name,
+            storage_body,
+        )
+        .await?;
         after_persisted_custom_resource_write(
             self.state,
             &resource,
@@ -2275,7 +2260,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
         )
         .await;
         let data = normalize_custom_resource_response_data(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
@@ -2333,12 +2318,14 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         } = self.target.scope.resource_type;
         let ns = self.target.scope.namespace;
         let api_version = self.target.scope.resource_type.api_version();
-        body = crate::api::mutation::write::run_admission(
-            self.state.db.as_ref(),
-            AdmissionContextRequest {
-                api_version: &api_version,
-                kind: &info.kind,
-                operation: "UPDATE",
+        body = self
+            .state
+            .resource_mutation()
+            .admission
+            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                api_version,
+                kind: info.kind.clone(),
+                operation: "UPDATE".to_string(),
                 namespace: ns.map(str::to_string),
                 name: Some(self.target.name.to_string()),
                 object: body,
@@ -2346,11 +2333,10 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
                 dry_run: false,
                 subresource: None,
                 options: None,
-            },
-        )
-        .await?;
+            })
+            .await?;
         apply_crd_pruning(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             group,
             version,
             &info.kind,
@@ -2380,9 +2366,14 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         let ns = self.target.scope.namespace;
         let api_version = self.target.scope.resource_type.api_version();
         let stored_api_version = current.api_version.clone();
-        let conversion = load_crd_conversion_config(self.state.db.as_ref(), group, plural).await?;
+        let conversion = load_crd_conversion_config(
+            self.state.resource_mutation().resource_query.as_ref(),
+            group,
+            plural,
+        )
+        .await?;
         let storage_body = normalize_custom_resource_storage_data(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
@@ -2390,18 +2381,16 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
             body,
         )
         .await?;
-        let resource = self
-            .state
-            .db
-            .update_resource(
-                &stored_api_version,
-                &info.kind,
-                ns,
-                self.target.name,
-                storage_body,
-                current.resource_version,
-            )
-            .await?;
+        let resource = crate::api::resource_command_ports::update_non_pod_resource(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &stored_api_version,
+            &info.kind,
+            ns,
+            self.target.name,
+            storage_body,
+            current.resource_version,
+        )
+        .await?;
         after_persisted_custom_resource_write(
             self.state,
             &resource,
@@ -2420,7 +2409,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         )
         .await;
         let data = normalize_custom_resource_response_data(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
@@ -2467,7 +2456,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         let is_dry_run = dry_run.is_all();
         if is_apply_yaml && self.query.field_validation.as_deref() == Some("Strict") {
             check_cr_field_validation_strict(
-                self.state.db.as_ref(),
+                self.state.resource_mutation().resource_query.as_ref(),
                 group,
                 version,
                 &info.kind,
@@ -2475,7 +2464,12 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             )
             .await?;
         }
-        let conversion = load_crd_conversion_config(self.state.db.as_ref(), group, plural).await?;
+        let conversion = load_crd_conversion_config(
+            self.state.resource_mutation().resource_query.as_ref(),
+            group,
+            plural,
+        )
+        .await?;
         let storage_api_version =
             storage_api_version_for_request(group, version, conversion.as_ref());
 
@@ -2494,19 +2488,21 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             Err(AppError::NotFound(_)) if is_apply_yaml => {
                 let mut created_resource = patch.clone();
                 apply_crd_defaults(
-                    self.state.db.as_ref(),
+                    self.state.resource_mutation().resource_query.as_ref(),
                     group,
                     version,
                     &info.kind,
                     &mut created_resource,
                 )
                 .await;
-                created_resource = crate::api::mutation::write::run_admission(
-                    self.state.db.as_ref(),
-                    AdmissionContextRequest {
-                        api_version: &api_version,
-                        kind: &info.kind,
-                        operation: "CREATE",
+                created_resource = self
+                    .state
+                    .resource_mutation()
+                    .admission
+                    .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                        api_version: api_version.clone(),
+                        kind: info.kind.clone(),
+                        operation: "CREATE".to_string(),
                         namespace: ns.map(str::to_string),
                         name: Some(self.target.name.to_string()),
                         object: created_resource,
@@ -2514,11 +2510,10 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                         dry_run: is_dry_run,
                         subresource: None,
                         options: None,
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 apply_crd_pruning(
-                    self.state.db.as_ref(),
+                    self.state.resource_mutation().resource_query.as_ref(),
                     group,
                     version,
                     &info.kind,
@@ -2534,7 +2529,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                 }
 
                 let storage_created_resource = normalize_custom_resource_storage_data(
-                    self.state.db.as_ref(),
+                    self.state.resource_mutation().resource_query.as_ref(),
                     conversion.as_ref(),
                     group,
                     plural,
@@ -2542,17 +2537,15 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                     created_resource,
                 )
                 .await?;
-                let resource = self
-                    .state
-                    .db
-                    .create_resource(
-                        &storage_api_version,
-                        &info.kind,
-                        ns,
-                        self.target.name,
-                        storage_created_resource,
-                    )
-                    .await?;
+                let resource = crate::api::resource_command_ports::create_non_pod_resource(
+                    self.state.resource_mutation().resource_command.as_ref(),
+                    &storage_api_version,
+                    &info.kind,
+                    ns,
+                    self.target.name,
+                    storage_created_resource,
+                )
+                .await?;
                 after_persisted_custom_resource_write(
                     self.state,
                     &resource,
@@ -2562,7 +2555,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                 )
                 .await;
                 let data = normalize_custom_resource_response_data(
-                    self.state.db.as_ref(),
+                    self.state.resource_mutation().resource_query.as_ref(),
                     conversion.as_ref(),
                     group,
                     plural,
@@ -2579,12 +2572,14 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         };
 
         let mut patched_resource = crate::api::apply_patch(&current.data, &patch, content_type)?;
-        patched_resource = crate::api::mutation::write::run_admission(
-            self.state.db.as_ref(),
-            AdmissionContextRequest {
-                api_version: &api_version,
-                kind: &info.kind,
-                operation: "UPDATE",
+        patched_resource = self
+            .state
+            .resource_mutation()
+            .admission
+            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                api_version: api_version.clone(),
+                kind: info.kind.clone(),
+                operation: "UPDATE".to_string(),
                 namespace: ns.map(str::to_string),
                 name: Some(self.target.name.to_string()),
                 object: patched_resource,
@@ -2592,11 +2587,10 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                 dry_run: is_dry_run,
                 subresource: None,
                 options: None,
-            },
-        )
-        .await?;
+            })
+            .await?;
         apply_crd_pruning(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             group,
             version,
             &info.kind,
@@ -2617,7 +2611,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         }
 
         let storage_patched_resource = normalize_custom_resource_storage_data(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
@@ -2625,18 +2619,16 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             patched_resource,
         )
         .await?;
-        let resource = self
-            .state
-            .db
-            .update_resource(
-                &stored_api_version,
-                &info.kind,
-                ns,
-                self.target.name,
-                storage_patched_resource,
-                current.resource_version,
-            )
-            .await?;
+        let resource = crate::api::resource_command_ports::update_non_pod_resource(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &stored_api_version,
+            &info.kind,
+            ns,
+            self.target.name,
+            storage_patched_resource,
+            current.resource_version,
+        )
+        .await?;
         after_persisted_custom_resource_write(
             self.state,
             &resource,
@@ -2655,7 +2647,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         )
         .await;
         let data = normalize_custom_resource_response_data(
-            self.state.db.as_ref(),
+            self.state.resource_mutation().resource_query.as_ref(),
             conversion.as_ref(),
             group,
             plural,
@@ -2773,7 +2765,12 @@ async fn delete_cr_inner(
             .or_insert_with(|| serde_json::json!("DeleteOptions"));
     }
 
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
+    let conversion = load_crd_conversion_config(
+        state.resource_mutation().resource_query.as_ref(),
+        group,
+        plural,
+    )
+    .await?;
     let (resource, stored_api_version) = get_existing_custom_resource_for_write(
         state,
         group,
@@ -2789,12 +2786,13 @@ async fn delete_cr_inner(
         &resource,
         &delete_intent.preconditions,
     )?;
-    let _ = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version: &requested_api_version,
-            kind: &info.kind,
-            operation: "DELETE",
+    let _ = state
+        .resource_mutation()
+        .admission
+        .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+            api_version: requested_api_version.clone(),
+            kind: info.kind.clone(),
+            operation: "DELETE".to_string(),
             namespace: ns.map(str::to_string),
             name: Some(name.to_string()),
             object: Value::Null,
@@ -2802,9 +2800,8 @@ async fn delete_cr_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: Some(options_value),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     if is_dry_run {
         return Ok(Json(crate::api::mutation::response::delete_success_status(
@@ -2820,7 +2817,8 @@ async fn delete_cr_inner(
         name.to_string(),
     );
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
-        db: state.db.as_ref(),
+        resource_query: state.resource_mutation().resource_query.as_ref(),
+        lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
     };
     match crate::api::mutation::delete::delete_loaded_with_strategy(
         &delete_strategy,
@@ -2838,27 +2836,31 @@ async fn delete_cr_inner(
                 "custom_delete_mark",
             )
             .await;
-            if let Err(e) = controllers::gc::finalize_foreground_owner_if_ready(
-                state.db.as_ref(),
-                &updated,
-                state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+            if let Err(e) = crate::api::gc_ports::finalize_foreground_owner(
+                state.resource_mutation().gc_owner_lifecycle.as_ref(),
+                updated.clone(),
             )
             .await
             {
                 state
+                    .controller_reconcile()
                     .metrics
                     .cascade_delete_failures_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(name = %name, kind = %info.kind, error = %e, "CRD foreground finalize failed");
             }
 
-            if let Some(latest) = state
-                .db
-                .get_resource(&stored_api_version, &info.kind, ns, name)
-                .await?
+            if let Some(latest) = crate::api::resource_query_ports::get_resource(
+                state.resource_mutation().resource_query.as_ref(),
+                &stored_api_version,
+                &info.kind,
+                ns,
+                name,
+            )
+            .await?
             {
                 let normalized = normalize_custom_resource_response_data(
-                    state.db.as_ref(),
+                    state.resource_mutation().resource_query.as_ref(),
                     conversion.as_ref(),
                     group,
                     plural,
@@ -2882,18 +2884,20 @@ async fn delete_cr_inner(
             )
             .await;
             if !delete_intent.orphan_children
-                && let Err(e) = controllers::gc::cascade_delete_with_uid(
-                    state.db.as_ref(),
-                    &deleted.uid,
-                    &stored_api_version,
-                    &deleted.name,
-                    &info.kind,
-                    ns.map(str::to_string),
-                    state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+                && let Err(e) = crate::api::gc_ports::cascade_delete(
+                    state.resource_mutation().gc_owner_lifecycle.as_ref(),
+                    klights_reconcile_api::GcOwnerIdentity::new(
+                        &stored_api_version,
+                        &info.kind,
+                        ns.map(str::to_string),
+                        &deleted.name,
+                        &deleted.uid,
+                    ),
                 )
                 .await
             {
                 state
+                    .controller_reconcile()
                     .metrics
                     .cascade_delete_failures_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

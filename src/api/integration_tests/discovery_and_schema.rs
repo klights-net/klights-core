@@ -8,7 +8,7 @@ async fn test_patch_crd_apply_yaml_create_registers_route_for_duplicate_field_de
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -331,8 +331,9 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
         ),
     )]);
     let mut state = build_test_app_state().await;
-    state.metrics_provider = std::sync::Arc::new(StaticMetricsProvider { runtime });
-    let db = state.db.clone();
+    state.pod_node_subresources_mut().metrics_provider =
+        std::sync::Arc::new(StaticMetricsProvider { runtime });
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     db.create_resource(
         "v1",
@@ -794,6 +795,7 @@ async fn test_aggregated_discovery_includes_crd_resources() {
 
     // Register a CRD in the registry
     state
+        .discovery()
         .crd_registry
         .register(crate::controllers::crd::CrdResourceInfo {
             group: "stable.example.com".to_string(),
@@ -868,8 +870,8 @@ async fn test_aggregated_discovery_includes_crd_synced_from_datastore() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let crd_registry = state.crd_registry.clone();
+    let db = state.resource_mutation().db.clone();
+    let crd_registry = state.discovery().crd_registry.clone();
 
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
@@ -1295,7 +1297,7 @@ async fn test_garbage_collector_orphan_delete_pods_survive() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     // Create the test namespace
@@ -1434,7 +1436,7 @@ async fn test_garbage_collector_orphan_pods_have_owner_refs_removed() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     // Create namespace
@@ -1618,6 +1620,125 @@ async fn test_pod_eviction_marks_pod_terminating_and_returns_201() {
 }
 
 #[tokio::test]
+async fn pod_eviction_preserves_dry_run_preconditions_and_grace_period() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let create_namespace = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"eviction-options"}}"#,
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(create_namespace)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    let create_pod = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/eviction-options/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"victim"},"spec":{"containers":[{"name":"c","image":"nginx"}]}}"#,
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(create_pod).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let uid = created.pointer("/metadata/uid").unwrap().as_str().unwrap();
+    let resource_version = created
+        .pointer("/metadata/resourceVersion")
+        .unwrap()
+        .as_str()
+        .unwrap();
+
+    let eviction = |uid: &str, resource_version: &str| {
+        json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": {"name": "victim", "namespace": "eviction-options"},
+            "deleteOptions": {
+                "gracePeriodSeconds": 7,
+                "preconditions": {"uid": uid, "resourceVersion": resource_version}
+            }
+        })
+    };
+    let dry_run = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/eviction-options/pods/victim/eviction?dryRun=All")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&eviction(uid, resource_version)).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(dry_run).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let get_pod = || {
+        Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/eviction-options/pods/victim")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(get_pod()).await.unwrap();
+    let after_dry_run: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        after_dry_run
+            .pointer("/metadata/deletionTimestamp")
+            .is_none(),
+        "dry-run eviction must not mutate the Pod"
+    );
+
+    let wrong_uid = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/eviction-options/pods/victim/eviction")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&eviction("wrong-uid", resource_version)).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(wrong_uid).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+
+    let live = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/eviction-options/pods/victim/eviction")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&eviction(uid, resource_version)).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(live).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    let response = app.clone().oneshot(get_pod()).await.unwrap();
+    let terminating: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        terminating.pointer("/metadata/deletionGracePeriodSeconds"),
+        Some(&json!(7))
+    );
+}
+
+#[tokio::test]
 async fn test_pod_delete_returns_accepted_when_marked_terminating() {
     use axum::{
         body::{Body, to_bytes},
@@ -1701,6 +1822,17 @@ async fn test_pod_eviction_respects_pdb_and_returns_disruptionbudget_cause() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/evict-pdb-test/pods/victim/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(
+            r#"{"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
         .method("POST")
         .uri("/apis/policy/v1/namespaces/evict-pdb-test/poddisruptionbudgets")
         .header("content-type", "application/json")
@@ -1732,6 +1864,11 @@ async fn test_pod_eviction_respects_pdb_and_returns_disruptionbudget_cause() {
         resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
         "eviction must be rejected when matching PDB has disruptionsAllowed=0"
+    );
+    assert_eq!(
+        resp.headers().get(axum::http::header::RETRY_AFTER),
+        Some(&axum::http::HeaderValue::from_static("10")),
+        "PDB throttling must tell eviction clients when to retry"
     );
 
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2615,7 +2752,7 @@ async fn test_deployment_main_update_preserves_status_subresource() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2729,7 +2866,7 @@ async fn test_deployment_unconditional_main_update_ignores_status_churn() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(

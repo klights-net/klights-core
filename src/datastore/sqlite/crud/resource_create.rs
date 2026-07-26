@@ -57,9 +57,11 @@ impl Datastore {
             }
             return match self.create_namespace(name, data).await {
                 Ok(resource) => Ok(resource),
-                Err(err) if err.to_string().contains("Namespace already exists") => {
-                    Err(anyhow!("Resource already exists (409 Conflict)"))
-                }
+                Err(err) if err.to_string().contains("Namespace already exists") => Err(
+                    anyhow::Error::new(crate::datastore::errors::DatastoreError::already_exists(
+                        "Resource already exists",
+                    )),
+                ),
                 Err(err) => Err(err),
             };
         }
@@ -186,7 +188,11 @@ impl Datastore {
                         Some(&live.uid),
                     );
                 }
-                Err(anyhow!("Resource already exists (409 Conflict)"))
+                Err(anyhow::Error::new(
+                    crate::datastore::errors::DatastoreError::already_exists(
+                        "Resource already exists",
+                    ),
+                ))
             }
             Err(e) => Err(anyhow!("Failed to create resource: {}", e)),
         }

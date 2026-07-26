@@ -1,12 +1,6 @@
 use std::sync::Arc;
 
-use crate::datastore::{NetworkMetadataStore, NetworkStore, PodCleanupStore};
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-
-/// Focused datastore capability required by pod runtime sandbox persistence.
-pub trait PodRuntimeNetworkStore: NetworkStore + NetworkMetadataStore {}
-
-impl<T> PodRuntimeNetworkStore for T where T: NetworkStore + NetworkMetadataStore {}
 
 /// Node-local runtime persistence port for sandbox rows, pod network rows,
 /// and pod slot admission.
@@ -20,14 +14,6 @@ pub trait PodRuntimeStore: Send + Sync {
 
     /// Delete a sandbox row by UID-qualified key.
     async fn delete_sandbox(&self, key: &PodRuntimeKey) -> anyhow::Result<()>;
-
-    /// Look up sandbox id by namespace/name only (used only at API admission
-    /// before UID verification). Callers must validate UID before mutating.
-    async fn get_sandbox_id_by_name(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-    ) -> anyhow::Result<Option<String>>;
 }
 
 /// Pod slot admission operations.
@@ -35,16 +21,14 @@ pub trait PodRuntimeStore: Send + Sync {
 pub trait PodSlotAdmission: Send + Sync {
     /// Subscribe to pod slot admission events.
     /// Returns a broadcast receiver for slot changes.
-    fn subscribe(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::datastore::PodSlotAdmissionEvent>;
+    fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription>;
 
     /// Try to admit a pod into a slot.
     async fn try_admit(
         &self,
         key: &PodRuntimeKey,
         node_name: &str,
-    ) -> anyhow::Result<crate::datastore::PodSlotAdmissionResult>;
+    ) -> anyhow::Result<klights_node_store::PodSlotAdmissionResult>;
 
     /// Clear a pod's slot by UID-qualified key.
     async fn clear_slot(&self, key: &PodRuntimeKey) -> anyhow::Result<()>;
@@ -54,89 +38,100 @@ pub trait PodSlotAdmission: Send + Sync {
 
 /// Production runtime store adapter over the datastore backend.
 pub struct RealPodRuntimeStore {
-    db: Arc<dyn PodRuntimeNetworkStore>,
+    store: Arc<dyn klights_node_store::PodRuntimeStore>,
 }
 
 impl RealPodRuntimeStore {
-    pub fn new(db: Arc<dyn PodRuntimeNetworkStore>) -> Self {
-        Self { db }
+    pub fn new(store: Arc<dyn klights_node_store::PodRuntimeStore>) -> Self {
+        Self { store }
     }
 }
 
 #[async_trait::async_trait]
 impl PodRuntimeStore for RealPodRuntimeStore {
     async fn record_sandbox(&self, key: &PodRuntimeKey, sandbox_id: &str) -> anyhow::Result<()> {
-        self.db
-            .record_sandbox(&key.namespace, &key.name, &key.uid, sandbox_id)
-            .await?;
-        Ok(())
+        let sandbox = klights_node_store::PodRuntimeSandbox::try_new(&key.uid, sandbox_id)?;
+        self.store
+            .record_sandbox(sandbox)
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn get_sandbox_id(&self, key: &PodRuntimeKey) -> anyhow::Result<Option<String>> {
-        self.db
-            .get_sandbox_for_uid(&key.namespace, &key.name, &key.uid)
+        let pod_uid = klights_node_store::RuntimePodUid::try_new(&key.uid)?;
+        self.store
+            .get_pod_runtime(pod_uid)
             .await
-            .map_err(|e| anyhow::anyhow!("{:#}", e))
+            .map_err(anyhow::Error::from)
+            .map(|record| {
+                record
+                    .filter(|record| {
+                        record.pod().namespace == key.namespace && record.pod().name == key.name
+                    })
+                    .and_then(|record| record.sandbox_id().map(ToString::to_string))
+            })
     }
 
     async fn delete_sandbox(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
-        let sandbox_id = match self.get_sandbox_id(key).await? {
-            Some(id) => id,
-            None => return Ok(()), // already gone
-        };
-        self.db
-            .delete_sandbox_for_uid(&key.namespace, &key.name, &key.uid, &sandbox_id)
-            .await?;
-        Ok(())
-    }
-
-    async fn get_sandbox_id_by_name(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-    ) -> anyhow::Result<Option<String>> {
-        self.db
-            .get_sandbox(namespace, pod_name)
+        let pod_uid = klights_node_store::RuntimePodUid::try_new(&key.uid)?;
+        self.store
+            .delete_pod_runtime_for_uid(pod_uid)
             .await
-            .map_err(|e| anyhow::anyhow!("{:#}", e))
+            .map_err(anyhow::Error::from)
     }
 }
 
 /// Production slot admission adapter over the datastore backend.
 pub struct RealPodSlotAdmission {
-    db: Arc<dyn PodCleanupStore>,
+    store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
+    events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
     node_name: String,
 }
 
 impl RealPodSlotAdmission {
-    pub fn new(db: Arc<dyn PodCleanupStore>, node_name: String) -> Self {
-        Self { db, node_name }
+    pub fn new(
+        store: Arc<dyn klights_node_store::PodSlotAdmissionStore>,
+        events: Arc<dyn klights_node_store::PodSlotAdmissionEventSource>,
+        node_name: String,
+    ) -> Self {
+        Self {
+            store,
+            events,
+            node_name,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl PodSlotAdmission for RealPodSlotAdmission {
-    fn subscribe(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::datastore::PodSlotAdmissionEvent> {
-        self.db.subscribe_pod_slot_admissions()
+    fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription> {
+        self.events.subscribe()
     }
 
     async fn try_admit(
         &self,
         key: &PodRuntimeKey,
         node_name: &str,
-    ) -> anyhow::Result<crate::datastore::PodSlotAdmissionResult> {
-        self.db
-            .pod_slot_try_admit(&key.namespace, &key.name, &key.uid, node_name)
+    ) -> anyhow::Result<klights_node_store::PodSlotAdmissionResult> {
+        let request = klights_node_store::PodSlotAdmissionRequest::try_new(
+            klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
+            node_name,
+        )?;
+        self.store
+            .try_admit(request)
             .await
-            .map_err(|e| anyhow::anyhow!("{:#}", e))
+            .map_err(anyhow::Error::from)
     }
 
     async fn clear_slot(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
-        self.db
-            .pod_slot_clear_if_uid(&key.namespace, &key.name, &key.uid, &self.node_name)
-            .await?;
+        let request = klights_node_store::PodSlotAdmissionRequest::try_new(
+            klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
+            &self.node_name,
+        )?;
+        self.store
+            .clear_if_uid(request)
+            .await
+            .map_err(anyhow::Error::from)?;
         Ok(())
     }
 }

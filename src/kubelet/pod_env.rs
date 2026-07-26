@@ -1,10 +1,11 @@
-use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref};
+use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::control_plane::client::{
-    ResourceListRequest, ResourceQueryConsistency, config_map_get_request, secret_get_request,
+use klights_leader_api::{
+    LeaderResourceQuery, ResourceListRequest, ResourceQueryConsistency, config_map_get_request,
+    secret_get_request,
 };
 
 #[async_trait]
@@ -13,23 +14,26 @@ pub trait EnvSourceReader: Send + Sync {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>>;
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>>;
 
     async fn config_map(
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>>;
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>>;
 
-    async fn services(&self, namespace: &str) -> anyhow::Result<Vec<crate::datastore::Resource>>;
+    async fn services(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>>;
 }
 
 pub struct LeaderApiEnvSourceReader {
-    cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    cluster_api: Arc<dyn LeaderResourceQuery>,
 }
 
 impl LeaderApiEnvSourceReader {
-    pub fn new(cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>) -> Self {
+    pub fn new(cluster_api: Arc<dyn LeaderResourceQuery>) -> Self {
         Self { cluster_api }
     }
 }
@@ -40,7 +44,7 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         // Fresh leader read (not the worker cache): env injection happens at
         // container start, and a Secret created moments earlier may not yet have
         // propagated to a primed-but-lagging worker cache. A cached miss would
@@ -60,7 +64,7 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         // Fresh leader read (see `secret`): a just-created ConfigMap may not yet
         // be in a primed-but-lagging worker cache, and a cached miss would
         // spuriously fail the container.
@@ -74,7 +78,10 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
             .map_err(anyhow::Error::new)
     }
 
-    async fn services(&self, namespace: &str) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+    async fn services(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
         Ok(self
             .cluster_api
             .list_resources(ResourceListRequest::try_new(
@@ -104,7 +111,7 @@ impl EnvSourceReader for DatastoreEnvSourceReader<'_> {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         self.db
             .get_resource("v1", "Secret", Some(namespace), name)
             .await
@@ -114,13 +121,16 @@ impl EnvSourceReader for DatastoreEnvSourceReader<'_> {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         self.db
             .get_resource("v1", "ConfigMap", Some(namespace), name)
             .await
     }
 
-    async fn services(&self, namespace: &str) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+    async fn services(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
         Ok(self
             .db
             .list_resources(
@@ -203,9 +213,10 @@ pub fn collect_literal_env_vars(
 
 /// Collect env vars resolvable from valueFrom.fieldRef/resourceFieldRef for subPathExpr expansion.
 /// This uses pod/container context available at create/restart time.
-pub fn collect_value_from_env_vars_for_subpath(
+pub fn collect_value_from_env_vars_for_subpath_with_capacity(
     container_spec: &Value,
     pod_data: &Value,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let Some(env_array) = container_spec.get("env").and_then(|e| e.as_array()) else {
@@ -232,7 +243,7 @@ pub fn collect_value_from_env_vars_for_subpath(
         {
             map.insert(
                 name.to_string(),
-                resolve_resource_field_ref(resource, container_spec),
+                resolve_resource_field_ref_with_capacity(resource, container_spec, node_capacity),
             );
         }
     }
@@ -510,11 +521,12 @@ pub async fn resolve_env_from_source(
     resolved
 }
 
-pub fn build_subpath_env(
+pub fn build_subpath_env_with_capacity(
     container_spec: &Value,
     pod_data: &Value,
     resolved_env_from: &[(String, String)],
     resolved_env: &std::collections::HashMap<String, String>,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 ) -> std::collections::HashMap<String, String> {
     let mut subpath_env: std::collections::HashMap<String, String> =
         resolved_env_from.iter().cloned().collect();
@@ -524,10 +536,42 @@ pub fn build_subpath_env(
     for (key, value) in resolved_env {
         subpath_env.insert(key.clone(), value.clone());
     }
-    for (key, value) in collect_value_from_env_vars_for_subpath(container_spec, pod_data) {
+    for (key, value) in collect_value_from_env_vars_for_subpath_with_capacity(
+        container_spec,
+        pod_data,
+        node_capacity,
+    ) {
         subpath_env.insert(key, value);
     }
     subpath_env
+}
+
+#[cfg(test)]
+pub fn collect_value_from_env_vars_for_subpath(
+    container_spec: &Value,
+    pod_data: &Value,
+) -> std::collections::HashMap<String, String> {
+    collect_value_from_env_vars_for_subpath_with_capacity(
+        container_spec,
+        pod_data,
+        crate::kubelet::node::NodeCapacity::default(),
+    )
+}
+
+#[cfg(test)]
+pub fn build_subpath_env(
+    container_spec: &Value,
+    pod_data: &Value,
+    resolved_env_from: &[(String, String)],
+    resolved_env: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    build_subpath_env_with_capacity(
+        container_spec,
+        pod_data,
+        resolved_env_from,
+        resolved_env,
+        crate::kubelet::node::NodeCapacity::default(),
+    )
 }
 
 #[cfg(test)]
@@ -938,15 +982,14 @@ mod tests {
 
         use async_trait::async_trait;
 
-        use crate::control_plane::client::{
-            CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
-            LeaderCacheReadiness, LeaderWatch, LeaderWatchError, LeaderWatchFuture, WatchRequest,
-        };
-        use crate::datastore::Resource;
+        use crate::control_plane::client::LeaderApiClient;
         use crate::kubelet::pod_env::{EnvSourceReader, LeaderApiEnvSourceReader};
+        use klights_cluster_core::Resource;
         use klights_leader_api::{
-            LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
-            ResourceQueryConsistency, ResourceQueryError, ResourceQueryFuture,
+            CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
+            LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+            ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryConsistency,
+            ResourceQueryError, ResourceQueryFuture, WatchRequest,
         };
 
         struct FreshOnlyLeaderApiClient {

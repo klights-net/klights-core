@@ -2,6 +2,31 @@ use super::*;
 use serde_json::Value;
 use serde_json::json;
 
+async fn reconcile_deployment<T>(
+    db: &T,
+    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_writer: &dyn crate::kubelet::pod_repository::PodObjectWriter,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    deployment: &Value,
+    node_name: &str,
+) -> anyhow::Result<()>
+where
+    T: crate::datastore::DatastoreBackend + Clone + 'static,
+{
+    let non_pod_finalization =
+        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
+    super::reconcile_deployment(
+        db,
+        pod_reader,
+        pod_writer,
+        pod_delete_sink,
+        &non_pod_finalization,
+        deployment,
+        node_name,
+    )
+    .await
+}
+
 fn make_deployment(name: &str, namespace: &str, uid: &str, replicas: i64, rv: &str) -> Value {
     json!({
         "apiVersion": "apps/v1",

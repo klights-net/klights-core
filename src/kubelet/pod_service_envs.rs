@@ -32,7 +32,9 @@ pub async fn resolve_service_envs_from_source(
     }
 }
 
-fn service_envs_from_resources(services: &[crate::datastore::Resource]) -> Vec<(String, String)> {
+fn service_envs_from_resources(
+    services: &[klights_cluster_core::Resource],
+) -> Vec<(String, String)> {
     let mut envs = Vec::new();
 
     for svc in services {

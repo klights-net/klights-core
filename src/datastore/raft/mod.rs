@@ -21,10 +21,10 @@ mod tests {
     use bytes::Bytes;
 
     use crate::datastore::raft::state_machine::N1Raft;
-    use crate::kubelet::outbox::payload::OutboxOperation;
+    use crate::node_outbox::payload::OutboxOperation;
 
     fn pod_status_payload(ns: &str, name: &str, uid: &str) -> Bytes {
-        crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        crate::node_outbox::payload::OutboxPayload::from_command(
             crate::datastore::command::StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
@@ -72,7 +72,7 @@ mod tests {
 
         assert!(matches!(
             applied.result,
-            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+            crate::node_outbox::OutboxApplyResult::Applied { .. }
         ));
         assert!(raft.last_commit_index().await > 0);
     }

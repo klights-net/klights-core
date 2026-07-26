@@ -5,7 +5,11 @@ pub async fn custom_resource_discovery(
     Path((group, version)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, AppError> {
-    let resources = state.crd_registry.list_resources(&group, &version).await;
+    let resources = state
+        .discovery()
+        .crd_registry
+        .list_resources(&group, &version)
+        .await;
 
     if resources.is_empty() {
         let path_and_query = uri

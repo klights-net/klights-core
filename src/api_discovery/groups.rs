@@ -273,7 +273,11 @@ pub async fn api_groups(State(state): State<Arc<AppState>>, headers: HeaderMap) 
     ];
 
     // Dynamically add CRD API groups from the registry
-    let crd_versions_by_group = state.crd_registry.list_versions_by_group().await;
+    let crd_versions_by_group = state
+        .discovery()
+        .crd_registry
+        .list_versions_by_group()
+        .await;
     for (group, versions) in crd_versions_by_group {
         // Skip if already in static list
         if groups.iter().any(|g| g.name == group) {
@@ -355,8 +359,11 @@ pub async fn api_groups(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                 let mut resources = aggregated_resources_for_group_version(&g.name, &v.version);
                 // For CRD groups (empty static resources), populate from CRD registry
                 if resources.is_empty() {
-                    let crd_resources =
-                        state.crd_registry.list_resources(&g.name, &v.version).await;
+                    let crd_resources = state
+                        .discovery()
+                        .crd_registry
+                        .list_resources(&g.name, &v.version)
+                        .await;
                     for crd in crd_resources {
                         resources.push(APIResourceDiscovery {
                             resource: crd.plural.clone(),
@@ -476,7 +483,11 @@ pub async fn api_group_by_name(
     }
 
     // Check CRD registry for dynamic groups
-    let crd_versions_by_group = state.crd_registry.list_versions_by_group().await;
+    let crd_versions_by_group = state
+        .discovery()
+        .crd_registry
+        .list_versions_by_group()
+        .await;
     if let Some(versions) = crd_versions_by_group.get(&group)
         && !versions.is_empty()
     {

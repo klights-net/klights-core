@@ -1,43 +1,51 @@
 //! Side-effect trait and registry for post-mutation hooks.
 
 use super::policy::ErrorPolicy;
-use crate::datastore::DatastoreBackend;
-use crate::kubelet::pod_repository::PodRepository;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_pod_api::PodQuery;
+use klights_reconcile_api::GcPodDeleteSink;
 use klights_reconcile_api::{ControllerReconcileSink, ServiceReconcileSink};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Shared, late-bound slot for the process-wide [`PodRepository`].
+/// Shared, late-bound slot for the focused Pod capabilities used by hooks.
 ///
 /// Constructed empty by `SideEffectRegistry::new` (and consequently by
-/// `default_registry`); populated by `SideEffectRegistry::set_pod_repository`
-/// once `PodRepository` exists. Side effects that need pod-scoped reads
-/// (e.g. PDB status, ResourceQuota recount) hold a clone of this `Arc` and
-/// resolve the repository at `apply` time so the registry-vs-repository
-/// construction-order cycle stays manageable.
+/// `default_registry`); populated after bootstrap constructs the focused
+/// query and actor-owned deletion capabilities.
 #[derive(Clone, Default)]
-pub struct PodRepositorySlot {
-    inner: Arc<RwLock<Option<Arc<PodRepository>>>>,
+pub struct PodSideEffectPortsSlot {
+    inner: Arc<RwLock<PodSideEffectPorts>>,
 }
 
-impl PodRepositorySlot {
+#[derive(Default)]
+struct PodSideEffectPorts {
+    query: Option<Arc<dyn PodQuery>>,
+    delete: Option<Arc<dyn GcPodDeleteSink>>,
+}
+
+impl PodSideEffectPortsSlot {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(None)),
+            inner: Arc::new(RwLock::new(PodSideEffectPorts::default())),
         }
     }
 
-    pub fn set(&self, repository: Arc<PodRepository>) {
+    pub fn set(&self, query: Arc<dyn PodQuery>, delete: Arc<dyn GcPodDeleteSink>) {
         if let Ok(mut guard) = self.inner.write() {
-            *guard = Some(repository);
+            guard.query = Some(query);
+            guard.delete = Some(delete);
         }
     }
 
-    pub fn get(&self) -> Option<Arc<PodRepository>> {
-        self.inner.read().ok().and_then(|g| g.clone())
+    pub fn query(&self) -> Option<Arc<dyn PodQuery>> {
+        self.inner.read().ok().and_then(|g| g.query.clone())
+    }
+
+    pub fn delete(&self) -> Option<Arc<dyn GcPodDeleteSink>> {
+        self.inner.read().ok().and_then(|g| g.delete.clone())
     }
 }
 
@@ -111,11 +119,11 @@ pub trait SideEffect: Send + Sync {
     /// Apply this side effect. Returns Ok(()) on success.
     ///
     /// Error is handled according to the hook's `ErrorPolicy`.
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()>;
+    async fn apply(&self, resource: &Value) -> Result<()>;
 
     /// Apply delete-specific side effects for a resource that has already
     /// been hard-deleted from the datastore.
-    async fn apply_delete(&self, _resource: &Value, _db: &dyn DatastoreBackend) -> Result<()> {
+    async fn apply_delete(&self, _resource: &Value) -> Result<()> {
         Ok(())
     }
 }
@@ -134,7 +142,7 @@ pub struct SideEffectFailure {
 /// Registry mapping (apiVersion, kind) to side-effect hooks.
 pub struct SideEffectRegistry {
     hooks: HashMap<(&'static str, &'static str), Vec<Hook>>,
-    pod_repository: PodRepositorySlot,
+    pod_ports: PodSideEffectPortsSlot,
     controller_dispatcher: ControllerDispatcherSlot,
 }
 
@@ -143,16 +151,14 @@ impl SideEffectRegistry {
     pub fn new() -> Self {
         Self {
             hooks: HashMap::new(),
-            pod_repository: PodRepositorySlot::new(),
+            pod_ports: PodSideEffectPortsSlot::new(),
             controller_dispatcher: ControllerDispatcherSlot::new(),
         }
     }
 
-    /// Borrow the (potentially-empty) shared `PodRepository` slot. Side
-    /// effects clone this at construction time and resolve the repository
-    /// at `apply` time — see `pdb.rs` and `resource_quota.rs`.
-    pub fn pod_repository_slot(&self) -> PodRepositorySlot {
-        self.pod_repository.clone()
+    /// Borrow the potentially-empty focused Pod capability slot.
+    pub fn pod_ports_slot(&self) -> PodSideEffectPortsSlot {
+        self.pod_ports.clone()
     }
 
     /// Borrow the shared controller-dispatcher slot used by side effects that
@@ -161,11 +167,9 @@ impl SideEffectRegistry {
         self.controller_dispatcher.clone()
     }
 
-    /// Late-bind the process-wide `PodRepository`. Bootstrap calls this
-    /// once after `PodRepository::new` returns; before that, side effects
-    /// that look up the slot will see `None` and degrade to a debug log.
-    pub fn set_pod_repository(&self, repository: Arc<PodRepository>) {
-        self.pod_repository.set(repository);
+    /// Late-bind the focused Pod query and actor-owned deletion capabilities.
+    pub fn set_pod_ports(&self, query: Arc<dyn PodQuery>, delete: Arc<dyn GcPodDeleteSink>) {
+        self.pod_ports.set(query, delete);
     }
 
     /// Late-bind the process-wide controller dispatcher. Bootstrap calls this
@@ -196,9 +200,8 @@ impl SideEffectRegistry {
     pub async fn run_hooks_collect_failures(
         &self,
         resource: &Value,
-        db: &dyn DatastoreBackend,
     ) -> (Vec<SideEffectFailure>, bool) {
-        self.run_hooks_collect_failures_matching(resource, db, |_| true)
+        self.run_hooks_collect_failures_matching(resource, |_| true)
             .await
     }
 
@@ -206,10 +209,9 @@ impl SideEffectRegistry {
     pub async fn run_named_hook_collect_failures(
         &self,
         resource: &Value,
-        db: &dyn DatastoreBackend,
         hook_name: &'static str,
     ) -> (Vec<SideEffectFailure>, bool) {
-        self.run_hooks_collect_failures_matching(resource, db, |hook| {
+        self.run_hooks_collect_failures_matching(resource, |hook| {
             hook.side_effect.name() == hook_name
         })
         .await
@@ -218,7 +220,6 @@ impl SideEffectRegistry {
     async fn run_hooks_collect_failures_matching(
         &self,
         resource: &Value,
-        db: &dyn DatastoreBackend,
         should_run: impl Fn(&Hook) -> bool,
     ) -> (Vec<SideEffectFailure>, bool) {
         let api_version = resource
@@ -235,7 +236,7 @@ impl SideEffectRegistry {
                 if !should_run(hook) {
                     continue;
                 }
-                match hook.side_effect.apply(resource, db).await {
+                match hook.side_effect.apply(resource).await {
                     Err(e) => {
                         failures.push(SideEffectFailure {
                             hook: hook.side_effect.name(),
@@ -276,8 +277,8 @@ impl SideEffectRegistry {
     }
 
     /// Run all registered hooks for a resource type.
-    pub async fn run_hooks(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let (failures, fatal) = self.run_hooks_collect_failures(resource, db).await;
+    pub async fn run_hooks(&self, resource: &Value) -> Result<()> {
+        let (failures, fatal) = self.run_hooks_collect_failures(resource).await;
         if fatal {
             if let Some(error) = failures.into_iter().next() {
                 anyhow::bail!(error.error)
@@ -292,7 +293,6 @@ impl SideEffectRegistry {
     pub async fn run_delete_hooks_collect_failures(
         &self,
         resource: &Value,
-        db: &dyn DatastoreBackend,
     ) -> (Vec<SideEffectFailure>, bool) {
         let api_version = resource
             .get("apiVersion")
@@ -304,7 +304,7 @@ impl SideEffectRegistry {
         let mut fatal = false;
         if let Some(hooks) = self.hooks.get(&key) {
             for hook in hooks {
-                match hook.side_effect.apply_delete(resource, db).await {
+                match hook.side_effect.apply_delete(resource).await {
                     Ok(()) => {
                         tracing::debug!(
                             side_effect = %hook.side_effect.name(),
@@ -350,12 +350,8 @@ impl SideEffectRegistry {
     }
 
     /// Run all registered delete hooks for a resource type.
-    pub async fn run_delete_hooks(
-        &self,
-        resource: &Value,
-        db: &dyn DatastoreBackend,
-    ) -> Result<()> {
-        let (failures, fatal) = self.run_delete_hooks_collect_failures(resource, db).await;
+    pub async fn run_delete_hooks(&self, resource: &Value) -> Result<()> {
+        let (failures, fatal) = self.run_delete_hooks_collect_failures(resource).await;
         if fatal {
             if let Some(error) = failures.into_iter().next() {
                 anyhow::bail!(error.error)
@@ -390,14 +386,13 @@ mod tests {
             self.name
         }
 
-        async fn apply(&self, _resource: &Value, _db: &dyn DatastoreBackend) -> Result<()> {
+        async fn apply(&self, _resource: &Value) -> Result<()> {
             Ok(())
         }
     }
 
     #[tokio::test]
     async fn test_registry_runs_hooks_in_order() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let mut registry = SideEffectRegistry::new();
 
         registry.register(
@@ -414,13 +409,12 @@ mod tests {
         );
 
         let resource = json!({"apiVersion": "v1", "kind": "Test"});
-        let result = registry.run_hooks(&resource, db_handle.as_ref()).await;
+        let result = registry.run_hooks(&resource).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_registry_ignores_unknown_resource_types() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let mut registry = SideEffectRegistry::new();
 
         registry.register(
@@ -431,7 +425,7 @@ mod tests {
         );
 
         let unknown = json!({"apiVersion": "v1", "kind": "Unknown"});
-        let result = registry.run_hooks(&unknown, db_handle.as_ref()).await;
+        let result = registry.run_hooks(&unknown).await;
         assert!(result.is_ok());
     }
 
@@ -445,12 +439,11 @@ mod tests {
                 "failing"
             }
 
-            async fn apply(&self, _resource: &Value, _db: &dyn DatastoreBackend) -> Result<()> {
+            async fn apply(&self, _resource: &Value) -> Result<()> {
                 anyhow::bail!("intentional failure")
             }
         }
 
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let mut registry = SideEffectRegistry::new();
 
         registry.register(
@@ -461,7 +454,7 @@ mod tests {
         );
 
         let resource = json!({"apiVersion": "v1", "kind": "Test"});
-        let result = registry.run_hooks(&resource, db_handle.as_ref()).await;
+        let result = registry.run_hooks(&resource).await;
         // Warn policy continues despite failure
         assert!(result.is_ok());
     }
@@ -479,7 +472,7 @@ mod tests {
             service_ipam,
         ));
         let metrics = crate::side_effects::SideEffectMetrics::new();
-        let registry = crate::side_effects::default_registry(
+        let registry = crate::side_effect_registry_composition::default_registry(
             metrics,
             None,
             Some(task_supervisor.clone()),
@@ -528,10 +521,7 @@ mod tests {
         .await
         .unwrap();
 
-        registry
-            .run_hooks(&node.data, db_handle.as_ref())
-            .await
-            .unwrap();
+        registry.run_hooks(&node.data).await.unwrap();
 
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert_eq!(

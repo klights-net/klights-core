@@ -5,10 +5,10 @@
 //! - API version is v1 (core) not apps/v1
 //! - Otherwise functionally identical to ReplicaSet
 
-use crate::datastore::DatastoreBackend;
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::{Context as _, Result};
+use async_trait::async_trait;
 use futures::future::{poll_fn, select_all};
+use klights_pod_api::{PodListRequest, PodQuery};
 use klights_types::LabelSelector;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -17,18 +17,55 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::Poll;
 
+#[async_trait]
+pub trait ReplicationControllerStore:
+    crate::controllers::gc::GcResourceStore + Send + Sync
+{
+    async fn get_replication_controller(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<klights_cluster_core::Resource>>;
+    async fn list_resource_quotas(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<klights_cluster_core::Resource>>;
+    async fn update_replication_controller_status(
+        &self,
+        resource: &klights_cluster_core::Resource,
+        status: Value,
+    ) -> Result<()>;
+}
+
+#[async_trait]
+pub trait ReplicationControllerPodMutation: Send + Sync {
+    async fn create_replication_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> Result<klights_cluster_core::Resource>;
+    async fn replace_replication_controller_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> Result<klights_cluster_core::Resource>;
+}
+
 type ReplicationControllerReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
 type PodCreateFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<crate::datastore::Resource>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<klights_cluster_core::Resource>> + Send + 'a>>;
 
 enum ScaleUpPollResult {
     Status(Result<()>),
-    Create(Result<crate::datastore::Resource>),
+    Create(Result<klights_cluster_core::Resource>),
 }
 
 struct ScaleUpProgress<'state, 'future> {
     in_flight_creates: &'state mut Vec<PodCreateFuture<'future>>,
-    owned_pods: &'state mut Vec<crate::datastore::Resource>,
+    owned_pods: &'state mut Vec<klights_cluster_core::Resource>,
     created_in_reconcile: &'state mut usize,
     creation_failure: &'state mut Option<String>,
 }
@@ -58,12 +95,29 @@ fn is_controller_owner_ref(owner_ref: &Value) -> bool {
         .unwrap_or(false)
 }
 
+async fn list_replication_controller_pods(
+    pod_query: &(impl PodQuery + ?Sized),
+    namespace: &str,
+) -> Result<Vec<klights_cluster_core::Resource>> {
+    let result = pod_query
+        .list_pods(PodListRequest::try_new(
+            Some(namespace.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )?)
+        .await?;
+    Ok(result.into_parts().0)
+}
+
 /// Reconcile a ReplicationController to match desired state
 pub async fn reconcile_replicationcontroller(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    db: &(impl ReplicationControllerStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
+    pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -75,10 +129,7 @@ pub async fn reconcile_replicationcontroller(
     let reconcile_lock = replicationcontroller_reconcile_lock(namespace, rc_name).await;
     let _reconcile_guard = reconcile_lock.lock().await;
 
-    let live_resource = match db
-        .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
-        .await?
-    {
+    let live_resource = match db.get_replication_controller(namespace, rc_name).await? {
         Some(resource) => resource,
         None => return Ok(()),
     };
@@ -87,15 +138,13 @@ pub async fn reconcile_replicationcontroller(
         db,
         live_resource.clone(),
         pod_delete_sink,
+        non_pod_finalization,
     )
     .await?
     {
         crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
         crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
-            match db
-                .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
-                .await?
-            {
+            match db.get_replication_controller(namespace, rc_name).await? {
                 Some(resource) => resource,
                 None => return Ok(()),
             }
@@ -103,8 +152,10 @@ pub async fn reconcile_replicationcontroller(
         _ => live_resource,
     };
 
-    let rc =
-        crate::api::inject_resource_version(live_resource.data, live_resource.resource_version);
+    let rc = crate::controllers::resource_projection::with_resource_version(
+        live_resource.data,
+        live_resource.resource_version,
+    );
 
     if rc.pointer("/metadata/deletionTimestamp").is_some() {
         return Ok(());
@@ -131,12 +182,10 @@ pub async fn reconcile_replicationcontroller(
     let template = &rc["spec"]["template"];
 
     // Find all pods matching selector
-    let all_pods_result = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
-        .await?;
+    let all_pods = list_replication_controller_pods(pod_reader, namespace).await?;
 
     let mut owned_pods = Vec::new();
-    for pod in all_pods_result.items {
+    for pod in all_pods {
         let matches_selector = pod_matches_selector(&pod.data, &selector);
 
         // Check if pod is owned by this RC
@@ -167,7 +216,11 @@ pub async fn reconcile_replicationcontroller(
                     })
                     .collect();
                 pod_writer
-                    .update_pod_owner_references(namespace, &pod.name.clone(), released_refs)
+                    .replace_replication_controller_pod_owner_references(
+                        namespace,
+                        &pod.name.clone(),
+                        released_refs,
+                    )
                     .await?;
             }
             continue;
@@ -187,7 +240,11 @@ pub async fn reconcile_replicationcontroller(
             owner_refs.push(owner_ref);
 
             pod_writer
-                .update_pod_owner_references(namespace, &pod.name.clone(), owner_refs)
+                .replace_replication_controller_pod_owner_references(
+                    namespace,
+                    &pod.name.clone(),
+                    owner_refs,
+                )
                 .await?;
 
             owned_pods.push(pod);
@@ -214,9 +271,7 @@ pub async fn reconcile_replicationcontroller(
                     && current_replicas + created_in_reconcile + in_flight_creates.len()
                         < desired_replicas
                 {
-                    let Some(live_rc) = db
-                        .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
-                        .await?
+                    let Some(live_rc) = db.get_replication_controller(namespace, rc_name).await?
                     else {
                         return Ok(());
                     };
@@ -289,10 +344,7 @@ pub async fn reconcile_replicationcontroller(
     } else if current_replicas > desired_replicas {
         let to_delete = current_replicas - desired_replicas;
         for (deleted, pod) in active_pods.iter().take(to_delete).enumerate() {
-            let Some(live_rc) = db
-                .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
-                .await?
-            else {
+            let Some(live_rc) = db.get_replication_controller(namespace, rc_name).await? else {
                 return Ok(());
             };
             if live_rc
@@ -311,25 +363,24 @@ pub async fn reconcile_replicationcontroller(
             if current_replicas.saturating_sub(deleted) <= live_replicas {
                 break;
             }
-            pod_writer.delete_pod(namespace, &pod.name.clone()).await?;
+            pod_delete_sink
+                .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                    klights_types::PodIdentity::new(namespace, &pod.name, &pod.uid),
+                ))
+                .await?;
         }
     }
 
     // Re-query owned pods after scale operations to get fresh state.
-    let mut current_owned_pods = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
+    let mut current_owned_pods = list_replication_controller_pods(pod_reader, namespace)
         .await?
-        .items
         .into_iter()
         .filter(|pod| {
             common.is_owned_by(&pod.data, rc_uid) && pod_matches_selector(&pod.data, &selector)
         })
         .collect::<Vec<_>>();
 
-    let Some(live_rc) = db
-        .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
-        .await?
-    else {
+    let Some(live_rc) = db.get_replication_controller(namespace, rc_name).await? else {
         return Ok(());
     };
     if live_rc
@@ -348,19 +399,21 @@ pub async fn reconcile_replicationcontroller(
     let active_after_scale = active_replicationcontroller_pods(&current_owned_pods);
     if active_after_scale.len() > live_desired_replicas {
         let surplus = active_after_scale.len() - live_desired_replicas;
-        let surplus_pod_names = active_after_scale
+        let surplus_pods = active_after_scale
             .iter()
             .take(surplus)
-            .map(|pod| pod.name.clone())
+            .map(|pod| (pod.name.clone(), pod.uid.clone()))
             .collect::<Vec<_>>();
         drop(active_after_scale);
-        for pod_name in surplus_pod_names {
-            pod_writer.delete_pod(namespace, &pod_name).await?;
+        for (pod_name, pod_uid) in surplus_pods {
+            pod_delete_sink
+                .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                    klights_types::PodIdentity::new(namespace, &pod_name, &pod_uid),
+                ))
+                .await?;
         }
-        current_owned_pods = pod_reader
-            .list_pods(Some(namespace), None, None, None, None)
+        current_owned_pods = list_replication_controller_pods(pod_reader, namespace)
             .await?
-            .items
             .into_iter()
             .filter(|pod| {
                 common.is_owned_by(&pod.data, rc_uid) && pod_matches_selector(&pod.data, &selector)
@@ -401,26 +454,18 @@ fn should_publish_scale_up_progress(
 }
 
 async fn scale_up_create_concurrency_limit(
-    db: &dyn DatastoreBackend,
+    db: &(impl ReplicationControllerStore + ?Sized),
     namespace: &str,
     template: &Value,
 ) -> Result<usize> {
-    let quota_list = db
-        .list_resources(
-            "v1",
-            "ResourceQuota",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let quota_list = db.list_resource_quotas(namespace).await?;
 
-    if quota_list.items.is_empty() {
+    if quota_list.is_empty() {
         return Ok(RC_SCALE_UP_MAX_IN_FLIGHT);
     }
 
     let quota_probe_pod = quota_probe_pod_from_template(namespace, template);
     let has_matching_pod_quota = quota_list
-        .items
         .iter()
         .any(|quota| resource_quota_constrains_pod_creates(&quota.data, &quota_probe_pod));
     Ok(if has_matching_pod_quota {
@@ -496,8 +541,8 @@ fn pod_has_controller_owner(pod: &Value) -> bool {
 }
 
 fn active_replicationcontroller_pods(
-    pods: &[crate::datastore::Resource],
-) -> Vec<&crate::datastore::Resource> {
+    pods: &[klights_cluster_core::Resource],
+) -> Vec<&klights_cluster_core::Resource> {
     pods.iter()
         .filter(|p| {
             p.data["metadata"]["deletionTimestamp"].is_null()
@@ -509,13 +554,13 @@ fn active_replicationcontroller_pods(
 
 /// Create a pod from RC template
 async fn create_pod(
-    pod_writer: &dyn PodObjectWriter,
+    pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     rc_name: &str,
     rc_uid: &str,
     namespace: &str,
     node_name: &str,
     template: &Value,
-) -> Result<crate::datastore::Resource> {
+) -> Result<klights_cluster_core::Resource> {
     let pod_name = format!(
         "{}-{}",
         rc_name,
@@ -541,17 +586,17 @@ async fn create_pod(
     )?;
 
     let created = pod_writer
-        .create_controller_pod(namespace, &pod_name, node_name, pod)
+        .create_replication_controller_pod(namespace, &pod_name, node_name, pod)
         .await?;
 
     Ok(created)
 }
 
 async fn update_replicationcontroller_status_while_polling_creates<'a>(
-    db: &dyn DatastoreBackend,
+    db: &(impl ReplicationControllerStore + ?Sized),
     name: &str,
     namespace: &str,
-    status_pods: Vec<crate::datastore::Resource>,
+    status_pods: Vec<klights_cluster_core::Resource>,
     progress: ScaleUpProgress<'_, 'a>,
 ) -> Result<()> {
     let ScaleUpProgress {
@@ -613,16 +658,16 @@ mod tests;
 /// clears it when all desired replicas are running. Conformance test
 /// P0-E2E-20260423-06 verifies the condition surfaces within the timeout.
 async fn update_replicationcontroller_status(
-    db: &dyn DatastoreBackend,
+    db: &(impl ReplicationControllerStore + ?Sized),
     name: &str,
     namespace: &str,
-    owned_pods: &[crate::datastore::Resource],
+    owned_pods: &[klights_cluster_core::Resource],
     creation_failure: Option<&str>,
 ) -> Result<()> {
     // Get current RC first so status update can preserve condition history and
     // report the currently observed generation.
     let rc = db
-        .get_resource("v1", "ReplicationController", Some(namespace), name)
+        .get_replication_controller(namespace, name)
         .await?
         .context("RC not found")?;
 
@@ -672,7 +717,7 @@ async fn update_replicationcontroller_status(
         "conditions": conditions
     });
 
-    crate::controllers::common::write_status_for_resource(db, &rc, &status).await?;
+    db.update_replication_controller_status(&rc, status).await?;
 
     Ok(())
 }

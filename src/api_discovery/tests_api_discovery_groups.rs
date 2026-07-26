@@ -103,8 +103,12 @@ async fn test_p0_8_crd_create_publishes_schema_to_openapi_v3_group_version() {
     .await
     .unwrap();
 
-    let v3 =
-        build_openapi_v3_group_version(&db, "crd-publish-openapi-test.example.com", "v1").await;
+    let v3 = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "crd-publish-openapi-test.example.com",
+        "v1",
+    )
+    .await;
 
     let schemas = v3["components"]["schemas"].as_object().unwrap();
     let has_testcr = schemas.keys().any(|k| k.contains("TestCR"));
@@ -115,7 +119,10 @@ async fn test_p0_8_crd_create_publishes_schema_to_openapi_v3_group_version() {
     );
 
     // The discovery endpoint must also list the group/version path
-    let discovery = openapi_v3_discovery_with_crds(&db).await;
+    let discovery = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let paths = discovery["paths"].as_object().unwrap();
     assert!(
         paths.contains_key("apis/crd-publish-openapi-test.example.com/v1"),
@@ -155,7 +162,7 @@ async fn crd_group_discovery_lists_all_served_versions_in_one_group() {
         .await;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    state.crd_registry = registry;
+    state.discovery_mut().crd_registry = registry;
     let app = crate::api::build_router(state);
 
     let response = app
@@ -218,7 +225,7 @@ async fn crd_group_by_name_lists_all_served_versions() {
     }
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    state.crd_registry = registry;
+    state.discovery_mut().crd_registry = registry;
     let app = crate::api::build_router(state);
 
     let response = app
@@ -274,7 +281,12 @@ async fn test_p0_8_crd_delete_removes_schema_from_openapi_v3_group_version() {
     .unwrap();
 
     // Verify schema appears before delete
-    let v3_before = build_openapi_v3_group_version(&db, "crd-delete-test.example.com", "v1").await;
+    let v3_before = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "crd-delete-test.example.com",
+        "v1",
+    )
+    .await;
     let schemas_before = v3_before["components"]["schemas"].as_object().unwrap();
     assert!(
         schemas_before.keys().any(|k| k.contains("DeleteMe")),
@@ -292,7 +304,12 @@ async fn test_p0_8_crd_delete_removes_schema_from_openapi_v3_group_version() {
     .unwrap();
 
     // Verify schema is GONE after delete
-    let v3_after = build_openapi_v3_group_version(&db, "crd-delete-test.example.com", "v1").await;
+    let v3_after = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "crd-delete-test.example.com",
+        "v1",
+    )
+    .await;
     let schemas_after = v3_after["components"]["schemas"].as_object().unwrap();
     assert!(
         !schemas_after.keys().any(|k| k.contains("DeleteMe")),
@@ -301,7 +318,10 @@ async fn test_p0_8_crd_delete_removes_schema_from_openapi_v3_group_version() {
     );
 
     // The discovery endpoint must also NOT list the group/version after delete
-    let discovery = openapi_v3_discovery_with_crds(&db).await;
+    let discovery = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let paths = discovery["paths"].as_object().unwrap();
     assert!(
         !paths.contains_key("apis/crd-delete-test.example.com/v1"),
@@ -334,7 +354,10 @@ async fn test_p0_8_crd_delete_removes_definition_from_openapi_v2() {
     .unwrap();
 
     // Verify definition appears before delete
-    let v2_before = openapi_v2(&db).await;
+    let v2_before = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let defs_before = v2_before["definitions"].as_object().unwrap();
     assert!(
         defs_before.keys().any(|k| k.contains("DeleteMeV2")),
@@ -352,7 +375,10 @@ async fn test_p0_8_crd_delete_removes_definition_from_openapi_v2() {
     .unwrap();
 
     // Verify definition is GONE
-    let v2_after = openapi_v2(&db).await;
+    let v2_after = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let defs_after = v2_after["definitions"].as_object().unwrap();
     assert!(
         !defs_after.keys().any(|k| k.contains("DeleteMeV2")),
@@ -386,7 +412,12 @@ async fn test_p0_8_crd_update_replaces_schema_in_openapi_v3() {
         .unwrap();
 
     // Verify old schema is present
-    let v3_before = build_openapi_v3_group_version(&db, "crd-update-test.example.com", "v1").await;
+    let v3_before = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "crd-update-test.example.com",
+        "v1",
+    )
+    .await;
     let schemas_before = v3_before["components"]["schemas"].as_object().unwrap();
     let key_before = schemas_before
         .keys()
@@ -419,7 +450,12 @@ async fn test_p0_8_crd_update_replaces_schema_in_openapi_v3() {
     .unwrap();
 
     // After UPDATE: schema must reflect new properties
-    let v3_after = build_openapi_v3_group_version(&db, "crd-update-test.example.com", "v1").await;
+    let v3_after = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "crd-update-test.example.com",
+        "v1",
+    )
+    .await;
     let schemas_after = v3_after["components"]["schemas"].as_object().unwrap();
     let key_after = schemas_after
         .keys()
@@ -486,7 +522,10 @@ async fn test_p0_8_openapi_v2_preserves_x_kubernetes_preserve_unknown_fields() {
     .unwrap();
 
     // Use stripped helper (not openapi_v2() directly) because the strip happens in HTTP handler.
-    let spec = get_openapi_v2_stripped(&db).await;
+    let spec = get_openapi_v2_stripped(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = spec["definitions"].as_object().unwrap();
 
     let def_name = definitions
@@ -558,7 +597,10 @@ async fn test_p0_8_openapi_v2_served_false_removes_definition() {
         .unwrap();
 
     // Both versions must appear in /openapi/v2
-    let v2_before = openapi_v2(&db).await;
+    let v2_before = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let defs_before = v2_before["definitions"].as_object().unwrap();
     assert!(
         defs_before
@@ -613,7 +655,10 @@ async fn test_p0_8_openapi_v2_served_false_removes_definition() {
     .unwrap();
 
     // After UPDATE: v5 stays, v6alpha1 must be gone from /openapi/v2
-    let v2_after = openapi_v2(&db).await;
+    let v2_after = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let defs_after = v2_after["definitions"].as_object().unwrap();
     assert!(
         defs_after
@@ -672,7 +717,12 @@ async fn test_p0_8_openapi_v3_preserves_x_kubernetes_preserve_unknown_fields() {
     .await
     .unwrap();
 
-    let v3 = build_openapi_v3_group_version(&db, "preserve3.example.com", "v1").await;
+    let v3 = build_openapi_v3_group_version(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "preserve3.example.com",
+        "v1",
+    )
+    .await;
     let schemas = v3["components"]["schemas"]
         .as_object()
         .expect("schemas must exist");
@@ -738,7 +788,10 @@ async fn test_p0_8_crd_version_remove_removes_schema_from_openapi_v3() {
         .unwrap();
 
     // Both v1 and v2 appear in discovery
-    let disc_before = openapi_v3_discovery_with_crds(&db).await;
+    let disc_before = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let paths_before = disc_before["paths"].as_object().unwrap();
     assert!(
         paths_before.contains_key("apis/ver-remove-test.example.com/v1"),
@@ -781,7 +834,10 @@ async fn test_p0_8_crd_version_remove_removes_schema_from_openapi_v3() {
     .unwrap();
 
     // After UPDATE: only v1 appears; v2 must be gone from discovery
-    let disc_after = openapi_v3_discovery_with_crds(&db).await;
+    let disc_after = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let paths_after = disc_after["paths"].as_object().unwrap();
     assert!(
         paths_after.contains_key("apis/ver-remove-test.example.com/v1"),
@@ -831,7 +887,10 @@ async fn test_p0_8_openapi_v2_strips_preserve_unknown_fields_from_empty_schema()
     .await
     .unwrap();
 
-    let spec = get_openapi_v2_stripped(&db).await;
+    let spec = get_openapi_v2_stripped(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let def_key = "com.example.empty-schema.v1.Foo";
     let def = spec
         .pointer(&format!("/definitions/{}", def_key))

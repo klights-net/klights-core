@@ -392,7 +392,6 @@ fn map_committed_apply_error(error: anyhow::Error) -> CommittedApplyError {
     if lower.contains("unsupported")
         || lower.contains("does not support")
         || lower.contains("does not implement")
-        || lower.contains("assignment mode")
     {
         CommittedApplyError::UnsupportedMode { message }
     } else if lower.contains("corrupt")
@@ -569,10 +568,7 @@ impl DurableAllocatorRead for DatastoreDurableAllocatorRead {
                 .read_durable_allocator_observation()
                 .await
                 .map_err(map_allocator_error)?;
-            DurableAllocatorState::try_new(
-                observation.resource_version_assignment,
-                observation.position,
-            )
+            DurableAllocatorState::try_new(observation.position)
         })
     }
 }
@@ -585,7 +581,6 @@ fn map_allocator_error(error: anyhow::Error) -> AllocatorStateError {
     } else if lower.contains("unsupported")
         || lower.contains("does not support")
         || lower.contains("does not implement")
-        || lower.contains("assignment mode")
     {
         AllocatorStateError::UnsupportedMode { message }
     } else if lower.contains("cancel") {
@@ -608,30 +603,26 @@ pub(crate) struct DatastoreAuthoritativeSnapshotPersistence {
 }
 
 impl DatastoreAuthoritativeSnapshotPersistence {
-    pub(crate) fn new_capture(db: DatastoreHandle) -> Self {
-        Self::from_legacy_handle(db)
-    }
-
     pub(crate) fn new(
         db: DatastoreHandle,
         _authority: crate::datastore::raft::SnapshotInstallAuthority,
     ) -> Self {
-        Self::from_legacy_handle(db)
+        Self::from_handle(db)
     }
 
     #[cfg(test)]
     fn new_for_test(db: DatastoreHandle) -> Self {
-        Self::from_legacy_handle(db)
+        Self::from_handle(db)
     }
 
-    fn from_legacy_handle(db: DatastoreHandle) -> Self {
+    fn from_handle(db: DatastoreHandle) -> Self {
         let recovery = std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
             db.clone(),
         ));
         Self { db, recovery }
     }
 
-    pub(crate) async fn restore_legacy_raft_snapshot(
+    pub(crate) async fn restore_authoritative_raft_snapshot(
         &self,
         data: crate::datastore::raft::snapshot::RaftSnapshotData,
     ) -> anyhow::Result<()> {
@@ -647,7 +638,7 @@ impl DatastoreAuthoritativeSnapshotPersistence {
         };
         self.db
             .replace_replicated_resource_state(
-                data.commits,
+                data.operations,
                 data.current_rv,
                 data.watch_event_high_water,
                 data.watch_replay_floors,
@@ -660,9 +651,7 @@ impl DatastoreAuthoritativeSnapshotPersistence {
                         .as_ref()
                         .map_or(0, |metadata| metadata.leader_epoch),
                     membership,
-                    resource_version_assignment_mode: None,
                     command_codec_activation_version: data.command_codec_activation_version,
-                    snapshot_assignment_mode: Some(data.resource_version_assignment_mode),
                 }),
             )
             .await
@@ -676,17 +665,13 @@ impl AuthoritativeSnapshotPersistence for DatastoreAuthoritativeSnapshotPersiste
     ) -> SnapshotPersistenceFuture<'_> {
         Box::pin(async move {
             let mut parts = snapshot.into_parts();
-            let resource_version_assignment = parts.resource_version_assignment();
             let position = parts.position();
-            let commits = parts.take_commits();
+            let operations = parts.take_operations();
             let replay_floors = parts.take_replay_floors();
             let (metadata, membership) = parts.into_metadata_and_membership();
-            let snapshot_assignment_mode = resource_version_assignment.is_none().then_some(
-                crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot,
-            );
             self.db
                 .replace_replicated_resource_state(
-                    commits,
+                    operations,
                     metadata.current_rv,
                     position.map(|position| position.event_id),
                     replay_floors.map(|floors| {
@@ -737,9 +722,7 @@ impl AuthoritativeSnapshotPersistence for DatastoreAuthoritativeSnapshotPersiste
                                 crate::datastore::ReplicatedMembershipState::Present(value)
                             }
                         },
-                        resource_version_assignment_mode: resource_version_assignment,
                         command_codec_activation_version: None,
-                        snapshot_assignment_mode,
                     }),
                 )
                 .await
@@ -783,10 +766,10 @@ impl NormalizingSnapshotCaptureSession {
             return Ok(Some(first));
         }
 
-        let mut commits = first
-            .into_commits()
-            .expect("commit page kind must contain commits");
-        while commits.len() < self.page_limit {
+        let mut operations = first
+            .into_operations()
+            .expect("commit page kind must contain snapshot restore operations");
+        while operations.len() < self.page_limit {
             let Some(next) = self.inner.next_page().await? else {
                 break;
             };
@@ -795,21 +778,21 @@ impl NormalizingSnapshotCaptureSession {
                 break;
             }
 
-            let remaining = self.page_limit - commits.len();
-            let mut next_commits = next
-                .into_commits()
-                .expect("commit page kind must contain commits");
-            if next_commits.len() <= remaining {
-                commits.append(&mut next_commits);
+            let remaining = self.page_limit - operations.len();
+            let mut next_operations = next
+                .into_operations()
+                .expect("commit page kind must contain snapshot restore operations");
+            if next_operations.len() <= remaining {
+                operations.append(&mut next_operations);
                 continue;
             }
 
-            let remainder = next_commits.split_off(remaining);
-            commits.append(&mut next_commits);
-            self.buffered = Some(SnapshotCapturePage::try_commits(remainder)?);
+            let remainder = next_operations.split_off(remaining);
+            operations.append(&mut next_operations);
+            self.buffered = Some(SnapshotCapturePage::try_operations(remainder)?);
             break;
         }
-        Ok(Some(SnapshotCapturePage::try_commits(commits)?))
+        Ok(Some(SnapshotCapturePage::try_operations(operations)?))
     }
 }
 
@@ -881,8 +864,6 @@ fn map_snapshot_persistence_error(error: anyhow::Error) -> SnapshotPersistenceEr
     } else if lower.contains("unsupported")
         || lower.contains("does not support")
         || lower.contains("does not implement")
-        || lower.contains("cannot downgrade")
-        || lower.contains("assignment mode")
     {
         SnapshotPersistenceError::UnsupportedMode { message }
     } else if lower.contains("cancel") {
@@ -968,8 +949,7 @@ mod tests {
         ClusterMembership, ClusterMetadata, LogApplyAppliedOutboxRow, LogApplyCommit,
         LogApplyMutation, LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow,
         LogApplyPodCleanupIntentRow, LogApplyResourceRow, LogApplyWatchEventRow,
-        NoPublicChangeReason, OutboxStreamWatermark, ResourceVersionAssignment,
-        WatchReplayPosition,
+        NoPublicChangeReason, OutboxStreamWatermark, SnapshotRestoreOperation, WatchReplayPosition,
     };
     use klights_cluster_store::{
         AppliedOutboxLookup, AuthoritativeSnapshot, AuthoritativeSnapshotCapture,
@@ -1076,15 +1056,16 @@ mod tests {
     async fn normalizing_session_coalesces_commits_with_one_bounded_remainder() {
         let page_limit = 256;
         let commit_page = |start: i64| {
-            SnapshotCapturePage::try_commits(
+            SnapshotCapturePage::try_operations(
                 (start..start + 200)
-                    .map(|resource_version| LogApplyCommit::new(resource_version, Vec::new()))
+                    .map(|resource_version| {
+                        SnapshotRestoreOperation::new(resource_version, None, Vec::new())
+                    })
                     .collect(),
             )
             .unwrap()
         };
         let header = SnapshotCaptureHeader::try_new(
-            Some(ResourceVersionAssignment::LegacyLeaderAssigned),
             None,
             WatchReplayPosition {
                 resource_version: 600,
@@ -1121,7 +1102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_raft_restore_replaces_divergent_metadata_and_authoritative_absence() {
+    async fn raft_restore_replaces_divergent_metadata_and_authoritative_absence() {
         let destination = Datastore::new_in_memory().await.unwrap();
         destination
             .replace_replicated_resource_state(
@@ -1140,11 +1121,7 @@ mod tests {
                             leader_hint: Some("stale-cp".into()),
                         },
                     ),
-                    resource_version_assignment_mode: Some(
-                        ResourceVersionAssignment::CommittedApplyV1,
-                    ),
                     command_codec_activation_version: None,
-                    snapshot_assignment_mode: None,
                 }),
             )
             .await
@@ -1152,14 +1129,10 @@ mod tests {
         let restore =
             DatastoreAuthoritativeSnapshotPersistence::new_for_test(Arc::new(destination.clone()));
         restore
-            .restore_legacy_raft_snapshot(crate::datastore::raft::snapshot::RaftSnapshotData {
+            .restore_authoritative_raft_snapshot(crate::datastore::raft::snapshot::RaftSnapshotData {
                 last_applied: None,
                 membership: openraft::StoredMembership::default(),
                 current_rv: 5,
-                resource_version_assignment_mode:
-                    crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
-                        ResourceVersionAssignment::CommittedApplyV1,
-                    ),
                 command_codec_activation_version: None,
                 watch_event_high_water: Some(0),
                 watch_replay_floors: Some(Vec::new()),
@@ -1171,7 +1144,7 @@ mod tests {
                 cluster_membership: Some(
                     crate::datastore::raft::snapshot::RaftSnapshotMembership::AuthoritativeAbsent,
                 ),
-                commits: Vec::new(),
+                operations: Vec::new(),
             })
             .await
             .unwrap();
@@ -1204,7 +1177,7 @@ mod tests {
         ));
         assert!(matches!(
             map_snapshot_persistence_error(anyhow::anyhow!(
-                "cannot downgrade committed apply assignment mode"
+                "redb backend does not support authoritative snapshot restore"
             )),
             SnapshotPersistenceError::UnsupportedMode { .. }
         ));
@@ -1263,12 +1236,6 @@ mod tests {
         let db = Datastore::new_in_memory()
             .await
             .expect("in-memory datastore");
-        db.set_klights_meta(
-            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-            klights_cluster_core::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-        )
-        .await
-        .expect("enable committed apply V1");
         let handle: DatastoreHandle = Arc::new(db.clone()) as Arc<dyn DatastoreBackend>;
         (
             db,
@@ -1278,7 +1245,7 @@ mod tests {
     }
 
     fn committed_v1(mutations: Vec<LogApplyMutation>) -> LogApplyCommit {
-        LogApplyCommit::new(0, mutations).into_committed_apply_v1_template()
+        LogApplyCommit::try_new(mutations).expect("test commit must be an RV-zero live template")
     }
 
     fn status_commit(
@@ -1287,51 +1254,53 @@ mod tests {
         status_stamp: i64,
         stream_seq: i64,
     ) -> LogApplyCommit {
-        let mut commit = committed_v1(vec![
-            LogApplyMutation::PutResource(LogApplyResourceRow {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                name: "adapter-status".to_string(),
-                uid: "adapter-status-uid".to_string(),
-                resource_version: 0,
-                data: json!({
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "metadata": {
-                        "namespace": "default",
-                        "name": "adapter-status",
-                        "uid": "adapter-status-uid"
-                    },
-                    "status": {"phase": "Running", "message": status_message}
+        LogApplyCommit::try_new_with_watermark(
+            vec![
+                LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "adapter-status".to_string(),
+                    uid: "adapter-status-uid".to_string(),
+                    resource_version: 0,
+                    data: json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "namespace": "default",
+                            "name": "adapter-status",
+                            "uid": "adapter-status-uid"
+                        },
+                        "status": {"phase": "Running", "message": status_message}
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some("adapter-status-uid".to_string()),
+                    precondition_resource_version: None,
+                    status_only: true,
                 }),
-                require_absent: false,
-                require_existing: true,
-                precondition_uid: Some("adapter-status-uid".to_string()),
-                precondition_resource_version: None,
-                status_only: true,
+                LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
+                    idempotency_key: idempotency_key.to_string(),
+                    subject_key: "v1/Pod/default/adapter-status/adapter-status-uid".to_string(),
+                    operation: "PodStatus".to_string(),
+                    first_seen_ms: status_stamp,
+                    applied_rv: None,
+                    result_proto: crate::storage_wire_codec::encode_response_protobuf(
+                        &crate::datastore::command::StorageResponse::Ack {
+                            resource_version: 0,
+                        },
+                    )
+                    .expect("encode applied-outbox acknowledgement"),
+                    status_stamp: Some(status_stamp),
+                }),
+            ],
+            Some(OutboxStreamWatermark {
+                client_id: "adapter-worker".to_string(),
+                stream_id: 11,
+                stream_seq,
             }),
-            LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
-                idempotency_key: idempotency_key.to_string(),
-                subject_key: "v1/Pod/default/adapter-status/adapter-status-uid".to_string(),
-                operation: "PodStatus".to_string(),
-                first_seen_ms: status_stamp,
-                applied_rv: None,
-                result_proto: crate::storage_wire_codec::encode_response_protobuf(
-                    &crate::datastore::command::StorageResponse::Ack {
-                        resource_version: 0,
-                    },
-                )
-                .expect("encode applied-outbox acknowledgement"),
-                status_stamp: Some(status_stamp),
-            }),
-        ]);
-        commit.outbox_watermark = Some(OutboxStreamWatermark {
-            client_id: "adapter-worker".to_string(),
-            stream_id: 11,
-            stream_seq,
-        });
-        commit
+        )
+        .expect("status commit must be an RV-zero live template")
     }
 
     async fn adapter_pod(reader: &DatastoreClusterResourceRead) -> klights_cluster_core::Resource {
@@ -2015,8 +1984,16 @@ mod tests {
             .expect("in-memory datastore");
         db.replace_replicated_resource_state(
             vec![
-                LogApplyCommit::new(100, vec![snapshot_watch_event(1, 100, "higher-rv")]),
-                LogApplyCommit::new(50, vec![snapshot_watch_event(2, 50, "later-lower-rv")]),
+                SnapshotRestoreOperation::new(
+                    100,
+                    None,
+                    vec![snapshot_watch_event(1, 100, "higher-rv")],
+                ),
+                SnapshotRestoreOperation::new(
+                    50,
+                    None,
+                    vec![snapshot_watch_event(2, 50, "later-lower-rv")],
+                ),
             ],
             100,
             Some(5),
@@ -2025,11 +2002,7 @@ mod tests {
                 cluster_id: "history-cluster".to_string(),
                 leader_epoch: 1,
                 membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
-                resource_version_assignment_mode: Some(
-                    ResourceVersionAssignment::LegacyLeaderAssigned,
-                ),
                 command_codec_activation_version: None,
-                snapshot_assignment_mode: None,
             }),
         )
         .await
@@ -2095,10 +2068,6 @@ mod tests {
             .read_allocator_state()
             .await
             .expect("allocator state");
-        assert_eq!(
-            state.resource_version_assignment(),
-            ResourceVersionAssignment::LegacyLeaderAssigned
-        );
         assert_eq!(state.position().resource_version, 100);
         assert_eq!(state.position().event_id, 5);
         assert_eq!(state.next_resource_version(), 101);
@@ -2150,12 +2119,11 @@ mod tests {
             },
             "data": {"state": "leader"}
         });
-        let commits = vec![
-            LogApplyCommit {
-                resource_version: 7,
-                resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-                outbox_watermark: None,
-                mutations: vec![
+        let operations = vec![
+            SnapshotRestoreOperation::new(
+                7,
+                None,
+                vec![
                     LogApplyMutation::PutResource(LogApplyResourceRow {
                         api_version: "v1".to_string(),
                         kind: "ConfigMap".to_string(),
@@ -2181,18 +2149,21 @@ mod tests {
                         status_stamp: Some(44),
                     }),
                 ],
-            },
-            LogApplyCommit::new(6, vec![snapshot_watch_event(5, 6, "later-lower-rv")]),
-            LogApplyCommit {
-                resource_version: 7,
-                resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-                outbox_watermark: Some(OutboxStreamWatermark {
+            ),
+            SnapshotRestoreOperation::new(
+                6,
+                None,
+                vec![snapshot_watch_event(5, 6, "later-lower-rv")],
+            ),
+            SnapshotRestoreOperation::new(
+                7,
+                Some(OutboxStreamWatermark {
                     client_id: "worker-a".to_string(),
                     stream_id: 3,
                     stream_seq: 4,
                 }),
-                mutations: Vec::new(),
-            },
+                Vec::new(),
+            ),
         ];
         let floors = vec![
             DurableReplayFloor::all(1, 1, true).unwrap(),
@@ -2206,8 +2177,7 @@ mod tests {
             leader_hint: Some("https://cp-1:7446".to_string()),
         };
         let snapshot = AuthoritativeSnapshot::try_new(
-            commits,
-            Some(ResourceVersionAssignment::CommittedApplyV1),
+            operations,
             Some(WatchReplayPosition {
                 resource_version: 7,
                 event_id: 9,
@@ -2249,10 +2219,6 @@ mod tests {
         );
 
         let state = allocator.read_allocator_state().await.unwrap();
-        assert_eq!(
-            state.resource_version_assignment(),
-            ResourceVersionAssignment::CommittedApplyV1
-        );
         assert_eq!(state.position().resource_version, 7);
         assert_eq!(state.position().event_id, 9);
         assert_eq!(state.next_resource_version(), 8);
@@ -2331,99 +2297,6 @@ mod tests {
             db.current_watch_replay_position().await.unwrap().event_id,
             10
         );
-    }
-
-    #[tokio::test]
-    async fn rejected_snapshot_mode_downgrade_is_atomic_and_fail_closed() {
-        let db = Datastore::new_in_memory()
-            .await
-            .expect("in-memory datastore");
-        db.set_klights_meta(
-            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-            ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-        )
-        .await
-        .unwrap();
-        db.set_klights_meta(
-            crate::bootstrap::cluster_meta::KEY_CLUSTER_ID,
-            "destination-cluster",
-        )
-        .await
-        .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "8")
-            .await
-            .unwrap();
-        let preserved = db
-            .create_resource(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "preserved",
-                json!({"metadata": {"name": "preserved", "namespace": "default"}}),
-            )
-            .await
-            .unwrap();
-        let before_position = db.current_watch_replay_position().await.unwrap();
-        let handle: DatastoreHandle = Arc::new(db.clone()) as Arc<dyn DatastoreBackend>;
-        let restore = DatastoreAuthoritativeSnapshotPersistence::new_for_test(handle.clone());
-        let allocator = DatastoreDurableAllocatorRead::new(handle);
-        for (name, assignment) in [
-            ("absent legacy field", None),
-            (
-                "explicit legacy mode",
-                Some(ResourceVersionAssignment::LegacyLeaderAssigned),
-            ),
-        ] {
-            let downgrade = AuthoritativeSnapshot::try_new(
-                Vec::new(),
-                assignment,
-                Some(WatchReplayPosition::default()),
-                Some(Vec::new()),
-                ClusterMetadata {
-                    cluster_id: "source-cluster".to_string(),
-                    leader_epoch: 1,
-                    current_rv: 0,
-                },
-                SnapshotMembership::AuthoritativeAbsent,
-            )
-            .unwrap();
-            let error = restore
-                .restore_authoritative_snapshot(downgrade)
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("cannot downgrade"), "{name}");
-            assert_eq!(
-                allocator
-                    .read_allocator_state()
-                    .await
-                    .unwrap()
-                    .resource_version_assignment(),
-                ResourceVersionAssignment::CommittedApplyV1,
-                "{name}"
-            );
-            assert_eq!(
-                db.current_watch_replay_position().await.unwrap(),
-                before_position,
-                "{name}"
-            );
-            assert_eq!(
-                db.get_resource("v1", "ConfigMap", Some("default"), "preserved")
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .resource_version,
-                preserved.resource_version,
-                "{name}"
-            );
-            assert_eq!(
-                db.get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
-                    .await
-                    .unwrap()
-                    .as_deref(),
-                Some("destination-cluster"),
-                "{name}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2558,20 +2431,14 @@ mod tests {
                 .contains("voter set")
         );
 
-        db.set_klights_meta(
-            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-            "unknown-mode",
-        )
-        .await
-        .unwrap();
         let allocator = DatastoreDurableAllocatorRead::new(handle);
-        assert!(
+        assert_eq!(
             allocator
                 .read_allocator_state()
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("unknown-mode")
+                .unwrap()
+                .next_resource_version(),
+            1
         );
     }
 
@@ -2596,7 +2463,6 @@ mod tests {
             .restore_authoritative_snapshot(
                 AuthoritativeSnapshot::try_new(
                     Vec::new(),
-                    Some(ResourceVersionAssignment::LegacyLeaderAssigned),
                     Some(WatchReplayPosition::default()),
                     Some(Vec::new()),
                     ClusterMetadata {
@@ -2693,29 +2559,29 @@ mod tests {
         pages: &[SnapshotCapturePage],
     ) -> AuthoritativeSnapshot {
         let current_rv = header.metadata().current_rv;
-        let mut commits = Vec::new();
+        let mut operations = Vec::new();
         let mut floors = Vec::new();
         for page in pages {
-            if let Some(rows) = page.commits() {
-                commits.extend_from_slice(rows);
+            if let Some(rows) = page.operations() {
+                operations.extend_from_slice(rows);
             } else if let Some(rows) = page.applied_outbox() {
-                commits.extend(rows.iter().cloned().map(|row| {
-                    LogApplyCommit::new(current_rv, vec![LogApplyMutation::PutAppliedOutbox(row)])
+                operations.extend(rows.iter().cloned().map(|row| {
+                    SnapshotRestoreOperation::new(
+                        current_rv,
+                        None,
+                        vec![LogApplyMutation::PutAppliedOutbox(row)],
+                    )
                 }));
             } else if let Some(rows) = page.outbox_watermarks() {
-                commits.extend(rows.iter().cloned().map(|outbox_watermark| LogApplyCommit {
-                    resource_version: current_rv,
-                    resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-                    outbox_watermark: Some(outbox_watermark),
-                    mutations: Vec::new(),
+                operations.extend(rows.iter().cloned().map(|outbox_watermark| {
+                    SnapshotRestoreOperation::new(current_rv, Some(outbox_watermark), Vec::new())
                 }));
             } else if let Some(rows) = page.replay_floors() {
                 floors.extend_from_slice(rows);
             }
         }
         AuthoritativeSnapshot::try_new(
-            commits,
-            header.resource_version_assignment(),
+            operations,
             Some(header.position()),
             Some(floors),
             header.metadata().clone(),
@@ -2805,17 +2671,18 @@ mod tests {
                 })
             })
             .collect();
-        let mut commits = vec![LogApplyCommit::new(1, mutations)];
-        commits.extend(
-            (0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE).map(|index| LogApplyCommit {
-                resource_version: 1,
-                resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-                outbox_watermark: Some(OutboxStreamWatermark {
-                    client_id: format!("worker-{index:04}"),
-                    stream_id: 1,
-                    stream_seq: 1,
-                }),
-                mutations: Vec::new(),
+        let mut operations = vec![SnapshotRestoreOperation::new(1, None, mutations)];
+        operations.extend(
+            (0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE).map(|index| {
+                SnapshotRestoreOperation::new(
+                    1,
+                    Some(OutboxStreamWatermark {
+                        client_id: format!("worker-{index:04}"),
+                        stream_id: 1,
+                        stream_seq: 1,
+                    }),
+                    Vec::new(),
+                )
             }),
         );
         let floors = (0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE)
@@ -2829,7 +2696,7 @@ mod tests {
             })
             .collect();
         db.replace_replicated_resource_state(
-            commits,
+            operations,
             1,
             Some(0),
             Some(floors),
@@ -2837,11 +2704,7 @@ mod tests {
                 cluster_id: "capture-page-cluster".into(),
                 leader_epoch: 1,
                 membership: crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent,
-                resource_version_assignment_mode: Some(
-                    ResourceVersionAssignment::LegacyLeaderAssigned,
-                ),
                 command_codec_activation_version: None,
-                snapshot_assignment_mode: None,
             }),
         )
         .await
@@ -2913,8 +2776,8 @@ mod tests {
         assert_eq!(pages.headers.len(), 1);
         let begun = &pages.headers[0];
         assert_eq!(
-            begun.resource_version_assignment(),
-            header.resource_version_assignment()
+            begun.command_codec_activation_version(),
+            header.command_codec_activation_version()
         );
         assert_eq!(begun.position(), header.position());
         assert_eq!(begun.metadata(), header.metadata());
@@ -2962,11 +2825,10 @@ mod tests {
                 "resourceVersion": "7"
             }
         });
-        let commit = LogApplyCommit {
-            resource_version: 7,
-            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-            outbox_watermark: Some(watermark.clone()),
-            mutations: vec![
+        let operation = SnapshotRestoreOperation::new(
+            7,
+            Some(watermark.clone()),
+            vec![
                 LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".into(),
                     kind: "ConfigMap".into(),
@@ -3042,7 +2904,7 @@ mod tests {
                 }),
                 LogApplyMutation::PutAppliedOutbox(outbox.clone()),
             ],
-        };
+        );
         let floors = vec![
             DurableReplayFloor::all(1, 1, true).unwrap(),
             DurableReplayFloor::namespaced("v1", "ConfigMap", "default", 4, 4, true).unwrap(),
@@ -3055,7 +2917,7 @@ mod tests {
         };
         source
             .replace_replicated_resource_state(
-                vec![commit],
+                vec![operation],
                 7,
                 Some(9),
                 Some(
@@ -3093,11 +2955,7 @@ mod tests {
                     membership: crate::datastore::ReplicatedMembershipState::Present(
                         membership.clone(),
                     ),
-                    resource_version_assignment_mode: Some(
-                        ResourceVersionAssignment::CommittedApplyV1,
-                    ),
                     command_codec_activation_version: None,
-                    snapshot_assignment_mode: None,
                 }),
             )
             .await
@@ -3220,8 +3078,10 @@ mod tests {
         let before = destination_ledger.current_apply_position().await.unwrap();
         let duplicate = destination_ledger
             .apply_committed_raft(CommittedRaftApplyRequest::new(
-                LogApplyCommit::new(0, vec![LogApplyMutation::PutAppliedOutbox(outbox)])
-                    .into_committed_apply_v1_template(),
+                crate::log_apply::test_live_commit(
+                    0,
+                    vec![LogApplyMutation::PutAppliedOutbox(outbox)],
+                ),
             ))
             .await
             .unwrap();
@@ -3284,10 +3144,10 @@ mod tests {
                 .is_some_and(|rows| rows.iter().any(|row| row.stream_seq == 1))
         }));
         assert!(pages.pages.iter().all(|page| {
-            page.commits().is_none_or(|commits| {
-                commits.iter().all(|commit| {
-                    commit.outbox_watermark.is_none()
-                        && commit.mutations.iter().all(|mutation| {
+            page.operations().is_none_or(|operations| {
+                operations.iter().all(|operation| {
+                    operation.outbox_watermark().is_none()
+                        && operation.mutations().iter().all(|mutation| {
                             !matches!(
                                 mutation,
                                 klights_cluster_core::LogApplyMutation::PutAppliedOutbox(_)

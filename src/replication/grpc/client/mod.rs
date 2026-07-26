@@ -9,21 +9,26 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use bytes::Bytes;
-use futures::{Stream, StreamExt as _};
+use futures::StreamExt as _;
 use hyper_util::rt::TokioIo;
 use klights_cluster_core::Resource;
 use klights_leader_api::{
-    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
-    OutboxDeliveryResult,
+    LeaderOutboxDelivery, LeaderWatchError, NetworkTopologyError, NodeDataplaneQuery,
+    NodeDataplaneResult, NodeSubnetAllocationError, NodeSubnetAllocationRequest,
+    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError,
+    OutboxDeliveryFuture, OutboxDeliveryRequest, OutboxDeliveryResult, PeerSubnetsQuery,
+    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
+    PodCleanupIntentListRequest, ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandRequest,
+    ResourceCommandResult, ResourceEvent, ResourceListRequest, ResourceListResult,
+    ResourceQueryError, WatchRequest, WatchStream,
 };
 use klights_node_api::{
     BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecStreamChannel,
     ExecStreamOptions, ExecTerminalError, NodeExecFrame, NodeExecRequest, NodeExecRuntime,
-    NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogEvent, NodeLogFuture,
-    NodeLogRequest, NodeLogResult, NodeLogRuntime, NodeLogSetupError, NodeLogTarget,
-    NodeLogTerminalError, NodeMetricsError, NodeMetricsRequest, NodeMetricsRuntime,
-    NodeMetricsTarget,
+    NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogEvent, NodeLogRequest,
+    NodeLogResult, NodeLogRuntime, NodeLogSetupError, NodeLogTarget, NodeLogTerminalError,
+    NodeMetricsError, NodeMetricsRequest, NodeMetricsRuntime, NodeMetricsTarget,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::rustls::{
@@ -36,24 +41,13 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::Service;
 
-use crate::control_plane::client::{
-    LeaderWatchError, ListRequest, ListResponse, NetworkTopologyError, NodeDataplaneQuery,
-    NodeDataplaneResult, NodeSubnetAllocationError, NodeSubnetAllocationRequest,
-    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
-    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
-    PodCleanupIntentListRequest, ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
-    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandRequest,
-    ResourceCommandResult, ResourceEvent, WatchRequest, WatchStream,
-};
 use crate::leader_tls_policy::{LeaderTlsVerificationPolicy, ResolvedLeaderTlsVerification};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
 use crate::replication::grpc::{
-    JOIN_TOKEN_METADATA_KEY, entry_from_proto, generated, log_apply_commit_from_proto,
-    resource_command_request_to_proto, watch_replay_position_from_proto,
-    watch_replay_position_to_proto,
+    JOIN_TOKEN_METADATA_KEY, entry_from_proto, generated, resource_command_request_to_proto,
+    watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
-use klights_leader_api::ResourceQueryError;
 use klights_types::ResourceKey;
 /// Response from SignControlplaneCsr RPC.
 pub struct SignControlplaneCsrResponse {
@@ -73,7 +67,6 @@ use klights_supervisor::{TaskCategory, TaskSupervisor};
 const CONNECT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_ITEM_CHANNEL_CAPACITY: usize = 1024;
 const NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
-const NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
 // bug-grpc A1: message-size limits now live on `GrpcTransportPolicy`
 // (`max_message_bytes`); the former `MAX_GRPC_MESSAGE_BYTES` constant is
 // gone so client, CRI, and server cannot drift.
@@ -167,300 +160,6 @@ struct ConnectDispatchContext {
     observed_leader_endpoint: Option<String>,
 }
 
-pub(crate) struct LocalNodeLogRuntime {
-    pod_logs_root: PathBuf,
-    task_supervisor: Arc<TaskSupervisor>,
-    pod_log_follow_watch: Option<crate::api_pod_subresources::logs::PodLogFollowWatchSource>,
-}
-
-impl LocalNodeLogRuntime {
-    #[cfg(test)]
-    pub(crate) fn new(containerd_namespace: String, task_supervisor: Arc<TaskSupervisor>) -> Self {
-        Self {
-            pod_logs_root: crate::paths::pod_logs_root_path(&containerd_namespace),
-            task_supervisor,
-            pod_log_follow_watch: None,
-        }
-    }
-
-    pub(crate) fn new_with_pod_event_store(
-        pod_logs_root: PathBuf,
-        task_supervisor: Arc<TaskSupervisor>,
-        pod_log_follow_watch: crate::api_pod_subresources::logs::PodLogFollowWatchSource,
-    ) -> Self {
-        Self {
-            pod_logs_root,
-            task_supervisor,
-            pod_log_follow_watch: Some(pod_log_follow_watch),
-        }
-    }
-
-    fn log_path(&self, target: &NodeLogTarget) -> String {
-        self.pod_logs_root
-            .join(format!(
-                "{}_{}_{}",
-                target.namespace(),
-                target.pod_name(),
-                target.pod_uid()
-            ))
-            .join(target.container_name())
-            .join("0.log")
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-impl NodeLogRuntime for LocalNodeLogRuntime {
-    fn read_logs(&self, request: NodeLogRequest) -> NodeLogFuture<'_, NodeLogResult> {
-        let (target, options) = request.into_parts();
-        let log_path = self.log_path(&target);
-        let (follow, tail_lines, timestamps, since_time, since_seconds, limit_bytes, previous) =
-            options.into_parts();
-        let is_previous = previous.as_deref() == Some("true");
-        let params = crate::api_pod_subresources::logs::LogQuery {
-            container: Some(target.container_name().to_string()),
-            follow,
-            tail_lines,
-            timestamps,
-            since_seconds,
-            since_time,
-            limit_bytes,
-            previous,
-            insecure_skip_tls_verify_backend: false,
-        };
-
-        Box::pin(async move {
-            if is_previous {
-                return Ok(NodeLogResult::success(Vec::new()));
-            }
-            match crate::api_pod_subresources::logs::build_log_output_bytes(
-                &log_path,
-                &params,
-                self.task_supervisor.as_ref(),
-            )
-            .await
-            {
-                Ok(content) => Ok(NodeLogResult::success(content.to_vec())),
-                Err(e) => Ok(NodeLogResult::failed(
-                    Vec::new(),
-                    NodeLogTerminalError::new(format!("{e:?}")),
-                )),
-            }
-        })
-    }
-
-    fn open_logs(
-        &self,
-        request: NodeLogRequest,
-    ) -> NodeLogFuture<'_, Box<dyn BoundedByteStream<Frame = NodeLogEvent>>> {
-        let (target, options) = request.into_parts();
-        let log_path = self.log_path(&target);
-        let (follow, tail_lines, timestamps, since_time, since_seconds, limit_bytes, previous) =
-            options.into_parts();
-        let params = crate::api_pod_subresources::logs::LogQuery {
-            container: Some(target.container_name().to_string()),
-            follow: Some(follow.unwrap_or_else(|| "true".to_string())),
-            tail_lines,
-            timestamps,
-            since_seconds,
-            since_time,
-            limit_bytes,
-            previous,
-            insecure_skip_tls_verify_backend: false,
-        };
-        let namespace = target.namespace().to_string();
-        let pod_name = target.pod_name().to_string();
-        let pod_uid = target.pod_uid().to_string();
-        let container_name = target.container_name().to_string();
-
-        if params.previous.as_deref() == Some("true") {
-            return Box::pin(async move {
-                let (tx, rx) = mpsc::channel(NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY);
-                let _ = tx.send(NodeLogEvent::terminal()).await;
-                Ok(Box::new(LocalPodLogStreamSession {
-                    inbound_rx: Mutex::new(rx),
-                    producer_cancel: CancellationToken::new(),
-                    cancelled: AtomicBool::new(false),
-                })
-                    as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
-            });
-        }
-
-        let pod_log_follow_watch = self.pod_log_follow_watch.clone();
-        let task_supervisor = self.task_supervisor.clone();
-        let producer_supervisor = task_supervisor.clone();
-        let (tx, rx) = mpsc::channel(NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY);
-        let log_tx = tx.clone();
-        let producer_cancel = CancellationToken::new();
-        let task_cancel = producer_cancel.clone();
-        let log_task = async move {
-            let mut inbound = if let Some(pod_log_follow_watch) = pod_log_follow_watch {
-                let pod_events =
-                    crate::api_pod_subresources::logs::build_pod_log_follow_event_cursor(
-                        &pod_log_follow_watch,
-                    )
-                    .await;
-                let termination = crate::api_pod_subresources::logs::PodLogFollowTermination::new(
-                    pod_events,
-                    namespace,
-                    pod_name,
-                    pod_uid,
-                    container_name,
-                    false,
-                );
-                Box::pin(
-                    crate::api_pod_subresources::logs::follow_log_file_with_termination_watch(
-                        log_path,
-                        params,
-                        producer_supervisor.clone(),
-                        termination,
-                    ),
-                )
-                    as Pin<
-                        Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
-                    >
-            } else {
-                Box::pin(
-                    crate::api_pod_subresources::logs::follow_log_file_with_initial_query(
-                        log_path,
-                        params,
-                        producer_supervisor.clone(),
-                    ),
-                )
-            };
-            loop {
-                let item = tokio::select! {
-                    biased;
-                    _ = task_cancel.cancelled() => return,
-                    item = inbound.next() => item,
-                };
-                let Some(item) = item else {
-                    break;
-                };
-                match item {
-                    Ok(log_content) => {
-                        let send = log_tx.send(NodeLogEvent::data(log_content.to_vec()));
-                        if tokio::select! {
-                            biased;
-                            _ = task_cancel.cancelled() => true,
-                            result = send => result.is_err(),
-                        } {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        let send = log_tx.send(NodeLogEvent::failed(
-                            Vec::new(),
-                            NodeLogTerminalError::new(err.to_string()),
-                        ));
-                        tokio::select! {
-                            biased;
-                            _ = task_cancel.cancelled() => {},
-                            _ = send => {},
-                        }
-                        return;
-                    }
-                }
-            }
-            let send = log_tx.send(NodeLogEvent::terminal());
-            tokio::select! {
-                biased;
-                _ = task_cancel.cancelled() => {},
-                _ = send => {},
-            }
-        };
-
-        Box::pin(async move {
-            if let Err(err) = task_supervisor
-                .spawn_async(
-                    TaskCategory::Network,
-                    "grpc_client_local_pod_log_follow",
-                    log_task,
-                )
-                .await
-            {
-                let _ = tx
-                    .send(NodeLogEvent::failed(
-                        Vec::new(),
-                        NodeLogTerminalError::new(err.to_string()),
-                    ))
-                    .await;
-            }
-            Ok(Box::new(LocalPodLogStreamSession {
-                inbound_rx: Mutex::new(rx),
-                producer_cancel,
-                cancelled: AtomicBool::new(false),
-            })
-                as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
-        })
-    }
-}
-
-struct LocalPodLogStreamSession {
-    inbound_rx: Mutex<mpsc::Receiver<NodeLogEvent>>,
-    producer_cancel: CancellationToken,
-    cancelled: AtomicBool,
-}
-
-impl BoundedByteStream for LocalPodLogStreamSession {
-    type Frame = NodeLogEvent;
-
-    fn bounds(&self) -> ByteStreamBounds {
-        ByteStreamBounds::try_new(
-            NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY,
-            NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY,
-        )
-        .expect("log stream capacities are non-zero constants")
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-
-    fn send_frame(&self, _frame: NodeLogEvent) -> ByteStreamFuture<'_, ()> {
-        Box::pin(async move { Err(ByteStreamError::closed("pod log stream is receive-only")) })
-    }
-
-    fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeLogEvent>> {
-        Box::pin(async move {
-            if self.is_cancelled() {
-                return Err(ByteStreamError::cancelled());
-            }
-            let frame = self.inbound_rx.lock().await.recv().await;
-            match frame {
-                Some(frame) => {
-                    if frame.is_terminal() {
-                        self.cancelled.store(true, Ordering::Release);
-                        self.producer_cancel.cancel();
-                    }
-                    Ok(Some(frame))
-                }
-                None => {
-                    self.cancelled.store(true, Ordering::Release);
-                    self.producer_cancel.cancel();
-                    Ok(None)
-                }
-            }
-        })
-    }
-
-    fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
-        Box::pin(async move {
-            if !self.cancelled.swap(true, Ordering::AcqRel) {
-                self.producer_cancel.cancel();
-                self.inbound_rx.get_mut().close();
-            }
-            Ok(())
-        })
-    }
-}
-
-impl Drop for LocalPodLogStreamSession {
-    fn drop(&mut self) {
-        self.producer_cancel.cancel();
-    }
-}
-
 fn node_exec_error_frame(message: String) -> NodeExecFrame {
     NodeExecFrame::new(
         ExecStreamChannel::Error,
@@ -546,10 +245,10 @@ impl RegistrationSnapshotView for crate::kubelet::node::NodeRegistrationSnapshot
     ) -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
         crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
             node_mode: match self.node_mode {
-                crate::controllers::annotations::NodePeerMode::Root => {
+                klights_network_api::NodePeerMode::Root => {
                     crate::replication::grpc::raft_rpc::RemoteNodeMode::Root
                 }
-                crate::controllers::annotations::NodePeerMode::Rootless => {
+                klights_network_api::NodePeerMode::Rootless => {
                     crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless
                 }
             },
@@ -1086,29 +785,8 @@ impl ReplicationGrpcClient {
             leader_epoch: response.leader_epoch,
             current_rv: response.current_rv,
             current_log_index: response.current_log_index,
-            supported_features: response.supported_features,
+            command_codec_version: response.command_codec_version,
         })
-    }
-
-    pub async fn snapshot(
-        &self,
-        last_applied_rv: i64,
-    ) -> Result<Vec<crate::log_apply::LogApplyCommit>> {
-        // bug-grpc: snapshot is a large streaming read — keep it on the
-        // Stream lane so it cannot HOL-block hot Status/Read unary RPCs.
-        let mut client = self.tonic_client_lane(ChannelLane::Stream).await?;
-        let mut request = tonic::Request::new(generated::SnapshotRequest { last_applied_rv });
-        self.add_join_token(&mut request)?;
-        let mut stream = client
-            .snapshot(request)
-            .await
-            .context("gRPC Snapshot failed")?
-            .into_inner();
-        let mut entries = Vec::new();
-        while let Some(entry) = stream.message().await.context("read snapshot entry")? {
-            entries.push(log_apply_commit_from_proto(entry)?);
-        }
-        Ok(entries)
     }
 
     pub async fn get_resource_rpc(
@@ -1145,19 +823,19 @@ impl ReplicationGrpcClient {
 
     pub async fn list_resources_rpc(
         &self,
-        req: ListRequest,
-    ) -> std::result::Result<ListResponse, ResourceQueryError> {
-        let expected_api_version = req.api_version.clone();
-        let expected_kind = req.kind.clone();
-        let expected_namespace = req.namespace.clone();
+        req: ResourceListRequest,
+    ) -> std::result::Result<ResourceListResult, ResourceQueryError> {
+        let expected_api_version = req.api_version().to_string();
+        let expected_kind = req.kind().to_string();
+        let expected_namespace = req.namespace().map(str::to_owned);
         let request = generated::ListResourcesRequest {
-            api_version: req.api_version,
-            kind: req.kind,
-            namespace: req.namespace,
-            label_selector: req.label_selector,
-            field_selector: req.field_selector,
-            limit: req.limit,
-            continue_token: req.continue_token,
+            api_version: expected_api_version.clone(),
+            kind: expected_kind.clone(),
+            namespace: expected_namespace.clone(),
+            label_selector: req.label_selector().map(str::to_owned),
+            field_selector: req.field_selector().map(str::to_owned),
+            limit: req.limit(),
+            continue_token: req.continue_token().map(str::to_owned),
         };
         let response = self
             .unary_call(
@@ -1187,16 +865,16 @@ impl ReplicationGrpcClient {
                 "ListResources item identity is outside the requested scope",
             ));
         }
-        Ok(ListResponse {
+        ResourceListResult::try_new(
             items,
-            resource_version: response.resource_version,
-            watch_replay_position: response
+            response.resource_version,
+            response
                 .watch_replay_position
                 .as_ref()
                 .map(watch_replay_position_from_proto),
-            continue_token: response.continue_token,
-            remaining_item_count: response.remaining_item_count,
-        })
+            response.continue_token,
+            response.remaining_item_count,
+        )
     }
 
     pub async fn submit_resource_command_rpc(
@@ -1551,8 +1229,8 @@ impl ReplicationGrpcClient {
     /// Fail startup before this client can submit commands to an older leader.
     pub async fn require_command_codec_v3(&self) -> anyhow::Result<()> {
         let metadata = self.metadata().await?;
-        crate::replication::protocol::require_command_codec_v3(
-            metadata.supported_features,
+        crate::replication::protocol::require_exact_command_codec(
+            metadata.command_codec_version,
             "replication leader",
         )
         .map_err(anyhow::Error::msg)
@@ -1586,8 +1264,7 @@ impl ReplicationGrpcClient {
                         .raft_append_entries(tonic::Request::new(
                             generated::RaftAppendEntriesRequest {
                                 payload,
-                                supported_features:
-                                    crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                                command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                                 receiver_admission,
                             },
                         ))
@@ -1619,8 +1296,7 @@ impl ReplicationGrpcClient {
                     client
                         .raft_vote(tonic::Request::new(generated::RaftVoteRequest {
                             payload,
-                            supported_features:
-                                crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                             receiver_admission,
                         }))
                         .await
@@ -1652,8 +1328,7 @@ impl ReplicationGrpcClient {
                         .raft_install_snapshot(tonic::Request::new(
                             generated::RaftInstallSnapshotRequest {
                                 payload,
-                                supported_features:
-                                    crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                                command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                                 receiver_admission,
                             },
                         ))
@@ -1713,7 +1388,7 @@ impl ReplicationGrpcClient {
             node_internal_ip: registration.node_internal_ip.clone(),
             node_git_commit: registration.snapshot.host.git_commit.clone(),
             node_registration: Some(node_registration_to_proto(&registration.snapshot)),
-            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
             storage_incarnation: registration.storage_incarnation.clone(),
             storage_log_attestation: Some(generated::RaftStorageAttestation {
                 high_watermark: registration
@@ -2439,7 +2114,7 @@ impl ReplicationGrpcClient {
             dataplane_mode: dataplane_mode_wire(self.config.dataplane.mode).to_string(),
             dataplane_encryption: dataplane_encryption_wire(self.config.dataplane.encryption)
                 .to_string(),
-            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
         }
     }
 
@@ -2466,6 +2141,7 @@ impl ReplicationGrpcClient {
         self.config.dataplane.clone()
     }
 
+    #[cfg(test)]
     fn add_join_token<T>(&self, request: &mut tonic::Request<T>) -> Result<()> {
         let _ = request;
         Ok(())

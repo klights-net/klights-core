@@ -373,6 +373,7 @@ async fn reconcile_rc_test(
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         rc,
         node_name,
     )
@@ -494,6 +495,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &rc,
         "test-node",
     );
@@ -502,6 +504,7 @@ async fn test_concurrent_replicationcontroller_reconcile_creates_only_desired_po
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &rc,
         "test-node",
     );
@@ -627,6 +630,7 @@ async fn test_replicationcontroller_stale_snapshot_after_delete_does_not_recreat
         pod_repo.as_ref(),
         pod_repo.as_ref(),
         pod_repo.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &stale_snapshot,
         "test-node",
     )
@@ -701,6 +705,7 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &rc_with_rv,
         "test-node",
     )
@@ -716,10 +721,24 @@ async fn test_replicationcontroller_create_loop_observes_live_scale_down() {
         )
         .await
         .unwrap();
+    let active = pods
+        .items
+        .iter()
+        .filter(|pod| pod.data.pointer("/metadata/deletionTimestamp").is_none())
+        .count();
+    assert_eq!(
+        active, 5,
+        "ReplicationController reconcile must converge active Pods to the lowered live replica count"
+    );
     assert_eq!(
         pods.items.len(),
-        5,
-        "ReplicationController reconcile must stop creating Pods after live spec.replicas is lowered"
+        7,
+        "surplus picked-up Pod rows remain until UID-bound lifecycle actors finalize them"
+    );
+    assert_eq!(
+        pods.items.len() - active,
+        2,
+        "each surplus Pod must be marked terminating through the actor-owned path"
     );
 
     let current_rc = db
@@ -846,6 +865,7 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
             reader_for_task.as_ref(),
             writer_for_task.as_ref(),
             reader_for_task.as_ref(),
+            crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &rc_for_task,
             "test-node",
         )
@@ -947,6 +967,7 @@ async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flig
             reader_for_task.as_ref(),
             writer_for_task.as_ref(),
             reader_for_task.as_ref(),
+            crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &rc_for_task,
             "test-node",
         )
@@ -1414,6 +1435,7 @@ async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbo
         repository.as_ref(),
         repository.as_ref(),
         &delete_sink,
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &rc,
         "leader",
     )
@@ -1451,6 +1473,7 @@ async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbo
         repository.as_ref(),
         repository.as_ref(),
         &delete_sink,
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &rc,
         "leader",
     )

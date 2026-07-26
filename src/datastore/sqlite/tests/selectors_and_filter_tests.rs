@@ -760,7 +760,7 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
 
     // Raft stamps the next sequential rv: the delete lands above the list rv.
     let delete_rv = list.resource_version + 1;
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
         delete_rv,
         vec![crate::log_apply::LogApplyMutation::DeleteResource(
             crate::log_apply::LogApplyResourceKey {
@@ -791,7 +791,7 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
 }
 
 #[tokio::test]
-async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
+async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
     let db = Datastore::new_in_memory().await.unwrap();
 
     let created = db
@@ -799,10 +799,10 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
             "v1",
             "ConfigMap",
             Some("default"),
-            "cm-reserved-delete",
+            "cm-pending-delete",
             json!({
                 "metadata": {
-                    "name": "cm-reserved-delete",
+                    "name": "cm-pending-delete",
                     "namespace": "default"
                 },
                 "data": {"k": "v"}
@@ -815,22 +815,22 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
         api_version: "v1".to_string(),
         kind: "ConfigMap".to_string(),
         namespace: Some("default".to_string()),
-        name: "cm-reserved-delete".to_string(),
+        name: "cm-pending-delete".to_string(),
         preconditions: crate::datastore::types::ResourcePreconditions::uid(created.uid.clone()),
     };
-    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+    let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
-            "reserved-delete-list-watch",
-            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            "pending-delete-list-watch",
+            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
             payload.as_ref(),
             "mn-controlplane1",
         )
         .await
         .expect("build unapplied delete commit");
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+    let klights_cluster_core::BuildOutboxOutcome::NeedsPropose {
         commit,
         applied_rv: delete_rv,
         ..
@@ -839,7 +839,7 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
         panic!("expected a fresh delete commit");
     };
 
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
         delete_rv + 1,
         vec![crate::log_apply::LogApplyMutation::PutResource(
             crate::log_apply::LogApplyResourceRow {
@@ -877,7 +877,7 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
             Some("default"),
             ResourceListQuery::new(
                 None,
-                Some("metadata.name=cm-reserved-delete"),
+                Some("metadata.name=cm-pending-delete"),
                 Some(500),
                 None,
             ),
@@ -887,14 +887,12 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
     assert!(
         list.items
             .iter()
-            .any(|item| item.name == "cm-reserved-delete"),
-        "test setup must list cm-reserved-delete before the pending delete applies"
+            .any(|item| item.name == "cm-pending-delete"),
+        "test setup must list cm-pending-delete before the pending delete applies"
     );
-    assert!(
-        list.resource_version < delete_rv,
-        "list contains cm-reserved-delete while delete rv={delete_rv} is reserved but unapplied; \
-         list rv={} would make catch-up skip the delete",
-        list.resource_version
+    assert_eq!(
+        list.resource_version, delete_rv,
+        "an unrelated committed write may consume the proposal's candidate RV"
     );
 
     db.apply_log_apply_commit(commit).await.unwrap();
@@ -904,9 +902,9 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
         .unwrap();
     assert!(
         catch_up.iter().any(|event| {
-            event.resource.name == "cm-reserved-delete" && event.event_type.as_ref() == "DELETED"
+            event.resource.name == "cm-pending-delete" && event.event_type.as_ref() == "DELETED"
         }),
-        "watch catch-up from list rv={} must include reserved delete rv={delete_rv}",
+        "committed apply must allocate the delete after the LIST snapshot even when its original candidate RV was consumed; list rv={}",
         list.resource_version
     );
 }

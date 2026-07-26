@@ -6,9 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures::{FutureExt as _, StreamExt as _, pin_mut, poll};
-use klights_cluster_core::{
-    PositionedWatchEvent, Resource, ResourceVersionAssignment, WatchReplayPosition,
-};
+use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_cluster_store::{
     AllocatorStateFuture, DurableAllocatorRead, DurableAllocatorState, DurableWatchEvent,
     DurableWatchHistoryRead, ResourceGetRequest, ResourceListRead, ResourceListRequest,
@@ -182,8 +180,7 @@ async fn lagged_bounded_subscriber_recovers_exclusively_from_durable_position() 
         Arc::new(NoLists),
         Arc::new(history),
         Arc::new(FixedAllocator(
-            DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, anchor)
-                .expect("allocator"),
+            DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         hub.clone(),
         Arc::new(NamespacedScopes),
@@ -242,8 +239,7 @@ async fn scalar_resource_version_uses_the_atomic_event_high_water_filter() {
         Arc::new(NoLists),
         Arc::new(history),
         Arc::new(FixedAllocator(
-            DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, anchor)
-                .expect("allocator"),
+            DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
         Arc::new(NamespacedScopes),
@@ -329,8 +325,7 @@ async fn dropping_stream_cancels_in_flight_replay_without_a_background_task() {
             dropped: dropped.clone(),
         }),
         Arc::new(FixedAllocator(
-            DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, anchor)
-                .expect("allocator"),
+            DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
         Arc::new(NamespacedScopes),
@@ -375,8 +370,7 @@ async fn regressing_history_page_is_rejected_before_waiting_for_a_live_signal() 
         Arc::new(NoLists),
         Arc::new(history),
         Arc::new(FixedAllocator(
-            DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, anchor)
-                .expect("allocator"),
+            DurableAllocatorState::try_new(anchor).expect("allocator"),
         )),
         Arc::new(WatchSignalHub::new(1)),
         Arc::new(NamespacedScopes),
@@ -441,8 +435,7 @@ async fn malformed_equal_cursor_and_non_exact_event_pages_are_rejected() {
             Arc::new(NoLists),
             Arc::new(history),
             Arc::new(FixedAllocator(
-                DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, anchor)
-                    .expect("allocator"),
+                DurableAllocatorState::try_new(anchor).expect("allocator"),
             )),
             Arc::new(WatchSignalHub::new(1)),
             Arc::new(NamespacedScopes),
@@ -497,8 +490,7 @@ async fn replay_rejects_cluster_and_all_namespaces_scope_mismatches_before_yield
             Arc::new(NoLists),
             Arc::new(history),
             Arc::new(FixedAllocator(
-                DurableAllocatorState::try_new(ResourceVersionAssignment::CommittedApplyV1, anchor)
-                    .expect("allocator"),
+                DurableAllocatorState::try_new(anchor).expect("allocator"),
             )),
             Arc::new(WatchSignalHub::new(1)),
             Arc::new(FixedScope(scope)),

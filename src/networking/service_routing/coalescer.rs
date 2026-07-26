@@ -590,8 +590,8 @@ struct ServiceRoutingWatchTarget {
 }
 
 impl ServiceRoutingWatchTarget {
-    fn request(self) -> crate::control_plane::client::WatchRequest {
-        crate::control_plane::client::WatchRequest::try_new(
+    fn request(self) -> klights_leader_api::WatchRequest {
+        klights_leader_api::WatchRequest::try_new(
             self.api_version,
             self.kind,
             None,
@@ -642,8 +642,8 @@ enum ServiceRoutingWatchItem {
     Event {
         target: ServiceRoutingWatchTarget,
         event: std::result::Result<
-            crate::control_plane::client::ResourceEvent,
-            crate::control_plane::client::LeaderWatchError,
+            klights_leader_api::ResourceEvent,
+            klights_leader_api::LeaderWatchError,
         >,
     },
     Closed {
@@ -656,7 +656,7 @@ type ServiceRoutingWatchStream =
 
 fn wrap_service_routing_watch_stream(
     target: ServiceRoutingWatchTarget,
-    mut stream: crate::control_plane::client::WatchStream,
+    mut stream: klights_leader_api::WatchStream,
 ) -> ServiceRoutingWatchStream {
     use futures::StreamExt;
 
@@ -745,9 +745,9 @@ fn watch_event_object_identity(object: &serde_json::Value) -> Result<(&str, &str
 fn apply_service_routing_watch_event_to_inventory(
     table: &KlightsTable,
     target: ServiceRoutingWatchTarget,
-    event: crate::control_plane::client::ResourceEvent,
+    event: klights_leader_api::ResourceEvent,
 ) -> Result<Option<super::inventory::InventoryApply>> {
-    use crate::control_plane::client::WatchEventType;
+    use klights_leader_api::WatchEventType;
 
     match event.event_type() {
         WatchEventType::Bookmark => return Ok(Some(super::inventory::InventoryApply::NoChange)),
@@ -1217,16 +1217,14 @@ async fn ensure_sysctl_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_plane::client::{
-        CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
-        LeaderCacheReadiness, LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent,
-        WatchEventType, WatchRequest, WatchStream,
-    };
+    use crate::control_plane::client::LeaderApiClient;
     use crate::datastore::Resource;
     use async_trait::async_trait;
     use klights_leader_api::{
-        LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
-        ResourceQueryError, ResourceQueryFuture,
+        CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
+        LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent,
+        ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryError,
+        ResourceQueryFuture, WatchEventType, WatchRequest, WatchStream,
     };
     use std::sync::{
         Arc, Mutex,

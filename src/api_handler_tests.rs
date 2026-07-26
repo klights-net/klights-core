@@ -3,6 +3,12 @@ use crate::controllers::replicaset::reconcile_replicaset;
 use crate::controllers::service::ServiceIpam;
 use serde_json::json;
 
+fn gc_non_pod_finalization(
+    db: &crate::datastore::sqlite::Datastore,
+) -> crate::gc_delete_adapter::GcNonPodFinalizationAdapter {
+    crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()))
+}
+
 // ========================
 // Deployment handler tests
 // ========================
@@ -70,6 +76,7 @@ async fn test_create_deployment_triggers_reconciliation() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -155,6 +162,7 @@ async fn test_update_deployment_updates_replicaset() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -216,6 +224,7 @@ async fn test_update_deployment_updates_replicaset() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &updated_with_rv,
         "test-node",
     )
@@ -300,6 +309,7 @@ async fn test_patch_deployment_reconciles() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -348,6 +358,7 @@ async fn test_patch_deployment_reconciles() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &patched_with_rv,
         "test-node",
     )
@@ -631,6 +642,7 @@ async fn test_create_replicaset_creates_pods() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &rs_with_rv,
         "test-node",
     )
@@ -872,6 +884,7 @@ async fn test_rs_template_equals_deployment_template_ignore_hash() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -984,6 +997,7 @@ async fn test_deployment_gets_revision_annotation_after_reconcile() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -1095,6 +1109,7 @@ async fn test_delete_deployment_cascade_deletes_replicaset_and_pods() {
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -1165,6 +1180,7 @@ async fn test_delete_deployment_cascade_deletes_replicaset_and_pods() {
         "Deployment",
         Some("default".to_string()),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
     )
     .await
     .unwrap();
@@ -1267,6 +1283,7 @@ async fn test_delete_collection_deployment_cascade_deletes_replicaset_and_pods()
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
         &deploy_with_rv,
         "test-node",
     )
@@ -1342,6 +1359,7 @@ async fn test_delete_collection_deployment_cascade_deletes_replicaset_and_pods()
         "Deployment",
         Some("default".to_string()),
         __pod_repo.as_ref(),
+        &gc_non_pod_finalization(&db),
     )
     .await
     .unwrap();

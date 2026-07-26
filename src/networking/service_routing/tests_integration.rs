@@ -4,7 +4,7 @@
 mod integration_tests {
     use crate::networking::netfilter::Netfilter;
     use crate::networking::service_routing::*;
-    use crate::networking::{ClusterCidr, PodSubnet};
+    use klights_types::{ClusterCidr, PodSubnet};
     use std::net::Ipv4Addr;
     use std::process::Command;
     use tokio_util::sync::CancellationToken;

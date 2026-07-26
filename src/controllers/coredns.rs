@@ -1,11 +1,41 @@
-use crate::datastore::DatastoreBackend;
-use crate::kubelet::pod_repository::PodRepository;
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
-use std::sync::Arc;
 
 const COREDNS_KUBECONFIG_PORT_ANNOTATION: &str = "klights.dev/kubeconfig-port";
 const COREDNS_KUBECONFIG_PATH_ANNOTATION: &str = "klights.dev/kubeconfig-path";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoreDnsResourceKind {
+    ServiceAccount,
+    ClusterRole,
+    ClusterRoleBinding,
+    ConfigMap,
+    Deployment,
+    Service,
+}
+
+#[async_trait]
+pub(crate) trait CoreDnsBootstrapStore: Send + Sync {
+    async fn get_coredns_resource(&self, kind: CoreDnsResourceKind) -> Result<Option<Resource>>;
+    async fn create_coredns_resource(
+        &self,
+        kind: CoreDnsResourceKind,
+        value: Value,
+    ) -> Result<Resource>;
+    async fn update_coredns_resource(
+        &self,
+        kind: CoreDnsResourceKind,
+        value: Value,
+        expected_resource_version: i64,
+    ) -> Result<Resource>;
+    async fn reconcile_coredns_deployment(
+        &self,
+        deployment: Resource,
+        node_name: &str,
+    ) -> Result<()>;
+}
 
 /// Derive the DNS service ClusterIP from the service CIDR.
 /// Returns network address + 10 (e.g., "10.43.128.0/17" -> "10.43.128.10").
@@ -13,11 +43,8 @@ pub fn derive_dns_service_ip(service_cidr: &str) -> String {
     crate::service_ips::dns_service_ip(service_cidr)
 }
 
-/// Bootstrap CoreDNS resources on startup: ConfigMap, Deployment, and Service.
-/// Idempotent — skips creation if resources already exist.
-pub async fn bootstrap_coredns(
-    db: &dyn DatastoreBackend,
-    pod_repository: Arc<PodRepository>,
+pub(crate) async fn bootstrap_coredns_with_store(
+    store: &dyn CoreDnsBootstrapStore,
     _tls_port: u16,
     service_cidr: &str,
     _containerd_namespace: &str,
@@ -25,30 +52,28 @@ pub async fn bootstrap_coredns(
 ) -> Result<()> {
     let dns_ip = derive_dns_service_ip(service_cidr);
 
-    create_coredns_serviceaccount(db).await?;
-    create_coredns_rbac(db).await?;
-    create_coredns_configmap(db).await?;
-    create_coredns_deployment(db, pod_repository, node_name).await?;
-    create_coredns_service(db, &dns_ip).await?;
+    create_coredns_serviceaccount(store).await?;
+    create_coredns_rbac(store).await?;
+    create_coredns_configmap(store).await?;
+    create_coredns_deployment(store, node_name).await?;
+    create_coredns_service(store, &dns_ip).await?;
     tracing::info!("CoreDNS bootstrap complete (DNS service IP: {})", dns_ip);
     Ok(())
 }
 
-async fn create_coredns_serviceaccount(db: &dyn DatastoreBackend) -> Result<()> {
-    if db
-        .get_resource("v1", "ServiceAccount", Some("kube-system"), "coredns")
+async fn create_coredns_serviceaccount(store: &dyn CoreDnsBootstrapStore) -> Result<()> {
+    if store
+        .get_coredns_resource(CoreDnsResourceKind::ServiceAccount)
         .await?
         .is_some()
     {
         return Ok(());
     }
 
-    db.create_resource(
-        "v1",
-        "ServiceAccount",
-        Some("kube-system"),
-        "coredns",
-        json!({
+    store
+        .create_coredns_resource(
+            CoreDnsResourceKind::ServiceAccount,
+            json!({
             "apiVersion": "v1",
             "kind": "ServiceAccount",
             "metadata": {
@@ -59,19 +84,19 @@ async fn create_coredns_serviceaccount(db: &dyn DatastoreBackend) -> Result<()> 
                     "kubernetes.io/name": "CoreDNS"
                 }
             }
-        }),
-    )
-    .await?;
+            }),
+        )
+        .await?;
     tracing::info!("Created CoreDNS ServiceAccount");
     Ok(())
 }
 
-async fn create_coredns_rbac(db: &dyn DatastoreBackend) -> Result<()> {
-    create_or_reconcile_coredns_clusterrole(db).await?;
-    create_or_reconcile_coredns_clusterrolebinding(db).await
+async fn create_coredns_rbac(store: &dyn CoreDnsBootstrapStore) -> Result<()> {
+    create_or_reconcile_coredns_clusterrole(store).await?;
+    create_or_reconcile_coredns_clusterrolebinding(store).await
 }
 
-async fn create_or_reconcile_coredns_clusterrole(db: &dyn DatastoreBackend) -> Result<()> {
+async fn create_or_reconcile_coredns_clusterrole(store: &dyn CoreDnsBootstrapStore) -> Result<()> {
     let desired = json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRole",
@@ -96,13 +121,8 @@ async fn create_or_reconcile_coredns_clusterrole(db: &dyn DatastoreBackend) -> R
         ]
     });
 
-    if let Some(existing) = db
-        .get_resource(
-            "rbac.authorization.k8s.io/v1",
-            "ClusterRole",
-            None,
-            "system:coredns",
-        )
+    if let Some(existing) = store
+        .get_coredns_resource(CoreDnsResourceKind::ClusterRole)
         .await?
     {
         if existing.data.pointer("/rules") == desired.pointer("/rules") {
@@ -114,32 +134,27 @@ async fn create_or_reconcile_coredns_clusterrole(db: &dyn DatastoreBackend) -> R
             .as_object_mut()
             .expect("ClusterRole resource must be a JSON object")
             .insert("rules".to_string(), desired["rules"].clone());
-        db.update_resource(
-            "rbac.authorization.k8s.io/v1",
-            "ClusterRole",
-            None,
-            "system:coredns",
-            updated,
-            existing.resource_version,
-        )
-        .await?;
+        store
+            .update_coredns_resource(
+                CoreDnsResourceKind::ClusterRole,
+                updated,
+                existing.resource_version,
+            )
+            .await?;
         tracing::info!("Updated CoreDNS ClusterRole");
         return Ok(());
     }
 
-    db.create_resource(
-        "rbac.authorization.k8s.io/v1",
-        "ClusterRole",
-        None,
-        "system:coredns",
-        desired,
-    )
-    .await?;
+    store
+        .create_coredns_resource(CoreDnsResourceKind::ClusterRole, desired)
+        .await?;
     tracing::info!("Created CoreDNS ClusterRole");
     Ok(())
 }
 
-async fn create_or_reconcile_coredns_clusterrolebinding(db: &dyn DatastoreBackend) -> Result<()> {
+async fn create_or_reconcile_coredns_clusterrolebinding(
+    store: &dyn CoreDnsBootstrapStore,
+) -> Result<()> {
     let desired = json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
@@ -164,13 +179,8 @@ async fn create_or_reconcile_coredns_clusterrolebinding(db: &dyn DatastoreBacken
         ]
     });
 
-    if let Some(existing) = db
-        .get_resource(
-            "rbac.authorization.k8s.io/v1",
-            "ClusterRoleBinding",
-            None,
-            "system:coredns",
-        )
+    if let Some(existing) = store
+        .get_coredns_resource(CoreDnsResourceKind::ClusterRoleBinding)
         .await?
     {
         if existing.data.pointer("/roleRef") == desired.pointer("/roleRef")
@@ -185,35 +195,28 @@ async fn create_or_reconcile_coredns_clusterrolebinding(db: &dyn DatastoreBacken
             .expect("ClusterRoleBinding resource must be a JSON object");
         object.insert("roleRef".to_string(), desired["roleRef"].clone());
         object.insert("subjects".to_string(), desired["subjects"].clone());
-        db.update_resource(
-            "rbac.authorization.k8s.io/v1",
-            "ClusterRoleBinding",
-            None,
-            "system:coredns",
-            updated,
-            existing.resource_version,
-        )
-        .await?;
+        store
+            .update_coredns_resource(
+                CoreDnsResourceKind::ClusterRoleBinding,
+                updated,
+                existing.resource_version,
+            )
+            .await?;
         tracing::info!("Updated CoreDNS ClusterRoleBinding");
         return Ok(());
     }
 
-    db.create_resource(
-        "rbac.authorization.k8s.io/v1",
-        "ClusterRoleBinding",
-        None,
-        "system:coredns",
-        desired,
-    )
-    .await?;
+    store
+        .create_coredns_resource(CoreDnsResourceKind::ClusterRoleBinding, desired)
+        .await?;
     tracing::info!("Created CoreDNS ClusterRoleBinding");
     Ok(())
 }
 
-async fn create_coredns_configmap(db: &dyn DatastoreBackend) -> Result<()> {
+async fn create_coredns_configmap(store: &dyn CoreDnsBootstrapStore) -> Result<()> {
     let desired_corefile = desired_coredns_corefile();
-    if let Some(existing) = db
-        .get_resource("v1", "ConfigMap", Some("kube-system"), "coredns")
+    if let Some(existing) = store
+        .get_coredns_resource(CoreDnsResourceKind::ConfigMap)
         .await?
     {
         let current = existing
@@ -234,15 +237,13 @@ async fn create_coredns_configmap(db: &dyn DatastoreBackend) -> Result<()> {
             .as_object_mut()
             .expect("ConfigMap data must be a JSON object");
         data.insert("Corefile".to_string(), json!(desired_corefile));
-        db.update_resource(
-            "v1",
-            "ConfigMap",
-            Some("kube-system"),
-            "coredns",
-            updated,
-            existing.resource_version,
-        )
-        .await?;
+        store
+            .update_coredns_resource(
+                CoreDnsResourceKind::ConfigMap,
+                updated,
+                existing.resource_version,
+            )
+            .await?;
         tracing::info!("Updated CoreDNS ConfigMap to in-cluster API config");
         return Ok(());
     }
@@ -259,7 +260,8 @@ async fn create_coredns_configmap(db: &dyn DatastoreBackend) -> Result<()> {
         }
     });
 
-    db.create_resource("v1", "ConfigMap", Some("kube-system"), "coredns", cm)
+    store
+        .create_coredns_resource(CoreDnsResourceKind::ConfigMap, cm)
         .await?;
     tracing::info!("Created CoreDNS ConfigMap");
     Ok(())
@@ -285,12 +287,11 @@ fn desired_coredns_corefile() -> String {
 }
 
 async fn create_coredns_deployment(
-    db: &dyn DatastoreBackend,
-    pod_repository: Arc<PodRepository>,
+    store: &dyn CoreDnsBootstrapStore,
     node_name: &str,
 ) -> Result<()> {
-    if let Some(existing) = db
-        .get_resource("apps/v1", "Deployment", Some("kube-system"), "coredns")
+    if let Some(existing) = store
+        .get_coredns_resource(CoreDnsResourceKind::Deployment)
         .await?
     {
         let mut updated = (*existing.data).clone();
@@ -299,18 +300,17 @@ async fn create_coredns_deployment(
         changed |= remove_legacy_coredns_kubeconfig_mount(&mut updated);
         changed |= remove_legacy_coredns_kubeconfig_volume(&mut updated);
         if changed {
-            let updated = db
-                .update_resource(
-                    "apps/v1",
-                    "Deployment",
-                    Some("kube-system"),
-                    "coredns",
+            let updated = store
+                .update_coredns_resource(
+                    CoreDnsResourceKind::Deployment,
                     updated,
                     existing.resource_version,
                 )
                 .await?;
             tracing::info!("Updated CoreDNS Deployment template to remove node-local kubeconfig");
-            reconcile_coredns_deployment(db, pod_repository, updated, node_name).await?;
+            store
+                .reconcile_coredns_deployment(updated, node_name)
+                .await?;
         }
         return Ok(());
     }
@@ -372,18 +372,14 @@ async fn create_coredns_deployment(
         }
     });
 
-    let created = db
-        .create_resource(
-            "apps/v1",
-            "Deployment",
-            Some("kube-system"),
-            "coredns",
-            deployment,
-        )
+    let created = store
+        .create_coredns_resource(CoreDnsResourceKind::Deployment, deployment)
         .await?;
     tracing::info!("Created CoreDNS Deployment");
 
-    reconcile_coredns_deployment(db, pod_repository, created, node_name).await?;
+    store
+        .reconcile_coredns_deployment(created, node_name)
+        .await?;
     tracing::info!("Reconciled CoreDNS Deployment (ReplicaSet + Pod created)");
     Ok(())
 }
@@ -435,30 +431,9 @@ fn remove_array_entries_by_name(value: Option<&mut Value>, name: &str) -> bool {
     items.len() != before
 }
 
-async fn reconcile_coredns_deployment(
-    db: &dyn DatastoreBackend,
-    pod_repository: Arc<PodRepository>,
-    deployment: crate::datastore::types::Resource,
-    node_name: &str,
-) -> Result<()> {
-    let deployment_with_metadata =
-        crate::api::inject_resource_version(deployment.data, deployment.resource_version);
-    let pod_repo_ref = pod_repository.as_ref();
-    crate::controllers::deployment::reconcile_deployment(
-        db,
-        pod_repo_ref,
-        pod_repo_ref,
-        pod_repo_ref,
-        &deployment_with_metadata,
-        node_name,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn create_coredns_service(db: &dyn DatastoreBackend, dns_ip: &str) -> Result<()> {
-    let exists = db
-        .get_resource("v1", "Service", Some("kube-system"), "kube-dns")
+async fn create_coredns_service(store: &dyn CoreDnsBootstrapStore, dns_ip: &str) -> Result<()> {
+    let exists = store
+        .get_coredns_resource(CoreDnsResourceKind::Service)
         .await?
         .is_some();
     if exists {
@@ -490,7 +465,8 @@ async fn create_coredns_service(db: &dyn DatastoreBackend, dns_ip: &str) -> Resu
         }
     });
 
-    db.create_resource("v1", "Service", Some("kube-system"), "kube-dns", service)
+    store
+        .create_coredns_resource(CoreDnsResourceKind::Service, service)
         .await?;
     tracing::info!("Created CoreDNS Service (ClusterIP: {})", dns_ip);
     Ok(())
@@ -499,6 +475,91 @@ async fn create_coredns_service(db: &dyn DatastoreBackend, dns_ip: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coredns_bootstrap_adapter::bootstrap_coredns as bootstrap_coredns_root;
+    use std::sync::Mutex;
+
+    async fn bootstrap_coredns(
+        db: &dyn crate::datastore::DatastoreBackend,
+        pod_repository: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+        tls_port: u16,
+        service_cidr: &str,
+        containerd_namespace: &str,
+        node_name: &str,
+    ) -> anyhow::Result<()> {
+        bootstrap_coredns_root(
+            db,
+            pod_repository,
+            crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+            tls_port,
+            service_cidr,
+            containerd_namespace,
+            node_name,
+        )
+        .await
+    }
+
+    #[derive(Default)]
+    struct FakeCoreDnsStore {
+        created: Mutex<Vec<CoreDnsResourceKind>>,
+        reconciled_deployments: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl CoreDnsBootstrapStore for FakeCoreDnsStore {
+        async fn get_coredns_resource(
+            &self,
+            _kind: CoreDnsResourceKind,
+        ) -> Result<Option<Resource>> {
+            Ok(None)
+        }
+
+        async fn create_coredns_resource(
+            &self,
+            kind: CoreDnsResourceKind,
+            value: Value,
+        ) -> Result<Resource> {
+            self.created.lock().unwrap().push(kind);
+            Ok(Resource::try_from_data(std::sync::Arc::new(value))?)
+        }
+
+        async fn update_coredns_resource(
+            &self,
+            _kind: CoreDnsResourceKind,
+            _value: Value,
+            _expected_resource_version: i64,
+        ) -> Result<Resource> {
+            unreachable!("empty fake store never updates")
+        }
+
+        async fn reconcile_coredns_deployment(
+            &self,
+            _deployment: Resource,
+            _node_name: &str,
+        ) -> Result<()> {
+            *self.reconciled_deployments.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn focused_store_bootstrap_creates_exact_resource_family_once() {
+        let store = FakeCoreDnsStore::default();
+        bootstrap_coredns_with_store(&store, 6443, "10.43.128.0/17", "klights", "node-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            *store.created.lock().unwrap(),
+            vec![
+                CoreDnsResourceKind::ServiceAccount,
+                CoreDnsResourceKind::ClusterRole,
+                CoreDnsResourceKind::ClusterRoleBinding,
+                CoreDnsResourceKind::ConfigMap,
+                CoreDnsResourceKind::Deployment,
+                CoreDnsResourceKind::Service,
+            ]
+        );
+        assert_eq!(*store.reconciled_deployments.lock().unwrap(), 1);
+    }
 
     #[tokio::test]
     async fn test_bootstrap_coredns_creates_all_resources() {

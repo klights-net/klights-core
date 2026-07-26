@@ -52,53 +52,56 @@ pub fn without_loopback_nameservers(
     (nameservers, searches, options)
 }
 
-/// Cached host resolv.conf parse result. The host DNS config rarely changes
-/// during a klights process lifetime; re-reading on every pod start (the only
-/// caller is `dnsPolicy: Default`) was a sync FS hit on the async kubelet path.
-/// One read at first call, then served from memory thereafter.
-static HOST_RESOLV_CONF: std::sync::OnceLock<(Vec<String>, Vec<String>, Vec<String>)> =
-    std::sync::OnceLock::new();
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostDnsConfig {
+    nameservers: Vec<String>,
+    searches: Vec<String>,
+    options: Vec<String>,
+}
 
-fn read_host_resolv_conf_uncached() -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut selected = crate::utils::read_utf8_file("/etc/resolv.conf")
-        .ok()
-        .map(|content| parse_resolv_conf_content(&content))
-        .map(|(ns, search, opts)| without_loopback_nameservers(ns, search, opts))
-        .unwrap_or_default();
-
-    if selected.0.is_empty() {
-        for path in ["/run/systemd/resolve/resolv.conf"] {
-            let Some(parsed) = crate::utils::read_utf8_file(path)
-                .ok()
-                .map(|content| parse_resolv_conf_content(&content))
-                .map(|(ns, search, opts)| without_loopback_nameservers(ns, search, opts))
-            else {
-                continue;
-            };
-            if !parsed.0.is_empty() {
-                selected = parsed;
-                break;
-            }
+impl HostDnsConfig {
+    /// Build the immutable DNS snapshot injected by root construction.
+    ///
+    /// `resolved_upstream` is used only when the primary file contains no
+    /// non-loopback nameserver, matching systemd-resolved stub behavior.
+    pub fn from_resolv_conf_contents(
+        primary: Option<&str>,
+        resolved_upstream: Option<&str>,
+    ) -> Self {
+        let parse = |content: &str| {
+            let (nameservers, searches, options) = parse_resolv_conf_content(content);
+            without_loopback_nameservers(nameservers, searches, options)
+        };
+        let mut selected = primary.map(parse).unwrap_or_default();
+        if selected.0.is_empty()
+            && let Some(upstream) = resolved_upstream.map(parse)
+            && !upstream.0.is_empty()
+        {
+            selected = upstream;
+        }
+        if selected.0.is_empty() {
+            selected.0.push("192.0.2.53".to_string());
+        }
+        Self {
+            nameservers: selected.0,
+            searches: selected.1,
+            options: selected.2,
         }
     }
 
-    let (mut nameservers, searches, options) = selected;
-    if nameservers.is_empty() {
-        nameservers.push("192.0.2.53".to_string());
+    pub fn as_parts(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.nameservers.clone(),
+            self.searches.clone(),
+            self.options.clone(),
+        )
     }
-
-    (nameservers, searches, options)
 }
 
-/// Parse host DNS config for pod dnsPolicy=Default.
-/// If /etc/resolv.conf points at systemd-resolved's loopback stub, use the
-/// resolved upstream file instead so pods do not point 127.0.0.53 at themselves.
-///
-/// Result is cached process-wide; the host resolv.conf is read at most once.
-pub fn parse_host_resolv_conf() -> (Vec<String>, Vec<String>, Vec<String>) {
-    HOST_RESOLV_CONF
-        .get_or_init(read_host_resolv_conf_uncached)
-        .clone()
+impl Default for HostDnsConfig {
+    fn default() -> Self {
+        Self::from_resolv_conf_contents(None, None)
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +125,21 @@ search example.internal
         );
         assert_eq!(searches, vec!["example.internal"]);
         assert_eq!(options, vec!["edns0", "trust-ad"]);
+    }
+
+    #[test]
+    fn host_dns_config_prefers_injected_upstream_over_loopback_stub() {
+        let config = HostDnsConfig::from_resolv_conf_contents(
+            Some("nameserver 127.0.0.53\nsearch local"),
+            Some("nameserver 192.0.2.10\nsearch example.internal"),
+        );
+        assert_eq!(
+            config.as_parts(),
+            (
+                vec!["192.0.2.10".to_string()],
+                vec!["example.internal".to_string()],
+                Vec::new(),
+            )
+        );
     }
 }

@@ -6,19 +6,22 @@ use std::collections::HashMap;
 pub struct PodVolumeManager<'a> {
     file_process: &'a klights_supervisor::FileProcessExecutor,
     sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
-    containerd_namespace: &'a str,
+    paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 impl<'a> PodVolumeManager<'a> {
     pub fn new(
         file_process: &'a klights_supervisor::FileProcessExecutor,
         sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
-        containerd_namespace: &'a str,
+        paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        node_capacity: crate::kubelet::node::NodeCapacity,
     ) -> Self {
         Self {
             file_process,
             sources,
-            containerd_namespace,
+            paths,
+            node_capacity,
         }
     }
 
@@ -30,6 +33,8 @@ impl<'a> PodVolumeManager<'a> {
         pod: &Value,
     ) -> Result<HashMap<String, String>> {
         let registry = crate::kubelet::volume_registry::VolumeRegistry::with_defaults();
+        let volumes_root_path = self.paths.volumes_root();
+        let volumes_root = volumes_root_path.to_string_lossy();
         let ctx = crate::kubelet::volume_registry::VolumeContext {
             file_process: self.file_process,
             sources: self.sources,
@@ -37,7 +42,8 @@ impl<'a> PodVolumeManager<'a> {
             pod_name,
             pod_dir_id,
             pod,
-            containerd_namespace: self.containerd_namespace,
+            volumes_root: &volumes_root,
+            node_capacity: self.node_capacity,
         };
         let mut volume_paths = HashMap::new();
 

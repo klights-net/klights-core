@@ -1,12 +1,12 @@
 #[cfg(test)]
 use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
 use crate::api::{AppError, watch_event_to_table};
-use crate::datastore::CatchUpResource;
-use crate::datastore::DatastoreHandle;
 #[cfg(test)]
 use crate::datastore::RawWatchEvent;
 #[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
+#[cfg(test)]
+use crate::datastore::{CatchUpResource, DatastoreHandle};
 #[cfg(test)]
 use crate::datastore::{
     DatastoreBackendWatchStore, RawWatchReplayStore, SnapshotAtRv, WatchReplayAnchorStore,
@@ -26,11 +26,41 @@ use klights_kube_protobuf::{AcceptValue, ResponseFormat};
 use klights_types::LabelSelector;
 #[cfg(test)]
 use klights_watch::WatchSignalReceiver;
+#[cfg(not(test))]
+use klights_watch::WatchSignalReceiver;
 use klights_watch::WatchTopic;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+pub type WatchSourceCurrentResourceVersionFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>;
+pub type WatchSourceListFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<klights_leader_api::ResourceListResult, AppError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub trait WatchStreamSource: Send + Sync {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> WatchSignalReceiver;
+    fn current_resource_version(&self) -> WatchSourceCurrentResourceVersionFuture<'_>;
+    fn list_watch_resources<'a>(
+        &'a self,
+        api_version: &'a str,
+        kind: &'a str,
+        namespace: Option<&'a str>,
+        label_selector: Option<&'a str>,
+        field_selector: Option<&'a str>,
+        limit: Option<i64>,
+    ) -> WatchSourceListFuture<'a>;
+    fn watch_resources(
+        &self,
+        request: klights_leader_api::WatchRequest,
+    ) -> klights_leader_api::LeaderWatchFuture<'_>;
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,7 +145,7 @@ pub const READ_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// request. On the leader — and any node already caught up — this is a
 /// single resource-version read and returns immediately.
 pub async fn wait_until_datastore_fresh(
-    db: &DatastoreHandle,
+    db: &(impl WatchStreamSource + ?Sized),
     target_rv: i64,
     topic: WatchTopic,
     task_supervisor: &klights_supervisor::TaskSupervisor,
@@ -126,7 +156,7 @@ pub async fn wait_until_datastore_fresh(
     // Subscribe BEFORE the first freshness check so an advance landing
     // between the check and the wait is still observed (no lost wakeup).
     let mut fresh_rx = db.subscribe_watch_signals(topic);
-    if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
+    if db.current_resource_version().await.unwrap_or(0) >= target_rv {
         return;
     }
     let sleep = task_supervisor.sleep("watch_read_freshness_wait", READ_FRESHNESS_TIMEOUT);
@@ -156,7 +186,7 @@ pub async fn wait_until_datastore_fresh(
                 Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
                     // A burst of writes overflowed our buffer; re-check the
                     // authoritative counter directly.
-                    if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
+                    if db.current_resource_version().await.unwrap_or(0) >= target_rv {
                         return;
                     }
                 }
@@ -296,12 +326,18 @@ pub fn serialize_positioned_watch_event_for_stream(
     table_format: bool,
     stream_format: WatchStreamFormat,
 ) -> Result<Vec<u8>, Vec<u8>> {
-    try_serialize_watch_event_for_stream(
-        crate::control_plane::client::legacy_watch_event(&event),
-        kind,
-        table_format,
-        stream_format,
-    )
+    let event = WatchEvent {
+        event_type: match event.event_type() {
+            klights_leader_api::WatchEventType::Added => EventType::Added,
+            klights_leader_api::WatchEventType::Modified => EventType::Modified,
+            klights_leader_api::WatchEventType::Deleted => EventType::Deleted,
+            klights_leader_api::WatchEventType::Bookmark => EventType::Bookmark,
+            klights_leader_api::WatchEventType::Error => EventType::Error,
+        },
+        object: event.resource().data.clone(),
+        encoded_payload: None,
+    };
+    try_serialize_watch_event_for_stream(event, kind, table_format, stream_format)
 }
 
 #[cfg(test)]
@@ -541,8 +577,8 @@ pub(crate) fn bookmark_rv_for_watch_scope(
 /// Inputs shared by every periodic-watch-BOOKMARK emission site, bundled so the
 /// shared resolver stays under clippy's argument limit and call sites read by
 /// named field.
-pub(crate) struct PeriodicBookmarkContext<'a> {
-    pub db: &'a DatastoreHandle,
+pub(crate) struct PeriodicBookmarkContext<'a, S: WatchStreamSource + ?Sized> {
+    pub db: &'a S,
     pub api_version: &'a str,
     pub kind: &'a str,
     pub watch_namespace: Option<&'a str>,
@@ -574,7 +610,9 @@ pub(crate) struct PeriodicBookmarkContext<'a> {
 /// that is 0 (a quiet, freshly-established watch that has observed nothing)
 /// this falls back to a fresh collection snapshot read so the client still gets
 /// a valid, advancing resume point.
-pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_>) -> i64 {
+pub(crate) async fn resolve_periodic_bookmark_rv<S: WatchStreamSource + ?Sized>(
+    ctx: PeriodicBookmarkContext<'_, S>,
+) -> i64 {
     let PeriodicBookmarkContext {
         db,
         api_version,
@@ -608,14 +646,9 @@ pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_
     }
     if rv <= 0 && !has_scope_filter {
         rv = db
-            .list_resources(
-                api_version,
-                kind,
-                watch_namespace,
-                crate::datastore::ResourceListQuery::new(None, None, Some(1), None),
-            )
+            .list_watch_resources(api_version, kind, watch_namespace, None, None, Some(1))
             .await
-            .map(|list| list.resource_version)
+            .map(|list| list.resource_version())
             .unwrap_or(0);
     }
     rv
@@ -663,8 +696,8 @@ pub async fn recv_watch_timeout(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
     }
 }
 
-pub struct LabelSelectorWatchStreamRequest<'a> {
-    pub db: DatastoreHandle,
+pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
+    pub db: S,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub api_version: &'a str,
     pub kind: String,
@@ -743,8 +776,8 @@ where
     Ok((signal_rx, replay_start_position))
 }
 
-pub async fn build_label_selector_watch_stream(
-    request: LabelSelectorWatchStreamRequest<'_>,
+pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
+    request: LabelSelectorWatchStreamRequest<'_, S>,
 ) -> Body {
     let LabelSelectorWatchStreamRequest {
         db,
@@ -763,8 +796,6 @@ pub async fn build_label_selector_watch_stream(
         emit_initial_state_for_resource_version_zero,
     } = request;
     let api_version = api_version.to_string();
-    let positioned_watch =
-        crate::control_plane::client::local::datastore_positioned_watch_service(db.clone());
     wait_until_datastore_fresh(
         &db,
         requested_rv,
@@ -786,22 +817,19 @@ pub async fn build_label_selector_watch_stream(
     let mut initial_frames = Vec::new();
     if emit_baseline {
         let list = match db
-            .list_resources(
+            .list_watch_resources(
                 &api_version,
                 &kind,
                 watch_namespace.as_deref(),
-                crate::datastore::ResourceListQuery::new(
-                    label_selector.as_deref(),
-                    field_selector.as_deref(),
-                    None,
-                    None,
-                ),
+                label_selector.as_deref(),
+                field_selector.as_deref(),
+                None,
             )
             .await
         {
             Ok(list) => list,
             Err(error) => {
-                tracing::warn!(%error, "positioned watch baseline LIST failed");
+                tracing::warn!(?error, "positioned watch baseline LIST failed");
                 return single_watch_frame_body(serialize_watch_status_for_stream(
                     stream_format,
                     500,
@@ -810,7 +838,7 @@ pub async fn build_label_selector_watch_stream(
                 ));
             }
         };
-        let Some(position) = list.watch_replay_position else {
+        let Some(position) = list.watch_replay_position() else {
             return single_watch_frame_body(serialize_watch_status_for_stream(
                 stream_format,
                 500,
@@ -819,9 +847,9 @@ pub async fn build_label_selector_watch_stream(
             ));
         };
         start_position = Some(position);
-        last_delivered_rv = last_delivered_rv.max(list.resource_version);
-        for resource in list.items {
-            let event = CatchUpResource::added(resource).into_watch_event();
+        last_delivered_rv = last_delivered_rv.max(list.resource_version());
+        for resource in list.into_items() {
+            let event = WatchEvent::added((*resource.data).clone());
             match try_serialize_watch_event_for_stream(event, &kind, table_format, stream_format) {
                 Ok(frame) => initial_frames.push(frame),
                 Err(frame) => return single_watch_frame_body(frame),
@@ -865,18 +893,15 @@ pub async fn build_label_selector_watch_stream(
             ));
         }
     };
-    let mut positioned_stream =
-        match klights_leader_api::LeaderWatch::watch_resources(&positioned_watch, watch_request)
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                return single_watch_frame_body(serialize_positioned_watch_error_for_stream(
-                    &error,
-                    stream_format,
-                ));
-            }
-        };
+    let mut positioned_stream = match db.watch_resources(watch_request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            return single_watch_frame_body(serialize_positioned_watch_error_for_stream(
+                &error,
+                stream_format,
+            ));
+        }
+    };
 
     let stream = async_stream::stream! {
         for frame in initial_frames {
@@ -2591,7 +2616,7 @@ mod tests {
         // initial-list. Holding event_type as Cow<'static, str> avoids the
         // per-event String allocation when the literal "ADDED" is reused.
         // Confirm the static literal flows through unchanged (no deep copy).
-        let resource = crate::datastore::Resource {
+        let resource = klights_cluster_core::Resource {
             id: 0,
             api_version: "v1".into(),
             kind: "Pod".into(),
@@ -3010,12 +3035,12 @@ mod tests {
         stored_namespace: Option<&str>,
         data_namespace: Option<&str>,
         name: &str,
-    ) -> crate::datastore::Resource {
+    ) -> klights_cluster_core::Resource {
         let mut metadata = serde_json::json!({"name": name});
         if let Some(ns) = data_namespace {
             metadata["namespace"] = serde_json::Value::String(ns.to_string());
         }
-        crate::datastore::Resource {
+        klights_cluster_core::Resource {
             id: 0,
             api_version: api_version.into(),
             kind: kind.into(),
@@ -3033,7 +3058,7 @@ mod tests {
 
     fn make_event_from_resource(
         event_type: EventType,
-        resource: &crate::datastore::Resource,
+        resource: &klights_cluster_core::Resource,
     ) -> WatchEvent {
         WatchEvent {
             event_type,

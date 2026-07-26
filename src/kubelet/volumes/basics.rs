@@ -3,22 +3,26 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+#[cfg(test)]
 pub fn volumes_root() -> String {
     let runtime_ns = crate::paths::runtime_namespace();
     volumes_root_for_namespace(&runtime_ns)
 }
 
+#[cfg(test)]
 pub fn volumes_root_for_namespace(runtime_ns: &str) -> String {
     crate::paths::volumes_root_path(runtime_ns)
         .to_string_lossy()
         .into_owned()
 }
 
+#[cfg(test)]
 pub fn empty_dir_volume_path(pod_name: &str, volume_name: &str) -> String {
     let runtime_ns = crate::paths::runtime_namespace();
     empty_dir_volume_path_for_namespace(&runtime_ns, pod_name, volume_name)
 }
 
+#[cfg(test)]
 pub fn empty_dir_volume_path_for_namespace(
     runtime_ns: &str,
     pod_name: &str,
@@ -29,6 +33,17 @@ pub fn empty_dir_volume_path_for_namespace(
         volumes_root_for_namespace(runtime_ns),
         pod_name,
         volume_name
+    )
+}
+
+pub fn empty_dir_volume_path_under_root(
+    volumes_root: &str,
+    pod_name: &str,
+    volume_name: &str,
+) -> String {
+    format!(
+        "{}/{}/volumes/empty-dir/{}",
+        volumes_root, pod_name, volume_name
     )
 }
 fn canonicalize_existing_path_for_mount(path: &str) -> Result<String> {
@@ -186,6 +201,7 @@ fn check_projection_path(vol_name: &str, source: &str, path: &str) -> Result<(),
 
 /// Creates an emptyDir volume for a pod with world-writable permissions.
 /// K8s spec requires emptyDir to be writable by the pod's fsGroup if set.
+#[cfg(test)]
 pub fn create_empty_dir(
     pod_name: &str,
     volume_name: &str,
@@ -196,6 +212,7 @@ pub fn create_empty_dir(
     create_empty_dir_for_namespace(&runtime_ns, pod_name, volume_name, medium, size_limit)
 }
 
+#[cfg(test)]
 pub fn create_empty_dir_for_namespace(
     runtime_ns: &str,
     pod_name: &str,
@@ -203,7 +220,18 @@ pub fn create_empty_dir_for_namespace(
     medium: Option<&str>,
     size_limit: Option<&str>,
 ) -> Result<String> {
-    let configured_path = empty_dir_volume_path_for_namespace(runtime_ns, pod_name, volume_name);
+    let volumes_root = volumes_root_for_namespace(runtime_ns);
+    create_empty_dir_under_root(&volumes_root, pod_name, volume_name, medium, size_limit)
+}
+
+pub fn create_empty_dir_under_root(
+    volumes_root: &str,
+    pod_name: &str,
+    volume_name: &str,
+    medium: Option<&str>,
+    size_limit: Option<&str>,
+) -> Result<String> {
+    let configured_path = empty_dir_volume_path_under_root(volumes_root, pod_name, volume_name);
     std::fs::create_dir_all(&configured_path)
         .with_context(|| format!("Failed to create emptyDir volume at {}", configured_path))?;
     let path = canonicalize_existing_path_for_mount(&configured_path)?;

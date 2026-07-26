@@ -8,33 +8,15 @@ pub mod remote;
 pub mod worker_store;
 
 use async_trait::async_trait;
-pub use klights_leader_api::{
-    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, DataplaneEncryption,
-    HostPortRange as LeaderHostPortRange, LeaderAuthenticatedProjectedServiceAccountToken,
-    LeaderCacheReadiness, LeaderNetworkTopologyCommand, LeaderNetworkTopologyQuery,
-    LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus, LeaderNodeSelfStatus,
-    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
-    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
-    NetworkDataplane, NetworkNodeMode, NetworkTopologyError, NetworkTopologyFuture,
-    NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture,
-    NodeLeaseRenewalRequest, NodeLeaseRenewalResult, NodeLifecycleStatusError,
-    NodeLifecycleStatusFuture, NodeLifecycleStatusRequest, NodeLifecycleStatusResult,
-    NodeSelfStatusError, NodeSelfStatusFuture, NodeSelfStatusRequest, NodeSelfStatusResult,
-    NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
-    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
-    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
-    PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountToken,
-    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
-    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
-    ResourceCommandRequest, ResourceCommandResult, ResourceEvent, ResourceGetRequest,
-    ResourceListRequest, ResourceListResult, ResourceQueryConsistency, ResourceQueryError,
-    ResourceQueryFuture, WatchEventType, WatchRequest, WatchResumeCursor, WatchStream,
-    config_map_get_request, node_get_request, pod_get_request, pods_on_node_list_request,
-    secret_get_request,
+use klights_leader_api::{
+    DataplaneEncryption, HostPortRange as LeaderHostPortRange, LeaderCacheReadiness,
+    LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
+    LeaderProjectedServiceAccountToken, LeaderResourceQuery, LeaderWatch, LeaderWatchError,
+    NetworkDataplane, NetworkNodeMode, NetworkTopologyError, ResourceEvent, ResourceListRequest,
+    ResourceListResult, ResourceQueryError, WatchEventType, WatchRequest,
 };
 
 use crate::datastore::{NodeSubnet, Resource, ResourceList};
-use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::watch::WatchEvent;
 
 pub type Pod = Resource;
@@ -67,21 +49,20 @@ pub(crate) fn focused_node_subnet(
 pub(crate) fn legacy_node_subnet(
     subnet: klights_leader_api::NodeSubnet,
 ) -> std::result::Result<NodeSubnet, NetworkTopologyError> {
-    let node_name = crate::networking::NodeName::parse(subnet.node_name())
+    let node_name = klights_types::NodeName::parse(subnet.node_name())
         .map_err(NetworkTopologyError::corrupt_response)?;
-    let pod_subnet = crate::networking::PodSubnet::parse(subnet.subnet())
+    let pod_subnet = klights_types::PodSubnet::parse(subnet.subnet())
         .map_err(NetworkTopologyError::corrupt_response)?;
     let mode = match subnet.mode() {
         NetworkNodeMode::Root => crate::controllers::annotations::NodePeerMode::Root,
         NetworkNodeMode::Rootless => crate::controllers::annotations::NodePeerMode::Rootless,
     };
-    let hostport_range =
-        subnet
-            .hostport_range()
-            .map(|range| crate::networking::types::HostPortRange {
-                start: range.start(),
-                end: range.end(),
-            });
+    let hostport_range = subnet
+        .hostport_range()
+        .map(|range| klights_types::HostPortRange {
+            start: range.start(),
+            end: range.end(),
+        });
     Ok(NodeSubnet {
         node_name,
         subnet: pod_subnet,
@@ -94,21 +75,17 @@ pub(crate) fn legacy_node_subnet(
 }
 
 pub(crate) fn focused_dataplane(
-    metadata: DataplanePeerMetadata,
+    metadata: klights_cluster_store::DataplanePeerMetadata,
 ) -> std::result::Result<NetworkDataplane, NetworkTopologyError> {
     NetworkDataplane::try_new(
         metadata.node_name,
         match metadata.mode {
-            crate::networking::wireguard::DataplaneMode::Root => NetworkNodeMode::Root,
-            crate::networking::wireguard::DataplaneMode::Rootless => NetworkNodeMode::Rootless,
+            klights_cluster_store::DataplaneMode::Root => NetworkNodeMode::Root,
+            klights_cluster_store::DataplaneMode::Rootless => NetworkNodeMode::Rootless,
         },
         match metadata.encryption {
-            crate::networking::wireguard::DataplaneEncryption::Enabled => {
-                DataplaneEncryption::WireGuard
-            }
-            crate::networking::wireguard::DataplaneEncryption::Disabled => {
-                DataplaneEncryption::Direct
-            }
+            klights_cluster_store::DataplaneEncryption::Enabled => DataplaneEncryption::WireGuard,
+            klights_cluster_store::DataplaneEncryption::Disabled => DataplaneEncryption::Direct,
         },
         metadata.public_key.as_ref().map(|key| key.as_str()),
         metadata.endpoint,
@@ -116,42 +93,54 @@ pub(crate) fn focused_dataplane(
     )
 }
 
-pub(crate) trait IntoFocusedDataplane {
-    fn into_focused_dataplane(self) -> Result<NetworkDataplane, NetworkTopologyError>;
-}
-
-impl IntoFocusedDataplane for NetworkDataplane {
-    fn into_focused_dataplane(self) -> Result<NetworkDataplane, NetworkTopologyError> {
-        Ok(self)
-    }
-}
-
-impl IntoFocusedDataplane for DataplanePeerMetadata {
-    fn into_focused_dataplane(self) -> Result<NetworkDataplane, NetworkTopologyError> {
-        focused_dataplane(self)
-    }
-}
-
 pub(crate) fn legacy_dataplane(
     metadata: NetworkDataplane,
-) -> std::result::Result<DataplanePeerMetadata, NetworkTopologyError> {
+) -> std::result::Result<klights_cluster_store::DataplanePeerMetadata, NetworkTopologyError> {
     let mode = match metadata.mode() {
-        NetworkNodeMode::Root => crate::networking::wireguard::DataplaneMode::Root,
-        NetworkNodeMode::Rootless => crate::networking::wireguard::DataplaneMode::Rootless,
+        NetworkNodeMode::Root => klights_cluster_store::DataplaneMode::Root,
+        NetworkNodeMode::Rootless => klights_cluster_store::DataplaneMode::Rootless,
     };
     let encryption = match metadata.encryption() {
-        DataplaneEncryption::WireGuard => {
-            crate::networking::wireguard::DataplaneEncryption::Enabled
-        }
-        DataplaneEncryption::Direct => crate::networking::wireguard::DataplaneEncryption::Disabled,
+        DataplaneEncryption::WireGuard => klights_cluster_store::DataplaneEncryption::Enabled,
+        DataplaneEncryption::Direct => klights_cluster_store::DataplaneEncryption::Disabled,
     };
-    DataplanePeerMetadata::try_new(
+    klights_cluster_store::DataplanePeerMetadata::try_new(
         metadata.node_name().to_string(),
         mode,
         encryption,
         metadata.public_key().map(str::to_owned),
         Some(metadata.endpoint().to_string()),
         metadata.port(),
+    )
+    .map_err(|error| NetworkTopologyError::corrupt_response(error.to_string()))
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_dataplane(
+    metadata: klights_cluster_store::DataplanePeerMetadata,
+) -> std::result::Result<crate::networking::wireguard::DataplanePeerMetadata, NetworkTopologyError>
+{
+    crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        metadata.node_name,
+        match metadata.mode {
+            klights_cluster_store::DataplaneMode::Root => {
+                crate::networking::wireguard::DataplaneMode::Root
+            }
+            klights_cluster_store::DataplaneMode::Rootless => {
+                crate::networking::wireguard::DataplaneMode::Rootless
+            }
+        },
+        match metadata.encryption {
+            klights_cluster_store::DataplaneEncryption::Enabled => {
+                crate::networking::wireguard::DataplaneEncryption::Enabled
+            }
+            klights_cluster_store::DataplaneEncryption::Disabled => {
+                crate::networking::wireguard::DataplaneEncryption::Disabled
+            }
+        },
+        metadata.public_key.map(|key| key.to_string()),
+        Some(metadata.endpoint.to_string()),
+        metadata.port,
     )
     .map_err(|error| NetworkTopologyError::corrupt_response(error.to_string()))
 }
@@ -406,7 +395,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::control_plane::client::{
+    use klights_leader_api::{
         LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
         LeaderResourceQuery, NodeDataplaneQuery, NodeSubnetAllocationRequest, NodeSubnetQuery,
         PeerSubnetsQuery, PodCleanupIntentAckRequest, ResourceQueryConsistency, pod_get_request,
@@ -608,9 +597,11 @@ mod tests {
     }
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
-    use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-    use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
-    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+    use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+    use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+    use klights_leader_api::{
+        OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
+    };
 
     #[test]
     fn positioned_watch_adapters_implement_focused_ports() {
@@ -1042,6 +1033,9 @@ mod tests {
             "worker-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
+        client.set_non_pod_finalization(Arc::new(
+            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
+        ));
         let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
             Arc::new(crate::controllers::service::ServiceIpam::new(
                 "10.43.128.0/17",
@@ -1144,6 +1138,9 @@ mod tests {
             "worker-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
+        client.set_non_pod_finalization(Arc::new(
+            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
+        ));
         let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
             Arc::new(crate::controllers::service::ServiceIpam::new(
                 "10.43.128.0/17",

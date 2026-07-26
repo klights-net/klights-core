@@ -1,24 +1,28 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 
-use crate::datastore::DatastoreBackend;
-use crate::side_effects::{ControllerDispatcherSlot, SideEffect};
+#[async_trait]
+pub(crate) trait DaemonSetNodeSideEffectStore: Send + Sync {
+    async fn list_daemonsets(&self) -> Result<Vec<Resource>>;
+}
 
 /// Cached fingerprint of scheduling-relevant node fields. When these don't
 /// change, we skip the expensive "enqueue every DaemonSet" step.
 #[derive(Clone, PartialEq)]
-struct NodeSchedulingFingerprint {
+pub(crate) struct NodeSchedulingFingerprint {
     labels: Option<Value>,
     taints: Option<Value>,
     unschedulable: Option<Value>,
 }
 
 impl NodeSchedulingFingerprint {
-    fn from_node(node: &Value) -> Self {
+    pub(crate) fn from_node(node: &Value) -> Self {
         Self {
             labels: node.pointer("/metadata/labels").cloned(),
             taints: node.pointer("/spec/taints").cloned(),
@@ -27,106 +31,78 @@ impl NodeSchedulingFingerprint {
     }
 }
 
-struct DaemonSetNodeReconcile {
-    controller_dispatcher: ControllerDispatcherSlot,
-    last_fingerprint: Mutex<HashMap<String, NodeSchedulingFingerprint>>,
-}
-
-pub fn daemonset_node_reconcile(
-    controller_dispatcher: ControllerDispatcherSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(DaemonSetNodeReconcile {
-        controller_dispatcher,
-        last_fingerprint: Mutex::new(HashMap::new()),
-    })
-}
-
-#[async_trait]
-impl SideEffect for DaemonSetNodeReconcile {
-    fn name(&self) -> &'static str {
-        "daemonset_node_reconcile"
+pub(crate) async fn reconcile_keys_for_node<Store: DaemonSetNodeSideEffectStore + ?Sized>(
+    node: &Value,
+    store: &Store,
+    last_fingerprint: &Mutex<HashMap<String, NodeSchedulingFingerprint>>,
+) -> Result<Vec<ReconcileKey>> {
+    // Only enqueue DaemonSets when scheduling-relevant node fields
+    // (labels, taints, unschedulable) actually change. Routine kubelet
+    // heartbeats update only status and must not trigger a DaemonSet
+    // reconciliation storm.
+    let node_name = node
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if node_name.is_empty() {
+        return Ok(Vec::new());
     }
 
-    async fn apply(&self, node: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            tracing::debug!("daemonset_node_reconcile: controller dispatcher is not bound yet");
-            return Ok(());
+    let fingerprint = NodeSchedulingFingerprint::from_node(node);
+    let changed = {
+        let mut cache = last_fingerprint.lock().unwrap();
+        let prev = cache.get(node_name);
+        let changed = match prev {
+            Some(prev) => *prev != fingerprint,
+            None => true,
         };
-
-        // Only enqueue DaemonSets when scheduling-relevant node fields
-        // (labels, taints, unschedulable) actually change. Routine kubelet
-        // heartbeats update only status and must not trigger a DaemonSet
-        // reconciliation storm.
-        let node_name = node
-            .pointer("/metadata/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if node_name.is_empty() {
-            return Ok(());
+        if changed {
+            cache.insert(node_name.to_string(), fingerprint);
         }
+        changed
+    };
 
-        let fingerprint = NodeSchedulingFingerprint::from_node(node);
-        let changed = {
-            let mut cache = self.last_fingerprint.lock().unwrap();
-            let prev = cache.get(node_name);
-            let changed = match prev {
-                Some(prev) => *prev != fingerprint,
-                None => true,
-            };
-            if changed {
-                cache.insert(node_name.to_string(), fingerprint);
-            }
-            changed
-        };
-
-        if !changed {
-            tracing::debug!(
-                target: "klights::daemonset_node_reconcile",
-                node = %node_name,
-                "node scheduling fingerprint unchanged; skipping DaemonSet enqueue"
-            );
-            return Ok(());
-        }
-
-        tracing::info!(
+    if !changed {
+        tracing::debug!(
             target: "klights::daemonset_node_reconcile",
             node = %node_name,
-            "node labels/taints changed; enqueuing DaemonSets"
+            "node scheduling fingerprint unchanged; skipping DaemonSet enqueue"
         );
-
-        let daemonsets = db
-            .list_resources(
-                "apps/v1",
-                "DaemonSet",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        let mut keys = Vec::with_capacity(daemonsets.items.len());
-        for daemonset in daemonsets.items {
-            let Some(namespace) = daemonset.namespace.as_deref() else {
-                continue;
-            };
-            keys.push(klights_reconcile_api::ReconcileKey::namespaced(
-                "apps/v1",
-                "DaemonSet",
-                namespace,
-                &daemonset.name,
-            ));
-        }
-        dispatcher.enqueue_reconcile_batch(keys).await?;
-        Ok(())
+        return Ok(Vec::new());
     }
+
+    tracing::info!(
+        target: "klights::daemonset_node_reconcile",
+        node = %node_name,
+        "node labels/taints changed; enqueuing DaemonSets"
+    );
+
+    let daemonsets = store.list_daemonsets().await?;
+    let mut keys = Vec::with_capacity(daemonsets.len());
+    for daemonset in daemonsets {
+        let Some(namespace) = daemonset.namespace.as_deref() else {
+            continue;
+        };
+        keys.push(ReconcileKey::namespaced(
+            "apps/v1",
+            "DaemonSet",
+            namespace,
+            &daemonset.name,
+        ));
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::side_effects::ControllerDispatcherSlot;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn node_label_change_enqueues_daemonsets_without_reconciling_inline() {
         let db = crate::datastore::test_support::in_memory().await;
+        let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
@@ -170,8 +146,8 @@ mod tests {
         .await
         .unwrap();
 
-        let effect = daemonset_node_reconcile(slot);
-        effect.apply(&node.data, &db).await.unwrap();
+        let effect = crate::daemonset_node_side_effect_adapter::effect(db_handle.clone(), slot);
+        effect.apply(&node.data).await.unwrap();
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,
             vec![klights_reconcile_api::ReconcileKey::namespaced(
@@ -195,7 +171,7 @@ mod tests {
             )
             .await
             .unwrap();
-        effect.apply(&labelled_node.data, &db).await.unwrap();
+        effect.apply(&labelled_node.data).await.unwrap();
 
         let pods = db
             .list_resources(

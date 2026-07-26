@@ -23,7 +23,7 @@ use openraft::AnyError;
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{LogId, RaftLogReader, StorageError, StorageIOError, Vote};
 
-use crate::datastore::raft::types::{NodeId, TypeConfig};
+use super::types::{NodeId, TypeConfig};
 
 #[derive(Clone)]
 pub struct SqliteRaftLogStorage {

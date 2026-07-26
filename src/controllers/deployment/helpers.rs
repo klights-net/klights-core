@@ -1,7 +1,21 @@
-use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+#[async_trait]
+pub trait DeploymentPodReader: Send + Sync {
+    async fn list_pods_by_owner_uid(
+        &self,
+        namespace: &str,
+        owner_uid: &str,
+    ) -> Result<Vec<klights_cluster_core::Resource>>;
+
+    async fn list_namespace_pods(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<klights_cluster_core::Resource>>;
+}
 
 /// Compute a deterministic pod-template-hash from the pod template spec.
 /// K8s uses this as the RS name suffix, and adds it to RS labels, RS selector,
@@ -89,7 +103,7 @@ pub(super) fn get_max_unavailable(spec: &Value, desired_replicas: i64) -> i64 {
     (desired_replicas * 25) / 100
 }
 
-pub(super) fn get_next_revision(owned_rs_list: &[crate::datastore::Resource]) -> i64 {
+pub(super) fn get_next_revision(owned_rs_list: &[klights_cluster_core::Resource]) -> i64 {
     let mut max_revision = 0i64;
     for rs in owned_rs_list {
         if let Some(annotations) = rs
@@ -109,10 +123,10 @@ pub(super) fn get_next_revision(owned_rs_list: &[crate::datastore::Resource]) ->
 
 /// Count pods owned by deployment (via its ReplicaSets)
 /// Returns (total_pods, ready_pods, updated_pods, available_pods)
-pub(super) async fn count_deployment_pods(
-    pod_reader: &dyn PodReader,
+pub(super) async fn count_deployment_pods<R: DeploymentPodReader + ?Sized>(
+    pod_reader: &R,
     namespace: &str,
-    owned_rs_list: &[crate::datastore::Resource],
+    owned_rs_list: &[klights_cluster_core::Resource],
     current_template: &Value,
 ) -> Result<(i64, i64, i64, i64)> {
     let common = crate::controllers::common::controller_common();
@@ -146,11 +160,9 @@ pub(super) async fn count_deployment_pods(
         if owned_pods.is_empty()
             && let Some(selector_obj) = rs.data.get("spec").and_then(|s| s.get("selector"))
         {
-            let all_ns_pods = pod_reader
-                .list_pods(Some(namespace), None, None, None, None)
-                .await?;
-            owned_pods = all_ns_pods
-                .items
+            owned_pods = pod_reader
+                .list_namespace_pods(namespace)
+                .await?
                 .into_iter()
                 .filter(|pod| {
                     pod.data

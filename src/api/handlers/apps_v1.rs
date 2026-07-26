@@ -150,7 +150,11 @@ async fn create_deployment(
 
     let (status, json_response) = &result;
     if *status == StatusCode::CREATED {
-        state.controller_dispatcher.enqueue(&json_response.0).await;
+        state
+            .controller_reconcile()
+            .controller_dispatcher
+            .enqueue(&json_response.0)
+            .await;
     }
 
     Ok(result)
@@ -172,7 +176,11 @@ async fn update_deployment(
     )
     .await?;
 
-    state.controller_dispatcher.enqueue(&result.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&result.0)
+        .await;
 
     Ok(result)
 }
@@ -196,7 +204,11 @@ async fn patch_deployment(
     .await?;
 
     let (_status, json_response) = &result;
-    state.controller_dispatcher.enqueue(&json_response.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&json_response.0)
+        .await;
 
     Ok(result)
 }

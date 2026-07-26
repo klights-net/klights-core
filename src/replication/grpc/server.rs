@@ -86,7 +86,7 @@ pub fn validate_join_metadata(
 fn require_worker_command_codec_v3(
     join: &generated::JoinRequest,
 ) -> std::result::Result<(), Status> {
-    crate::replication::protocol::require_command_codec_v3(join.supported_features, "worker")
+    crate::replication::protocol::require_exact_command_codec(join.command_codec_version, "worker")
         .map_err(Status::failed_precondition)
 }
 
@@ -423,7 +423,6 @@ pub struct GrpcReplicationServer {
     node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
     node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
-    authoritative_snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
     peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
     credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     /// Phase 3 raft RPC dispatcher. Populated by the leader bootstrap
@@ -452,9 +451,6 @@ impl GrpcReplicationServer {
     fn from_parts(
         service: Arc<ReplicationService>,
         ports: ReplicationServerPorts,
-        authoritative_snapshot_capture: Arc<
-            dyn klights_cluster_store::AuthoritativeSnapshotCapture,
-        >,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
         #[cfg(test)] db: Option<DatastoreHandle>,
@@ -468,7 +464,6 @@ impl GrpcReplicationServer {
             node_self_query: None,
             node_self_status: None,
             node_lifecycle_status: None,
-            authoritative_snapshot_capture,
             peer_authenticator,
             credential_issuer,
             raft_rpc_router: None,
@@ -514,16 +509,12 @@ impl GrpcReplicationServer {
     pub(crate) fn new_with_ports(
         service: Arc<ReplicationService>,
         ports: ReplicationServerPorts,
-        authoritative_snapshot_capture: Arc<
-            dyn klights_cluster_store::AuthoritativeSnapshotCapture,
-        >,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     ) -> Self {
         Self::from_parts(
             service,
             ports,
-            authoritative_snapshot_capture,
             peer_authenticator,
             credential_issuer,
             #[cfg(test)]
@@ -592,22 +583,19 @@ impl GrpcReplicationServer {
         if let Some(dispatcher) = controller_dispatcher {
             local.set_controller_dispatcher(dispatcher);
         }
+        local.set_non_pod_finalization(Arc::new(
+            crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db.clone()),
+        ));
         let projected_token = Arc::new(
             crate::control_plane::client::local::AuthenticatedProjectedTokenIssuer::new(
                 local.clone(),
             ),
         );
         let ports = ReplicationServerPorts::from_shared(local, projected_token);
-        let capture = Arc::new(
-            crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new_capture(
-                db.clone(),
-            ),
-        );
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         Self::from_parts(
             service,
             ports,
-            capture,
             Arc::new(
                 crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
                     supervisor.clone(),
@@ -995,68 +983,6 @@ fn apply_outbox_error_response(
     })
 }
 
-fn snapshot_persistence_status(error: klights_cluster_store::SnapshotPersistenceError) -> Status {
-    match error {
-        klights_cluster_store::SnapshotPersistenceError::Cancelled => {
-            Status::cancelled(error.to_string())
-        }
-        klights_cluster_store::SnapshotPersistenceError::Timeout => {
-            Status::deadline_exceeded(error.to_string())
-        }
-        klights_cluster_store::SnapshotPersistenceError::Retryable { .. } => {
-            Status::unavailable(error.to_string())
-        }
-        klights_cluster_store::SnapshotPersistenceError::ResourceExhausted { .. } => {
-            Status::resource_exhausted(error.to_string())
-        }
-        klights_cluster_store::SnapshotPersistenceError::CorruptData { .. }
-        | klights_cluster_store::SnapshotPersistenceError::InvalidSnapshot { .. } => {
-            Status::data_loss(error.to_string())
-        }
-        klights_cluster_store::SnapshotPersistenceError::UnsupportedMode { .. } => {
-            Status::unimplemented(error.to_string())
-        }
-        klights_cluster_store::SnapshotPersistenceError::PersistenceFailed { .. } => {
-            Status::internal(error.to_string())
-        }
-        _ => Status::internal(error.to_string()),
-    }
-}
-
-fn legacy_snapshot_commits(
-    current_rv: i64,
-    page: klights_cluster_store::SnapshotCapturePage,
-) -> Vec<crate::log_apply::LogApplyCommit> {
-    use klights_cluster_store::SnapshotCapturePageKind;
-    match page.kind() {
-        SnapshotCapturePageKind::Commits => page.into_commits().expect("page kind checked"),
-        SnapshotCapturePageKind::AppliedOutbox => page
-            .into_applied_outbox()
-            .expect("page kind checked")
-            .into_iter()
-            .map(|row| {
-                crate::log_apply::LogApplyCommit::new(
-                    current_rv,
-                    vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)],
-                )
-            })
-            .collect(),
-        SnapshotCapturePageKind::OutboxWatermarks => page
-            .into_outbox_watermarks()
-            .expect("page kind checked")
-            .into_iter()
-            .map(|outbox_watermark| crate::log_apply::LogApplyCommit {
-                resource_version: current_rv,
-                resource_version_assignment:
-                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                outbox_watermark: Some(outbox_watermark),
-                mutations: Vec::new(),
-            })
-            .collect(),
-        SnapshotCapturePageKind::ReplayFloors => Vec::new(),
-    }
-}
-
 #[cfg(test)]
 pub fn mount_service(
     app: axum::Router,
@@ -1238,7 +1164,6 @@ pub(crate) fn mount_service_full_production(
     app: axum::Router,
     service: Arc<ReplicationService>,
     ports: ReplicationServerPorts,
-    authoritative_snapshot_capture: Arc<dyn klights_cluster_store::AuthoritativeSnapshotCapture>,
     peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
     credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
@@ -1256,7 +1181,6 @@ pub(crate) fn mount_service_full_production(
     let mut grpc = GrpcReplicationServer::new_with_ports(
         service,
         ports,
-        authoritative_snapshot_capture,
         peer_authenticator,
         credential_issuer,
     )
@@ -1312,8 +1236,6 @@ pub(crate) fn mount_service_full_production(
 #[tonic::async_trait]
 impl generated::replication_server::Replication for GrpcReplicationServer {
     type ConnectStream = BoxStream<'static, std::result::Result<generated::LeaderMessage, Status>>;
-    type SnapshotStream =
-        BoxStream<'static, std::result::Result<generated::ReplicationEntry, Status>>;
     type WatchResourcesStream =
         BoxStream<'static, std::result::Result<generated::WatchEvent, Status>>;
 
@@ -1626,53 +1548,6 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    async fn snapshot(
-        &self,
-        request: Request<generated::SnapshotRequest>,
-    ) -> std::result::Result<Response<Self::SnapshotStream>, Status> {
-        self.require_steady_state_auth(&request).await?;
-        let _last_applied_rv = request.into_inner().last_applied_rv;
-        let capture = self.authoritative_snapshot_capture.clone();
-
-        let stream = async_stream::stream! {
-            let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
-                klights_cluster_store::SnapshotPageLimit::try_new(
-                    klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE,
-                ).expect("snapshot maximum is valid"),
-                std::time::Duration::from_secs(30),
-            ).expect("snapshot request is valid");
-            let mut session = match capture.begin_capture(request).await {
-                Ok(session) => session,
-                Err(error) => {
-                    yield Err(snapshot_persistence_status(error));
-                    return;
-                }
-            };
-            let current_rv = session.header().position().resource_version;
-            loop {
-                let page = match session.next_page().await {
-                    Ok(Some(page)) => page,
-                    Ok(None) => return,
-                    Err(error) => {
-                        yield Err(snapshot_persistence_status(error));
-                        return;
-                    }
-                };
-                for commit in legacy_snapshot_commits(current_rv, page) {
-                    match crate::replication::grpc::log_apply_commit_to_proto(&commit) {
-                        Ok(proto) => yield Ok(proto),
-                        Err(error) => {
-                            yield Err(Status::internal(error.to_string()));
-                            return;
-                        }
-                    }
-                }
-            }
-        };
-
-        Ok(Response::new(Box::pin(stream)))
-    }
-
     async fn get_metadata(
         &self,
         request: Request<generated::MetadataRequest>,
@@ -1684,7 +1559,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             leader_epoch: metadata.leader_epoch,
             current_rv: metadata.current_rv,
             current_log_index: metadata.current_log_index,
-            supported_features: metadata.supported_features,
+            command_codec_version: metadata.command_codec_version,
         }))
     }
 
@@ -2052,18 +1927,17 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let caller = exact_projected_token_node_authority(&authenticated_identity);
         let req = request.into_inner();
-        let token_request =
-            crate::control_plane::client::ProjectedServiceAccountTokenRequest::try_new(
-                req.namespace,
-                req.service_account_name,
-                req.audiences,
-                req.expiration_seconds,
-                req.bound_pod_name.unwrap_or_default(),
-                req.bound_pod_uid.unwrap_or_default(),
-                req.bound_node_name.unwrap_or_default(),
-                req.bound_node_uid,
-            )
-            .map_err(projected_token_error_to_status)?;
+        let token_request = klights_leader_api::ProjectedServiceAccountTokenRequest::try_new(
+            req.namespace,
+            req.service_account_name,
+            req.audiences,
+            req.expiration_seconds,
+            req.bound_pod_name.unwrap_or_default(),
+            req.bound_pod_uid.unwrap_or_default(),
+            req.bound_node_name.unwrap_or_default(),
+            req.bound_node_uid,
+        )
+        .map_err(projected_token_error_to_status)?;
         enforce_node_authority(&caller, token_request.bound_node_name())?;
         let token = self
             .ports
@@ -2321,9 +2195,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let caller = node_authority_from_identity(&identity);
         let req = request.into_inner();
-        let request =
-            crate::control_plane::client::PodCleanupIntentListRequest::try_new(req.node_name)
-                .map_err(pod_cleanup_intent_error_to_status)?;
+        let request = klights_leader_api::PodCleanupIntentListRequest::try_new(req.node_name)
+            .map_err(pod_cleanup_intent_error_to_status)?;
         enforce_node_authority(&caller, request.node_name())?;
         let items = self
             .ports
@@ -2347,7 +2220,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let caller = node_authority_from_identity(&identity);
         let req = request.into_inner();
-        let request = crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
+        let request = klights_leader_api::PodCleanupIntentAckRequest::try_new(
             req.node_name,
             req.namespace,
             req.pod_name,
@@ -2373,8 +2246,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
     ) -> std::result::Result<Response<generated::RaftAppendEntriesResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
         let request = request.into_inner();
-        crate::replication::protocol::require_command_codec_v3(
-            request.supported_features,
+        crate::replication::protocol::require_exact_command_codec(
+            request.command_codec_version,
             "Raft append-entries peer",
         )
         .map_err(Status::failed_precondition)?;
@@ -2405,8 +2278,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
     ) -> std::result::Result<Response<generated::RaftVoteResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
         let request = request.into_inner();
-        crate::replication::protocol::require_command_codec_v3(
-            request.supported_features,
+        crate::replication::protocol::require_exact_command_codec(
+            request.command_codec_version,
             "Raft vote peer",
         )
         .map_err(Status::failed_precondition)?;
@@ -2437,8 +2310,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
     ) -> std::result::Result<Response<generated::RaftInstallSnapshotResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
         let request = request.into_inner();
-        crate::replication::protocol::require_command_codec_v3(
-            request.supported_features,
+        crate::replication::protocol::require_exact_command_codec(
+            request.command_codec_version,
             "Raft snapshot peer",
         )
         .map_err(Status::failed_precondition)?;
@@ -2584,7 +2457,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     as_learner: req.as_learner,
                     storage_incarnation,
                     storage_log_attestation,
-                    supported_features: req.supported_features,
+                    command_codec_version: req.command_codec_version,
                     node_internal_ip,
                     node_registration,
                     legacy_node_git_commit: Some(req.node_git_commit)
@@ -2910,13 +2783,13 @@ fn focused_dataplane_to_proto(
 }
 
 fn pod_cleanup_intent_to_proto(
-    intent: crate::control_plane::client::PodCleanupIntent,
+    intent: klights_leader_api::PodCleanupIntent,
 ) -> std::result::Result<generated::PodCleanupIntentObject, Status> {
     let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
         intent.into_parts();
     let pod_data_json = serde_json::to_vec(pod.data.as_ref()).map_err(|error| {
         pod_cleanup_intent_error_to_status(
-            crate::control_plane::client::PodCleanupIntentError::corrupt_intent(format!(
+            klights_leader_api::PodCleanupIntentError::corrupt_intent(format!(
                 "encode Pod cleanup intent snapshot for {namespace}/{pod_name} uid={pod_uid}: {error}"
             )),
         )
@@ -2934,9 +2807,9 @@ fn pod_cleanup_intent_to_proto(
 }
 
 fn projected_token_error_to_status(
-    error: crate::control_plane::client::ProjectedServiceAccountTokenError,
+    error: klights_leader_api::ProjectedServiceAccountTokenError,
 ) -> Status {
-    use crate::control_plane::client::ProjectedServiceAccountTokenError as Error;
+    use klights_leader_api::ProjectedServiceAccountTokenError as Error;
     let message = error.to_string();
     match error {
         Error::InvalidRequest { .. } => Status::invalid_argument(message),
@@ -2955,10 +2828,8 @@ fn projected_token_error_to_status(
     }
 }
 
-fn pod_cleanup_intent_error_to_status(
-    error: crate::control_plane::client::PodCleanupIntentError,
-) -> Status {
-    use crate::control_plane::client::PodCleanupIntentError as Error;
+fn pod_cleanup_intent_error_to_status(error: klights_leader_api::PodCleanupIntentError) -> Status {
+    use klights_leader_api::PodCleanupIntentError as Error;
     let message = error.to_string();
     match error {
         Error::InvalidRequest { .. } => Status::invalid_argument(message),
@@ -3517,56 +3388,10 @@ mod tests {
         ControlplaneJoinHandler, ControlplaneJoinOutcome, RaftRpcRouterError,
     };
     use crate::replication::grpc::{
-        generated::{self, JoinRequest, JoinRole, MetadataRequest, SnapshotRequest},
+        generated::{self, JoinRequest, JoinRole, MetadataRequest},
         server::{require_worker_command_codec_v3, validate_join_metadata},
     };
 
-    #[test]
-    fn snapshot_persistence_errors_preserve_tonic_categories() {
-        let cases = [
-            (
-                klights_cluster_store::SnapshotPersistenceError::Cancelled,
-                tonic::Code::Cancelled,
-            ),
-            (
-                klights_cluster_store::SnapshotPersistenceError::Timeout,
-                tonic::Code::DeadlineExceeded,
-            ),
-            (
-                klights_cluster_store::SnapshotPersistenceError::ResourceExhausted {
-                    message: "capacity".to_string(),
-                },
-                tonic::Code::ResourceExhausted,
-            ),
-            (
-                klights_cluster_store::SnapshotPersistenceError::Retryable {
-                    message: "busy".to_string(),
-                },
-                tonic::Code::Unavailable,
-            ),
-            (
-                klights_cluster_store::SnapshotPersistenceError::CorruptData {
-                    message: "bad page".to_string(),
-                },
-                tonic::Code::DataLoss,
-            ),
-            (
-                klights_cluster_store::SnapshotPersistenceError::UnsupportedMode {
-                    message: "unsupported".to_string(),
-                },
-                tonic::Code::Unimplemented,
-            ),
-            (
-                klights_cluster_store::SnapshotPersistenceError::PersistenceFailed {
-                    message: "io".to_string(),
-                },
-                tonic::Code::Internal,
-            ),
-        ];
-        for (error, expected) in cases {
-            assert_eq!(super::snapshot_persistence_status(error).code(), expected);
-        }
-    }
     use crate::replication::protocol::ReplicationEntry;
     use crate::replication::service::ReplicationService;
     use async_trait::async_trait;
@@ -3827,7 +3652,7 @@ mod tests {
             dataplane_port: 51_820,
             dataplane_mode: "root".to_string(),
             dataplane_encryption: "enabled".to_string(),
-            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
         }
     }
 
@@ -5184,7 +5009,7 @@ mod tests {
                 as_learner,
                 storage_incarnation: _,
                 storage_log_attestation: _,
-                supported_features: _,
+                command_codec_version: _,
                 node_internal_ip,
                 node_registration,
                 legacy_node_git_commit,
@@ -5577,7 +5402,7 @@ mod tests {
         let status = grpc
             .raft_append_entries(tonic::Request::new(generated::RaftAppendEntriesRequest {
                 payload: vec![],
-                supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                 receiver_admission: test_raft_receiver_admission(),
             }))
             .await
@@ -5708,7 +5533,7 @@ mod tests {
             .raft_append_entries(request_with_join_token(
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 &token,
@@ -5724,7 +5549,7 @@ mod tests {
         let status = grpc
             .raft_vote(tonic::Request::new(generated::RaftVoteRequest {
                 payload: vec![],
-                supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                 receiver_admission: test_raft_receiver_admission(),
             }))
             .await
@@ -5745,7 +5570,7 @@ mod tests {
             .raft_append_entries(request_with_controlplane_client_cert(
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "controlplane-2",
@@ -5762,7 +5587,7 @@ mod tests {
             .raft_append_entries(request_with_controlplane_client_cert(
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: Vec::new(),
                 },
                 "controlplane-2",
@@ -5779,7 +5604,7 @@ mod tests {
             .raft_append_entries(request_with_controlplane_client_cert(
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::COMMITTED_APPLY_RV_V1,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION - 1,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "old-controlplane",
@@ -5802,7 +5627,7 @@ mod tests {
             .raft_install_snapshot(request_with_controlplane_client_cert(
                 generated::RaftInstallSnapshotRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "controlplane-3",
@@ -5825,7 +5650,7 @@ mod tests {
             .raft_vote(request_with_node_client_cert(
                 generated::RaftVoteRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "worker-1",
@@ -5842,7 +5667,7 @@ mod tests {
             .raft_append_entries(request_with_node_client_cert(
                 generated::RaftAppendEntriesRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "worker-1",
@@ -5859,7 +5684,7 @@ mod tests {
             .raft_install_snapshot(request_with_admin_cert(
                 generated::RaftInstallSnapshotRequest {
                     payload: vec![],
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
             ))
@@ -5958,7 +5783,7 @@ mod tests {
             preconditions: ResourcePreconditions::uid("node-uid-1"),
             strict_resource_version: false,
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .expect("encode payload");
 
@@ -5966,7 +5791,7 @@ mod tests {
             .apply_outbox(request_with_node_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "smuggled-node-patch".to_string(),
-                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                    operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
                         .to_string(),
                     payload_proto: payload,
@@ -5999,25 +5824,23 @@ mod tests {
         assert!(stored.data.pointer("/metadata/labels/smuggled").is_none());
 
         let valid_status_payload = || {
-            crate::kubelet::outbox::payload::OutboxPayload::from_command(
-                StorageCommand::UpdateStatus {
-                    api_version: "v1".to_string(),
-                    kind: "Node".to_string(),
-                    namespace: None,
-                    name: "worker-1".to_string(),
-                    status: serde_json::json!({"conditions": []}),
-                    expected_rv: None,
-                    preconditions: ResourcePreconditions::uid("node-uid-1"),
-                    observed_status_stamp: None,
-                },
-            )
+            crate::node_outbox::payload::OutboxPayload::from_command(StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Node".to_string(),
+                namespace: None,
+                name: "worker-1".to_string(),
+                status: serde_json::json!({"conditions": []}),
+                expected_rv: None,
+                preconditions: ResourcePreconditions::uid("node-uid-1"),
+                observed_status_stamp: None,
+            })
             .encode_protobuf()
             .expect("encode valid RPC Node status")
         };
         grpc.apply_outbox(request_with_node_client_cert(
             generated::ApplyOutboxRequest {
                 idempotency_key: "valid-after-smuggling".to_string(),
-                operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
                     .to_string(),
                 payload_proto: valid_status_payload(),
@@ -6036,7 +5859,7 @@ mod tests {
             .apply_outbox(request_with_node_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "malformed-rpc-row".to_string(),
-                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                    operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
                         .to_string(),
                     payload_proto: vec![0xff, 0x00, 0x81],
@@ -6062,7 +5885,7 @@ mod tests {
         grpc.apply_outbox(request_with_node_client_cert(
             generated::ApplyOutboxRequest {
                 idempotency_key: "valid-after-malformed".to_string(),
-                operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
                     .to_string(),
                 payload_proto: valid_status_payload(),
@@ -6109,7 +5932,7 @@ mod tests {
             preconditions: ResourcePreconditions::uid("wrong-node-uid"),
             observed_status_stamp: None,
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .expect("encode payload");
 
@@ -6117,7 +5940,7 @@ mod tests {
             .apply_outbox(request_with_node_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "wrong-node-uid".to_string(),
-                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                    operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
                         .to_string(),
                     payload_proto: payload,
@@ -6179,7 +6002,7 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
         let grpc = super::GrpcReplicationServer::new(service, db.clone());
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
             StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Node".to_string(),
@@ -6210,7 +6033,7 @@ mod tests {
             .apply_outbox(request_with_controlplane_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "controlplane2-node-ready".to_string(),
-                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                    operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
                         .to_string(),
                     payload_proto: payload,
@@ -6260,7 +6083,7 @@ mod tests {
             endpoint: "192.0.2.10".to_string(),
             port: Some(7679),
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .expect("encode dataplane payload");
 
@@ -6541,7 +6364,7 @@ mod tests {
             endpoint: "192.0.2.20".to_string(),
             port: Some(7679),
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .unwrap();
 
@@ -6549,7 +6372,7 @@ mod tests {
             .apply_outbox(request_with_node_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "dataplane-worker-2-from-worker-1".to_string(),
-                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeDataplane
+                    operation: crate::node_outbox::payload::OutboxOperation::NodeDataplane
                         .as_str()
                         .to_string(),
                     payload_proto: payload,
@@ -6588,7 +6411,7 @@ mod tests {
         require_worker_command_codec_v3(&current).expect("v3 worker is admitted");
 
         let mut old_worker = current;
-        old_worker.supported_features = crate::replication::protocol::COMMITTED_APPLY_RV_V1;
+        old_worker.command_codec_version = crate::log_apply::COMMAND_CODEC_VERSION - 1;
         let status = require_worker_command_codec_v3(&old_worker)
             .expect_err("a pre-v3 worker must fail the stream handshake");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -6712,14 +6535,17 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let addresses =
             crate::kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
+        let profile = crate::kubelet::node_config::NodeRegistrationProfile::new(
+            klights_network_api::NodePeerMode::Root,
+            crate::kubelet::node_config::KubeletNodeRole::Leader,
+            false,
+            crate::version::git_version(),
+        );
         crate::kubelet::node::register_node_at_addresses(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             &db,
             "leader-a",
-            &crate::bootstrap::NodeMode::Root,
-            &crate::bootstrap::NodeRole::Leader {
-                bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Seed,
-            },
+            &profile,
             None,
             &addresses,
         )
@@ -6744,7 +6570,7 @@ mod tests {
         let publisher = crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
             "leader-a",
             query.clone(),
-            Arc::new(crate::kubelet::outbox::Outbox::new(node_local.clone())),
+            Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
         );
 
         super::refresh_local_node_external_ip_from_observed_endpoint(
@@ -6763,10 +6589,10 @@ mod tests {
             .expect("external IP status row");
         assert_eq!(
             row.operation,
-            crate::kubelet::outbox::payload::OutboxOperation::NodeStatus.as_str()
+            crate::node_outbox::payload::OutboxOperation::NodeStatus.as_str()
         );
         let payload =
-            crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
+            crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
                 .expect("decode status payload");
         let StorageCommand::UpdateStatus { status, .. } = payload.command else {
             panic!("external IP publication must be status-only")
@@ -6804,10 +6630,10 @@ mod tests {
             )
             .await
             .expect("create joining Node");
-        let dataplane = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let dataplane = klights_cluster_store::DataplanePeerMetadata::try_new(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_cluster_store::DataplaneMode::Root,
+            klights_cluster_store::DataplaneEncryption::Enabled,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("192.0.2.80".to_string()),
             Some(51_820),
@@ -7082,27 +6908,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_rpc_rejects_invalid_bootstrap_token() {
-        let db = Arc::new(crate::datastore::test_support::in_memory().await);
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
-            .await
-            .unwrap();
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
-        let grpc = super::GrpcReplicationServer::new(service, db);
-        let mut request = tonic::Request::new(SnapshotRequest { last_applied_rv: 0 });
-        request
-            .metadata_mut()
-            .insert("x-klights-join-token", "wrong-token".parse().unwrap());
-
-        let status = match grpc.snapshot(request).await {
-            Ok(_) => panic!("snapshot must reject requests with an invalid bootstrap token"),
-            Err(status) => status,
-        };
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[tokio::test]
     async fn sign_controlplane_csr_sends_private_key_material_to_cp_and_replica() {
         for node_name in ["mn-controlplane2", "mn-replica"] {
             let db = Arc::new(crate::datastore::test_support::in_memory().await);
@@ -7240,7 +7045,7 @@ mod tests {
                 node_internal_ip: "172.31.50.2".to_string(),
                 node_git_commit: "testhash1".to_string(),
                 node_registration: Some(test_node_registration_proto("testhash1")),
-                supported_features: 0,
+                command_codec_version: 0,
                 storage_incarnation: "00000000-0000-4000-8000-000000000001".to_string(),
                 storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
             },
@@ -7288,7 +7093,7 @@ mod tests {
             node_internal_ip: "172.31.20.2".to_string(),
             node_git_commit: "testhash2".to_string(),
             node_registration: Some(test_node_registration_proto("testhash2")),
-            supported_features: 0,
+            command_codec_version: 0,
             storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
             storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
         };
@@ -7569,10 +7374,10 @@ mod tests {
             .await
             .unwrap();
         db.update_node_dataplane(
-            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            klights_cluster_store::DataplanePeerMetadata::try_new(
                 "leader".to_string(),
-                crate::networking::wireguard::DataplaneMode::Root,
-                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                klights_cluster_store::DataplaneMode::Root,
+                klights_cluster_store::DataplaneEncryption::Enabled,
                 Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                 Some("192.0.2.1".to_string()),
                 Some(51_820),
@@ -7646,7 +7451,7 @@ mod tests {
             node_internal_ip: "172.31.20.2".to_string(),
             node_git_commit: "testhash3".to_string(),
             node_registration: None,
-            supported_features: 0,
+            command_codec_version: 0,
             storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
             storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
         });
@@ -7705,7 +7510,7 @@ mod tests {
             node_internal_ip: "172.31.14.2".to_string(),
             node_git_commit: "joinhash1".to_string(),
             node_registration: Some(test_node_registration_proto("joinhash1")),
-            supported_features: 0,
+            command_codec_version: 0,
             storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
             storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
         });
@@ -7830,14 +7635,14 @@ mod tests {
             },
             observed_status_stamp: None,
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .unwrap();
         let response = grpc
             .apply_outbox(request_with_node_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "pod-status-web-worker".to_string(),
-                    operation: crate::kubelet::outbox::payload::OutboxOperation::PodStatus
+                    operation: crate::node_outbox::payload::OutboxOperation::PodStatus
                         .as_str()
                         .to_string(),
                     payload_proto: payload,
@@ -7950,7 +7755,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn channel_proto_sink_forwards_commits_as_protos_round_trip() {
+    async fn channel_snapshot_sink_forwards_typed_restore_operations() {
         use crate::datastore::snapshot_export::stream_snapshot_commits;
         use crate::replication::test_proto_channel_sink::TestProtoChannelSink;
 
@@ -7982,24 +7787,22 @@ mod tests {
         .await
         .unwrap();
 
-        // Baseline: the legacy Vec path (equivalence oracle).
+        // Baseline: the Vec path (equivalence oracle).
         let baseline = crate::datastore::snapshot_export::generate_snapshot(&db, 0)
             .await
             .unwrap();
 
         // Streaming path: push straight into a bounded channel.
-        let (tx, mut rx) = mpsc::channel::<Result<generated::ReplicationEntry, tonic::Status>>(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut sink = TestProtoChannelSink::new(tx);
         stream_snapshot_commits(&db, 0, &mut sink).await.unwrap();
         // `finish` drops the inner sender so the receiver stream terminates.
         sink.finish();
 
-        // Drain the channel, decode each proto back to a LogApplyCommit.
-        let mut collected: Vec<crate::log_apply::LogApplyCommit> = Vec::new();
+        // Drain the channel as typed authoritative restore operations.
+        let mut collected = Vec::new();
         while let Some(item) = rx.recv().await {
-            let proto = item.expect("proto conversion must not fail");
-            let commit = crate::replication::grpc::log_apply_commit_from_proto(proto).unwrap();
-            collected.push(commit);
+            collected.push(item.expect("snapshot stream must not fail"));
         }
 
         assert_eq!(
@@ -8007,16 +7810,6 @@ mod tests {
             baseline.len(),
             "streamed commit count must match the legacy Vec path"
         );
-        for (streamed_commit, baseline_commit) in collected.iter().zip(baseline.iter()) {
-            assert_eq!(
-                streamed_commit.resource_version, baseline_commit.resource_version,
-                "resource_version must match per commit"
-            );
-            assert_eq!(
-                streamed_commit.mutations.len(),
-                baseline_commit.mutations.len(),
-                "mutation count must match per commit"
-            );
-        }
+        assert_eq!(collected, baseline);
     }
 }

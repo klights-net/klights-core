@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_runtime::service::{PodDeletionFinalizeResult, PodRuntimeKey};
+use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use klights_pod_api::{
     BoundPodFinalization, BoundPodFinalizationError, BoundPodFinalizationFuture,
     BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
@@ -62,7 +62,7 @@ struct TestPodGcReconcileSink;
 impl PodGcReconcileSink for TestPodGcReconcileSink {
     fn reconcile_owner_references<'a>(
         &'a self,
-        _pod: crate::datastore::Resource,
+        _pod: klights_cluster_core::Resource,
         _pod_delete_sink: &'a dyn GcPodDeleteSink,
     ) -> klights_reconcile_api::ReconcileSinkFuture<'a> {
         Box::pin(async { Ok(()) })
@@ -78,7 +78,7 @@ impl PodGcReconcileSink for TestPodGcReconcileSink {
 
     fn finalize_foreground_owners<'a>(
         &'a self,
-        _deleted_dependent: crate::datastore::Resource,
+        _deleted_dependent: klights_cluster_core::Resource,
         _pod_delete_sink: &'a dyn GcPodDeleteSink,
     ) -> klights_reconcile_api::ReconcileSinkFuture<'a> {
         Box::pin(async { Ok(()) })
@@ -105,14 +105,14 @@ impl PodPdbReconcileSink for TestPodPdbReconcileSink {
 /// `RealPodDeletionFinalizer`.
 struct RootBoundPodFinalization {
     store: Arc<PodStore>,
-    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
 }
 
 impl RootBoundPodFinalization {
     fn new(
         store: Arc<PodStore>,
-        cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+        cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
         outbox: Option<Arc<Outbox>>,
     ) -> Self {
         Self {
@@ -136,7 +136,7 @@ impl RootBoundPodFinalization {
                 subject_key,
                 uuid::Uuid::new_v4()
             ),
-            operation: crate::kubelet::outbox::payload::OutboxOperation::PodMetadata,
+            operation: crate::node_outbox::payload::OutboxOperation::PodMetadata,
             subject: OutboxSubject {
                 key: subject_key,
                 namespace: Some(ns.to_string()),
@@ -177,10 +177,10 @@ impl BoundPodFinalization for RootBoundPodFinalization {
                 let observation = if let Some(cluster_api) = &self.cluster_api {
                     let live = cluster_api
                         .get_resource(
-                            crate::control_plane::client::pod_get_request(
+                            klights_leader_api::pod_get_request(
                                 &ns,
                                 &name,
-                                crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+                                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
                             )
                             .map_err(|error| {
                                 BoundPodFinalizationError::unavailable(error.to_string())
@@ -257,11 +257,11 @@ pub(crate) struct RealPodDeletionFinalizer {
     gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
     namespace_termination: Arc<dyn NamespaceTerminationSink>,
-    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
     bound_pod_finalization: Arc<dyn BoundPodFinalization>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
-    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
@@ -271,10 +271,10 @@ pub(crate) struct RealPodDeletionFinalizerDependencies {
     pub(crate) gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub(crate) pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
     pub(crate) namespace_termination: Arc<dyn NamespaceTerminationSink>,
-    pub(crate) cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    pub(crate) cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     pub(crate) outbox: Option<Arc<Outbox>>,
     pub(crate) mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
-    pub(crate) metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    pub(crate) metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
@@ -314,7 +314,7 @@ impl RealPodDeletionFinalizer {
     pub(crate) fn new(
         store: Arc<PodStore>,
         gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-        cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+        cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
         outbox: Option<Arc<Outbox>>,
         side_effects: Arc<crate::side_effects::SideEffectRegistry>,
         metrics: Arc<crate::side_effects::SideEffectMetrics>,
@@ -352,12 +352,12 @@ impl RealPodDeletionFinalizer {
         ns: &str,
         name: &str,
         uid: &str,
-        live: &crate::datastore::Resource,
+        live: &klights_cluster_core::Resource,
     ) -> OutboxCommand {
         let subject_key = format!("v1/Pod/{ns}/{name}/{uid}");
         OutboxCommand {
             idempotency_key: format!("{}:actor-delete-mark:{}", subject_key, uuid::Uuid::new_v4()),
-            operation: crate::kubelet::outbox::payload::OutboxOperation::PodMetadata,
+            operation: crate::node_outbox::payload::OutboxOperation::PodMetadata,
             subject: OutboxSubject {
                 key: subject_key,
                 namespace: Some(ns.to_string()),
@@ -365,19 +365,19 @@ impl RealPodDeletionFinalizer {
                 uid: Some(uid.to_string()),
             },
             pod_uid: uid.to_string(),
-            command: crate::datastore::command::StorageCommand::PatchResource {
+            command: klights_cluster_core::StorageCommand::PatchResource {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some(ns.to_string()),
                 name: name.to_string(),
-                patch_kind: crate::datastore::PatchKind::Merge,
+                patch_kind: klights_cluster_core::PatchKind::Merge,
                 patch: serde_json::json!({
                     "metadata": {
                         "deletionTimestamp": crate::utils::k8s_timestamp(),
                         "deletionGracePeriodSeconds": pod_delete_grace_period_seconds(&live.data),
                     }
                 }),
-                preconditions: crate::datastore::ResourcePreconditions {
+                preconditions: klights_cluster_core::ResourcePreconditions {
                     uid: Some(uid.to_string()),
                     resource_version: None,
                 },
@@ -460,10 +460,10 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
 
         let live = if let Some(cluster_api) = &self.cluster_api {
             cluster_api
-                .get_resource(crate::control_plane::client::pod_get_request(
+                .get_resource(klights_leader_api::pod_get_request(
                     ns,
                     name,
-                    crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
                 )?)
                 .await?
         } else {
@@ -562,9 +562,7 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
             .finalize_foreground_owners(live.clone(), self.gc_pod_delete_sink.as_ref())
             .await
         {
-            self.metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_cascade_delete_failure();
             tracing::error!(
                 namespace = %ns,
                 pod = %name,
@@ -574,7 +572,8 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
             );
         }
 
-        let deleted_resource = crate::datastore::Resource::from_data_lossy(deleted_data.clone());
+        let deleted_resource =
+            klights_cluster_core::Resource::from_data_lossy(deleted_data.clone());
         if let Err(err) = self
             .mutation_reconcile
             .reconcile_pod_mutation(

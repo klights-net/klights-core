@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::datastore::node_local::{DeadLetterRow, NodeLocalHandle};
+use crate::node_outbox::payload::OutboxOperationExt as _;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 #[derive(Clone)]
@@ -61,9 +62,22 @@ async fn dead_letter_replay(
     State(state): State<AdminState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
+    let row = state
+        .node_db
+        .get_dead_letter(id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let operation = crate::node_outbox::payload::OutboxOperation::try_from(row.operation.as_str())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let payload = crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let classification = operation
+        .classification(&payload.command)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let replayed = state
         .node_db
-        .replay_dead_letter(id)
+        .replay_dead_letter(id, classification)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if replayed {
@@ -155,6 +169,33 @@ mod tests {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
     }
 
+    fn pod_status_classification() -> klights_node_store::OutboxClassification {
+        klights_node_store::OutboxClassification::try_new(
+            klights_node_store::OutboxPriority::Workload,
+            klights_node_store::OutboxSupersedability::PodStatus,
+            klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+            klights_node_store::OutboxSequencePolicy::PerSubject,
+        )
+        .expect("valid Pod status classification")
+    }
+
+    fn pod_status_payload() -> Vec<u8> {
+        crate::node_outbox::payload::OutboxPayload::from_command(
+            klights_cluster_core::StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                status: serde_json::json!({"phase": "Running"}),
+                expected_rv: None,
+                preconditions: klights_cluster_core::ResourcePreconditions::uid("uid-1"),
+                observed_status_stamp: Some(1),
+            },
+        )
+        .encode_protobuf()
+        .expect("encode test Pod status outbox envelope")
+    }
+
     async fn node_db() -> NodeLocalHandle {
         selector::open_node_local(
             BackendKind::Sqlite,
@@ -183,8 +224,9 @@ mod tests {
             subject_uid: Some("uid-1".to_string()),
             pod_uid: "uid-1".to_string(),
             operation: "PodStatus".to_string(),
-            payload_proto: vec![1, 2, 3],
+            payload_proto: pod_status_payload(),
             next_due_ms: 1000,
+            classification: pod_status_classification(),
         })
         .await
         .expect("enqueue for dead letter");
@@ -250,6 +292,7 @@ mod tests {
             operation: "PodStatus".to_string(),
             payload_proto: vec![],
             next_due_ms: 1000,
+            classification: pod_status_classification(),
         })
         .await
         .expect("enqueue");
@@ -377,6 +420,7 @@ mod tests {
             operation: "PodStatus".to_string(),
             payload_proto: vec![],
             next_due_ms: 1000,
+            classification: pod_status_classification(),
         })
         .await
         .expect("enqueue");

@@ -1,49 +1,28 @@
 //! Side effect to mirror Endpoints to EndpointSlices.
 
-use super::SideEffect;
-use crate::controllers::endpoints;
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
-
-/// Mirrors manually-created/updated Endpoints to EndpointSlices.
-pub struct EndpointMirrorEffect;
 
 #[async_trait]
-impl SideEffect for EndpointMirrorEffect {
-    fn name(&self) -> &'static str {
-        "endpoint_mirror"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        endpoints::mirror_endpoints_to_endpointslice(db, resource).await
-    }
-
-    async fn apply_delete(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        endpoints::delete_mirrored_endpointslice_for_endpoints(db, resource).await
-    }
-}
-
-/// Create an EndpointMirrorEffect instance.
-pub fn endpoint_mirror() -> Arc<dyn SideEffect> {
-    Arc::new(EndpointMirrorEffect)
+pub(crate) trait EndpointMirrorStore: Send + Sync {
+    async fn mirror_endpoints(&self, resource: &Value) -> Result<()>;
+    async fn delete_mirrored_endpointslice(&self, resource: &Value) -> Result<()>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_endpoint_mirror_name() {
-        let effect = endpoint_mirror();
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = crate::endpoint_mirror_side_effect_adapter::effect(db_handle);
         assert_eq!(effect.name(), "endpoint_mirror");
     }
 
     #[tokio::test]
     async fn endpoint_mirror_delete_hook_removes_mirrored_slice() {
         let db = crate::datastore::test_support::in_memory().await;
+        let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
         db.create_resource(
             "discovery.k8s.io/v1",
             "EndpointSlice",
@@ -75,8 +54,8 @@ mod tests {
             }
         });
 
-        endpoint_mirror()
-            .apply_delete(&endpoints, &db)
+        crate::endpoint_mirror_side_effect_adapter::effect(db_handle)
+            .apply_delete(&endpoints)
             .await
             .expect("delete hook");
 

@@ -16,6 +16,19 @@ pub struct ProtoCommandMeta {
     pub authoring_node: String,
 }
 
+/// Opaque durable node-outbox payload.
+///
+/// Persistence stores these encoded bytes unchanged in its existing
+/// `payload_proto` BLOB. The replication boundary validates
+/// `codec_version == 3` before decoding `command_payload`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoOutboxCommandEnvelope {
+    #[prost(uint32, tag = "1")]
+    pub codec_version: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub command_payload: Vec<u8>,
+}
+
 /// Protobuf wire type for the `CommandError` enum.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ProtoCommandError {

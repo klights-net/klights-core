@@ -260,7 +260,7 @@ fn item_names(list: &serde_json::Value) -> Vec<String> {
 #[tokio::test]
 async fn mutation_dry_run_create_does_not_persist_generated_crd_or_pod() {
     let state = build_test_app_state().await;
-    let pod_repository = state.pod_repository.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -546,7 +546,7 @@ async fn mutation_crd_apply_create_dry_run_returns_created_without_persisting() 
 #[tokio::test]
 async fn mutation_delete_dry_run_does_not_mark_or_remove_generated_crd_or_pod() {
     let state = build_test_app_state().await;
-    let pod_repository = state.pod_repository.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -638,7 +638,7 @@ async fn mutation_delete_dry_run_does_not_mark_or_remove_generated_crd_or_pod() 
 #[tokio::test]
 async fn mutation_delete_returns_accepted_when_resource_is_retained() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -743,7 +743,7 @@ async fn mutation_delete_returns_accepted_when_resource_is_retained() {
 #[tokio::test]
 async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_matching_items() {
     let state = build_test_app_state().await;
-    let pod_repository = state.pod_repository.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -838,7 +838,7 @@ async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_m
 #[tokio::test]
 async fn mutation_crd_deletecollection_with_finalizers_marks_instead_of_hard_deleting() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -890,7 +890,7 @@ async fn mutation_crd_deletecollection_with_finalizers_marks_instead_of_hard_del
 #[tokio::test]
 async fn mutation_crd_deletecollection_precondition_conflict_leaves_items_live() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -946,6 +946,7 @@ struct WidgetHookRecord {
 }
 
 struct RecordingWidgetSideEffect {
+    db: crate::datastore::DatastoreHandle,
     records: std::sync::Arc<std::sync::Mutex<Vec<WidgetHookRecord>>>,
 }
 
@@ -955,21 +956,13 @@ impl crate::side_effects::SideEffect for RecordingWidgetSideEffect {
         "recording-widget"
     }
 
-    async fn apply(
-        &self,
-        resource: &serde_json::Value,
-        db: &dyn crate::datastore::DatastoreBackend,
-    ) -> anyhow::Result<()> {
-        self.record("apply", resource, db).await?;
+    async fn apply(&self, resource: &serde_json::Value) -> anyhow::Result<()> {
+        self.record("apply", resource, self.db.as_ref()).await?;
         Ok(())
     }
 
-    async fn apply_delete(
-        &self,
-        resource: &serde_json::Value,
-        db: &dyn crate::datastore::DatastoreBackend,
-    ) -> anyhow::Result<()> {
-        self.record("delete", resource, db).await?;
+    async fn apply_delete(&self, resource: &serde_json::Value) -> anyhow::Result<()> {
+        self.record("delete", resource, self.db.as_ref()).await?;
         Ok(())
     }
 }
@@ -1025,17 +1018,25 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
     use std::sync::Mutex;
 
     let mut state = build_test_app_state().await;
+    let hook_db = state.resource_mutation().db.clone();
     let records = Arc::new(Mutex::new(Vec::new()));
     let mut registry = crate::side_effects::SideEffectRegistry::new();
     registry.register(
         "example.com/v1",
         "Widget",
         Arc::new(RecordingWidgetSideEffect {
+            db: hook_db,
             records: records.clone(),
         }),
         crate::side_effects::ErrorPolicy::Warn,
     );
-    state.side_effects = Arc::new(registry);
+    let registry = Arc::new(registry);
+    let mutation_effects =
+        crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
+            registry,
+            state.controller_reconcile().metrics.clone(),
+        );
+    state.resource_mutation_mut().mutation_effects = mutation_effects;
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -1177,6 +1178,7 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
 async fn mutation_dry_run_does_not_enqueue_service_or_controller_side_effects() {
     let state = build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -1195,7 +1197,7 @@ async fn mutation_dry_run_does_not_enqueue_service_or_controller_side_effects() 
         )
         .await
         .unwrap();
-    let dispatcher = state.controller_dispatcher.clone();
+    let dispatcher = state.controller_reconcile().controller_dispatcher.clone();
     let app = crate::api::build_router(state);
 
     let response = request(
@@ -1235,7 +1237,7 @@ async fn mutation_dry_run_does_not_enqueue_service_or_controller_side_effects() 
 #[tokio::test]
 async fn mutation_delete_uid_precondition_conflict_is_consistent_across_paths() {
     let state = build_test_app_state().await;
-    let pod_repository = state.pod_repository.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -1315,8 +1317,8 @@ async fn mutation_delete_uid_precondition_conflict_is_consistent_across_paths() 
 #[tokio::test]
 async fn mutation_delete_foreground_adds_finalizer_without_hard_deleting_non_pod_resources() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
+    let db = state.resource_mutation().db.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
@@ -1471,7 +1473,7 @@ async fn mutation_delete_foreground_adds_finalizer_without_hard_deleting_non_pod
 #[tokio::test]
 async fn mutation_create_defaults_are_persisted_for_json_and_protobuf_pod_paths() {
     let state = build_test_app_state().await;
-    let pod_repository = state.pod_repository.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
 
     let json_response = request(

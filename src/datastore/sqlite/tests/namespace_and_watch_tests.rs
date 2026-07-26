@@ -1122,7 +1122,7 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
         },
     });
 
-    let commit = crate::log_apply::LogApplyCommit::new(
+    let commit = crate::log_apply::test_live_commit(
         51,
         vec![crate::log_apply::LogApplyMutation::PutNamespace(
             crate::log_apply::LogApplyNamespaceRow {
@@ -1168,7 +1168,7 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
         .db_call("raft-namespace-put-watch-bytes-leader", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 51],
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 1],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -1178,7 +1178,7 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
         .db_call("raft-namespace-put-watch-bytes-follower", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 51],
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 1],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -1195,7 +1195,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let put_commit = crate::log_apply::LogApplyCommit::new(
+    let put_commit = crate::log_apply::test_live_commit(
         51,
         vec![crate::log_apply::LogApplyMutation::PutNamespace(
             crate::log_apply::LogApplyNamespaceRow {
@@ -1223,7 +1223,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
         .await
         .expect("follower namespace seed PUT must apply");
 
-    let delete_commit = crate::log_apply::LogApplyCommit::new(
+    let delete_commit = crate::log_apply::test_live_commit(
         52,
         vec![crate::log_apply::LogApplyMutation::DeleteNamespace {
             name: "deterministic-ns".to_string(),
@@ -1243,7 +1243,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
         .db_call("raft-namespace-delete-watch-bytes-leader", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 52],
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 2],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -1253,7 +1253,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
         .db_call("raft-namespace-delete-watch-bytes-follower", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 52],
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 2],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -1288,9 +1288,11 @@ async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
             },
         },
     });
-    let committed_bytes = serde_json::to_vec(&watch_payload).unwrap();
+    let mut committed_payload = watch_payload.clone();
+    committed_payload["object"]["metadata"]["resourceVersion"] = json!("1");
+    let committed_bytes = serde_json::to_vec(&committed_payload).unwrap();
 
-    let commit = crate::log_apply::LogApplyCommit::new(
+    let commit = crate::log_apply::test_live_commit(
         10_024,
         vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
             crate::log_apply::LogApplyWatchEventRow {
@@ -1321,7 +1323,7 @@ async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
             |conn| {
                 Ok(conn.query_row(
                     "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                    rusqlite::params!["v1", "ConfigMap", "default", "replay-configmap", 10_024],
+                    rusqlite::params!["v1", "ConfigMap", "default", "replay-configmap", 1],
                     |row| row.get::<_, Vec<u8>>(0),
                 )?)
             },
@@ -1334,7 +1336,7 @@ async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
             |conn| {
                 Ok(conn.query_row(
                     "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                    rusqlite::params!["v1", "ConfigMap", "default", "replay-configmap", 10_024],
+                    rusqlite::params!["v1", "ConfigMap", "default", "replay-configmap", 1],
                     |row| row.get::<_, Vec<u8>>(0),
                 )?)
             },
@@ -1368,7 +1370,7 @@ async fn raft_watch_gc_replays_identically() {
 
     for resource_version in [10_i64, 20, 30] {
         let name = format!("watch-gc-{resource_version}");
-        let commit = crate::log_apply::LogApplyCommit::new(
+        let commit = crate::log_apply::test_live_commit(
             resource_version,
             vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
                 crate::log_apply::LogApplyWatchEventRow {
@@ -1394,7 +1396,7 @@ async fn raft_watch_gc_replays_identically() {
             .expect("follower watch GC seed must apply");
     }
 
-    let gc_commit = crate::log_apply::LogApplyCommit::new(
+    let gc_commit = crate::log_apply::test_live_commit(
         40,
         vec![crate::log_apply::LogApplyMutation::GcWatchEvents {
             max_rows: 1,
@@ -1505,14 +1507,16 @@ async fn raft_watch_gc_replays_identically() {
             "v1".to_string(),
             "ConfigMap".to_string(),
             "default".to_string(),
-            20,
+            2,
         )]
     );
 
-    assert_eq!(leader_remaining_rows[0].0, 30);
+    assert_eq!(leader_remaining_rows[0].0, 3);
     assert_eq!(leader_remaining_rows[0].1, "v1");
     assert_eq!(leader_remaining_rows[0].2, "ConfigMap");
     assert_eq!(leader_remaining_rows[0].3, "default");
-    let expected_tail = serde_json::to_vec(&payload_for(30, "watch-gc-30")).unwrap();
+    let mut expected_tail = payload_for(30, "watch-gc-30");
+    expected_tail["metadata"]["resourceVersion"] = json!("3");
+    let expected_tail = serde_json::to_vec(&expected_tail).unwrap();
     assert_eq!(leader_remaining_rows[0].5, expected_tail);
 }

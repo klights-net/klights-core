@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use crate::networking::{NodeName, PodSubnet};
+use klights_types::{NodeName, PodSubnet};
 use rusqlite::OptionalExtension;
 
 use super::NodeSubnet;
@@ -544,8 +544,8 @@ fn migrate_node_subnets_gateway_ip(conn: &mut rusqlite::Connection) -> rusqlite:
 }
 
 pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {
-    use crate::controllers::annotations::{NodePeerMode, parse_node_peer_mode};
-    use crate::networking::types::HostPortRange;
+    use klights_types::HostPortRange;
+    use klights_types::{NodePeerMode, parse_node_peer_mode};
 
     let node_name_str: String = row.get(0)?;
     let subnet_str: String = row.get(1)?;

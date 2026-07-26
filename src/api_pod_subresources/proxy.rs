@@ -233,8 +233,8 @@ pub async fn pod_proxy_inner(
     let effective_port_override = port_override.or(parsed.port_num);
 
     // Look up the pod
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         namespace,
         name,
     )
@@ -321,7 +321,7 @@ pub async fn pod_proxy_inner(
         req,
         &target_url,
         allow_default_port_fallback && port != 8080,
-        state.task_supervisor.clone(),
+        state.operational().task_supervisor.clone(),
     )
     .await
 }
@@ -974,6 +974,7 @@ pub async fn service_proxy_inner(
 
     // Look up the service
     let service = state
+        .resource_mutation()
         .db
         .get_resource("v1", "Service", Some(namespace), name)
         .await?
@@ -1018,6 +1019,7 @@ pub async fn service_proxy_inner(
 
     // Get Endpoints for this service
     let endpoints = state
+        .resource_mutation()
         .db
         .get_resource("v1", "Endpoints", Some(namespace), name)
         .await?
@@ -1132,7 +1134,7 @@ pub async fn service_proxy_inner(
         match service_proxy_request_with_readiness_retries(
             replay,
             &target_url,
-            state.task_supervisor.clone(),
+            state.operational().task_supervisor.clone(),
         )
         .await
         {

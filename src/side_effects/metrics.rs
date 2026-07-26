@@ -87,3 +87,15 @@ impl Default for SideEffectMetrics {
         }
     }
 }
+
+impl klights_reconcile_api::ReconcileFailureMetrics for SideEffectMetrics {
+    fn record_cascade_delete_failure(&self) {
+        self.cascade_delete_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_namespace_delete_failure(&self) {
+        self.namespace_delete_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}

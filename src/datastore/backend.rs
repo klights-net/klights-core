@@ -51,7 +51,7 @@ impl Default for PodEndpointEffect {
 /// private so transport and API layers cannot synthesize apply effects.
 #[doc(hidden)]
 pub struct CommittedOutboxApply {
-    result: crate::kubelet::outbox::OutboxApplyResult,
+    result: klights_cluster_core::OutboxApplyOutcome,
     resource_effect: ResourceMutationEffect,
     pod_endpoint_effect: PodEndpointEffect,
     committed_resource: Option<crate::datastore::Resource>,
@@ -59,7 +59,7 @@ pub struct CommittedOutboxApply {
 
 impl CommittedOutboxApply {
     pub(crate) const fn new(
-        result: crate::kubelet::outbox::OutboxApplyResult,
+        result: klights_cluster_core::OutboxApplyOutcome,
         resource_effect: ResourceMutationEffect,
         pod_endpoint_effect: PodEndpointEffect,
     ) -> Self {
@@ -82,7 +82,7 @@ impl CommittedOutboxApply {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        crate::kubelet::outbox::OutboxApplyResult,
+        klights_cluster_core::OutboxApplyOutcome,
         ResourceMutationEffect,
         PodEndpointEffect,
         Option<crate::datastore::Resource>,
@@ -99,30 +99,30 @@ impl CommittedOutboxApply {
 async fn apply_with_default_endpoint_effect<F, Fut>(
     payload: &[u8],
     apply: F,
-) -> std::result::Result<CommittedOutboxApply, crate::kubelet::outbox::OutboxApplyError>
+) -> std::result::Result<CommittedOutboxApply, klights_cluster_core::OutboxApplyError>
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<
             Output = std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                klights_cluster_core::OutboxApplyOutcome,
+                klights_cluster_core::OutboxApplyError,
             >,
         > + Send,
 {
-    let is_pod_status = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(payload)
+    let is_pod_status = crate::storage_wire_codec::decode_outbox_payload_protobuf(payload)
         .ok()
         .is_some_and(|payload| {
             matches!(
-                payload.command,
+                payload.command(),
                 StorageCommand::UpdateStatus {
-                    ref api_version,
-                    ref kind,
+                    api_version,
+                    kind,
                     ..
                 } if api_version == "v1" && kind == "Pod"
             )
         });
     if is_pod_status {
-        return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+        return Err(klights_cluster_core::OutboxApplyError::Retryable(
             "backend must implement an atomic Pod endpoint effect for v1/Pod status apply"
                 .to_string(),
         ));
@@ -131,7 +131,7 @@ where
     let result = apply().await?;
     let resource_effect = if matches!(
         result,
-        crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+        klights_cluster_core::OutboxApplyOutcome::Applied { .. }
     ) {
         ResourceMutationEffect::Changed
     } else {
@@ -159,11 +159,11 @@ use super::types::ReplicatedCreateOptions;
 use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
     ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent, PodEndpointEvent, PodEndpointRow,
-    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
-    PodWorkqueueKind, PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata,
-    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayFloor, WatchReplayPosition,
-    WatchReplayRead, WatchTarget,
+    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult,
+    PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplayRead,
+    RawWatchEvent, ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList,
+    ResourceListQuery, ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv,
+    WatchReplayFloor, WatchReplayPosition, WatchReplayRead, WatchTarget,
 };
 
 /// Exclusive guard held while a logical snapshot walks multiple bounded read
@@ -282,7 +282,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// so a promoted replica restarts with the original cluster id.
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
+        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -1097,15 +1097,15 @@ pub trait DatastoreBackend: Send + Sync {
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()>;
 
     /// Persist cluster-visible dataplane metadata for a node. The metadata
     /// must already be validated and must not contain any private key material.
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         let _ = metadata;
         Err(anyhow::anyhow!(
@@ -1116,7 +1116,7 @@ pub trait DatastoreBackend: Send + Sync {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         let _ = node_name;
         Err(anyhow::anyhow!(
             "backend does not support node dataplane metadata"
@@ -1185,7 +1185,7 @@ pub trait DatastoreBackend: Send + Sync {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()>;
+    ) -> Result<PodSlotMutationResult>;
 
     async fn pod_slot_clear_if_uid(
         &self,
@@ -1193,7 +1193,7 @@ pub trait DatastoreBackend: Send + Sync {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()>;
+    ) -> Result<PodSlotClearResult>;
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent>;
 
@@ -1358,18 +1358,6 @@ pub trait DatastoreBackend: Send + Sync {
         Ok(out)
     }
 
-    async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> Result<bool> {
-        let _ = idempotency_key;
-        let _ = reserved_rv;
-        Err(anyhow::anyhow!(
-            "backend does not support applied_outbox placeholder cleanup"
-        ))
-    }
-
     /// Apply an outbox payload transactionally: check idempotency, apply
     /// mutation, and insert ledger row all in one cluster.db transaction.
     async fn apply_outbox_transactionally(
@@ -1379,8 +1367,8 @@ pub trait DatastoreBackend: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     >;
 
     async fn apply_outbox_transactionally_with_watermark(
@@ -1391,8 +1379,8 @@ pub trait DatastoreBackend: Send + Sync {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         let _ = watermark;
         self.apply_outbox_transactionally(idempotency_key, operation, payload, authoring_node)
@@ -1410,7 +1398,7 @@ pub trait DatastoreBackend: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<CommittedOutboxApply, crate::kubelet::outbox::OutboxApplyError> {
+    ) -> std::result::Result<CommittedOutboxApply, klights_cluster_core::OutboxApplyError> {
         apply_with_default_endpoint_effect(payload, || {
             self.apply_outbox_transactionally_with_watermark(
                 idempotency_key,
@@ -1442,7 +1430,7 @@ pub trait DatastoreBackend: Send + Sync {
 
     /// T1.3/T1.4: build a `LogApplyCommit` from an outbox payload WITHOUT
     /// applying it. The leader's raft proposer encodes the returned commit
-    /// as the raft entry payload (via a placeholder/ledger-aware path) and
+    /// as the fixed committed-apply-v1 Raft entry payload and
     /// submits through `client_write`; the state machine apply path on every
     /// node is the only caller that actually mutates `cluster.db` (via
     /// `apply_log_apply_commit`).
@@ -1453,8 +1441,8 @@ pub trait DatastoreBackend: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     >;
     async fn build_log_apply_commit_for_outbox_with_watermark(
         &self,
@@ -1464,8 +1452,8 @@ pub trait DatastoreBackend: Send + Sync {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         let _ = watermark;
         self.build_log_apply_commit_for_outbox(idempotency_key, operation, payload, authoring_node)
@@ -1908,17 +1896,17 @@ pub trait NetworkMetadataStore: Send + Sync {
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()>;
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()>;
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>>;
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>>;
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>>;
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()>;
@@ -2008,7 +1996,7 @@ pub trait ReplicationStore: Send + Sync {
     ) -> Result<()>;
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
+        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -2049,7 +2037,7 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
+        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -2375,14 +2363,14 @@ pub trait PodCleanupStore: Send + Sync {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()>;
+    ) -> Result<PodSlotMutationResult>;
     async fn pod_slot_clear_if_uid(
         &self,
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()>;
+    ) -> Result<PodSlotClearResult>;
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent>;
 }
 
@@ -2409,11 +2397,6 @@ pub trait AppliedOutboxStore: Send + Sync {
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<AppliedOutboxRecord>>;
-    async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> Result<bool>;
     async fn apply_outbox_transactionally(
         &self,
         idempotency_key: &str,
@@ -2421,8 +2404,8 @@ pub trait AppliedOutboxStore: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     >;
     async fn apply_outbox_transactionally_with_watermark(
         &self,
@@ -2432,8 +2415,8 @@ pub trait AppliedOutboxStore: Send + Sync {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     >;
     async fn apply_outbox_transactionally_with_watermark_effect(
         &self,
@@ -2442,7 +2425,7 @@ pub trait AppliedOutboxStore: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<CommittedOutboxApply, crate::kubelet::outbox::OutboxApplyError>;
+    ) -> std::result::Result<CommittedOutboxApply, klights_cluster_core::OutboxApplyError>;
     async fn build_log_apply_commit_for_command(
         &self,
         command: StorageCommand,
@@ -2456,8 +2439,8 @@ pub trait AppliedOutboxStore: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     >;
     async fn build_log_apply_commit_for_outbox_with_watermark(
         &self,
@@ -2467,8 +2450,8 @@ pub trait AppliedOutboxStore: Send + Sync {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     >;
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize>;
 }
@@ -2628,8 +2611,8 @@ impl NetworkMetadataStore for DatastoreBackendPodRuntimeStore {
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         self.db
             .update_node_peer_attributes(node_name, mode, hostport_range)
@@ -2638,7 +2621,7 @@ impl NetworkMetadataStore for DatastoreBackendPodRuntimeStore {
 
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         self.db.update_node_dataplane(metadata).await
     }
@@ -2646,7 +2629,7 @@ impl NetworkMetadataStore for DatastoreBackendPodRuntimeStore {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         self.db.get_node_dataplane(node_name).await
     }
 
@@ -2735,7 +2718,7 @@ impl PodCleanupStore for DatastoreBackendPodRuntimeStore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotMutationResult> {
         self.db
             .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
             .await
@@ -2747,7 +2730,7 @@ impl PodCleanupStore for DatastoreBackendPodRuntimeStore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotClearResult> {
         self.db
             .pod_slot_clear_if_uid(namespace, pod_name, pod_uid, node_name)
             .await
@@ -2810,7 +2793,6 @@ mod endpoint_effect_default_tests {
     use super::apply_with_default_endpoint_effect;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
-    use crate::kubelet::outbox::payload::OutboxPayload;
 
     struct FakeBackend {
         mutation_called: AtomicBool,
@@ -2819,28 +2801,27 @@ mod endpoint_effect_default_tests {
     impl FakeBackend {
         async fn apply(
             &self,
-        ) -> Result<
-            crate::kubelet::outbox::OutboxApplyResult,
-            crate::kubelet::outbox::OutboxApplyError,
-        > {
+        ) -> Result<klights_cluster_core::OutboxApplyOutcome, klights_cluster_core::OutboxApplyError>
+        {
             self.mutation_called.store(true, Ordering::SeqCst);
-            Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 1 })
+            Ok(klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv: 1 })
         }
     }
 
     #[tokio::test]
     async fn fake_backend_cannot_apply_pod_status_without_atomic_endpoint_effect() {
-        let payload = OutboxPayload::from_command(StorageCommand::UpdateStatus {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some("default".to_string()),
-            name: "web".to_string(),
-            status: serde_json::json!({"podIP": "10.42.0.2"}),
-            expected_rv: Some(1),
-            preconditions: ResourcePreconditions::uid("uid-web"),
-            observed_status_stamp: None,
-        })
-        .encode_protobuf()
+        let payload = crate::storage_wire_codec::encode_outbox_payload_protobuf(
+            &klights_cluster_core::OutboxPayload::new(StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                status: serde_json::json!({"podIP": "10.42.0.2"}),
+                expected_rv: Some(1),
+                preconditions: ResourcePreconditions::uid("uid-web"),
+                observed_status_stamp: None,
+            }),
+        )
         .expect("encode Pod status payload");
         let backend = FakeBackend {
             mutation_called: AtomicBool::new(false),
@@ -2853,7 +2834,7 @@ mod endpoint_effect_default_tests {
 
         assert!(matches!(
             error,
-            crate::kubelet::outbox::OutboxApplyError::Retryable(message)
+            klights_cluster_core::OutboxApplyError::Retryable(message)
                 if message.contains("atomic Pod endpoint effect")
         ));
         assert!(

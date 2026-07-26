@@ -5,9 +5,8 @@
 use crate::datastore::errors::OpenError;
 use crate::datastore::sqlite::Datastore;
 use crate::log_apply::{
-    LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
-    LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyPodCleanupIntentRow,
-    LogApplyResourceRow, LogApplyWatchEventRow,
+    LogApplyAppliedOutboxRow, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
+    LogApplyNodeSubnetRow, LogApplyPodCleanupIntentRow, LogApplyResourceRow, LogApplyWatchEventRow,
 };
 use rusqlite::OptionalExtension;
 use serde_json::json;
@@ -749,7 +748,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
 async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
-    let derived_resource_commit = LogApplyCommit::new(
+    let derived_resource_commit = crate::log_apply::test_live_commit(
         30,
         vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version: "v1".to_string(),
@@ -777,7 +776,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let seed_watch_10 = LogApplyCommit::new(
+    let seed_watch_10 = crate::log_apply::test_live_commit(
         10,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -791,7 +790,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let seed_watch_20 = LogApplyCommit::new(
+    let seed_watch_20 = crate::log_apply::test_live_commit(
         20,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -805,7 +804,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let mixed_commit = LogApplyCommit::new(
+    let mixed_commit = crate::log_apply::test_live_commit(
         60,
         vec![
             LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
@@ -914,7 +913,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         ],
     );
 
-    let gc_commit = LogApplyCommit::new(
+    let gc_commit = crate::log_apply::test_live_commit(
         61,
         vec![LogApplyMutation::GcWatchEvents {
             max_rows: 2,
@@ -971,7 +970,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         .db_call("mixed-family-derived-watch-bytes-leader", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-derived", 30],
+                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-derived", 3],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -981,7 +980,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         .db_call("mixed-family-derived-watch-bytes-follower", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-derived", 30],
+                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-derived", 3],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -996,10 +995,10 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "metadata": {
-                "name": "mixed-family-main",
+                "name": "mixed-family-main-watch",
                 "namespace": "mixed-family-ns",
                 "uid": "mixed-family-main-uid",
-                "resourceVersion": "60",
+                "resourceVersion": "4",
             },
             "data": {
                 "seed": "main"
@@ -1012,7 +1011,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         .db_call("mixed-family-explicit-watch-bytes-leader", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-main-watch", 60],
+                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-main-watch", 4],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -1022,7 +1021,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         .db_call("mixed-family-explicit-watch-bytes-follower", |conn| {
             Ok(conn.query_row(
                 "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
-                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-main-watch", 60],
+                rusqlite::params!["v1", "ConfigMap", "mixed-family-ns", "mixed-family-main-watch", 4],
                 |row| row.get::<_, Vec<u8>>(0),
             )?)
         })
@@ -1030,5 +1029,9 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         .unwrap();
 
     assert_eq!(leader_explicit_watch, follower_explicit_watch);
-    assert_eq!(leader_explicit_watch, explicit_watch_payload);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&leader_explicit_watch).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&explicit_watch_payload).unwrap(),
+        "explicit watch payload must preserve its semantic JSON shape"
+    );
 }

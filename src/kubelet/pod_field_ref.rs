@@ -73,7 +73,11 @@ pub fn resolve_field_ref(field_path: &str, pod_data: &Value) -> String {
 /// Resolve a resourceFieldRef to a container resource value.
 /// Returns "0" when resources are not set (K8s returns node allocatable for
 /// missing limits and 0 for missing requests).
-pub fn resolve_resource_field_ref(resource: &str, container_spec: &Value) -> String {
+pub fn resolve_resource_field_ref_with_capacity(
+    resource: &str,
+    container_spec: &Value,
+    node_capacity: crate::kubelet::node::NodeCapacity,
+) -> String {
     let raw_value = match resource {
         "limits.cpu" => container_spec
             .pointer("/resources/limits/cpu")
@@ -102,15 +106,10 @@ pub fn resolve_resource_field_ref(resource: &str, container_spec: &Value) -> Str
         None => {
             return match resource {
                 "limits.memory" => {
-                    let bytes = crate::kubelet::node::memory_ki() * 1024;
+                    let bytes = node_capacity.memory_ki() * 1024;
                     bytes.to_string()
                 }
-                "limits.cpu" => {
-                    let cores = std::thread::available_parallelism()
-                        .map(|n| n.get() as u64)
-                        .unwrap_or(1);
-                    cores.to_string()
-                }
+                "limits.cpu" => node_capacity.cpu_cores().to_string(),
                 _ => "0".to_string(),
             };
         }
@@ -145,6 +144,15 @@ pub fn resolve_resource_field_ref(resource: &str, container_spec: &Value) -> Str
 }
 
 #[cfg(test)]
+pub fn resolve_resource_field_ref(resource: &str, container_spec: &Value) -> String {
+    resolve_resource_field_ref_with_capacity(
+        resource,
+        container_spec,
+        crate::kubelet::node::NodeCapacity::default(),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -166,6 +174,21 @@ mod tests {
         assert_eq!(
             result, "2",
             "limits.cpu=2 must return '2', not the node CPU count"
+        );
+    }
+
+    #[test]
+    fn missing_limits_use_the_injected_node_capacity() {
+        let container_spec = serde_json::json!({"name": "app", "resources": {}});
+        let capacity = crate::kubelet::node::NodeCapacity::new(123_456, 37);
+
+        assert_eq!(
+            resolve_resource_field_ref_with_capacity("limits.memory", &container_spec, capacity,),
+            (123_456_u64 * 1024).to_string()
+        );
+        assert_eq!(
+            resolve_resource_field_ref_with_capacity("limits.cpu", &container_spec, capacity),
+            "37"
         );
     }
 }

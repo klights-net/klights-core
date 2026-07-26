@@ -1,4 +1,4 @@
-use crate::kubelet::pod_dns::parse_host_resolv_conf;
+use crate::kubelet::pod_dns::HostDnsConfig;
 use crate::kubelet::pod_hosts::{parse_boolish, resolve_hostname};
 use k8s_cri::v1::{
     DnsConfig, Int64Value, LinuxPodSandboxConfig, LinuxSandboxSecurityContext, NamespaceOption,
@@ -11,28 +11,34 @@ use serde_json::Value;
 /// - dnsPolicy: "Default" → use host's /etc/resolv.conf
 /// - dnsPolicy: "None" → empty DNS config (or use spec.dnsConfig if provided)
 /// - dnsPolicy: "ClusterFirstWithHostNet" → same as ClusterFirst
-pub fn build_sandbox_config_with_dns_policy(
-    pod_name: &str,
-    namespace: &str,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SandboxRuntimeInputs {
+    pub host_dns: HostDnsConfig,
+    pub rootless: bool,
+}
+
+pub struct SandboxIdentity<'a> {
+    pub pod_name: &'a str,
+    pub namespace: &'a str,
+    pub pod_uid: &'a str,
+    pub containerd_namespace: &'a str,
+}
+
+pub fn build_sandbox_config_with_runtime_inputs(
+    identity: SandboxIdentity<'_>,
     _pod_ip: &str,
-    pod_uid: &str,
-    containerd_ns: &str,
     dns_ip: &str,
     pod_spec: &Value,
+    runtime_inputs: &SandboxRuntimeInputs,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
 ) -> PodSandboxConfig {
-    // Detect rootless mode: inside a user namespace, uid_map shows a non-trivial
-    // mapping (not "0 0 4294967295").  In rootless mode the process cannot create
-    // cgroups under /sys/fs/cgroup/ so we leave cgroup_parent empty.
-    let rootless = std::fs::read_to_string("/proc/self/uid_map")
-        .map(|m| {
-            let fields: Vec<&str> = m.split_whitespace().collect();
-            !(fields.len() >= 3
-                && fields[0] == "0"
-                && fields[1] == "0"
-                && fields[2] == "4294967295")
-        })
-        .unwrap_or(false);
-    let cgroup_parent = if rootless {
+    let SandboxIdentity {
+        pod_name,
+        namespace,
+        pod_uid,
+        containerd_namespace,
+    } = identity;
+    let cgroup_parent = if runtime_inputs.rootless {
         String::new()
     } else {
         // Use containerd-namespace-specific cgroup hierarchy for isolation from K3s.
@@ -46,7 +52,7 @@ pub fn build_sandbox_config_with_dns_policy(
         // can lead to controller reclamation under resource pressure.
         format!(
             "/{ns}/besteffort/pod{uid}",
-            ns = containerd_ns,
+            ns = containerd_namespace,
             uid = pod_uid
         )
     };
@@ -61,7 +67,7 @@ pub fn build_sandbox_config_with_dns_policy(
     let dns_config = match dns_policy {
         "Default" => {
             // Use host's /etc/resolv.conf
-            let (nameservers, searches, options) = parse_host_resolv_conf();
+            let (nameservers, searches, options) = runtime_inputs.host_dns.as_parts();
             Some(DnsConfig {
                 servers: nameservers,
                 searches,
@@ -199,7 +205,8 @@ pub fn build_sandbox_config_with_dns_policy(
             ..Default::default()
         }),
         hostname,
-        log_directory: crate::paths::pod_log_dir_path(containerd_ns, namespace, pod_name, pod_uid)
+        log_directory: paths
+            .pod_log_dir(namespace, pod_name, pod_uid)
             .to_string_lossy()
             .into_owned(),
         dns_config,
@@ -261,6 +268,34 @@ pub fn build_sandbox_config_with_dns_policy(
         }),
         windows: None,
     }
+}
+
+#[cfg(test)]
+pub fn build_sandbox_config_with_dns_policy(
+    pod_name: &str,
+    namespace: &str,
+    pod_ip: &str,
+    pod_uid: &str,
+    containerd_ns: &str,
+    dns_ip: &str,
+    pod_spec: &Value,
+) -> PodSandboxConfig {
+    build_sandbox_config_with_runtime_inputs(
+        SandboxIdentity {
+            pod_name,
+            namespace,
+            pod_uid,
+            containerd_namespace: containerd_ns,
+        },
+        pod_ip,
+        dns_ip,
+        pod_spec,
+        &SandboxRuntimeInputs::default(),
+        &crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+            "/tmp/klights-sandbox-test",
+        ))
+        .expect("absolute test path"),
+    )
 }
 
 #[cfg(test)]
@@ -346,9 +381,13 @@ mod tests {
         );
         assert_eq!(
             config.log_directory,
-            crate::paths::pod_log_dir_path("klights", "production", "nginx", "uid-999")
-                .to_string_lossy()
-                .into_owned()
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+                "/tmp/klights-sandbox-test"
+            ),)
+            .unwrap()
+            .pod_log_dir("production", "nginx", "uid-999")
+            .to_string_lossy()
+            .into_owned()
         );
     }
 

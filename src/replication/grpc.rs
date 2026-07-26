@@ -20,9 +20,9 @@ mod ca_files;
 pub(crate) use ca_files::ReplicationRuntimeFiles;
 mod conversions;
 pub(crate) use conversions::{
-    entry_from_proto, entry_to_proto, log_apply_commit_from_proto, log_apply_commit_to_proto,
-    resource_command_request_from_proto, resource_command_request_to_proto,
-    watch_replay_position_from_proto, watch_replay_position_to_proto,
+    entry_from_proto, entry_to_proto, resource_command_request_from_proto,
+    resource_command_request_to_proto, watch_replay_position_from_proto,
+    watch_replay_position_to_proto,
 };
 pub const JOIN_TOKEN_METADATA_KEY: &str = "x-klights-join-token";
 pub(crate) const WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY: &str = "x-klights-watch-error";

@@ -10,6 +10,7 @@
 
 use crate::controller::{Context, Controller};
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -60,6 +61,19 @@ pub trait CsrIssuer: Send + Sync {
         &self,
         request: CsrIssuanceRequest,
     ) -> Result<CsrIssuanceOutcome, CsrIssuanceError>;
+}
+
+#[async_trait]
+pub(crate) trait CsrStatusStore: Send + Sync {
+    async fn get_csr(&self, name: &str) -> anyhow::Result<Option<Resource>>;
+
+    async fn update_csr_status(
+        &self,
+        name: &str,
+        uid: &str,
+        resource_version: i64,
+        status: Value,
+    ) -> anyhow::Result<()>;
 }
 
 /// CSR signer controller that validates and signs kubelet client CSRs.
@@ -240,15 +254,15 @@ fn extract_name(csr: &Value) -> String {
         .to_string()
 }
 
-async fn update_csr_with_certificate(
-    db: &dyn crate::datastore::backend::DatastoreBackend,
+async fn update_csr_with_certificate<S: CsrStatusStore + ?Sized>(
+    store: &S,
     csr_name: &str,
     uid: &str,
     resource_version: i64,
     certificate_pem: &str,
     now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
-    let existing = db.get_resource(API_VERSION, KIND, None, csr_name).await?;
+    let existing = store.get_csr(csr_name).await?;
 
     let Some(existing) = existing else {
         return Ok(());
@@ -296,18 +310,9 @@ async fn update_csr_with_certificate(
         "conditions": conditions,
     });
 
-    db.update_status_only_with_preconditions(
-        API_VERSION,
-        KIND,
-        None,
-        csr_name,
-        status,
-        crate::datastore::ResourcePreconditions {
-            resource_version: Some(resource_version),
-            uid: Some(uid.to_string()),
-        },
-    )
-    .await?;
+    store
+        .update_csr_status(csr_name, uid, resource_version, status)
+        .await?;
 
     Ok(())
 }
@@ -378,8 +383,8 @@ mod tests {
 
     async fn raft_handle() -> crate::datastore::backend::DatastoreHandle {
         use crate::datastore::backend::DatastoreHandle;
-        use crate::datastore::command::StorageCommand;
         use crate::datastore::sequenced::{RaftProposal, SequencedDatastore};
+        use klights_cluster_core::StorageCommand;
 
         struct InlineProposer {
             inner: DatastoreHandle,
@@ -391,13 +396,13 @@ mod tests {
                 &self,
                 command: StorageCommand,
             ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("csr-signer-test-{}", uuid::Uuid::new_v4());
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
-                    crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                    crate::node_outbox::payload::OutboxOperation::PodStatus,
                     bytes::Bytes::from(payload),
                     "csr-signer-test",
                 )
@@ -420,18 +425,18 @@ mod tests {
                 authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
                     .map_err(|err| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                        crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                     })?;
-                let operation =
-                    crate::kubelet::outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()),
-                    )?;
+                let operation = crate::node_outbox::payload::OutboxOperation::try_from(operation)
+                    .map_err(|err| {
+                    crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
+                })?;
                 crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,

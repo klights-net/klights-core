@@ -111,13 +111,9 @@ async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
 #[tokio::test]
 async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_aware_handler() {
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let (_lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(1);
-    state.pod_lifecycle_rx = Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(
-        lifecycle_rx,
-    ))));
-    state.pod_lifecycle_router = Some(std::sync::Arc::new(
+    state.pod_node_subresources_mut().pod_lifecycle_router = Some(std::sync::Arc::new(
         crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::from_env(
-            state.task_supervisor.clone(),
+            state.operational().task_supervisor.clone(),
             crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
         ),
     ));
@@ -126,12 +122,13 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
 
     let (_leader_addr_tx, leader_addr_rx) =
         tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
-    state.is_raft_leader_rx = Some(std::sync::Arc::new(
+    state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx.clone(), leader_addr_rx, None),
     ));
 
     // Seed a Pending PVC with no matching PV yet, then create the matching PV.
     let pvc = state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -151,6 +148,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
         .await
         .unwrap();
     let pv = state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -171,47 +169,24 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
         .await
         .unwrap();
 
-    let context = PodWatcherRuntimeContext {
-        pod_watch_source: std::sync::Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
-                crate::datastore::DatastoreBackendWatchStore::new(state.db.clone()),
-            )),
-        ),
-        cluster_api: state.cluster_api.clone(),
-        node_local: None,
-        config: state.config.clone(),
-        task_supervisor: state.task_supervisor.clone(),
-        file_process: state.file_process.clone(),
-        pod_repository: state.pod_repository.clone(),
-        pod_lifecycle_router: state
-            .pod_lifecycle_router
-            .clone()
-            .expect("test router configured"),
-        persistent_volume_event_handler: std::sync::Arc::new(
-            crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
-                state.db.clone(),
-                is_leader_rx,
-                state.file_process.clone(),
-            ),
-        ),
-        pod_lifecycle_rx: state
-            .pod_lifecycle_rx
-            .clone()
-            .expect("test lifecycle receiver configured"),
-        pod_start_retry_state: state.pod_start_retry_state.clone(),
-    };
+    let persistent_volume_event_handler =
+        crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+            state.resource_mutation().db.clone(),
+            is_leader_rx,
+            state.operational().file_process.clone(),
+        );
 
     // The runtime context no longer carries a reconciliation boolean;
     // leadership is expressed through the injected handler. While not leader,
     // a PV event must not originate a binding write.
-    context
-        .persistent_volume_event_handler
+    persistent_volume_event_handler
         .handle_pv_event(
             &crate::watch::WatchEvent::added((*pv.data).clone()),
             "ctx-pv",
         )
         .await;
     let pvc_as_follower = state
+        .resource_mutation()
         .db
         .get_resource("v1", "PersistentVolumeClaim", Some("default"), "ctx-pvc")
         .await
@@ -227,14 +202,14 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
 
     // A live leadership transition (no restart) lets the same handler bind.
     is_leader_tx.send(true).unwrap();
-    context
-        .persistent_volume_event_handler
+    persistent_volume_event_handler
         .handle_pvc_event(
             &crate::watch::WatchEvent::added((*pvc.data).clone()),
             "ctx-pvc",
         )
         .await;
     let pvc_as_leader = state
+        .resource_mutation()
         .db
         .get_resource("v1", "PersistentVolumeClaim", Some("default"), "ctx-pvc")
         .await

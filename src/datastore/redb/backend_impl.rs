@@ -13,12 +13,12 @@ use tokio::sync::broadcast;
 
 use ::redb::{ReadableDatabase, ReadableTable};
 
-use crate::controllers::annotations::NodePeerMode;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
-use crate::networking::types::HostPortRange;
+use klights_types::HostPortRange;
+use klights_types::NodePeerMode;
 #[cfg(test)]
 use klights_watch::WatchSignal;
 use klights_watch::WatchTopic;
@@ -68,31 +68,36 @@ pub(super) fn decode_outbox_watermark_key(
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
-        self.accessor.call("redb_atomic_allocator_observation", |db| {
-            let read = db.begin_read()?;
-            let meta = read.open_table(tables::META)?;
-            let parse_meta = |key: &str| -> Result<i64> {
-                match meta.get(key)? {
-                    None => Ok(0),
-                    Some(value) => {
-                        let raw = std::str::from_utf8(value.value()).map_err(|error| anyhow!("invalid UTF-8 {key} metadata: {error}"))?;
-                        raw.parse::<i64>().map_err(|_| anyhow!("invalid numeric {key} metadata {raw:?}"))
+        self.accessor
+            .call("redb_atomic_allocator_observation", |db| {
+                let read = db.begin_read()?;
+                let meta = read.open_table(tables::META)?;
+                let parse_meta = |key: &str| -> Result<i64> {
+                    match meta.get(key)? {
+                        None => Ok(0),
+                        Some(value) => {
+                            let raw = std::str::from_utf8(value.value()).map_err(|error| {
+                                anyhow!("invalid UTF-8 {key} metadata: {error}")
+                            })?;
+                            raw.parse::<i64>()
+                                .map_err(|_| anyhow!("invalid numeric {key} metadata {raw:?}"))
+                        }
                     }
+                };
+                let resource_version = parse_meta("rv")?;
+                let event_id = parse_meta("watch_event_id")?;
+                if resource_version < 0 || event_id < 0 {
+                    return Err(anyhow!("allocator values must be non-negative"));
                 }
-            };
-            let resource_version = parse_meta("rv")?;
-            let event_id = parse_meta("watch_event_id")?;
-            if resource_version < 0 || event_id < 0 { return Err(anyhow!("allocator values must be non-negative")); }
-            let klights = read.open_table(tables::KLIGHTS_META)?;
-            let assignment = match klights.get(crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE)? {
-                None => crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                Some(value) => crate::datastore::resource_version_assignment::parse_resource_version_assignment_mode(value.value())?,
-            };
-            Ok(DurableAllocatorObservation {
-                resource_version_assignment: assignment,
-                position: WatchReplayPosition { resource_version, event_id, resource_version_filter_through_event_id: 0 },
+                Ok(DurableAllocatorObservation {
+                    position: WatchReplayPosition {
+                        resource_version,
+                        event_id,
+                        resource_version_filter_through_event_id: 0,
+                    },
+                })
             })
-        }).await
+            .await
     }
 
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
@@ -103,10 +108,10 @@ impl DatastoreBackend for RedbDatastore {
                 let get = |key: &str| -> Result<Option<String>> {
                     Ok(klights.get(key)?.map(|value| value.value().to_string()))
                 };
-                let cluster_id = get(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)?
+                let cluster_id = get(klights_cluster_store::CLUSTER_ID_META_KEY)?
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| anyhow!("cluster_id is missing or empty"))?;
-                let raw_epoch = get(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH)?
+                let raw_epoch = get(klights_cluster_store::LEADER_EPOCH_META_KEY)?
                     .ok_or_else(|| anyhow!("leader_epoch is missing"))?;
                 let leader_epoch = raw_epoch
                     .parse::<i64>()
@@ -127,9 +132,9 @@ impl DatastoreBackend for RedbDatastore {
                     ));
                 }
                 let membership = match (
-                    get(crate::bootstrap::cluster_meta::KEY_RAFT_VOTERS)?,
-                    get(crate::bootstrap::cluster_meta::KEY_RAFT_TERM)?,
-                    get(crate::bootstrap::cluster_meta::KEY_RAFT_LEADER_HINT)?,
+                    get(klights_cluster_store::RAFT_VOTERS_META_KEY)?,
+                    get(klights_cluster_store::RAFT_TERM_META_KEY)?,
+                    get(klights_cluster_store::RAFT_LEADER_HINT_META_KEY)?,
                 ) {
                     (None, None, None) => ReplicatedMembershipState::AuthoritativeAbsent,
                     (Some(raw_voters), Some(raw_term), Some(raw_hint)) => {
@@ -808,14 +813,14 @@ impl DatastoreBackend for RedbDatastore {
     }
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         self.network.update_node_dataplane(metadata).await
     }
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         self.network.get_node_dataplane(node_name).await
     }
     async fn get_node_subnet(&self, n: &str) -> Result<Option<NodeSubnet>> {
@@ -842,7 +847,7 @@ impl DatastoreBackend for RedbDatastore {
         pod: &str,
         uid: &str,
         node: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotMutationResult> {
         self.pod_slots.mark_terminating(ns, pod, uid, node).await
     }
     async fn pod_slot_clear_if_uid(
@@ -851,7 +856,7 @@ impl DatastoreBackend for RedbDatastore {
         pod: &str,
         uid: &str,
         node: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotClearResult> {
         self.pod_slots.clear_if_uid(ns, pod, uid, node).await
     }
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
@@ -1244,10 +1249,10 @@ impl DatastoreBackend for RedbDatastore {
         _payload: &[u8],
         _authoring_node: &str,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
-        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+        Err(klights_cluster_core::OutboxApplyError::Retryable(
             "redb: apply_outbox_transactionally not implemented".to_string(),
         ))
     }
@@ -1259,10 +1264,10 @@ impl DatastoreBackend for RedbDatastore {
         _payload: &[u8],
         _authoring_node: &str,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
-        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+        Err(klights_cluster_core::OutboxApplyError::Retryable(
             "redb: build_log_apply_commit_for_outbox not implemented".to_string(),
         ))
     }
@@ -1871,8 +1876,8 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         crate::datastore::DatastoreBackend::update_node_peer_attributes(
             self,
@@ -1885,7 +1890,7 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
 
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         crate::datastore::DatastoreBackend::update_node_dataplane(self, metadata).await
     }
@@ -1893,7 +1898,7 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         crate::datastore::DatastoreBackend::get_node_dataplane(self, node_name).await
     }
 
@@ -2001,7 +2006,7 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
+        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -2399,7 +2404,7 @@ impl crate::datastore::PodCleanupStore for RedbDatastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotMutationResult> {
         crate::datastore::DatastoreBackend::pod_slot_mark_terminating(
             self, namespace, pod_name, pod_uid, node_name,
         )
@@ -2412,7 +2417,7 @@ impl crate::datastore::PodCleanupStore for RedbDatastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotClearResult> {
         crate::datastore::DatastoreBackend::pod_slot_clear_if_uid(
             self, namespace, pod_name, pod_uid, node_name,
         )
@@ -2468,19 +2473,6 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         crate::datastore::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
     }
 
-    async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> Result<bool> {
-        crate::datastore::DatastoreBackend::delete_uncommitted_applied_outbox_placeholder(
-            self,
-            idempotency_key,
-            reserved_rv,
-        )
-        .await
-    }
-
     async fn apply_outbox_transactionally(
         &self,
         idempotency_key: &str,
@@ -2488,8 +2480,8 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally(
             self,
@@ -2509,8 +2501,8 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark(
             self,
@@ -2532,7 +2524,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::CommittedOutboxApply,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
             self,
@@ -2567,8 +2559,8 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox(
             self,
@@ -2588,8 +2580,8 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox_with_watermark(
             self,

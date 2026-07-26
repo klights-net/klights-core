@@ -550,12 +550,13 @@ mod tests {
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
-            containerd_data_dir: crate::paths::containerd_data_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
             containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
+            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                crate::paths::data_root_path(&namespace),
+            )
+            .unwrap(),
         };
 
         let identity = setup_worker(&cfg, "10.99.0.20")
@@ -606,12 +607,13 @@ mod tests {
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
-            containerd_data_dir: crate::paths::containerd_data_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
             containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
+            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                crate::paths::data_root_path(&namespace),
+            )
+            .unwrap(),
         };
 
         setup_leader(
@@ -732,12 +734,13 @@ mod tests {
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: joiner_etc_dir.to_string_lossy().into_owned(),
-            containerd_data_dir: crate::paths::containerd_data_dir_path(&joiner_namespace)
-                .to_string_lossy()
-                .into_owned(),
             containerd_state_dir: crate::paths::containerd_state_dir_path(&joiner_namespace)
                 .to_string_lossy()
                 .into_owned(),
+            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                crate::paths::data_root_path(&joiner_namespace),
+            )
+            .unwrap(),
         };
 
         setup_leader(
@@ -815,12 +818,13 @@ mod tests {
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
-            containerd_data_dir: crate::paths::containerd_data_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
             containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
+            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                crate::paths::data_root_path(&namespace),
+            )
+            .unwrap(),
         };
 
         let identity = setup_leader(
@@ -888,12 +892,13 @@ mod tests {
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
-            containerd_data_dir: crate::paths::containerd_data_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
             containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
                 .to_string_lossy()
                 .into_owned(),
+            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                crate::paths::data_root_path(&namespace),
+            )
+            .unwrap(),
         };
 
         setup_leader(

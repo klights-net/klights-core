@@ -16,9 +16,8 @@ pub(super) async fn enqueue_job_reconcile_for_terminal_watch_pod(
 
 pub(super) struct WatchEventHandlerContext<'a> {
     pub persistent_volume_event_handler: &'a Arc<dyn PersistentVolumeEventHandler>,
-    pub cluster_api: &'a Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    pub pod_cleanup_intents: &'a Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
     pub node_name: &'a str,
-    pub containerd_namespace: &'a str,
     pub pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_creation_tracker: &'a PodCreationTracker,
     pub retry_state: &'a PodStartRetryTracker,
@@ -27,14 +26,16 @@ pub(super) struct WatchEventHandlerContext<'a> {
         std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
     pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pub file_process: klights_supervisor::FileProcessExecutor,
+    pub deadline_timers: super::deadline_timers::DeadlineTimerRegistry,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, event: WatchEvent) {
     let WatchEventHandlerContext {
         persistent_volume_event_handler,
-        cluster_api,
+        pod_cleanup_intents,
         node_name,
-        containerd_namespace,
         pod_repo,
         pod_creation_tracker,
         retry_state,
@@ -42,6 +43,9 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         pod_lifecycle_router,
         task_supervisor,
         file_process,
+        deadline_timers,
+        node_capacity,
+        paths,
     } = context;
     // Check event kind and dispatch to appropriate handler
     let event_kind = event
@@ -82,9 +86,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             .pointer("/metadata/namespace")
             .and_then(|n| n.as_str())
             .unwrap_or("default");
-        let volumes_root = crate::paths::volumes_root_path(containerd_namespace)
-            .to_string_lossy()
-            .into_owned();
+        let volumes_root = paths.volumes_root().to_string_lossy().into_owned();
         let refresh_result = if event.event_type == EventType::Deleted {
             crate::kubelet::volumes::refresh_secret_configmap_volumes_after_delete(
                 &file_process,
@@ -147,6 +149,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
     if event.event_type == EventType::Modified {
         schedule_active_deadline_timer_for_modified_pod(
             &event.object,
+            deadline_timers,
             task_supervisor.clone(),
             pod_lifecycle_router.clone(),
         )
@@ -214,13 +217,12 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         enqueue_job_reconcile_for_terminal_watch_pod(pod_repo, &event.object).await;
 
         // Refresh downwardAPI volumes to reflect metadata changes (labels/annotations)
-        let volumes_root = crate::paths::volumes_root_path(containerd_namespace)
-            .to_string_lossy()
-            .into_owned();
+        let volumes_root = paths.volumes_root().to_string_lossy().into_owned();
         if let Err(e) = crate::kubelet::volumes::refresh_downward_api_volumes(
             &file_process,
             &event.object,
             &volumes_root,
+            node_capacity,
         )
         .await
         {
@@ -272,15 +274,18 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         if orphan_enqueued
             && let Some(key) = node_lost_cleanup_intent_key_for_deleted_pod(&event, node_name)
         {
-            match crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
+            match klights_leader_api::PodCleanupIntentAckRequest::try_new(
                 key.node_name.as_str(),
                 key.namespace.as_str(),
                 key.pod_name.as_str(),
                 key.pod_uid.as_str(),
-                crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+                crate::kubelet::pod_lifecycle_core::message::POD_CLEANUP_REASON_NODE_LOST,
             ) {
                 Ok(request) => {
-                    if let Err(err) = cluster_api.acknowledge_pod_cleanup_intent(request).await {
+                    if let Err(err) = pod_cleanup_intents
+                        .acknowledge_pod_cleanup_intent(request)
+                        .await
+                    {
                         tracing::warn!(
                             node = %key.node_name,
                             namespace = %key.namespace,
@@ -415,7 +420,7 @@ pub(super) async fn handle_namespace_termination_event(
 /// `Datastore`.
 #[cfg(test)]
 pub(super) struct PodPhaseUpdateRequest<'a> {
-    pub pod_resource: &'a crate::datastore::Resource,
+    pub pod_resource: &'a klights_cluster_core::Resource,
     pub container_infos: &'a [(String, ContainerInfo)],
     pub restart_counts: &'a std::collections::HashMap<String, i32>,
     pub current_phase: Option<&'a str>,
@@ -848,7 +853,6 @@ mod tests {
     async fn configmap_watch_refresh_uses_configured_runtime_namespace_not_global_env() {
         let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().expect("tempdir");
-        let runtime_ns = "event-handler-runtime-ns";
         let wrong_global_ns = "event-handler-wrong-global-ns";
         let _data_root = EnvVarGuard::set("KLIGHTS_DATA_ROOT", temp.path());
         let _runtime_env = EnvVarGuard::set("KLIGHTS_CONTAINERD_NAMESPACE", wrong_global_ns);
@@ -856,7 +860,7 @@ mod tests {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
         let pod_repo = fixture_pod_repo(db_handle.clone(), supervisor.clone());
-        let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> =
+        let pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents> =
             Arc::new(crate::control_plane::client::local::LocalApiClient::new(
                 db_handle.clone(),
                 "worker-a".to_string(),
@@ -909,7 +913,12 @@ mod tests {
             "cm-pod",
             "uid-cm-pod",
         );
-        let volume_path = crate::paths::volumes_root_path(runtime_ns)
+        let paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            std::path::PathBuf::from("/tmp/klights-event-handler-test"),
+        )
+        .unwrap();
+        let volume_path = paths
+            .volumes_root()
             .join(pod_dir_id)
             .join("volumes/config-map/config-vol");
         let volume_path = volume_path.to_string_lossy().into_owned();
@@ -922,15 +931,17 @@ mod tests {
             WatchEventHandlerContext {
                 file_process: crate::kubelet::file_blocking::test_file_process_executor(),
                 persistent_volume_event_handler: &persistent_volume_event_handler,
-                cluster_api: &cluster_api,
+                pod_cleanup_intents: &pod_cleanup_intents,
                 node_name: "worker-a",
-                containerd_namespace: runtime_ns,
                 pod_repo: &pod_repo,
                 pod_creation_tracker: &pod_creation_tracker,
                 retry_state: &retry_state,
                 pod_lifecycle_state: &pod_lifecycle_state,
                 pod_lifecycle_router,
                 task_supervisor: supervisor,
+                deadline_timers: super::deadline_timers::DeadlineTimerRegistry::default(),
+                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                paths,
             },
             WatchEvent::modified(json!({
                 "apiVersion": "v1",

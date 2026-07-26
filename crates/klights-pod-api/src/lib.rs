@@ -11,6 +11,44 @@ use std::future::Future;
 use std::pin::Pin;
 
 use klights_cluster_core::Resource;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodLifecycleActorDiagnostic {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodLifecycleTraceDiagnostic {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub event: String,
+    pub resource_version: Option<i64>,
+    pub sandbox_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PodLifecycleDiagnostics {
+    pub actor_states: Vec<PodLifecycleActorDiagnostic>,
+    pub recent_trace: Vec<PodLifecycleTraceDiagnostic>,
+}
+
+pub type PodLifecycleDiagnosticsFuture<'a> =
+    Pin<Box<dyn Future<Output = PodLifecycleDiagnostics> + Send + 'a>>;
+
+pub trait PodLifecycleDiagnosticsQuery: Send + Sync {
+    fn pod_lifecycle_diagnostics(&self) -> PodLifecycleDiagnosticsFuture<'_>;
+}
+
+pub type PodStartRetryDiagnosticsFuture<'a> =
+    Pin<Box<dyn Future<Output = Vec<(String, String)>> + Send + 'a>>;
+
+pub trait PodStartRetryDiagnostics: Send + Sync {
+    fn pending_pod_start_retries(&self) -> PodStartRetryDiagnosticsFuture<'_>;
+}
 use klights_types::PodIdentity;
 
 pub type PodRepositoryFuture<'a, T> =
@@ -251,6 +289,209 @@ pub trait PodMarkTerminating: Send + Sync {
     fn mark_pod_terminating(
         &self,
         request: PodMarkTerminatingRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodApiCreateRequest {
+    pub namespace: String,
+    pub body: serde_json::Value,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodApiCreateResult {
+    pub resource: Option<Resource>,
+    pub body: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+pub enum PodApiWriteOutcome {
+    Persisted(Resource),
+    DryRun(serde_json::Value),
+}
+
+#[derive(Clone, Debug)]
+pub enum PodApiDeleteOutcome {
+    GracefulSet(Resource),
+    DryRun(serde_json::Value),
+}
+
+#[derive(Clone, Debug)]
+pub struct PodApiUpdateRequest {
+    pub namespace: String,
+    pub name: String,
+    pub body: serde_json::Value,
+    pub current: Resource,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodApiPatchRequest {
+    pub namespace: String,
+    pub name: String,
+    pub patch: serde_json::Value,
+    pub patch_kind: PodStatusPatchKind,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodApiDeleteRequest {
+    pub namespace: String,
+    pub name: String,
+    pub options: PodDeleteOptions,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodApiDeleteCollectionRequest {
+    pub namespace: String,
+    pub label_selector: Option<String>,
+    pub field_selector: Option<String>,
+    pub dry_run: bool,
+}
+
+pub trait PodApiMutation: Send + Sync {
+    fn create_pod(
+        &self,
+        request: PodApiCreateRequest,
+    ) -> PodRepositoryFuture<'_, PodApiCreateResult>;
+
+    fn update_pod(
+        &self,
+        request: PodApiUpdateRequest,
+    ) -> PodRepositoryFuture<'_, PodApiWriteOutcome>;
+
+    fn patch_pod(&self, request: PodApiPatchRequest)
+    -> PodRepositoryFuture<'_, PodApiWriteOutcome>;
+
+    fn delete_pod(
+        &self,
+        request: PodApiDeleteRequest,
+    ) -> PodRepositoryFuture<'_, PodApiDeleteOutcome>;
+
+    fn delete_collection_pods(
+        &self,
+        request: PodApiDeleteCollectionRequest,
+    ) -> PodRepositoryFuture<'_, ()>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodSnapshotListRequest {
+    pub list: PodListRequest,
+    pub snapshot_resource_version: i64,
+}
+
+#[derive(Clone, Debug)]
+pub enum PodSnapshotListOutcome {
+    List(PodListResult),
+    Current,
+    Expired,
+}
+
+pub trait PodSnapshotQuery: Send + Sync {
+    fn snapshot_pods(
+        &self,
+        request: PodSnapshotListRequest,
+    ) -> PodRepositoryFuture<'_, PodSnapshotListOutcome>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodEvictionDeleteRequest {
+    namespace: String,
+    name: String,
+    options: PodDeleteOptions,
+    dry_run: bool,
+}
+
+impl PodEvictionDeleteRequest {
+    pub fn try_new(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        options: PodDeleteOptions,
+        dry_run: bool,
+    ) -> Result<Self, PodRepositoryError> {
+        let target = PodMutationTarget::try_by_name(namespace, name)?;
+        Ok(Self {
+            namespace: target.namespace,
+            name: target.name,
+            options,
+            dry_run,
+        })
+    }
+
+    pub fn into_parts(self) -> (String, String, PodDeleteOptions, bool) {
+        (self.namespace, self.name, self.options, self.dry_run)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PodEvictionDeleteOutcome {
+    Persisted(Resource),
+    DryRun,
+}
+
+pub trait PodEvictionDelete: Send + Sync {
+    fn delete_for_eviction(
+        &self,
+        request: PodEvictionDeleteRequest,
+    ) -> PodRepositoryFuture<'_, PodEvictionDeleteOutcome>;
+}
+
+/// HTTP patch semantics for the Pod status subresource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PodStatusPatchKind {
+    JsonPatch,
+    MergePatch,
+    StrategicMerge,
+    ApplyPatch,
+}
+
+impl PodStatusPatchKind {
+    pub fn from_content_type(content_type: Option<&str>) -> Self {
+        match content_type {
+            Some("application/json-patch+json") => Self::JsonPatch,
+            Some("application/strategic-merge-patch+json") => Self::StrategicMerge,
+            Some("application/apply-patch+yaml") => Self::ApplyPatch,
+            _ => Self::MergePatch,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PodStatusReplaceRequest {
+    pub namespace: String,
+    pub name: String,
+    pub status: serde_json::Value,
+    pub expected_resource_version: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodStatusPatchRequest {
+    pub namespace: String,
+    pub name: String,
+    pub patch: serde_json::Value,
+    pub patch_kind: PodStatusPatchKind,
+    pub expected_resource_version: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodEphemeralContainersRequest {
+    pub namespace: String,
+    pub name: String,
+    pub containers: Vec<serde_json::Value>,
+    pub expected_resource_version: i64,
+}
+
+pub trait PodSubresourceMutation: Send + Sync {
+    fn replace_status(&self, request: PodStatusReplaceRequest)
+    -> PodRepositoryFuture<'_, Resource>;
+
+    fn patch_status(&self, request: PodStatusPatchRequest) -> PodRepositoryFuture<'_, Resource>;
+
+    fn update_ephemeral_containers(
+        &self,
+        request: PodEphemeralContainersRequest,
     ) -> PodRepositoryFuture<'_, Resource>;
 }
 
@@ -976,7 +1217,9 @@ impl fmt::Display for PodRepositoryError {
             Self::AlreadyExists { message } => {
                 write!(formatter, "Pod already exists: {message}")
             }
-            Self::Conflict { message } => write!(formatter, "Pod conflict: {message}"),
+            Self::Conflict { message } => {
+                write!(formatter, "Pod conflict: {message} (409 Conflict)")
+            }
             Self::Forbidden { message } => write!(formatter, "Pod operation forbidden: {message}"),
             Self::Unprocessable { message } => write!(formatter, "invalid Pod: {message}"),
             Self::Internal { message } => write!(formatter, "Pod repository failure: {message}"),

@@ -2130,6 +2130,7 @@ version = "0.0.0"
 name = "klights-cluster-store"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "klights-cluster-core",
  "klights-types",
 ]
@@ -2177,6 +2178,7 @@ dependencies = [
  "klights-cluster-core",
  "klights-types",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2224,6 +2226,7 @@ version = "0.0.0"
 dependencies = [
  "klights-cluster-core",
  "klights-types",
+ "serde_json",
 ]
 
 [[package]]
@@ -2251,6 +2254,7 @@ dependencies = [
  "json-patch",
  "num-bigint",
  "num-traits",
+ "serde",
  "serde_json",
 ]
 

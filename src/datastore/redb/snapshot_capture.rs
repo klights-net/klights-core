@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use ::redb::{ReadableDatabase, ReadableTable};
 use klights_cluster_core::{
-    ClusterMembership, ClusterMetadata, ClusterMutation, LogApplyAppliedOutboxRow, LogApplyCommit,
+    ClusterMembership, ClusterMetadata, ClusterMutation, LogApplyAppliedOutboxRow,
     LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyWatchEventRow, NetworkMutation,
-    Resource, ResourceVersionAssignment, WatchHistoryMutation, WatchReplayPosition,
+    Resource, SnapshotRestoreOperation, WatchHistoryMutation, WatchReplayPosition,
 };
 use klights_cluster_store::{
     DurableReplayFloor, DurableReplayTarget, SnapshotCaptureHeader, SnapshotCapturePage,
@@ -305,15 +305,6 @@ fn read_header(
         .ok_or_else(|| corrupt("leader_epoch is missing"))?
         .parse()
         .map_err(corrupt)?;
-    let assignment = get(
-        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-    )?
-    .map(|raw| {
-        crate::datastore::resource_version_assignment::parse_resource_version_assignment_mode(&raw)
-            .map_err(corrupt)
-    })
-    .transpose()?
-    .unwrap_or(ResourceVersionAssignment::LegacyLeaderAssigned);
     let command_codec_activation_version =
         get(crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)?
             .map(|raw| raw.parse::<u32>().map_err(corrupt))
@@ -333,7 +324,6 @@ fn read_header(
         _ => return Err(corrupt("membership metadata is incomplete")),
     };
     SnapshotCaptureHeader::try_new(
-        Some(assignment),
         command_codec_activation_version,
         WatchReplayPosition {
             resource_version: current_rv,
@@ -531,11 +521,11 @@ fn resource_page(
         return Ok((None, empty));
     }
     let next = cursor(rows.last().unwrap());
-    let commits = rows
+    let operations = rows
         .iter()
-        .map(crate::datastore::snapshot_export::live_resource_commit)
+        .map(crate::datastore::snapshot_export::resource_restore_operation)
         .collect();
-    Ok((Some(SnapshotCapturePage::try_commits(commits)?), next))
+    Ok((Some(SnapshotCapturePage::try_operations(operations)?), next))
 }
 
 fn watch_page(
@@ -593,7 +583,7 @@ fn watch_page(
             event_type: event_type.into(),
             data,
         };
-        commits.push(LogApplyCommit::from_cluster_mutations(
+        commits.push(snapshot_operation(
             rv,
             vec![ClusterMutation::WatchHistory(
                 WatchHistoryMutation::PutWatchEvent(row),
@@ -608,7 +598,7 @@ fn watch_page(
         return Ok((None, Phase::Subnet(None)));
     }
     Ok((
-        Some(SnapshotCapturePage::try_commits(commits)?),
+        Some(SnapshotCapturePage::try_operations(commits)?),
         Phase::Watch(next),
     ))
 }
@@ -685,7 +675,7 @@ fn json_network_page(
                 port,
             })
         };
-        commits.push(LogApplyCommit::from_cluster_mutations(
+        commits.push(snapshot_operation(
             current_rv,
             vec![ClusterMutation::Network(mutation)],
         ));
@@ -705,7 +695,7 @@ fn json_network_page(
         ));
     }
     Ok((
-        Some(SnapshotCapturePage::try_commits(commits)?),
+        Some(SnapshotCapturePage::try_operations(commits)?),
         if subnet {
             Phase::Subnet(next)
         } else {
@@ -738,7 +728,7 @@ fn pod_cleanup_page(
         }
         let intent: crate::datastore::PodCleanupIntent =
             serde_json::from_slice(value.value()).map_err(corrupt)?;
-        commits.push(LogApplyCommit::from_cluster_mutations(
+        commits.push(snapshot_operation(
             intent.resource_version,
             vec![
                 crate::datastore::snapshot_export::cluster_pod_cleanup_mutation_from_intent(intent),
@@ -753,7 +743,7 @@ fn pod_cleanup_page(
         return Ok((None, Phase::Watermark(None)));
     }
     Ok((
-        Some(SnapshotCapturePage::try_commits(commits)?),
+        Some(SnapshotCapturePage::try_operations(commits)?),
         Phase::PodCleanup(next),
     ))
 }
@@ -895,6 +885,20 @@ fn required<'a>(
         .and_then(|v| v.as_str())
         .ok_or_else(|| corrupt(format!("{key} missing")))
 }
+fn snapshot_operation(
+    resource_version: i64,
+    mutations: Vec<ClusterMutation>,
+) -> SnapshotRestoreOperation {
+    SnapshotRestoreOperation::new(
+        resource_version,
+        None,
+        mutations
+            .into_iter()
+            .map(ClusterMutation::into_log_apply_mutation)
+            .collect(),
+    )
+}
+
 fn persistence(error: impl std::fmt::Display) -> SnapshotPersistenceError {
     SnapshotPersistenceError::PersistenceFailed {
         message: error.to_string(),

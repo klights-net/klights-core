@@ -2,7 +2,9 @@
 //! Extracted from generated_handlers.rs (refactor).
 
 use crate::api::*;
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+#[cfg(test)]
+use crate::datastore::DatastoreBackend;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use std::sync::Arc;
 
 use super::helpers::*;
@@ -11,9 +13,10 @@ use crate::api::mutation::write::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
-use crate::kubelet::pod_repository::PodApiWriter;
+use klights_pod_api::PodApiMutation;
 use klights_reconcile_api::MutationOperation;
 
+#[cfg(test)]
 pub use crate::api::finalizer_delete::DeleteCompletion;
 
 pub struct GeneratedListInnerRequest {
@@ -21,6 +24,7 @@ pub struct GeneratedListInnerRequest {
     pub kind: &'static str,
     pub list_kind: &'static str,
     pub namespace: Option<String>,
+    pub namespaced: bool,
     pub query: ListQuery,
     pub headers: HeaderMap,
 }
@@ -67,6 +71,7 @@ pub struct GeneratedPatchInnerRequest<'a> {
     pub body: Bytes,
 }
 
+#[cfg(test)]
 pub struct GeneratedDeleteCompletionRequest<'a> {
     pub target: crate::api::finalizer_delete::ResourceDeleteTarget<'a>,
     pub initial_resource: Resource,
@@ -81,9 +86,12 @@ async fn enqueue_generated_controller_after_mutation(
     kind: &'static str,
     resource: &Value,
 ) {
-    if crate::controllers::workqueue::controller_kind_static(api_version, kind).is_some() {
-        state.controller_dispatcher.enqueue(resource).await;
-    }
+    let _ = (api_version, kind);
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(resource)
+        .await;
 }
 
 async fn maybe_reconcile_cluster_role_aggregation(
@@ -95,12 +103,14 @@ async fn maybe_reconcile_cluster_role_aggregation(
         return;
     }
 
-    if let Err(err) =
-        crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(state.db.as_ref())
-            .await
+    if let Err(err) = state
+        .resource_mutation()
+        .generated_lifecycle
+        .reconcile_cluster_role_aggregation()
+        .await
     {
         tracing::warn!(
-            error = %err,
+            error = ?err,
             "failed to reconcile ClusterRole aggregation after mutation"
         );
     }
@@ -121,6 +131,7 @@ async fn schedule_foreground_owner_finalization(
     let dispatch_name = name.clone();
 
     if let Err(err) = state
+        .operational()
         .task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Background,
@@ -130,18 +141,16 @@ async fn schedule_foreground_owner_finalization(
                 let worker_namespace = dispatch_namespace.clone();
                 let worker_name = dispatch_name.clone();
                 let worker_owner = owner;
-                let worker_supervisor = dispatch_state.task_supervisor.clone();
-                let worker_metrics = dispatch_state.metrics.clone();
+                let worker_supervisor = dispatch_state.operational().task_supervisor.clone();
+                let worker_metrics = dispatch_state.controller_reconcile().metrics.clone();
                 if let Err(err) = worker_supervisor
                     .spawn_async(
                         klights_supervisor::TaskCategory::PodDeleteWorkqueue,
                         "foreground_owner_finalization",
                         async move {
-                            if let Err(err) = controllers::gc::finalize_foreground_owner_if_ready(
-                                worker_state.db.as_ref(),
-                                &worker_owner,
-                                worker_state.pod_repository.as_ref()
-                                    as &dyn klights_reconcile_api::GcPodDeleteSink,
+                            if let Err(err) = crate::api::gc_ports::finalize_foreground_owner(
+                                worker_state.resource_mutation().gc_owner_lifecycle.as_ref(),
+                                worker_owner,
                             )
                             .await
                             {
@@ -162,6 +171,7 @@ async fn schedule_foreground_owner_finalization(
                     .await
                 {
                     dispatch_state
+                        .controller_reconcile()
                         .metrics
                         .cascade_delete_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -179,6 +189,7 @@ async fn schedule_foreground_owner_finalization(
         .await
     {
         state
+            .controller_reconcile()
             .metrics
             .cascade_delete_failures_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -200,9 +211,7 @@ async fn dispatch_generated_mutation_event(
     context: &'static str,
 ) {
     crate::api::mutation::dispatch_mutation_event(
-        &state.side_effects,
-        state.db.as_ref(),
-        &state.metrics,
+        state.resource_mutation().mutation_effects.as_ref(),
         crate::api::mutation::MutationEvent {
             operation,
             resource,
@@ -215,6 +224,7 @@ async fn dispatch_generated_mutation_event(
     .await;
 }
 
+#[cfg(test)]
 pub async fn mark_foreground_deletion_with_retry(
     db: &dyn DatastoreBackend,
     api_version: &str,
@@ -224,8 +234,10 @@ pub async fn mark_foreground_deletion_with_retry(
     initial_resource: Resource,
     delete_preconditions: ResourcePreconditions,
 ) -> Result<Resource, AppError> {
+    let lifecycle =
+        crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(db);
     crate::api::finalizer_delete::mark_foreground_deletion_with_retry(
-        db,
+        &lifecycle,
         api_version,
         kind,
         ns,
@@ -236,12 +248,15 @@ pub async fn mark_foreground_deletion_with_retry(
     .await
 }
 
+#[cfg(test)]
 pub async fn complete_non_foreground_delete_with_live_recheck(
     db: &dyn DatastoreBackend,
     request: GeneratedDeleteCompletionRequest<'_>,
 ) -> Result<DeleteCompletion, AppError> {
+    let lifecycle =
+        crate::bootstrap::finalizer_lifecycle_adapter::BorrowedFinalizerLifecycleStore::new(db);
     crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
-        db,
+        &lifecycle,
         crate::api::finalizer_delete::NonForegroundDeleteRequest {
             target: request.target,
             initial_resource: request.initial_resource,
@@ -264,7 +279,8 @@ pub async fn delete_collection_listed_resource_inner(
     let resource_name = resource.name.clone();
     let resource_uid = resource.uid.clone();
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
-        db: state.db.as_ref(),
+        resource_query: state.resource_mutation().resource_query.as_ref(),
+        lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
     };
     let target_identity = klights_types::ResourceKey::new(
         api_version,
@@ -288,13 +304,14 @@ pub async fn delete_collection_listed_resource_inner(
             if api_version == "v1"
                 && kind == "Node"
                 && let Err(err) = state
-                    .db
-                    .delete_pod_cleanup_intents_for_node(&resource.name)
+                    .resource_mutation()
+                    .generated_lifecycle
+                    .delete_node_cleanup_intents(resource.name.clone())
                     .await
             {
                 tracing::warn!(
                     node = %resource.name,
-                    error = %err,
+                    error = ?err,
                     "failed to delete pod cleanup intents for deleted node"
                 );
             }
@@ -321,11 +338,10 @@ async fn run_post_hard_delete_effects(
     .await;
 
     if api_version == "v1" && kind == "Service" {
-        crate::controllers::service::release_service_allocations_from_resource(
-            state.service_ipam.as_ref(),
-            state.nodeport_alloc.as_ref(),
-            &resource.data,
-        );
+        state
+            .controller_reconcile()
+            .service_allocations
+            .release_resource(&resource.data);
     }
 
     dispatch_generated_mutation_event(
@@ -340,18 +356,20 @@ async fn run_post_hard_delete_effects(
         return;
     }
 
-    if let Err(e) = controllers::gc::cascade_delete_with_uid(
-        state.db.as_ref(),
-        &resource.uid,
-        api_version,
-        &resource.name,
-        kind,
-        namespace.map(str::to_string),
-        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+    if let Err(e) = crate::api::gc_ports::cascade_delete(
+        state.resource_mutation().gc_owner_lifecycle.as_ref(),
+        klights_reconcile_api::GcOwnerIdentity::new(
+            api_version,
+            kind,
+            namespace.map(str::to_string),
+            &resource.name,
+            &resource.uid,
+        ),
     )
     .await
     {
         state
+            .controller_reconcile()
             .metrics
             .cascade_delete_failures_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -369,6 +387,7 @@ pub async fn list_inner(
         kind,
         list_kind,
         namespace,
+        namespaced,
         query,
         headers,
     } = request;
@@ -378,7 +397,7 @@ pub async fn list_inner(
         kind,
         query.label_selector.as_deref(),
         query.field_selector.as_deref(),
-        ns.is_some(),
+        namespaced,
     )?;
     if query.watch == Some("true".to_string()) {
         query.validate_send_initial_events_watch()?;
@@ -395,7 +414,6 @@ pub async fn list_inner(
 
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(str::to_string);
-        let db = state.db.clone();
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let table_format = wants_table_format(&headers)?;
         let protobuf_supported = protobuf_watch_supported_for_request(
@@ -408,23 +426,24 @@ pub async fn list_inner(
         let stream_format = negotiate_watch_stream_format(&headers, protobuf_supported)?;
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
-        let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
-            db,
-            task_supervisor: state.task_supervisor.clone(),
-            api_version,
-            kind: kind_owned,
-            watch_namespace: ns_owned,
-            requested_rv,
-            send_initial_events,
-            send_bookmarks,
-            label_selector,
-            field_selector,
-            table_format,
-            stream_format,
-            timeout_seconds: query.timeout_seconds,
-            emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
-        })
-        .await;
+        let body = state
+            .resource_mutation()
+            .generated_watch
+            .build_watch_stream(crate::api::generated_handler_ports::GeneratedWatchRequest {
+                api_version: api_version.to_string(),
+                kind: kind_owned,
+                namespace: ns_owned,
+                requested_resource_version: requested_rv,
+                send_initial_events,
+                send_bookmarks,
+                label_selector,
+                field_selector,
+                table_format,
+                stream_format,
+                timeout_seconds: query.timeout_seconds,
+                emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
+            })
+            .await;
         return Ok(Response::builder()
             .header("Content-Type", stream_format.content_type())
             .header("Transfer-Encoding", "chunked")
@@ -446,43 +465,62 @@ pub async fn list_inner(
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token)?;
 
-    let list_query = crate::datastore::ResourceListQuery::new(
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
-        normalized_limit,
-        db_continue_name.as_deref(),
-    );
-
     // Consistent-snapshot selection (pin Exact / session continuations, downgrade
     // a continuation that outran the retained window, honor resourceVersionMatch)
     // is shared across every list handler — see `query::resolve_list_page`.
-    let db_for_snapshot = state.db.clone();
-    let db_for_live = state.db.clone();
+    let reads_for_snapshot = state.resource_mutation().custom_resource_reads.clone();
+    let query_for_live = state.resource_mutation().resource_query.clone();
+    let snapshot_label_selector = query.label_selector.clone();
+    let live_label_selector = query.label_selector;
+    let snapshot_field_selector = query.field_selector.clone();
+    let live_field_selector = query.field_selector;
+    let snapshot_continue_name = db_continue_name.clone();
+    let live_continue_name = db_continue_name;
+    let snapshot_namespace = ns.map(str::to_string);
+    let live_namespace = snapshot_namespace.clone();
     let crate::api::query::ResolvedListPage {
         list,
         response_rv,
         continue_resource_version,
     } = crate::api::query::resolve_list_page(
-        state.db.as_ref(),
+        state.resource_mutation().list_resource_versions.as_ref(),
         rv_match,
         continue_resource_version,
         |srv| async move {
-            db_for_snapshot
-                .snapshot_resources_at_rv(api_version, kind, ns, list_query, srv)
+            reads_for_snapshot
+                .snapshot_resources_at_rv(
+                    crate::api::custom_resource_ports::CustomResourceSnapshotRequest {
+                        api_version: api_version.to_string(),
+                        kind: kind.to_string(),
+                        namespace: snapshot_namespace,
+                        label_selector: snapshot_label_selector,
+                        field_selector: snapshot_field_selector,
+                        limit: normalized_limit,
+                        continue_token: snapshot_continue_name,
+                        resource_version: srv,
+                    },
+                )
                 .await
-                .map_err(AppError::from)
         },
         || async move {
-            db_for_live
-                .list_resources(api_version, kind, ns, list_query)
-                .await
-                .map_err(AppError::from)
+            crate::api::resource_query_ports::list_resources(
+                query_for_live.as_ref(),
+                api_version,
+                kind,
+                live_namespace.as_deref(),
+                live_label_selector.as_deref(),
+                live_field_selector.as_deref(),
+                normalized_limit,
+                live_continue_name.as_deref(),
+            )
+            .await
         },
     )
     .await?;
 
-    let mut items: Vec<Value> = Vec::with_capacity(list.items.len());
-    for r in list.items {
+    let (listed_resources, _, _, continue_token, remaining_item_count) = list.into_parts();
+    let mut items: Vec<Value> = Vec::with_capacity(listed_resources.len());
+    for r in listed_resources {
         let mut data = inject_resource_version(r.data, r.resource_version);
         normalize_resource_for_read(api_version, kind, &mut data);
         inject_node_last_heartbeat_on_leader(&state, api_version, kind, &mut data).await;
@@ -507,7 +545,7 @@ pub async fn list_inner(
     let mut metadata = serde_json::json!({
         "resourceVersion": resource_version,
     });
-    if let Some(ref name) = list.continue_token {
+    if let Some(ref name) = continue_token {
         let token = crate::api::query::encode_response_continue_token(
             name,
             response_rv,
@@ -515,7 +553,7 @@ pub async fn list_inner(
         );
         metadata["continue"] = serde_json::json!(token);
     }
-    if let Some(remaining) = list.remaining_item_count {
+    if let Some(remaining) = remaining_item_count {
         metadata["remainingItemCount"] = serde_json::json!(remaining);
     }
     let response = serde_json::json!({
@@ -537,14 +575,22 @@ pub async fn get_inner(
     name: &str,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    match state.db.get_resource(api_version, kind, ns, name).await? {
+    match crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        api_version,
+        kind,
+        ns,
+        name,
+    )
+    .await?
+    {
         Some(resource) => {
             let resource = if api_version == "v1" && kind == "Secret" {
-                crate::bootstrap::bootstrap_token::rotate_bootstrap_token_secret_for_get(
-                    state.db.as_ref(),
-                    &resource,
-                )
-                .await?
+                state
+                    .resource_mutation()
+                    .generated_lifecycle
+                    .rotate_bootstrap_token_secret(resource)
+                    .await?
             } else {
                 resource
             };
@@ -591,6 +637,7 @@ async fn inject_node_last_heartbeat_on_leader(
     }
 
     let is_raft_leader = state
+        .operational()
         .is_raft_leader_rx
         .as_ref()
         .is_some_and(|proxy| proxy.is_leader());
@@ -602,7 +649,12 @@ async fn inject_node_last_heartbeat_on_leader(
         return;
     };
 
-    if let Some(observation) = state.node_lease_tracker.observed(node_name).await {
+    if let Some(observation) = state
+        .controller_reconcile()
+        .node_lease_tracker
+        .observed(node_name)
+        .await
+    {
         ready["lastHeartbeatTime"] = serde_json::json!(observation.renew_time_string());
     }
 }
@@ -626,7 +678,11 @@ impl<'a> BuiltinCreateStrategy<'a> {
 impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
     async fn before_admission(&self, mut body: Value) -> Result<Value, AppError> {
         if let Some(namespace) = self.namespace {
-            reject_if_namespace_missing_or_terminating(self.state.db.as_ref(), namespace).await?;
+            self.state
+                .resource_mutation()
+                .builtin_admission_defaults
+                .ensure_namespace_active(namespace.to_string())
+                .await?;
         }
 
         check_field_validation_strict_typed(self.api_version, self.kind, self.query, &body)?;
@@ -652,12 +708,10 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
         }
 
         if self.kind == "Pod" {
-            if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
-                return Err(AppError::UnprocessableEntity(msg));
-            }
-            if let Err(msg) = crate::kubelet::volumes::validate_volume_projection_paths(&body) {
-                return Err(AppError::UnprocessableEntity(msg));
-            }
+            self.state
+                .resource_mutation()
+                .builtin_admission_defaults
+                .validate_pod_volume_paths(&body)?;
             validate_pod_sysctls(&body)?;
         }
 
@@ -690,12 +744,13 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
             return Ok(body);
         }
         let is_dry_run = dry_run.is_all();
-        crate::api::mutation::write::run_admission(
-            self.state.db.as_ref(),
-            AdmissionContextRequest {
-                api_version: self.api_version,
-                kind: self.kind,
-                operation: "CREATE",
+        self.state
+            .resource_mutation()
+            .admission
+            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                api_version: self.api_version.to_string(),
+                kind: self.kind.to_string(),
+                operation: "CREATE".to_string(),
                 namespace: self.namespace.map(str::to_string),
                 name: body
                     .get("metadata")
@@ -707,9 +762,8 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
                 dry_run: is_dry_run,
                 subresource: None,
                 options: None,
-            },
-        )
-        .await
+            })
+            .await
     }
 
     async fn persist_create(
@@ -733,13 +787,12 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
                 .to_string();
             let result = self
                 .state
+                .resource_mutation()
                 .pod_repository
-                .api_create_pod(crate::kubelet::pod_repository::PodApiCreateRequest {
+                .create_pod(klights_pod_api::PodApiCreateRequest {
                     namespace: namespace.to_string(),
-                    name: String::new(),
                     body,
                     dry_run: is_dry_run,
-                    run_admission: true,
                 })
                 .await
                 .map_err(|error| {
@@ -754,16 +807,21 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
         if kind == "Pod"
             && let Some(namespace) = ns
         {
-            apply_pod_runtimeclass_admission(self.state.db.as_ref(), &mut body).await?;
-            apply_limitrange_defaults_to_pod(self.state.db.as_ref(), namespace, &mut body).await?;
-            enforce_limitrange_constraints_for_pod(self.state.db.as_ref(), namespace, &body)
+            body = self
+                .state
+                .resource_mutation()
+                .builtin_admission_defaults
+                .prepare_pod_create(namespace.to_string(), body)
                 .await?;
         }
         if kind == "PersistentVolumeClaim"
             && let Some(namespace) = ns
         {
-            apply_default_storage_class_admission(self.state.db.as_ref(), &mut body).await?;
-            enforce_limitrange_constraints_for_pvc(self.state.db.as_ref(), namespace, &body)
+            body = self
+                .state
+                .resource_mutation()
+                .builtin_admission_defaults
+                .prepare_pvc_create(namespace.to_string(), body)
                 .await?;
         }
 
@@ -776,8 +834,13 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
         if kind != "ResourceQuota"
             && let Some(namespace) = ns
         {
-            check_resource_quota_for_creation(self.state.db.as_ref(), namespace, kind, &body)
-                .await?;
+            check_resource_quota_for_creation(
+                self.state.resource_mutation().quota_runtime.as_ref(),
+                namespace,
+                kind,
+                &body,
+            )
+            .await?;
         }
 
         let resource_name = resolve_resource_name(&mut body)?;
@@ -826,41 +889,36 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
 
         let pending_service_allocations = if api_version == "v1" && kind == "Service" {
             Some(
-                crate::controllers::service::prepare_service_for_create(
-                    self.state.db.as_ref(),
-                    &mut body,
-                    self.state.service_ipam.as_ref(),
-                    self.state.nodeport_alloc.as_ref(),
-                )
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to allocate service fields: {e}"))
-                })?,
+                self.state
+                    .controller_reconcile()
+                    .service_allocations
+                    .prepare_create(&mut body)
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("Failed to allocate service fields: {e}"))
+                    })?,
             )
         } else {
             None
         };
 
-        let resource = match self
-            .state
-            .db
-            .create_resource(api_version, kind, ns, &resource_name, body)
-            .await
+        let resource = match crate::api::resource_command_ports::create_non_pod_resource(
+            self.state.resource_mutation().resource_command.as_ref(),
+            api_version,
+            kind,
+            ns,
+            &resource_name,
+            body,
+        )
+        .await
         {
             Ok(resource) => resource,
             Err(e) => {
                 if let Some(pending) = pending_service_allocations {
-                    pending.release(
-                        self.state.service_ipam.as_ref(),
-                        self.state.nodeport_alloc.as_ref(),
-                    );
+                    pending.release();
                 }
                 // Attach details.{group,kind,name} to AlreadyExists/Conflict.
-                return Err(AppError::from(e).with_resource_context(
-                    api_version,
-                    kind,
-                    &resource_name,
-                ));
+                return Err(e.with_resource_context(api_version, kind, &resource_name));
             }
         };
 
@@ -881,11 +939,15 @@ struct BuiltinUpdateStrategy<'a> {
 #[async_trait::async_trait]
 impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
     async fn load_current(&self) -> Result<Resource, AppError> {
-        self.state
-            .db
-            .get_resource(self.api_version, self.kind, self.namespace, self.name)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("{} not found", self.kind)))
+        crate::api::resource_query_ports::get_resource(
+            self.state.resource_mutation().resource_query.as_ref(),
+            self.api_version,
+            self.kind,
+            self.namespace,
+            self.name,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} not found", self.kind)))
     }
 
     async fn prepare_update(
@@ -913,12 +975,10 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
         check_field_validation_strict_typed(self.api_version, kind, self.query, &body)?;
 
         if kind == "Pod" {
-            if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
-                return Err(AppError::UnprocessableEntity(msg));
-            }
-            if let Err(msg) = crate::kubelet::volumes::validate_volume_projection_paths(&body) {
-                return Err(AppError::UnprocessableEntity(msg));
-            }
+            self.state
+                .resource_mutation()
+                .builtin_admission_defaults
+                .validate_pod_volume_paths(&body)?;
             validate_pod_sysctls(&body)?;
         }
 
@@ -935,12 +995,14 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
         )
         .await?;
 
-        body = crate::api::mutation::write::run_admission(
-            self.state.db.as_ref(),
-            AdmissionContextRequest {
-                api_version: self.api_version,
-                kind,
-                operation: "UPDATE",
+        body = self
+            .state
+            .resource_mutation()
+            .admission
+            .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                api_version: self.api_version.to_string(),
+                kind: kind.to_string(),
+                operation: "UPDATE".to_string(),
                 namespace: ns.map(str::to_string),
                 name: Some(self.name.to_string()),
                 object: body,
@@ -948,16 +1010,15 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
                 dry_run: dry_run.is_all(),
                 subresource: None,
                 options: None,
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         if kind == "Pod"
             && let Some(namespace) = ns
         {
             validate_pod_resource_requirements_immutable(&current.data, &body)?;
             check_resource_quota_for_pod_update(
-                self.state.db.as_ref(),
+                self.state.resource_mutation().quota_runtime.as_ref(),
                 namespace,
                 &current.data,
                 &body,
@@ -968,7 +1029,7 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
             && let Some(namespace) = ns
         {
             check_resource_quota_for_pvc_update(
-                self.state.db.as_ref(),
+                self.state.resource_mutation().quota_runtime.as_ref(),
                 namespace,
                 &current.data,
                 &body,
@@ -1025,13 +1086,14 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
 
         let resource = self
             .state
-            .db
-            .update_main_resource_with_preconditions(
-                self.api_version,
-                kind,
-                self.namespace,
-                self.name,
-                body.clone(),
+            .resource_mutation()
+            .generated_mutations
+            .update_main_resource(
+                self.api_version.to_string(),
+                kind.to_string(),
+                self.namespace.map(str::to_string),
+                self.name.to_string(),
+                body,
                 ResourcePreconditions {
                     uid: Some(current.uid.clone()),
                     resource_version: requested_rv,
@@ -1082,12 +1144,15 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
         }
 
         if supports_apply_create {
-            let exists = self
-                .state
-                .db
-                .get_resource(api_version, kind, ns, name)
-                .await?
-                .is_some();
+            let exists = crate::api::resource_query_ports::get_resource(
+                self.state.resource_mutation().resource_query.as_ref(),
+                api_version,
+                kind,
+                ns,
+                name,
+            )
+            .await?
+            .is_some();
             if !exists {
                 // CSR apply-create: server-fill spec identity fields from the
                 // authenticated identity. Clients must not be able to forge
@@ -1120,12 +1185,14 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     apply_force,
                 )
                 .map_err(|conflicts| AppError::Conflict(conflicts.message()))?;
-                let admitted = crate::api::mutation::write::run_admission(
-                    self.state.db.as_ref(),
-                    AdmissionContextRequest {
-                        api_version,
-                        kind,
-                        operation: "CREATE",
+                let admitted = self
+                    .state
+                    .resource_mutation()
+                    .admission
+                    .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                        api_version: api_version.to_string(),
+                        kind: kind.to_string(),
+                        operation: "CREATE".to_string(),
                         namespace: ns.map(str::to_string),
                         name: Some(name.to_string()),
                         object: applied_object,
@@ -1133,12 +1200,11 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                         dry_run: is_dry_run,
                         subresource: None,
                         options: None,
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 if let Some(namespace) = ns {
                     check_resource_quota_for_creation(
-                        self.state.db.as_ref(),
+                        self.state.resource_mutation().quota_runtime.as_ref(),
                         namespace,
                         kind,
                         &admitted,
@@ -1153,11 +1219,15 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                         body: admitted_with_annot,
                     });
                 }
-                let resource = self
-                    .state
-                    .db
-                    .create_resource(api_version, kind, ns, name, admitted_with_annot)
-                    .await?;
+                let resource = crate::api::resource_command_ports::create_non_pod_resource(
+                    self.state.resource_mutation().resource_command.as_ref(),
+                    api_version,
+                    kind,
+                    ns,
+                    name,
+                    admitted_with_annot,
+                )
+                .await?;
                 let context = if ns.is_some() {
                     "namespaced_apply_create"
                 } else {
@@ -1188,12 +1258,15 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
 
         let max_retries = 20;
         for attempt in 0..max_retries {
-            let current = self
-                .state
-                .db
-                .get_resource(api_version, kind, ns, name)
-                .await?
-                .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
+            let current = crate::api::resource_query_ports::get_resource(
+                self.state.resource_mutation().resource_query.as_ref(),
+                api_version,
+                kind,
+                ns,
+                name,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
 
             let mut patched = if is_apply {
                 crate::api::server_side_apply::server_side_apply(
@@ -1223,12 +1296,14 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
             )
             .await?;
 
-            patched = crate::api::mutation::write::run_admission(
-                self.state.db.as_ref(),
-                AdmissionContextRequest {
-                    api_version,
-                    kind,
-                    operation: "UPDATE",
+            patched = self
+                .state
+                .resource_mutation()
+                .admission
+                .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+                    api_version: api_version.to_string(),
+                    kind: kind.to_string(),
+                    operation: "UPDATE".to_string(),
                     namespace: ns.map(str::to_string),
                     name: Some(name.to_string()),
                     object: patched,
@@ -1236,9 +1311,8 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     dry_run: is_dry_run,
                     subresource: None,
                     options: None,
-                },
-            )
-            .await?;
+                })
+                .await?;
 
             if (kind == "ConfigMap" || kind == "Secret")
                 && current
@@ -1256,7 +1330,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
             {
                 validate_pod_resource_requirements_immutable(&current.data, &patched)?;
                 check_resource_quota_for_pod_update(
-                    self.state.db.as_ref(),
+                    self.state.resource_mutation().quota_runtime.as_ref(),
                     namespace,
                     &current.data,
                     &patched,
@@ -1267,7 +1341,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                 && let Some(namespace) = ns
             {
                 check_resource_quota_for_pvc_update(
-                    self.state.db.as_ref(),
+                    self.state.resource_mutation().quota_runtime.as_ref(),
                     namespace,
                     &current.data,
                     &patched,
@@ -1310,24 +1384,19 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                 return Ok(WriteResult::DryRun(patched));
             }
 
-            match self
-                .state
-                .db
-                .update_resource(
-                    api_version,
-                    kind,
-                    ns,
-                    name,
-                    patched.clone(),
-                    current.resource_version,
-                )
-                .await
+            match crate::api::resource_command_ports::update_non_pod_resource(
+                self.state.resource_mutation().resource_command.as_ref(),
+                api_version,
+                kind,
+                ns,
+                name,
+                patched,
+                current.resource_version,
+            )
+            .await
             {
                 Ok(resource) => return Ok(WriteResult::Persisted(resource)),
-                Err(e)
-                    if attempt < max_retries - 1
-                        && crate::datastore::errors::is_conflict_error(&e) =>
-                {
+                Err(e) if attempt < max_retries - 1 && matches!(e, AppError::Conflict(_)) => {
                     tracing::debug!(
                         "PATCH {}/{:?} {}: conflict on attempt {}, retrying",
                         kind,
@@ -1338,6 +1407,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
                     let _ = self
                         .state
+                        .operational()
                         .task_supervisor
                         .sleep(
                             "patch_conflict_retry_backoff",
@@ -1346,7 +1416,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                         .await;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
 
@@ -1401,42 +1471,29 @@ pub async fn create_inner(
                 .await;
 
                 if kind == "Namespace" {
-                    if let Err(e) = crate::controllers::namespace::create_default_service_account(
-                        state.db.as_ref(),
-                        &resource_name,
-                    )
-                    .await
+                    if let Err(e) = state
+                        .resource_mutation()
+                        .generated_lifecycle
+                        .create_default_service_account(resource_name.clone())
+                        .await
                     {
                         tracing::warn!(
-                            "Failed to create default ServiceAccount in namespace {}: {:#}",
+                            "Failed to create default ServiceAccount in namespace {}: {:#?}",
                             resource_name,
                             e
                         );
                     }
 
-                    let ca_cert_path =
-                        crate::paths::ca_cert_path(&state.config.containerd_namespace);
-                    if let Ok(ca_cert_pem) =
-                        crate::utils::read_utf8_file_async(&state.file_process, &ca_cert_path).await
+                    if let Err(e) = state
+                        .resource_mutation()
+                        .generated_lifecycle
+                        .create_root_ca_config_map(resource_name.clone())
+                        .await
                     {
-                        if let Err(e) =
-                            crate::controllers::namespace::create_kube_root_ca_configmap(
-                                state.db.as_ref(),
-                                &resource_name,
-                                &ca_cert_pem,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
-                                resource_name,
-                                e
-                            );
-                        }
-                    } else {
                         tracing::warn!(
-                            "Failed to read CA cert from {} for kube-root-ca.crt ConfigMap",
-                            ca_cert_path.display()
+                            "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#?}",
+                            resource_name,
+                            e
                         );
                     }
                 }
@@ -1492,15 +1549,15 @@ pub async fn update_inner(
         WriteResult::Persisted(resource) => {
             if kind == "Pod" {
                 if let Some(namespace) = ns {
-                    maybe_hard_delete_pod_after_finalizers_drained(
-                        state.db.as_ref(),
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        &resource.data,
-                    )
-                    .await;
+                    let _ = state
+                        .resource_mutation()
+                        .generated_lifecycle
+                        .maybe_finalize_pod_after_finalizers_drained(
+                            namespace.to_string(),
+                            name.to_string(),
+                            (*resource.data).clone(),
+                        )
+                        .await;
                 }
             } else {
                 crate::api::finalizer_delete::finalize_after_update_if_ready(
@@ -1549,16 +1606,15 @@ pub async fn update_inner(
                     .and_then(|v| v.as_str())
                     .is_none_or(|s| s.is_empty());
                 if ca_crt_empty
-                    && let Err(e) = crate::controllers::namespace::reconcile_kube_root_ca_data(
-                        &state.file_process,
-                        state.db.as_ref(),
-                        namespace,
-                    )
-                    .await
+                    && let Err(e) = state
+                        .resource_mutation()
+                        .generated_lifecycle
+                        .reconcile_root_ca_data(namespace.to_string())
+                        .await
                 {
                     tracing::warn!(
                         namespace = %namespace,
-                        error = %e,
+                        error = ?e,
                         "failed to reconcile kube-root-ca.crt after data modification"
                     );
                 }
@@ -1594,10 +1650,9 @@ fn metadata_resource_version(body: &Value) -> Option<i64> {
 /// hard-deletes a Pod row (HR#11).
 #[allow(clippy::too_many_arguments)]
 async fn run_owner_cascade_sweeps(
-    db: crate::datastore::DatastoreHandle,
-    pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    gc_owner_lifecycle: Arc<dyn klights_reconcile_api::GcOwnerLifecyclePort>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     api_version: String,
     owner_uid: String,
     owner_name: String,
@@ -1617,14 +1672,15 @@ async fn run_owner_cascade_sweeps(
         {
             return; // root shutdown
         }
-        match controllers::gc::owner_cascade_sweep_once(
-            db.as_ref(),
-            &owner_uid,
-            &api_version,
-            &owner_name,
-            &owner_kind,
-            namespace.clone(),
-            pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+        match crate::api::gc_ports::sweep_dependents(
+            gc_owner_lifecycle.as_ref(),
+            klights_reconcile_api::GcOwnerIdentity::new(
+                &api_version,
+                &owner_kind,
+                namespace.clone(),
+                &owner_name,
+                &owner_uid,
+            ),
         )
         .await
         {
@@ -1634,9 +1690,7 @@ async fn run_owner_cascade_sweeps(
             // until the owner has no non-terminating children left.
             Ok(true) => continue,
             Err(e) => {
-                metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics.record_cascade_delete_failure();
                 tracing::error!(
                     namespace = ?namespace,
                     name = %owner_name,
@@ -1667,11 +1721,15 @@ pub async fn delete_inner(
     let delete_intent = crate::api::mutation::DeleteIntent::from_query_and_body(&query, &body)?;
     let is_dry_run = delete_intent.dry_run.is_all();
 
-    let resource = state
-        .db
-        .get_resource(api_version, kind, ns, name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        api_version,
+        kind,
+        ns,
+        name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
     crate::api::mutation::delete::ensure_delete_preconditions_match(
         &resource,
         &delete_intent.preconditions,
@@ -1679,12 +1737,13 @@ pub async fn delete_inner(
 
     let delete_options_value =
         serde_json::to_value(&delete_intent.options).unwrap_or_else(|_| serde_json::json!({}));
-    let _ = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version,
-            kind,
-            operation: "DELETE",
+    let _ = state
+        .resource_mutation()
+        .admission
+        .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            operation: "DELETE".to_string(),
             namespace: ns.map(str::to_string),
             name: Some(name.to_string()),
             object: Value::Null,
@@ -1692,26 +1751,25 @@ pub async fn delete_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: Some(delete_options_value),
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     if kind == "Pod"
         && let Some(namespace) = ns
     {
-        let outcome = crate::kubelet::pod_repository::PodApiWriter::api_delete_pod(
-            state.pod_repository.as_ref(),
-            namespace,
-            name,
-            delete_intent.options,
-            is_dry_run,
-        )
-        .await?;
+        let outcome = state
+            .resource_mutation()
+            .pod_repository
+            .delete_pod(klights_pod_api::PodApiDeleteRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                options: delete_intent.options.into(),
+                dry_run: is_dry_run,
+            })
+            .await?;
         return match outcome {
-            crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(v) => {
-                Ok((StatusCode::OK, Json(v)))
-            }
-            crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(r) => {
+            klights_pod_api::PodApiDeleteOutcome::DryRun(v) => Ok((StatusCode::OK, Json(v))),
+            klights_pod_api::PodApiDeleteOutcome::GracefulSet(r) => {
                 // Fire side effects (ResourceQuota recount, etc.) after
                 // pod deletionTimestamp is set. The pod still exists in the
                 // datastore but the RQ reconciler excludes terminating pods.
@@ -1750,7 +1808,8 @@ pub async fn delete_inner(
     let target_identity =
         klights_types::ResourceKey::new(api_version, kind, ns.map(str::to_string), name);
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
-        db: state.db.as_ref(),
+        resource_query: state.resource_mutation().resource_query.as_ref(),
+        lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
     };
     let outcome = crate::api::mutation::delete::delete_loaded_with_strategy(
         &delete_strategy,
@@ -1798,30 +1857,33 @@ pub async fn delete_inner(
     if api_version == "v1"
         && kind == "Node"
         && let Err(err) = state
-            .db
-            .delete_pod_cleanup_intents_for_node(&resource.name)
+            .resource_mutation()
+            .generated_lifecycle
+            .delete_node_cleanup_intents(resource.name.clone())
             .await
     {
         tracing::warn!(
             node = %resource.name,
-            error = %err,
+            error = ?err,
             "failed to delete pod cleanup intents for deleted node"
         );
     }
 
     if !delete_intent.orphan_children {
-        if let Err(e) = controllers::gc::cascade_delete_with_uid(
-            state.db.as_ref(),
-            &owner_uid,
-            api_version,
-            &owner_name_gc,
-            &owner_kind_gc,
-            ns.map(str::to_string),
-            state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+        if let Err(e) = crate::api::gc_ports::cascade_delete(
+            state.resource_mutation().gc_owner_lifecycle.as_ref(),
+            klights_reconcile_api::GcOwnerIdentity::new(
+                api_version,
+                &owner_kind_gc,
+                ns.map(str::to_string),
+                &owner_name_gc,
+                &owner_uid,
+            ),
         )
         .await
         {
             state
+                .controller_reconcile()
                 .metrics
                 .cascade_delete_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1836,15 +1898,15 @@ pub async fn delete_inner(
         // finalization, and the loop stops as soon as no owned child remains
         // non-terminating (idle-silent).
         if let Err(err) = state
+            .operational()
             .task_supervisor
             .spawn_async(
                 klights_supervisor::TaskCategory::PodDeleteWorkqueue,
                 "owner_cascade_sweeps",
                 run_owner_cascade_sweeps(
-                    state.db.clone(),
-                    state.pod_repository.clone(),
-                    state.task_supervisor.clone(),
-                    state.metrics.clone(),
+                    state.resource_mutation().gc_owner_lifecycle.clone(),
+                    state.operational().task_supervisor.clone(),
+                    state.controller_reconcile().metrics.clone(),
                     api_version.to_string(),
                     owner_uid.clone(),
                     owner_name_gc.clone(),
@@ -1863,16 +1925,15 @@ pub async fn delete_inner(
     if kind == "ConfigMap"
         && name == "kube-root-ca.crt"
         && let Some(namespace) = ns
-        && let Err(e) = crate::controllers::namespace::reconcile_kube_root_ca(
-            &state.file_process,
-            state.db.as_ref(),
-            namespace,
-        )
-        .await
+        && let Err(e) = state
+            .resource_mutation()
+            .generated_lifecycle
+            .reconcile_root_ca(namespace.to_string())
+            .await
     {
         tracing::warn!(
             namespace = %namespace,
-            error = %e,
+            error = ?e,
             "failed to recreate kube-root-ca.crt after deletion"
         );
     }
@@ -1950,15 +2011,15 @@ pub async fn patch_inner(
         WriteResult::Persisted(resource) => {
             if kind == "Pod" {
                 if let Some(namespace) = ns {
-                    maybe_hard_delete_pod_after_finalizers_drained(
-                        state.db.as_ref(),
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        &resource.data,
-                    )
-                    .await;
+                    let _ = state
+                        .resource_mutation()
+                        .generated_lifecycle
+                        .maybe_finalize_pod_after_finalizers_drained(
+                            namespace.to_string(),
+                            name.to_string(),
+                            (*resource.data).clone(),
+                        )
+                        .await;
                 }
             } else {
                 crate::api::finalizer_delete::finalize_after_update_if_ready(
@@ -2027,20 +2088,17 @@ pub async fn delete_collection_shared_inner(
 ) -> Result<Json<Value>, AppError> {
     let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(&query)?;
     let is_dry_run = dry_run.is_all();
-    let list = state
-        .db
-        .list_resources(
-            api_version,
-            kind,
-            namespace,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
+    let list = crate::api::resource_query_ports::list_resources(
+        state.resource_mutation().resource_query.as_ref(),
+        api_version,
+        kind,
+        namespace,
+        query.label_selector.as_deref(),
+        None,
+        None,
+        None,
+    )
+    .await?;
 
     if is_dry_run {
         return Ok(Json(
@@ -2049,10 +2107,11 @@ pub async fn delete_collection_shared_inner(
     }
 
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
-        db: state.db.as_ref(),
+        resource_query: state.resource_mutation().resource_query.as_ref(),
+        lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
     };
 
-    for resource in list.items {
+    for resource in list.into_items() {
         let owner_uid = resource.uid.clone();
         let res_name = resource.name.clone();
         let target_identity = klights_types::ResourceKey::new(
@@ -2063,7 +2122,7 @@ pub async fn delete_collection_shared_inner(
         );
         let item_intent = crate::api::mutation::DeleteIntent::collection_item(
             dry_run,
-            crate::datastore::ResourcePreconditions::uid(owner_uid.clone()),
+            klights_cluster_core::ResourcePreconditions::uid(owner_uid.clone()),
         );
         match crate::api::mutation::delete::delete_loaded_with_strategy(
             &delete_strategy,
@@ -2076,18 +2135,20 @@ pub async fn delete_collection_shared_inner(
             Ok(crate::api::mutation::delete::DeleteResult::HardDeleted(deleted)) => {
                 run_post_hard_delete_effects(&state, api_version, kind, namespace, &deleted, false)
                     .await;
-                if let Err(e) = controllers::gc::cascade_delete_with_uid(
-                    state.db.as_ref(),
-                    &owner_uid,
-                    api_version,
-                    &res_name,
-                    kind,
-                    namespace.map(str::to_string),
-                    state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+                if let Err(e) = crate::api::gc_ports::cascade_delete(
+                    state.resource_mutation().gc_owner_lifecycle.as_ref(),
+                    klights_reconcile_api::GcOwnerIdentity::new(
+                        api_version,
+                        kind,
+                        namespace.map(str::to_string),
+                        &res_name,
+                        &owner_uid,
+                    ),
                 )
                 .await
                 {
                     state
+                        .controller_reconcile()
                         .metrics
                         .cascade_delete_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2098,6 +2159,7 @@ pub async fn delete_collection_shared_inner(
             | Ok(crate::api::mutation::delete::DeleteResult::GoneOrUidChanged) => {}
             Err(e) => {
                 state
+                    .controller_reconcile()
                     .metrics
                     .cascade_delete_failures_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2162,14 +2224,17 @@ mod tests {
 
     async fn seeded_rbac_state() -> Arc<AppState> {
         let state = Arc::new(crate::api::test_support::build_test_app_state().await);
-        crate::controllers::rbac_reconcile::reconcile_default_rbac_objects(state.db.as_ref())
-            .await
-            .expect("seed default RBAC");
+        crate::controllers::rbac_reconcile::reconcile_default_rbac_objects(
+            state.resource_mutation().db.as_ref(),
+        )
+        .await
+        .expect("seed default RBAC");
         state
     }
 
     async fn create_labeled_aggregate_source(state: &Arc<AppState>, name: &str, rule: Value) {
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "rbac.authorization.k8s.io/v1",
@@ -2188,13 +2253,16 @@ mod tests {
             )
             .await
             .expect("create aggregate source");
-        crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(state.db.as_ref())
-            .await
-            .expect("seed aggregate rules");
+        crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(
+            state.resource_mutation().db.as_ref(),
+        )
+        .await
+        .expect("seed aggregate rules");
     }
 
     async fn view_has_rule(state: &Arc<AppState>, expected: &Value) -> bool {
         let view = state
+            .resource_mutation()
             .db
             .get_resource("rbac.authorization.k8s.io/v1", "ClusterRole", None, "view")
             .await
@@ -2236,23 +2304,26 @@ mod tests {
         let issuer = Arc::new(crate::bootstrap::auth_adapters::AuthCsrIssuer::new(
             signer.clone(),
             Arc::new(crate::auth::clock::SystemClock),
-            state.task_supervisor.clone(),
+            state.operational().task_supervisor.clone(),
         ));
         let dispatcher = Arc::new(
             crate::controller_dispatcher::ControllerDispatcher::new_with_nodeport(
-                state.service_ipam.clone(),
-                state.nodeport_alloc.clone(),
-                state.task_supervisor.clone(),
+                state.controller_reconcile().service_ipam.clone(),
+                state.controller_reconcile().nodeport_alloc.clone(),
+                state.operational().task_supervisor.clone(),
                 Some(issuer),
             ),
         );
         dispatcher
-            .set_sync_context(state.db.clone(), state.config.node_name.clone())
+            .set_sync_context(
+                state.resource_mutation().db.clone(),
+                state.operational().config.node_name.clone(),
+            )
             .await;
         dispatcher
-            .set_pod_repository(state.pod_repository.clone())
+            .set_pod_repository(state.resource_mutation().pod_repository.clone())
             .await;
-        state.controller_dispatcher = dispatcher;
+        state.controller_reconcile_mut().controller_dispatcher = dispatcher;
         let state = Arc::new(state);
 
         let body = json!({
@@ -2298,6 +2369,7 @@ mod tests {
         );
 
         let stored = state
+            .resource_mutation()
             .db
             .get_resource(
                 "certificates.k8s.io/v1",
@@ -2374,6 +2446,7 @@ mod tests {
         .expect("apply-create CSR");
 
         let stored = state
+            .resource_mutation()
             .db
             .get_resource(
                 "certificates.k8s.io/v1",
@@ -2532,10 +2605,11 @@ mod tests {
             )
             .await
             .expect("hold pod-delete workqueue permit");
-        app_state.task_supervisor = task_supervisor;
+        app_state.operational_mut().task_supervisor = task_supervisor;
         let state = Arc::new(app_state);
         let owner_uid = "fg-rc-owner-uid";
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "v1",
@@ -2559,6 +2633,7 @@ mod tests {
             let pod_name = format!("fg-rc-pod-{i}");
             let pod_uid = format!("fg-rc-pod-{i}-uid");
             state
+                .resource_mutation()
                 .db
                 .create_resource(
                     "v1",
@@ -2637,6 +2712,7 @@ mod tests {
         for i in 0..3 {
             let pod_name = format!("fg-rc-pod-{i}");
             let pod = state
+                .resource_mutation()
                 .db
                 .get_resource("v1", "Pod", Some("default"), &pod_name)
                 .await

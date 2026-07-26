@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use klights_cluster_core::StorageCommand;
 use serde_json::Value;
 use tokio::sync::{Notify, RwLock};
 
-use crate::datastore::command::StorageCommand;
 use crate::utils::k8s_time_format;
 
 pub const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 = 30;

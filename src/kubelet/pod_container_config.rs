@@ -1,5 +1,5 @@
 use crate::kubelet::pod_env::expand_env_var_references;
-use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref};
+use crate::kubelet::pod_field_ref::{resolve_field_ref, resolve_resource_field_ref_with_capacity};
 use crate::kubelet::pod_resources::{parse_cpu_resource, parse_memory_resource};
 use k8s_cri::v1::{
     ContainerConfig, ContainerMetadata, ImageSpec, KeyValue, LinuxContainerConfig,
@@ -47,13 +47,14 @@ pub fn check_run_as_non_root(
     }
 }
 
-pub fn build_container_config(
+pub fn build_container_config_with_capacity(
     container_spec: &Value,
     pod_data: &Value,
     container_name: &str,
     kubernetes_service_ip: &str,
     resolved_env_from: &[(String, String)],
     resolved_env: &std::collections::HashMap<String, String>,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 ) -> ContainerConfig {
     let image = container_spec
         .get("image")
@@ -138,7 +139,11 @@ pub fn build_container_config(
                     && let Some(resource) =
                         resource_field_ref.get("resource").and_then(|r| r.as_str())
                 {
-                    let resolved_value = resolve_resource_field_ref(resource, container_spec);
+                    let resolved_value = resolve_resource_field_ref_with_capacity(
+                        resource,
+                        container_spec,
+                        node_capacity,
+                    );
                     expansion_map.insert(name.to_string(), resolved_value.clone());
                     envs.push(KeyValue {
                         key: name.to_string(),
@@ -340,6 +345,26 @@ pub fn build_container_config(
         windows: None,
         cdi_devices: vec![],
     }
+}
+
+#[cfg(test)]
+pub fn build_container_config(
+    container_spec: &Value,
+    pod_data: &Value,
+    container_name: &str,
+    kubernetes_service_ip: &str,
+    resolved_env_from: &[(String, String)],
+    resolved_env: &std::collections::HashMap<String, String>,
+) -> ContainerConfig {
+    build_container_config_with_capacity(
+        container_spec,
+        pod_data,
+        container_name,
+        kubernetes_service_ip,
+        resolved_env_from,
+        resolved_env,
+        crate::kubelet::node::NodeCapacity::default(),
+    )
 }
 
 #[cfg(test)]

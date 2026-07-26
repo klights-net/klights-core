@@ -1,5 +1,8 @@
 //! Transport-neutral leader-owned API contracts for klights.
 
+mod crd_registry;
+pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
+
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
@@ -3338,6 +3341,52 @@ impl OutboxDeliveryOperation {
     }
 }
 
+impl TryFrom<klights_cluster_core::OutboxOperation> for OutboxDeliveryOperation {
+    type Error = OutboxDeliveryError;
+
+    fn try_from(operation: klights_cluster_core::OutboxOperation) -> Result<Self, Self::Error> {
+        use klights_cluster_core::OutboxOperation;
+
+        Ok(match operation {
+            OutboxOperation::PodStatus => Self::PodStatus,
+            OutboxOperation::RuntimeReconcile => Self::RuntimeReconcile,
+            OutboxOperation::ProbeReadiness => Self::ProbeReadiness,
+            OutboxOperation::DeadlineExceeded => Self::DeadlineExceeded,
+            OutboxOperation::ContainerStatusSnapshot => Self::ContainerStatusSnapshot,
+            OutboxOperation::EphemeralContainerStatuses => Self::EphemeralContainerStatuses,
+            OutboxOperation::PodMetadata => Self::PodMetadata,
+            OutboxOperation::NodeRegistration => Self::NodeRegistration,
+            OutboxOperation::NodeDataplane => Self::NodeDataplane,
+            OutboxOperation::NodeStatus => Self::NodeStatus,
+            OutboxOperation::EventCreate => Self::EventCreate,
+            OutboxOperation::LeaseRenew => {
+                return Err(OutboxDeliveryError::invalid(
+                    "delivery.operation",
+                    "LeaseRenew uses LeaderNodeLeaseRenewal and is forbidden on durable delivery",
+                ));
+            }
+        })
+    }
+}
+
+impl From<OutboxDeliveryOperation> for klights_cluster_core::OutboxOperation {
+    fn from(operation: OutboxDeliveryOperation) -> Self {
+        match operation {
+            OutboxDeliveryOperation::PodStatus => Self::PodStatus,
+            OutboxDeliveryOperation::RuntimeReconcile => Self::RuntimeReconcile,
+            OutboxDeliveryOperation::ProbeReadiness => Self::ProbeReadiness,
+            OutboxDeliveryOperation::DeadlineExceeded => Self::DeadlineExceeded,
+            OutboxDeliveryOperation::ContainerStatusSnapshot => Self::ContainerStatusSnapshot,
+            OutboxDeliveryOperation::EphemeralContainerStatuses => Self::EphemeralContainerStatuses,
+            OutboxDeliveryOperation::PodMetadata => Self::PodMetadata,
+            OutboxDeliveryOperation::NodeRegistration => Self::NodeRegistration,
+            OutboxDeliveryOperation::NodeDataplane => Self::NodeDataplane,
+            OutboxDeliveryOperation::NodeStatus => Self::NodeStatus,
+            OutboxDeliveryOperation::EventCreate => Self::EventCreate,
+        }
+    }
+}
+
 /// Validated transport-neutral durable-delivery request.
 ///
 /// The authenticated author is deliberately absent. Local and remote adapters
@@ -3509,6 +3558,30 @@ impl OutboxDeliveryResult {
     }
 }
 
+impl From<klights_cluster_core::OutboxApplyOutcome> for OutboxDeliveryResult {
+    fn from(outcome: klights_cluster_core::OutboxApplyOutcome) -> Self {
+        match outcome {
+            klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv } => {
+                Self::Applied { applied_rv }
+            }
+            klights_cluster_core::OutboxApplyOutcome::AlreadyApplied { applied_rv } => {
+                Self::AlreadyApplied { applied_rv }
+            }
+        }
+    }
+}
+
+impl From<OutboxDeliveryResult> for klights_cluster_core::OutboxApplyOutcome {
+    fn from(result: OutboxDeliveryResult) -> Self {
+        match result {
+            OutboxDeliveryResult::Applied { applied_rv } => Self::Applied { applied_rv },
+            OutboxDeliveryResult::AlreadyApplied { applied_rv } => {
+                Self::AlreadyApplied { applied_rv }
+            }
+        }
+    }
+}
+
 /// Failure returned by durable leader delivery.
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3637,6 +3710,21 @@ impl fmt::Display for OutboxDeliveryError {
 
 impl std::error::Error for OutboxDeliveryError {}
 
+impl From<klights_cluster_core::OutboxApplyError> for OutboxDeliveryError {
+    fn from(error: klights_cluster_core::OutboxApplyError) -> Self {
+        match error {
+            klights_cluster_core::OutboxApplyError::Retryable(message) => Self::Retryable(message),
+            klights_cluster_core::OutboxApplyError::ConflictTerminal(message) => {
+                Self::ConflictTerminal(message)
+            }
+            klights_cluster_core::OutboxApplyError::NotFound(message) => Self::NotFound(message),
+            klights_cluster_core::OutboxApplyError::UidMismatch { expected, actual } => {
+                Self::UidMismatch { expected, actual }
+            }
+        }
+    }
+}
+
 pub type OutboxDeliveryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OutboxDeliveryResult, OutboxDeliveryError>> + Send + 'a>>;
 
@@ -3673,6 +3761,66 @@ pub trait LeaderAuthenticatedOutboxDelivery: Send + Sync {
         &self,
         request: AuthenticatedOutboxDeliveryRequest,
     ) -> OutboxDeliveryFuture<'_>;
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FollowerDiagnostics {
+    pub follower_count: usize,
+    pub max_lag: i64,
+    pub followers: Vec<FollowerDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FollowerDiagnostic {
+    pub node_name: String,
+    pub applied_resource_version: i64,
+    pub lag: i64,
+    pub mode: String,
+    pub encryption: String,
+    pub public_key: Option<String>,
+}
+
+pub type FollowerDiagnosticsFuture<'a> =
+    Pin<Box<dyn Future<Output = FollowerDiagnostics> + Send + 'a>>;
+
+pub trait LeaderFollowerDiagnostics: Send + Sync {
+    fn follower_diagnostics(&self) -> FollowerDiagnosticsFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterStatusMetadata {
+    pub cluster_id: String,
+    pub leader_epoch: i64,
+    pub current_resource_version: i64,
+}
+
+pub type ClusterStatusMetadataFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ClusterStatusMetadata, ClusterStatusMetadataError>> + Send + 'a>,
+>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterStatusMetadataError {
+    message: String,
+}
+
+impl ClusterStatusMetadataError {
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ClusterStatusMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClusterStatusMetadataError {}
+
+pub trait LeaderClusterStatusMetadata: Send + Sync {
+    fn cluster_status_metadata(&self) -> ClusterStatusMetadataFuture<'_>;
 }
 
 /// Bootstrap identity class admitted by the leader.

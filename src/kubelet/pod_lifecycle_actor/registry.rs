@@ -6,12 +6,12 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
+use crate::node_outbox::Outbox;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 
-use super::actor::{PodLifecycleActor, PodLifecycleActorRuntime, pod_actor_idle_grace_duration};
+use super::actor::{PodLifecycleActor, PodLifecycleActorRuntime};
 use super::config::PodLifecycleConcurrencyConfig;
 use super::message::{LifecycleMessage, PodLifecycleKey, PodSlotKey};
 use super::trace::{LifecycleTraceEntry, LifecycleTraceRing};
@@ -149,6 +149,7 @@ pub struct PodLifecycleActorState {
 }
 
 impl PodLifecycleRegistry {
+    #[cfg(test)]
     pub fn new(
         supervisor: Arc<TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
@@ -158,11 +159,11 @@ impl PodLifecycleRegistry {
             supervisor,
             config,
             executor_holder,
-            pod_actor_idle_grace_duration(),
+            super::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         )
     }
 
-    fn new_with_idle_grace(
+    pub fn new_with_idle_grace(
         supervisor: Arc<TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
         executor_holder: Arc<std::sync::Mutex<Arc<dyn PodWorkExecutor>>>,

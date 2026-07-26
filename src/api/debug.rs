@@ -22,15 +22,14 @@ pub async fn pod_lifecycle_debug_dump(
         }));
     }
 
-    let diag = if let Some(router) = state.pod_lifecycle_router.as_ref() {
-        router.diagnostics().await
+    let diag = if let Some(router) = state
+        .pod_node_subresources()
+        .pod_lifecycle_diagnostics
+        .as_ref()
+    {
+        router.pod_lifecycle_diagnostics().await
     } else {
-        crate::kubelet::pod_lifecycle_router::PodLifecycleDiagnostics {
-            mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
-            actor_states: Vec::new(),
-            recent_trace: Vec::new(),
-            active_pod_count: 0,
-        }
+        klights_pod_api::PodLifecycleDiagnostics::default()
     };
 
     let actors = diag
@@ -51,9 +50,9 @@ pub async fn pod_lifecycle_debug_dump(
         .into_iter()
         .map(|entry| {
             json!({
-                "namespace": entry.key.namespace,
-                "podName": entry.key.name,
-                "uid": entry.key.uid,
+                "namespace": entry.namespace,
+                "podName": entry.name,
+                "uid": entry.uid,
                 "event": entry.event,
                 "resourceVersion": entry.resource_version,
                 "sandboxId": entry.sandbox_id,
@@ -62,6 +61,7 @@ pub async fn pod_lifecycle_debug_dump(
         .collect::<Vec<_>>();
 
     let pending_controller_keys = state
+        .controller_reconcile()
         .controller_dispatcher
         .pending_reconcile_keys()
         .await
@@ -69,13 +69,15 @@ pub async fn pod_lifecycle_debug_dump(
         .map(reconcile_key_to_string)
         .collect::<Vec<_>>();
 
-    let pending_retry_keys = if let Some(retry_state) = state.pod_start_retry_state.as_ref() {
-        retry_state.lock().await.pending_key_pairs()
-    } else {
-        Vec::new()
-    };
+    let pending_retry_keys =
+        if let Some(retry_state) = state.pod_node_subresources().pod_start_retry_state.as_ref() {
+            retry_state.pending_pod_start_retries().await
+        } else {
+            Vec::new()
+        };
 
     let side_effect_failures = state
+        .controller_reconcile()
         .metrics
         .recent_failures()
         .into_iter()

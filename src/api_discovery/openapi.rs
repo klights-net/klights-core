@@ -20,30 +20,26 @@ fn static_openapi_v3_paths() -> &'static serde_json::Map<String, Value> {
     })
 }
 
-pub async fn openapi_v3_discovery_with_crds(db: &dyn DatastoreBackend) -> Value {
+pub async fn openapi_v3_discovery_with_crds(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+) -> Value {
     let mut paths = static_openapi_v3_paths().clone();
 
     // Collect CRD group/version pairs
-    let crds = db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .unwrap_or_else(|_| crate::datastore::ResourceList {
-            items: vec![],
-            resource_version: 0,
-            watch_replay_position: None,
-            continue_token: None,
-            remaining_item_count: None,
-        });
+    let crds = crate::api::resource_query_ports::list_all_resources(
+        query,
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+    )
+    .await
+    .map(klights_leader_api::ResourceListResult::into_items)
+    .unwrap_or_default();
 
     // Use a set to avoid duplicate group/version entries
     let mut seen = std::collections::HashSet::new();
 
-    for crd_resource in crds.items {
+    for crd_resource in crds {
         let spec = match crd_resource.data.get("spec") {
             Some(s) => s,
             None => continue,
@@ -592,28 +588,22 @@ fn openapi_v3_schemas_from_definitions(
 }
 
 /// OpenAPI v2 endpoint - returns Swagger 2.0 spec with CRD schemas
-pub async fn openapi_v2(db: &dyn DatastoreBackend) -> Value {
+pub async fn openapi_v2(query: &dyn klights_leader_api::LeaderResourceQuery) -> Value {
     // Fetch all CRDs from the database
-    let crds = db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .unwrap_or_else(|_| crate::datastore::ResourceList {
-            items: vec![],
-            resource_version: 0,
-            watch_replay_position: None,
-            continue_token: None,
-            remaining_item_count: None,
-        });
+    let crds = crate::api::resource_query_ports::list_all_resources(
+        query,
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+    )
+    .await
+    .map(klights_leader_api::ResourceListResult::into_items)
+    .unwrap_or_default();
 
     // Build definitions from generated built-in schemas plus CRD schemas.
     let mut definitions = builtin_openapi_definitions();
 
-    for crd_resource in crds.items {
+    for crd_resource in crds {
         // Extract CRD metadata
         let crd_data = &crd_resource.data;
         let spec = match crd_data.get("spec") {
@@ -709,7 +699,7 @@ pub async fn openapi_v2(db: &dyn DatastoreBackend) -> Value {
 
 /// Handler for GET /openapi/v3
 pub async fn get_openapi_v3_discovery(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(openapi_v3_discovery_with_crds(state.db.as_ref()).await)
+    Json(openapi_v3_discovery_with_crds(state.resource_mutation().resource_query.as_ref()).await)
 }
 
 /// Build OpenAPI v3 path operations for a resource.
@@ -854,11 +844,11 @@ fn builtin_openapi_schema_key(group: &str, version: &str, kind: &str) -> String 
 
 /// Build OpenAPI v3 spec for a specific CRD group/version (testable).
 pub async fn build_openapi_v3_group_version(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     group: &str,
     version: &str,
 ) -> Value {
-    let v2 = openapi_v2(db).await;
+    let v2 = openapi_v2(query).await;
     let all_definitions = v2.get("definitions").and_then(|d| d.as_object());
 
     let mut schemas = all_definitions
@@ -937,12 +927,19 @@ pub async fn get_openapi_v3_group_version(
     State(state): State<Arc<AppState>>,
     Path((group, version)): Path<(String, String)>,
 ) -> Json<Value> {
-    Json(build_openapi_v3_group_version(state.db.as_ref(), &group, &version).await)
+    Json(
+        build_openapi_v3_group_version(
+            state.resource_mutation().resource_query.as_ref(),
+            &group,
+            &version,
+        )
+        .await,
+    )
 }
 
 /// Build OpenAPI v3 spec for core v1 resources (testable).
-pub async fn build_openapi_v3_api_v1(db: &dyn DatastoreBackend) -> Value {
-    let v2 = openapi_v2(db).await;
+pub async fn build_openapi_v3_api_v1(query: &dyn klights_leader_api::LeaderResourceQuery) -> Value {
+    let v2 = openapi_v2(query).await;
     let definitions = v2
         .get("definitions")
         .cloned()
@@ -1023,7 +1020,7 @@ pub async fn build_openapi_v3_api_v1(db: &dyn DatastoreBackend) -> Value {
 
 /// Handler for GET /openapi/v3/api/v1
 pub async fn get_openapi_v3_api_v1(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(build_openapi_v3_api_v1(state.db.as_ref()).await)
+    Json(build_openapi_v3_api_v1(state.resource_mutation().resource_query.as_ref()).await)
 }
 
 /// Handler for GET /openapi/v3/apis
@@ -1064,7 +1061,7 @@ pub async fn get_openapi_v3_apis() -> Json<Value> {
 /// to consume JSON OpenAPI from the apiserver for schema validation flows.
 /// Always return JSON Swagger 2.0 here.
 pub async fn get_openapi_v2(State(state): State<Arc<AppState>>, _headers: HeaderMap) -> Response {
-    let mut spec = openapi_v2(state.db.as_ref()).await;
+    let mut spec = openapi_v2(state.resource_mutation().resource_query.as_ref()).await;
     // Strip x-kubernetes-preserve-unknown-fields from definitions: Swagger 2.0 clients
     // do not support this extension. The openapi_v2() function keeps it for v3 callers
     // (build_openapi_v3_group_version delegates to openapi_v2); strip it here for the
@@ -1082,8 +1079,8 @@ pub async fn get_openapi_v2(State(state): State<Arc<AppState>>, _headers: Header
 /// Tests that directly call openapi_v2() see the v3-compatible version (field preserved).
 /// Tests that want v2 HTTP behavior should call this instead.
 #[cfg(test)]
-pub async fn get_openapi_v2_stripped(db: &dyn DatastoreBackend) -> Value {
-    let mut spec = openapi_v2(db).await;
+pub async fn get_openapi_v2_stripped(query: &dyn klights_leader_api::LeaderResourceQuery) -> Value {
+    let mut spec = openapi_v2(query).await;
     if let Some(defs) = spec.get_mut("definitions").and_then(|d| d.as_object_mut()) {
         for def in defs.values_mut() {
             strip_x_kubernetes_extension_recursive(def, "x-kubernetes-preserve-unknown-fields");

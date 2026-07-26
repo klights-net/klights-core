@@ -16,7 +16,6 @@ pub mod endpoints;
 pub mod endpoints_controller;
 pub mod gc;
 pub mod hpa;
-pub mod hpa_controller;
 pub mod job;
 pub mod job_controller;
 pub mod kube_service;
@@ -32,6 +31,7 @@ pub mod replicaset;
 pub mod replicaset_controller;
 pub mod replication_controller_runner;
 pub mod replicationcontroller;
+pub(crate) mod resource_projection;
 pub mod resource_quota;
 pub mod scheduler;
 pub mod service;
@@ -43,7 +43,9 @@ pub mod test_utils;
 pub mod workqueue;
 
 #[cfg(test)]
-use crate::datastore::{DatastoreBackend, Resource};
+use crate::datastore::DatastoreBackend;
+#[cfg(test)]
+use klights_cluster_core::Resource;
 
 /// Find all pods in a namespace owned by the resource identified by `owner_uid`.
 ///

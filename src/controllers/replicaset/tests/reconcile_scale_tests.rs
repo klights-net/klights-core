@@ -1093,11 +1093,21 @@ async fn test_replicaset_scale_down_deletes_excess_pods() {
         .iter()
         .filter(|pod| pod.data.pointer("/metadata/deletionTimestamp").is_none())
         .collect();
+    let terminating_after = pods_after.items.len() - active_after.len();
 
     assert_eq!(
         active_after.len(),
         2,
         "Expected 2 active pods after scale down"
+    );
+    assert_eq!(
+        pods_after.items.len(),
+        5,
+        "ReplicaSet scale-down must leave actor-owned Pod rows in place"
+    );
+    assert_eq!(
+        terminating_after, 3,
+        "ReplicaSet scale-down must mark exactly the three surplus Pod UIDs terminating"
     );
 
     // Verify remaining pods still have correct owner reference

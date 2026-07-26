@@ -24,6 +24,22 @@ pub(super) const POD_RUNTIME_LIST: &str = "SELECT pod_uid, namespace, pod_name, 
 pub(super) const POD_RUNTIME_LIST_NS: &str = "SELECT pod_uid, namespace, pod_name, node_name, \
      sandbox_id, cgroup_path, created_ms, started_ms FROM pod_runtime WHERE namespace = ?1 ORDER BY pod_uid";
 
+pub(super) const POD_SLOT_ADMISSION_SELECT: &str = "SELECT pod_uid, node_name, state, updated_rv \
+     FROM pod_slot_admissions WHERE namespace = ?1 AND pod_name = ?2";
+pub(super) const POD_SLOT_ADMISSION_INSERT: &str = "INSERT INTO pod_slot_admissions \
+     (namespace, pod_name, pod_uid, node_name, state, updated_rv, updated_at_ms) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+pub(super) const POD_SLOT_ADMISSION_UPDATE: &str = "UPDATE pod_slot_admissions \
+     SET pod_uid = ?3, node_name = ?4, state = ?5, updated_rv = ?6, updated_at_ms = ?7 \
+     WHERE namespace = ?1 AND pod_name = ?2";
+pub(super) const POD_SLOT_ADMISSION_DELETE_IF_UID: &str = "DELETE FROM pod_slot_admissions \
+     WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3";
+pub(super) const POD_SLOT_RV_SELECT: &str =
+    "SELECT value FROM _node_meta WHERE key = 'pod_slot_resource_version'";
+pub(super) const POD_SLOT_RV_UPSERT: &str = "INSERT INTO _node_meta (key, value) \
+     VALUES ('pod_slot_resource_version', ?1) \
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
 pub(super) const POD_STATUS_CHECKPOINT_UPSERT: &str = "INSERT INTO pod_status_checkpoints \
      (pod_uid, namespace, pod_name, base_rv, applied_rv, status_json, updated_ms) \
      VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
@@ -61,7 +77,8 @@ pub(super) const OUTBOX_INSERT: &str = "INSERT INTO outbox \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
 pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, client_id, idempotency_key, enqueued_ms, \
      subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-     subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
+     subject_uid, pod_uid, operation, priority_class, supersedable_pod_status, \
+     is_terminal_pod_delete, stream_id, stream_seq, \
      payload_proto, attempt, next_due_ms, leased_until_ms, lease_token, last_error \
      FROM outbox WHERE id = ?1";
 // Strict per-stream single-in-flight: an assigned candidate is excluded while
@@ -107,7 +124,7 @@ static OUTBOX_CLAIM_NEXT_DUE_SQL: LazyLock<String> = LazyLock::new(|| outbox_cla
 static OUTBOX_CLAIM_DUE_BATCH_SQL: LazyLock<String> = LazyLock::new(|| outbox_claim_due_sql("?2"));
 
 fn outbox_claim_due_sql(limit: &str) -> String {
-    use crate::kubelet::outbox::payload::{OUTBOX_DIAGNOSTIC_AGING_MS, OutboxPriorityClass};
+    use klights_node_store::{OUTBOX_DIAGNOSTIC_AGING_MS, OutboxPriority};
 
     format!(
         "{OUTBOX_CLAIM_DUE_SELECT_AND_WHERE}ORDER BY CASE \
@@ -119,8 +136,8 @@ fn outbox_claim_due_sql(limit: &str) -> String {
            THEN {diagnostic} ELSE {workload} END \
          ELSE candidate.priority_class END, \
          candidate.enqueued_ms ASC, candidate.id ASC LIMIT {limit}",
-        diagnostic = OutboxPriorityClass::Diagnostic.persisted_value(),
-        workload = OutboxPriorityClass::Workload.persisted_value(),
+        diagnostic = OutboxPriority::Diagnostic.persisted_value(),
+        workload = OutboxPriority::Workload.persisted_value(),
         aging_ms = OUTBOX_DIAGNOSTIC_AGING_MS,
     )
 }

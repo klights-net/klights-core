@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
 
 use super::store::PodStore;
 

@@ -489,6 +489,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         volume_name: "podinfo",
         default_mode: None,
         items: &items,
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
     })
     .await
     .unwrap();
@@ -546,6 +547,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &pod_for_refresh.data,
         volumes_root,
+        crate::kubelet::node::NodeCapacity::default(),
     )
     .await
     .unwrap();
@@ -619,6 +621,7 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &pod_resource.data,
         volumes_root,
+        crate::kubelet::node::NodeCapacity::default(),
     )
     .await
     .unwrap();
@@ -728,6 +731,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &updated_pod,
         volumes_root,
+        crate::kubelet::node::NodeCapacity::default(),
     )
     .await
     .unwrap();

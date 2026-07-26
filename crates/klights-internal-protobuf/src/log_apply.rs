@@ -8,14 +8,8 @@ pub struct ProtoLogApplyCommit {
     pub mutations: Vec<ProtoLogApplyMutation>,
     #[prost(message, optional, tag = "3")]
     pub outbox_watermark: Option<ProtoOutboxStreamWatermark>,
-    #[prost(enumeration = "ProtoResourceVersionAssignment", tag = "4")]
-    pub resource_version_assignment: i32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
-pub enum ProtoResourceVersionAssignment {
-    LegacyLeaderAssigned = 0,
-    CommittedApplyV1 = 1,
+    // Tag 4 was the removed assignment-profile enum. It is permanently
+    // unused: live commits have one fixed committed-apply contract.
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

@@ -8,6 +8,22 @@ pub(super) fn hydrate_watch_event_data(
     name: &str,
     resource_version: i64,
 ) -> Value {
+    if data
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| matches!(event_type, "ADDED" | "MODIFIED" | "DELETED" | "ERROR"))
+        && let Some(object) = data.get_mut("object")
+    {
+        *object = hydrate_watch_event_data(
+            std::mem::take(object),
+            api_version,
+            kind,
+            namespace,
+            name,
+            resource_version,
+        );
+        return data;
+    }
     if let Some(obj) = data.as_object_mut() {
         obj.insert("apiVersion".to_string(), serde_json::json!(api_version));
         obj.insert("kind".to_string(), serde_json::json!(kind));
@@ -165,7 +181,6 @@ pub(super) fn validate_metadata_uid_immutable(incoming: &Value, existing: &Value
         return Ok(());
     };
     klights_cluster_core::validate_apply_preconditions(
-        klights_cluster_core::ApplyPreconditionPolicy::Strict,
         klights_cluster_core::ApplyPreconditions {
             uid: Some(incoming_uid),
             ..klights_cluster_core::ApplyPreconditions::default()
@@ -186,7 +201,6 @@ pub(super) fn validate_resource_preconditions(
     current_rv: i64,
 ) -> Result<()> {
     klights_cluster_core::validate_apply_preconditions(
-        klights_cluster_core::ApplyPreconditionPolicy::Strict,
         klights_cluster_core::ApplyPreconditions {
             uid: preconditions.uid.as_deref(),
             resource_version: preconditions.resource_version,

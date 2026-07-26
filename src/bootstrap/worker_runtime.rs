@@ -45,8 +45,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let grpc_transport_policy = cfg.grpc_transport_policy;
     let network_cleanup = cfg.network_cleanup;
     let shutdown_token = cfg.shutdown_token;
-    let containerd_data_dir = cfg.containerd_data_dir;
-    let containerd_state_dir = cfg.containerd_state_dir;
+    let runtime_paths = cfg.runtime_paths;
     let node_ip = identity.node_ip;
     let follower_dataplane = identity.follower_dataplane.unwrap();
     let grpc_ca_cert_path =
@@ -211,11 +210,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let _ = leader_endpoint;
 
     let ob_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let outbox = std::sync::Arc::new(crate::kubelet::outbox::Outbox::with_notify(
+    let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::with_notify(
         node_local.clone(),
         ob_notify.clone(),
     ));
-    crate::kubelet::outbox::OutboxDispatcher::new(
+    crate::node_outbox::OutboxDispatcher::new(
         node_local.clone(),
         remote_api_client.clone(),
         ob_notify,
@@ -223,7 +222,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // bug-grpc: pipelined dispatch — keep multiple worker→leader
     // `apply_outbox` round-trips in flight (one per Status channel-lane
     // connection) instead of one row per WAN RTT.
-    .with_batch_mode(crate::kubelet::outbox::DEFAULT_DISPATCH_INFLIGHT)
+    .with_batch_mode(crate::node_outbox::DEFAULT_DISPATCH_INFLIGHT)
     .start(task_supervisor.clone(), shutdown_token.clone())
     .await
     .context("worker outbox")?;
@@ -247,6 +246,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     )
     .await?;
 
+    let network_runtime_inputs = crate::bootstrap::runtime_inputs::NetworkRuntimeInputs::capture();
     let net = phases::network::boot(phases::network::NetworkBootArgs {
         config: &config,
         node_mode: &node_mode,
@@ -254,8 +254,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         cluster_api: cluster_api.clone(),
         node_local: node_local.clone(),
         network_cleanup: &network_cleanup,
-        containerd_data_dir: &containerd_data_dir,
-        containerd_state_dir: &containerd_state_dir,
+        runtime_paths: &runtime_paths,
+        runtime_inputs: network_runtime_inputs,
         supervisor: task_supervisor.clone(),
         grpc_transport_policy: grpc_transport_policy.clone(),
         shutdown_token: shutdown_token.clone(),
@@ -271,6 +271,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let cni_readiness = net.cni_readiness;
     let dataplane_health = net.dataplane_health;
     let pod_network_cache = net.pod_network_cache;
+    let pod_runtime_store = net.pod_runtime_store;
+    let pod_endpoint_store = net.pod_endpoint_store;
     let assignment_waiter = net.assignment_waiter;
     // A worker is always multinode: start NetworkUnavailable=True until the
     // first successful peer-route sync confirms every Ready peer is reachable.
@@ -294,21 +296,22 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     // which reads the Node via gRPC to write its dataplane-readiness conditions.
     let registration_addresses =
         kubelet::node::NodeRegistrationAddresses::new(node_ip.clone(), None);
+    let registration_profile =
+        crate::bootstrap::node_registration_profile::build(&node_mode, &cli.role);
     let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
         &file_process,
         &config.node_name,
-        &node_mode,
-        &cli.role,
+        &registration_profile,
         registration_addresses,
         None,
         None,
     )
     .await;
-    if let Err(e) = kubelet::node::register_node_snapshot(
+    let registration_health = dataplane_health.snapshot();
+    if let Err(e) = crate::bootstrap::node_registration_adapter::register_node_snapshot(
         &*db,
         Some(outbox.as_ref()),
-        Some(cluster_api.clone()),
-        Some(&dataplane_health),
+        Some(&registration_health),
         &registration,
     )
     .await
@@ -333,10 +336,14 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     }
     follower_grpc_client
         .set_node_log_runtime(std::sync::Arc::new(
-            crate::replication::grpc::client::LocalNodeLogRuntime::new_with_pod_event_store(
+            crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
-                crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(db.clone()),
+                crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
+                    std::sync::Arc::new(
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(db.clone()),
+                    ),
+                ),
             ),
         ))
         .await;
@@ -366,6 +373,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             query_for_peer_watch.clone(),
             outbox.clone(),
         ));
+        let readiness_publisher =
+            crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
+                query_for_peer_watch.clone(),
+                node_status_for_peer_watch,
+            );
         let cancel = shutdown_token.clone();
         task_supervisor
             .spawn_async(
@@ -380,8 +392,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                         node_name,
                         peering,
                         supervisor_for_task,
-                        Some(health_for_peer_watch),
-                        node_status_for_peer_watch,
+                        Some(std::sync::Arc::new(health_for_peer_watch)),
+                        readiness_publisher,
                         cancel,
                     )
                     .await;
@@ -392,12 +404,13 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     };
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = std::sync::Arc::new(crate::side_effects::default_registry(
-        metrics.clone(),
-        Some(services.clone()),
-        Some(task_supervisor.clone()),
-        Some(db.clone()),
-    ));
+    let side_effects =
+        std::sync::Arc::new(crate::side_effect_registry_composition::default_registry(
+            metrics.clone(),
+            Some(services.clone()),
+            Some(task_supervisor.clone()),
+            Some(db.clone()),
+        ));
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
@@ -426,35 +439,67 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         },
         None,
     );
+    let kubelet_capacity =
+        crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
+            &file_process,
+            crate::version::GIT_VERSION,
+        )
+        .await
+        .node_capacity();
+    let sandbox_inputs =
+        crate::bootstrap::runtime_inputs::capture_sandbox_inputs(&file_process, &node_mode).await;
+    let kubelet_runtime_network = crate::kubelet::context::KubeletRuntimeNetworkServices::new(
+        network.datapath().clone(),
+        network.peering().clone(),
+        services.clone(),
+    );
+    let kubelet_status_delivery = crate::kubelet::context::KubeletStatusDeliveryServices::new(
+        cluster_api.clone(),
+        cluster_api.clone(),
+        cluster_api.clone(),
+        cluster_api.clone(),
+        outbox.clone(),
+    );
+    let pod_slot_adapter =
+        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(db.clone());
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
             repository_parts: pod_repository_parts,
             supervisor: task_supervisor.clone(),
-            outbox: Some(outbox.clone()),
-            cluster_api: Some(cluster_api.clone()),
+            outbox: Some(kubelet_status_delivery.outbox.clone()),
+            resource_query: Some(kubelet_status_delivery.resource_query.clone()),
+            projected_tokens: Some(kubelet_status_delivery.projected_tokens.clone()),
             node_name: config.node_name.clone(),
             service_cidr: config.service_cidr.clone(),
             lifecycle_concurrency: crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+            pod_actor_idle_grace:
+                crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            sandbox_inputs,
+            node_capacity: kubelet_capacity,
+            paths: runtime_paths.clone(),
             lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             cri: cri_for_pod_watcher.clone().map(crate::kubelet::cri::SharedCriClient::new),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
             probe_manager: None,
-            datapath: Some(network.datapath().clone()),
+            datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
             runtime_node_role: worker_pod_runtime_node_role(),
             runtime_service: None,
             runtime_store: std::sync::Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db.clone()),
+                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
+                    pod_runtime_store.clone(),
+                ),
             ),
             slot_admission: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    db.clone(),
+                    pod_slot_adapter.clone(),
+                    pod_slot_adapter,
                     config.node_name.clone(),
                 ),
             ),
             event_sink: std::sync::Arc::new(
-                crate::kubelet::pod_runtime::events::RealPodEventSink::new(
+                crate::bootstrap::kubelet_ports::RootPodEventSink::new(
                     Some(outbox.clone()),
                     db.clone(),
                 ),
@@ -478,29 +523,37 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let plr = pod_subsystem.lifecycle_router.clone();
     pod_repository.set_pod_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
     worker_store.set_pod_lifecycle_router(plr.clone());
-    side_effects.set_pod_repository(pod_repository.clone());
+    side_effects.set_pod_ports(pod_repository.clone(), pod_repository.clone());
 
-    services.request_services_sync()?;
-
-    let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletContext {
-        cluster_api,
-        node_local: node_local.clone(),
-        outbox: outbox.clone(),
-        task_supervisor: task_supervisor.clone(),
-        file_process: file_process.clone(),
-        config: config.clone(),
-        network: network.clone(),
-        pod_repository: pod_repository.clone(),
-        pod_lifecycle_router: plr,
-        pod_probe_manager: pod_subsystem
-            .probe_manager
-            .clone()
-            .expect("PodSubsystem must construct ProbeManager"),
-        pod_lifecycle_rx,
-        pod_start_retry_state: std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::kubelet::pod_creation_state::PodStartRetryState::new(),
-        )),
-    });
+    let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
+        config.service_cidr.clone(),
+        config.node_name.clone(),
+        config.containerd_namespace.clone(),
+        crate::kubelet::log_rotation::LogRotationPolicy::default(),
+        kubelet_capacity,
+        runtime_paths,
+    )
+    .context("worker kubelet configuration")?;
+    let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletServices::new(
+        crate::kubelet::context::KubeletLifecycleServices::new(
+            pod_repository.clone(),
+            plr,
+            pod_lifecycle_rx,
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::kubelet::pod_creation_state::PodStartRetryState::new(),
+            )),
+        ),
+        kubelet_runtime_network,
+        kubelet_status_delivery,
+        crate::kubelet::context::KubeletLocalExecutionServices::new(
+            pod_runtime_store,
+            pod_endpoint_store,
+            task_supervisor.clone(),
+            file_process.clone(),
+            kubelet_config,
+        ),
+    ));
+    kctx.runtime_network().services.request_services_sync()?;
 
     let pod_watch_source = std::sync::Arc::new(
         crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(worker_store.clone()),
@@ -519,9 +572,11 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                     klights_supervisor::TaskCategory::Background,
                     "worker_pod_watcher",
                     async move {
-                        kubelet::pod_manager::run_pod_watcher_with_context(
+                        kubelet::pod_manager::run_pod_watcher_with_services(
                             runtime_ports,
-                            ctx,
+                            ctx.lifecycle(),
+                            ctx.status_delivery(),
+                            ctx.local_execution(),
                             watch_source,
                             volume_events,
                             c,

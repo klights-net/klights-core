@@ -9,19 +9,17 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::datastore::Resource;
-use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::sqlite::{PodStatusCheckpoint, RuntimeObservationCheckpoint};
 use crate::datastore::node_local::{
     NodeLocalHandle, OutboxFailureDisposition, OutboxInsert, OutboxRow,
 };
+use klights_cluster_core::Resource;
+use klights_cluster_core::StorageCommand;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
-use self::payload::{OutboxOperation, OutboxPayload};
+use self::payload::{OutboxOperation, OutboxOperationExt as _, OutboxPayload};
 
-pub(crate) use klights_leader_api::{
-    OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
-};
+pub(crate) use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome as OutboxApplyResult};
 
 // bug-grpc: lease must outlast a worst-case pipelined WAN apply so a slow
 // `apply_outbox` does not expire its own claim mid-flight (which would let
@@ -250,6 +248,9 @@ impl Outbox {
             name: subject_name,
             uid: subject_uid,
         } = subject;
+        let classification = operation
+            .classification(&command)
+            .map_err(anyhow::Error::new)?;
         let payload = OutboxPayload::from_command(command).encode_protobuf()?;
         let (subject_api_version, subject_kind) = operation.subject_api_version_kind();
         self.node_db
@@ -266,6 +267,7 @@ impl Outbox {
                 operation: operation.as_str().to_string(),
                 payload_proto: payload,
                 next_due_ms: now_ms,
+                classification,
             })
             .await?;
         self.notify.notify_one();
@@ -1029,9 +1031,14 @@ impl OutboxDispatcher {
                 self.rtt.record_sample(dispatch_start.elapsed());
                 self.dispatch_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let apply_result = OutboxApplyResult::from(result);
                 if records_checkpoint
                     && let Err(err) = self
-                        .mark_pod_status_checkpoint_applied_result(&row.pod_uid, &result, now_ms)
+                        .mark_pod_status_checkpoint_applied_result(
+                            &row.pod_uid,
+                            &apply_result,
+                            now_ms,
+                        )
                         .await
                 {
                     tracing::warn!(pod_uid = %row.pod_uid, error = %err, "mark checkpoint applied failed");
@@ -1077,7 +1084,10 @@ impl OutboxDispatcher {
                     &row.idempotency_key,
                     self.rtt.estimate_ms(),
                 ));
-                if matches!(err, OutboxApplyError::CodecIncompatible { .. }) {
+                if matches!(
+                    err,
+                    klights_leader_api::OutboxDeliveryError::CodecIncompatible { .. }
+                ) {
                     match self
                         .node_db
                         .mark_outbox_attempt_failed(row.id, lease_token, backoff_until_ms, &error)
@@ -1236,7 +1246,10 @@ impl OutboxDispatcher {
         row: &OutboxRow,
         lease_token: &str,
         request: OutboxDeliveryRequest,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
+    ) -> std::result::Result<
+        klights_leader_api::OutboxDeliveryResult,
+        klights_leader_api::OutboxDeliveryError,
+    > {
         let Some(supervisor) = self.lease_renewal_supervisor.as_ref() else {
             return self.client.deliver_outbox(request).await;
         };
@@ -1248,18 +1261,22 @@ impl OutboxDispatcher {
             tokio::select! {
                 result = &mut delivery => return result,
                 timer_result = supervisor.sleep(timer_name.clone(), renewal_period) => {
-                    timer_result.map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+                    timer_result.map_err(|error| {
+                        klights_leader_api::OutboxDeliveryError::Retryable(error.to_string())
+                    })?;
                     if supervisor.root_cancellation_token().is_cancelled() {
-                        return Err(OutboxApplyError::cancelled());
+                        return Err(klights_leader_api::OutboxDeliveryError::cancelled());
                     }
                     let leased_until_ms = now_ms().saturating_add(self.lease_ms.max(1));
                     let renewed = self
                         .node_db
                         .renew_outbox_lease(row.id, lease_token, leased_until_ms)
                         .await
-                        .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+                        .map_err(|error| {
+                            klights_leader_api::OutboxDeliveryError::Retryable(error.to_string())
+                        })?;
                     if !renewed {
-                        return Err(OutboxApplyError::Retryable(format!(
+                        return Err(klights_leader_api::OutboxDeliveryError::Retryable(format!(
                             "outbox lease lost while delivery was in flight for row {}",
                             row.id,
                         )));
@@ -1381,13 +1398,18 @@ fn deterministic_jitter_ms(idempotency_key: &str, attempt: i64, window_ms: i64) 
     (hash % (window_ms.max(0) as u64 + 1)) as i64
 }
 
-fn actor_owned_pod_delete_needs_dead_letter(row: &OutboxRow, err: &OutboxApplyError) -> bool {
-    if matches!(err, OutboxApplyError::NotFound(_)) {
+fn actor_owned_pod_delete_needs_dead_letter(
+    row: &OutboxRow,
+    err: &klights_leader_api::OutboxDeliveryError,
+) -> bool {
+    use klights_leader_api::OutboxDeliveryError;
+
+    if matches!(err, OutboxDeliveryError::NotFound(_)) {
         return false;
     }
     if !matches!(
         err,
-        OutboxApplyError::UidMismatch { .. } | OutboxApplyError::ConflictTerminal(_)
+        OutboxDeliveryError::UidMismatch { .. } | OutboxDeliveryError::ConflictTerminal(_)
     ) {
         return false;
     }
@@ -1420,21 +1442,32 @@ mod tests {
     mod dead_letter_tests;
     use std::sync::Arc;
 
-    use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryFuture, OutboxDeliveryRequest};
+    use klights_leader_api::{
+        LeaderOutboxDelivery, OutboxDeliveryError as OutboxApplyError, OutboxDeliveryFuture,
+        OutboxDeliveryRequest, OutboxDeliveryResult as OutboxApplyResult,
+    };
     use std::collections::HashSet;
     use tokio::sync::{Mutex, Notify};
 
-    use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend_kind::BackendKind;
-    use crate::datastore::command::StorageCommand;
     use crate::datastore::node_local::{NodeLocalHandle, selector};
-    use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+    use crate::node_outbox::payload::OutboxOperationExt as _;
+    use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+    use klights_cluster_core::ResourcePreconditions;
+    use klights_cluster_core::StorageCommand;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
-    use super::{
-        DispatchOutcome, Outbox, OutboxApplyError, OutboxApplyResult, OutboxCommand,
-        OutboxDispatcher, OutboxSubject,
-    };
+    use super::{DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject};
+
+    fn pod_status_classification() -> klights_node_store::OutboxClassification {
+        klights_node_store::OutboxClassification::try_new(
+            klights_node_store::OutboxPriority::Workload,
+            klights_node_store::OutboxSupersedability::PodStatus,
+            klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+            klights_node_store::OutboxSequencePolicy::PerSubject,
+        )
+        .expect("valid Pod status classification")
+    }
 
     #[test]
     fn dispatcher_constructor_requires_only_the_focused_delivery_port() {
@@ -2697,7 +2730,7 @@ mod tests {
             .mark_pod_status_checkpoint_applied("uid-checkpoint-race", 12, 300)
             .await
             .expect("older outbox row marked applied");
-        let live = crate::datastore::Resource {
+        let live = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -2749,7 +2782,7 @@ mod tests {
     async fn later_runtime_checkpoint_without_ip_preserves_prior_pod_ip_and_scheduled_condition() {
         let node_db = node_db().await;
         let outbox = Outbox::new(node_db.clone());
-        let live = crate::datastore::Resource {
+        let live = klights_cluster_core::Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -3001,15 +3034,6 @@ mod tests {
     #[tokio::test]
     async fn outbox_terminal_decision_unknown_operation_consumes_assigned_sequence() {
         let cluster_db = crate::datastore::test_support::in_memory().await;
-        assert_eq!(
-            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                &cluster_db,
-            )
-            .await
-            .expect("read assignment mode"),
-            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-            "this regression explicitly covers legacy leader-assigned resourceVersions"
-        );
         let (node_db, sqlite_node_db) =
             crate::datastore::node_local::selector::open_node_local_with_sqlite(
                 BackendKind::Sqlite,
@@ -3035,6 +3059,7 @@ mod tests {
                 operation: OutboxOperation::PodStatus.as_str().to_string(),
                 payload_proto: vec![0xff],
                 next_due_ms: 1_000,
+                classification: pod_status_classification(),
             })
             .await
             .expect("enqueue legacy row before unknown operation migration");
@@ -3205,6 +3230,7 @@ mod tests {
                 operation: OutboxOperation::PodStatus.as_str().to_string(),
                 payload_proto: Vec::new(),
                 next_due_ms: 1,
+                classification: pod_status_classification(),
             })
             .await
             .unwrap();
@@ -3258,6 +3284,7 @@ mod tests {
                 operation: OutboxOperation::PodStatus.as_str().to_string(),
                 payload_proto: vec![0xff],
                 next_due_ms: 1_000,
+                classification: pod_status_classification(),
             })
             .await
             .expect("enqueue row before operation corruption");
@@ -3369,17 +3396,18 @@ mod tests {
             .await
             .expect("seed existing node");
 
+        let registration_profile = crate::kubelet::node_config::NodeRegistrationProfile::new(
+            klights_network_api::NodePeerMode::Root,
+            crate::kubelet::node_config::KubeletNodeRole::Worker,
+            true,
+            "v1.34.6+klights-test".to_string(),
+        );
         crate::kubelet::node::register_node_with_outbox(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             db.as_ref(),
             &outbox,
             "node-a",
-            &crate::bootstrap::NodeMode::Root,
-            &crate::bootstrap::NodeRole::Worker {
-                leader_endpoints: vec!["https://leader:7979".to_string()],
-                token: Some("token".to_string()),
-                skip_ca: false,
-            },
+            &registration_profile,
             None,
             None,
         )
@@ -3394,10 +3422,10 @@ mod tests {
                 "uid": "pod-uid-1"
             }
         });
-        crate::kubelet::events::emit_pod_event_with_outbox(
+        crate::pod_events::emit_pod_event_with_outbox(
             db.as_ref(),
             Some(&outbox),
-            crate::kubelet::events::PodEventRecord {
+            crate::pod_events::PodEventRecord {
                 pod: &pod,
                 reason: "Started",
                 message: "Started container app",

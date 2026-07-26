@@ -1,5 +1,4 @@
 use crate::api::*;
-use crate::datastore::ListPageRequest;
 use klights_types::LabelSelector;
 
 pub async fn get_namespace(
@@ -7,6 +6,7 @@ pub async fn get_namespace(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let ns = state
+        .resource_mutation()
         .db
         .get_namespace(&name)
         .await?
@@ -63,10 +63,10 @@ pub async fn list_namespaces(
             .is_some_and(|rv| rv.trim() == "0");
 
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let db = state.db.clone();
+        let db = state.resource_mutation().db.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            task_supervisor: state.task_supervisor.clone(),
+            task_supervisor: state.operational().task_supervisor.clone(),
             api_version: "v1",
             kind: "Namespace".to_string(),
             watch_namespace: None,
@@ -97,44 +97,34 @@ pub async fn list_namespaces(
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token.clone())?;
 
-    let list_query = crate::datastore::ResourceListQuery::new(
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
-        normalized_limit,
-        db_continue_name.as_deref(),
-    );
+    let list_query = crate::api::query::NamespaceListRequest {
+        label_selector: query.label_selector.clone(),
+        field_selector: query.field_selector.clone(),
+        limit: normalized_limit,
+        continue_token: db_continue_name,
+    };
 
     // Namespaces persist in their own table but back a real consistent snapshot
     // (the sqlite reconstructor reads that table when kind == Namespace), so the
     // shared helper pins paginated continuations / Exact reads exactly like every
     // other kind. See `query::resolve_list_page`.
-    let db_for_snapshot = state.db.clone();
-    let db_for_live = state.db.clone();
+    let namespace_lists = state.resource_mutation().namespace_lists.clone();
+    let snapshot_lists = namespace_lists.clone();
+    let snapshot_query = list_query.clone();
     let crate::api::query::ResolvedListPage {
         list: list_response,
         response_rv,
         continue_resource_version,
     } = crate::api::query::resolve_list_page(
-        state.db.as_ref(),
+        state.resource_mutation().list_resource_versions.as_ref(),
         rv_match,
         continue_resource_version,
         |srv| async move {
-            db_for_snapshot
-                .snapshot_resources_at_rv("v1", "Namespace", None, list_query, srv)
+            snapshot_lists
+                .snapshot_namespaces(snapshot_query, srv)
                 .await
-                .map_err(AppError::from)
         },
-        || async move {
-            let page = ListPageRequest::try_new(
-                list_query.limit,
-                list_query.continue_token.map(str::to_string),
-            )
-            .map_err(AppError::from)?;
-            db_for_live
-                .list_namespaces_page(list_query.label_selector, list_query.field_selector, page)
-                .await
-                .map_err(AppError::from)
-        },
+        || async move { namespace_lists.list_namespaces(list_query).await },
     )
     .await?;
 
@@ -176,7 +166,7 @@ pub async fn create_namespace(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Namespace",
@@ -256,15 +246,20 @@ pub async fn create_namespace(
     ensure_namespace_status_phase_active(&mut body);
 
     let resource = state
+        .resource_mutation()
         .db
         .create_namespace(&name, body)
         .await
         .map_err(|err| map_namespace_create_error(&name, err))?;
 
     // Auto-create default ServiceAccount and kube-root-ca.crt ConfigMap
-    if let Err(e) =
-        crate::controllers::namespace::create_default_service_account(state.db.as_ref(), &name)
-            .await
+    let namespace_bootstrap = state
+        .resource_mutation()
+        .pod_repository
+        .namespace_bootstrap_port();
+    if let Err(e) = namespace_bootstrap
+        .create_default_service_account(name.clone())
+        .await
     {
         tracing::warn!(
             "Failed to create default ServiceAccount in namespace {}: {:#}",
@@ -272,15 +267,13 @@ pub async fn create_namespace(
             e
         );
     }
-    let ca_cert_path = crate::paths::ca_cert_path(&state.config.containerd_namespace);
-    match crate::utils::read_utf8_file_async(&state.file_process, &ca_cert_path).await {
+    let ca_cert_path = crate::paths::ca_cert_path(&state.operational().config.containerd_namespace);
+    match crate::utils::read_utf8_file_async(&state.operational().file_process, &ca_cert_path).await
+    {
         Ok(ca_cert_pem) => {
-            if let Err(e) = crate::controllers::namespace::create_kube_root_ca_configmap(
-                state.db.as_ref(),
-                &name,
-                &ca_cert_pem,
-            )
-            .await
+            if let Err(e) = namespace_bootstrap
+                .create_root_ca_config_map(name.clone(), ca_cert_pem)
+                .await
             {
                 tracing::warn!(
                     "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
@@ -322,6 +315,7 @@ pub async fn update_namespace(
     LenientJson(mut body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let current = state
+        .resource_mutation()
         .db
         .get_namespace(&name)
         .await?
@@ -330,7 +324,7 @@ pub async fn update_namespace(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Namespace",
@@ -351,6 +345,7 @@ pub async fn update_namespace(
     }
 
     let resource = state
+        .resource_mutation()
         .db
         .update_namespace(&name, body, current.resource_version)
         .await?;
@@ -365,6 +360,7 @@ pub async fn finalize_namespace(
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let current = state
+        .resource_mutation()
         .db
         .get_namespace(&name)
         .await?
@@ -378,6 +374,7 @@ pub async fn finalize_namespace(
     // Finalize updates the finalizers list (spec.finalizers)
     // Extract finalizers from request body and update namespace
     let resource = state
+        .resource_mutation()
         .db
         .update_namespace(&name, body, current.resource_version)
         .await?;
@@ -393,8 +390,18 @@ pub async fn finalize_namespace(
         .and_then(|v| v.as_str())
         .is_some();
     if finalizers_empty && has_deletion_timestamp {
-        if state.db.count_namespace_resources(&resource.name).await? == 0 {
-            state.db.delete_namespace(&resource.name.clone()).await?;
+        if state
+            .resource_mutation()
+            .db
+            .count_namespace_resources(&resource.name)
+            .await?
+            == 0
+        {
+            state
+                .resource_mutation()
+                .db
+                .delete_namespace(&resource.name.clone())
+                .await?;
         } else {
             let uid = resource
                 .data
@@ -408,10 +415,10 @@ pub async fn finalize_namespace(
             // enqueue a workqueue retry in that StillPending case too,
             // not only on Err.
             let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome(
-                state.db.as_ref(),
+                state.resource_mutation().db.as_ref(),
                 &resource.name,
                 &uid,
-                &state.metrics,
+                &state.controller_reconcile().metrics,
             )
             .await;
             let need_retry = match &outcome {
@@ -427,8 +434,8 @@ pub async fn finalize_namespace(
                 }
             };
             if need_retry {
-                crate::kubelet::pod_repository::PodRepository::enqueue_namespace_termination(
-                    state.pod_repository.as_ref(),
+                klights_reconcile_api::NamespaceTerminationQueueSink::enqueue_namespace_termination(
+                    state.resource_mutation().pod_repository.as_ref(),
                     resource.name.clone(),
                     uid,
                 )
@@ -455,6 +462,7 @@ pub async fn patch_namespace(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, AppError> {
     let current = state
+        .resource_mutation()
         .db
         .get_namespace(&name)
         .await?
@@ -469,7 +477,7 @@ pub async fn patch_namespace(
         .map_err(|e| AppError::BadRequest(format!("Invalid patch body: {}", e)))?;
     let patched = apply_patch(&current.data, &patch_value, content_type)?;
     let patched = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Namespace",
@@ -490,6 +498,7 @@ pub async fn patch_namespace(
     }
 
     let resource = state
+        .resource_mutation()
         .db
         .update_namespace(&name, patched, current.resource_version)
         .await?;
@@ -516,14 +525,22 @@ pub async fn delete_namespace(
     }
 
     let current = state
+        .resource_mutation()
         .db
         .get_namespace(&name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
 
     let has_finalizers = resource_has_finalizers(&current.data, "/spec/finalizers");
-    if !has_finalizers && state.db.count_namespace_resources(&name).await? == 0 {
-        state.db.delete_namespace(&name).await?;
+    if !has_finalizers
+        && state
+            .resource_mutation()
+            .db
+            .count_namespace_resources(&name)
+            .await?
+            == 0
+    {
+        state.resource_mutation().db.delete_namespace(&name).await?;
         return Ok((
             StatusCode::OK,
             Json(crate::api::mutation::response::delete_collection_success_status()),
@@ -533,6 +550,7 @@ pub async fn delete_namespace(
     let mut terminating: Value = (*current.data).clone();
     set_namespace_terminating_status(&mut terminating, false);
     let updated = state
+        .resource_mutation()
         .db
         .update_namespace(&name, terminating, current.resource_version)
         .await?;
@@ -546,10 +564,10 @@ pub async fn delete_namespace(
     // Ok with StillPending (pods still draining, content not yet drained,
     // or worker-side races), enqueue a workqueue retry — not only on Err.
     let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         &name,
         &uid,
-        &state.metrics,
+        &state.controller_reconcile().metrics,
     )
     .await;
     let need_retry = match &outcome {
@@ -565,8 +583,8 @@ pub async fn delete_namespace(
         }
     };
     if need_retry {
-        crate::kubelet::pod_repository::PodRepository::enqueue_namespace_termination(
-            state.pod_repository.as_ref(),
+        klights_reconcile_api::NamespaceTerminationQueueSink::enqueue_namespace_termination(
+            state.resource_mutation().pod_repository.as_ref(),
             name.clone(),
             uid,
         )

@@ -1,22 +1,32 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryFuture, OutboxDeliveryRequest};
+use klights_leader_api::{
+    LeaderOutboxDelivery, OutboxDeliveryError as OutboxApplyError, OutboxDeliveryFuture,
+    OutboxDeliveryRequest, OutboxDeliveryResult as OutboxApplyResult,
+};
 use tokio::sync::Mutex;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::{NodeLocalHandle, selector};
-use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-use crate::kubelet::outbox::{
-    DispatchOutcome, Outbox, OutboxApplyError, OutboxApplyResult, OutboxCommand, OutboxDispatcher,
-    OutboxSubject,
-};
+use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::node_outbox::{DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject};
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
+}
+
+fn pod_status_classification() -> klights_node_store::OutboxClassification {
+    klights_node_store::OutboxClassification::try_new(
+        klights_node_store::OutboxPriority::Workload,
+        klights_node_store::OutboxSupersedability::PodStatus,
+        klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+        klights_node_store::OutboxSequencePolicy::PerSubject,
+    )
+    .expect("valid Pod status classification")
 }
 
 async fn node_db() -> NodeLocalHandle {
@@ -350,6 +360,7 @@ async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
         operation: OutboxOperation::PodStatus.as_str().to_string(),
         payload_proto: Vec::new(),
         next_due_ms: enqueued,
+        classification: pod_status_classification(),
     };
     // Older row A, then younger row B, same subject.
     node_db

@@ -1,31 +1,29 @@
 use async_trait::async_trait;
 use klights_leader_api::{
-    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
-    OutboxDeliveryResult,
+    CacheReadinessFuture, CacheReadinessRequest, LeaderAuthenticatedProjectedServiceAccountToken,
+    LeaderCacheReadiness, LeaderNetworkTopologyCommand, LeaderNetworkTopologyQuery,
+    LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus, LeaderNodeSubnetAllocation,
+    LeaderOutboxDelivery, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+    NetworkDataplane, NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery,
+    NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest,
+    NodeLeaseRenewalResult, NodeLifecycleStatusError, NodeLifecycleStatusFuture,
+    NodeLifecycleStatusRequest, NodeLifecycleStatusResult, NodeSubnetAllocationError,
+    NodeSubnetAllocationFuture, NodeSubnetAllocationRequest, NodeSubnetAllocationResult,
+    NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError, OutboxDeliveryFuture,
+    OutboxDeliveryRequest, OutboxDeliveryResult, PeerSubnetsQuery, PeerSubnetsResult,
+    PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
+    PodCleanupIntentListRequest, ProjectedServiceAccountTokenError,
+    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceCommandError,
+    ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest,
+    ResourceListRequest, ResourceListResult, ResourceQueryFuture, WatchRequest,
 };
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::watch;
 
 use crate::control_plane::client::{
-    CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
-    LeaderAuthenticatedProjectedServiceAccountToken, LeaderCacheReadiness,
-    LeaderNetworkTopologyCommand, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
-    LeaderNodeLifecycleStatus, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
-    LeaderProjectedServiceAccountToken, LeaderResourceCommand, LeaderResourceQuery, LeaderWatch,
-    LeaderWatchError, LeaderWatchFuture, NetworkDataplane, NetworkTopologyError,
-    NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError,
-    NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
-    NodeLifecycleStatusError, NodeLifecycleStatusFuture, NodeLifecycleStatusRequest,
-    NodeLifecycleStatusResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
-    NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
-    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
-    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
-    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
-    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
-    ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
-    ResourceListResult, ResourceQueryFuture, WatchRequest, focused_dataplane, focused_node_subnet,
-    query_error, query_list_result,
+    LeaderApiClient, focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::cluster_store_adapter::{
@@ -34,8 +32,10 @@ use crate::datastore::cluster_store_adapter::{
 use crate::datastore::command::StorageCommand;
 use crate::datastore::sequenced::WriteRejection;
 use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
-use crate::kubelet::outbox::OutboxApplyError;
 use crate::kubelet::pod_repository::store::PodStore;
+use crate::node_outbox::OutboxApplyError;
+#[cfg(test)]
+use crate::node_outbox::payload::OutboxOperationExt as _;
 
 #[cfg(test)]
 type ProjectedTokenAsyncBoundary = Arc<
@@ -117,7 +117,7 @@ fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIss
 }
 
 #[cfg(test)]
-use crate::control_plane::client::{ResourceQueryConsistency, pod_get_request};
+use klights_leader_api::{ResourceQueryConsistency, pod_get_request};
 
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
 ///
@@ -170,6 +170,7 @@ pub struct LocalApiClient {
     raft: crate::datastore::raft::state_machine::N1Raft,
     authoring_node: String,
     containerd_namespace: String,
+    service_account_signing_key_path: std::path::PathBuf,
     file_process: klights_supervisor::FileProcessExecutor,
     crypto: klights_supervisor::CryptoExecutor,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
@@ -179,6 +180,7 @@ pub struct LocalApiClient {
     /// reconcile keys that the gRPC `Replication::apply_outbox` handler
     /// fires for remote-worker forwarded writes.
     controller_dispatcher: Arc<OnceCell<Arc<ControllerDispatcher>>>,
+    non_pod_finalization: Arc<OnceCell<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>>,
     /// T6 step 1 inner gate: every mutation method on this client first
     /// reads `*is_leader_rx.borrow()`. When false (this node is not the
     /// elected raft leader) the call is refused with
@@ -238,10 +240,8 @@ impl LocalApiClient {
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
             }
-            let signing_key_path =
-                crate::paths::service_account_signing_key_path(&self.containerd_namespace);
             let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-                &signing_key_path,
+                &self.service_account_signing_key_path,
                 &self.file_process,
             )
             .await;
@@ -413,7 +413,29 @@ impl LocalApiClient {
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        let pod_store = Arc::new(PodStore::new(db.clone()));
+        let signing_key_path =
+            crate::paths::service_account_signing_key_path(&containerd_namespace);
+        Self::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
+            db,
+            authoring_node,
+            containerd_namespace,
+            signing_key_path,
+            node_lease_tracker,
+            is_leader_rx,
+            file_process,
+        )
+    }
+
+    pub(crate) fn new_with_node_lease_tracker_namespace_signing_key_and_file_process(
+        db: DatastoreHandle,
+        authoring_node: String,
+        containerd_namespace: String,
+        service_account_signing_key_path: std::path::PathBuf,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
         let positioned_watch = datastore_positioned_watch_service(db.clone());
         let crypto = file_process.crypto_executor();
         Self {
@@ -423,10 +445,12 @@ impl LocalApiClient {
             pod_store,
             authoring_node,
             containerd_namespace,
+            service_account_signing_key_path,
             file_process,
             crypto,
             node_lease_tracker,
             controller_dispatcher: Arc::new(OnceCell::new()),
+            non_pod_finalization: Arc::new(OnceCell::new()),
             is_leader_rx,
         }
     }
@@ -449,7 +473,7 @@ impl LocalApiClient {
     pub(crate) async fn deliver_test_outbox(
         &self,
         idempotency_key: &str,
-        operation: crate::kubelet::outbox::payload::OutboxOperation,
+        operation: crate::node_outbox::payload::OutboxOperation,
         payload: bytes::Bytes,
         client_id: &str,
         stream_id: i64,
@@ -474,6 +498,13 @@ impl LocalApiClient {
     /// is silently ignored (OnceCell::set returns Err on repeat).
     pub fn set_controller_dispatcher(&self, dispatcher: Arc<ControllerDispatcher>) {
         let _ = self.controller_dispatcher.set(dispatcher);
+    }
+
+    pub fn set_non_pod_finalization(
+        &self,
+        port: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    ) {
+        let _ = self.non_pod_finalization.set(port);
     }
 
     #[cfg(test)]
@@ -601,12 +632,12 @@ impl LeaderResourceQuery for LocalApiClient {
         request: ResourceGetRequest,
     ) -> ResourceQueryFuture<'_, Option<Resource>> {
         Box::pin(async move {
-            let leader_fresh = request.consistency()
-                == crate::control_plane::client::ResourceQueryConsistency::LeaderFresh;
+            let leader_fresh =
+                request.consistency() == klights_leader_api::ResourceQueryConsistency::LeaderFresh;
             let mut leadership_rx = self.is_leader_rx.clone();
             let sampled_is_leader = *leadership_rx.borrow_and_update();
             if leader_fresh && !sampled_is_leader {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                return Err(klights_leader_api::ResourceQueryError::retryable(
                     "leader-fresh resource query reached a non-leader local client",
                 ));
             }
@@ -622,7 +653,7 @@ impl LeaderResourceQuery for LocalApiClient {
                 .await
                 .map_err(query_error)?;
             if leader_fresh && leadership_rx.has_changed().unwrap_or(true) {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                return Err(klights_leader_api::ResourceQueryError::retryable(
                     "leadership changed during local leader-fresh resource query",
                 ));
             }
@@ -635,12 +666,12 @@ impl LeaderResourceQuery for LocalApiClient {
         request: ResourceListRequest,
     ) -> ResourceQueryFuture<'_, ResourceListResult> {
         Box::pin(async move {
-            let leader_fresh = request.consistency()
-                == crate::control_plane::client::ResourceQueryConsistency::LeaderFresh;
+            let leader_fresh =
+                request.consistency() == klights_leader_api::ResourceQueryConsistency::LeaderFresh;
             let mut leadership_rx = self.is_leader_rx.clone();
             let sampled_is_leader = *leadership_rx.borrow_and_update();
             if leader_fresh && !sampled_is_leader {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                return Err(klights_leader_api::ResourceQueryError::retryable(
                     "leader-fresh resource query reached a non-leader local client",
                 ));
             }
@@ -660,7 +691,7 @@ impl LeaderResourceQuery for LocalApiClient {
                 .await
                 .map_err(query_error)?;
             if leader_fresh && leadership_rx.has_changed().unwrap_or(true) {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                return Err(klights_leader_api::ResourceQueryError::retryable(
                     "leadership changed during local leader-fresh resource query",
                 ));
             }
@@ -786,7 +817,8 @@ pub(crate) async fn submit_resource_command_to_store(
 fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
     if let Some(error) = error.downcast_ref::<crate::datastore::errors::DatastoreError>() {
         return match error {
-            crate::datastore::errors::DatastoreError::Conflict { message } => {
+            crate::datastore::errors::DatastoreError::AlreadyExists { message }
+            | crate::datastore::errors::DatastoreError::Conflict { message } => {
                 ResourceCommandError::Conflict {
                     message: message.clone(),
                 }
@@ -872,9 +904,9 @@ impl LeaderNodeLifecycleStatus for LocalApiClient {
             if !*self.is_leader_rx.borrow() {
                 return Err(NodeLifecycleStatusError::NotLeader);
             }
-            let get = crate::control_plane::client::node_get_request(
+            let get = klights_leader_api::node_get_request(
                 request.node_name(),
-                crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
             )
             .map_err(|error| NodeLifecycleStatusError::apply_failed(error.to_string()))?;
             let current = LeaderResourceQuery::get_resource(self, get)
@@ -1145,7 +1177,7 @@ impl LeaderNetworkTopologyCommand for LocalApiClient {
                 return Ok(());
             };
             let mut data = (*resource.data).clone();
-            if !crate::kubelet::node::stamp_node_routing_metadata_from_store(
+            if !crate::node_routing_metadata::stamp_from_store(
                 self.db.as_ref(),
                 &metadata.node_name,
                 &mut data,
@@ -1199,8 +1231,7 @@ impl LocalApiClient {
             &client_id, stream_id, stream_seq,
         );
         let decoded =
-            match crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(payload.as_ref())
-            {
+            match crate::node_outbox::payload::OutboxPayload::decode_protobuf(payload.as_ref()) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     let terminal =
@@ -1302,24 +1333,27 @@ impl LocalApiClient {
                     None
                 };
             crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                controller_dispatcher.map(|dispatcher| {
-                    dispatcher.as_ref() as &dyn klights_reconcile_api::ControllerReconcileSink
-                }),
-                controller_dispatcher.map(|dispatcher| {
-                    dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
-                }),
-                gc_pod_delete_sink
-                    .as_deref()
-                    .map(|sink| sink as &dyn klights_reconcile_api::GcPodDeleteSink),
+                crate::control_plane::client::pod_status_side_effects::PodSideEffectSinks {
+                    controller: controller_dispatcher.map(|dispatcher| {
+                        dispatcher.as_ref() as &dyn klights_reconcile_api::ControllerReconcileSink
+                    }),
+                    service: controller_dispatcher.map(|dispatcher| {
+                        dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
+                    }),
+                    pod_delete: gc_pod_delete_sink
+                        .as_deref()
+                        .map(|sink| sink as &dyn klights_reconcile_api::GcPodDeleteSink),
+                    non_pod_finalization: self.non_pod_finalization.get().map(Arc::as_ref),
+                },
                 command,
                 outcome.resource.as_ref(),
                 outcome.pod_endpoint_effect,
                 self.db.as_ref(),
             )
             .await
-            .map_err(crate::kubelet::outbox::OutboxApplyError::Retryable)?;
+            .map_err(crate::node_outbox::OutboxApplyError::Retryable)?;
         }
-        Ok(outcome.result)
+        Ok(outcome.result.into())
     }
 }
 
@@ -1349,9 +1383,9 @@ mod inner_gate_tests {
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
     use crate::datastore::{DatastoreBackend, ReplicatedCreateOptions, ResourceListQuery};
-    use crate::kubelet::outbox::OutboxApplyError;
-    use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+    use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
     use futures::StreamExt as _;
+    use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
     use klights_leader_api::{
         LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,
         ResourceQueryError, WatchEventType,
@@ -2599,18 +2633,16 @@ mod inner_gate_tests {
             let (leadership_tx, leadership_rx) = watch::channel(true);
             let data_root = tempfile::tempdir().unwrap();
             let namespace = data_root.path().to_str().unwrap().to_string();
-            crate::utils::create_dir_all(crate::paths::etc_dir_path(&namespace)).unwrap();
-            crate::utils::write_file(
-                crate::paths::service_account_signing_key_path(&namespace),
-                "unused-test-signing-key",
-            )
-            .unwrap();
+            let signing_key_path = data_root.path().join("etc/service-account-signing.key");
+            crate::utils::create_dir_all(signing_key_path.parent().unwrap()).unwrap();
+            crate::utils::write_file(&signing_key_path, "unused-test-signing-key").unwrap();
             let sign_probe = install_projected_token_issue_test_probe(namespace.clone(), reader);
             let client = Arc::new(
-                LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+                LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
                     db,
                     "node-a".to_string(),
                     namespace,
+                    signing_key_path,
                     Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
                     leadership_rx,
                     crate::kubelet::file_blocking::test_file_process_executor(),
@@ -2713,18 +2745,16 @@ mod inner_gate_tests {
         seed_projected_token_adapter_resources(db.as_ref()).await;
         let data_root = tempfile::tempdir().unwrap();
         let namespace = data_root.path().to_str().unwrap().to_string();
-        crate::utils::create_dir_all(crate::paths::etc_dir_path(&namespace)).unwrap();
+        let signing_key_path = data_root.path().join("etc/service-account-signing.key");
+        crate::utils::create_dir_all(signing_key_path.parent().unwrap()).unwrap();
         let signing_key = crate::auth::generate_ca_full().unwrap().3;
-        crate::utils::write_file(
-            crate::paths::service_account_signing_key_path(&namespace),
-            &signing_key,
-        )
-        .unwrap();
+        crate::utils::write_file(&signing_key_path, &signing_key).unwrap();
         let local = Arc::new(
-            LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+            LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
                 db,
                 "leader-cp1".to_string(),
                 namespace,
+                signing_key_path,
                 Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
                 always_leader_watch(),
                 crate::kubelet::file_blocking::test_file_process_executor(),

@@ -35,14 +35,22 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::controller_dispatcher::ControllerDispatcher;
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreHandle, WatchTarget};
-use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
-};
+use crate::watch::{EventType, WatchCursorError, WatchEvent};
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
-use klights_watch::WatchTopic;
+
+#[async_trait::async_trait]
+pub trait CronJobWatch: Send {
+    async fn next_event(&mut self) -> std::result::Result<WatchEvent, WatchCursorError>;
+}
+
+#[async_trait::async_trait]
+pub trait CronJobSchedulerRuntime: Send + Sync {
+    async fn list_cronjobs(&self) -> Result<Vec<klights_cluster_core::Resource>>;
+
+    async fn reconcile_cronjob(&self, resource: &klights_cluster_core::Resource) -> Result<()>;
+
+    async fn subscribe_watch(&self) -> Result<Box<dyn CronJobWatch>>;
+}
 
 /// Maximum delay we ever pass to `spawn_delay` for a single arm. Long
 /// delays still work (Tokio's timer wheel handles years); this cap is a
@@ -52,32 +60,21 @@ use klights_watch::WatchTopic;
 const MAX_ARM_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct CronJobScheduler {
-    db: DatastoreHandle,
-    dispatcher: Arc<ControllerDispatcher>,
+    runtime: Arc<dyn CronJobSchedulerRuntime>,
     supervisor: Arc<TaskSupervisor>,
     timers: Mutex<HashMap<String /* uid */, SupervisedJoinHandle<()>>>,
 }
 
 impl CronJobScheduler {
     pub fn new(
-        db: DatastoreHandle,
-        dispatcher: Arc<ControllerDispatcher>,
+        runtime: Arc<dyn CronJobSchedulerRuntime>,
         supervisor: Arc<TaskSupervisor>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            db,
-            dispatcher,
+            runtime,
             supervisor,
             timers: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Test-only accessor for the inner controller dispatcher reference.
-    /// Lets test code drive `reconcile_cronjob_one` with the same
-    /// dispatcher the scheduler would pass.
-    #[cfg(test)]
-    pub fn dispatcher_for_test(&self) -> &ControllerDispatcher {
-        self.dispatcher.as_ref()
     }
 
     /// Number of currently-armed UID timers (test/observability only).
@@ -104,16 +101,7 @@ impl CronJobScheduler {
     /// timer. Returns once arming is complete; the armed timers fire
     /// asynchronously in the background.
     pub async fn startup_walk(self: &Arc<Self>) -> Result<()> {
-        let listing = self
-            .db
-            .list_resources(
-                "batch/v1",
-                "CronJob",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        for resource in listing.items {
+        for resource in self.runtime.list_cronjobs().await? {
             Arc::clone(self).arm(&resource.data).await;
         }
         Ok(())
@@ -220,16 +208,7 @@ impl CronJobScheduler {
         // The CronJob may have been deleted/suspended during the wait.
         // We re-discover it by listing — UID lookup needs no special
         // index, the CronJob population per cluster is small.
-        let listing = match self
-            .db
-            .list_resources(
-                "batch/v1",
-                "CronJob",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await
-        {
+        let listing = match self.runtime.list_cronjobs().await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("CronJob fire {}: list failed: {:#}", uid, e);
@@ -237,7 +216,6 @@ impl CronJobScheduler {
             }
         };
         let Some(resource) = listing
-            .items
             .into_iter()
             .find(|r| r.data.pointer("/metadata/uid").and_then(|v| v.as_str()) == Some(uid))
         else {
@@ -265,32 +243,15 @@ impl CronJobScheduler {
             return;
         }
 
-        if let Err(e) = crate::controllers::cronjob::reconcile_cronjob_one(
-            self.db.as_ref(),
-            Some(self.dispatcher.as_ref()),
-            &resource.data,
-            resource.resource_version,
-        )
-        .await
-        {
+        if let Err(e) = self.runtime.reconcile_cronjob(&resource).await {
             tracing::warn!("CronJob fire {}: reconcile failed: {:#}", uid, e);
         }
 
         // Re-arm for the next fire. Re-read the CronJob via list again so
         // we pick up any status mutation our own reconcile produced
         // (lastScheduleTime moves forward).
-        let refreshed = match self
-            .db
-            .list_resources(
-                "batch/v1",
-                "CronJob",
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await
-        {
-            Ok(l) => l
-                .items
+        let refreshed = match self.runtime.list_cronjobs().await {
+            Ok(listing) => listing
                 .into_iter()
                 .find(|r| r.data.pointer("/metadata/uid").and_then(|v| v.as_str()) == Some(uid)),
             Err(e) => {
@@ -325,27 +286,20 @@ impl CronJobScheduler {
     /// `batch/v1`/`CronJob`, and arms / cancels timers in response.
     /// Runs until `cancel` fires.
     pub async fn run_watch_loop(self: Arc<Self>, cancel: CancellationToken) {
-        let topic = WatchTopic::new("batch/v1", "CronJob");
-        let mut cursor = SignalWatchCursor::new(
-            self.db.subscribe_watch_signals(topic.clone()),
-            DatastoreWatchReplaySource::new(
-                std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    self.db.clone(),
-                )),
-                vec![WatchTarget::namespaced("batch/v1", "CronJob")],
-            ),
-            topic,
-            WatchDeliveryScope::NamespacedAll,
-            self.db.get_current_resource_version().await.unwrap_or(0),
-            WindowPolicy::default_watch_delivery(),
-        );
+        let mut watch = match self.runtime.subscribe_watch().await {
+            Ok(watch) => watch,
+            Err(error) => {
+                tracing::warn!("cronjob_scheduler: watch subscribe failed: {error:#}");
+                return;
+            }
+        };
         if let Err(e) = self.startup_walk().await {
             tracing::warn!("cronjob_scheduler: startup walk after watch subscribe failed: {e:#}");
         }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                msg = cursor.next_event() => {
+                msg = watch.next_event() => {
                     match msg {
                         Ok(event) => {
                             if !is_cronjob_event(&event) {

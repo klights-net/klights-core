@@ -160,11 +160,7 @@ fn maybe_pause_list_resources_snapshot_after_rows_for_test(
     }
 }
 
-fn list_response_resource_version(
-    _items: &[Resource],
-    current_rv: i64,
-    pending_reserved_rv: Option<i64>,
-) -> i64 {
+fn list_response_resource_version(_items: &[Resource], current_rv: i64) -> i64 {
     // Every list (complete or paginated) reports the in-transaction global
     // snapshot resourceVersion. Because rows and `current_rv` are read inside
     // the same WAL read transaction, `current_rv` is already consistent with
@@ -174,39 +170,7 @@ fn list_response_resource_version(
     // collection revision anchors a follow-up `?watch=true&resourceVersion=<list
     // rv>` to "now", replaying nothing for objects already reflected in the
     // list (the kubectl `-w` phantom-pod artifact).
-    let mut response_rv = current_rv;
-    if let Some(reserved_rv) = pending_reserved_rv.filter(|rv| *rv > 0) {
-        response_rv = response_rv.min(reserved_rv.saturating_sub(1));
-    }
-    response_rv
-}
-
-fn list_subject_key_prefix(api_version: &str, kind: &str, namespace: Option<&str>) -> String {
-    match namespace {
-        Some(namespace) => format!("{api_version}/{kind}/{namespace}/"),
-        None => format!("{api_version}/{kind}/"),
-    }
-}
-
-fn pending_reserved_rv_for_collection_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    subject_prefix: &str,
-) -> tokio_rusqlite::Result<Option<i64>> {
-    if Datastore::resource_version_assignment_mode_in_tx(tx)?
-        == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
-    {
-        return Ok(None);
-    }
-    tx.query_row(
-        "SELECT MIN(reserved_rv) FROM applied_outbox
-         WHERE reserved_rv IS NOT NULL
-           AND applied_rv IS NULL
-           AND length(result_proto) = 0
-           AND subject_key LIKE ?1",
-        rusqlite::params![format!("{subject_prefix}%")],
-        |row| row.get(0),
-    )
-    .map_err(tokio_rusqlite::Error::from)
+    current_rv
 }
 
 impl Datastore {
@@ -424,7 +388,7 @@ impl Datastore {
             let token_for_count = token_owned.clone();
             let ns_for_count = ns_owned.clone();
             let event_compat = needs_event_v1_compat(api_version, kind);
-            let (items, total_after_token, watch_position, pending_reserved_rv) =
+            let (items, total_after_token, watch_position) =
                 if use_namespaced_table(api_version, kind, &namespace) {
                     self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
@@ -492,17 +456,7 @@ impl Datastore {
                         let total_after_token: i64 =
                             conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
                         let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                            &tx,
-                            &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
-                        )?;
-
-                        Ok((
-                            items,
-                            total_after_token,
-                            watch_position,
-                            pending_reserved_rv,
-                        ))
+                        Ok((items, total_after_token, watch_position))
                     })
                     .await?
                 } else {
@@ -548,16 +502,7 @@ impl Datastore {
                         let total_after_token: i64 =
                             conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
                         let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                            &tx,
-                            &list_subject_key_prefix(&av, &k, None),
-                        )?;
-                        Ok((
-                            items,
-                            total_after_token,
-                            watch_position,
-                            pending_reserved_rv,
-                        ))
+                        Ok((items, total_after_token, watch_position))
                     })
                     .await?
                 };
@@ -568,11 +513,8 @@ impl Datastore {
                 next_token = items.last().map(|r| r.name.clone());
                 remaining_item_count = Some((total_after_token - lim).max(0));
             }
-            let response_rv = list_response_resource_version(
-                &items,
-                watch_position.resource_version,
-                pending_reserved_rv,
-            );
+            let response_rv =
+                list_response_resource_version(&items, watch_position.resource_version);
             let watch_replay_position = Some(WatchReplayPosition {
                 resource_version: response_rv,
                 ..watch_position
@@ -611,11 +553,7 @@ impl Datastore {
             // Build the pushdown separately for each branch because the param
             // offset (base query parameter count) differs between namespaced
             // and cluster paths.
-            let (items, watch_position, pending_reserved_rv) = if use_namespaced_table(
-                api_version,
-                kind,
-                &namespace,
-            ) {
+            let (items, watch_position) = if use_namespaced_table(api_version, kind, &namespace) {
                 // Base param count WITHOUT token/cursor: used for residual
                 // cursor batching where the cursor comes after pushdown.
                 // The non-residual path adds token back for its offset.
@@ -785,11 +723,7 @@ impl Datastore {
                             cursor_name = last_candidate_name;
                         }
                         let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                            &tx,
-                            &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
-                        )?;
-                        Ok((page_items, watch_position, pending_reserved_rv))
+                        Ok((page_items, watch_position))
                     })
                     .await?
                 } else {
@@ -902,11 +836,7 @@ impl Datastore {
                             pause_continue_token.as_deref(),
                         );
                         let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                            &tx,
-                            &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
-                        )?;
-                        Ok((page_items, watch_position, pending_reserved_rv))
+                        Ok((page_items, watch_position))
                     })
                     .await?
                 }
@@ -1038,11 +968,7 @@ impl Datastore {
                             cursor_name = last_candidate_name;
                         }
                         let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                            &tx,
-                            &list_subject_key_prefix(&av, &k, None),
-                        )?;
-                        Ok((page_items, watch_position, pending_reserved_rv))
+                        Ok((page_items, watch_position))
                     })
                     .await?
                 } else {
@@ -1112,11 +1038,7 @@ impl Datastore {
                             }
                         }
                         let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                            &tx,
-                            &list_subject_key_prefix(&av, &k, None),
-                        )?;
-                        Ok((page_items, watch_position, pending_reserved_rv))
+                        Ok((page_items, watch_position))
                     })
                     .await?
                 }
@@ -1131,11 +1053,8 @@ impl Datastore {
                 items.truncate(lim);
                 next_token = items.last().map(|r| r.name.clone());
             }
-            let response_rv = list_response_resource_version(
-                &items,
-                watch_position.resource_version,
-                pending_reserved_rv,
-            );
+            let response_rv =
+                list_response_resource_version(&items, watch_position.resource_version);
             let watch_replay_position = Some(WatchReplayPosition {
                 resource_version: response_rv,
                 ..watch_position
@@ -1177,11 +1096,7 @@ impl Datastore {
         };
         let no_limit_field_conditions = no_limit_field_pushdown.residual_fields;
 
-        let (items, watch_position, pending_reserved_rv) = if use_namespaced_table(
-            api_version,
-            kind,
-            &namespace,
-        ) {
+        let (items, watch_position) = if use_namespaced_table(api_version, kind, &namespace) {
             // Namespaced resources
             self.read_db_call("db_query", move |conn| {
                 let tx = conn.transaction()?;
@@ -1269,11 +1184,7 @@ impl Datastore {
                     items.push(item);
                 }
                 let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                    &tx,
-                    &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
-                )?;
-                Ok((items, watch_position, pending_reserved_rv))
+                Ok((items, watch_position))
             })
             .await?
         } else {
@@ -1348,11 +1259,7 @@ impl Datastore {
                     items.push(item);
                 }
                 let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
-                let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
-                    &tx,
-                    &list_subject_key_prefix(&av, &k, None),
-                )?;
-                Ok((items, watch_position, pending_reserved_rv))
+                Ok((items, watch_position))
             })
             .await?
         };
@@ -1373,11 +1280,7 @@ impl Datastore {
             items.truncate(lim);
             next_token = Some(items.last().unwrap().name.clone());
         }
-        let response_rv = list_response_resource_version(
-            &items,
-            watch_position.resource_version,
-            pending_reserved_rv,
-        );
+        let response_rv = list_response_resource_version(&items, watch_position.resource_version);
         Ok(ResourceList {
             items,
             resource_version: response_rv,
@@ -1429,22 +1332,6 @@ impl Datastore {
         self.read_db_call("list_resources_for_watch_targets", move |conn| {
             let tx = conn.transaction()?;
             let mut items = Vec::new();
-            let mut pending_reserved_rv = None::<i64>;
-            for target in &targets {
-                let namespace = match &target.scope {
-                    WatchTargetScope::Cluster => None,
-                    WatchTargetScope::Namespaced(namespace) => namespace.as_deref(),
-                };
-                if let Some(reserved_rv) = pending_reserved_rv_for_collection_in_tx(
-                    &tx,
-                    &list_subject_key_prefix(&target.api_version, &target.kind, namespace),
-                )? {
-                    pending_reserved_rv = Some(
-                        pending_reserved_rv.map_or(reserved_rv, |current| current.min(reserved_rv)),
-                    );
-                }
-            }
-
             for target in &targets {
                 match &target.scope {
                     WatchTargetScope::Cluster => {
@@ -1552,11 +1439,8 @@ impl Datastore {
             }
 
             let mut watch_replay_position = Self::current_watch_replay_position_in_tx(&tx)?;
-            let response_rv = list_response_resource_version(
-                &items,
-                watch_replay_position.resource_version,
-                pending_reserved_rv,
-            );
+            let response_rv =
+                list_response_resource_version(&items, watch_replay_position.resource_version);
             watch_replay_position.resource_version = response_rv;
             Ok(ResourceList {
                 items,

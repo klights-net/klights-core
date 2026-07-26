@@ -11,10 +11,9 @@ use tokio::sync::broadcast;
 use crate::datastore::sqlite::DbExecutor;
 use crate::datastore::{
     PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkAllocationRequest,
-    PodNetworkEndpoint, PodSlotAdmissionEvent, PodWorkqueueEntry, PodWorkqueueKind,
+    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
+    PodSlotClearResult, PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind,
 };
-use crate::storage_wire_codec::decode_command_protobuf;
-
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 
@@ -78,6 +77,7 @@ pub struct OutboxInsert {
     pub subject_uid: Option<String>,
     pub pod_uid: String,
     pub operation: String,
+    pub classification: klights_node_store::OutboxClassification,
     pub payload_proto: Vec<u8>,
     pub next_due_ms: i64,
 }
@@ -96,6 +96,8 @@ pub struct OutboxRow {
     pub subject_uid: Option<String>,
     pub pod_uid: String,
     pub operation: String,
+    pub priority_class: i64,
+    pub supersedable_pod_status: bool,
     pub is_terminal_pod_delete: bool,
     pub stream_id: i64,
     pub stream_seq: i64,
@@ -294,6 +296,269 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("pod_runtime admit failed: {e}"))
+    }
+
+    pub async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult> {
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+        let pod_uid = pod_uid.to_string();
+        let node_name = node_name.to_string();
+        let event_namespace = namespace.clone();
+        let event_pod_name = pod_name.clone();
+        let event_pod_uid = pod_uid.clone();
+        let (result, event) = self
+            .db_call("node_local:pod_slot_try_admit", move |conn| {
+                let tx = conn.transaction()?;
+                let existing = read_pod_slot(&tx, &namespace, &pod_name)?;
+                let (result, event) = match existing {
+                    None => {
+                        let rv = next_pod_slot_resource_version(&tx)?;
+                        tx.execute(
+                            queries::POD_SLOT_ADMISSION_INSERT,
+                            rusqlite::params![
+                                namespace,
+                                pod_name,
+                                pod_uid,
+                                node_name,
+                                PodSlotAdmissionState::Admitted.as_str(),
+                                rv,
+                                now_ms(),
+                            ],
+                        )?;
+                        (
+                            PodSlotAdmissionResult::Admitted {
+                                resource_version: rv,
+                            },
+                            Some(PodSlotAdmissionEvent::Changed {
+                                namespace: event_namespace,
+                                pod_name: event_pod_name,
+                                pod_uid: event_pod_uid,
+                                state: PodSlotAdmissionState::Admitted,
+                                resource_version: rv,
+                            }),
+                        )
+                    }
+                    Some(row) if row.pod_uid == pod_uid => {
+                        if row.state == PodSlotAdmissionState::Admitted
+                            && row.node_name == node_name
+                        {
+                            (
+                                PodSlotAdmissionResult::Admitted {
+                                    resource_version: row.resource_version,
+                                },
+                                None,
+                            )
+                        } else {
+                            let rv = next_pod_slot_resource_version(&tx)?;
+                            tx.execute(
+                                queries::POD_SLOT_ADMISSION_UPDATE,
+                                rusqlite::params![
+                                    namespace,
+                                    pod_name,
+                                    pod_uid,
+                                    node_name,
+                                    PodSlotAdmissionState::Admitted.as_str(),
+                                    rv,
+                                    now_ms(),
+                                ],
+                            )?;
+                            (
+                                PodSlotAdmissionResult::Admitted {
+                                    resource_version: rv,
+                                },
+                                Some(PodSlotAdmissionEvent::Changed {
+                                    namespace: event_namespace,
+                                    pod_name: event_pod_name,
+                                    pod_uid: event_pod_uid,
+                                    state: PodSlotAdmissionState::Admitted,
+                                    resource_version: rv,
+                                }),
+                            )
+                        }
+                    }
+                    Some(row) => (
+                        PodSlotAdmissionResult::Blocked {
+                            blocking_uid: row.pod_uid,
+                            blocking_node: row.node_name,
+                            state: row.state,
+                            resource_version: row.resource_version,
+                        },
+                        None,
+                    ),
+                };
+                tx.commit()?;
+                Ok((result, event))
+            })
+            .await
+            .map_err(|e| anyhow!("pod slot admission failed: {e}"))?;
+        if let Some(event) = event {
+            let _ = self.pod_slot_admission_tx.send(event);
+        }
+        Ok(result)
+    }
+
+    pub async fn pod_slot_mark_terminating(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotMutationResult> {
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+        let pod_uid = pod_uid.to_string();
+        let node_name = node_name.to_string();
+        let event_namespace = namespace.clone();
+        let event_pod_name = pod_name.clone();
+        let event_pod_uid = pod_uid.clone();
+        let (result, event) = self
+            .db_call("node_local:pod_slot_mark_terminating", move |conn| {
+                let tx = conn.transaction()?;
+                let existing = read_pod_slot(&tx, &namespace, &pod_name)?;
+                let (result, event) = match existing {
+                    Some(row) if row.pod_uid != pod_uid => {
+                        return Err(tokio_rusqlite::Error::Other(Box::new(
+                            std::io::Error::other("pod slot admission UID precondition failed"),
+                        )));
+                    }
+                    Some(row)
+                        if row.state == PodSlotAdmissionState::Terminating
+                            && row.node_name == node_name =>
+                    {
+                        (
+                            PodSlotMutationResult::Unchanged {
+                                resource_version: row.resource_version,
+                            },
+                            None,
+                        )
+                    }
+                    Some(_) => {
+                        let rv = next_pod_slot_resource_version(&tx)?;
+                        tx.execute(
+                            queries::POD_SLOT_ADMISSION_UPDATE,
+                            rusqlite::params![
+                                namespace,
+                                pod_name,
+                                pod_uid,
+                                node_name,
+                                PodSlotAdmissionState::Terminating.as_str(),
+                                rv,
+                                now_ms(),
+                            ],
+                        )?;
+                        (
+                            PodSlotMutationResult::Changed {
+                                resource_version: rv,
+                            },
+                            Some(PodSlotAdmissionEvent::Changed {
+                                namespace: event_namespace,
+                                pod_name: event_pod_name,
+                                pod_uid: event_pod_uid,
+                                state: PodSlotAdmissionState::Terminating,
+                                resource_version: rv,
+                            }),
+                        )
+                    }
+                    None => {
+                        let rv = next_pod_slot_resource_version(&tx)?;
+                        tx.execute(
+                            queries::POD_SLOT_ADMISSION_INSERT,
+                            rusqlite::params![
+                                namespace,
+                                pod_name,
+                                pod_uid,
+                                node_name,
+                                PodSlotAdmissionState::Terminating.as_str(),
+                                rv,
+                                now_ms(),
+                            ],
+                        )?;
+                        (
+                            PodSlotMutationResult::Changed {
+                                resource_version: rv,
+                            },
+                            Some(PodSlotAdmissionEvent::Changed {
+                                namespace: event_namespace,
+                                pod_name: event_pod_name,
+                                pod_uid: event_pod_uid,
+                                state: PodSlotAdmissionState::Terminating,
+                                resource_version: rv,
+                            }),
+                        )
+                    }
+                };
+                tx.commit()?;
+                Ok((result, event))
+            })
+            .await
+            .map_err(|e| anyhow!("pod slot terminating transition failed: {e}"))?;
+        if let Some(event) = event {
+            let _ = self.pod_slot_admission_tx.send(event);
+        }
+        Ok(result)
+    }
+
+    pub async fn pod_slot_clear_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<PodSlotClearResult> {
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+        let pod_uid = pod_uid.to_string();
+        let event_namespace = namespace.clone();
+        let event_pod_name = pod_name.clone();
+        let event_pod_uid = pod_uid.clone();
+        let (result, event) = self
+            .db_call("node_local:pod_slot_clear_if_uid", move |conn| {
+                let tx = conn.transaction()?;
+                let Some(row) = read_pod_slot(&tx, &namespace, &pod_name)? else {
+                    tx.commit()?;
+                    return Ok((PodSlotClearResult::NotFound, None));
+                };
+                if row.pod_uid != pod_uid {
+                    tx.commit()?;
+                    return Ok((
+                        PodSlotClearResult::UidMismatch {
+                            blocking_uid: row.pod_uid,
+                            blocking_node: row.node_name,
+                            state: row.state,
+                            resource_version: row.resource_version,
+                        },
+                        None,
+                    ));
+                }
+                let rv = next_pod_slot_resource_version(&tx)?;
+                tx.execute(
+                    queries::POD_SLOT_ADMISSION_DELETE_IF_UID,
+                    rusqlite::params![namespace, pod_name, pod_uid],
+                )?;
+                tx.commit()?;
+                Ok((
+                    PodSlotClearResult::Cleared {
+                        resource_version: rv,
+                    },
+                    Some(PodSlotAdmissionEvent::Cleared {
+                        namespace: event_namespace,
+                        pod_name: event_pod_name,
+                        pod_uid: event_pod_uid,
+                        resource_version: rv,
+                    }),
+                ))
+            })
+            .await
+            .map_err(|e| anyhow!("pod slot clear failed: {e}"))?;
+        if let Some(event) = event {
+            let _ = self.pod_slot_admission_tx.send(event);
+        }
+        Ok(result)
     }
 
     pub async fn record_sandbox(&self, pod_uid: &str, sandbox_id: &str) -> Result<()> {
@@ -516,15 +781,13 @@ impl SqliteNodeLocalDb {
     }
 
     pub async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
-        let (operation, priority_class, supersedable_pod_status) =
-            persisted_outbox_classification(row.operation.as_str())?;
-        let is_terminal_pod_delete =
-            is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
+        let (priority_class, supersedable_pod_status, is_terminal_pod_delete, sequence_policy) =
+            row.classification.persisted_values();
         self.db_call("node_local:outbox_enqueue", move |conn| {
             let tx = conn.transaction()?;
             let client_id = ensure_outbox_client_id_in_tx(&tx)?;
-            let sequenced =
-                operation != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew;
+            let sequenced = sequence_policy
+                == klights_node_store::OutboxSequencePolicy::PerSubject.persisted_value();
             let stream_id = if sequenced {
                 outbox_stream_id(&row.subject_key)
             } else {
@@ -551,7 +814,7 @@ impl SqliteNodeLocalDb {
                     row.operation,
                     priority_class,
                     supersedable_pod_status,
-                    if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
+                    is_terminal_pod_delete,
                     stream_id,
                     stream_seq,
                     row.payload_proto,
@@ -718,7 +981,6 @@ impl SqliteNodeLocalDb {
                 return Ok(None);
             };
             let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
-            assign_outbox_stream_seq_if_needed(&tx, id)?;
             tx.execute(
                 queries::OUTBOX_SET_LEASE,
                 rusqlite::params![id, leased_until_ms, lease_token, now_ms],
@@ -877,8 +1139,8 @@ impl SqliteNodeLocalDb {
                 let tx = conn.transaction()?;
                 let ids = {
                     let mut stmt = tx.prepare(queries::outbox_claim_due_batch())?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![now_ms, limit_i64], |row| row.get(0))?;
+                    let rows =
+                        stmt.query_map(rusqlite::params![now_ms, limit_i64], |row| row.get(0))?;
                     rows.collect::<rusqlite::Result<Vec<i64>>>()?
                 };
                 if ids.is_empty() {
@@ -888,7 +1150,6 @@ impl SqliteNodeLocalDb {
                 let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
                 let mut leased_ids = Vec::new();
                 for &id in &ids {
-                    assign_outbox_stream_seq_if_needed(&tx, id)?;
                     let changed = tx.execute(
                         queries::OUTBOX_SET_LEASE,
                         rusqlite::params![id, leased_until_ms, lease_token, now_ms],
@@ -899,11 +1160,7 @@ impl SqliteNodeLocalDb {
                 }
                 let mut rows = Vec::with_capacity(leased_ids.len());
                 {
-                    let mut stmt = tx.prepare("SELECT id, client_id, idempotency_key, enqueued_ms, \
-                        subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-                        subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
-                        payload_proto, attempt, next_due_ms, leased_until_ms, lease_token, last_error \
-                        FROM outbox WHERE id = ?1")?;
+                    let mut stmt = tx.prepare(queries::OUTBOX_ROW_SELECT)?;
                     for id in leased_ids {
                         if let Some(row) = stmt.query_row([id], row_to_outbox).optional()? {
                             rows.push(row);
@@ -1052,7 +1309,11 @@ impl SqliteNodeLocalDb {
         .map_err(|e| anyhow!("dead letter delete failed: {e}"))
     }
 
-    pub async fn replay_dead_letter(&self, id: i64) -> Result<bool> {
+    pub async fn replay_dead_letter(
+        &self,
+        id: i64,
+        classification: klights_node_store::OutboxClassification,
+    ) -> Result<bool> {
         let now = now_ms();
         let row = self
             .db_call("node_local:outbox_dead_letter_replay_get", move |conn| {
@@ -1065,11 +1326,8 @@ impl SqliteNodeLocalDb {
         let Some(row) = row else {
             return Ok(false);
         };
-        let (operation, priority_class, supersedable_pod_status) =
-            persisted_outbox_classification(row.operation.as_str())?;
-        let is_terminal_pod_delete =
-            is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
-
+        let (priority_class, supersedable_pod_status, is_terminal_pod_delete, sequence_policy) =
+            classification.persisted_values();
         self.db_call("node_local:outbox_dead_letter_replay", move |conn| {
             let tx = conn.transaction()?;
             let client_id = if row.client_id.is_empty() {
@@ -1077,8 +1335,8 @@ impl SqliteNodeLocalDb {
             } else {
                 row.client_id
             };
-            let sequenced =
-                operation != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew;
+            let sequenced = sequence_policy
+                == klights_node_store::OutboxSequencePolicy::PerSubject.persisted_value();
             let stream_id = if row.stream_id > 0 {
                 row.stream_id
             } else if sequenced {
@@ -1086,7 +1344,13 @@ impl SqliteNodeLocalDb {
             } else {
                 0
             };
-            let stream_seq = row.stream_seq;
+            let stream_seq = if row.stream_seq > 0 {
+                row.stream_seq
+            } else if sequenced {
+                allocate_next_outbox_stream_seq(&tx, stream_id)?
+            } else {
+                0
+            };
             tx.execute(
                 queries::OUTBOX_INSERT,
                 rusqlite::params![
@@ -1103,7 +1367,7 @@ impl SqliteNodeLocalDb {
                     row.operation,
                     priority_class,
                     supersedable_pod_status,
-                    if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
+                    is_terminal_pod_delete,
                     stream_id,
                     stream_seq,
                     row.payload_proto,
@@ -1409,69 +1673,6 @@ fn ensure_outbox_client_id_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Re
     Ok(client_id)
 }
 
-fn persisted_outbox_classification(
-    operation: &str,
-) -> Result<(crate::kubelet::outbox::payload::OutboxOperation, i64, i64)> {
-    let operation = crate::kubelet::outbox::payload::OutboxOperation::try_from(operation)?;
-    Ok((
-        operation,
-        operation.priority_class().persisted_value(),
-        i64::from(operation.supersedable_pod_status()),
-    ))
-}
-
-fn assign_outbox_stream_seq_if_needed(
-    tx: &rusqlite::Transaction<'_>,
-    outbox_id: i64,
-) -> rusqlite::Result<()> {
-    let (client_id, subject_key, operation, stream_id, stream_seq): (
-        String,
-        String,
-        String,
-        i64,
-        i64,
-    ) = tx.query_row(
-        "SELECT client_id, subject_key, operation, stream_id, stream_seq \
-         FROM outbox WHERE id = ?1",
-        [outbox_id],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        },
-    )?;
-    if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
-        return Ok(());
-    }
-    if !client_id.is_empty() && stream_id > 0 && stream_seq > 0 {
-        return Ok(());
-    }
-    let client_id = if client_id.is_empty() {
-        ensure_outbox_client_id_in_tx(tx)?
-    } else {
-        client_id
-    };
-    let stream_id = if stream_id > 0 {
-        stream_id
-    } else {
-        outbox_stream_id(&subject_key)
-    };
-    let stream_seq = if stream_seq > 0 {
-        stream_seq
-    } else {
-        allocate_next_outbox_stream_seq(tx, stream_id)?
-    };
-    tx.execute(
-        "UPDATE outbox SET client_id = ?2, stream_id = ?3, stream_seq = ?4 WHERE id = ?1",
-        rusqlite::params![outbox_id, client_id, stream_id, stream_seq],
-    )?;
-    Ok(())
-}
-
 fn allocate_next_outbox_stream_seq(
     tx: &rusqlite::Transaction<'_>,
     stream_id: i64,
@@ -1519,15 +1720,17 @@ fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         subject_uid: row.get(9)?,
         pod_uid: row.get(10)?,
         operation: row.get(11)?,
-        is_terminal_pod_delete: row.get::<_, i64>(12)? != 0,
-        stream_id: row.get(13)?,
-        stream_seq: row.get(14)?,
-        payload_proto: row.get(15)?,
-        attempt: row.get(16)?,
-        next_due_ms: row.get(17)?,
-        leased_until_ms: row.get(18)?,
-        lease_token: row.get(19)?,
-        last_error: row.get(20)?,
+        priority_class: row.get(12)?,
+        supersedable_pod_status: row.get::<_, i64>(13)? != 0,
+        is_terminal_pod_delete: row.get::<_, i64>(14)? != 0,
+        stream_id: row.get(15)?,
+        stream_seq: row.get(16)?,
+        payload_proto: row.get(17)?,
+        attempt: row.get(18)?,
+        next_due_ms: row.get(19)?,
+        leased_until_ms: row.get(20)?,
+        lease_token: row.get(21)?,
+        last_error: row.get(22)?,
     })
 }
 
@@ -1538,14 +1741,6 @@ pub fn outbox_stream_id(subject_key: &str) -> i64 {
     let value = u64::from_be_bytes(shard_bytes);
     let stream_id = (value & i64::MAX as u64) as i64;
     if stream_id == 0 { 1 } else { stream_id }
-}
-
-fn is_terminal_pod_delete_outbox_row(operation: &str, payload_proto: &[u8]) -> bool {
-    if operation != "PodMetadata" {
-        return false;
-    }
-    decode_command_protobuf(payload_proto)
-        .is_ok_and(|command| command.variant_name() == "FinalizeBoundPod")
 }
 
 fn row_to_dead_letter(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {
@@ -1570,6 +1765,54 @@ fn row_to_dead_letter(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow
         last_error: row.get(17)?,
         moved_at_ms: row.get(18)?,
     })
+}
+
+struct PodSlotRow {
+    pod_uid: String,
+    node_name: String,
+    state: PodSlotAdmissionState,
+    resource_version: i64,
+}
+
+fn read_pod_slot(
+    tx: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    pod_name: &str,
+) -> rusqlite::Result<Option<PodSlotRow>> {
+    tx.query_row(
+        queries::POD_SLOT_ADMISSION_SELECT,
+        rusqlite::params![namespace, pod_name],
+        |row| {
+            let state_text: String = row.get(2)?;
+            let state = PodSlotAdmissionState::parse(&state_text).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::other(err.to_string())),
+                )
+            })?;
+            Ok(PodSlotRow {
+                pod_uid: row.get(0)?,
+                node_name: row.get(1)?,
+                state,
+                resource_version: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn next_pod_slot_resource_version(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<i64> {
+    let current = tx
+        .query_row(queries::POD_SLOT_RV_SELECT, [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let next = current.saturating_add(1);
+    tx.execute(queries::POD_SLOT_RV_UPSERT, [next.to_string()])?;
+    Ok(next)
 }
 
 #[cfg(test)]

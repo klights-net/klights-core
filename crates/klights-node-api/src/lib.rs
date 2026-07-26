@@ -7,6 +7,33 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 
+/// Transport limits needed by the kubelet's local containerd CRI channel.
+///
+/// Inter-node keepalive, TLS, lane, and RPC deadline policy deliberately
+/// remain outside this node-facing value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CriTransportPolicy {
+    connect_timeout: std::time::Duration,
+    max_message_bytes: usize,
+}
+
+impl CriTransportPolicy {
+    pub const fn new(connect_timeout: std::time::Duration, max_message_bytes: usize) -> Self {
+        Self {
+            connect_timeout,
+            max_message_bytes,
+        }
+    }
+
+    pub const fn connect_timeout(self) -> std::time::Duration {
+        self.connect_timeout
+    }
+
+    pub const fn max_message_bytes(self) -> usize {
+        self.max_message_bytes
+    }
+}
+
 fn require_nonempty(value: &str, field: &'static str) -> Result<(), ExecSetupError> {
     if value.trim().is_empty() {
         Err(ExecSetupError::invalid(field, "must not be empty"))

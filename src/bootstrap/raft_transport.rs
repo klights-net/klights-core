@@ -248,7 +248,7 @@ impl ReplicationGrpcMemberFeatureProbe {
             leader_epoch: 0,
             current_rv: 0,
             current_log_index: 0,
-            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
         })
     }
 }
@@ -294,8 +294,8 @@ mod tests {
         let metadata = ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local)
             .expect("the local member must not require a self gRPC connection");
         assert_eq!(
-            metadata.supported_features,
-            crate::replication::protocol::LOCAL_SUPPORTED_FEATURES
+            metadata.command_codec_version,
+            crate::log_apply::COMMAND_CODEC_VERSION
         );
         assert!(
             ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local + 1)

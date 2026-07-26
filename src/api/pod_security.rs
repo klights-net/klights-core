@@ -1,7 +1,5 @@
 use serde_json::Value;
 
-use crate::datastore::DatastoreBackend;
-
 use super::AppError;
 
 const LABEL_PREFIX: &str = "pod-security.kubernetes.io/";
@@ -14,16 +12,23 @@ enum PodSecurityLevel {
 }
 
 pub async fn enforce_pod_security_admission(
-    db: &dyn DatastoreBackend,
+    resource_query: &dyn klights_leader_api::LeaderResourceQuery,
     namespace: &str,
     pod: &Value,
 ) -> Result<(), AppError> {
-    let Some(namespace_resource) = db
-        .get_resource("v1", "Namespace", None, namespace)
-        .await
-        .map_err(|e| {
-            AppError::BadRequest(format!("failed to read namespace for PodSecurity: {e}"))
-        })?
+    let Some(namespace_resource) = crate::api::resource_query_ports::get_resource(
+        resource_query,
+        "v1",
+        "Namespace",
+        None,
+        namespace,
+    )
+    .await
+    .map_err(|error| {
+        AppError::BadRequest(format!(
+            "failed to read namespace for PodSecurity: {error:?}"
+        ))
+    })?
     else {
         return Ok(());
     };

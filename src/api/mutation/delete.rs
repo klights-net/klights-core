@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::api::AppError;
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use crate::resource_preconditions;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 
 pub fn ensure_delete_preconditions_match(
     resource: &Resource,
@@ -32,21 +32,22 @@ pub trait DeleteStrategy: Send + Sync {
 }
 
 pub struct FinalizerAwareDeleteStrategy<'a> {
-    pub db: &'a dyn DatastoreBackend,
+    pub resource_query: &'a dyn klights_leader_api::LeaderResourceQuery,
+    pub lifecycle: &'a dyn klights_reconcile_api::FinalizerLifecyclePort,
 }
 
 #[async_trait]
 impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
     async fn load(&self, target: &klights_types::ResourceKey) -> Result<Resource, AppError> {
-        self.db
-            .get_resource(
-                &target.api_version,
-                &target.kind,
-                target.namespace.as_deref(),
-                &target.name,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("{} not found", target.kind)))
+        crate::api::resource_query_ports::get_resource(
+            self.resource_query,
+            &target.api_version,
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} not found", target.kind)))
     }
 
     async fn execute(
@@ -59,7 +60,7 @@ impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
             && intent.propagation_policy == crate::api::mutation::PropagationPolicy::Foreground
         {
             let updated = crate::api::finalizer_delete::mark_foreground_deletion_with_retry(
-                self.db,
+                self.lifecycle,
                 &target.api_version,
                 &target.kind,
                 target.namespace.as_deref(),
@@ -73,7 +74,7 @@ impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
 
         let grace_seconds = intent.options._grace_period_seconds.unwrap_or(0);
         match crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
-            self.db,
+            self.lifecycle,
             crate::api::finalizer_delete::NonForegroundDeleteRequest {
                 target: crate::api::finalizer_delete::ResourceDeleteTarget {
                     api_version: &target.api_version,

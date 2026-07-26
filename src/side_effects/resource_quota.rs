@@ -1,84 +1,103 @@
 //! Side effect to recount ResourceQuota after namespaced resource mutations.
 
-use super::{PodRepositorySlot, SideEffect};
-use crate::controllers::resource_quota;
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
-
-/// Recounts ResourceQuota status.used after any namespaced resource mutation.
-///
-/// Holds a [`PodRepositorySlot`] so the late-bound `PodRepository` is
-/// resolved at `apply` time — pod-scoped quota counts (cpu/memory sums,
-/// scoped pod counts) go through `PodReader::list_pods`.
-pub struct ResourceQuotaEffect {
-    pod_repository: PodRepositorySlot,
-}
 
 #[async_trait]
-impl SideEffect for ResourceQuotaEffect {
-    fn name(&self) -> &'static str {
-        "resource_quota_recount"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let namespace = resource
-            .pointer("/metadata/namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if namespace.is_empty() {
-            return Ok(());
-        }
-
-        let kind = resource
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let name = resource
-            .pointer("/metadata/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let Some(pod_repository) = self.pod_repository.get() else {
-            tracing::debug!(
-                "ResourceQuotaEffect skipped for {}: PodRepository not yet bound",
-                namespace
-            );
-            return Ok(());
-        };
-
-        tracing::info!(
-            kind = %kind,
-            name = %name,
-            namespace = %namespace,
-            "ResourceQuotaEffect firing"
-        );
-
-        resource_quota::reconcile_resource_quotas_for_namespace(
-            db,
-            pod_repository.as_ref(),
-            namespace,
-        )
-        .await
-    }
+pub(crate) trait ResourceQuotaSideEffectPort: Send + Sync {
+    async fn recount_namespace(&self, namespace: &str) -> Result<()>;
 }
 
-/// Create a ResourceQuotaEffect instance backed by the supplied late-bound
-/// `PodRepository` slot.
-pub fn resource_quota_recount(pod_repository: PodRepositorySlot) -> Arc<dyn SideEffect> {
-    Arc::new(ResourceQuotaEffect { pod_repository })
+pub(crate) async fn apply_resource_quota_event<Port: ResourceQuotaSideEffectPort + ?Sized>(
+    resource: &Value,
+    port: &Port,
+) -> Result<()> {
+    let namespace = resource
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if namespace.is_empty() {
+        return Ok(());
+    }
+
+    let kind = resource
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let name = resource
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    tracing::info!(
+        kind = %kind,
+        name = %name,
+        namespace = %namespace,
+        "ResourceQuotaEffect firing"
+    );
+    port.recount_namespace(namespace).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct FakeResourceQuotaPort {
+        namespaces: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceQuotaSideEffectPort for FakeResourceQuotaPort {
+        async fn recount_namespace(&self, namespace: &str) -> anyhow::Result<()> {
+            self.namespaces.lock().unwrap().push(namespace.to_string());
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn test_resource_quota_recount_name() {
-        let effect = resource_quota_recount(PodRepositorySlot::new());
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = crate::resource_quota_side_effect_adapter::effect(
+            db_handle,
+            crate::side_effects::PodSideEffectPortsSlot::new(),
+        );
         assert_eq!(effect.name(), "resource_quota_recount");
+    }
+
+    #[tokio::test]
+    async fn namespaced_event_recounts_exact_namespace_through_port() {
+        let port = FakeResourceQuotaPort {
+            namespaces: Mutex::new(Vec::new()),
+        };
+        apply_resource_quota_event(
+            &serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "work", "name": "settings"}
+            }),
+            &port,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*port.namespaces.lock().unwrap(), vec!["work"]);
+    }
+
+    #[tokio::test]
+    async fn cluster_scoped_event_does_not_recount() {
+        let port = FakeResourceQuotaPort {
+            namespaces: Mutex::new(Vec::new()),
+        };
+        apply_resource_quota_event(
+            &serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "node-a"}
+            }),
+            &port,
+        )
+        .await
+        .unwrap();
+        assert!(port.namespaces.lock().unwrap().is_empty());
     }
 }

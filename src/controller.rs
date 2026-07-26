@@ -39,6 +39,7 @@ pub struct Context {
     /// Request-scoped metrics provider used by HPA. Optional so unit tests
     /// that exercise unrelated controllers do not need metrics wiring.
     pub metrics_provider: Option<Arc<dyn crate::metrics::MetricsProvider>>,
+    non_pod_finalization: Option<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>,
     /// Explicit access to supervised filesystem and process work.
     file_process: klights_supervisor::FileProcessExecutor,
 }
@@ -57,6 +58,7 @@ impl Context {
             services: None,
             pod_repository: None,
             metrics_provider: None,
+            non_pod_finalization: None,
             file_process,
         }
     }
@@ -81,6 +83,7 @@ impl Context {
             services: None,
             pod_repository: None,
             metrics_provider: None,
+            non_pod_finalization: None,
             file_process,
         }
     }
@@ -100,6 +103,7 @@ impl Context {
             services: Some(services),
             pod_repository: None,
             metrics_provider: None,
+            non_pod_finalization: None,
             file_process,
         }
     }
@@ -130,6 +134,7 @@ impl Context {
             services: Some(services),
             pod_repository: None,
             metrics_provider: None,
+            non_pod_finalization: None,
             file_process,
         }
     }
@@ -147,6 +152,20 @@ impl Context {
     ) -> Self {
         self.metrics_provider = Some(metrics_provider);
         self
+    }
+
+    pub fn with_non_pod_finalization(
+        mut self,
+        port: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    ) -> Self {
+        self.non_pod_finalization = Some(port);
+        self
+    }
+
+    pub fn non_pod_finalization(
+        &self,
+    ) -> Option<&dyn klights_reconcile_api::GcNonPodFinalizationPort> {
+        self.non_pod_finalization.as_deref()
     }
 
     /// Returns the datastore handle (trait object).
@@ -325,11 +344,15 @@ macro_rules! controller_wrapper {
                     )
                 })?;
                 let pod_repo_ref = pod_repository.as_ref();
+                let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
+                    ::anyhow::anyhow!("{} requires non-Pod GC finalization in Context", $name)
+                })?;
                 $core_fn(
                     ctx.db_handle().as_ref(),
                     pod_repo_ref,
                     pod_repo_ref,
                     pod_repo_ref,
+                    non_pod_finalization,
                     &resource,
                     ctx.node_name(),
                 )
@@ -433,11 +456,15 @@ macro_rules! controller_wrapper {
                     )
                 })?;
                 let pod_repo_ref = pod_repository.as_ref();
+                let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
+                    ::anyhow::anyhow!("{} requires non-Pod GC finalization in Context", $name)
+                })?;
                 $core_fn(
                     ctx.db_handle().as_ref(),
                     pod_repo_ref,
                     pod_repo_ref,
                     pod_repo_ref,
+                    non_pod_finalization,
                     &resource,
                 )
                 .await
@@ -491,11 +518,15 @@ macro_rules! controller_wrapper {
                     )
                 })?;
                 let pod_repo_ref = pod_repository.as_ref();
+                let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
+                    ::anyhow::anyhow!("{} requires non-Pod GC finalization in Context", $name)
+                })?;
                 $core_fn(
                     ctx.db_handle().as_ref(),
                     pod_repo_ref,
                     pod_repo_ref,
                     pod_repo_ref,
+                    non_pod_finalization,
                     &resource,
                     ctx.node_name(),
                 )

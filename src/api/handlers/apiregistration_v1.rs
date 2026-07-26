@@ -12,11 +12,15 @@ pub async fn get_apiservice_status(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    let resource = state
-        .db
-        .get_resource("apiregistration.k8s.io/v1", "APIService", None, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound("APIService not found".to_string()))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "apiregistration.k8s.io/v1",
+        "APIService",
+        None,
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("APIService not found".to_string()))?;
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     Ok(K8sResponse::new(data, &headers))
@@ -26,32 +30,16 @@ pub async fn delete_collection_apiservices(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "apiregistration.k8s.io/v1",
-                "APIService",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
-    state.apiservice_proxy_cache.clear().await;
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "apiregistration.k8s.io/v1",
+        "APIService",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
+    state.discovery().apiservice_proxy_cache.clear().await;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))

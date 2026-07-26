@@ -3,16 +3,20 @@
 #[macro_use]
 pub mod macros;
 
+pub(crate) mod admission_ports;
 pub mod apiservice_proxy;
 pub(crate) mod auth_middleware;
 pub(crate) mod backend_proxy_headers;
 mod crd_conversion;
+pub(crate) mod custom_resource_ports;
 mod custom_resources;
 mod debug;
 mod defaulting;
 mod errors;
 mod extractors;
 pub mod finalizer_delete;
+mod gc_ports;
+pub(crate) mod generated_handler_ports;
 pub mod generated_handlers;
 mod handlers;
 pub mod helpers;
@@ -26,25 +30,29 @@ mod patch;
 #[cfg(test)]
 mod patch_tests;
 mod pod_handlers;
+pub(crate) mod pod_repository_ports;
 mod pod_security;
-mod query;
+pub(crate) mod query;
 mod quotas;
 pub mod raft_proxy;
 mod rbac_admission;
 pub(crate) mod request_info;
+mod resource_command_ports;
+pub(crate) mod resource_query_ports;
 mod response;
 #[cfg(test)]
 mod response_tests;
 mod routes;
 pub mod server_side_apply;
 mod state;
+pub(crate) mod state_ports;
 mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
 mod validation;
 #[cfg(test)]
 mod watch_session;
-mod watch_stream;
+pub(crate) mod watch_stream;
 
 #[cfg(test)]
 mod defaulting_tests;
@@ -75,7 +83,7 @@ pub use defaulting::{
     increment_generation_if_spec_changed, inject_create_metadata, set_deletion_timestamp,
 };
 pub use errors::AppError;
-use errors::{map_mutating_admission_error, map_validating_admission_error};
+pub(crate) use errors::{map_mutating_admission_error, map_validating_admission_error};
 pub use extractors::LenientJson;
 use extractors::{decode_json_or_proto, parse_lenient_value_from_bytes};
 pub use generated_handlers::*;
@@ -97,7 +105,8 @@ pub use handlers::flowcontrol_v1::{
 #[cfg(test)]
 pub use helpers::watch_event_from_type;
 pub use helpers::{
-    NamespaceTerminationOutcome, apply_default_storage_class_admission,
+    AdmissionResourceStore, NamespaceTerminationMetrics, NamespaceTerminationOutcome,
+    NamespaceTerminationStore, apply_default_storage_class_admission,
     apply_limitrange_defaults_to_pod, apply_patch, apply_pod_runtimeclass_admission,
     enforce_limitrange_constraints_for_pod, enforce_limitrange_constraints_for_pvc, ensure_array,
     ensure_namespace_status_phase_active, ensure_object, normalize_resource_for_read,
@@ -133,20 +142,26 @@ pub use response::K8sResponse;
 #[cfg(test)]
 pub use response::prefers_protobuf;
 use response::{
-    deployment_list_to_table, generic_list_to_table, node_list_to_table, pod_list_to_table,
-    replicaset_list_to_table, statefulset_list_to_table, wants_table_format, watch_event_to_table,
+    deployment_list_to_table, node_list_to_table, pod_list_to_table, replicaset_list_to_table,
+    statefulset_list_to_table, wants_table_format, watch_event_to_table,
 };
 pub use routes::build_router;
 pub use state::AppState;
+pub(crate) use state::{
+    ApiAuthPolicy, ApiAuthenticators, ApiControllerReconcileServices,
+    ApiDiscoveryAggregationServices, ApiNodeRole, ApiOperationalConfig, ApiOperationalServices,
+    ApiPodNodeSubresourceServices, ApiRemoteNodeServices, ApiResourceMutationServices,
+};
 pub use validation::{
-    AdmissionContextRequest, DeleteOptions, apply_crd_defaults, apply_crd_pruning,
-    build_admission_context, check_content_type, check_cr_field_validation_strict,
-    check_deployment_strict_decode_from_raw_json, check_field_validation_strict,
-    check_field_validation_strict_typed, check_immutable_fields, inject_resource_version,
-    parse_apply_yaml, parse_delete_options_body, prepare_admissionregistration_resource,
-    run_admission_for_request, validate_builtin_field_selector, validate_builtin_resource_spec,
-    validate_crd_field_selector, validate_pod_resource_requirements_immutable,
-    validate_pod_sysctls, validate_priorityclass_update_immutable,
+    AdmissionContextRequest, AdmissionExecution, AdmissionExecutionFuture, DeleteOptions,
+    apply_crd_defaults, apply_crd_pruning, build_admission_context, check_content_type,
+    check_cr_field_validation_strict, check_deployment_strict_decode_from_raw_json,
+    check_field_validation_strict, check_field_validation_strict_typed, check_immutable_fields,
+    inject_resource_version, parse_apply_yaml, parse_delete_options_body,
+    prepare_admissionregistration_resource, run_admission, run_admission_for_request,
+    validate_builtin_field_selector, validate_builtin_resource_spec, validate_crd_field_selector,
+    validate_pod_resource_requirements_immutable, validate_pod_sysctls,
+    validate_priorityclass_update_immutable,
 };
 #[cfg(test)]
 pub use validation::{
@@ -232,13 +247,16 @@ use crate::api_status::{
     update_validatingadmissionpolicybinding_status, update_validatingwebhookconfiguration_status,
     update_volumeattachment_status,
 };
+#[cfg(test)]
 use crate::controllers;
 #[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{CatchUpResource, DatastoreBackend, Resource, WatchTarget};
+#[cfg(test)]
+use crate::datastore::{CatchUpResource, WatchTarget};
 #[cfg(test)]
 use crate::watch::WatchCursorError;
 use crate::watch::WatchEvent;
+use klights_cluster_core::Resource;
 use klights_types::LabelSelector;
 
 // APIService proxy helpers moved to apiservice_proxy.rs
@@ -565,7 +583,11 @@ async fn update_replicationcontroller(
     )
     .await?;
 
-    state.controller_dispatcher.enqueue(&result.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&result.0)
+        .await;
 
     Ok(result)
 }
@@ -590,7 +612,11 @@ async fn patch_replicationcontroller(
     .await?;
 
     let (_status, json_response) = &result;
-    state.controller_dispatcher.enqueue(&json_response.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&json_response.0)
+        .await;
 
     Ok(result)
 }

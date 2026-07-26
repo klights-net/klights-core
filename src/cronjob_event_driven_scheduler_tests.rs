@@ -31,8 +31,11 @@ async fn make_scheduler() -> (
             supervisor.clone(),
         ),
     );
-    let scheduler =
-        CronJobScheduler::new(db_handle.clone(), dispatcher.clone(), supervisor.clone());
+    let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
+        db_handle.clone(),
+        dispatcher.clone(),
+        supervisor.clone(),
+    );
     (db, db_handle, dispatcher, supervisor, scheduler)
 }
 
@@ -203,7 +206,7 @@ async fn next_fire_advances_after_status_update() {
 /// owning CronJob UID.
 #[tokio::test]
 async fn forbid_concurrent_blocks_second_job_when_active_present() {
-    let (db, _db_handle, _dispatcher, _supervisor, scheduler) = make_scheduler().await;
+    let (db, _db_handle, dispatcher, _supervisor, _scheduler) = make_scheduler().await;
 
     let mut body = cj_with_uid("u-forbid", "cj-forbid", "* * * * *");
     body["spec"]["concurrencyPolicy"] = json!("ForbidConcurrent");
@@ -258,7 +261,7 @@ async fn forbid_concurrent_blocks_second_job_when_active_present() {
         .unwrap();
     crate::controllers::cronjob::reconcile_cronjob_one(
         &db,
-        Some(scheduler.dispatcher_for_test()),
+        Some(dispatcher.as_ref()),
         &cj_now,
         resource.resource_version,
     )

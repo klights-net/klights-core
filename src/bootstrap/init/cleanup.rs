@@ -55,6 +55,9 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
     let containerd_state_dir = paths::containerd_state_dir_path(namespace)
         .to_string_lossy()
         .into_owned();
+    let runtime_paths =
+        kubelet::runtime_paths::KubeletRuntimePaths::new(paths::data_root_path(namespace))
+            .context("invalid cleanup runtime path layout")?;
     let mut cleanup_cni_rpc = match start_cleanup_cni_rpc_server(
         namespace,
         &cleanup_task_supervisor,
@@ -74,10 +77,15 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
     };
 
     // Connect to containerd for sandbox teardown.
+    let cri_transport_policy = klights_node_api::CriTransportPolicy::new(
+        grpc_transport_policy.connect_timeout,
+        grpc_transport_policy.max_message_bytes,
+    );
     let mut cri = match kubelet::CriClient::connect_with_policy(
         containerd_socket.to_string_lossy().as_ref(),
         namespace,
-        grpc_transport_policy.as_ref(),
+        &cri_transport_policy,
+        kubelet::cri::DEFAULT_IMAGE_PULL_RESPONSE_TIMEOUT,
     )
     .await
     {
@@ -95,6 +103,7 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
                 namespace,
                 &cleanup_task_supervisor,
                 &file_process,
+                &runtime_paths,
             )
             .await;
             if let Some(cleanup_cni_rpc) = cleanup_cni_rpc.take() {
@@ -160,8 +169,13 @@ pub async fn run_cleanup_with_flags(cli: CliFlags) -> anyhow::Result<()> {
         }
     }
 
-    stop_namespace_containerd_after_cleanup(namespace, &cleanup_task_supervisor, &file_process)
-        .await;
+    stop_namespace_containerd_after_cleanup(
+        namespace,
+        &cleanup_task_supervisor,
+        &file_process,
+        &runtime_paths,
+    )
+    .await;
     if let Some(cleanup_cni_rpc) = cleanup_cni_rpc.take() {
         cleanup_cni_rpc.shutdown().await;
     }
@@ -276,11 +290,13 @@ pub async fn stop_namespace_containerd_after_cleanup(
     namespace: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     file_process: &klights_supervisor::FileProcessExecutor,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
 ) {
     match kubelet::ContainerdManager::stop_namespace_containerd(
         namespace,
         task_supervisor,
         file_process,
+        paths,
     )
     .await
     {

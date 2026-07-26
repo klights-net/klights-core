@@ -729,7 +729,7 @@ impl crate::kubelet::pod_repository::PodReader for RollingUpdateObservedGenerati
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::datastore::ResourceList> {
+    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
         self.inner
             .list_pods(ns, label_selector, field_selector, limit, continue_token)
             .await
@@ -777,7 +777,12 @@ impl crate::kubelet::pod_repository::PodReader for RollingUpdateObservedGenerati
                 "deployment observedGeneration advanced to 2 before matching new ReplicaSet existed"
             );
         }
-        self.inner.list_pods_by_owner_uid(ns, owner_uid).await
+        crate::kubelet::pod_repository::PodReader::list_pods_by_owner_uid(
+            self.inner.as_ref(),
+            ns,
+            owner_uid,
+        )
+        .await
     }
 }
 

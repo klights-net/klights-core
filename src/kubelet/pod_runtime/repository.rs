@@ -1,6 +1,6 @@
-use crate::datastore::Resource;
 use crate::kubelet::pod_repository::{PodRepository, PodStatusUpdate, RuntimeReconcileStatus};
 use crate::kubelet::pod_startup_error::PodStartupErrorKind;
+use klights_cluster_core::Resource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LivePodUidCheck {

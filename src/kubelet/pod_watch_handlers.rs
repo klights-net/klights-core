@@ -1,5 +1,9 @@
+#[cfg(test)]
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::watch::{EventType, WatchEvent};
+#[cfg(test)]
+use crate::watch::EventType;
+use crate::watch::WatchEvent;
+#[cfg(test)]
 use klights_reconcile_api::PvcReconcileSink;
 
 #[async_trait::async_trait]
@@ -15,12 +19,14 @@ pub trait PersistentVolumeEventHandler: Send + Sync {
 /// caching leadership at construction. A voter that loses leadership stops
 /// originating writes immediately; a follower that gains leadership begins
 /// reconciling on the next delivered event without restart.
+#[cfg(test)]
 pub struct DatastorePersistentVolumeEventHandler {
     db: DatastoreHandle,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
     file_process: klights_supervisor::FileProcessExecutor,
 }
 
+#[cfg(test)]
 impl DatastorePersistentVolumeEventHandler {
     pub fn new(
         db: DatastoreHandle,
@@ -35,6 +41,7 @@ impl DatastorePersistentVolumeEventHandler {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
     async fn handle_pvc_event(&self, event: &WatchEvent, event_name: &str) {
@@ -89,6 +96,7 @@ impl PersistentVolumeEventHandler for NoopPersistentVolumeEventHandler {
 }
 
 /// Handle PersistentVolumeClaim ADDED/MODIFIED events
+#[cfg(test)]
 pub async fn handle_pvc_event(
     file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
@@ -140,6 +148,7 @@ pub async fn handle_pvc_event(
 }
 
 /// Handle PersistentVolume ADDED events
+#[cfg(test)]
 pub async fn handle_pv_event(
     file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
@@ -206,8 +215,8 @@ mod tests {
 
     async fn seed_matching_pv_and_pvc() -> (
         crate::datastore::DatastoreHandle,
-        crate::datastore::Resource,
-        crate::datastore::Resource,
+        klights_cluster_core::Resource,
+        klights_cluster_core::Resource,
     ) {
         let db: crate::datastore::DatastoreHandle =
             std::sync::Arc::new(crate::datastore::test_support::in_memory().await);

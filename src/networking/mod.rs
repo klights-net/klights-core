@@ -4,7 +4,6 @@ pub mod cni;
 pub mod config;
 pub mod dataplane_health;
 pub mod device_state;
-pub(crate) mod hostport_resource;
 pub mod netfilter;
 pub mod netns_sync;
 pub mod plane;
@@ -54,7 +53,7 @@ pub use config::{NetworkBootConfig, NetworkCleanupConfig, NetworkMode};
 pub use plane::NetworkPlane;
 pub use pod_endpoint_resolver::SqlitePodEndpointResolver;
 pub use rootless_plane::RootlessNetworkPlane;
-pub use types::{BridgeName, ClusterCidr, NodeName, PodSubnet};
+pub use types::BridgeName;
 
 /// Historical pod-link MTU used when encryption is disabled.
 pub const POD_OVERLAY_MTU: u32 = 1450;

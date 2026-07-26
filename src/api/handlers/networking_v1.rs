@@ -93,31 +93,15 @@ async fn delete_collection_ingressclasses(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "networking.k8s.io/v1",
-            "IngressClass",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "networking.k8s.io/v1",
-                "IngressClass",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "networking.k8s.io/v1",
+        "IngressClass",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))

@@ -1,9 +1,8 @@
-use crate::datastore::WatchReplayPosition;
 use crate::watch::{
     SelectorMembership, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
     WatchReplaySource, WindowPolicy,
 };
-use klights_watch::{WatchSignalReceiver, WatchTopic};
+use klights_watch::{WatchReplayPosition, WatchSignalReceiver, WatchTopic};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WatchSessionConfig {
@@ -214,12 +213,12 @@ fn classify_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::{
+    use crate::watch::{EventType, WatchContentType, WatchEvent, encode_watch_payload, event_key};
+    use async_trait::async_trait;
+    use klights_watch::{
         PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
         WatchReplayPosition, WatchReplayRead,
     };
-    use crate::watch::{EventType, WatchContentType, WatchEvent, encode_watch_payload, event_key};
-    use async_trait::async_trait;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 

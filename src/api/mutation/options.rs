@@ -32,6 +32,20 @@ impl DryRunMode {
     ) -> Result<Self, crate::api::AppError> {
         Self::from_query(query.dry_run.as_deref())
     }
+
+    pub fn from_eviction(
+        query: &crate::api::CreateUpdateQuery,
+        delete_option_values: &[String],
+    ) -> Result<Self, crate::api::AppError> {
+        let query_mode = Self::from_create_update_query(query)?;
+        match delete_option_values {
+            [] => Ok(query_mode),
+            [value] if value == "All" => Ok(Self::All),
+            _ => Err(crate::api::AppError::BadRequest(
+                "deleteOptions.dryRun supports only [\"All\"]".to_string(),
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +82,7 @@ impl PropagationPolicy {
 pub struct DeleteIntent {
     pub dry_run: DryRunMode,
     pub options: crate::api::DeleteOptions,
-    pub preconditions: crate::datastore::ResourcePreconditions,
+    pub preconditions: klights_cluster_core::ResourcePreconditions,
     pub propagation_policy: PropagationPolicy,
     pub orphan_children: bool,
     /// Whether a UID mismatch discovered during the finalizer-aware delete is a
@@ -136,7 +150,7 @@ impl DeleteIntent {
 
     pub fn collection_item(
         dry_run: DryRunMode,
-        preconditions: crate::datastore::ResourcePreconditions,
+        preconditions: klights_cluster_core::ResourcePreconditions,
     ) -> Self {
         Self {
             dry_run,

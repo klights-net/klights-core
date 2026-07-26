@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use crate::control_plane::client::{
-    CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness, PodCleanupIntent,
-    PodCleanupIntentListRequest,
+use crate::kubelet::pod_lifecycle_core::message::{
+    LifecycleMessage, POD_CLEANUP_REASON_NODE_LOST, PodLifecycleKey,
 };
-use crate::datastore::POD_CLEANUP_REASON_NODE_LOST;
-use crate::datastore::node_local::NodeLocalHandle;
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
 use crate::kubelet::pod_runtime::cri::CriRuntime;
 use anyhow::{Context, Result};
+use klights_leader_api::{
+    CacheReadinessRequest, LeaderCacheReadiness, LeaderPodCleanupIntents, LeaderResourceQuery,
+    PodCleanupIntent, PodCleanupIntentListRequest,
+};
 
 pub use crate::kubelet::reconciler::cri_inventory::{
     CriInventoryAction as StartupAction, diff_cri_inventory as plan_startup_actions,
@@ -19,32 +19,52 @@ pub use crate::kubelet::reconciler::cri_inventory::{
 
 pub struct StartupReconciler {
     node_name: String,
-    containerd_ns: String,
-    cluster_api: Arc<dyn LeaderApiClient>,
+    paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    resource_query: Arc<dyn LeaderResourceQuery>,
     cache_readiness: Arc<dyn LeaderCacheReadiness>,
-    node_local: NodeLocalHandle,
+    pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
+    pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     cri: Arc<dyn CriRuntime>,
     router: Arc<PodLifecycleRouter>,
     file_process: klights_supervisor::FileProcessExecutor,
 }
 
+pub struct StartupDependencies {
+    pub resource_query: Arc<dyn LeaderResourceQuery>,
+    pub cache_readiness: Arc<dyn LeaderCacheReadiness>,
+    pub pod_cleanup_intents: Arc<dyn LeaderPodCleanupIntents>,
+    pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
+    pub cri: Arc<dyn CriRuntime>,
+    pub router: Arc<PodLifecycleRouter>,
+    pub file_process: klights_supervisor::FileProcessExecutor,
+}
+
 impl StartupReconciler {
     pub fn new(
         node_name: String,
-        containerd_ns: String,
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
-        cri: Arc<dyn CriRuntime>,
-        router: Arc<PodLifecycleRouter>,
-        file_process: klights_supervisor::FileProcessExecutor,
+        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
+        dependencies: StartupDependencies,
     ) -> Self {
-        let cache_readiness: Arc<dyn LeaderCacheReadiness> = cluster_api.clone();
+        let StartupDependencies {
+            resource_query,
+            cache_readiness,
+            pod_cleanup_intents,
+            pod_runtime_store,
+            pod_endpoint_store,
+            cri,
+            router,
+            file_process,
+        } = dependencies;
         Self {
             node_name,
-            containerd_ns,
-            cluster_api,
+            paths,
+            resource_query,
             cache_readiness,
-            node_local,
+            pod_cleanup_intents,
+            pod_runtime_store,
+            pod_endpoint_store,
             cri,
             router,
             file_process,
@@ -64,15 +84,15 @@ impl StartupReconciler {
             .context("wait for pod cache before startup reconcile")?;
 
         let runtime_rows = self
-            .node_local
+            .pod_runtime_store
             .list_pod_runtime()
             .await
             .context("list node-local pod_runtime rows")?;
         let leader_pods = self
-            .cluster_api
-            .list_resources(crate::control_plane::client::pods_on_node_list_request(
+            .resource_query
+            .list_resources(klights_leader_api::pods_on_node_list_request(
                 &self.node_name,
-                crate::control_plane::client::ResourceQueryConsistency::Cached,
+                klights_leader_api::ResourceQueryConsistency::Cached,
             )?)
             .await
             .context("list leader pods on node")?
@@ -93,10 +113,11 @@ impl StartupReconciler {
         let live_owners: std::collections::HashSet<(String, String, String)> = runtime_rows
             .iter()
             .filter_map(|row| {
+                let pod = row.pod();
                 crate::kubelet::reconciler::cri_inventory::pod_artifact_owner(
-                    &row.namespace,
-                    &row.pod_name,
-                    &row.pod_uid,
+                    &pod.namespace,
+                    &pod.name,
+                    &pod.uid,
                 )
             })
             .chain(sandboxes.iter().filter_map(|s| {
@@ -112,7 +133,7 @@ impl StartupReconciler {
             .collect();
         match crate::kubelet::reconciler::cri_inventory::sweep_orphan_pod_artifacts(
             &self.file_process,
-            &self.containerd_ns,
+            self.paths.volumes_root(),
             &live_owners,
         )
         .await
@@ -126,7 +147,7 @@ impl StartupReconciler {
 
         let mut actions = plan_startup_actions(true, &runtime_rows, &leader_pods, &sandboxes, &[]);
         let cleanup_intents = self
-            .cluster_api
+            .pod_cleanup_intents
             .list_pod_cleanup_intents(
                 PodCleanupIntentListRequest::try_new(self.node_name.clone())
                     .map_err(anyhow::Error::new)?,
@@ -140,7 +161,7 @@ impl StartupReconciler {
                 let namespace = intent.namespace().to_string();
                 let pod_name = intent.pod_name().to_string();
                 let pod_uid = intent.pod_uid().to_string();
-                self.cluster_api
+                self.pod_cleanup_intents
                     .acknowledge_pod_cleanup_intent(
                         intent.ack_request().map_err(anyhow::Error::new)?,
                     )
@@ -183,8 +204,16 @@ impl StartupReconciler {
                         OrphanReason::LeaderDeletedWhileDown,
                     )
                     .await?;
-                    self.node_local.delete_pod_runtime_for_uid(&key.uid).await?;
-                    self.node_local.delete_endpoint_for_uid(&key.uid).await?;
+                    self.pod_runtime_store
+                        .delete_pod_runtime_for_uid(klights_node_store::RuntimePodUid::try_new(
+                            key.uid.clone(),
+                        )?)
+                        .await?;
+                    self.pod_endpoint_store
+                        .delete_endpoint_for_uid(klights_node_store::PodUidKey::try_new(
+                            key.uid.clone(),
+                        )?)
+                        .await?;
                 }
                 StartupAction::ReattachExistingSandbox { key, pod, .. }
                 | StartupAction::RecreateMissingSandbox { key, pod } => {
@@ -243,7 +272,7 @@ mod tests {
             reason,
             rv,
             1_700_000_000_000,
-            crate::datastore::Resource::try_from_data(Arc::new(json!({
+            klights_cluster_core::Resource::try_from_data(Arc::new(json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {

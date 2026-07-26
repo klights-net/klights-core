@@ -41,6 +41,7 @@ fn validate_raft_backend_capability(
 
 pub struct OpenLeaderArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
+    pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub role: &'a NodeRole,
     pub node_mode: &'a crate::bootstrap::NodeMode,
     pub supervisor: Arc<TaskSupervisor>,
@@ -64,9 +65,9 @@ pub struct DatastorePhase {
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
     pub replication_service: Option<Arc<crate::replication::ReplicationService>>,
     pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
-    pub outbox: Arc<crate::kubelet::outbox::Outbox>,
+    pub outbox: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-    pub node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
+    pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     /// P3-11c: when this node is a leader-class boot under raft mode,
     /// `raft_node` holds the live `RaftNode` so later phases (kubelet
     /// label task — Step D — and the gRPC server's RaftRpcRouter /
@@ -88,9 +89,9 @@ pub struct DatastorePhase {
 
 struct RemoteForwarderParts {
     forwarder: Arc<dyn crate::control_plane::client::LeaderApiClient>,
-    resource_commands: Arc<dyn crate::control_plane::client::LeaderResourceCommand>,
+    resource_commands: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     outbox_deliveries: Arc<dyn klights_leader_api::LeaderOutboxDelivery>,
-    node_lease_renewals: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
+    node_lease_renewals: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     lease_client: Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
 }
@@ -114,6 +115,7 @@ fn passive_store_open_request(config: &KlightsConfig) -> PassiveStoreOpenRequest
 pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let OpenLeaderArgs {
         config,
+        runtime_paths,
         role,
         node_mode,
         supervisor,
@@ -144,9 +146,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // the duplicate writes collided on UNIQUE(watch_events.resource_version)
     // when raft AppendEntries reached the joiner. With Phase A removed,
     // the joiner starts with an empty cluster.db, JoinAsControlplane
-    // triggers the seed's add_voter, and raft (or legacy leader-follower
-    // replication for historical deployments) populates the full state
-    // through its own snapshot+AppendEntries / follower replay path.
+    // triggers the seed's add_voter, and Raft populates the full state
+    // through authoritative snapshot installation plus AppendEntries.
     let is_joining_controlplane = role.is_controlplane_join();
 
     let node_lease_tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
@@ -340,10 +341,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             // sequenced facade. It never receives the passive backend used by
             // Raft proposal materialization and committed apply.
             let local_api_client = Arc::new(
-                crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+                crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
                     db_handle.clone(),
                     config.node_name.clone(),
                     config.containerd_namespace.clone(),
+                    runtime_paths.service_account_signing_key(),
                     node_lease_tracker.clone(),
                     is_leader_rx.clone(),
                     klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
@@ -508,14 +510,15 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 } else {
                     *skip_ca
                 };
+                let registration_profile =
+                    crate::bootstrap::node_registration_profile::build(node_mode, r);
                 let join_node_registration =
                     crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
                         &klights_supervisor::FileProcessExecutor::from_supervisor(
                             supervisor.as_ref(),
                         ),
                         &config.node_name,
-                        node_mode,
-                        r,
+                        &registration_profile,
                         crate::kubelet::node::NodeRegistrationAddresses::new(
                             node_ip.to_string(),
                             config.external_endpoint.clone(),
@@ -784,7 +787,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     let outbox_delivery_client: Arc<dyn klights_leader_api::LeaderOutboxDelivery> =
         leader_proxy.clone();
-    let node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal> =
+    let node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal> =
         leader_proxy.clone();
     let replication_metadata = Arc::new(
         crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(
@@ -806,7 +809,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
-        let ob = Arc::new(crate::kubelet::outbox::Outbox::with_notify(
+        let ob = Arc::new(crate::node_outbox::Outbox::with_notify(
             node_local.clone(),
             notify.clone(),
         ));
@@ -824,7 +827,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     let mut delay = std::time::Duration::from_millis(500);
                     let max_delay = std::time::Duration::from_secs(30);
                     loop {
-                        let dispatcher = crate::kubelet::outbox::OutboxDispatcher::production(
+                        let dispatcher = crate::node_outbox::OutboxDispatcher::production(
                             node_local_for_retry.clone(),
                             apply_client_for_retry.clone(),
                             notify_for_retry.clone(),
@@ -1715,7 +1718,7 @@ mod tests {
             .await
             .expect_err("connection to nonexistent leader fails");
         let msg = match &err {
-            crate::kubelet::outbox::OutboxApplyError::Retryable(m) => m.clone(),
+            klights_leader_api::OutboxDeliveryError::Retryable(m) => m.clone(),
             other => format!("{other:?}"),
         };
         assert!(

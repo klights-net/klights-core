@@ -164,6 +164,7 @@ pub async fn get_namespace_status(
     // Namespaces are stored in the dedicated `namespaces` table (not `cluster_resources`),
     // so we must use get_namespace rather than the generic get_cluster_status_subresource.
     let resource = state
+        .resource_mutation()
         .db
         .get_namespace(&name)
         .await?

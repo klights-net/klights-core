@@ -12,9 +12,22 @@
 
 use std::sync::Arc;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::AppState;
+/// Focused runtime port used by the event-driven scheduler.
+///
+/// Controller code owns the scheduling policy while bootstrap adapts the
+/// leader datastore and Pod repository to this narrow contract.
+#[async_trait]
+pub trait SchedulerRuntime: Send + Sync {
+    fn subscribe_signals(&self) -> klights_watch::WatchSignalReceiver;
+
+    async fn current_resource_version(&self) -> Result<i64>;
+
+    async fn schedule_all_unbound_pods(&self) -> Result<()>;
+}
 
 /// Scheduler controller configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,24 +73,15 @@ pub fn should_wake_scheduler(event: &crate::watch::WatchEvent) -> bool {
 /// Run the scheduler watch loop.
 ///
 /// Disabled by default — call this only when config.enabled = true.
-pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken) {
-    let db = state.db.clone();
-    let mut signal_rx = klights_watch::WatchSignalReceiver::new(
-        [
-            klights_watch::WatchTopic::new("v1", "Pod"),
-            klights_watch::WatchTopic::new("v1", "Node"),
-        ]
-        .into_iter()
-        .map(|topic| db.subscribe_watch_signals(topic))
-        .collect(),
-    );
-    let mut last_seen_rv = db.get_current_resource_version().await.unwrap_or(0);
+pub async fn run_scheduler_watch(runtime: Arc<dyn SchedulerRuntime>, cancel: CancellationToken) {
+    let mut signal_rx = runtime.subscribe_signals();
+    let mut last_seen_rv = runtime.current_resource_version().await.unwrap_or(0);
 
     // Initial sweep: the watch replay only catches events with RV > floor_rv.
     // Pods created before the scheduler starts (e.g. during CoreDNS bootstrap)
     // must be picked up by a direct list so they don't remain Pending forever.
     tracing::info!("scheduler: running initial sweep for unbound pods");
-    if let Err(e) = state.pod_repository.schedule_all_unbound_pods().await {
+    if let Err(e) = runtime.schedule_all_unbound_pods().await {
         tracing::warn!("scheduler initial sweep failed: {e:#}");
     }
 
@@ -97,7 +101,7 @@ pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken
                     }
                     last_seen_rv = high_rv;
                     tracing::debug!("scheduler controller woke on watch signal");
-                    if let Err(e) = state.pod_repository.schedule_all_unbound_pods().await {
+                    if let Err(e) = runtime.schedule_all_unbound_pods().await {
                         tracing::warn!("scheduler reconcile failed: {e:#}");
                     }
                 }
@@ -105,10 +109,13 @@ pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken
                     tracing::warn!(
                         "scheduler watch signals lagged by {n}; running full unbound-pod sweep"
                     );
-                    if let Err(e) = state.pod_repository.schedule_all_unbound_pods().await {
+                    if let Err(e) = runtime.schedule_all_unbound_pods().await {
                         tracing::warn!("scheduler reconcile after signal lag failed: {e:#}");
                     }
-                    last_seen_rv = db.get_current_resource_version().await.unwrap_or(last_seen_rv);
+                    last_seen_rv = runtime
+                        .current_resource_version()
+                        .await
+                        .unwrap_or(last_seen_rv);
                 }
                 Err(klights_watch::WatchSignalReceiveError::Closed) => break,
             }

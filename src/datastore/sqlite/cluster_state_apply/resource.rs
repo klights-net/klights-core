@@ -18,15 +18,6 @@ pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ResourcePreconditionMode {
-    /// Legacy replay mode preserves convergence behavior for ordinary resource replay,
-    /// while leaving status-only writes subject to strict preconditions.
-    LegacyFollowerReplay,
-    /// Committed-v1 mode enforces full uid/resourceVersion preconditions.
-    StrictCommittedApply,
-}
-
 struct ResourceWriteSink<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
@@ -191,7 +182,6 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         mut row: LogApplyResourceRow,
         emit_watch_events: bool,
-        resource_precondition_mode: ResourcePreconditionMode,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
@@ -205,18 +195,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             );
             self.get_existing_resource(identity)?
         };
-        match resource_precondition_mode {
-            // V1 must validate the exact committed mutation before status
-            // normalization can merge live fields or relax its preconditions.
-            ResourcePreconditionMode::StrictCommittedApply => {
-                validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
-            }
-            // Legacy replay converges ordinary and status rows using only the
-            // structural create/update presence conditions.
-            ResourcePreconditionMode::LegacyFollowerReplay => {
-                validate_put_resource_presence_preconditions(&row, existing.as_ref())?;
-            }
-        }
+        validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
         let identity = resource_identity(
             &row.api_version,
@@ -257,7 +236,6 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         patch: LogApplyResourcePatch,
         emit_watch_events: bool,
-        resource_precondition_mode: ResourcePreconditionMode,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
@@ -284,7 +262,6 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             &current_uid,
             &current_bytes,
             identity.namespace(),
-            resource_precondition_mode,
         )?;
         let data_bytes = serde_json::to_vec(&patched_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -310,7 +287,6 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         resource_version: i64,
         key: LogApplyResourceKey,
         emit_watch_events: bool,
-        resource_precondition_mode: ResourcePreconditionMode,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
@@ -327,7 +303,6 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         };
         let requested_uid = (!key.uid.is_empty()).then_some(key.uid.as_str());
         let event_type = klights_cluster_core::decide_resource_delete(
-            apply_precondition_policy(resource_precondition_mode),
             requested_uid,
             key.precondition_resource_version,
             Some(klights_cluster_core::CurrentResourceState {
@@ -480,10 +455,8 @@ fn apply_latest_patch_to_current_resource(
     current_uid: &str,
     current_bytes: &[u8],
     namespace: Option<&str>,
-    resource_precondition_mode: ResourcePreconditionMode,
 ) -> tokio_rusqlite::Result<serde_json::Value> {
     klights_cluster_core::validate_apply_preconditions(
-        apply_precondition_policy(resource_precondition_mode),
         klights_cluster_core::ApplyPreconditions {
             uid: patch.precondition_uid.as_deref(),
             resource_version: patch.precondition_resource_version,
@@ -806,34 +779,7 @@ fn validate_put_resource_apply_preconditions(
     row: &LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
 ) -> tokio_rusqlite::Result<()> {
-    validate_put_resource_preconditions(
-        klights_cluster_core::ApplyPreconditionPolicy::Strict,
-        row,
-        existing,
-    )
-}
-
-/// `LegacyFollowerReplay` PUT validation: enforce only structural conditions
-/// (`require_absent` / `require_existing`) and allow ordinary resource replay
-/// to converge despite stale local UID/resourceVersion preconditions.
-fn validate_put_resource_presence_preconditions(
-    row: &LogApplyResourceRow,
-    existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
-    validate_put_resource_preconditions(
-        klights_cluster_core::ApplyPreconditionPolicy::PresenceOnly,
-        row,
-        existing,
-    )
-}
-
-fn validate_put_resource_preconditions(
-    policy: klights_cluster_core::ApplyPreconditionPolicy,
-    row: &LogApplyResourceRow,
-    existing: Option<&ExistingResourceRow>,
-) -> tokio_rusqlite::Result<()> {
     klights_cluster_core::validate_apply_preconditions(
-        policy,
         klights_cluster_core::ApplyPreconditions {
             require_absent: row.require_absent,
             require_existing: row.require_existing,
@@ -848,19 +794,6 @@ fn validate_put_resource_preconditions(
         ),
     )
     .map_err(apply_precondition_error)
-}
-
-const fn apply_precondition_policy(
-    mode: ResourcePreconditionMode,
-) -> klights_cluster_core::ApplyPreconditionPolicy {
-    match mode {
-        ResourcePreconditionMode::StrictCommittedApply => {
-            klights_cluster_core::ApplyPreconditionPolicy::Strict
-        }
-        ResourcePreconditionMode::LegacyFollowerReplay => {
-            klights_cluster_core::ApplyPreconditionPolicy::PresenceOnly
-        }
-    }
 }
 
 fn apply_precondition_error(

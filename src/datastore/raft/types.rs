@@ -9,7 +9,7 @@
 //! - `Node = RaftMemberNode` — carries the API endpoint URL so peers can drive
 //!   `RaftNetwork` without consulting an external membership directory.
 //! - `D = StorageCommandPayload` — opaque bytes carrying a serialized
-//!   `crate::datastore::command::StorageCommand` (protobuf), the unit of
+//!   `super::super::command::StorageCommand` (protobuf), the unit of
 //!   replication. The Raft state machine deserializes inside `apply`.
 //! - `R = StorageCommandResult` — result of applying a command on the
 //!   leader, returned to the proposer.
@@ -26,7 +26,7 @@ use openraft::declare_raft_types;
 use openraft::impls::OneshotResponder;
 use serde::{Deserialize, Serialize};
 
-use crate::datastore::Resource;
+use super::super::Resource;
 
 pub use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
 
@@ -123,7 +123,7 @@ pub struct StorageCommandResult {
     /// Ephemeral local handoff from committed SQLite apply to the leader-side
     /// side-effect dispatcher. It is never serialized into a Raft response.
     #[serde(skip)]
-    pub(crate) pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+    pub(crate) pod_endpoint_effect: super::super::PodEndpointEffect,
 }
 
 const fn is_false(value: &bool) -> bool {

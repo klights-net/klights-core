@@ -42,19 +42,19 @@ mod cases {
                         .inner
                         .build_log_apply_commit_for_command(
                             command,
-                            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                            crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                             "inline-proposer",
                         )
                         .await?;
                     return self.inner.apply_raft_log_apply_commit(commit).await;
                 }
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("inline-{}", uuid::Uuid::new_v4());
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
-                    crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                    crate::node_outbox::payload::OutboxOperation::PodStatus,
                     bytes::Bytes::from(payload),
                     "inline-proposer",
                 )
@@ -77,23 +77,21 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
                 self.calls
                     .lock()
                     .unwrap()
                     .push(command.variant_name().to_string());
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
-                    .map_err(|e| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string())
-                    })?;
+                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
-                    crate::kubelet::outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()),
+                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
                     )?,
                     bytes::Bytes::from(payload),
                     authoring_node,
@@ -132,8 +130,8 @@ mod cases {
             _authoring_node: &str,
             _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
         ) -> std::result::Result<
-            crate::kubelet::outbox::OutboxApplyResult,
-            crate::kubelet::outbox::OutboxApplyError,
+            crate::node_outbox::OutboxApplyResult,
+            crate::node_outbox::OutboxApplyError,
         > {
             panic!("this operation must not submit an outbox proposal")
         }
@@ -177,7 +175,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_log_apply_commit(
                 &ds,
-                crate::log_apply::LogApplyCommit::new(1, Vec::new()),
+                crate::log_apply::test_live_commit(1, Vec::new()),
             )
             .await
             .expect_err("application facade must reject legacy committed apply"),
@@ -186,7 +184,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit(
                 &ds,
-                crate::log_apply::LogApplyCommit::new(2, Vec::new()),
+                crate::log_apply::test_live_commit(2, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply"),
@@ -195,7 +193,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit_outcome(
                 &ds,
-                crate::log_apply::LogApplyCommit::new(3, Vec::new()),
+                crate::log_apply::test_live_commit(3, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply outcomes"),
@@ -218,7 +216,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_log_apply_commit(
                 &ds,
-                crate::log_apply::LogApplyCommit::new(4, Vec::new()),
+                crate::log_apply::test_live_commit(4, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject legacy committed apply"),
@@ -227,7 +225,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit(
                 &ds,
-                crate::log_apply::LogApplyCommit::new(5, Vec::new()),
+                crate::log_apply::test_live_commit(5, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject Raft committed apply"),
@@ -236,7 +234,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit_outcome(
                 &ds,
-                crate::log_apply::LogApplyCommit::new(6, Vec::new()),
+                crate::log_apply::test_live_commit(6, Vec::new()),
             )
             .await
             .expect_err(
@@ -520,15 +518,8 @@ mod cases {
             )
             .await
             .expect("seed existing resource");
-        DatastoreBackend::set_klights_meta(
-            inner.as_ref(),
-            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-        )
-        .await
-        .expect("activate V1 for zero-RV raft template");
         let ds = inner;
-        let commit = crate::log_apply::LogApplyCommit::new(
+        let commit = crate::log_apply::test_live_commit(
             0,
             vec![crate::log_apply::LogApplyMutation::PutResource(
                 crate::log_apply::LogApplyResourceRow {
@@ -554,8 +545,7 @@ mod cases {
                     status_only: false,
                 },
             )],
-        )
-        .into_committed_apply_v1_template();
+        );
 
         let result = ds
             .apply_raft_log_apply_commit(commit)
@@ -2095,7 +2085,6 @@ mod cases {
             .unwrap();
         follower
             .apply_log_apply_commit(crate::log_apply::LogApplyCommit::delete_resource(
-                delete_rv,
                 "v1",
                 "ConfigMap",
                 Some("default".to_string()),
@@ -2162,20 +2151,20 @@ mod cases {
                 resource_version: Some(1),
             },
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
                 "lease-renew-key",
-                crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str(),
+                crate::node_outbox::payload::OutboxOperation::LeaseRenew.as_str(),
                 &payload,
                 "worker-1",
             )
             .await
             .unwrap();
-        let crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv } = result else {
+        let crate::node_outbox::OutboxApplyResult::Applied { applied_rv } = result else {
             panic!("expected LeaseRenew to be accepted");
         };
         assert_eq!(applied_rv, 0);
@@ -2198,20 +2187,20 @@ mod cases {
             name: "from-outbox".into(),
             data: json!({"metadata": {"name": "from-outbox", "namespace": "default"}}),
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .unwrap();
 
         let result = ds
             .apply_outbox_transactionally(
                 "create-from-outbox-key",
-                crate::kubelet::outbox::payload::OutboxOperation::NodeRegistration.as_str(),
+                crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
                 &payload,
                 "worker-1",
             )
             .await
             .unwrap();
-        let crate::kubelet::outbox::OutboxApplyResult::Applied { .. } = result else {
+        let crate::node_outbox::OutboxApplyResult::Applied { .. } = result else {
             panic!("expected first outbox apply to mutate the leader");
         };
 
@@ -2307,13 +2296,13 @@ mod cases {
                 command: StorageCommand,
             ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command.clone());
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("inline-{}", uuid::Uuid::new_v4());
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
-                    crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                    crate::node_outbox::payload::OutboxOperation::PodStatus,
                     bytes::Bytes::from(payload),
                     "raft-inline",
                 )
@@ -2336,20 +2325,18 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.clone());
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
-                    .map_err(|e| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string())
-                    })?;
+                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
                 let result = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
-                    crate::kubelet::outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()),
+                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
                     )?,
                     bytes::Bytes::from(payload),
                     authoring_node,
@@ -2421,8 +2408,8 @@ mod cases {
                 _authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
                 unreachable!("resource batch routing should use propose_command")
             }
@@ -2502,20 +2489,18 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.clone());
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
-                    .map_err(|e| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string())
-                    })?;
+                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
-                    crate::kubelet::outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()),
+                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
                     )?,
                     bytes::Bytes::from(payload),
                     authoring_node,
@@ -2532,7 +2517,7 @@ mod cases {
         let inner = proposer.inner.clone();
         let ds = SequencedDatastore::new(inner.clone(), proposer.clone());
 
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
             StorageCommand::CreateResource {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
@@ -2547,13 +2532,13 @@ mod cases {
         let result = ds
             .apply_outbox_transactionally(
                 "outbox-key",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                 &payload,
                 "worker-1",
             )
             .await
             .expect("apply_outbox via proposer");
-        let crate::kubelet::outbox::OutboxApplyResult::Applied { .. } = result else {
+        let crate::node_outbox::OutboxApplyResult::Applied { .. } = result else {
             panic!("expected Applied for first outbox apply");
         };
 
@@ -2620,26 +2605,24 @@ mod cases {
                 authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
                 self.calls.lock().unwrap().push(command.variant_name());
-                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()
-                    .map_err(|e| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string())
-                    })?;
+                    .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
-                    crate::kubelet::outbox::payload::OutboxOperation::try_from(operation).map_err(
-                        |e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()),
+                    crate::node_outbox::payload::OutboxOperation::try_from(operation).map_err(
+                        |e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()),
                     )?,
                     bytes::Bytes::from(payload),
                     authoring_node,
                 )
                 .await
-                .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
+                .map_err(|e| crate::node_outbox::OutboxApplyError::Retryable(e.to_string()))?;
                 Ok(outcome.result)
             }
         }
@@ -2995,10 +2978,10 @@ mod cases {
                 _a: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
-                Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+                Err(crate::node_outbox::OutboxApplyError::Retryable(
                     "not the leader".into(),
                 ))
             }
@@ -3037,7 +3020,7 @@ mod cases {
     #[tokio::test]
     async fn raft_mode_follower_proposer_rejects_outbox_apply_no_local_mutation() {
         let (ds, inner) = make_ds_with_follower_proposer().await;
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(
             StorageCommand::CreateResource {
                 api_version: "v1".into(),
                 kind: "ConfigMap".into(),
@@ -3053,7 +3036,7 @@ mod cases {
             .await
             .expect_err("follower outbox must reject");
         assert!(
-            matches!(err, crate::kubelet::outbox::OutboxApplyError::Retryable(_)),
+            matches!(err, crate::node_outbox::OutboxApplyError::Retryable(_)),
             "expected Retryable error, got: {err:?}"
         );
         assert!(
@@ -3117,10 +3100,10 @@ mod cases {
             "follower must not locally allocate node_subnets"
         );
 
-        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let metadata = klights_cluster_store::DataplanePeerMetadata::try_new(
             "worker-1".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            klights_cluster_store::DataplaneMode::Root,
+            klights_cluster_store::DataplaneEncryption::Enabled,
             Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
             Some("192.0.2.10".to_string()),
             Some(7679),
@@ -3152,10 +3135,10 @@ mod cases {
             .await
             .expect("subnet allocation through proposer must succeed");
         ds.update_node_dataplane(
-            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            klights_cluster_store::DataplanePeerMetadata::try_new(
                 "worker-1".to_string(),
-                crate::networking::wireguard::DataplaneMode::Root,
-                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                klights_cluster_store::DataplaneMode::Root,
+                klights_cluster_store::DataplaneEncryption::Enabled,
                 Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                 Some("192.0.2.10".to_string()),
                 Some(7679),

@@ -7,14 +7,14 @@
 #[cfg(test)]
 use crate::datastore::types::{NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState};
 #[cfg(test)]
-use crate::networking::{NodeName, PodSubnet};
-#[cfg(test)]
 use anyhow::{Context, Result, anyhow};
 use klights_cluster_core::{ClusterMetadata, CommandMeta, Resource, StorageCommand};
 use klights_node_api::{
     NodeExecFrame, NodeExecRequest, NodeExecSyncRequest, NodeExecSyncResult, NodeMetricsError,
     NodeMetricsRequest, NodeMetricsResult,
 };
+#[cfg(test)]
+use klights_types::{NodeName, PodSubnet};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::net::Ipv4Addr;
@@ -65,28 +65,19 @@ pub struct MetadataResponse {
     pub leader_epoch: i64,
     pub current_rv: i64,
     pub current_log_index: i64,
-    #[serde(default)]
-    pub supported_features: u64,
+    pub command_codec_version: u32,
 }
 
-pub const COMMITTED_APPLY_RV_V1: u64 = 1 << 0;
-/// Member authors and accepts the exact codec-v3 command contract.
-pub const COMMAND_CODEC_V3: u64 = 1 << 1;
-pub const LOCAL_SUPPORTED_FEATURES: u64 = COMMITTED_APPLY_RV_V1 | COMMAND_CODEC_V3;
-
-pub const fn supports_command_codec_v3(supported_features: u64) -> bool {
-    supported_features & COMMAND_CODEC_V3 != 0
-}
-
-pub fn require_command_codec_v3(
-    supported_features: u64,
+pub fn require_exact_command_codec(
+    command_codec_version: u32,
     peer: &str,
 ) -> std::result::Result<(), String> {
-    if supports_command_codec_v3(supported_features) {
+    if command_codec_version == crate::log_apply::COMMAND_CODEC_VERSION {
         Ok(())
     } else {
         Err(format!(
-            "{peer} does not advertise the required COMMAND_CODEC_V3 capability"
+            "{peer} must advertise exact command codec version {} (received {command_codec_version})",
+            crate::log_apply::COMMAND_CODEC_VERSION,
         ))
     }
 }
@@ -98,31 +89,9 @@ impl From<ClusterMetadata> for MetadataResponse {
             leader_epoch: m.leader_epoch,
             current_rv: m.current_rv,
             current_log_index: 0,
-            supported_features: LOCAL_SUPPORTED_FEATURES,
+            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
         }
     }
-}
-
-/// Request for a full state snapshot from the leader.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotRequest {
-    /// The last resource version the replica has applied.
-    /// If 0, the replica has no data and needs a full snapshot.
-    pub last_applied_rv: i64,
-}
-
-/// Response to a snapshot request.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum SnapshotResponse {
-    /// Leader will stream the full state.
-    Accepted {
-        /// Starting resource version of the snapshot.
-        start_rv: i64,
-        /// Total number of entries that will be streamed.
-        entry_count: i64,
-    },
-    /// Leader is not ready to serve snapshots.
-    NotReady { reason: String },
 }
 
 /// Request to subscribe to the command stream from a given resource version.
@@ -268,8 +237,8 @@ impl From<NodeSubnet> for ForwardedNodeSubnet {
             gateway_ip: subnet.gateway_ip.to_string(),
             node_ip: subnet.node_ip.to_string(),
             mode: match subnet.mode {
-                crate::controllers::annotations::NodePeerMode::Root => "root",
-                crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
+                klights_network_api::NodePeerMode::Root => "root",
+                klights_network_api::NodePeerMode::Rootless => "rootless",
             }
             .to_string(),
             hostport_range: subnet.hostport_range.map(|range| range.to_string()),
@@ -292,12 +261,14 @@ impl ForwardedNodeSubnet {
             .node_ip
             .parse()
             .with_context(|| format!("invalid forwarded node IP '{}'", self.node_ip))?;
-        let mode = crate::controllers::annotations::parse_node_peer_mode(Some(&self.mode))
-            .unwrap_or(crate::controllers::annotations::NodePeerMode::Root);
+        let mode = match self.mode.as_str() {
+            "rootless" => klights_network_api::NodePeerMode::Rootless,
+            _ => klights_network_api::NodePeerMode::Root,
+        };
         let hostport_range = self
             .hostport_range
             .as_deref()
-            .map(crate::networking::types::HostPortRange::parse)
+            .map(klights_types::HostPortRange::parse)
             .transpose()
             .map_err(|err| anyhow!("invalid forwarded hostport range: {err}"))?;
 
@@ -452,28 +423,32 @@ mod tests {
         assert_eq!(resp.leader_epoch, 5);
         assert_eq!(resp.current_rv, 100);
         assert_eq!(resp.current_log_index, 0);
-        assert_eq!(resp.supported_features, LOCAL_SUPPORTED_FEATURES);
+        assert_eq!(
+            resp.command_codec_version,
+            crate::log_apply::COMMAND_CODEC_VERSION
+        );
         assert_eq!(
             serde_json::from_str::<MetadataResponse>(&serde_json::to_string(&resp).unwrap())
                 .unwrap()
-                .supported_features,
-            LOCAL_SUPPORTED_FEATURES
+                .command_codec_version,
+            crate::log_apply::COMMAND_CODEC_VERSION
         );
-        assert_eq!(
+        assert!(
             serde_json::from_str::<MetadataResponse>(
-                r#"{"cluster_id":"legacy","leader_epoch":1,"current_rv":2,"current_log_index":3}"#
+                r#"{"cluster_id":"missing","leader_epoch":1,"current_rv":2,"current_log_index":3}"#
             )
-            .unwrap()
-            .supported_features,
-            0
+            .is_err(),
+            "metadata without an exact codec version must fail closed"
         );
     }
 
     #[test]
-    fn command_codec_v3_capability_is_an_exact_fail_closed_admission_bit() {
-        assert!(require_command_codec_v3(LOCAL_SUPPORTED_FEATURES, "v3").is_ok());
-        assert!(require_command_codec_v3(COMMITTED_APPLY_RV_V1, "v2").is_err());
-        assert!(require_command_codec_v3(0, "legacy").is_err());
+    fn command_codec_v3_is_an_exact_fail_closed_version() {
+        assert!(require_exact_command_codec(crate::log_apply::COMMAND_CODEC_VERSION, "v3").is_ok());
+        assert!(
+            require_exact_command_codec(crate::log_apply::COMMAND_CODEC_VERSION - 1, "v2").is_err()
+        );
+        assert!(require_exact_command_codec(0, "legacy").is_err());
     }
 
     #[test]
@@ -504,15 +479,6 @@ mod tests {
         let json = serde_json::to_vec(&hb).unwrap();
         let decoded: StreamItem = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded, hb);
-    }
-
-    #[test]
-    fn snapshot_request_serializes() {
-        let req = SnapshotRequest {
-            last_applied_rv: 10,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"last_applied_rv\":10"));
     }
 
     #[test]

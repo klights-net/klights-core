@@ -829,7 +829,6 @@ fn slot_admission_blocked_parks_start_without_startpod() {
         operation_id,
         blocking_uid: "old-uid".to_string(),
         blocking_node: "node-a".to_string(),
-        state: crate::datastore::PodSlotAdmissionState::Terminating,
     });
     assert!(matches!(blocked, PodAction::Noop));
 
@@ -865,7 +864,6 @@ fn slot_admission_wake_rechecks_before_startpod() {
         operation_id,
         blocking_uid: "old-uid".to_string(),
         blocking_node: "node-a".to_string(),
-        state: crate::datastore::PodSlotAdmissionState::Terminating,
     });
 
     let wake = actor.handle_for_test(LifecycleMessage::SlotAdmissionWake { key: key.clone() });
@@ -896,7 +894,6 @@ fn blocked_slot_uses_single_waiter_for_repeated_watch_events() {
         operation_id,
         blocking_uid: "old-uid".to_string(),
         blocking_node: "node-a".to_string(),
-        state: crate::datastore::PodSlotAdmissionState::Terminating,
     });
 
     for rv in 2..8 {
@@ -939,7 +936,6 @@ fn stale_slot_wake_for_old_uid_ignored() {
         operation_id,
         blocking_uid: "old-uid".to_string(),
         blocking_node: "node-a".to_string(),
-        state: crate::datastore::PodSlotAdmissionState::Terminating,
     });
 
     let stale = actor.handle_for_test(LifecycleMessage::SlotAdmissionWake {

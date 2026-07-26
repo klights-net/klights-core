@@ -1,6 +1,7 @@
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -10,6 +11,29 @@ type JobReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
 
 static JOB_RECONCILE_LOCKS: LazyLock<tokio::sync::Mutex<JobReconcileLocks>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+#[async_trait]
+pub trait JobStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn update_job_status(&self, resource: &Resource, status: Value) -> Result<Resource>;
+}
+
+#[async_trait]
+pub trait JobPodMutation: Send + Sync {
+    async fn create_job_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> Result<Resource>;
+    async fn replace_job_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> Result<Resource>;
+}
 
 async fn job_reconcile_lock(namespace: &str, name: &str) -> Arc<tokio::sync::Mutex<()>> {
     let key = format!("{namespace}/{name}");
@@ -64,7 +88,7 @@ fn format_indexes(indexes: &std::collections::HashSet<i64>) -> Option<String> {
     Some(out.join(","))
 }
 
-fn pod_completion_index(pod: &crate::datastore::Resource) -> Option<i64> {
+fn pod_completion_index(pod: &klights_cluster_core::Resource) -> Option<i64> {
     pod.data
         .pointer("/metadata/annotations/batch.kubernetes.io~1job-completion-index")
         .and_then(|v| v.as_str())
@@ -90,14 +114,11 @@ struct LiveJobCreateState {
 }
 
 async fn live_job_create_state(
-    db: &dyn DatastoreBackend,
+    db: &(impl JobStore + ?Sized),
     namespace: &str,
     name: &str,
 ) -> Result<Option<LiveJobCreateState>> {
-    let Some(resource) = db
-        .get_resource("batch/v1", "Job", Some(namespace), name)
-        .await?
-    else {
+    let Some(resource) = db.get_job(namespace, name).await? else {
         return Ok(None);
     };
     if resource
@@ -190,7 +211,7 @@ pub fn job_ttl_cleanup_delay(job: &Value) -> Result<Option<Duration>> {
 }
 
 async fn mark_job_foreground_deleting(
-    db: &dyn DatastoreBackend,
+    db: &(impl JobStore + ?Sized),
     resource: &Resource,
 ) -> Result<Resource> {
     let mut data: Value = (*resource.data).clone();
@@ -231,9 +252,10 @@ async fn mark_job_foreground_deleting(
 }
 
 async fn delete_finished_job_for_ttl(
-    db: &dyn DatastoreBackend,
+    db: &(impl JobStore + ?Sized),
     resource: &Resource,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
     if resource
         .data
@@ -244,16 +266,20 @@ async fn delete_finished_job_for_ttl(
     }
 
     let marked = mark_job_foreground_deleting(db, resource).await?;
-    let _ =
-        crate::controllers::gc::finalize_foreground_owner_if_ready(db, &marked, pod_delete_sink)
-            .await?;
+    let _ = crate::controllers::gc::finalize_foreground_owner_if_ready(
+        db,
+        &marked,
+        pod_delete_sink,
+        non_pod_finalization,
+    )
+    .await?;
     Ok(())
 }
 
 /// Evaluate successPolicy rules. Returns true if any rule is satisfied.
 fn check_success_policy(
     spec: &Value,
-    active_owned_pods: &[&crate::datastore::Resource],
+    active_owned_pods: &[&klights_cluster_core::Resource],
     succeeded_count: i64,
     historical_succeeded_indexes: &std::collections::HashSet<i64>,
 ) -> bool {
@@ -440,7 +466,7 @@ fn pod_failure_ignored_by_policy(spec: &Value, pod: &Value) -> bool {
 /// Returns true if any rule with action=FailJob matches.
 fn check_pod_failure_policy(
     spec: &Value,
-    active_owned_pods: &[&crate::datastore::Resource],
+    active_owned_pods: &[&klights_cluster_core::Resource],
 ) -> bool {
     active_owned_pods.iter().copied().any(|pod| {
         pod.data.pointer("/status/phase").and_then(|p| p.as_str()) == Some("Failed")
@@ -450,9 +476,9 @@ fn check_pod_failure_policy(
 
 fn fail_index_policy_matches(
     spec: &Value,
-    active_owned_pods: &[&crate::datastore::Resource],
+    active_owned_pods: &[&klights_cluster_core::Resource],
 ) -> std::collections::HashSet<i64> {
-    let failed_pods: Vec<&crate::datastore::Resource> = active_owned_pods
+    let failed_pods: Vec<&klights_cluster_core::Resource> = active_owned_pods
         .iter()
         .copied()
         .filter(|pod| pod.data.pointer("/status/phase").and_then(|p| p.as_str()) == Some("Failed"))
@@ -823,10 +849,11 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
 /// Reconcile a Job: manage pod creation/deletion against `completions`,
 /// `parallelism`, and `backoffLimit`. Returns the updated Job resource.
 pub async fn reconcile_job(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    db: &(impl JobStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
+    pod_writer: &(impl JobPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     job: &Value,
     node_name: &str,
 ) -> Result<Value> {
@@ -845,9 +872,7 @@ pub async fn reconcile_job(
     let reconcile_lock = job_reconcile_lock(initial_namespace, initial_name).await;
     let _reconcile_guard = reconcile_lock.lock().await;
 
-    let latest_job = db
-        .get_resource("batch/v1", "Job", Some(initial_namespace), initial_name)
-        .await?;
+    let latest_job = db.get_job(initial_namespace, initial_name).await?;
     let latest_job = match latest_job {
         Some(resource) => resource,
         None => return Ok(job.clone()),
@@ -865,7 +890,7 @@ pub async fn reconcile_job(
     }
 
     if job_ttl_cleanup_delay(&latest_job.data)?.is_some_and(|delay| delay.is_zero()) {
-        delete_finished_job_for_ttl(db, &latest_job, pod_delete_sink).await?;
+        delete_finished_job_for_ttl(db, &latest_job, pod_delete_sink, non_pod_finalization).await?;
         return Ok(std::sync::Arc::unwrap_or_clone(latest_job.data.clone()));
     }
 
@@ -904,7 +929,9 @@ pub async fn reconcile_job(
 
     // List existing pods owned by this Job, then apply Kubernetes controller
     // adoption/release semantics before computing status or creating pods.
-    let mut owned_pods = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let mut owned_pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     if let Some(selector) = job_pod_selector(spec, template) {
         let mut retained_owned_pods = Vec::new();
         for pod in owned_pods {
@@ -923,16 +950,23 @@ pub async fn reconcile_job(
                         .cloned()
                         .unwrap_or_default();
                     pod_writer
-                        .update_pod_owner_references(namespace, &pod.name, owner_refs)
+                        .replace_job_pod_owner_references(namespace, &pod.name, owner_refs)
                         .await?;
                 }
             }
         }
 
         let all_pods = pod_reader
-            .list_pods(Some(namespace), None, None, None, None)
+            .list_pods(PodListRequest::try_new(
+                Some(namespace.to_string()),
+                None,
+                None,
+                None,
+                None,
+            )?)
             .await?
-            .items;
+            .into_parts()
+            .0;
         for pod in all_pods {
             if pod_owned_by_job(&pod.data, uid) {
                 continue;
@@ -951,7 +985,7 @@ pub async fn reconcile_job(
                     .cloned()
                     .unwrap_or_default();
                 pod_writer
-                    .update_pod_owner_references(namespace, &pod.name, owner_refs)
+                    .replace_job_pod_owner_references(namespace, &pod.name, owner_refs)
                     .await?;
                 retained_owned_pods.push(pod);
             }
@@ -1070,7 +1104,11 @@ pub async fn reconcile_job(
         for pod in &active_owned_pods {
             let phase = pod.data.pointer("/status/phase").and_then(|p| p.as_str());
             if matches!(phase, Some("Pending") | Some("Running") | None) {
-                pod_writer.delete_pod(namespace, &pod.name).await?;
+                pod_delete_sink
+                    .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                        klights_types::PodIdentity::new(namespace, &pod.name, &pod.uid),
+                    ))
+                    .await?;
             }
         }
         active_count = 0;
@@ -1095,7 +1133,11 @@ pub async fn reconcile_job(
             .rev()
             .take(excess as usize)
         {
-            pod_writer.delete_pod(namespace, &pod.name).await?;
+            pod_delete_sink
+                .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                    klights_types::PodIdentity::new(namespace, &pod.name, &pod.uid),
+                ))
+                .await?;
             deleted_active_pod_names.insert(pod.name.clone());
             active_count -= 1;
             if pod_is_ready(&pod.data) {
@@ -1292,7 +1334,7 @@ pub async fn reconcile_job(
                 }
 
                 pod_writer
-                    .create_controller_pod(namespace, &pod_name, node_name, pod)
+                    .create_job_pod(namespace, &pod_name, node_name, pod)
                     .await?;
                 created += 1;
             }
@@ -1341,17 +1383,16 @@ pub async fn reconcile_job(
                 )?;
 
                 pod_writer
-                    .create_controller_pod(namespace, &pod_name, node_name, pod)
+                    .create_job_pod(namespace, &pod_name, node_name, pod)
                     .await?;
             }
         }
     }
 
-    let final_owned_pods = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
-    let Some(status_job_resource) = db
-        .get_resource("batch/v1", "Job", Some(namespace), name)
-        .await?
-    else {
+    let final_owned_pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
+    let Some(status_job_resource) = db.get_job(namespace, name).await? else {
         return Ok(std::sync::Arc::unwrap_or_clone(latest_job.data.clone()));
     };
     if status_job_resource
@@ -1365,12 +1406,11 @@ pub async fn reconcile_job(
     }
     let status = derive_job_status_from_owned_pods(&status_job_resource.data, &final_owned_pods);
 
-    let updated_resource =
-        crate::controllers::common::write_status_for_resource(db, &status_job_resource, &status)
-            .await?;
+    let updated_resource = db.update_job_status(&status_job_resource, status).await?;
 
     if job_ttl_cleanup_delay(&updated_resource.data)?.is_some_and(|delay| delay.is_zero()) {
-        delete_finished_job_for_ttl(db, &updated_resource, pod_delete_sink).await?;
+        delete_finished_job_for_ttl(db, &updated_resource, pod_delete_sink, non_pod_finalization)
+            .await?;
     }
 
     Ok(std::sync::Arc::unwrap_or_clone(updated_resource.data))

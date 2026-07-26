@@ -312,7 +312,7 @@ async fn test_list_items_include_resource_version() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -380,7 +380,7 @@ async fn test_list_items_include_resource_version_when_paginating() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -469,7 +469,7 @@ async fn test_list_with_limit_returns_correct_count() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -548,7 +548,7 @@ async fn test_list_with_continue_returns_next_chunk() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -635,7 +635,7 @@ async fn test_list_chunking_complete_iteration() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1047,9 +1047,9 @@ async fn test_delete_namespace_enters_terminating_before_final_removal() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
-    let metrics = state.metrics.clone();
+    let db = state.resource_mutation().db.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
+    let metrics = state.controller_reconcile().metrics.clone();
     let app = crate::api::build_router(state);
 
     let create_ns_req = Request::builder()
@@ -1149,8 +1149,8 @@ async fn test_namespace_termination_preserves_pod_until_actor_finalizes() {
     use serde_json::json;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let metrics = state.metrics.clone();
+    let db = state.resource_mutation().db.clone();
+    let metrics = state.controller_reconcile().metrics.clone();
 
     db.create_namespace(
         "ns-actor-owned-delete",
@@ -1233,6 +1233,7 @@ async fn test_namespace_termination_preserves_pod_until_actor_finalizes() {
 
     assert!(
         state
+            .resource_mutation()
             .pod_repository
             .finalize_pod_deletion_after_actor_cleanup("ns-actor-owned-delete", "pod-a", &pod.uid,)
             .await
@@ -1263,9 +1264,9 @@ async fn test_namespace_delete_pod_finalizer_blocks_non_pod_deletion_until_clear
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
-    let metrics = state.metrics.clone();
+    let db = state.resource_mutation().db.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
+    let metrics = state.controller_reconcile().metrics.clone();
     let app = crate::api::build_router(state);
 
     let create_ns_req = Request::builder()
@@ -1446,8 +1447,8 @@ async fn test_stale_namespace_termination_uid_does_not_delete_recreated_namespac
     use serde_json::json;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let metrics = state.metrics.clone();
+    let db = state.resource_mutation().db.clone();
+    let metrics = state.controller_reconcile().metrics.clone();
 
     db.create_namespace(
         "ns-recreated",
@@ -1510,7 +1511,7 @@ async fn test_delete_collection_pods_reconciles_resource_quota_used_immediately(
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     // 1. Create namespace
@@ -1624,7 +1625,7 @@ async fn test_delete_configmap_with_finalizer_marks_terminating_without_hard_del
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     let ns = json!({
@@ -1754,7 +1755,7 @@ async fn test_delete_collection_configmap_with_finalizer_does_not_cascade_child(
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -1875,7 +1876,7 @@ async fn test_delete_collection_dry_run_does_not_delete_configmaps_or_pods() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -1992,7 +1993,7 @@ async fn test_delete_collection_dry_run_does_not_delete_configmaps_or_pods() {
 #[tokio::test]
 async fn test_delete_collection_stale_same_name_replacement_does_not_delete_or_cascade() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_namespace(
         "stale-delete-collection-ns",
@@ -2134,7 +2135,7 @@ async fn test_configmap_finalizer_drain_hard_deletes_non_pod_row() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -2225,7 +2226,7 @@ async fn test_orphan_delete_configmap_removes_child_ownerrefs_before_owner_delet
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -2314,7 +2315,7 @@ async fn test_orphan_delete_deployment_removes_replicaset_ownerrefs() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -2433,7 +2434,7 @@ async fn test_finalizer_held_orphan_delete_orphans_child_and_drain_does_not_casc
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_namespace(
@@ -2565,7 +2566,7 @@ async fn test_finalizer_held_orphan_delete_orphans_child_and_drain_does_not_casc
 #[tokio::test]
 async fn test_single_delete_explicit_uid_race_returns_conflict_not_notfound() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_resource(
         "v1",
@@ -3088,7 +3089,7 @@ async fn test_apf_rejects_matching_request_when_limited_priority_level_is_full()
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     db.create_resource(
         "flowcontrol.apiserver.k8s.io/v1",
         "PriorityLevelConfiguration",
@@ -3178,7 +3179,7 @@ async fn test_apf_queue_mode_rejects_when_queue_length_limit_is_full() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let apf = state.api_priority_fairness.clone();
 
     db.create_resource(
@@ -3335,7 +3336,7 @@ async fn test_apf_queue_mode_separates_unrelated_flows() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let apf = state.api_priority_fairness.clone();
 
     db.create_resource(
@@ -3572,7 +3573,7 @@ async fn test_gc_foreground_rc_delete_retains_parent_until_pods_are_deleted() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3710,7 +3711,7 @@ async fn test_gc_foreground_delete_ignores_non_blocking_owner_ref_child() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3809,7 +3810,7 @@ async fn test_gc_foreground_delete_ignores_non_blocking_owner_ref_child() {
 #[tokio::test]
 async fn test_foreground_delete_mark_retries_internal_rv_conflict_without_user_rv_precondition() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_resource(
         "v1",
@@ -3917,7 +3918,7 @@ async fn test_foreground_delete_mark_retries_internal_rv_conflict_without_user_r
 #[tokio::test]
 async fn test_finalizer_delete_mark_retries_internal_rv_conflict_preserving_concurrent_update() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_resource(
         "v1",
@@ -4022,7 +4023,7 @@ async fn test_finalizer_delete_mark_retries_internal_rv_conflict_preserving_conc
 async fn test_delete_collection_finalizer_mark_retries_internal_rv_conflict_preserving_concurrent_update()
  {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_resource(
         "v1",
@@ -4129,7 +4130,7 @@ async fn test_delete_collection_finalizer_mark_retries_internal_rv_conflict_pres
 #[tokio::test]
 async fn test_single_delete_live_recheck_marks_when_same_uid_gains_finalizer() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_resource(
         "v1",
@@ -4235,7 +4236,7 @@ async fn test_single_delete_live_recheck_marks_when_same_uid_gains_finalizer() {
 #[tokio::test]
 async fn test_delete_collection_live_recheck_marks_when_same_uid_gains_finalizer() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     db.create_resource(
         "v1",
@@ -4334,7 +4335,7 @@ async fn test_node_proxy_route_accepts_name_with_port_suffix() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4412,7 +4413,7 @@ async fn test_pod_and_service_proxy_routes_return_backend_response() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4524,7 +4525,7 @@ async fn test_pod_and_service_proxy_filters_sensitive_forwarded_headers() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let bootstrap_token = crate::bootstrap::bootstrap_token::generate_bootstrap_token();
     crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
         db.as_ref(),
@@ -4650,7 +4651,7 @@ async fn test_pod_and_service_proxy_root_get_redirects_to_trailing_slash() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4764,7 +4765,7 @@ async fn test_service_proxy_named_port_uses_matching_endpoint_port() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4862,7 +4863,7 @@ async fn test_service_proxy_https_get_retries_transient_tls_eof() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -5419,7 +5420,7 @@ async fn test_apiservice_paths_proxy_to_registered_service_backend() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -5556,7 +5557,7 @@ async fn test_apiservice_service_reference_uses_https_on_non_443_port() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -5697,7 +5698,7 @@ async fn test_apiservice_proxy_uses_endpoint_port_when_service_port_differs() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -5833,7 +5834,7 @@ async fn test_apiservice_proxy_falls_back_to_not_ready_endpoint_addresses() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -5962,7 +5963,7 @@ async fn test_apiservice_proxy_sets_requestheader_identity_headers() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -6194,8 +6195,8 @@ async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalizati
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
+    let db = state.resource_mutation().db.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
     let app = crate::api::build_router(state);
 
     // Create the namespace via the HTTP path so all namespace-finalizer wiring

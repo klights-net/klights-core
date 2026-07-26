@@ -73,6 +73,7 @@ pub async fn delete_custom_resources_for_crd(
     for version in &versions {
         let api_version = format!("{group}/{version}");
         let keys = state
+            .resource_mutation()
             .db
             .list_resource_keys_for_scope(api_version.clone(), kind.to_string(), namespaced)
             .await?;
@@ -89,6 +90,7 @@ pub async fn delete_custom_resources_for_crd(
 
     for (api_version, namespace, name) in targets {
         state
+            .resource_mutation()
             .db
             .delete_resource(&api_version, kind, namespace.as_deref(), &name)
             .await?;
@@ -102,6 +104,7 @@ pub async fn delete_crd_with_deregistration(
     Query(query): Query<CreateUpdateQuery>,
 ) -> Result<Json<Value>, AppError> {
     let resource = state
+        .resource_mutation()
         .db
         .get_resource(
             "apiextensions.k8s.io/v1",
@@ -135,7 +138,11 @@ pub async fn delete_crd_with_deregistration(
     {
         for ver in versions {
             if let Some(ver_name) = ver.get("name").and_then(|n| n.as_str()) {
-                state.crd_registry.remove(group, ver_name, plural).await;
+                state
+                    .discovery()
+                    .crd_registry
+                    .remove(group, ver_name, plural)
+                    .await;
             }
         }
     }
@@ -151,6 +158,7 @@ pub async fn delete_crd_with_deregistration(
         );
     }
     let _ = state
+        .resource_mutation()
         .db
         .update_resource(
             "apiextensions.k8s.io/v1",
@@ -164,6 +172,7 @@ pub async fn delete_crd_with_deregistration(
 
     // hard-delete
     state
+        .resource_mutation()
         .db
         .delete_resource(
             "apiextensions.k8s.io/v1",
@@ -180,21 +189,19 @@ pub async fn delete_collection_customresourcedefinitions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in &list.items {
+    let resources = crate::api::resource_query_ports::list_resources(
+        state.resource_mutation().resource_query.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        query.label_selector.as_deref(),
+        None,
+        None,
+        None,
+    )
+    .await?
+    .into_items();
+    for resource in &resources {
         // Deregister each CRD from the registry before deleting
         let group = resource
             .data
@@ -213,12 +220,17 @@ pub async fn delete_collection_customresourcedefinitions(
         {
             for ver in versions {
                 if let Some(ver_name) = ver.get("name").and_then(|n| n.as_str()) {
-                    state.crd_registry.remove(group, ver_name, plural).await;
+                    state
+                        .discovery()
+                        .crd_registry
+                        .remove(group, ver_name, plural)
+                        .await;
                 }
             }
         }
         delete_custom_resources_for_crd(&state, &resource.data).await?;
         let _ = state
+            .resource_mutation()
             .db
             .delete_resource(
                 "apiextensions.k8s.io/v1",
@@ -387,7 +399,7 @@ async fn create_crd_with_registration(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     let admitted = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "apiextensions.k8s.io/v1",
             kind: "CustomResourceDefinition",
@@ -421,6 +433,7 @@ async fn create_crd_with_registration(
     // Real K8s creates the CRD first, then the CRD controller updates status,
     // causing a MODIFIED event. Tests watch for this MODIFIED event.
     let resource = state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -433,9 +446,11 @@ async fn create_crd_with_registration(
 
     // Register the CRD in the registry immediately (so API routes are ready)
     let body_with_status = add_crd_established_condition(body.clone());
-    if let Err(e) =
-        crate::controllers::crd::register_crd_from_value(&state.crd_registry, &body_with_status)
-            .await
+    if let Err(e) = crate::api_discovery::register_crd_from_value(
+        &state.discovery().crd_registry,
+        &body_with_status,
+    )
+    .await
     {
         tracing::error!("Failed to register CRD: {}", e);
     }
@@ -445,6 +460,7 @@ async fn create_crd_with_registration(
     // Return the latest RV in the create response so watch catch-up from this RV
     // does not replay this intermediate MODIFIED event before DELETE.
     let updated = state
+        .resource_mutation()
         .db
         .update_resource(
             "apiextensions.k8s.io/v1",
@@ -474,6 +490,7 @@ async fn update_crd_with_registration(
     LenientJson(mut body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     let current = state
+        .resource_mutation()
         .db
         .get_resource(
             "apiextensions.k8s.io/v1",
@@ -502,7 +519,7 @@ async fn update_crd_with_registration(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
-        state.db.as_ref(),
+        state.resource_mutation().db.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "apiextensions.k8s.io/v1",
             kind: "CustomResourceDefinition",
@@ -541,6 +558,7 @@ async fn update_crd_with_registration(
         for ver in versions {
             if let Some(ver_name) = ver.get("name").and_then(|n| n.as_str()) {
                 state
+                    .discovery()
                     .crd_registry
                     .remove(old_group, ver_name, old_plural)
                     .await;
@@ -571,6 +589,7 @@ async fn update_crd_with_registration(
     }
 
     let resource = state
+        .resource_mutation()
         .db
         .update_resource(
             "apiextensions.k8s.io/v1",
@@ -583,8 +602,11 @@ async fn update_crd_with_registration(
         .await?;
 
     // Re-register with new spec
-    if let Err(e) =
-        crate::controllers::crd::register_crd_from_value(&state.crd_registry, &resource.data).await
+    if let Err(e) = crate::api_discovery::register_crd_from_value(
+        &state.discovery().crd_registry,
+        &resource.data,
+    )
+    .await
     {
         tracing::error!("Failed to re-register CRD: {}", e);
     }
@@ -617,6 +639,7 @@ async fn patch_crd_with_registration(
     // Server-side apply PATCH is create-or-update for CRDs.
     if content_type == Some("application/apply-patch+yaml") {
         let exists = state
+            .resource_mutation()
             .db
             .get_resource(
                 "apiextensions.k8s.io/v1",
@@ -640,7 +663,7 @@ async fn patch_crd_with_registration(
             }
 
             let admitted = run_admission_for_request(
-                state.db.as_ref(),
+                state.resource_mutation().db.as_ref(),
                 build_admission_context(AdmissionContextRequest {
                     api_version: "apiextensions.k8s.io/v1",
                     kind: "CustomResourceDefinition",
@@ -661,6 +684,7 @@ async fn patch_crd_with_registration(
             }
 
             let resource = state
+                .resource_mutation()
                 .db
                 .create_resource(
                     "apiextensions.k8s.io/v1",
@@ -672,8 +696,8 @@ async fn patch_crd_with_registration(
                 .await?;
 
             let body_with_status = add_crd_established_condition(admitted);
-            if let Err(e) = crate::controllers::crd::register_crd_from_value(
-                &state.crd_registry,
+            if let Err(e) = crate::api_discovery::register_crd_from_value(
+                &state.discovery().crd_registry,
                 &body_with_status,
             )
             .await
@@ -682,6 +706,7 @@ async fn patch_crd_with_registration(
             }
 
             let response_resource = match state
+                .resource_mutation()
                 .db
                 .update_resource(
                     "apiextensions.k8s.io/v1",
@@ -711,6 +736,7 @@ async fn patch_crd_with_registration(
     let max_retries = 5;
     for attempt in 0..max_retries {
         let current = state
+            .resource_mutation()
             .db
             .get_resource(
                 "apiextensions.k8s.io/v1",
@@ -723,7 +749,7 @@ async fn patch_crd_with_registration(
 
         let patched = apply_patch(&current.data, &patch, content_type)?;
         let patched = run_admission_for_request(
-            state.db.as_ref(),
+            state.resource_mutation().db.as_ref(),
             build_admission_context(AdmissionContextRequest {
                 api_version: "apiextensions.k8s.io/v1",
                 kind: "CustomResourceDefinition",
@@ -744,6 +770,7 @@ async fn patch_crd_with_registration(
         }
 
         match state
+            .resource_mutation()
             .db
             .update_resource(
                 "apiextensions.k8s.io/v1",
@@ -775,6 +802,7 @@ async fn patch_crd_with_registration(
                     for ver in versions {
                         if let Some(ver_name) = ver.get("name").and_then(|n| n.as_str()) {
                             state
+                                .discovery()
                                 .crd_registry
                                 .remove(old_group, ver_name, old_plural)
                                 .await;
@@ -782,8 +810,8 @@ async fn patch_crd_with_registration(
                     }
                 }
                 // Re-register with new spec
-                if let Err(e) = crate::controllers::crd::register_crd_from_value(
-                    &state.crd_registry,
+                if let Err(e) = crate::api_discovery::register_crd_from_value(
+                    &state.discovery().crd_registry,
                     &resource.data,
                 )
                 .await
@@ -792,9 +820,7 @@ async fn patch_crd_with_registration(
                 }
                 return Ok(Json(std::sync::Arc::unwrap_or_clone(resource.data)));
             }
-            Err(e)
-                if attempt < max_retries - 1 && crate::datastore::errors::is_conflict_error(&e) =>
-            {
+            Err(e) if attempt < max_retries - 1 && crate::api::errors::is_conflict_error(&e) => {
                 tracing::debug!(
                     "PATCH CRD {}: conflict on attempt {}, retrying",
                     name,

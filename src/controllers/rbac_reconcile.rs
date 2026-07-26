@@ -1,33 +1,64 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Map, Value};
 
+#[cfg(test)]
+use crate::controllers::default_rbac_policy::RBAC_API_VERSION;
 use crate::controllers::default_rbac_policy::{
-    AUTOUPDATE_ANNOTATION, DefaultRbacObject, RBAC_API_VERSION, default_cluster_role_rules,
-    default_rbac_fixtures,
+    AUTOUPDATE_ANNOTATION, DefaultRbacObject, default_cluster_role_rules, default_rbac_fixtures,
 };
-use crate::datastore::DatastoreBackend;
 use klights_types::LabelSelector;
 
-pub async fn reconcile_default_rbac_objects(db: &dyn DatastoreBackend) -> Result<()> {
+#[async_trait]
+pub(crate) trait RbacPolicyStore: Send + Sync {
+    async fn get_rbac_object(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+
+    async fn create_rbac_object(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+    ) -> Result<Resource>;
+
+    async fn update_rbac_object(
+        &self,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+        expected_resource_version: i64,
+    ) -> Result<Resource>;
+
+    async fn list_cluster_roles(&self) -> Result<Vec<Resource>>;
+}
+
+pub(crate) async fn reconcile_default_rbac_objects<S: RbacPolicyStore + ?Sized>(
+    store: &S,
+) -> Result<()> {
     for fixture in default_rbac_fixtures() {
-        reconcile_default_rbac_object(db, &fixture).await?;
+        reconcile_default_rbac_object(store, &fixture).await?;
     }
 
-    reconcile_cluster_role_aggregation(db).await?;
+    reconcile_cluster_role_aggregation(store).await?;
 
     Ok(())
 }
 
-async fn reconcile_default_rbac_object(
-    db: &dyn DatastoreBackend,
+async fn reconcile_default_rbac_object<S: RbacPolicyStore + ?Sized>(
+    store: &S,
     fixture: &DefaultRbacObject,
 ) -> Result<()> {
     let (kind, name, namespace) = fixture.key();
-    let existing = db
-        .get_resource(RBAC_API_VERSION, kind, namespace, name)
-        .await?;
+    let existing = store.get_rbac_object(kind, namespace, name).await?;
 
     match existing {
         Some(existing_obj) => {
@@ -47,28 +78,23 @@ async fn reconcile_default_rbac_object(
                 | reconcile_aggregation_rule(&mut patched, &expected);
 
             if changed {
-                db.update_resource(
-                    RBAC_API_VERSION,
-                    kind,
-                    namespace,
-                    name,
-                    Value::Object(patched),
-                    existing_obj.resource_version,
-                )
-                .await?;
+                store
+                    .update_rbac_object(
+                        kind,
+                        namespace,
+                        name,
+                        Value::Object(patched),
+                        existing_obj.resource_version,
+                    )
+                    .await?;
             }
 
             Ok(())
         }
         None => {
-            db.create_resource(
-                RBAC_API_VERSION,
-                kind,
-                namespace,
-                name,
-                fixture.to_json_value(),
-            )
-            .await?;
+            store
+                .create_rbac_object(kind, namespace, name, fixture.to_json_value())
+                .await?;
             Ok(())
         }
     }
@@ -188,30 +214,22 @@ fn reconcile_aggregation_rule(existing: &mut Map<String, Value>, desired: &Value
 /// roles. Unlike a one-way add-only merge, this fully recomputes the managed
 /// rule set on each pass, so privilege contributed by a source role is revoked
 /// when that source loses the aggregation label or is deleted.
-pub(crate) async fn reconcile_cluster_role_aggregation(db: &dyn DatastoreBackend) -> Result<()> {
-    let cluster_roles = db
-        .list_resources_page(
-            RBAC_API_VERSION,
-            "ClusterRole",
-            None,
-            None,
-            None,
-            crate::datastore::types::ListPageRequest::unbounded(),
-        )
-        .await?;
+pub(crate) async fn reconcile_cluster_role_aggregation<S: RbacPolicyStore + ?Sized>(
+    store: &S,
+) -> Result<()> {
+    let cluster_roles = store.list_cluster_roles().await?;
 
     // Snapshot every ClusterRole body once for selector matching.
     let role_values: Vec<Value> = cluster_roles
-        .items
         .iter()
         .map(|resource| resource.data.as_ref().clone())
         .collect();
 
-    for resource in &cluster_roles.items {
+    for resource in &cluster_roles {
         let Some(selectors) = aggregation_selectors(resource.data.as_ref()) else {
             continue;
         };
-        reconcile_aggregated_role(db, resource, &role_values, &selectors).await?;
+        reconcile_aggregated_role(store, resource, &role_values, &selectors).await?;
     }
 
     Ok(())
@@ -233,9 +251,9 @@ fn aggregation_selectors(role: &Value) -> Option<Vec<LabelSelector>> {
     )
 }
 
-async fn reconcile_aggregated_role(
-    db: &dyn DatastoreBackend,
-    target: &crate::datastore::Resource,
+async fn reconcile_aggregated_role<S: RbacPolicyStore + ?Sized>(
+    store: &S,
+    target: &klights_cluster_core::Resource,
     cluster_roles: &[Value],
     selectors: &[LabelSelector],
 ) -> Result<()> {
@@ -293,15 +311,15 @@ async fn reconcile_aggregated_role(
         .cloned()
         .unwrap_or_default();
     patched.insert("rules".to_string(), Value::Array(desired_rules));
-    db.update_resource(
-        RBAC_API_VERSION,
-        "ClusterRole",
-        None,
-        target_name,
-        Value::Object(patched),
-        target.resource_version,
-    )
-    .await?;
+    store
+        .update_rbac_object(
+            "ClusterRole",
+            None,
+            target_name,
+            Value::Object(patched),
+            target.resource_version,
+        )
+        .await?;
 
     Ok(())
 }

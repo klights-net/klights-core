@@ -115,13 +115,17 @@ async fn start_controlplane_leader_control_stream_if_needed(
     }
     client
         .set_node_log_runtime(std::sync::Arc::new(
-            crate::replication::grpc::client::LocalNodeLogRuntime::new_with_pod_event_store(
+            crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
                 crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
-                    std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                        pod_event_db,
-                    )),
+                    std::sync::Arc::new(
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                            std::sync::Arc::new(
+                                crate::datastore::DatastoreBackendWatchStore::new(pod_event_db),
+                            ),
+                        ),
+                    ),
                 ),
             ),
         ))
@@ -155,8 +159,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let grpc_transport_policy = cfg.grpc_transport_policy;
     let network_cleanup = cfg.network_cleanup;
     let shutdown_token = cfg.shutdown_token;
-    let containerd_data_dir = cfg.containerd_data_dir;
-    let containerd_state_dir = cfg.containerd_state_dir;
+    let runtime_paths = cfg.runtime_paths;
     let node_ip = identity.node_ip;
     let local_dataplane = identity
         .follower_dataplane
@@ -188,6 +191,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
 
     let ds = phases::datastore::open_leader(phases::datastore::OpenLeaderArgs {
         config: &config,
+        runtime_paths: &runtime_paths,
         role: &cli.role,
         node_mode: &node_mode,
         supervisor: task_supervisor.clone(),
@@ -290,6 +294,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         }
     }
 
+    let network_runtime_inputs = crate::bootstrap::runtime_inputs::NetworkRuntimeInputs::capture();
     let net = phases::network::boot(phases::network::NetworkBootArgs {
         config: &config,
         node_mode: &node_mode,
@@ -297,8 +302,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         cluster_api: cluster_api.clone(),
         node_local: node_local.clone(),
         network_cleanup: &network_cleanup,
-        containerd_data_dir: &containerd_data_dir,
-        containerd_state_dir: &containerd_state_dir,
+        runtime_paths: &runtime_paths,
+        runtime_inputs: network_runtime_inputs,
         supervisor: task_supervisor.clone(),
         grpc_transport_policy: grpc_transport_policy.clone(),
         shutdown_token: shutdown_token.clone(),
@@ -313,6 +318,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let cni_readiness = net.cni_readiness;
     let dataplane_health = net.dataplane_health;
     let pod_network_cache = net.pod_network_cache;
+    let pod_runtime_store = net.pod_runtime_store;
+    let pod_endpoint_store = net.pod_endpoint_store;
     let assignment_waiter = net.assignment_waiter;
     let controlplane_leader_control_stream_handle =
         start_controlplane_leader_control_stream_if_needed(
@@ -341,8 +348,9 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         db,
         cluster_api: cluster_api.clone(),
         remote_api_client: remote_api_client.clone(),
-        _node_local: node_local.clone(),
         pod_network_cache,
+        pod_runtime_store,
+        pod_endpoint_store,
         assignment_waiter,
         replication_service_for_router: replication_service_for_router.clone(),
         outbox_runtime: outbox_runtime.clone(),
@@ -356,6 +364,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         cri_for_pod_watcher,
         cri_for_api: cri_for_api.clone(),
         cni_readiness,
+        runtime_paths: runtime_paths.clone(),
         supervisor: task_supervisor.clone(),
         grpc_transport_policy: grpc_transport_policy.clone(),
         shutdown_token: shutdown_token.clone(),
@@ -373,7 +382,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let node_lifecycle_handle = bp.node_lifecycle_handle;
     let scheduler_controller_handle = bp.scheduler_controller_handle;
     let dispatcher_for_worker = bp.dispatcher_for_worker;
-    let scheduler_state = bp._watcher_state.clone();
     let app = bp.app;
     let cri_for_shutdown = cri_for_api.clone();
     let dispatcher_for_cronjobs = dispatcher_for_worker.clone();
@@ -386,7 +394,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         dispatcher_for_worker: &dispatcher_for_worker,
         dispatcher_for_cronjobs: &dispatcher_for_cronjobs,
         pod_repository: &pod_repository,
-        scheduler_state: &scheduler_state,
         cri_for_shutdown: &cri_for_shutdown,
         datapath: network.datapath(),
         is_leader_rx: is_leader_rx.clone(),
@@ -728,7 +735,7 @@ mod tests {
         assert_eq!(stored.node_name, "leader-a");
         assert_eq!(
             stored.encryption,
-            crate::networking::wireguard::DataplaneEncryption::Disabled
+            klights_cluster_store::DataplaneEncryption::Disabled
         );
         assert!(stored.public_key.is_none());
         assert_eq!(stored.endpoint.to_string(), "192.0.2.10");
@@ -748,7 +755,7 @@ mod tests {
         )
         .await
         .expect("open node-local test db");
-        let outbox = crate::kubelet::outbox::Outbox::new(node_db.clone());
+        let outbox = crate::node_outbox::Outbox::new(node_db.clone());
         let dataplane = crate::replication::grpc::client::JoinDataplaneMetadata {
             public_key: Some("worker-public-key".to_string()),
             endpoint: "192.0.2.55".to_string(),
@@ -771,7 +778,7 @@ mod tests {
         assert_eq!(row.subject_name, "worker-a");
         assert_eq!(row.subject_key, "v1/Node/worker-a/dataplane");
         let payload =
-            crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
+            crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
                 .expect("decode dataplane outbox payload");
         match payload.command {
             crate::datastore::command::StorageCommand::UpdateNodeDataplane {

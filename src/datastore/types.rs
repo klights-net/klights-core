@@ -12,8 +12,8 @@ use std::borrow::Cow;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use crate::networking::{NodeName, PodSubnet};
 use crate::watch::WatchEvent;
+use klights_types::{NodeName, PodSubnet};
 
 // TEMPORARY(Phase 5.1): one compatibility facade preserves root datastore
 // source paths while adjacent cluster semantics are extracted.
@@ -52,6 +52,26 @@ pub enum PodSlotAdmissionResult {
         resource_version: i64,
     },
     Blocked {
+        blocking_uid: String,
+        blocking_node: String,
+        state: PodSlotAdmissionState,
+        resource_version: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PodSlotMutationResult {
+    Changed { resource_version: i64 },
+    Unchanged { resource_version: i64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PodSlotClearResult {
+    Cleared {
+        resource_version: i64,
+    },
+    NotFound,
+    UidMismatch {
         blocking_uid: String,
         blocking_node: String,
         state: PodSlotAdmissionState,
@@ -100,17 +120,10 @@ pub struct ReplicatedSnapshotMetadata {
     pub cluster_id: String,
     pub leader_epoch: i64,
     pub membership: ReplicatedMembershipState,
-    /// Snapshot-only mode metadata. `None` preserves callers that restore
-    /// cluster identity without carrying the RV-assignment envelope.
-    pub resource_version_assignment_mode: Option<crate::log_apply::ResourceVersionAssignment>,
     /// Exact command-codec activation proof captured with the authoritative
     /// snapshot. `None` is fail-closed and removes any destination-local
     /// marker; only `Some(3)` may reopen proposal capability after restore.
     pub command_codec_activation_version: Option<u32>,
-    /// Retains whether a Raft snapshot omitted the assignment-mode field.
-    /// Older non-Raft callers may continue to use the explicit legacy field.
-    pub snapshot_assignment_mode:
-        Option<crate::datastore::resource_version_assignment::SnapshotAssignmentMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +135,6 @@ pub enum ReplicatedMembershipState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableAllocatorObservation {
-    pub resource_version_assignment: klights_cluster_core::ResourceVersionAssignment,
     pub position: klights_cluster_core::WatchReplayPosition,
 }
 
@@ -617,11 +629,11 @@ pub struct NodeSubnet {
     pub node_ip: Ipv4Addr,
     /// Peer mode projected from the node's `klights.io/mode` annotation
     /// (F2-04). Defaults to `Root` for legacy rows or pre-F2-05 nodes.
-    pub mode: crate::controllers::annotations::NodePeerMode,
+    pub mode: klights_types::NodePeerMode,
     /// Rootless host-port graft range projected from `klights.io/hostport-range`.
     /// `None` for root peers; `Some` for rootless peers when the annotation
     /// parses cleanly.
-    pub hostport_range: Option<crate::networking::types::HostPortRange>,
+    pub hostport_range: Option<klights_types::HostPortRange>,
 }
 
 /// Pod-level network state captured at the CNI boundary. Returned by

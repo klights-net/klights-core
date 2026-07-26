@@ -29,9 +29,11 @@ pub trait PodVolumeRuntime: Send + Sync {
 /// Production volume runtime adapter delegating to [`PodVolumeManager`].
 pub struct RealPodVolumeRuntime {
     sources: Arc<dyn VolumeSourceReader>,
-    containerd_namespace: String,
+    _containerd_namespace: String,
     supervisor: Arc<TaskSupervisor>,
     file_process: klights_supervisor::FileProcessExecutor,
+    node_capacity: crate::kubelet::node::NodeCapacity,
+    paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     projected_sa_refresh_cancellations: Arc<Mutex<HashMap<PodRuntimeKey, CancellationToken>>>,
 }
 
@@ -40,11 +42,15 @@ impl RealPodVolumeRuntime {
         sources: Arc<dyn VolumeSourceReader>,
         containerd_namespace: String,
         supervisor: Arc<TaskSupervisor>,
+        node_capacity: crate::kubelet::node::NodeCapacity,
+        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Self {
         Self {
             sources,
-            containerd_namespace,
+            _containerd_namespace: containerd_namespace,
             file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+            node_capacity,
+            paths,
             supervisor,
             projected_sa_refresh_cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -79,15 +85,14 @@ impl RealPodVolumeRuntime {
             .lock()
             .expect("projected SA refresh cancellation map poisoned")
             .insert(key.clone(), cancel.clone());
-        let volumes_root = crate::paths::volumes_root_path(&self.containerd_namespace)
-            .to_string_lossy()
-            .into_owned();
+        let volumes_root = self.paths.volumes_root().to_string_lossy().into_owned();
         crate::kubelet::projected_sa_token_refresh::schedule_projected_service_account_token_refresh(
             crate::kubelet::projected_sa_token_refresh::ProjectedSaTokenRefreshRequest {
                 file_process: self.file_process.clone(),
                 sources: self.sources.clone(),
                 volumes_root,
                 key: key.clone(),
+                node_capacity: self.node_capacity,
             },
             pod,
             self.supervisor.clone(),
@@ -108,7 +113,8 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
             &self.file_process,
             self.sources.as_ref(),
-            &self.containerd_namespace,
+            &self.paths,
+            self.node_capacity,
         );
         let volume_paths = manager
             .process_volumes(&pod_dir_id, &key.name, &key.namespace, pod)
@@ -121,9 +127,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
     async fn cleanup_volumes(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
         self.cancel_projected_sa_refresh(key);
         let pod_dir_id = key.volume_dir_id();
-        let pod_volumes_dir = crate::paths::volumes_root_path(&self.containerd_namespace)
-            .join(&pod_dir_id)
-            .join("volumes");
+        let pod_volumes_dir = self.paths.volumes_root().join(&pod_dir_id).join("volumes");
         let pod_volumes_path = pod_volumes_dir.to_string_lossy().into_owned();
         crate::kubelet::volumes::unmount_volume_mounts_under(&self.file_process, &pod_volumes_path)
             .await?;
@@ -164,6 +168,11 @@ mod tests {
             Arc::new(klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
+            crate::kubelet::node::NodeCapacity::default(),
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
+                containerd_ns,
+            ))
+            .unwrap(),
         );
         let key = PodRuntimeKey {
             namespace: "default".to_string(),
@@ -209,6 +218,11 @@ mod tests {
             Arc::new(klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
+            crate::kubelet::node::NodeCapacity::default(),
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
+                containerd_ns,
+            ))
+            .unwrap(),
         );
         let pod = serde_json::json!({
             "spec": {

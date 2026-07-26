@@ -15,9 +15,9 @@ use crate::auth::clock::SystemClock;
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::impersonation::ImpersonationRequest;
 use crate::auth::middleware::{
-    AuthnRuntime, BootstrapTokenAuthenticator, BoundTokenSubjectLookup,
-    ServiceAccountSigningKeyProvider, authenticate_forwarded_client_cert, authenticate_parts,
-    client_cert_is_trusted_proxy, resolve_request_identity,
+    AuthnRuntime, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
+    authenticate_forwarded_client_cert, authenticate_parts, client_cert_is_trusted_proxy,
+    resolve_request_identity,
 };
 
 pub const FORWARDED_CLIENT_CERT_HEADER: &str = "x-remote-client-certificate";
@@ -39,6 +39,7 @@ impl ApiAuthResources<'_> {
         name: &str,
     ) -> Result<Option<String>, AuthenticationError> {
         self.state
+            .resource_mutation()
             .db
             .get_resource(api_version, kind, namespace, name)
             .await
@@ -59,49 +60,15 @@ impl ApiAuthResources<'_> {
     }
 }
 
-pub(crate) struct DatastoreBootstrapTokenAuthenticator {
-    db: crate::datastore::DatastoreHandle,
-}
-
-impl DatastoreBootstrapTokenAuthenticator {
-    pub(crate) fn new(db: crate::datastore::DatastoreHandle) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait::async_trait]
-impl BootstrapTokenAuthenticator for DatastoreBootstrapTokenAuthenticator {
-    async fn authenticate_bootstrap_token(
-        &self,
-        token: &str,
-    ) -> Result<AuthenticatedIdentity, AuthenticationError> {
-        crate::bootstrap::bootstrap_token::validate_bootstrap_token(self.db.as_ref(), token)
-            .await
-            .map(|identity| {
-                AuthenticatedIdentity::bootstrap(&identity.token_id, &identity.extra_groups)
-            })
-            .map_err(|error| match error {
-                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::Rejected {
-                    message,
-                } => AuthenticationError::unauthenticated(message),
-                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::DependencyFailure {
-                    message,
-                } => AuthenticationError::dependency_failure(message),
-                crate::bootstrap::bootstrap_token::BootstrapTokenAuthenticationError::InternalFailure {
-                    message,
-                } => AuthenticationError::internal_failure(message),
-            })
-    }
-}
-
 #[async_trait::async_trait]
 impl ServiceAccountSigningKeyProvider for ApiAuthResources<'_> {
     async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
-        let signing_key_path =
-            crate::paths::service_account_signing_key_path(&self.state.config.containerd_namespace);
+        let signing_key_path = crate::paths::service_account_signing_key_path(
+            &self.state.operational().config.containerd_namespace,
+        );
         crate::auth::read_service_account_signing_key_supervised(
             &signing_key_path,
-            self.state.task_supervisor.as_ref(),
+            self.state.operational().task_supervisor.as_ref(),
         )
         .await
         .map_err(|error| {
@@ -128,8 +95,8 @@ impl BoundTokenSubjectLookup for ApiAuthResources<'_> {
         namespace: &str,
         name: &str,
     ) -> Result<Option<String>, AuthenticationError> {
-        crate::kubelet::pod_repository::PodReader::get_pod(
-            self.state.pod_repository.as_ref(),
+        crate::api::pod_repository_ports::get_pod(
+            self.state.resource_mutation().pod_repository.as_ref(),
             namespace,
             name,
         )
@@ -178,7 +145,7 @@ pub(crate) async fn authenticate_token_for_review(
         state.oidc_authenticator.as_deref(),
         state.webhook_authenticator.as_deref(),
         &clock,
-        &state.task_supervisor,
+        &state.operational().task_supervisor,
         false,
     );
     crate::auth::middleware::authenticate_token_for_review(&runtime, token, audiences).await
@@ -195,11 +162,15 @@ pub async fn authenticate_request(
 
     let extension_user = request.extensions().get::<AuthenticatedIdentity>().cloned();
     let client_cert = request.extensions().get::<TlsClientCertificate>().cloned();
-    let is_trusted_proxy =
-        match client_cert_is_trusted_proxy(client_cert.as_ref(), &state.task_supervisor).await {
-            Ok(is_trusted) => is_trusted,
-            Err(error) => return AppError::from(error).into_response(),
-        };
+    let is_trusted_proxy = match client_cert_is_trusted_proxy(
+        client_cert.as_ref(),
+        &state.operational().task_supervisor,
+    )
+    .await
+    {
+        Ok(is_trusted) => is_trusted,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let authorization = match request.headers().get(AUTHORIZATION) {
         Some(value) => match value.to_str() {
             Ok(raw) => Some(raw.to_string()),
@@ -220,8 +191,8 @@ pub async fn authenticate_request(
         state.oidc_authenticator.as_deref(),
         state.webhook_authenticator.as_deref(),
         &clock,
-        &state.task_supervisor,
-        state.config.anonymous_auth,
+        &state.operational().task_supervisor,
+        state.operational().config.anonymous_auth,
     );
     let identity = match authenticate_parts(&runtime, extension_user, client_cert, authorization)
         .await
@@ -236,7 +207,7 @@ pub async fn authenticate_request(
             match authenticate_forwarded_client_cert(
                 state.cluster_ca_pem.as_deref().map(String::as_str),
                 &cert_der,
-                &state.task_supervisor,
+                &state.operational().task_supervisor,
             )
             .await
             {
@@ -588,6 +559,7 @@ mod tests {
         uid: &str,
     ) {
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "v1",
@@ -630,6 +602,7 @@ mod tests {
         );
 
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "v1",
@@ -679,6 +652,7 @@ mod tests {
             "a token bound to a deleted Secret must be rejected"
         );
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "v1",

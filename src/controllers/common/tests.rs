@@ -2,6 +2,7 @@
 
 mod cases {
     use super::super::*;
+    use crate::datastore::DatastoreBackend;
     use crate::datastore::sqlite::Datastore;
 
     use serde_json::json;

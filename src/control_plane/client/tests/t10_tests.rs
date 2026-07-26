@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::control_plane::client::apply::{apply_outbox_transactionally, gc_applied_outbox};
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::command::StorageCommand;
-use crate::kubelet::outbox::OutboxApplyResult;
-use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::node_outbox::OutboxApplyResult;
+use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 
 fn pod_status_payload(uid: &str) -> Vec<u8> {
     let command = StorageCommand::UpdateStatus {
@@ -242,7 +242,7 @@ async fn pod_status_outbox_stale_rv_still_rejects_same_name_different_uid() {
     assert!(
         matches!(
             err,
-            crate::kubelet::outbox::OutboxApplyError::UidMismatch { .. }
+            crate::node_outbox::OutboxApplyError::UidMismatch { .. }
         ),
         "same-name replacement must remain protected by UID precondition, got: {err:?}"
     );
@@ -582,15 +582,12 @@ async fn transactional_worker_node_status_preserves_newer_leader_unknown_conditi
 
 #[tokio::test]
 async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
-    // Test that when an outbox apply fails at the mutation phase (after placeholder
-    // insert), the placeholder is cleaned up so a retry can succeed. We test this
-    // by calling the DatastoreBackend method directly, bypassing the outer UID
-    // mismatch check, with a payload for a non-existent pod.
+    // The mutation and ledger are one transaction. A mutation failure must leave
+    // neither durable state behind, so the same delivery can be retried.
     let db = Arc::new(crate::datastore::test_support::in_memory().await);
 
     // Call db.apply_outbox_transactionally directly (bypasses apply.rs which
-    // catches NotFound before placeholder). The pod doesn't exist, so
-    // apply_forwarded_command will fail → placeholder should be rolled back.
+    // catches NotFound first). The pod does not exist, so the atomic apply fails.
     let err = db
         .apply_outbox_transactionally(
             "rollback-key",
@@ -602,18 +599,18 @@ async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
         .expect_err("apply should fail for non-existent pod");
 
     assert!(
-        matches!(err, crate::kubelet::outbox::OutboxApplyError::Retryable(_)),
-        "error should be retryable (placeholder rolled back), got: {err:?}"
+        matches!(err, crate::node_outbox::OutboxApplyError::Retryable(_)),
+        "error should be retryable after atomic rollback, got: {err:?}"
     );
 
-    // Verify no applied_outbox row remains (placeholder was rolled back).
+    // Verify the failed transaction left no ledger row.
     let record = db
         .get_applied_outbox("rollback-key")
         .await
         .expect("get ledger");
     assert!(
         record.is_none(),
-        "placeholder should have been rolled back after mutation failure"
+        "failed atomic apply must not leave a ledger row"
     );
 
     // Create the pod now and retry — must succeed.
@@ -655,7 +652,7 @@ async fn outbox_apply_rolls_back_mutation_when_ledger_insert_fails() {
 }
 
 #[tokio::test]
-async fn outbox_apply_recovers_from_stale_placeholder() {
+async fn outbox_apply_rejects_incomplete_ledger_row_without_age_based_recovery() {
     let db = Arc::new(crate::datastore::test_support::in_memory().await);
     db.create_resource(
         "v1",
@@ -693,7 +690,7 @@ async fn outbox_apply_recovers_from_stale_placeholder() {
     .await
     .expect("insert stale placeholder");
 
-    let result = db
+    let err = db
         .apply_outbox_transactionally(
             "stale-placeholder-key",
             "PodStatus",
@@ -701,24 +698,24 @@ async fn outbox_apply_recovers_from_stale_placeholder() {
             "node-a",
         )
         .await
-        .expect("apply should recover stale placeholder");
-
-    assert!(matches!(result, OutboxApplyResult::Applied { .. }));
+        .expect_err("unsupported incomplete ledger rows must not be reclaimed");
+    assert!(matches!(
+        err,
+        crate::node_outbox::OutboxApplyError::Retryable(_)
+    ));
 
     let record = db
         .get_applied_outbox("stale-placeholder-key")
         .await
         .expect("get outbox record")
         .expect("outbox record exists");
-    assert!(
-        !record.subject_key.is_empty(),
-        "placeholder should be replaced"
-    );
-    assert!(record.applied_rv.is_some(), "applied RV must be captured");
+    assert!(record.subject_key.is_empty());
+    assert!(record.applied_rv.is_none());
+    assert!(record.result_proto.is_empty());
 }
 
 #[tokio::test]
-async fn outbox_apply_treats_fresh_placeholder_as_retryable_inflight() {
+async fn outbox_apply_rejects_fresh_incomplete_ledger_row_without_consuming_it() {
     let db = Arc::new(crate::datastore::test_support::in_memory().await);
     db.create_resource(
         "v1",
@@ -767,7 +764,7 @@ async fn outbox_apply_treats_fresh_placeholder_as_retryable_inflight() {
         .expect_err("fresh placeholder is still in-flight and must retry");
 
     assert!(
-        matches!(err, crate::kubelet::outbox::OutboxApplyError::Retryable(_)),
+        matches!(err, crate::node_outbox::OutboxApplyError::Retryable(_)),
         "fresh placeholder must be retryable, got: {err:?}"
     );
 }
@@ -936,61 +933,6 @@ async fn applied_outbox_gc_does_not_touch_recent() {
             i
         );
     }
-}
-
-#[tokio::test]
-async fn cleanup_uncommitted_outbox_claim_deletes_only_placeholder_rows() {
-    let db = Arc::new(crate::datastore::test_support::in_memory().await);
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
-        idempotency_key: "placeholder-key".to_string(),
-        subject_key: String::new(),
-        operation: "PodStatus".to_string(),
-        first_seen_ms: 1,
-        applied_rv: None,
-        result_proto: Vec::new(),
-        status_stamp: None,
-    })
-    .await
-    .expect("insert placeholder");
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
-        idempotency_key: "final-key".to_string(),
-        subject_key: "v1/Pod/default/web/uid-1".to_string(),
-        operation: "PodStatus".to_string(),
-        first_seen_ms: 1,
-        applied_rv: Some(42),
-        result_proto: vec![1, 2, 3],
-        status_stamp: None,
-    })
-    .await
-    .expect("insert final row");
-
-    assert!(
-        db.delete_uncommitted_applied_outbox_placeholder("placeholder-key", 0)
-            .await
-            .expect("delete placeholder"),
-        "placeholder row should be removed"
-    );
-    assert!(
-        !db.delete_uncommitted_applied_outbox_placeholder("final-key", 42)
-            .await
-            .expect("skip final row"),
-        "final applied row must not be removed by placeholder cleanup"
-    );
-
-    assert!(
-        db.get_applied_outbox("placeholder-key")
-            .await
-            .expect("get placeholder")
-            .is_none(),
-        "placeholder should be gone"
-    );
-    assert!(
-        db.get_applied_outbox("final-key")
-            .await
-            .expect("get final")
-            .is_some(),
-        "final applied row should remain"
-    );
 }
 
 #[tokio::test]

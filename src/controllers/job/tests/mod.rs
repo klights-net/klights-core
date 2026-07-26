@@ -1,4 +1,5 @@
 use super::*;
+use crate::datastore::DatastoreBackend;
 
 use crate::datastore::Resource;
 use crate::kubelet::pod_repository::PodObjectWriter;
@@ -14,11 +15,14 @@ async fn reconcile_job_test(
     node_name: &str,
 ) -> Result<Value> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
+    let non_pod_finalization =
+        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()));
     super::reconcile_job(
         db,
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),
+        &non_pod_finalization,
         job,
         node_name,
     )
@@ -239,6 +243,7 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         pod_reader.as_ref(),
         pod_writer.as_ref(),
         pod_reader.as_ref(),
+        crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &job_with_rv,
         "test-node",
     )

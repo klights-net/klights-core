@@ -17,8 +17,9 @@ use klights_reconcile_api::{
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
-use crate::datastore::{DatastoreHandle, PodWorkqueueEntry, PodWorkqueueKind};
-use crate::side_effects::SideEffectMetrics;
+#[cfg(test)]
+use crate::datastore::{DatastoreHandle, PodWorkqueueEntry as LegacyPodWorkqueueEntry};
+use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
 
@@ -29,6 +30,142 @@ const MIN_DELAY_MS: i64 = 5_000;
 const POD_DELETE_TARGET_NODE_PAYLOAD_KEY: &str = "target_node";
 const POD_DELETE_LAST_RESIGNAL_MS_PAYLOAD_KEY: &str = "last_resignal_ms";
 const REMOTE_POD_DELETE_RESIGNAL_MIN_INTERVAL_MS: i64 = 30_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PodWorkqueueKind {
+    Pod,
+    Namespace,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PodWorkqueueEntry {
+    pub id: i64,
+    pub kind: PodWorkqueueKind,
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub payload: Value,
+    pub attempt_count: i64,
+    pub next_attempt_at_ms: i64,
+}
+
+#[async_trait::async_trait]
+pub(crate) trait PodWorkqueuePersistence: Send + Sync {
+    async fn enqueue(
+        &self,
+        kind: PodWorkqueueKind,
+        pod: &PodIdentity,
+        payload: Value,
+        attempt_count: i64,
+        min_delay_ms: i64,
+        last_error: Option<&str>,
+    ) -> Result<()>;
+    async fn peek_next_due(&self) -> Result<Option<i64>>;
+    async fn claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>>;
+    async fn complete(&self, id: i64) -> Result<()>;
+    async fn record_failure(
+        &self,
+        row: PodWorkqueueEntry,
+        min_delay_ms: i64,
+        error: &str,
+    ) -> Result<()>;
+    async fn dead_letter(&self, id: i64, error: &str) -> Result<()>;
+}
+
+#[cfg(test)]
+fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::PodWorkqueueKind {
+    match kind {
+        PodWorkqueueKind::Pod => crate::datastore::PodWorkqueueKind::Pod,
+        PodWorkqueueKind::Namespace => crate::datastore::PodWorkqueueKind::Namespace,
+    }
+}
+
+#[cfg(test)]
+fn focused_entry(row: LegacyPodWorkqueueEntry) -> PodWorkqueueEntry {
+    PodWorkqueueEntry {
+        id: row.id,
+        kind: match row.kind {
+            crate::datastore::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
+            crate::datastore::PodWorkqueueKind::Namespace => PodWorkqueueKind::Namespace,
+        },
+        namespace: row.namespace,
+        name: row.name,
+        uid: row.uid,
+        payload: row.payload,
+        attempt_count: row.attempt_count,
+        next_attempt_at_ms: row.next_attempt_at_ms,
+    }
+}
+
+#[cfg(test)]
+fn legacy_entry(row: PodWorkqueueEntry) -> LegacyPodWorkqueueEntry {
+    LegacyPodWorkqueueEntry {
+        id: row.id,
+        kind: legacy_kind(row.kind),
+        namespace: row.namespace,
+        name: row.name,
+        uid: row.uid,
+        payload: row.payload,
+        attempt_count: row.attempt_count,
+        next_attempt_at_ms: row.next_attempt_at_ms,
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl PodWorkqueuePersistence for crate::datastore::DatastoreHandle {
+    async fn enqueue(
+        &self,
+        kind: PodWorkqueueKind,
+        pod: &PodIdentity,
+        payload: Value,
+        attempt_count: i64,
+        min_delay_ms: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.as_ref()
+            .pod_workqueue_enqueue(
+                legacy_kind(kind),
+                pod,
+                payload,
+                attempt_count,
+                min_delay_ms,
+                last_error,
+            )
+            .await
+    }
+
+    async fn peek_next_due(&self) -> Result<Option<i64>> {
+        self.as_ref().pod_workqueue_peek_next_due().await
+    }
+
+    async fn claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
+        Ok(self
+            .as_ref()
+            .pod_workqueue_claim_due(now_ms)
+            .await?
+            .map(focused_entry))
+    }
+
+    async fn complete(&self, id: i64) -> Result<()> {
+        self.as_ref().pod_workqueue_complete(id).await
+    }
+
+    async fn record_failure(
+        &self,
+        row: PodWorkqueueEntry,
+        min_delay_ms: i64,
+        error: &str,
+    ) -> Result<()> {
+        self.as_ref()
+            .pod_workqueue_record_failure(legacy_entry(row), min_delay_ms, error)
+            .await
+    }
+
+    async fn dead_letter(&self, id: i64, error: &str) -> Result<()> {
+        self.as_ref().pod_workqueue_dead_letter(id, error).await
+    }
+}
 
 /// Root-private adapter carrying the leader deferred-delete worker's narrow
 /// unscheduled-Pod row-removal authority.
@@ -75,9 +212,9 @@ pub(super) struct PodWorkqueue {
     store: Arc<PodStore>,
     unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
     leadership: Option<watch::Receiver<bool>>,
-    db: DatastoreHandle,
+    persistence: Arc<dyn PodWorkqueuePersistence>,
     supervisor: Arc<TaskSupervisor>,
-    metrics: Arc<SideEffectMetrics>,
+    metrics: Arc<dyn ReconcileFailureMetrics>,
     wake: Arc<Notify>,
     lifecycle_router: std::sync::Mutex<Option<Arc<dyn PodLifecycleWakeup>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
@@ -92,18 +229,18 @@ pub(super) struct PodWorkqueue {
 impl PodWorkqueue {
     pub(super) fn new(
         store: Arc<PodStore>,
-        db: DatastoreHandle,
+        persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
-        metrics: Arc<SideEffectMetrics>,
+        metrics: Arc<dyn ReconcileFailureMetrics>,
     ) -> Arc<Self> {
-        Self::new_with_unscheduled_deletion(store, db, supervisor, metrics, None, None)
+        Self::new_with_unscheduled_deletion(store, persistence, supervisor, metrics, None, None)
     }
 
     pub(super) fn new_leader(
         store: Arc<PodStore>,
-        db: DatastoreHandle,
+        persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
-        metrics: Arc<SideEffectMetrics>,
+        metrics: Arc<dyn ReconcileFailureMetrics>,
         leadership: watch::Receiver<bool>,
     ) -> Arc<Self> {
         let unscheduled_deletion: Arc<dyn UnscheduledPodDeletion> =
@@ -112,7 +249,7 @@ impl PodWorkqueue {
             });
         Self::new_with_unscheduled_deletion(
             store,
-            db,
+            persistence,
             supervisor,
             metrics,
             Some(unscheduled_deletion),
@@ -122,9 +259,9 @@ impl PodWorkqueue {
 
     fn new_with_unscheduled_deletion(
         store: Arc<PodStore>,
-        db: DatastoreHandle,
+        persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
-        metrics: Arc<SideEffectMetrics>,
+        metrics: Arc<dyn ReconcileFailureMetrics>,
         unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
         leadership: Option<watch::Receiver<bool>>,
     ) -> Arc<Self> {
@@ -132,7 +269,7 @@ impl PodWorkqueue {
             store,
             unscheduled_deletion,
             leadership,
-            db,
+            persistence: Arc::new(persistence),
             supervisor,
             metrics,
             wake: Arc::new(Notify::new()),
@@ -221,8 +358,8 @@ impl PodWorkqueue {
         let delay_ms = run_after.as_millis().min(i64::MAX as u128) as i64;
         let pod = PodIdentity::new(&ns, &name, &uid);
         let payload = pod_delete_target_payload(target_node.as_deref());
-        self.db
-            .pod_workqueue_enqueue(PodWorkqueueKind::Pod, &pod, payload, 0, delay_ms, None)
+        self.persistence
+            .enqueue(PodWorkqueueKind::Pod, &pod, payload, 0, delay_ms, None)
             .await?;
         Ok(())
     }
@@ -240,8 +377,8 @@ impl PodWorkqueue {
     ) -> Result<()> {
         self.ensure_reconciler_started().await?;
         let pod = PodIdentity::new("", &namespace, &uid);
-        self.db
-            .pod_workqueue_enqueue(PodWorkqueueKind::Namespace, &pod, json!({}), 0, 0, None)
+        self.persistence
+            .enqueue(PodWorkqueueKind::Namespace, &pod, json!({}), 0, 0, None)
             .await?;
         self.wake.notify_one();
         Ok(())
@@ -326,7 +463,7 @@ impl PodWorkqueue {
                     let _ = receiver.borrow_and_update();
                 }
             }
-            let next_due = match self.db.pod_workqueue_peek_next_due().await {
+            let next_due = match self.persistence.peek_next_due().await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::error!(error = %e, "pod_workqueue: peek_next_due failed");
@@ -381,7 +518,7 @@ impl PodWorkqueue {
             // runs on Background (unlimited) so a slow ns retry cannot
             // block pod cleanup, and many concurrent ns deletes can each
             // make progress without serializing through the limit.
-            let row = match self.db.pod_workqueue_claim_due(now_ms()).await {
+            let row = match self.persistence.claim_due(now_ms()).await {
                 Ok(Some(row)) => row,
                 Ok(None) => continue,
                 Err(e) => {
@@ -453,7 +590,7 @@ impl PodWorkqueue {
         };
 
         if result.is_ok() {
-            let _ = self.db.pod_workqueue_complete(row.id).await;
+            let _ = self.persistence.complete(row.id).await;
             return;
         }
 
@@ -469,8 +606,8 @@ impl PodWorkqueue {
         }
         if row.attempt_count >= MAX_ATTEMPTS {
             let _ = self
-                .db
-                .pod_workqueue_dead_letter(row.id, &format!("{err:#}"))
+                .persistence
+                .dead_letter(row.id, &format!("{err:#}"))
                 .await;
             self.bump_dead_letter_metric(row.kind);
             tracing::error!(
@@ -485,8 +622,8 @@ impl PodWorkqueue {
         }
 
         if let Err(enq_err) = self
-            .db
-            .pod_workqueue_record_failure(row, MIN_DELAY_MS, &format!("{err:#}"))
+            .persistence
+            .record_failure(row, MIN_DELAY_MS, &format!("{err:#}"))
             .await
         {
             tracing::error!(error = %enq_err, "pod_workqueue: record_failure failed");
@@ -498,8 +635,8 @@ impl PodWorkqueue {
     async fn park_claimed_row(&self, row: PodWorkqueueEntry, reason: &str) {
         let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
         if let Err(error) = self
-            .db
-            .pod_workqueue_enqueue(
+            .persistence
+            .enqueue(
                 row.kind,
                 &pod,
                 row.payload,
@@ -819,7 +956,7 @@ impl PodWorkqueue {
         ns: &str,
         name: &str,
         uid: &str,
-        resource: crate::datastore::Resource,
+        resource: klights_cluster_core::Resource,
     ) -> Result<()> {
         let Some(router) = self.lifecycle_router.lock().unwrap().clone() else {
             tracing::warn!(
@@ -905,14 +1042,10 @@ impl PodWorkqueue {
     fn bump_dead_letter_metric(&self, kind: PodWorkqueueKind) {
         match kind {
             PodWorkqueueKind::Pod => {
-                self.metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.record_cascade_delete_failure();
             }
             PodWorkqueueKind::Namespace => {
-                self.metrics
-                    .namespace_delete_failures_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.record_namespace_delete_failure();
             }
         }
     }
@@ -978,6 +1111,7 @@ mod tests {
     use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleWorkKind};
     use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
     use crate::kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
+    use crate::side_effects::SideEffectMetrics;
 
     #[derive(Default)]
     struct RecordingGcPodDeleteSink {
@@ -1890,7 +2024,7 @@ mod tests {
             "deferred delete should not be due before the requested delay"
         );
         let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
-        assert_eq!(row.kind, PodWorkqueueKind::Pod);
+        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
         assert_eq!(row.uid, "uid-old");
@@ -1932,7 +2066,7 @@ mod tests {
             "deferred delete should not be due before the requested delay"
         );
         let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
-        assert_eq!(row.kind, PodWorkqueueKind::Pod);
+        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
         assert_eq!(row.uid, "uid-old");
@@ -1983,7 +2117,7 @@ mod tests {
 
         let due = db.pod_workqueue_peek_next_due().await.unwrap().unwrap();
         let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
-        workqueue.clone().run_retry(row).await;
+        workqueue.clone().run_retry(focused_entry(row)).await;
 
         // The local actor must NOT be woken for a remote pod.
         assert!(
@@ -2185,7 +2319,7 @@ mod tests {
             .await
             .unwrap()
             .expect("namespace termination must enqueue actor-owned Pod delete work");
-        assert_eq!(row.kind, PodWorkqueueKind::Pod);
+        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "terminating-ns");
         assert_eq!(row.name, "unscheduled");
         assert_eq!(row.uid, "pod-uid");
@@ -2252,7 +2386,7 @@ mod tests {
 
         let due = db.pod_workqueue_peek_next_due().await.unwrap().unwrap();
         let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
-        workqueue.clone().run_retry(row).await;
+        workqueue.clone().run_retry(focused_entry(row)).await;
 
         // The pod must STILL exist in the datastore — remote leader workqueue
         // retries are actor wakeup/reminder state only.

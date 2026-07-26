@@ -6,7 +6,21 @@ use crate::datastore::node_local::{
     SqliteNodeLocalDb, selector,
 };
 use crate::datastore::sqlite::{DbExecutor, opener};
+use crate::datastore::{
+    PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
+    PodSlotMutationResult,
+};
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+fn pod_status_classification() -> klights_node_store::OutboxClassification {
+    klights_node_store::OutboxClassification::try_new(
+        klights_node_store::OutboxPriority::Workload,
+        klights_node_store::OutboxSupersedability::PodStatus,
+        klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+        klights_node_store::OutboxSequencePolicy::PerSubject,
+    )
+    .expect("valid Pod status classification")
+}
 
 fn supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
@@ -54,6 +68,38 @@ fn test_outbox_insert_with_operation(
     operation: &str,
     now_ms: i64,
 ) -> OutboxInsert {
+    let operation_kind: klights_cluster_core::OutboxOperation = operation
+        .try_into()
+        .expect("test outbox operation must be recognized");
+    let priority = match operation_kind.priority() {
+        klights_cluster_core::OutboxPriority::Lease => klights_node_store::OutboxPriority::Lease,
+        klights_cluster_core::OutboxPriority::NodeHealth => {
+            klights_node_store::OutboxPriority::NodeHealth
+        }
+        klights_cluster_core::OutboxPriority::Workload => {
+            klights_node_store::OutboxPriority::Workload
+        }
+        klights_cluster_core::OutboxPriority::Diagnostic => {
+            klights_node_store::OutboxPriority::Diagnostic
+        }
+    };
+    let supersedability = if operation_kind.is_supersedable_pod_status() {
+        klights_node_store::OutboxSupersedability::PodStatus
+    } else {
+        klights_node_store::OutboxSupersedability::Never
+    };
+    let sequence_policy = if operation_kind.uses_per_subject_sequence() {
+        klights_node_store::OutboxSequencePolicy::PerSubject
+    } else {
+        klights_node_store::OutboxSequencePolicy::Unsequenced
+    };
+    let classification = klights_node_store::OutboxClassification::try_new(
+        priority,
+        supersedability,
+        klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+        sequence_policy,
+    )
+    .expect("valid test outbox classification");
     OutboxInsert {
         idempotency_key: key.to_string(),
         enqueued_ms: now_ms,
@@ -67,6 +113,7 @@ fn test_outbox_insert_with_operation(
         operation: operation.to_string(),
         payload_proto: vec![],
         next_due_ms: now_ms,
+        classification,
     }
 }
 
@@ -308,7 +355,7 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
     );
 
     assert!(
-        db.replay_dead_letter(dead[0].id)
+        db.replay_dead_letter(dead[0].id, pod_status_classification())
             .await
             .expect("replay exact repaired dead-letter head")
     );
@@ -585,14 +632,14 @@ async fn node_local_outbox_ages_diagnostic_events_into_fair_service() {
         "fresh-status",
         "v1/Pod/default/web/pod-uid",
         "PodStatus",
-        crate::kubelet::outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
+        crate::node_outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
     ))
     .await
     .unwrap();
 
     let claimed = db
         .claim_next_due_outbox(
-            crate::kubelet::outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
+            crate::node_outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
             1_000,
             "lease-aged-event",
         )
@@ -781,6 +828,78 @@ async fn pod_runtime_is_uid_keyed_and_same_name_replacements_are_distinct() {
     let uids: Vec<_> = rows.into_iter().map(|row| row.pod_uid).collect();
 
     assert_eq!(uids, vec!["uid-new".to_string(), "uid-old".to_string()]);
+}
+
+#[tokio::test]
+async fn pod_slot_persistence_preserves_uid_cas_outcomes_and_monotonic_versions() {
+    let db = open_node_local_in_memory().await;
+    let mut events = db.subscribe_pod_slot_admissions();
+
+    let admitted = db
+        .pod_slot_try_admit("default", "web", "uid-old", "worker-a")
+        .await
+        .expect("admit old uid");
+    assert_eq!(
+        admitted,
+        PodSlotAdmissionResult::Admitted {
+            resource_version: 1
+        }
+    );
+    assert!(matches!(
+        events.recv().await.expect("admit event"),
+        PodSlotAdmissionEvent::Changed {
+            pod_uid,
+            state: PodSlotAdmissionState::Admitted,
+            resource_version: 1,
+            ..
+        } if pod_uid == "uid-old"
+    ));
+
+    assert_eq!(
+        db.pod_slot_try_admit("default", "web", "uid-new", "worker-a")
+            .await
+            .expect("replacement must be blocked"),
+        PodSlotAdmissionResult::Blocked {
+            blocking_uid: "uid-old".to_string(),
+            blocking_node: "worker-a".to_string(),
+            state: PodSlotAdmissionState::Admitted,
+            resource_version: 1,
+        }
+    );
+    assert_eq!(
+        db.pod_slot_mark_terminating("default", "web", "uid-old", "worker-a")
+            .await
+            .expect("mark old uid terminating"),
+        PodSlotMutationResult::Changed {
+            resource_version: 2
+        }
+    );
+    assert!(matches!(
+        db.pod_slot_clear_if_uid("default", "web", "uid-new")
+            .await
+            .expect("wrong uid is a typed no-op"),
+        PodSlotClearResult::UidMismatch {
+            blocking_uid,
+            resource_version: 2,
+            ..
+        } if blocking_uid == "uid-old"
+    ));
+    assert_eq!(
+        db.pod_slot_clear_if_uid("default", "web", "uid-old")
+            .await
+            .expect("clear old uid"),
+        PodSlotClearResult::Cleared {
+            resource_version: 3
+        }
+    );
+    assert_eq!(
+        db.pod_slot_try_admit("default", "web", "uid-new", "worker-a")
+            .await
+            .expect("admit replacement after clear"),
+        PodSlotAdmissionResult::Admitted {
+            resource_version: 4
+        }
+    );
 }
 
 #[tokio::test]

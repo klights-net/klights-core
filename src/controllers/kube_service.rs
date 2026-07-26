@@ -1,7 +1,37 @@
-use crate::datastore::DatastoreBackend;
-use crate::datastore::types::Resource;
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
+
+#[async_trait]
+pub(crate) trait KubernetesBootstrapStore: Send + Sync {
+    async fn get_bootstrap_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+
+    async fn create_bootstrap_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+    ) -> Result<Resource>;
+
+    async fn update_bootstrap_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        value: Value,
+        expected_resource_version: i64,
+    ) -> Result<Resource>;
+}
 
 /// Derive the kubernetes service ClusterIP from the service CIDR.
 /// Returns the first usable IP (network + 1), e.g. "10.43.128.0/17" -> "10.43.128.1".
@@ -11,12 +41,12 @@ pub fn derive_kubernetes_service_ip(service_cidr: &str) -> String {
 
 /// Bootstrap the default ServiceCIDR object expected by conformance tests.
 /// Idempotent — skips creation if the resource already exists.
-pub async fn bootstrap_default_service_cidr(
-    db: &dyn DatastoreBackend,
+pub(crate) async fn bootstrap_default_service_cidr<S: KubernetesBootstrapStore + ?Sized>(
+    store: &S,
     service_cidr: &str,
 ) -> Result<()> {
-    let exists = db
-        .get_resource("networking.k8s.io/v1", "ServiceCIDR", None, "kubernetes")
+    let exists = store
+        .get_bootstrap_resource("networking.k8s.io/v1", "ServiceCIDR", None, "kubernetes")
         .await?
         .is_some();
     if exists {
@@ -34,14 +64,15 @@ pub async fn bootstrap_default_service_cidr(
         }
     });
 
-    db.create_resource(
-        "networking.k8s.io/v1",
-        "ServiceCIDR",
-        None,
-        "kubernetes",
-        service_cidr_obj,
-    )
-    .await?;
+    store
+        .create_bootstrap_resource(
+            "networking.k8s.io/v1",
+            "ServiceCIDR",
+            None,
+            "kubernetes",
+            service_cidr_obj,
+        )
+        .await?;
     tracing::info!("Created default ServiceCIDR kubernetes ({})", service_cidr);
 
     Ok(())
@@ -51,8 +82,8 @@ pub async fn bootstrap_default_service_cidr(
 /// Creates the "kubernetes" service with ClusterIP derived from service_cidr,
 /// and Endpoints pointing to the API listener host IP for in-pod API access.
 /// Idempotent — skips creation if service already exists.
-pub async fn bootstrap_kubernetes_service(
-    db: &dyn DatastoreBackend,
+pub(crate) async fn bootstrap_kubernetes_service<S: KubernetesBootstrapStore + ?Sized>(
+    store: &S,
     service_cidr: &str,
     tls_port: u16,
     datapath: &dyn klights_network_api::Datapath,
@@ -80,7 +111,7 @@ pub async fn bootstrap_kubernetes_service(
     });
 
     create_or_reconcile_bootstrap_resource(
-        db,
+        store,
         "v1",
         "Service",
         Some("default"),
@@ -126,7 +157,7 @@ pub async fn bootstrap_kubernetes_service(
     });
 
     create_or_reconcile_bootstrap_resource(
-        db,
+        store,
         "v1",
         "Endpoints",
         Some("default"),
@@ -164,7 +195,7 @@ pub async fn bootstrap_kubernetes_service(
     });
 
     create_or_reconcile_bootstrap_resource(
-        db,
+        store,
         "discovery.k8s.io/v1",
         "EndpointSlice",
         Some("default"),
@@ -182,8 +213,8 @@ pub async fn bootstrap_kubernetes_service(
     Ok(())
 }
 
-async fn create_or_reconcile_bootstrap_resource(
-    db: &dyn DatastoreBackend,
+async fn create_or_reconcile_bootstrap_resource<S: KubernetesBootstrapStore + ?Sized>(
+    store: &S,
     api_version: &str,
     kind: &str,
     namespace: Option<&str>,
@@ -191,9 +222,12 @@ async fn create_or_reconcile_bootstrap_resource(
     desired: Value,
     top_level_fields: &[&str],
 ) -> Result<Resource> {
-    let Some(existing) = db.get_resource(api_version, kind, namespace, name).await? else {
-        return db
-            .create_resource(api_version, kind, namespace, name, desired)
+    let Some(existing) = store
+        .get_bootstrap_resource(api_version, kind, namespace, name)
+        .await?
+    else {
+        return store
+            .create_bootstrap_resource(api_version, kind, namespace, name, desired)
             .await;
     };
 
@@ -215,15 +249,16 @@ async fn create_or_reconcile_bootstrap_resource(
         return Ok(existing);
     }
 
-    db.update_resource(
-        api_version,
-        kind,
-        namespace,
-        name,
-        updated,
-        existing.resource_version,
-    )
-    .await
+    store
+        .update_bootstrap_resource(
+            api_version,
+            kind,
+            namespace,
+            name,
+            updated,
+            existing.resource_version,
+        )
+        .await
 }
 
 #[cfg(test)]

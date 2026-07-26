@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use klights_pod_api::PodRepositoryError;
 use serde_json::{Value, json};
 
-use crate::datastore::{Resource, ResourcePreconditions};
-use crate::side_effects::SideEffectMetrics;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::TaskSupervisor;
 
 use super::store::PodStore;
@@ -150,7 +150,7 @@ pub struct PodDeleteCoordinator {
     store: Arc<dyn PodDeleteStorePort>,
     queue: Arc<dyn PodDeleteQueuePort>,
     sleeper: Arc<dyn PodDeleteSleeperPort>,
-    metrics: Arc<SideEffectMetrics>,
+    metrics: Arc<dyn ReconcileFailureMetrics>,
 }
 
 impl PodDeleteCoordinator {
@@ -158,7 +158,7 @@ impl PodDeleteCoordinator {
         store: Arc<PodStore>,
         workqueue: Arc<PodWorkqueue>,
         supervisor: Arc<TaskSupervisor>,
-        metrics: Arc<SideEffectMetrics>,
+        metrics: Arc<dyn ReconcileFailureMetrics>,
     ) -> Self {
         Self::new_with_ports(
             store,
@@ -172,7 +172,7 @@ impl PodDeleteCoordinator {
         store: Arc<dyn PodDeleteStorePort>,
         queue: Arc<dyn PodDeleteQueuePort>,
         sleeper: Arc<dyn PodDeleteSleeperPort>,
-        metrics: Arc<SideEffectMetrics>,
+        metrics: Arc<dyn ReconcileFailureMetrics>,
     ) -> Self {
         Self {
             store,
@@ -230,9 +230,7 @@ impl PodDeleteCoordinator {
             )
             .await
         {
-            self.metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_cascade_delete_failure();
             tracing::error!(
                 namespace = %ns,
                 name = %name,
@@ -289,8 +287,7 @@ impl PodDeleteCoordinator {
                     break (updated, delete_base, grace_period_seconds);
                 }
                 Err(e)
-                    if crate::datastore::errors::is_conflict_error(&e)
-                        && attempt + 1 < MAX_DELETE_CONFLICT_RETRIES =>
+                    if is_repository_conflict(&e) && attempt + 1 < MAX_DELETE_CONFLICT_RETRIES =>
                 {
                     let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
                     self.sleeper
@@ -330,9 +327,7 @@ impl PodDeleteCoordinator {
             )
             .await
         {
-            self.metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics.record_cascade_delete_failure();
             tracing::error!(
                 namespace = %ns,
                 name = %name,
@@ -428,21 +423,20 @@ fn ensure_resource_preconditions_match(
 }
 
 fn map_store_error(error: anyhow::Error, namespace: &str, name: &str) -> PodRepositoryError {
-    if error
-        .downcast_ref::<crate::datastore::errors::DatastoreError>()
-        .is_some_and(crate::datastore::errors::DatastoreError::is_conflict)
-    {
-        return PodRepositoryError::conflict(error.to_string());
+    match error.downcast::<PodRepositoryError>() {
+        Ok(error) => error,
+        Err(error) => {
+            let _ = (namespace, name);
+            PodRepositoryError::internal(error.to_string())
+        }
     }
+}
 
-    let message = error.to_string();
-    if message.contains("409 Conflict") {
-        PodRepositoryError::conflict(message)
-    } else if message.contains("not found") {
-        PodRepositoryError::not_found(namespace, name)
-    } else {
-        PodRepositoryError::internal(message)
-    }
+fn is_repository_conflict(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<PodRepositoryError>(),
+        Some(PodRepositoryError::Conflict { .. })
+    )
 }
 
 pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> Value {
@@ -494,6 +488,7 @@ pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::side_effects::SideEffectMetrics;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
@@ -657,13 +652,11 @@ mod tests {
     fn store_errors_keep_kubernetes_conflict_not_found_and_internal_categories() {
         let cases = [
             (
-                anyhow::Error::new(crate::datastore::errors::DatastoreError::conflict(
-                    "stale resource version",
-                )),
-                PodRepositoryError::conflict("stale resource version (409 Conflict)"),
+                anyhow::Error::new(PodRepositoryError::conflict("stale resource version")),
+                PodRepositoryError::conflict("stale resource version"),
             ),
             (
-                anyhow::anyhow!("Pod row not found"),
+                anyhow::Error::new(PodRepositoryError::not_found("default", "pod-a")),
                 PodRepositoryError::not_found("default", "pod-a"),
             ),
             (

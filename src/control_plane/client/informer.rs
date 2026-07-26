@@ -1,10 +1,10 @@
 use anyhow::Result;
 
-use crate::control_plane::client::{
-    CacheReadinessRequest, ListRequest, ResourceEvent, ResourceQueryConsistency,
-    legacy_list_response,
-};
+use crate::control_plane::client::{ListRequest, legacy_list_response};
 use crate::datastore::{Resource, ResourceList, WatchReplayPosition};
+use klights_leader_api::{
+    CacheReadinessRequest, ResourceEvent, ResourceListRequest, ResourceQueryConsistency,
+};
 use klights_types::ResourceKey;
 
 /// Temporary legacy-client facade over the canonical watch-leaf cache.
@@ -86,10 +86,8 @@ pub(super) fn scope_for_request(request: &ListRequest) -> CacheReadinessRequest 
     .expect("legacy LIST request identity was already validated")
 }
 
-fn focused_list_request(
-    request: &ListRequest,
-) -> Result<crate::control_plane::client::ResourceListRequest> {
-    Ok(crate::control_plane::client::ResourceListRequest::try_new(
+fn focused_list_request(request: &ListRequest) -> Result<ResourceListRequest> {
+    Ok(ResourceListRequest::try_new(
         request.api_version.clone(),
         request.kind.clone(),
         request.namespace.clone(),

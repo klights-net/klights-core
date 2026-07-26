@@ -12,7 +12,9 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::side_effects::{SideEffectMetrics, SideEffectRegistry, default_registry};
+use crate::side_effect_registry_composition::default_registry;
+use crate::side_effects::SideEffectMetrics;
+use crate::side_effects::SideEffectRegistry;
 
 const CONVERGENCE_BUDGET: Duration = Duration::from_secs(1);
 
@@ -38,7 +40,7 @@ async fn make_registry_and_repo() -> (
         registry.clone(),
         metrics,
     ));
-    registry.set_pod_repository(pod_repo);
+    registry.set_pod_ports(pod_repo.clone(), pod_repo);
     (db, db_handle, registry)
 }
 
@@ -98,7 +100,7 @@ fn assert_within(start: Instant, label: &str) {
 /// achieved by the side-effect fan-out registering ResourceQuota itself.
 #[tokio::test]
 async fn rq_status_hard_synced_within_1s() {
-    let (db, db_handle, registry) = make_registry_and_repo().await;
+    let (db, _db_handle, registry) = make_registry_and_repo().await;
     let created = db
         .create_resource(
             "v1",
@@ -111,10 +113,7 @@ async fn rq_status_hard_synced_within_1s() {
         .unwrap();
 
     let start = Instant::now();
-    registry
-        .run_hooks(&created.data, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&created.data).await.unwrap();
     assert_within(start, "Status.Hard initial sync");
 
     let status = read_rq_status(&db, "rq").await;
@@ -128,7 +127,7 @@ async fn rq_status_hard_synced_within_1s() {
 /// Status.Used.pods must increment to 1 within 1s of a Pod create.
 #[tokio::test]
 async fn rq_status_used_increments_on_pod_create_within_1s() {
-    let (db, db_handle, registry) = make_registry_and_repo().await;
+    let (db, _db_handle, registry) = make_registry_and_repo().await;
     let rq = db
         .create_resource(
             "v1",
@@ -139,10 +138,7 @@ async fn rq_status_used_increments_on_pod_create_within_1s() {
         )
         .await
         .unwrap();
-    registry
-        .run_hooks(&rq.data, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&rq.data).await.unwrap();
 
     let pod_resource = db
         .create_resource("v1", "Pod", Some("default"), "p1", pod("p1"))
@@ -150,10 +146,7 @@ async fn rq_status_used_increments_on_pod_create_within_1s() {
         .unwrap();
 
     let start = Instant::now();
-    registry
-        .run_hooks(&pod_resource.data, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&pod_resource.data).await.unwrap();
     assert_within(start, "Status.Used after Pod create");
 
     let status = read_rq_status(&db, "rq").await;
@@ -167,7 +160,7 @@ async fn rq_status_used_increments_on_pod_create_within_1s() {
 /// Status.Used.pods must decrement back to 0 within 1s of a Pod delete.
 #[tokio::test]
 async fn rq_status_used_decrements_on_pod_delete_within_1s() {
-    let (db, db_handle, registry) = make_registry_and_repo().await;
+    let (db, _db_handle, registry) = make_registry_and_repo().await;
     let rq = db
         .create_resource(
             "v1",
@@ -178,19 +171,13 @@ async fn rq_status_used_decrements_on_pod_delete_within_1s() {
         )
         .await
         .unwrap();
-    registry
-        .run_hooks(&rq.data, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&rq.data).await.unwrap();
 
     let pod_resource = db
         .create_resource("v1", "Pod", Some("default"), "p1", pod("p1"))
         .await
         .unwrap();
-    registry
-        .run_hooks(&pod_resource.data, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&pod_resource.data).await.unwrap();
     let after_create = read_rq_status(&db, "rq").await;
     assert_eq!(
         after_create.pointer("/used/pods").and_then(|v| v.as_str()),
@@ -206,10 +193,7 @@ async fn rq_status_used_decrements_on_pod_delete_within_1s() {
         .unwrap();
 
     let start = Instant::now();
-    registry
-        .run_hooks(&pod_snapshot, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&pod_snapshot).await.unwrap();
     assert_within(start, "Status.Used after Pod delete");
 
     let status = read_rq_status(&db, "rq").await;
@@ -226,7 +210,7 @@ async fn rq_status_used_decrements_on_pod_delete_within_1s() {
 /// just verify the side-effect path itself accomplishes the resync.
 #[tokio::test]
 async fn rq_status_hard_resyncs_after_status_patch_within_1s() {
-    let (db, db_handle, registry) = make_registry_and_repo().await;
+    let (db, _db_handle, registry) = make_registry_and_repo().await;
     let created = db
         .create_resource(
             "v1",
@@ -237,10 +221,7 @@ async fn rq_status_hard_resyncs_after_status_patch_within_1s() {
         )
         .await
         .unwrap();
-    registry
-        .run_hooks(&created.data, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&created.data).await.unwrap();
     let before = read_rq_status(&db, "rq").await;
     assert_eq!(
         before.pointer("/hard/pods").and_then(|v| v.as_str()),
@@ -276,10 +257,7 @@ async fn rq_status_hard_resyncs_after_status_patch_within_1s() {
     );
 
     let start = Instant::now();
-    registry
-        .run_hooks(&tampered, db_handle.as_ref())
-        .await
-        .unwrap();
+    registry.run_hooks(&tampered).await.unwrap();
     assert_within(start, "Status.Hard resync after /status PATCH");
 
     let status = read_rq_status(&db, "rq").await;

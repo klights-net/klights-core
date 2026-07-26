@@ -2,7 +2,7 @@ use super::super::queries;
 use crate::log_apply::{
     LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
 };
-use crate::networking::{ClusterCidr, NodeName, PodSubnet};
+use klights_types::{ClusterCidr, NodeName, PodSubnet};
 use rusqlite::OptionalExtension;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;

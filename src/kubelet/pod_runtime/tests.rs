@@ -24,6 +24,39 @@ use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+async fn node_local_runtime_store()
+-> Arc<crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter> {
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let executor = crate::datastore::sqlite::DbExecutor::open_with_opts(
+        crate::datastore::sqlite::opener::OpenOpts::node_in_memory(),
+        supervisor,
+        "sqlite:pod-runtime-test",
+    )
+    .await
+    .expect("open node-local runtime store");
+    let backend = crate::datastore::node_local::SqliteNodeLocalDb::from_executor(executor)
+        .expect("create node-local runtime store");
+    crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter::new(Arc::new(backend))
+}
+
+async fn admit_runtime_key(
+    store: &crate::datastore::node_local::network_adapter::NodeLocalNetworkAdapter,
+    key: &PodRuntimeKey,
+) {
+    klights_node_store::PodRuntimeStore::admit_pod_runtime(
+        store,
+        klights_node_store::PodRuntimeAdmission::try_new(
+            klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
+            "node-1",
+        )
+        .expect("valid test runtime admission"),
+    )
+    .await
+    .expect("admit test runtime row");
+}
+
 #[test]
 fn pod_runtime_module_exports_only_declared_submodules() {
     // This module only exports test_support and service; no production
@@ -502,9 +535,11 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     );
     let repository = Arc::new(parts.repository);
     let datapath = Arc::new(crate::networking::test_support::MockNetworkProvider::new());
-    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
-        db.clone(),
-    ));
+    let old_key = PodRuntimeKey::new("ns", "same-name", "old-uid");
+    let new_key = PodRuntimeKey::new("ns", "same-name", "new-uid");
+    let pod_runtime_store = node_local_runtime_store().await;
+    admit_runtime_key(&pod_runtime_store, &old_key).await;
+    admit_runtime_key(&pod_runtime_store, &new_key).await;
     let store =
         Arc::new(crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store));
     let runtime = crate::kubelet::pod_runtime::network::RealPodNetworkRuntime::new(
@@ -512,9 +547,6 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
         repository,
         store.clone(),
     );
-    let old_key = PodRuntimeKey::new("ns", "same-name", "old-uid");
-    let new_key = PodRuntimeKey::new("ns", "same-name", "new-uid");
-
     store.record_sandbox(&old_key, "sandbox-old").await.unwrap();
     store.record_sandbox(&new_key, "sandbox-new").await.unwrap();
 
@@ -580,6 +612,10 @@ async fn real_filesystem_handles_termination_log_with_parity() {
         )),
         runtime_namespace.to_string(),
         "test-node".to_string(),
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
+            runtime_namespace,
+        ))
+        .unwrap(),
     );
     let key = PodRuntimeKey::new("ns", "pod", "uid-real-term");
     let expected_path =
@@ -607,6 +643,10 @@ async fn real_filesystem_cleanup_removes_entire_pod_root() {
         )),
         runtime_namespace.to_string(),
         "test-node".to_string(),
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
+            runtime_namespace,
+        ))
+        .unwrap(),
     );
     let key = PodRuntimeKey::new("ns", "pod", "uid-root-cleanup");
     let pod_root = crate::paths::volumes_root_path(runtime_namespace)
@@ -702,6 +742,10 @@ async fn fs_group_volume_ownership_with_parity() {
         )),
         containerd_ns.clone(),
         "test-node".to_string(),
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
+            &containerd_ns,
+        ))
+        .unwrap(),
     );
     let pod = serde_json::json!({
         "spec": {
@@ -1121,6 +1165,12 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
         node_name: "node-1".into(),
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
+        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+            "/tmp/klights-runtime-test",
+        ))
+        .unwrap(),
     };
     let node_view = std::sync::Arc::new(FakeNode::new("node-1", RuntimeNodeRole::Worker));
     let cluster_view = std::sync::Arc::new(
@@ -1466,6 +1516,12 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
                 node_name: "test-node".to_string(),
                 service_cidr: "10.43.128.0/17".to_string(),
                 containerd_namespace: "klights-test".to_string(),
+                sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                    std::path::PathBuf::from("/tmp/klights-runtime-test"),
+                )
+                .unwrap(),
             },
             node_view: harness.node_view.clone(),
             cluster_view: Arc::new(
@@ -3852,6 +3908,12 @@ async fn fixture_runtime_with_node(
         node_name: node_name.to_string(),
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
+        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+            "/tmp/klights-runtime-test",
+        ))
+        .unwrap(),
     };
     // Every role routes through the same worker cluster-view path.
     let cluster_view: std::sync::Arc<dyn crate::kubelet::pod_cluster_runtime::ClusterRuntimeView> =
@@ -4046,6 +4108,12 @@ async fn fixture_runtime_with_cluster(
         node_name: node_name.to_string(),
         service_cidr: "10.43.128.0/17".into(),
         containerd_namespace: "klights-test".into(),
+        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+            "/tmp/klights-runtime-test",
+        ))
+        .unwrap(),
     };
     let node_view = std::sync::Arc::new(FakeNode::new(node_name, role));
 
@@ -4826,13 +4894,10 @@ async fn shared_cri_runtime_implements_container_runtime_control_with_parity() {
 
 #[tokio::test]
 async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
-    let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    std::mem::forget(ds);
-    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
-        handle.clone(),
-    ));
-    let store = crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store);
+    let pod_runtime_store = node_local_runtime_store().await;
     let key = PodRuntimeKey::new("ns", "test-pod", "uid-1");
+    admit_runtime_key(&pod_runtime_store, &key).await;
+    let store = crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store);
 
     // Record sandbox.
     store.record_sandbox(&key, "sandbox-abc").await.unwrap();
@@ -4840,13 +4905,6 @@ async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
     // Retrieve by UID.
     let found = store.get_sandbox_id(&key).await.unwrap();
     assert_eq!(found.as_deref(), Some("sandbox-abc"));
-
-    // Retrieve by name (without UID).
-    let by_name = store
-        .get_sandbox_id_by_name("ns", "test-pod")
-        .await
-        .unwrap();
-    assert_eq!(by_name.as_deref(), Some("sandbox-abc"));
 
     // Delete by UID.
     store.delete_sandbox(&key).await.unwrap();
@@ -4856,13 +4914,14 @@ async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
 
 #[tokio::test]
 async fn real_pod_slot_admission_admits_and_clears_slot() {
-    let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    std::mem::forget(ds);
-    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
-        handle.clone(),
-    ));
+    let ds = crate::datastore::test_support::in_memory().await;
+    let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(Arc::new(
+        ds,
+    )
+        as Arc<dyn crate::datastore::PodCleanupStore>);
     let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-        pod_runtime_store,
+        pod_slot_adapter.clone(),
+        pod_slot_adapter,
         "node-1".into(),
     );
     let key = PodRuntimeKey::new("ns", "slot-pod", "uid-1");
@@ -4872,7 +4931,7 @@ async fn real_pod_slot_admission_admits_and_clears_slot() {
     assert!(
         matches!(
             result,
-            crate::datastore::PodSlotAdmissionResult::Admitted { .. }
+            klights_node_store::PodSlotAdmissionResult::Admitted { .. }
         ),
         "first admission should be Admitted, got {:?}",
         result
@@ -4887,13 +4946,14 @@ async fn real_pod_slot_admission_admits_and_clears_slot() {
 
 #[tokio::test]
 async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
-    let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    std::mem::forget(ds);
-    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
-        handle.clone(),
-    ));
+    let ds = crate::datastore::test_support::in_memory().await;
+    let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(Arc::new(
+        ds,
+    )
+        as Arc<dyn crate::datastore::PodCleanupStore>);
     let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-        pod_runtime_store,
+        pod_slot_adapter.clone(),
+        pod_slot_adapter,
         "node-1".into(),
     );
     let key = PodRuntimeKey::new("ns", "dup-pod", "uid-1");
@@ -4902,7 +4962,7 @@ async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
     let first = admission.try_admit(&key, "node-1").await.unwrap();
     assert!(matches!(
         first,
-        crate::datastore::PodSlotAdmissionResult::Admitted { .. }
+        klights_node_store::PodSlotAdmissionResult::Admitted { .. }
     ));
 
     // Second admission with different UID is blocked.
@@ -4911,7 +4971,7 @@ async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
     assert!(
         matches!(
             second,
-            crate::datastore::PodSlotAdmissionResult::Blocked { .. }
+            klights_node_store::PodSlotAdmissionResult::Blocked { .. }
         ),
         "second admission with different UID should be Blocked, got {:?}",
         second
@@ -5437,6 +5497,12 @@ async fn reconcile_ephemeral_full_sequence_with_parity() {
         node_name: "test-node".into(),
         service_cidr: "10.96.0.0/12".into(),
         containerd_namespace: "klights-test".into(),
+        sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
+        paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(std::path::PathBuf::from(
+            "/tmp/klights-runtime-test",
+        ))
+        .unwrap(),
     })
     .await;
     harness.cri.set_image_present(false);
@@ -8930,6 +8996,12 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         },
     )
     .await;
@@ -8989,6 +9061,12 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         },
     )
     .await;
@@ -9093,6 +9171,12 @@ async fn termination_message_mount_path_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         },
     )
     .await;
@@ -9159,6 +9243,12 @@ async fn hosts_file_mount_path_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         },
     )
     .await;
@@ -9197,11 +9287,11 @@ async fn hosts_file_mount_path_with_parity() {
     let config = create_configs
         .first()
         .expect("container config must be created");
-    let expected_host_path = crate::paths::containerd_hosts_dir_path(
-        runtime_namespace,
-        "kubelet-test",
-        "host-alias-pod",
+    let expected_host_path = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+        std::path::PathBuf::from("/tmp/klights-runtime-test"),
     )
+    .unwrap()
+    .containerd_hosts_dir("kubelet-test", "host-alias-pod")
     .join("hosts")
     .to_string_lossy()
     .into_owned();
@@ -9229,6 +9319,12 @@ async fn termination_message_file_handling_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: runtime_namespace.into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         },
     )
     .await;
@@ -9622,6 +9718,12 @@ async fn kubernetes_service_envs_with_parity() {
             node_name: "test-node".into(),
             service_cidr: "10.96.0.0/12".into(),
             containerd_namespace: "klights-test".into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         },
     )
     .await;
@@ -10336,6 +10438,12 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
                 node_name: "test-node".into(),
                 service_cidr: "10.43.128.0/17".into(),
                 containerd_namespace: "klights-test".into(),
+                sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+                node_capacity: crate::kubelet::node::NodeCapacity::default(),
+                paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                    std::path::PathBuf::from("/tmp/klights-runtime-test"),
+                )
+                .unwrap(),
             },
             node_view: std::sync::Arc::new(FakeNode::new("test-node", RuntimeNodeRole::Leader)),
             cluster_view: std::sync::Arc::new(

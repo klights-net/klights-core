@@ -1,7 +1,122 @@
 use crate::api::AppError;
-use crate::datastore::{DatastoreBackend, ResourceList, SnapshotAtRv};
 use serde::Deserialize;
 use std::future::Future;
+use std::pin::Pin;
+
+pub type ListResourceVersionFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>>;
+
+pub trait ListResourceVersionPort: Send + Sync {
+    fn advance_after(&self, minimum_resource_version: i64) -> ListResourceVersionFuture<'_>;
+}
+
+pub trait ListPageMetadata {
+    fn list_resource_version(&self) -> i64;
+}
+
+pub enum ListSnapshotResolution<Page> {
+    List(Page),
+    Current,
+    Expired,
+}
+
+pub trait ListSnapshotResult<Page> {
+    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<Page>;
+}
+
+#[derive(Clone, Debug)]
+pub struct NamespaceListRequest {
+    pub label_selector: Option<String>,
+    pub field_selector: Option<String>,
+    pub limit: Option<i64>,
+    pub continue_token: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NamespaceListPage {
+    pub items: Vec<klights_cluster_core::Resource>,
+    pub resource_version: i64,
+    pub continue_token: Option<String>,
+    pub remaining_item_count: Option<i64>,
+}
+
+pub enum NamespaceListSnapshot {
+    List(NamespaceListPage),
+    Current,
+    Expired,
+}
+
+pub type NamespaceListFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
+
+pub trait NamespaceListPort: Send + Sync {
+    fn list_namespaces(
+        &self,
+        request: NamespaceListRequest,
+    ) -> NamespaceListFuture<'_, NamespaceListPage>;
+
+    fn snapshot_namespaces(
+        &self,
+        request: NamespaceListRequest,
+        snapshot_resource_version: i64,
+    ) -> NamespaceListFuture<'_, NamespaceListSnapshot>;
+}
+
+impl ListPageMetadata for NamespaceListPage {
+    fn list_resource_version(&self) -> i64 {
+        self.resource_version
+    }
+}
+
+impl ListSnapshotResult<NamespaceListPage> for NamespaceListSnapshot {
+    fn into_list_snapshot_resolution(self) -> ListSnapshotResolution<NamespaceListPage> {
+        match self {
+            Self::List(list) => ListSnapshotResolution::List(list),
+            Self::Current => ListSnapshotResolution::Current,
+            Self::Expired => ListSnapshotResolution::Expired,
+        }
+    }
+}
+
+impl ListPageMetadata for klights_pod_api::PodListResult {
+    fn list_resource_version(&self) -> i64 {
+        self.resource_version()
+    }
+}
+
+impl ListSnapshotResult<klights_pod_api::PodListResult>
+    for klights_pod_api::PodSnapshotListOutcome
+{
+    fn into_list_snapshot_resolution(
+        self,
+    ) -> ListSnapshotResolution<klights_pod_api::PodListResult> {
+        match self {
+            Self::List(list) => ListSnapshotResolution::List(list),
+            Self::Current => ListSnapshotResolution::Current,
+            Self::Expired => ListSnapshotResolution::Expired,
+        }
+    }
+}
+
+impl ListPageMetadata for klights_leader_api::ResourceListResult {
+    fn list_resource_version(&self) -> i64 {
+        self.resource_version()
+    }
+}
+
+impl ListSnapshotResult<klights_leader_api::ResourceListResult>
+    for crate::api::custom_resource_ports::CustomResourceListSnapshot
+{
+    fn into_list_snapshot_resolution(
+        self,
+    ) -> ListSnapshotResolution<klights_leader_api::ResourceListResult> {
+        match self {
+            Self::List(list) => ListSnapshotResolution::List(list),
+            Self::Current => ListSnapshotResolution::Current,
+            Self::Expired => ListSnapshotResolution::Expired,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -442,7 +557,16 @@ mod list_rv_match_tests {
 #[cfg(test)]
 mod resolve_list_page_tests {
     use super::*;
-    use crate::datastore::sqlite::Datastore;
+    use crate::datastore::{ResourceList, SnapshotAtRv, sqlite::Datastore};
+
+    impl ListResourceVersionPort for Datastore {
+        fn advance_after(&self, minimum_resource_version: i64) -> ListResourceVersionFuture<'_> {
+            Box::pin(async move {
+                self.advance_resource_version_after(minimum_resource_version)
+                    .await
+            })
+        }
+    }
 
     fn empty_list(rv: i64, continue_token: Option<&str>) -> ResourceList {
         ResourceList {
@@ -564,7 +688,11 @@ mod resolve_list_page_tests {
             &db,
             ListResourceVersionMatch::NotOlderThan(100),
             ContinueResourceVersion::Current,
-            |_srv| async { panic!("NotOlderThan must not pin a snapshot") },
+            |_srv| async {
+                Err::<SnapshotAtRv, AppError>(AppError::Internal(
+                    "NotOlderThan unexpectedly pinned a snapshot".to_string(),
+                ))
+            },
             || async { Ok(empty_list(50, None)) },
         )
         .await
@@ -577,7 +705,7 @@ mod resolve_list_page_tests {
 }
 
 pub async fn resolve_list_response_resource_version(
-    db: &dyn DatastoreBackend,
+    resource_versions: &dyn ListResourceVersionPort,
     continue_resource_version: ContinueResourceVersion,
     current_resource_version: i64,
 ) -> Result<i64, AppError> {
@@ -586,9 +714,10 @@ pub async fn resolve_list_response_resource_version(
         ContinueResourceVersion::Session(rv) => Ok(rv),
         ContinueResourceVersion::Inconsistent { expired_rv } => {
             let min_rv = expired_rv.unwrap_or(current_resource_version);
-            db.advance_resource_version_after(min_rv)
+            resource_versions
+                .advance_after(min_rv)
                 .await
-                .map_err(AppError::from)
+                .map_err(|error| AppError::Internal(error.to_string()))
         }
         ContinueResourceVersion::InconsistentSession(rv) => Ok(rv),
     }
@@ -597,10 +726,10 @@ pub async fn resolve_list_response_resource_version(
 /// The consistent page a plain (non-watch) LIST resolved to, plus the metadata
 /// every list handler needs to render its response identically.
 #[derive(Debug)]
-pub struct ResolvedListPage {
+pub struct ResolvedListPage<Page> {
     /// The page of resources to serve — from a pinned historical snapshot when
     /// the read is consistent, otherwise from the live store.
-    pub list: ResourceList,
+    pub list: Page,
     /// The `metadata.resourceVersion` to report (already adjusted for
     /// `resourceVersionMatch` and continuation-session pinning).
     pub response_rv: i64,
@@ -624,25 +753,27 @@ pub struct ResolvedListPage {
 /// always at least as fresh as any past rv).
 ///
 /// When the pinned snapshot can no longer be reconstructed
-/// ([`SnapshotAtRv::Expired`]): an explicit `Exact` answers `410 Gone`, while a
+/// ([`ListSnapshotResolution::Expired`]): an explicit `Exact` answers `410 Gone`, while a
 /// still-fresh paginated continuation that merely outran the retained
 /// watch-event window continues from the last key against the live state and
 /// keeps subsequent page tokens marked inconsistent.
 ///
 /// `snapshot_fetch` is invoked only when a pin is required; callers without a
 /// real reconstruction (e.g. conversion-backed CRDs) may return
-/// [`SnapshotAtRv::Expired`] to opt into the inconsistent-continuation
+/// [`ListSnapshotResolution::Expired`] to opt into the inconsistent-continuation
 /// fallback. `live_fetch` is invoked only when no pinned snapshot is served.
-pub async fn resolve_list_page<SFut, LFut>(
-    db: &dyn DatastoreBackend,
+pub async fn resolve_list_page<Page, Snapshot, SFut, LFut>(
+    resource_versions: &dyn ListResourceVersionPort,
     rv_match: ListResourceVersionMatch,
     mut continue_resource_version: ContinueResourceVersion,
     snapshot_fetch: impl FnOnce(i64) -> SFut,
     live_fetch: impl FnOnce() -> LFut,
-) -> Result<ResolvedListPage, AppError>
+) -> Result<ResolvedListPage<Page>, AppError>
 where
-    SFut: Future<Output = Result<SnapshotAtRv, AppError>>,
-    LFut: Future<Output = Result<ResourceList, AppError>>,
+    Page: ListPageMetadata,
+    Snapshot: ListSnapshotResult<Page>,
+    SFut: Future<Output = Result<Snapshot, AppError>>,
+    LFut: Future<Output = Result<Page, AppError>>,
 {
     let snapshot_rv = match rv_match {
         ListResourceVersionMatch::Exact(rv) => Some(rv),
@@ -653,11 +784,11 @@ where
     };
 
     let snapshot_list = if let Some(srv) = snapshot_rv {
-        match snapshot_fetch(srv).await? {
-            SnapshotAtRv::List(list) => Some(list),
+        match snapshot_fetch(srv).await?.into_list_snapshot_resolution() {
+            ListSnapshotResolution::List(list) => Some(list),
             // rv is at/after current state — fall through to the live list.
-            SnapshotAtRv::Current => None,
-            SnapshotAtRv::Expired => match rv_match {
+            ListSnapshotResolution::Current => None,
+            ListSnapshotResolution::Expired => match rv_match {
                 ListResourceVersionMatch::Exact(rv) => {
                     return Err(AppError::expired(format!(
                         "too old resource version: {rv} (the requested resourceVersion is older than the server's retained history)"
@@ -683,9 +814,9 @@ where
     };
 
     let mut response_rv = resolve_list_response_resource_version(
-        db,
+        resource_versions,
         continue_resource_version,
-        list.resource_version,
+        list.list_resource_version(),
     )
     .await?;
     // resourceVersionMatch handling. Exact pins the reported list rv to the

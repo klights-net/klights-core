@@ -198,6 +198,7 @@ async fn referenced_role_rules(
     let api_version = format!("{RBAC_GROUP}/v1");
     let resource = match ref_kind {
         "ClusterRole" => state
+            .resource_mutation()
             .db
             .get_resource(&api_version, "ClusterRole", None, ref_name)
             .await
@@ -208,6 +209,7 @@ async fn referenced_role_rules(
                 return Vec::new();
             };
             state
+                .resource_mutation()
                 .db
                 .get_resource(&api_version, "Role", Some(ns), ref_name)
                 .await
@@ -304,7 +306,7 @@ mod tests {
     async fn alice_router(alice_rules: serde_json::Value) -> axum::Router {
         let mut state = crate::api::test_support::build_test_app_state().await;
         let store = Arc::new(ReaderBackedRbacPolicyStore::new(Arc::new(
-            DatastoreRbacResourceReader::new(state.db.clone()),
+            DatastoreRbacResourceReader::new(state.resource_mutation().db.clone()),
         )));
         state.authorizer = Arc::new(AuthorizerChain::new(vec![
             Box::new(SystemMastersAuthorizer),
@@ -314,6 +316,7 @@ mod tests {
         state.rbac_policy_store = store;
 
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "rbac.authorization.k8s.io/v1",
@@ -325,6 +328,7 @@ mod tests {
             .await
             .unwrap();
         state
+            .resource_mutation()
             .db
             .create_resource(
                 "rbac.authorization.k8s.io/v1",

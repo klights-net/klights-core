@@ -192,10 +192,6 @@ pub(super) const APPLIED_OUTBOX_INSERT: &str = "INSERT OR IGNORE INTO applied_ou
      (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
-pub(super) const APPLIED_OUTBOX_INSERT_PLACEHOLDER_WITH_RESERVED_RV: &str = "INSERT OR IGNORE INTO applied_outbox \
-     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp, reserved_rv) \
-     VALUES (?1, ?2, ?3, ?4, NULL, X'', NULL, ?5)";
-
 pub(super) const APPLIED_OUTBOX_UPSERT_EXACT: &str = "INSERT INTO applied_outbox \
      (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp, reserved_rv) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) \
@@ -625,10 +621,6 @@ pub(super) const UPSERT_KLIGHTS_META: &str =
 pub(super) const APPLIED_OUTBOX_UPDATE_RESULT: &str = "UPDATE applied_outbox \
      SET subject_key = ?2, applied_rv = ?3, result_proto = ?4, status_stamp = ?5 \
      WHERE idempotency_key = ?1";
-pub(super) const APPLIED_OUTBOX_DELETE_STALE_PLACEHOLDERS: &str = "DELETE FROM applied_outbox \
-     WHERE applied_rv IS NULL
-     AND result_proto = X''
-     AND first_seen_ms < ?1";
 pub(super) const APPLIED_OUTBOX_DELETE_EXPIRED: &str =
     "DELETE FROM applied_outbox WHERE first_seen_ms < ?1";
 pub(super) const APPLIED_OUTBOX_GC_PRUNABLE_COUNT: &str =
@@ -636,11 +628,6 @@ pub(super) const APPLIED_OUTBOX_GC_PRUNABLE_COUNT: &str =
 
 pub(super) const APPLIED_OUTBOX_DELETE_BY_KEY: &str =
     "DELETE FROM applied_outbox WHERE idempotency_key = ?1";
-
-pub(super) const APPLIED_OUTBOX_DELETE_UNCOMMITTED_PLACEHOLDER_BY_KEY: &str = "DELETE FROM applied_outbox \
-     WHERE idempotency_key = ?1 \
-       AND applied_rv IS NULL \
-       AND length(result_proto) = 0";
 
 // ---------------------------------------------------------------------------
 // Selector index tables (resource_labels, resource_fields)

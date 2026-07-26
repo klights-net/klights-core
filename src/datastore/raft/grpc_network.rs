@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::datastore::raft::types::RaftMemberNode;
+use super::types::RaftMemberNode;
 use async_trait::async_trait;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
@@ -23,7 +23,7 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 
-use crate::datastore::raft::types::{NodeId, TypeConfig};
+use super::types::{NodeId, TypeConfig};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PeerRaftRpcMetricsSnapshot {
@@ -286,7 +286,7 @@ pub struct GrpcRaftNetwork {
     /// T4: shared RTT estimator fed by successful AppendEntries round-trips.
     /// AppendEntries is the most frequent raft RPC (heartbeats), so it is the
     /// natural RTT source. Idle-silent: no traffic ⇒ no samples ⇒ no work.
-    rtt: Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
+    rtt: Arc<super::rtt_estimator::RttEstimator>,
 }
 
 impl GrpcRaftNetwork {
@@ -298,7 +298,7 @@ impl GrpcRaftNetwork {
             bound_target: None,
             bound_receiver_admission: None,
             metrics: Arc::new(GrpcRaftNetworkMetrics::default()),
-            rtt: Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
+            rtt: Arc::new(super::rtt_estimator::RttEstimator::new()),
         }
     }
 

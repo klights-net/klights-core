@@ -86,20 +86,4 @@ mod tests {
             other => panic!("expected Rootless, got {other:?}"),
         }
     }
-
-    #[test]
-    fn test_app_state_mode_is_root_after_bootstrap() {
-        // Bootstrap is async + heavy; this test exercises the contract that
-        // AppState carries a `mode` field that defaults to `Root` for the
-        // unit-test fixture. The full wiring is verified by integration
-        // tests in `validate.sh`.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let state = crate::api::test_support::build_test_app_state().await;
-            assert_eq!(state.mode, NodeMode::Root);
-        });
-    }
 }

@@ -194,16 +194,18 @@ impl PodLifecycleRouter {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
         mode: PodLifecycleRouteMode,
+        actor_idle_grace: std::time::Duration,
     ) -> Self {
         let backend: Arc<dyn PodLifecycleRouteBackend> = match mode {
             PodLifecycleRouteMode::Actor => {
                 let executor_holder = Arc::new(std::sync::Mutex::new(
                     Arc::new(NoopExecutor) as Arc<dyn executor::PodWorkExecutor>
                 ));
-                let registry = Arc::new(PodLifecycleRegistry::new(
+                let registry = Arc::new(PodLifecycleRegistry::new_with_idle_grace(
                     supervisor,
                     config,
                     executor_holder.clone(),
+                    actor_idle_grace,
                 ));
                 let backend: Arc<dyn PodLifecycleRouteBackend> = Arc::new(
                     ActorPodLifecycleBackend::new(registry.clone(), executor_holder),
@@ -222,7 +224,12 @@ impl PodLifecycleRouter {
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
     ) -> Self {
-        Self::new(supervisor, config, PodLifecycleRouteMode::Actor)
+        Self::new(
+            supervisor,
+            config,
+            PodLifecycleRouteMode::Actor,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+        )
     }
 
     /// Route a lifecycle message to the selected backend.
@@ -267,6 +274,38 @@ impl PodLifecycleRouter {
     }
 }
 
+impl klights_pod_api::PodLifecycleDiagnosticsQuery for PodLifecycleRouter {
+    fn pod_lifecycle_diagnostics(&self) -> klights_pod_api::PodLifecycleDiagnosticsFuture<'_> {
+        Box::pin(async move {
+            let diagnostics = self.diagnostics().await;
+            klights_pod_api::PodLifecycleDiagnostics {
+                actor_states: diagnostics
+                    .actor_states
+                    .into_iter()
+                    .map(|entry| klights_pod_api::PodLifecycleActorDiagnostic {
+                        namespace: entry.namespace,
+                        name: entry.name,
+                        uid: entry.uid,
+                        state: entry.state,
+                    })
+                    .collect(),
+                recent_trace: diagnostics
+                    .recent_trace
+                    .into_iter()
+                    .map(|entry| klights_pod_api::PodLifecycleTraceDiagnostic {
+                        namespace: entry.key.namespace,
+                        name: entry.key.name,
+                        uid: entry.key.uid,
+                        event: entry.event.to_string(),
+                        resource_version: entry.resource_version,
+                        sandbox_id: entry.sandbox_id,
+                    })
+                    .collect(),
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +344,7 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Actor,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
     }
@@ -315,6 +355,7 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Multiplex);
     }
@@ -412,6 +453,7 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         );
 
         let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -426,6 +468,7 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         );
 
         let diag = router.diagnostics().await;
@@ -444,6 +487,7 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         );
 
         // Mode selection works.
@@ -1115,6 +1159,7 @@ mod tests {
             test_supervisor(),
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
+            crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
         );
 
         assert_eq!(mux_router.mode(), PodLifecycleRouteMode::Multiplex);

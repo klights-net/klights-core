@@ -1,12 +1,47 @@
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use anyhow::Result;
+use async_trait::async_trait;
 use futures::StreamExt as _;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
 };
 use klights_types::PodIdentity;
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
+
+#[async_trait]
+pub trait GcResourceStore: Send + Sync {
+    async fn list_custom_resource_definitions(&self) -> Result<Vec<Resource>>;
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+    async fn update_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+    async fn find_owned_resources(
+        &self,
+        owner_uid: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>>;
+    async fn find_owned_by_name_kind_empty_uid(
+        &self,
+        owner_api_version: &str,
+        owner_name: &str,
+        owner_kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>>;
+    fn gc_store_error_is_conflict(&self, error: &anyhow::Error) -> bool;
+}
 
 const OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES: usize = 8;
 
@@ -232,7 +267,7 @@ fn builtin_owner_scope(api_version: &str, kind: &str) -> Option<OwnerScope> {
 }
 
 async fn custom_resource_scope(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     api_version: &str,
     kind: &str,
 ) -> Result<Option<OwnerScope>> {
@@ -240,16 +275,9 @@ async fn custom_resource_scope(
         return Ok(None);
     };
 
-    let crds = db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let crds = db.list_custom_resource_definitions().await?;
 
-    for crd in crds.items {
+    for crd in crds {
         let spec = crd.data.get("spec").unwrap_or(&serde_json::Value::Null);
         if spec.get("group").and_then(|v| v.as_str()) != Some(group) {
             continue;
@@ -284,7 +312,7 @@ async fn custom_resource_scope(
 }
 
 async fn owner_scope(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     api_version: &str,
     kind: &str,
 ) -> Result<OwnerScope> {
@@ -394,7 +422,7 @@ fn owner_ref_identity_matches(candidate: &serde_json::Value, target: &serde_json
 }
 
 async fn owner_ref_state(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_ref: &serde_json::Value,
     dependent_namespace: Option<&str>,
 ) -> Result<OwnerRefState> {
@@ -452,7 +480,7 @@ async fn owner_ref_state(
 }
 
 async fn owner_ref_points_to_live_owner(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_ref: &serde_json::Value,
     dependent_namespace: Option<&str>,
 ) -> Result<bool> {
@@ -463,7 +491,7 @@ async fn owner_ref_points_to_live_owner(
 }
 
 async fn has_another_live_owner(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     resource: &Resource,
     owner_uid: &str,
     owner_api_version: &str,
@@ -498,7 +526,7 @@ async fn has_another_live_owner(
 }
 
 async fn remove_owner_ref_from_resource(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     resource: Resource,
     owner_uid: &str,
     owner_api_version: &str,
@@ -548,7 +576,7 @@ async fn remove_owner_ref_from_resource(
         {
             Ok(_) => return Ok(()),
             Err(err)
-                if crate::datastore::errors::is_conflict_error(&err)
+                if db.gc_store_error_is_conflict(&err)
                     && attempt < OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES =>
             {
                 let Some(live) = db
@@ -575,7 +603,7 @@ async fn remove_owner_ref_from_resource(
 }
 
 async fn remove_owner_refs_from_resource(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     resource: Resource,
     refs_to_remove: &[serde_json::Value],
 ) -> Result<bool> {
@@ -618,7 +646,7 @@ async fn remove_owner_refs_from_resource(
         {
             Ok(_) => return Ok(true),
             Err(err)
-                if crate::datastore::errors::is_conflict_error(&err)
+                if db.gc_store_error_is_conflict(&err)
                     && attempt < OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES =>
             {
                 let Some(live) = db
@@ -645,7 +673,7 @@ async fn remove_owner_refs_from_resource(
 }
 
 async fn has_current_matching_dependents(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
@@ -705,9 +733,10 @@ async fn has_current_matching_dependents(
 }
 
 async fn delete_resource_and_dependents(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     resource: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
     let owner_uid = resource
         .data
@@ -733,7 +762,8 @@ async fn delete_resource_and_dependents(
         .await?;
     }
 
-    let delete_outcome = delete_resource_for_gc(db, resource, pod_delete_sink).await?;
+    let delete_outcome =
+        delete_resource_for_gc(db, resource, pod_delete_sink, non_pod_finalization).await?;
 
     if !orphan_dependents && delete_outcome == GcDeleteOutcome::HardDeleted {
         Box::pin(cascade_delete_with_uid(
@@ -744,6 +774,7 @@ async fn delete_resource_and_dependents(
             &owner_kind,
             owner_namespace,
             pod_delete_sink,
+            non_pod_finalization,
         ))
         .await?;
     }
@@ -757,9 +788,10 @@ async fn delete_resource_and_dependents(
 /// owner references are removed when a solid owner remains. Objects with no
 /// solid owners are deleted and the delete cascades to their dependents.
 pub async fn reconcile_owner_references(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     resource: Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<OwnerReferenceReconcile> {
     let Some(owner_refs) = resource
         .data
@@ -800,7 +832,7 @@ pub async fn reconcile_owner_references(
         return Ok(OwnerReferenceReconcile::HasLiveOwner);
     }
 
-    delete_resource_and_dependents(db, &resource, pod_delete_sink).await?;
+    delete_resource_and_dependents(db, &resource, pod_delete_sink, non_pod_finalization).await?;
     Ok(OwnerReferenceReconcile::Deleted)
 }
 
@@ -808,9 +840,10 @@ pub async fn reconcile_owner_references(
 /// Pod lifecycle actor (`GcPodDeleteSink`). Non-Pod resources use the
 /// shared finalizer-aware delete path.
 async fn delete_resource_for_gc(
-    db: &dyn DatastoreBackend,
+    _db: &(impl GcResourceStore + ?Sized),
     resource: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<GcDeleteOutcome> {
     if is_core_pod(resource) {
         if has_deletion_timestamp(resource) {
@@ -821,35 +854,21 @@ async fn delete_resource_for_gc(
         return request_gc_pod_delete_for_gc(pod_delete_sink, namespace, &resource.name, uid).await;
     }
 
-    match crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
-        db,
-        crate::api::finalizer_delete::NonForegroundDeleteRequest {
-            target: crate::api::finalizer_delete::ResourceDeleteTarget {
-                api_version: &resource.api_version,
-                kind: &resource.kind,
-                namespace: resource.namespace.as_deref(),
-                name: &resource.name,
-            },
-            initial_resource: resource.clone(),
-            delete_preconditions: ResourcePreconditions::uid(resource.uid.clone()),
-            orphan_children_before_completion: has_finalizer(&resource.data, "orphan"),
-            uid_mismatch_is_conflict: false,
-            grace_seconds: 0,
-        },
-    )
-    .await
+    match non_pod_finalization
+        .finalize_non_pod(klights_reconcile_api::GcNonPodFinalizationRequest {
+            resource: resource.clone(),
+            orphan_children: has_finalizer(&resource.data, "orphan"),
+        })
+        .await
     {
-        Ok(crate::api::finalizer_delete::DeleteCompletion::HardDeleted(_)) => {
+        Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::HardDeleted) => {
             Ok(GcDeleteOutcome::HardDeleted)
         }
-        Ok(crate::api::finalizer_delete::DeleteCompletion::MarkedTerminating(_)) => {
+        Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::MarkedTerminating) => {
             Ok(GcDeleteOutcome::MarkedTerminating)
         }
-        Ok(crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged) => {
-            Ok(GcDeleteOutcome::Gone)
-        }
-        Err(crate::api::AppError::NotFound(_)) => Ok(GcDeleteOutcome::Gone),
-        Err(e) => Err(anyhow::anyhow!("{e:?}")),
+        Ok(klights_reconcile_api::GcNonPodFinalizationOutcome::Gone) => Ok(GcDeleteOutcome::Gone),
+        Err(error) => Err(anyhow::anyhow!(error.to_string())),
     }
 }
 
@@ -896,14 +915,19 @@ async fn request_gc_pod_delete_for_gc(
 ///   from different API groups with the same kind/name)
 /// owner_name: the deleted resource's name (for empty-UID ownerRef lookup)
 /// owner_kind: the deleted resource's kind (for empty-UID ownerRef lookup)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the UID-qualified Kubernetes owner identity stays explicit at this public lifecycle boundary"
+)]
 pub async fn cascade_delete_with_uid(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
     owner_kind: &str,
     namespace: Option<String>,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     cascade_delete_with_uid_inner(
@@ -916,6 +940,7 @@ pub async fn cascade_delete_with_uid(
             namespace,
         },
         pod_delete_sink,
+        non_pod_finalization,
         &mut visited,
     )
     .await
@@ -943,14 +968,19 @@ struct CascadeDeleteRequest<'a> {
 ///
 /// HR#11-safe: Pod deletes route exclusively through `pod_delete_sink`
 /// (mark terminating); the cascade never hard-deletes a Pod row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the UID-qualified Kubernetes owner identity stays explicit at this public lifecycle boundary"
+)]
 pub async fn owner_cascade_sweep_once(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
     owner_kind: &str,
     namespace: Option<String>,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
     cascade_delete_with_uid(
         db,
@@ -960,6 +990,7 @@ pub async fn owner_cascade_sweep_once(
         owner_kind,
         namespace.clone(),
         pod_delete_sink,
+        non_pod_finalization,
     )
     .await?;
 
@@ -978,9 +1009,10 @@ pub async fn owner_cascade_sweep_once(
 }
 
 async fn cascade_delete_with_uid_inner(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     request: CascadeDeleteRequest<'_>,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     visited: &mut HashSet<CascadeOwnerKey>,
 ) -> Result<()> {
     let CascadeDeleteRequest {
@@ -1149,16 +1181,18 @@ async fn cascade_delete_with_uid_inner(
             continue;
         }
 
-        let delete_outcome = match delete_resource_for_gc(db, &current, pod_delete_sink).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                tracing::warn!("Failed to cascade delete resource: {}", e);
-                if first_error.is_none() {
-                    first_error = Some(e);
+        let delete_outcome =
+            match delete_resource_for_gc(db, &current, pod_delete_sink, non_pod_finalization).await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!("Failed to cascade delete resource: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         let should_recurse = delete_outcome == GcDeleteOutcome::HardDeleted
             || (delete_outcome == GcDeleteOutcome::MarkedTerminating && is_core_pod(&current));
         if !should_recurse {
@@ -1178,6 +1212,7 @@ async fn cascade_delete_with_uid_inner(
                 namespace: child_ns,
             },
             pod_delete_sink,
+            non_pod_finalization,
             visited,
         ))
         .await
@@ -1196,7 +1231,7 @@ async fn cascade_delete_with_uid_inner(
 /// Same parameter contract as `cascade_delete_with_uid` — apiVersion paired
 /// with name/kind disambiguates two owners from different API groups.
 pub async fn orphan_children(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
@@ -1274,14 +1309,19 @@ pub async fn orphan_children(
 
 /// Foreground deletion: delete children first, then parent can be deleted
 /// Returns true if all children are deleted and parent can now be removed
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the UID-qualified Kubernetes owner identity stays explicit at this public lifecycle boundary"
+)]
 pub async fn check_foreground_deletion_ready(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_uid: &str,
     owner_api_version: &str,
     owner_name: &str,
     owner_kind: &str,
     namespace: Option<String>,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
     if owner_uid.is_empty() {
         return Ok(true);
@@ -1473,13 +1513,15 @@ pub async fn check_foreground_deletion_ready(
             continue;
         }
 
-        let delete_outcome = match delete_resource_for_gc(db, &current, pod_delete_sink).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                tracing::warn!("Failed to delete child during foreground deletion: {}", e);
-                continue;
-            }
-        };
+        let delete_outcome =
+            match delete_resource_for_gc(db, &current, pod_delete_sink, non_pod_finalization).await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!("Failed to delete child during foreground deletion: {}", e);
+                    continue;
+                }
+            };
         match delete_outcome {
             GcDeleteOutcome::MarkedTerminating => {
                 pending_child_delete = true;
@@ -1499,6 +1541,7 @@ pub async fn check_foreground_deletion_ready(
                 &child_kind,
                 child_ns,
                 pod_delete_sink,
+                non_pod_finalization,
             ))
             .await;
         }
@@ -1548,9 +1591,10 @@ pub async fn check_foreground_deletion_ready(
 /// Re-check foreground-deleting owners after a dependent Pod row is removed by
 /// the actor-owned finalization path.
 pub async fn finalize_foreground_owners_after_dependent_delete(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     deleted_resource: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
     let Some(owner_refs) = deleted_resource
         .data
@@ -1568,14 +1612,16 @@ pub async fn finalize_foreground_owners_after_dependent_delete(
         else {
             continue;
         };
-        let _ = finalize_foreground_owner_if_ready(db, &owner, pod_delete_sink).await?;
+        let _ =
+            finalize_foreground_owner_if_ready(db, &owner, pod_delete_sink, non_pod_finalization)
+                .await?;
     }
 
     Ok(())
 }
 
 async fn foreground_owner_from_ref(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner_ref: &serde_json::Value,
     dependent_namespace: Option<&str>,
 ) -> Result<Option<Resource>> {
@@ -1624,9 +1670,10 @@ async fn foreground_owner_from_ref(
 /// hard-deleted here; their foreground finalizer is removed and the Pod actor
 /// remains the only owner allowed to remove the Pod row.
 pub async fn finalize_foreground_owner_if_ready(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<bool> {
     if !is_waiting_for_dependents_deletion(&owner.data) {
         return Ok(false);
@@ -1640,20 +1687,22 @@ pub async fn finalize_foreground_owner_if_ready(
         &owner.kind,
         owner.namespace.clone(),
         pod_delete_sink,
+        non_pod_finalization,
     )
     .await?;
     if !ready {
         return Ok(false);
     }
 
-    finalize_foreground_owner_resource(db, owner, pod_delete_sink).await?;
+    finalize_foreground_owner_resource(db, owner, pod_delete_sink, non_pod_finalization).await?;
     Ok(true)
 }
 
 async fn finalize_foreground_owner_resource(
-    db: &dyn DatastoreBackend,
+    db: &(impl GcResourceStore + ?Sized),
     owner: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
 ) -> Result<()> {
     let finalizers = owner
         .data
@@ -1666,19 +1715,19 @@ async fn finalize_foreground_owner_resource(
         .filter(|value| value.as_str() != Some("foregroundDeletion"))
         .collect();
 
-    if !non_foreground_finalizers.is_empty() || is_core_pod(owner) {
-        let mut data: serde_json::Value = (*owner.data).clone();
-        if let Some(metadata) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            if non_foreground_finalizers.is_empty() {
-                metadata.remove("finalizers");
-            } else {
-                metadata.insert(
-                    "finalizers".to_string(),
-                    serde_json::Value::Array(non_foreground_finalizers),
-                );
-            }
+    let mut data: serde_json::Value = (*owner.data).clone();
+    if let Some(metadata) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        if non_foreground_finalizers.is_empty() {
+            metadata.remove("finalizers");
+        } else {
+            metadata.insert(
+                "finalizers".to_string(),
+                serde_json::Value::Array(non_foreground_finalizers.clone()),
+            );
         }
-        db.update_resource_with_preconditions(
+    }
+    let updated = db
+        .update_resource_with_preconditions(
             &owner.api_version,
             &owner.kind,
             owner.namespace.as_deref(),
@@ -1687,27 +1736,29 @@ async fn finalize_foreground_owner_resource(
             ResourcePreconditions::from_resource(owner),
         )
         .await?;
-        if is_core_pod(owner) {
-            let namespace = owner.namespace.as_deref().unwrap_or("default");
-            pod_delete_sink
-                .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
-                    namespace,
-                    &owner.name,
-                    &owner.uid,
-                )))
-                .await?;
-        }
+    if is_core_pod(owner) {
+        let namespace = owner.namespace.as_deref().unwrap_or("default");
+        pod_delete_sink
+            .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
+                namespace,
+                &owner.name,
+                &owner.uid,
+            )))
+            .await?;
+        return Ok(());
+    }
+    if !non_foreground_finalizers.is_empty() {
         return Ok(());
     }
 
-    db.delete_resource_with_preconditions(
-        &owner.api_version,
-        &owner.kind,
-        owner.namespace.as_deref(),
-        &owner.name,
-        ResourcePreconditions::uid(owner.uid.clone()),
-    )
-    .await
+    non_pod_finalization
+        .finalize_non_pod(klights_reconcile_api::GcNonPodFinalizationRequest {
+            resource: updated,
+            orphan_children: false,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 #[cfg(test)]

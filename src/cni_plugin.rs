@@ -12,7 +12,7 @@ use std::os::unix::net::UnixStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::networking::PodSubnet;
+use klights_types::PodSubnet;
 
 const DEFAULT_MTU: u32 = crate::networking::wireguard::WIREGUARD_MTU;
 const CLEANUP_RPC_MAX_REQUEST_BYTES: usize = 64 * 1024;

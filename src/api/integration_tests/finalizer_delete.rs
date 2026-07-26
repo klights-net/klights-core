@@ -76,7 +76,7 @@ async fn create_widget_crd(app: &axum::Router) {
 #[tokio::test]
 async fn test_custom_resource_delete_with_finalizer_marks_terminating_until_finalizer_drains() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -164,7 +164,7 @@ async fn test_custom_resource_delete_with_finalizer_marks_terminating_until_fina
 #[tokio::test]
 async fn test_custom_resource_foreground_delete_preserves_user_finalizer_until_drain() {
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(

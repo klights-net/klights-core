@@ -5,10 +5,11 @@
 //! (ForbidConcurrent / Replace / Allow), and creates the Job.
 //! Status (lastScheduleTime, active) is kept up-to-date.
 
-use crate::controller_dispatcher::ControllerDispatcher;
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+use crate::controllers::common::ControllerStatusStore;
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
 
 // `reconcile_all_cronjobs_and_enqueue_jobs` (the periodic-scan entry
@@ -20,18 +21,27 @@ use serde_json::{Value, json};
 /// Public per-CronJob fire entry point used by `cronjob_scheduler`. Re-uses
 /// the same reconcile path as the legacy bulk scan so concurrency policy,
 /// status updates, and history cleanup stay consistent.
-pub async fn reconcile_cronjob_one(
-    db: &dyn DatastoreBackend,
-    dispatcher: Option<&ControllerDispatcher>,
+#[async_trait]
+pub(crate) trait CronJobStore: ControllerStatusStore {
+    async fn get_cronjob(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn create_job(&self, namespace: &str, name: &str, value: Value) -> Result<Resource>;
+    async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn delete_job(&self, namespace: &str, name: &str, uid: String) -> Result<()>;
+}
+
+pub(crate) async fn reconcile_cronjob_one<S: CronJobStore + ?Sized>(
+    store: &S,
+    dispatcher: Option<&dyn klights_reconcile_api::ControllerDispatcherPort>,
     cj: &Value,
     rv: i64,
 ) -> Result<()> {
-    reconcile_cronjob_inner(db, dispatcher, cj, rv).await
+    reconcile_cronjob_inner(store, dispatcher, cj, rv).await
 }
 
-async fn reconcile_cronjob_inner(
-    db: &dyn DatastoreBackend,
-    dispatcher: Option<&ControllerDispatcher>,
+async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
+    store: &S,
+    dispatcher: Option<&dyn klights_reconcile_api::ControllerDispatcherPort>,
     cj: &Value,
     _rv: i64,
 ) -> Result<()> {
@@ -46,10 +56,7 @@ async fn reconcile_cronjob_inner(
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("default");
-    let Some(live_cj) = db
-        .get_resource("batch/v1", "CronJob", Some(namespace), name)
-        .await?
-    else {
+    let Some(live_cj) = store.get_cronjob(namespace, name).await? else {
         return Ok(());
     };
     let cj = live_cj.data.as_ref();
@@ -69,7 +76,7 @@ async fn reconcile_cronjob_inner(
         .unwrap_or(false);
     if suspended {
         // Still clean up old jobs for suspended CronJobs
-        cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
+        cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
         return Ok(());
     }
 
@@ -100,13 +107,13 @@ async fn reconcile_cronjob_inner(
 
     let Some(scheduled_time) = most_recent_cronjob_schedule_time(cj, now, &schedule, true)? else {
         // Not yet due — just sync active list and clean up old jobs, then return.
-        sync_active_status(db, &live_cj, None).await?;
-        cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
+        sync_active_status(store, &live_cj, None).await?;
+        cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
         return Ok(());
     };
 
     // List currently active Jobs for this CronJob.
-    let active_jobs = list_active_jobs(db, namespace, uid).await?;
+    let active_jobs = list_active_jobs(store, namespace, uid).await?;
 
     match concurrency {
         "ForbidConcurrent" if !active_jobs.is_empty() => {
@@ -116,8 +123,8 @@ async fn reconcile_cronjob_inner(
                 name,
                 active_jobs.len()
             );
-            sync_active_status(db, &live_cj, None).await?;
-            cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
+            sync_active_status(store, &live_cj, None).await?;
+            cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
             return Ok(());
         }
         "Replace" => {
@@ -126,28 +133,24 @@ async fn reconcile_cronjob_inner(
             // replacement Job while the old one still exists (violates the
             // Replace contract).
             for job in &active_jobs {
-                db.delete_resource_with_preconditions(
-                    "batch/v1",
-                    "Job",
-                    Some(namespace),
-                    &job.name,
-                    ResourcePreconditions::uid(job.uid.clone()),
-                )
-                .await?;
+                store
+                    .delete_job(namespace, &job.name, job.uid.clone())
+                    .await?;
             }
         }
         _ => {} // "Allow": create regardless
     }
 
     // Create a new Job.
-    let created_job = create_job_from_cronjob(db, cj, name, namespace, uid, scheduled_time).await?;
+    let created_job =
+        create_job_from_cronjob(store, cj, name, namespace, uid, scheduled_time).await?;
     if let (Some(dispatcher), Some(job)) = (dispatcher, created_job.as_ref()) {
         dispatcher.enqueue(&job.data).await;
     }
-    sync_active_status(db, &live_cj, Some(scheduled_time)).await?;
+    sync_active_status(store, &live_cj, Some(scheduled_time)).await?;
 
     // Clean up old completed/failed Jobs that exceed history limits
-    cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
+    cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
 
     Ok(())
 }
@@ -249,8 +252,8 @@ pub fn most_recent_cronjob_schedule_time(
 }
 
 /// Create a Job from the CronJob template.
-async fn create_job_from_cronjob(
-    db: &dyn DatastoreBackend,
+async fn create_job_from_cronjob<S: CronJobStore + ?Sized>(
+    store: &S,
     cj: &Value,
     cj_name: &str,
     namespace: &str,
@@ -266,11 +269,7 @@ async fn create_job_from_cronjob(
     let job_name = format!("{}-{}", cj_name, ts_secs % 1_000_000_000);
 
     // Check if a Job with this name already exists (idempotent).
-    if db
-        .get_resource("batch/v1", "Job", Some(namespace), &job_name)
-        .await?
-        .is_some()
-    {
+    if store.get_job(namespace, &job_name).await?.is_some() {
         return Ok(None);
     }
 
@@ -304,9 +303,7 @@ async fn create_job_from_cronjob(
         obj.insert("metadata".to_string(), serde_json::Value::Object(meta_map));
     }
 
-    let created = db
-        .create_resource("batch/v1", "Job", Some(namespace), &job_name, job)
-        .await?;
+    let created = store.create_job(namespace, &job_name, job).await?;
     tracing::info!(
         "CronJob {}/{}: created Job for scheduled time {}",
         namespace,
@@ -319,8 +316,8 @@ async fn create_job_from_cronjob(
 /// Clean up old completed Jobs that exceed the CronJob's history limits.
 /// `successfulJobsHistoryLimit` (default 3) and `failedJobsHistoryLimit` (default 1)
 /// control how many completed/failed Jobs to retain. Oldest Jobs are deleted first.
-async fn cleanup_old_jobs_by_history_limit(
-    db: &dyn DatastoreBackend,
+async fn cleanup_old_jobs_by_history_limit<S: CronJobStore + ?Sized>(
+    store: &S,
     cj: &Value,
     namespace: &str,
     cj_uid: &str,
@@ -334,20 +331,13 @@ async fn cleanup_old_jobs_by_history_limit(
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as usize;
 
-    let jobs = db
-        .list_resources(
-            "batch/v1",
-            "Job",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let jobs = store.list_jobs(namespace).await?;
 
     // Collect completed (successful) and failed jobs owned by this CronJob
     let mut successful_jobs: Vec<&Resource> = Vec::new();
     let mut failed_jobs: Vec<&Resource> = Vec::new();
 
-    for job in &jobs.items {
+    for job in &jobs {
         let owned = job
             .data
             .pointer("/metadata/ownerReferences")
@@ -412,14 +402,9 @@ async fn cleanup_old_jobs_by_history_limit(
     if successful_jobs.len() > successful_limit {
         let to_delete = successful_jobs.len() - successful_limit;
         for job in successful_jobs.iter().take(to_delete) {
-            db.delete_resource_with_preconditions(
-                "batch/v1",
-                "Job",
-                Some(namespace),
-                &job.name,
-                ResourcePreconditions::uid(job.uid.clone()),
-            )
-            .await?;
+            store
+                .delete_job(namespace, &job.name, job.uid.clone())
+                .await?;
             tracing::info!(
                 "CronJob {}/{}: cleaned up old successful Job {} (limit={})",
                 namespace,
@@ -436,14 +421,9 @@ async fn cleanup_old_jobs_by_history_limit(
     if failed_jobs.len() > failed_limit {
         let to_delete = failed_jobs.len() - failed_limit;
         for job in failed_jobs.iter().take(to_delete) {
-            db.delete_resource_with_preconditions(
-                "batch/v1",
-                "Job",
-                Some(namespace),
-                &job.name,
-                ResourcePreconditions::uid(job.uid.clone()),
-            )
-            .await?;
+            store
+                .delete_job(namespace, &job.name, job.uid.clone())
+                .await?;
             tracing::info!(
                 "CronJob {}/{}: cleaned up old failed Job {} (limit={})",
                 namespace,
@@ -460,22 +440,14 @@ async fn cleanup_old_jobs_by_history_limit(
 }
 
 /// Return Jobs owned by this CronJob that are still active (not Complete/Failed).
-async fn list_active_jobs(
-    db: &dyn DatastoreBackend,
+async fn list_active_jobs<S: CronJobStore + ?Sized>(
+    store: &S,
     namespace: &str,
     cj_uid: &str,
 ) -> Result<Vec<Resource>> {
-    let jobs = db
-        .list_resources(
-            "batch/v1",
-            "Job",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let jobs = store.list_jobs(namespace).await?;
 
     let active: Vec<Resource> = jobs
-        .items
         .into_iter()
         .filter(|j| {
             // Owned by this CronJob
@@ -512,15 +484,15 @@ async fn list_active_jobs(
 }
 
 /// Sync the CronJob's status.lastScheduleTime and status.active list.
-async fn sync_active_status(
-    db: &dyn DatastoreBackend,
+async fn sync_active_status<S: CronJobStore + ?Sized>(
+    store: &S,
     cj_resource: &Resource,
     new_scheduled: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
     let cj = cj_resource.data.as_ref();
     let namespace = cj_resource.namespace.as_deref().unwrap_or("default");
     let cj_uid = cj_resource.uid.as_str();
-    let active_jobs = list_active_jobs(db, namespace, cj_uid).await?;
+    let active_jobs = list_active_jobs(store, namespace, cj_uid).await?;
     let active_refs: Vec<Value> = active_jobs
         .iter()
         .map(|j| {
@@ -569,7 +541,7 @@ async fn sync_active_status(
         return Ok(());
     }
 
-    crate::controllers::common::write_status_for_resource(db, cj_resource, &status).await?;
+    crate::controllers::common::write_status_for_resource(store, cj_resource, &status).await?;
 
     Ok(())
 }
@@ -578,14 +550,15 @@ async fn sync_active_status(
 mod tests {
     use super::*;
 
+    use crate::datastore::DatastoreBackend;
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Arc;
 
     async fn make_raft_cronjob_datastore() -> crate::datastore::sequenced::SequencedDatastore {
         use crate::datastore::backend::DatastoreHandle;
-        use crate::datastore::command::StorageCommand;
-        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+        use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+        use klights_cluster_core::StorageCommand;
 
         struct InlineProposer {
             inner: DatastoreHandle,
@@ -625,19 +598,19 @@ mod tests {
                 authoring_node: &str,
                 _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
             ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
+                crate::node_outbox::OutboxApplyResult,
+                crate::node_outbox::OutboxApplyError,
             > {
                 let payload = OutboxPayload::from_command(command)
                     .encode_protobuf()
                     .map_err(|err| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                        crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                     })?;
                 let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     idempotency_key,
                     OutboxOperation::try_from(operation).map_err(|err| {
-                        crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                        crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                     })?,
                     bytes::Bytes::from(payload),
                     authoring_node,

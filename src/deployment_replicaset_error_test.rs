@@ -51,6 +51,9 @@ mod tests {
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
+            &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
+                db.clone(),
+            )),
             &deployment_with_rv,
             "test-node",
         )

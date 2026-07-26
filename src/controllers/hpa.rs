@@ -1,31 +1,45 @@
 //! HorizontalPodAutoscaler controller reconcile logic.
 
-use crate::datastore::{
-    DatastoreBackend, PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions,
-};
-use crate::kubelet::pod_repository::{PodReader, PodRepository};
 use crate::metrics::{
     MetricsProvider, PodMetric, RuntimeMetricsSnapshot, format_resource_quantity,
     parse_resource_quantity_value, pod_request_for_resource,
 };
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result};
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
 
 const MAX_RETRIES: u32 = 5;
 
-pub async fn reconcile_hpa(
-    db: &dyn DatastoreBackend,
-    pod_repository: &PodRepository,
-    hpa: &Value,
-    node_name: &str,
-) -> Result<()> {
-    let metrics_provider = crate::metrics::FallbackOnlyMetricsProvider;
-    reconcile_hpa_with_metrics(db, pod_repository, hpa, node_name, &metrics_provider).await
+#[async_trait]
+pub(crate) trait HpaRuntime: Send + Sync {
+    async fn get_hpa(
+        &self,
+        api_version: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+    async fn get_scale_target(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+    async fn list_pods(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn patch_scale_target(&self, target: &ScaleTarget, replicas: i64) -> Result<Resource>;
+    async fn reconcile_scaled_target(
+        &self,
+        target: &ScaleTarget,
+        resource: &Value,
+        node_name: &str,
+    ) -> Result<()>;
+    async fn update_hpa_status(&self, current: &Resource, status: Value) -> Result<()>;
+    fn is_conflict(&self, error: &anyhow::Error) -> bool;
 }
 
-pub async fn reconcile_hpa_with_metrics(
-    db: &dyn DatastoreBackend,
-    pod_repository: &PodRepository,
+pub(crate) async fn reconcile_hpa_with_runtime(
+    runtime: &dyn HpaRuntime,
     hpa: &Value,
     node_name: &str,
     metrics_provider: &dyn MetricsProvider,
@@ -47,30 +61,21 @@ pub async fn reconcile_hpa_with_metrics(
 
     let mut last_conflict = None;
     for _ in 0..MAX_RETRIES {
-        let current = db
-            .get_resource(
-                api_version,
-                "HorizontalPodAutoscaler",
-                Some(namespace),
-                name,
-            )
+        let current = runtime
+            .get_hpa(api_version, namespace, name)
             .await?
             .context("HPA not found")?;
 
-        let decision = evaluate_hpa(
-            db,
-            pod_repository,
-            metrics_provider,
-            &current.data,
-            namespace,
-        )
-        .await?;
+        let decision = evaluate_hpa(runtime, metrics_provider, &current.data, namespace).await?;
         if decision.scale_active
             && let Some(target) = &decision.target
             && target.spec_replicas != decision.desired_replicas
         {
-            let patched_target = patch_scale_target(db, target, decision.desired_replicas).await?;
-            reconcile_scaled_target(db, pod_repository, &patched_target.data, target, node_name)
+            let patched_target = runtime
+                .patch_scale_target(target, decision.desired_replicas)
+                .await?;
+            runtime
+                .reconcile_scaled_target(target, &patched_target.data, node_name)
                 .await?;
         }
 
@@ -79,19 +84,9 @@ pub async fn reconcile_hpa_with_metrics(
             return Ok(());
         }
 
-        match db
-            .update_status_only_with_preconditions(
-                api_version,
-                "HorizontalPodAutoscaler",
-                Some(namespace),
-                name,
-                status,
-                ResourcePreconditions::from_resource(&current),
-            )
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(err) if crate::datastore::errors::is_conflict_error(&err) => {
+        match runtime.update_hpa_status(&current, status).await {
+            Ok(()) => return Ok(()),
+            Err(err) if runtime.is_conflict(&err) => {
                 last_conflict = Some(err);
                 continue;
             }
@@ -106,23 +101,23 @@ pub async fn reconcile_hpa_with_metrics(
 }
 
 #[derive(Clone, Copy)]
-enum ScaleTargetKind {
+pub(crate) enum ScaleTargetKind {
     Deployment,
     ReplicaSet,
     StatefulSet,
     ReplicationController,
 }
 
-struct ScaleTarget {
-    api_version: &'static str,
-    kind: &'static str,
-    name: String,
-    namespace: String,
-    uid: String,
+pub(crate) struct ScaleTarget {
+    pub(crate) api_version: &'static str,
+    pub(crate) kind: &'static str,
+    pub(crate) name: String,
+    pub(crate) namespace: String,
+    pub(crate) uid: String,
     selector: klights_types::LabelSelector,
     spec_replicas: i64,
     status_replicas: i64,
-    kind_tag: ScaleTargetKind,
+    pub(crate) kind_tag: ScaleTargetKind,
 }
 
 struct MetricObservation {
@@ -145,8 +140,7 @@ struct HpaDecision {
 }
 
 async fn evaluate_hpa(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+    runtime: &dyn HpaRuntime,
     metrics_provider: &dyn MetricsProvider,
     hpa: &Value,
     namespace: &str,
@@ -163,7 +157,7 @@ async fn evaluate_hpa(
         .unwrap_or(min_replicas)
         .max(min_replicas);
 
-    let Some(target) = get_scale_target(db, spec, namespace).await? else {
+    let Some(target) = get_scale_target(runtime, spec, namespace).await? else {
         return Ok(HpaDecision {
             target: None,
             current_replicas: 0,
@@ -178,7 +172,7 @@ async fn evaluate_hpa(
         });
     };
 
-    let observations = observe_metrics(pod_reader, metrics_provider, hpa, spec, &target).await?;
+    let observations = observe_metrics(runtime, metrics_provider, hpa, spec, &target).await?;
     if observations.is_empty() {
         let current = target.status_replicas;
         return Ok(HpaDecision {
@@ -224,7 +218,7 @@ async fn evaluate_hpa(
 }
 
 async fn get_scale_target(
-    db: &dyn DatastoreBackend,
+    runtime: &dyn HpaRuntime,
     spec: &Value,
     namespace: &str,
 ) -> Result<Option<ScaleTarget>> {
@@ -256,8 +250,8 @@ async fn get_scale_target(
         _ => return Ok(None),
     };
 
-    let Some(resource) = db
-        .get_resource(api_version, kind, Some(namespace), name)
+    let Some(resource) = runtime
+        .get_scale_target(api_version, kind, namespace, name)
         .await?
     else {
         return Ok(None);
@@ -310,17 +304,14 @@ async fn get_scale_target(
 }
 
 async fn observe_metrics(
-    pod_reader: &dyn PodReader,
+    runtime: &dyn HpaRuntime,
     metrics_provider: &dyn MetricsProvider,
     hpa: &Value,
     spec: &Value,
     target: &ScaleTarget,
 ) -> Result<Vec<MetricObservation>> {
-    let pods = pod_reader
-        .list_pods(Some(&target.namespace), None, None, None, None)
-        .await?;
+    let pods = runtime.list_pods(&target.namespace).await?;
     let matching_ready_pods: Vec<Resource> = pods
-        .items
         .iter()
         .filter(|pod| {
             pod.data.pointer("/metadata/deletionTimestamp").is_none()
@@ -532,87 +523,6 @@ fn desired_from_ratio(current_replicas: i64, current_value: i64, target_value: i
     ((current_replicas.max(0) * current_value.max(0)) + target_value - 1) / target_value
 }
 
-async fn patch_scale_target(
-    db: &dyn DatastoreBackend,
-    target: &ScaleTarget,
-    replicas: i64,
-) -> Result<Resource> {
-    db.patch_resource_latest_with_preconditions(
-        target.api_version,
-        target.kind,
-        Some(&target.namespace),
-        &target.name,
-        ResourcePatchRequest::new(
-            PatchKind::Merge,
-            json!({"spec": {"replicas": replicas.max(0)}}),
-            ResourcePreconditions::uid(target.uid.clone()),
-        ),
-    )
-    .await?
-    .ok_or_else(|| {
-        anyhow!(
-            "{} {} disappeared during HPA scale",
-            target.kind,
-            target.name
-        )
-    })
-}
-
-async fn reconcile_scaled_target(
-    db: &dyn DatastoreBackend,
-    pod_repository: &PodRepository,
-    target_resource: &Value,
-    target: &ScaleTarget,
-    node_name: &str,
-) -> Result<()> {
-    match target.kind_tag {
-        ScaleTargetKind::Deployment => {
-            crate::controllers::deployment::reconcile_deployment(
-                db,
-                pod_repository,
-                pod_repository,
-                pod_repository,
-                target_resource,
-                node_name,
-            )
-            .await
-        }
-        ScaleTargetKind::ReplicaSet => {
-            crate::controllers::replicaset::reconcile_replicaset(
-                db,
-                pod_repository,
-                pod_repository,
-                pod_repository,
-                target_resource,
-                node_name,
-            )
-            .await
-        }
-        ScaleTargetKind::StatefulSet => {
-            crate::controllers::statefulset::reconcile_statefulset(
-                db,
-                pod_repository,
-                pod_repository,
-                pod_repository,
-                target_resource,
-                node_name,
-            )
-            .await
-        }
-        ScaleTargetKind::ReplicationController => {
-            crate::controllers::replicationcontroller::reconcile_replicationcontroller(
-                db,
-                pod_repository,
-                pod_repository,
-                pod_repository,
-                target_resource,
-                node_name,
-            )
-            .await
-        }
-    }
-}
-
 fn build_status(hpa: &Value, decision: &HpaDecision) -> Value {
     let mut status = json!({
         "currentReplicas": decision.current_replicas,
@@ -744,10 +654,177 @@ fn existing_transition_time(
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
+    use crate::hpa_controller_adapter::{
+        reconcile_hpa as reconcile_hpa_root,
+        reconcile_hpa_with_metrics as reconcile_hpa_with_metrics_root,
+    };
     use klights_node_api::{
         NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResult, NodeMetricsTarget,
     };
     use serde_json::json;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn reconcile_hpa(
+        db: &dyn crate::datastore::DatastoreBackend,
+        pod_repository: &crate::kubelet::pod_repository::PodRepository,
+        hpa: &serde_json::Value,
+        node_name: &str,
+    ) -> anyhow::Result<()> {
+        reconcile_hpa_root(
+            db,
+            pod_repository,
+            crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+            hpa,
+            node_name,
+        )
+        .await
+    }
+
+    async fn reconcile_hpa_with_metrics(
+        db: &dyn crate::datastore::DatastoreBackend,
+        pod_repository: &crate::kubelet::pod_repository::PodRepository,
+        hpa: &serde_json::Value,
+        node_name: &str,
+        metrics_provider: &dyn crate::metrics::MetricsProvider,
+    ) -> anyhow::Result<()> {
+        reconcile_hpa_with_metrics_root(
+            db,
+            pod_repository,
+            crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+            hpa,
+            node_name,
+            metrics_provider,
+        )
+        .await
+    }
+
+    struct MissingTargetRuntime {
+        current: Mutex<Resource>,
+        conflict_updates_remaining: AtomicUsize,
+        successful_updates: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HpaRuntime for MissingTargetRuntime {
+        async fn get_hpa(
+            &self,
+            _api_version: &str,
+            _namespace: &str,
+            _name: &str,
+        ) -> Result<Option<Resource>> {
+            Ok(Some(self.current.lock().unwrap().clone()))
+        }
+
+        async fn get_scale_target(
+            &self,
+            _api_version: &str,
+            _kind: &str,
+            _namespace: &str,
+            _name: &str,
+        ) -> Result<Option<Resource>> {
+            Ok(None)
+        }
+
+        async fn list_pods(&self, _namespace: &str) -> Result<Vec<Resource>> {
+            unreachable!("missing target never lists Pods")
+        }
+
+        async fn patch_scale_target(
+            &self,
+            _target: &ScaleTarget,
+            _replicas: i64,
+        ) -> Result<Resource> {
+            unreachable!("missing target never scales")
+        }
+
+        async fn reconcile_scaled_target(
+            &self,
+            _target: &ScaleTarget,
+            _resource: &Value,
+            _node_name: &str,
+        ) -> Result<()> {
+            unreachable!("missing target never reconciles")
+        }
+
+        async fn update_hpa_status(&self, _current: &Resource, status: Value) -> Result<()> {
+            if self
+                .conflict_updates_remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                anyhow::bail!("synthetic HPA conflict")
+            }
+            let mut current = self.current.lock().unwrap();
+            std::sync::Arc::make_mut(&mut current.data)["status"] = status;
+            self.successful_updates.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_conflict(&self, error: &anyhow::Error) -> bool {
+            error.to_string().contains("HPA conflict")
+        }
+    }
+
+    fn missing_target_runtime(conflicts: usize) -> MissingTargetRuntime {
+        let hpa = json!({
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {
+                "name": "missing",
+                "namespace": "default",
+                "uid": "hpa-missing",
+                "generation": 1
+            },
+            "spec": {
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "missing"
+                },
+                "minReplicas": 1,
+                "maxReplicas": 3
+            }
+        });
+        MissingTargetRuntime {
+            current: Mutex::new(Resource::try_from_data(std::sync::Arc::new(hpa)).unwrap()),
+            conflict_updates_remaining: AtomicUsize::new(conflicts),
+            successful_updates: AtomicUsize::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_target_retries_status_conflict_and_then_stabilizes_as_noop() {
+        let runtime = missing_target_runtime(1);
+        let hpa = (*runtime.current.lock().unwrap().data).clone();
+        let metrics = crate::metrics::FallbackOnlyMetricsProvider;
+        reconcile_hpa_with_runtime(&runtime, &hpa, "node-a", &metrics)
+            .await
+            .unwrap();
+        assert_eq!(runtime.successful_updates.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            runtime
+                .current
+                .lock()
+                .unwrap()
+                .data
+                .pointer("/status/conditions/0/reason")
+                .and_then(Value::as_str),
+            Some("FailedGetScale")
+        );
+
+        let current = (*runtime.current.lock().unwrap().data).clone();
+        reconcile_hpa_with_runtime(&runtime, &current, "node-a", &metrics)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.successful_updates.load(Ordering::Relaxed),
+            1,
+            "stable missing-target status must not write again"
+        );
+    }
 
     async fn create_ready_pod(
         db: &dyn DatastoreBackend,

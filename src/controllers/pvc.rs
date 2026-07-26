@@ -1,5 +1,7 @@
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+use crate::controllers::common::ControllerStatusStore;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_types::LabelSelector;
 use serde_json::{Value, json};
 
@@ -22,21 +24,36 @@ fn status_with_updates<const N: usize>(resource: &Value, updates: [(&str, Value)
     Value::Object(status)
 }
 
-async fn write_pvc_status(
-    db: &dyn DatastoreBackend,
+#[async_trait]
+pub(crate) trait PvcStore: ControllerStatusStore {
+    async fn get_pvc(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn list_persistent_volumes(&self) -> Result<Vec<Resource>>;
+    async fn get_persistent_volume(&self, name: &str) -> Result<Option<Resource>>;
+    async fn create_persistent_volume(&self, name: &str, value: Value) -> Result<Resource>;
+    async fn update_persistent_volume(
+        &self,
+        name: &str,
+        value: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+}
+
+async fn write_pvc_status<S: PvcStore + ?Sized>(
+    store: &S,
     pvc: &Resource,
     status: Value,
 ) -> Result<Value> {
-    let updated = crate::controllers::common::write_status_for_resource(db, pvc, &status).await?;
+    let updated =
+        crate::controllers::common::write_status_for_resource(store, pvc, &status).await?;
     Ok(std::sync::Arc::unwrap_or_clone(updated.data))
 }
 
 /// Provision a PV for a PVC that has a storageClassName matching a known provisioner.
 /// Currently supports "local-path" (hostPath under KLIGHTS_DATA_ROOT/local-path-provisioner/).
 /// Returns the created PV name, or None if storageClassName is not provisioned.
-async fn provision_pv_for_pvc(
+async fn provision_pv_for_pvc<S: PvcStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    store: &S,
     pvc: &Value,
 ) -> Result<Option<String>> {
     let metadata = pvc
@@ -118,8 +135,7 @@ async fn provision_pv_for_pvc(
         }
     });
 
-    db.create_resource("v1", "PersistentVolume", None, &pv_name, pv)
-        .await?;
+    store.create_persistent_volume(&pv_name, pv).await?;
 
     tracing::info!(
         "Provisioned PV {} for PVC {}/{} (local-path)",
@@ -133,9 +149,9 @@ async fn provision_pv_for_pvc(
 
 /// Reconcile a PersistentVolumeClaim - bind to matching PersistentVolume
 /// Returns the updated PVC resource
-pub async fn reconcile_pvc(
+pub(crate) async fn reconcile_pvc<S: PvcStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    store: &S,
     pvc: &Value,
 ) -> Result<Value> {
     let input_metadata = pvc
@@ -150,13 +166,11 @@ pub async fn reconcile_pvc(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
 
-    let Some(live_pvc) = db
-        .get_resource("v1", "PersistentVolumeClaim", Some(namespace), name)
-        .await?
-    else {
+    let Some(live_pvc) = store.get_pvc(namespace, name).await? else {
         return Ok(pvc.clone());
     };
-    let pvc = crate::api::inject_resource_version(live_pvc.data.clone(), live_pvc.resource_version);
+    let mut pvc = std::sync::Arc::unwrap_or_clone(live_pvc.data.clone());
+    inject_resource_version(&mut pvc, live_pvc.resource_version);
 
     let metadata = pvc
         .get("metadata")
@@ -229,15 +243,7 @@ pub async fn reconcile_pvc(
     }
 
     // Find an available PV that matches capacity and accessModes
-    let pvs = db
-        .list_resources(
-            "v1",
-            "PersistentVolume",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?
-        .items;
+    let pvs = store.list_persistent_volumes().await?;
 
     let mut best_pv = None;
     for pv in &pvs {
@@ -391,15 +397,13 @@ pub async fn reconcile_pvc(
             }
         }
 
-        db.update_resource_with_preconditions(
-            "v1",
-            "PersistentVolume",
-            None,
-            &pv_name,
-            updated_pv,
-            ResourcePreconditions::from_resource(pv),
-        )
-        .await?;
+        store
+            .update_persistent_volume(
+                &pv_name,
+                updated_pv,
+                ResourcePreconditions::from_resource(pv),
+            )
+            .await?;
 
         let pvc_status = status_with_updates(
             &pvc,
@@ -410,14 +414,14 @@ pub async fn reconcile_pvc(
                 ("volumeName", json!(pv_name)),
             ],
         );
-        return write_pvc_status(db, &live_pvc, pvc_status).await;
+        return write_pvc_status(store, &live_pvc, pvc_status).await;
     }
 
     // No matching PV found - try to provision a PV
-    if let Some(provisioned_pv_name) = provision_pv_for_pvc(file_process, db, &pvc).await? {
+    if let Some(provisioned_pv_name) = provision_pv_for_pvc(file_process, store, &pvc).await? {
         // PV was provisioned, now bind PVC to it
-        let provisioned_pv = db
-            .get_resource("v1", "PersistentVolume", None, &provisioned_pv_name)
+        let provisioned_pv = store
+            .get_persistent_volume(&provisioned_pv_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Provisioned PV not found"))?;
 
@@ -463,15 +467,9 @@ pub async fn reconcile_pvc(
         let pv_rv = crate::utils::extract_resource_version(pv_metadata);
         let pv_preconditions = ResourcePreconditions::from_metadata(pv_metadata, pv_rv)?;
 
-        db.update_resource_with_preconditions(
-            "v1",
-            "PersistentVolume",
-            None,
-            &provisioned_pv_name,
-            updated_pv,
-            pv_preconditions,
-        )
-        .await?;
+        store
+            .update_persistent_volume(&provisioned_pv_name, updated_pv, pv_preconditions)
+            .await?;
 
         let pvc_status = status_with_updates(
             &pvc,
@@ -482,7 +480,7 @@ pub async fn reconcile_pvc(
                 ("volumeName", json!(provisioned_pv_name)),
             ],
         );
-        return write_pvc_status(db, &live_pvc, pvc_status).await;
+        return write_pvc_status(store, &live_pvc, pvc_status).await;
     }
 
     if pvc
@@ -494,7 +492,7 @@ pub async fn reconcile_pvc(
     }
 
     let pvc_status = status_with_updates(&pvc, [("phase", json!("Pending"))]);
-    write_pvc_status(db, &live_pvc, pvc_status).await
+    write_pvc_status(store, &live_pvc, pvc_status).await
 }
 
 #[cfg(test)]

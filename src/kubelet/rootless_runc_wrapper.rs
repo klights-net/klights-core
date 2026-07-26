@@ -7,46 +7,50 @@ use std::process::Command;
 
 pub const WRAPPER_MODE_ARG: &str = "__rootless-runc-wrapper";
 
-const DEFAULT_RUNC_BINARY: &str = "/usr/bin/runc";
+#[derive(Clone, Debug)]
+pub struct RootlessRuncWrapperConfig {
+    pub runc_binary: OsString,
+    pub current_dir: PathBuf,
+}
 
-pub fn run_from_args(args: Vec<OsString>) -> i32 {
-    if let Err(err) = sanitize_bundle_from_args(&args) {
+pub fn run_from_args(args: Vec<OsString>, config: RootlessRuncWrapperConfig) -> i32 {
+    if let Err(err) = sanitize_bundle_from_args(&args, &config.current_dir) {
         eprintln!("klights rootless runc wrapper: failed to sanitize OCI spec: {err:#}");
         return 1;
     }
 
-    let runc = std::env::var_os("KLIGHTS_RUNC_BINARY")
-        .unwrap_or_else(|| OsString::from(DEFAULT_RUNC_BINARY));
-    let err = Command::new(runc).arg("--rootless=true").args(args).exec();
+    let err = Command::new(config.runc_binary)
+        .arg("--rootless=true")
+        .args(args)
+        .exec();
     eprintln!("klights rootless runc wrapper: failed to exec runc: {err}");
     127
 }
 
-fn sanitize_bundle_from_args(args: &[OsString]) -> Result<()> {
-    let Some(bundle_dir) = resolve_bundle_dir(args)? else {
+fn sanitize_bundle_from_args(args: &[OsString], current_dir: &Path) -> Result<()> {
+    let Some(bundle_dir) = resolve_bundle_dir(args, current_dir) else {
         return Ok(());
     };
     sanitize_bundle_config(&bundle_dir)?;
     Ok(())
 }
 
-fn resolve_bundle_dir(args: &[OsString]) -> Result<Option<PathBuf>> {
+fn resolve_bundle_dir(args: &[OsString], current_dir: &Path) -> Option<PathBuf> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == "--bundle" || arg == "-b" {
-            return Ok(iter.next().map(PathBuf::from));
+            return iter.next().map(PathBuf::from);
         }
 
         if let Some(raw) = arg.to_str().and_then(|s| s.strip_prefix("--bundle=")) {
-            return Ok(Some(PathBuf::from(raw)));
+            return Some(PathBuf::from(raw));
         }
     }
 
-    let cwd = std::env::current_dir().context("resolve current directory for runc bundle")?;
-    if cwd.join("config.json").exists() {
-        Ok(Some(cwd))
+    if current_dir.join("config.json").exists() {
+        Some(current_dir.to_path_buf())
     } else {
-        Ok(None)
+        None
     }
 }
 

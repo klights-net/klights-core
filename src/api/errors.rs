@@ -88,6 +88,65 @@ impl From<PodRepositoryError> for AppError {
     }
 }
 
+impl From<klights_leader_api::ResourceQueryError> for AppError {
+    fn from(error: klights_leader_api::ResourceQueryError) -> Self {
+        let display = error.to_string();
+        match error {
+            klights_leader_api::ResourceQueryError::InvalidRequest { field, message } => {
+                Self::BadRequest(format!("{field}: {message}"))
+            }
+            klights_leader_api::ResourceQueryError::NotFound { .. } => Self::NotFound(display),
+            klights_leader_api::ResourceQueryError::Retryable { .. }
+            | klights_leader_api::ResourceQueryError::Timeout
+            | klights_leader_api::ResourceQueryError::Cancelled => {
+                Self::ServiceUnavailable(display)
+            }
+            _ => Self::InternalError(display),
+        }
+    }
+}
+
+impl From<klights_leader_api::ResourceCommandError> for AppError {
+    fn from(error: klights_leader_api::ResourceCommandError) -> Self {
+        let display = error.to_string();
+        match error {
+            klights_leader_api::ResourceCommandError::InvalidRequest { field, message } => {
+                Self::BadRequest(format!("{field}: {message}"))
+            }
+            klights_leader_api::ResourceCommandError::PodDeletionForbidden
+            | klights_leader_api::ResourceCommandError::Unauthorized => Self::Forbidden(display),
+            klights_leader_api::ResourceCommandError::Conflict { .. } => Self::Conflict(display),
+            klights_leader_api::ResourceCommandError::NotFound { .. } => Self::NotFound(display),
+            klights_leader_api::ResourceCommandError::NotLeader
+            | klights_leader_api::ResourceCommandError::Retryable { .. }
+            | klights_leader_api::ResourceCommandError::Timeout
+            | klights_leader_api::ResourceCommandError::Cancelled => {
+                Self::ServiceUnavailable(display)
+            }
+            _ => Self::InternalError(display),
+        }
+    }
+}
+
+impl From<klights_reconcile_api::FinalizerLifecycleError> for AppError {
+    fn from(error: klights_reconcile_api::FinalizerLifecycleError) -> Self {
+        match error {
+            klights_reconcile_api::FinalizerLifecycleError::PodForbidden(message) => {
+                Self::Forbidden(message)
+            }
+            klights_reconcile_api::FinalizerLifecycleError::NotFound(message) => {
+                Self::NotFound(message)
+            }
+            klights_reconcile_api::FinalizerLifecycleError::Conflict(message) => {
+                Self::Conflict(message)
+            }
+            klights_reconcile_api::FinalizerLifecycleError::Internal(message) => {
+                Self::InternalError(message)
+            }
+        }
+    }
+}
+
 impl From<ResourcePreconditionError> for AppError {
     fn from(error: ResourcePreconditionError) -> Self {
         Self::Conflict(error.to_string())
@@ -201,12 +260,6 @@ impl AppError {
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
-        if err
-            .downcast_ref::<crate::datastore::errors::DatastoreError>()
-            .is_some_and(crate::datastore::errors::DatastoreError::is_conflict)
-        {
-            return AppError::Conflict(err.to_string());
-        }
         let msg = err.to_string();
         if msg.contains("already exists") && msg.contains("409 Conflict") {
             AppError::AlreadyExists(msg)
@@ -218,6 +271,13 @@ impl From<anyhow::Error> for AppError {
             AppError::Internal(msg)
         }
     }
+}
+
+pub(crate) fn is_conflict_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("409 conflict")
+        || message.contains("version conflict")
+        || message.contains("rv conflict")
 }
 
 impl IntoResponse for AppError {

@@ -27,10 +27,10 @@ use klights_cluster_core::Resource;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{NodeSubnet, PodCleanupIntent};
 use crate::log_apply::{
-    ClusterMutation, LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
-    LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow,
-    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, PodCleanupMutation,
-    ResourceMutation, WatchHistoryMutation,
+    ClusterMutation, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
+    LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
+    NamespaceMutation, NetworkMutation, PodCleanupMutation, ResourceMutation,
+    SnapshotRestoreOperation, WatchHistoryMutation,
 };
 
 /// memory-improvement.md §10 P1: page size for keyset-paginated reads inside
@@ -75,7 +75,7 @@ pub(crate) fn install_snapshot_watch_page_pause() -> SnapshotWatchPagePause {
 pub async fn generate_snapshot(
     db: &dyn DatastoreBackend,
     after_rv: i64,
-) -> Result<Vec<LogApplyCommit>> {
+) -> Result<Vec<SnapshotRestoreOperation>> {
     let mut sink = VecSnapshotCommitSink::default();
     stream_snapshot_commits(db, after_rv, &mut sink).await?;
     Ok(sink.entries)
@@ -189,11 +189,8 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
                 mutations.push(live_resource_mutation(current));
             }
             mutations.push(watch_event_mutation(event_id, resource, event_type));
-            sink.push(LogApplyCommit::from_cluster_mutations(
-                resource_version,
-                mutations,
-            ))
-            .await?;
+            sink.push(snapshot_operation(resource_version, mutations))
+                .await?;
         }
         #[cfg(test)]
         let pause = { SNAPSHOT_WATCH_PAGE_PAUSE.lock().unwrap().take() };
@@ -215,7 +212,7 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
             .then_with(|| left_key.cmp(right_key))
     });
     for (_key, resource) in remaining_live {
-        sink.push(live_resource_commit(&resource)).await?;
+        sink.push(resource_restore_operation(&resource)).await?;
     }
 
     let current_rv = db.get_current_resource_version().await.unwrap_or(0);
@@ -239,13 +236,11 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
         }
 
         for watermark in db.list_outbox_stream_watermarks().await? {
-            sink.push(LogApplyCommit {
-                resource_version: current_rv,
-                resource_version_assignment:
-                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                mutations: Vec::new(),
-                outbox_watermark: Some(watermark),
-            })
+            sink.push(SnapshotRestoreOperation::new(
+                current_rv,
+                Some(watermark),
+                Vec::new(),
+            ))
             .await?;
         }
 
@@ -261,8 +256,9 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
             }
             after_key = rows.last().map(|row| row.idempotency_key.clone());
             for row in rows {
-                sink.push(LogApplyCommit::new(
+                sink.push(SnapshotRestoreOperation::new(
                     current_rv,
+                    None,
                     vec![LogApplyMutation::PutAppliedOutbox(row.into())],
                 ))
                 .await?;
@@ -284,7 +280,7 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
 }
 
 pub(crate) trait SnapshotCommitSink {
-    async fn push(&mut self, commit: LogApplyCommit) -> Result<()>;
+    async fn push(&mut self, operation: SnapshotRestoreOperation) -> Result<()>;
 
     fn finish(&mut self) -> Result<()> {
         Ok(())
@@ -293,7 +289,7 @@ pub(crate) trait SnapshotCommitSink {
 
 struct SnapshotCommitBatcher<'a, S: SnapshotCommitSink + Unpin + ?Sized> {
     sink: &'a mut S,
-    pending: Option<LogApplyCommit>,
+    pending: Option<SnapshotRestoreOperation>,
 }
 
 impl<'a, S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitBatcher<'a, S> {
@@ -313,34 +309,41 @@ impl<'a, S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitBatcher<'a, S> {
 }
 
 impl<S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitSink for SnapshotCommitBatcher<'_, S> {
-    async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
-        if commit.mutations.is_empty() {
-            if commit.outbox_watermark.is_none() {
+    async fn push(&mut self, operation: SnapshotRestoreOperation) -> Result<()> {
+        if operation.mutations().is_empty() {
+            if operation.outbox_watermark().is_none() {
                 return Ok(());
             }
             if let Some(previous) = self.pending.take() {
                 self.sink.push(previous).await?;
             }
-            self.sink.push(commit).await?;
+            self.sink.push(operation).await?;
             return Ok(());
         }
-        if commit.outbox_watermark.is_some() {
+        if operation.outbox_watermark().is_some() {
             if let Some(previous) = self.pending.take() {
                 self.sink.push(previous).await?;
             }
-            self.sink.push(commit).await?;
+            self.sink.push(operation).await?;
             return Ok(());
         }
-        match self.pending.as_mut() {
-            Some(pending) if pending.resource_version == commit.resource_version => {
-                pending.mutations.extend(commit.mutations);
+        match self.pending.take() {
+            Some(pending) if pending.resource_version() == operation.resource_version() => {
+                let (resource_version, watermark, mut mutations) = pending.into_parts();
+                let (_, _, appended) = operation.into_parts();
+                mutations.extend(appended);
+                self.pending = Some(SnapshotRestoreOperation::new(
+                    resource_version,
+                    watermark,
+                    mutations,
+                ));
             }
-            Some(_) => {
-                let previous = self.pending.replace(commit).expect("pending checked");
+            Some(previous) => {
                 self.sink.push(previous).await?;
+                self.pending = Some(operation);
             }
             None => {
-                self.pending = Some(commit);
+                self.pending = Some(operation);
             }
         }
         Ok(())
@@ -350,13 +353,13 @@ impl<S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitSink for SnapshotComm
 #[derive(Default)]
 #[cfg(test)]
 struct VecSnapshotCommitSink {
-    entries: Vec<LogApplyCommit>,
+    entries: Vec<SnapshotRestoreOperation>,
 }
 
 #[cfg(test)]
 impl SnapshotCommitSink for VecSnapshotCommitSink {
-    async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
-        self.entries.push(commit);
+    async fn push(&mut self, operation: SnapshotRestoreOperation) -> Result<()> {
+        self.entries.push(operation);
         Ok(())
     }
 }
@@ -402,12 +405,29 @@ fn live_resource_order(resource: &Resource) -> u8 {
     }
 }
 
-pub(crate) fn live_resource_commit(resource: &Resource) -> LogApplyCommit {
+pub(crate) fn resource_restore_operation(resource: &Resource) -> SnapshotRestoreOperation {
     snapshot_commit_from_family(resource.resource_version, live_resource_mutation(resource))
 }
 
-fn snapshot_commit_from_family(resource_version: i64, mutation: ClusterMutation) -> LogApplyCommit {
-    LogApplyCommit::from_cluster_mutations(resource_version, vec![mutation])
+fn snapshot_operation(
+    resource_version: i64,
+    mutations: Vec<ClusterMutation>,
+) -> SnapshotRestoreOperation {
+    SnapshotRestoreOperation::new(
+        resource_version,
+        None,
+        mutations
+            .into_iter()
+            .map(ClusterMutation::into_log_apply_mutation)
+            .collect(),
+    )
+}
+
+fn snapshot_commit_from_family(
+    resource_version: i64,
+    mutation: ClusterMutation,
+) -> SnapshotRestoreOperation {
+    snapshot_operation(resource_version, vec![mutation])
 }
 
 fn live_resource_mutation(resource: &Resource) -> ClusterMutation {
@@ -480,15 +500,15 @@ fn cluster_network_mutation_from_subnet(row: &NodeSubnet) -> ClusterMutation {
         gateway_ip: row.gateway_ip.to_string(),
         node_ip: row.node_ip.to_string(),
         mode: match row.mode {
-            crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
-            crate::controllers::annotations::NodePeerMode::Rootless => "rootless".to_string(),
+            klights_types::NodePeerMode::Root => "root".to_string(),
+            klights_types::NodePeerMode::Rootless => "rootless".to_string(),
         },
         hostport_range: row.hostport_range.as_ref().map(|range| range.to_string()),
     }))
 }
 
 fn cluster_network_mutation_from_dataplane(
-    row: &crate::networking::wireguard::DataplanePeerMetadata,
+    row: &klights_cluster_store::DataplanePeerMetadata,
 ) -> ClusterMutation {
     ClusterMutation::Network(NetworkMutation::PutNodeDataplane(
         LogApplyNodeDataplaneRow {
@@ -511,6 +531,7 @@ pub(crate) fn cluster_pod_cleanup_mutation_from_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_apply::LogApplyCommit;
 
     // ---- Snapshot generation tests ----
 
@@ -579,7 +600,7 @@ mod tests {
         assert!(
             entries.iter().any(|entry| {
                 matches!(
-                    entry.mutations.first(),
+                    entry.mutations().first(),
                     Some(crate::log_apply::LogApplyMutation::PutResource(row))
                         if row.api_version == "v1"
                         && row.kind == "ConfigMap"
@@ -625,9 +646,9 @@ mod tests {
 
         assert!(
             entries.iter().any(|entry| {
-                entry.resource_version == delete_rv
+                entry.resource_version() == delete_rv
                     && matches!(
-                        entry.mutations.first(),
+                        entry.mutations().first(),
                         Some(crate::log_apply::LogApplyMutation::DeleteResource(key))
                             if key.api_version == "v1"
                             && key.kind == "ConfigMap"
@@ -873,19 +894,31 @@ mod tests {
             stream_id: 7,
             stream_seq: 5,
         };
+        leader
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "watermark-anchor",
+                serde_json::json!({
+                    "metadata": {"name": "watermark-anchor", "namespace": "default"}
+                }),
+            )
+            .await
+            .unwrap();
         for seq in 1..=watermark.stream_seq {
             leader
-                .apply_raft_log_apply_commit(LogApplyCommit {
-                    resource_version: seq,
-                    resource_version_assignment:
-                        crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                    mutations: Vec::new(),
-                    outbox_watermark: Some(OutboxStreamWatermark {
-                        client_id: watermark.client_id.clone(),
-                        stream_id: watermark.stream_id,
-                        stream_seq: seq,
-                    }),
-                })
+                .apply_raft_log_apply_commit(
+                    LogApplyCommit::try_new_with_watermark(
+                        Vec::new(),
+                        Some(OutboxStreamWatermark {
+                            client_id: watermark.client_id.clone(),
+                            stream_id: watermark.stream_id,
+                            stream_seq: seq,
+                        }),
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap();
         }
@@ -899,18 +932,15 @@ mod tests {
             .unwrap();
 
         let duplicate = follower
-            .apply_raft_log_apply_commit(LogApplyCommit {
-                resource_version: 2,
-                resource_version_assignment:
-                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
-                mutations: Vec::new(),
-                outbox_watermark: Some(watermark),
-            })
+            .apply_raft_log_apply_commit(
+                LogApplyCommit::try_new_with_watermark(Vec::new(), Some(watermark)).unwrap(),
+            )
             .await
             .unwrap();
+        assert!(duplicate.error_message.is_none());
         assert_eq!(
-            duplicate.applied_rv,
-            Some(2),
+            follower.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            5,
             "restored watermark should make duplicate seq a no-op, not a gap"
         );
     }
@@ -1029,16 +1059,15 @@ mod tests {
             "generic commit builder should not mutate applied_outbox"
         );
         assert!(
-            !commit.mutations.iter().any(|mutation| matches!(
+            !commit.mutations().iter().any(|mutation| matches!(
                 mutation,
                 crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
             )),
             "generic post-snapshot commit must not emit applied_outbox mutations"
         );
         assert!(
-            commit.resource_version > leader_rv,
-            "post-snapshot raft proposals must reserve a leader RV greater than snapshot RV {leader_rv}, got {}",
-            commit.resource_version
+            commit.resource_version() == 0,
+            "post-snapshot raft proposals must remain RV-zero above snapshot RV {leader_rv}"
         );
         let applied = follower
             .apply_raft_log_apply_commit(commit)
@@ -1062,7 +1091,7 @@ mod tests {
     fn pod_status_payload(status: serde_json::Value, uid: &str, stamp: i64) -> Vec<u8> {
         use crate::datastore::ResourcePreconditions;
         use crate::datastore::command::StorageCommand;
-        use crate::kubelet::outbox::payload::OutboxPayload;
+        use crate::node_outbox::payload::OutboxPayload;
 
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -1116,8 +1145,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pod_status_replay_rejected_after_snapshot_install() {
-        use crate::datastore::sqlite::BuildOutboxOutcome;
         use crate::log_apply::OutboxStreamWatermark;
+        use klights_cluster_core::BuildOutboxOutcome;
 
         let leader = crate::datastore::test_support::in_memory().await;
         create_pod_for_status_snapshot(&leader, "uid-1").await;
@@ -1130,7 +1159,7 @@ mod tests {
         let newer = leader
             .build_log_apply_commit_for_outbox_with_watermark(
                 "status-newer",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                 &pod_status_payload(
                     serde_json::json!({"phase": "Running", "message": "newer"}),
                     "uid-1",
@@ -1177,7 +1206,7 @@ mod tests {
         let stale = follower
             .build_log_apply_commit_for_outbox_with_watermark(
                 "status-stale-after-snapshot",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
                 &pod_status_payload(
                     serde_json::json!({"phase": "Running", "message": "stale"}),
                     "uid-1",
@@ -1366,10 +1395,10 @@ mod tests {
             .await
             .unwrap();
         db.update_node_dataplane(
-            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            klights_cluster_store::DataplanePeerMetadata::try_new(
                 "leader".to_string(),
-                crate::networking::wireguard::DataplaneMode::Root,
-                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                klights_cluster_store::DataplaneMode::Root,
+                klights_cluster_store::DataplaneEncryption::Enabled,
                 Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                 Some("192.0.2.1".to_string()),
                 Some(51_820),
@@ -1387,8 +1416,8 @@ mod tests {
         // `mutations.first()`.
         assert!(
             entries.iter().any(|entry| {
-                entry.resource_version == current_rv
-                    && entry.mutations.iter().any(|m| {
+                entry.resource_version() == current_rv
+                    && entry.mutations().iter().any(|m| {
                         matches!(
                             m,
                             crate::log_apply::LogApplyMutation::PutNodeSubnet(row)
@@ -1402,8 +1431,8 @@ mod tests {
         );
         assert!(
             entries.iter().any(|entry| {
-                entry.resource_version == current_rv
-                    && entry.mutations.iter().any(|m| {
+                entry.resource_version() == current_rv
+                    && entry.mutations().iter().any(|m| {
                         matches!(
                             m,
                             crate::log_apply::LogApplyMutation::PutNodeDataplane(row)
@@ -1439,9 +1468,9 @@ mod tests {
 
         assert!(
             entries.iter().any(|entry| {
-                entry.resource_version == node.resource_version
+                entry.resource_version() == node.resource_version
                     && matches!(
-                        entry.mutations.first(),
+                        entry.mutations().first(),
                         Some(crate::log_apply::LogApplyMutation::PutResource(row))
                             if row.api_version == "v1"
                             && row.kind == "Node"
@@ -1484,7 +1513,7 @@ mod tests {
         // Verify the snapshot contains our resource
         let has_staged = entries.iter().any(|e| {
             matches!(
-                e.mutations.first(),
+                e.mutations().first(),
                 Some(crate::log_apply::LogApplyMutation::PutResource(row)) if row.name == "staged"
             )
         });
@@ -1601,16 +1630,12 @@ mod tests {
         }
     }
 
-    // memory-improvement.md §10 P1 — the streamed (proto sink) output must be
-    // byte-equivalent to the legacy Vec path over the same fixture, for both
+    // memory-improvement.md §10 P1 — the streamed typed output must be
+    // equivalent to the Vec path over the same fixture, for both
     // watch_events-heavy and applied_outbox-heavy cases. Drives a fixture table
-    // through both codepaths and compares the decoded LogApplyCommit sequence.
+    // through both codepaths and compares the SnapshotRestoreOperation sequence.
     #[tokio::test]
     async fn streamed_snapshot_matches_vec_path_across_fixture_table() {
-        use crate::log_apply::LogApplyCommit;
-        use crate::replication::grpc::{
-            generated, log_apply_commit_from_proto, log_apply_commit_to_proto,
-        };
         use crate::replication::test_proto_channel_sink::TestProtoChannelSink;
         use tokio::sync::mpsc;
 
@@ -1659,20 +1684,14 @@ mod tests {
                     .unwrap();
             }
 
-            // Baseline: the legacy Vec path (encode each commit to proto).
+            // Baseline: the Vec path.
             let baseline_commits = generate_snapshot(&leader, 0).await.unwrap();
-            let baseline_protos: Vec<generated::ReplicationEntry> = baseline_commits
-                .iter()
-                .map(log_apply_commit_to_proto)
-                .collect::<Result<_, _>>()
-                .unwrap();
 
-            // Streaming path: proto sink into a bounded channel. The producer
+            // Streaming path: typed sink into a bounded channel. The producer
             // and consumer must run concurrently (a bounded channel backpressures
             // once > capacity commits are queued), so drive them with join!.
-            let (tx, mut rx) =
-                mpsc::channel::<Result<generated::ReplicationEntry, tonic::Status>>(64);
-            let mut streamed_protos: Vec<generated::ReplicationEntry> = Vec::new();
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut streamed_commits = Vec::new();
             let producer = async {
                 let mut sink = TestProtoChannelSink::new(tx);
                 crate::datastore::snapshot_export::stream_snapshot_commits(&leader, 0, &mut sink)
@@ -1682,32 +1701,17 @@ mod tests {
             };
             let consumer = async {
                 while let Some(item) = rx.recv().await {
-                    streamed_protos.push(item.expect("proto encode must succeed"));
+                    streamed_commits.push(item.expect("snapshot stream must succeed"));
                 }
             };
             tokio::join!(producer, consumer);
 
             assert_eq!(
-                streamed_protos.len(),
-                baseline_protos.len(),
+                streamed_commits.len(),
+                baseline_commits.len(),
                 "case `{case}`: streamed commit count must match Vec path"
             );
-            for (s, b) in streamed_protos.iter().zip(baseline_protos.iter()) {
-                assert_eq!(
-                    s.commit_protobuf, b.commit_protobuf,
-                    "case `{case}`: streamed proto bytes must equal Vec-path proto bytes"
-                );
-            }
-            // Decode round-trip preserves the commit sequence.
-            let decoded: Vec<LogApplyCommit> = streamed_protos
-                .into_iter()
-                .map(log_apply_commit_from_proto)
-                .collect::<Result<_, _>>()
-                .unwrap();
-            for (got, want) in decoded.iter().zip(baseline_commits.iter()) {
-                assert_eq!(got.resource_version, want.resource_version);
-                assert_eq!(got.mutations.len(), want.mutations.len());
-            }
+            assert_eq!(streamed_commits, baseline_commits, "case `{case}`");
         }
     }
 }

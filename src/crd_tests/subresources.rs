@@ -113,6 +113,7 @@ async fn crd_operations_denied_with_deny_authorizer() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -135,7 +136,7 @@ async fn crd_operations_denied_with_deny_authorizer() {
         namespaced: true,
         selectable_fields: vec![],
     };
-    state.crd_registry.register(crd_info).await;
+    state.discovery().crd_registry.register(crd_info).await;
 
     let app = crate::api::build_router(state);
 
@@ -234,6 +235,7 @@ async fn crd_allowed_identity_gets_normal_response() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -254,7 +256,7 @@ async fn crd_allowed_identity_gets_normal_response() {
         namespaced: true,
         selectable_fields: vec![],
     };
-    state.crd_registry.register(crd_info).await;
+    state.discovery().crd_registry.register(crd_info).await;
 
     let app = crate::api::build_router(state);
 
@@ -341,6 +343,7 @@ async fn crd_list_authorization_preserves_field_and_label_selectors() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -361,7 +364,7 @@ async fn crd_list_authorization_preserves_field_and_label_selectors() {
         namespaced: true,
         selectable_fields: vec!["metadata.name".to_string()],
     };
-    state.crd_registry.register(crd_info).await;
+    state.discovery().crd_registry.register(crd_info).await;
 
     let app = crate::api::build_router(state);
     let base = "/apis/example-sel.com/v1/namespaces/default/selectorwidgets";
@@ -484,6 +487,7 @@ async fn crd_rbac_resource_names_uses_field_selector() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -504,7 +508,7 @@ async fn crd_rbac_resource_names_uses_field_selector() {
         namespaced: true,
         selectable_fields: vec!["metadata.name".to_string()],
     };
-    state.crd_registry.register(crd_info).await;
+    state.discovery().crd_registry.register(crd_info).await;
 
     let app = crate::api::build_router(state);
     let base = "/apis/example-rns.com/v1/namespaces/default/rnswidgets";
@@ -619,6 +623,7 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -639,7 +644,7 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         namespaced: true,
         selectable_fields: vec!["metadata.name".to_string()],
     };
-    state.crd_registry.register(crd_info).await;
+    state.discovery().crd_registry.register(crd_info).await;
 
     // Also register a cluster-scoped CRD before building the router
     let crd_cluster = json!({
@@ -663,6 +668,7 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -682,7 +688,11 @@ async fn crd_rbac_resource_names_requires_matching_metadata_name_selector() {
         namespaced: false,
         selectable_fields: vec!["metadata.name".to_string()],
     };
-    state.crd_registry.register(crd_info_cluster).await;
+    state
+        .discovery()
+        .crd_registry
+        .register(crd_info_cluster)
+        .await;
 
     let app = crate::api::build_router(state);
     let base = "/apis/example-rbac.com/v1/namespaces/default/rbacwidgets";

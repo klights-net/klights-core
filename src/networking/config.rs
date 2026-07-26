@@ -1,8 +1,9 @@
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+use crate::networking::BridgeName;
 use crate::networking::wireguard::DataplaneEncryption;
-use crate::networking::{BridgeName, ClusterCidr, NodeName};
+use klights_types::{ClusterCidr, NodeName};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkMode {

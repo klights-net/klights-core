@@ -38,7 +38,11 @@ async fn node_proxy_inner(
     let node_name = node_name_from_param(name_param);
 
     // Verify the node exists
-    let node = state.db.get_resource("v1", "Node", None, node_name).await?;
+    let node = state
+        .resource_mutation()
+        .db
+        .get_resource("v1", "Node", None, node_name)
+        .await?;
     if node.is_none() {
         return Err(AppError::NotFound(format!("Node {} not found", node_name)));
     }
@@ -50,12 +54,16 @@ async fn node_proxy_inner(
             // Return all pods on this node as a kubelet-style v1.PodList.
             // Routes through the pod repository so the v1/Pod read boundary
             // stays inside `PodStore`.
-            use crate::kubelet::pod_repository::PodReader;
-            let list = state
-                .pod_repository
-                .list_pods(None, None, None, None, None)
-                .await
-                .map_err(|e| AppError::InternalError(format!("Failed to list pods: {}", e)))?;
+            let list = crate::api::pod_repository_ports::list_pods(
+                state.resource_mutation().pod_repository.as_ref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| AppError::InternalError(format!("Failed to list pods: {}", e)))?;
 
             // Filter pods scheduled to this node
             let items: Vec<Value> = list

@@ -36,14 +36,14 @@ pub trait ClusterRuntimeView: Send + Sync {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>>;
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>>;
 
     /// Forward a Pod status update to the owning node.
     async fn forward_pod_status(
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
         status: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource>;
+    ) -> anyhow::Result<klights_cluster_core::Resource>;
 }
 
 /// Replication-level operations for multi-node Pod runtime.
@@ -53,7 +53,7 @@ pub trait ReplicationRuntime: Send + Sync {
     async fn enqueue_storage_command(
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::StorageCommand,
     ) -> anyhow::Result<()>;
 }
 
@@ -82,7 +82,7 @@ fn optional_status_string(status: &serde_json::Value, field: &str) -> Option<Str
 }
 
 fn live_status_string(
-    resource: Option<&crate::datastore::Resource>,
+    resource: Option<&klights_cluster_core::Resource>,
     field: &str,
 ) -> Option<String> {
     resource
@@ -97,7 +97,7 @@ async fn apply_forwarded_status(
     repository: &PodRepository,
     key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
     status: serde_json::Value,
-) -> anyhow::Result<crate::datastore::Resource> {
+) -> anyhow::Result<klights_cluster_core::Resource> {
     let phase = status
         .get("phase")
         .and_then(|v| v.as_str())
@@ -203,7 +203,7 @@ impl ClusterRuntimeView for WorkerClusterRuntimeView {
         &self,
         namespace: &str,
         name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>> {
         self.repository
             .get_pod(namespace, name)
             .await
@@ -214,7 +214,7 @@ impl ClusterRuntimeView for WorkerClusterRuntimeView {
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
         status: serde_json::Value,
-    ) -> anyhow::Result<crate::datastore::Resource> {
+    ) -> anyhow::Result<klights_cluster_core::Resource> {
         apply_forwarded_status(self.repository.as_ref(), key, status).await
     }
 }
@@ -237,7 +237,7 @@ impl ReplicationRuntime for RealReplicationRuntime {
     async fn enqueue_storage_command(
         &self,
         _key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        _command: crate::datastore::command::StorageCommand,
+        _command: klights_cluster_core::StorageCommand,
     ) -> anyhow::Result<()> {
         // Single-node: no replication needed. In multi-node mode this
         // enqueues the command for the replication stream.

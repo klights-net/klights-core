@@ -6,6 +6,26 @@
 
 use std::sync::Arc;
 
+pub(crate) struct ApiServiceRoutingSyncAdapter {
+    services: Arc<dyn klights_network_api::ServiceRouter>,
+}
+
+impl ApiServiceRoutingSyncAdapter {
+    pub(crate) fn new(services: Arc<dyn klights_network_api::ServiceRouter>) -> Self {
+        Self { services }
+    }
+}
+
+impl klights_reconcile_api::ServiceRoutingSync for ApiServiceRoutingSyncAdapter {
+    fn request_service_routing_sync(
+        &self,
+    ) -> Result<(), klights_reconcile_api::ReconcileSinkError> {
+        self.services.request_services_sync().map_err(|error| {
+            klights_reconcile_api::ReconcileSinkError::unavailable(error.to_string())
+        })
+    }
+}
+
 use crate::control_plane::client::LeaderApiClient;
 use klights_leader_api::{
     LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderResourceQuery, LeaderWatch,

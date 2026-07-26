@@ -7,23 +7,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use time::Duration;
 
-pub const DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 3600;
-pub const MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 600;
-/// Hard upper bound (1 year) on a minted ServiceAccount token's lifetime.
-/// Without a ceiling a caller with `create serviceaccounts/token` could request
-/// `expirationSeconds: i32::MAX` and receive a cluster-signed token valid for
-/// decades — an effectively permanent credential. Upstream Kubernetes clamps to
-/// `--service-account-max-token-expiration` and warns past 1 year; we cap here.
-pub const MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 365 * 24 * 3600;
-
-pub fn normalize_service_account_token_expiration_seconds(requested: Option<i64>) -> i64 {
-    requested
-        .unwrap_or(DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS)
-        .clamp(
-            MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
-            MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
-        )
-}
+use klights_types::normalize_service_account_token_expiration_seconds;
+#[cfg(test)]
+use klights_types::{
+    DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS, MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
+    MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
+};
 
 // TODO: this reimplementation intentionally mirrors the original monolith for now.
 // Kept as-is to preserve behavior while migrating split modules.

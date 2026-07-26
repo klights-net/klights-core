@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use klights_cluster_core::{
-    ClusterMembership, ClusterMetadata, ClusterMutation, LogApplyCommit, LogApplyNodeDataplaneRow,
-    LogApplyNodeSubnetRow, NetworkMutation, Resource, ResourceVersionAssignment,
+    ClusterMembership, ClusterMetadata, ClusterMutation, LogApplyNodeDataplaneRow,
+    LogApplyNodeSubnetRow, NetworkMutation, Resource, SnapshotRestoreOperation,
     WatchReplayPosition,
 };
 use klights_cluster_store::{
@@ -17,7 +17,7 @@ use rusqlite::{OptionalExtension, params};
 
 use super::DbExecutor;
 use super::opener::{OpenOpts, OpenPath};
-use crate::datastore::{PodCleanupIntent, resource_version_assignment};
+use crate::datastore::PodCleanupIntent;
 
 const MAX_CONCURRENT_SNAPSHOT_SESSIONS: usize = 2;
 
@@ -356,13 +356,6 @@ fn read_header(conn: &rusqlite::Connection) -> rusqlite::Result<SnapshotCaptureH
         )
         .optional()
     };
-    let assignment = get_meta(resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE)?
-        .map(|raw| {
-            resource_version_assignment::parse_resource_version_assignment_mode(&raw)
-                .map_err(text_error)
-        })
-        .transpose()?
-        .unwrap_or(ResourceVersionAssignment::LegacyLeaderAssigned);
     let command_codec_activation_version =
         get_meta(crate::datastore::raft::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION)?
             .map(|raw| raw.parse::<u32>().map_err(text_error))
@@ -389,7 +382,6 @@ fn read_header(conn: &rusqlite::Connection) -> rusqlite::Result<SnapshotCaptureH
         _ => return Err(text_error("membership metadata is incomplete")),
     };
     SnapshotCaptureHeader::try_new(
-        Some(assignment),
         command_codec_activation_version,
         WatchReplayPosition {
             resource_version: current_rv,
@@ -511,7 +503,7 @@ fn read_page(
             let commits = rows
                 .into_iter()
                 .map(|(id, resource, event_type)| {
-                    LogApplyCommit::from_cluster_mutations(
+                    snapshot_operation(
                         resource.resource_version,
                         vec![crate::datastore::snapshot_export::watch_event_mutation(
                             id, resource, event_type,
@@ -620,7 +612,7 @@ fn commit_page(
     let next = cursor(rows.last().unwrap());
     let commits = rows
         .iter()
-        .map(crate::datastore::snapshot_export::live_resource_commit)
+        .map(crate::datastore::snapshot_export::resource_restore_operation)
         .collect();
     Ok((Some(page_commits(commits)?), next))
 }
@@ -638,12 +630,7 @@ fn network_page<T>(
     let next = cursor(rows.last().unwrap());
     let commits = rows
         .into_iter()
-        .map(|row| {
-            LogApplyCommit::from_cluster_mutations(
-                current_rv,
-                vec![ClusterMutation::Network(mutation(row))],
-            )
-        })
+        .map(|row| snapshot_operation(current_rv, vec![ClusterMutation::Network(mutation(row))]))
         .collect();
     Ok((Some(page_commits(commits)?), next))
 }
@@ -693,7 +680,7 @@ fn read_pod_cleanup(
     let commits = rows
         .into_iter()
         .map(|intent| {
-            LogApplyCommit::from_cluster_mutations(
+            snapshot_operation(
                 intent.resource_version,
                 vec![
                     crate::datastore::snapshot_export::cluster_pod_cleanup_mutation_from_intent(
@@ -820,8 +807,24 @@ fn read_floors(
     Ok((Some(page), Phase::ReplayFloor(Some(key))))
 }
 
-fn page_commits(commits: Vec<LogApplyCommit>) -> rusqlite::Result<SnapshotCapturePage> {
-    SnapshotCapturePage::try_commits(commits).map_err(text_error)
+fn snapshot_operation(
+    resource_version: i64,
+    mutations: Vec<ClusterMutation>,
+) -> SnapshotRestoreOperation {
+    SnapshotRestoreOperation::new(
+        resource_version,
+        None,
+        mutations
+            .into_iter()
+            .map(ClusterMutation::into_log_apply_mutation)
+            .collect(),
+    )
+}
+
+fn page_commits(
+    operations: Vec<SnapshotRestoreOperation>,
+) -> rusqlite::Result<SnapshotCapturePage> {
+    SnapshotCapturePage::try_operations(operations).map_err(text_error)
 }
 
 fn text_error(error: impl std::fmt::Display + Send + Sync + 'static) -> rusqlite::Error {
@@ -869,13 +872,10 @@ mod tests {
         )
         .await
         .unwrap();
-        db.set_klights_meta(
-            crate::bootstrap::cluster_meta::KEY_CLUSTER_ID,
-            "pinned-cluster",
-        )
-        .await
-        .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "1")
+        db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "pinned-cluster")
+            .await
+            .unwrap();
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
             .await
             .unwrap();
         (root, db)
@@ -895,13 +895,10 @@ mod tests {
     #[tokio::test]
     async fn sqlite_in_memory_capture_round_trips_through_pinned_session() {
         let db = Arc::new(Datastore::new_in_memory().await.unwrap());
-        db.set_klights_meta(
-            crate::bootstrap::cluster_meta::KEY_CLUSTER_ID,
-            "memory-cluster",
-        )
-        .await
-        .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "1")
+        db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "memory-cluster")
+            .await
+            .unwrap();
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
             .await
             .unwrap();
         db.create_resource(
@@ -940,9 +937,9 @@ mod tests {
 
         let mut names = Vec::new();
         while let Some(page) = session.next_page().await.unwrap() {
-            if let Some(commits) = page.commits() {
-                for commit in commits {
-                    for mutation in &commit.mutations {
+            if let Some(operations) = page.operations() {
+                for operation in operations {
+                    for mutation in operation.mutations() {
                         if let LogApplyMutation::PutResource(row) = mutation {
                             names.push(row.name.clone());
                         }
@@ -1001,9 +998,9 @@ mod tests {
 
         let mut names = Vec::new();
         while let Some(page) = session.next_page().await.unwrap() {
-            if let Some(commits) = page.commits() {
-                for commit in commits {
-                    for mutation in &commit.mutations {
+            if let Some(operations) = page.operations() {
+                for operation in operations {
+                    for mutation in operation.mutations() {
                         if let LogApplyMutation::PutResource(row) = mutation {
                             names.push(row.name.clone());
                         }

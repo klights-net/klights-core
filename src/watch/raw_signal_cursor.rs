@@ -1,12 +1,13 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::datastore::{
-    PositionedWatchReplayRead, RawWatchEvent, RawWatchReplayStore, WatchReplayPosition, WatchTarget,
-};
+use crate::datastore::{RawWatchEvent, RawWatchReplayStore, WatchTarget};
 
 use super::signal_replay_cursor_core::{SignalReplayCursorCore, SignalReplayCursorSource};
-use klights_watch::{WatchSignalReceiver, WatchTopic};
+use klights_watch::{
+    PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayPosition, WatchSignalReceiver,
+    WatchTopic,
+};
 
 use super::{WatchCursorError, WatchDeliveryScope, WindowPolicy};
 
@@ -88,8 +89,19 @@ impl SignalReplayCursorSource<RawWatchEvent> for RawWatchReplaySource {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
-        self.replay_store
+        match self
+            .replay_store
             .list_raw_watch_events_after_position_checked_bounded(&self.targets, position, limit)
-            .await
+            .await?
+        {
+            crate::datastore::PositionedWatchReplayRead::Events(replay) => {
+                Ok(PositionedWatchReplayRead::Events(
+                    PositionedWatchReplay::new(replay.events, replay.next_position),
+                ))
+            }
+            crate::datastore::PositionedWatchReplayRead::Expired => {
+                Ok(PositionedWatchReplayRead::Expired)
+            }
+        }
     }
 }

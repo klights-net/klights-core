@@ -1,49 +1,21 @@
 //! Side effect to enqueue APIService availability reconciliation.
 
-use super::{ControllerDispatcherSlot, SideEffect};
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
-use std::sync::Arc;
-
-pub struct APIServiceReconcileEffect {
-    controller_dispatcher: ControllerDispatcherSlot,
-}
 
 #[async_trait]
-impl SideEffect for APIServiceReconcileEffect {
-    fn name(&self) -> &'static str {
-        "apiservice_reconcile"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            tracing::debug!(
-                "APIServiceReconcileEffect skipped: controller dispatcher not yet bound"
-            );
-            return Ok(());
-        };
-
-        dispatcher
-            .enqueue_reconcile_batch(apiservice_reconcile_keys_for_resource(resource, db).await?)
-            .await?;
-        Ok(())
-    }
+pub(crate) trait ApiServiceSideEffectStore: Send + Sync {
+    async fn list_apiservices(&self) -> Result<Vec<Resource>>;
 }
 
-pub fn apiservice_reconcile(
-    controller_dispatcher: ControllerDispatcherSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(APIServiceReconcileEffect {
-        controller_dispatcher,
-    })
-}
-
-pub async fn apiservice_reconcile_keys_for_resource(
+pub(crate) async fn apiservice_reconcile_keys_for_resource<
+    Store: ApiServiceSideEffectStore + ?Sized,
+>(
     resource: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
 ) -> Result<Vec<ReconcileKey>> {
     let api_version = resource
         .get("apiVersion")
@@ -86,16 +58,8 @@ pub async fn apiservice_reconcile_keys_for_resource(
         return Ok(Vec::new());
     }
 
-    let apiservices = db
-        .list_resources(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            ResourceListQuery::all(),
-        )
-        .await?;
+    let apiservices = store.list_apiservices().await?;
     Ok(apiservices
-        .items
         .into_iter()
         .filter(|apiservice| apiservice_targets_service(&apiservice.data, namespace, name))
         .map(|apiservice| {

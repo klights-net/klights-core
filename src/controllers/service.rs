@@ -1,8 +1,33 @@
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Mutex;
+
+#[async_trait]
+pub trait ServiceReconcileStore: Send + Sync {
+    async fn list_services(&self) -> Result<Vec<Resource>>;
+    async fn get_service(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn update_service(
+        &self,
+        namespace: &str,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+    fn service_store_error_is_conflict(&self, error: &anyhow::Error) -> bool;
+}
+
+pub trait ServiceControllerStore:
+    ServiceReconcileStore + crate::controllers::endpoints::EndpointReconcileStore
+{
+}
+
+impl<T> ServiceControllerStore for T where
+    T: ServiceReconcileStore + crate::controllers::endpoints::EndpointReconcileStore + ?Sized
+{
+}
 
 /// Readiness state for the NodePort allocator.
 /// Used to ensure the allocator is bootstrapped before allowing allocations.
@@ -108,10 +133,10 @@ impl ServiceIpam {
         // kubernetes service ClusterIP). Falls back to 0 on an unparseable
         // CIDR to preserve the previous tolerant behavior — config validation
         // happens at startup in `KlightsConfig::from_env`.
-        let (start_ip, end_ip) = crate::networking::ClusterCidr::parse(service_cidr)
-            .map(|c| {
-                let net = c.network();
-                let broadcast = net | !c.mask();
+        let (start_ip, end_ip) = klights_types::ClusterCidr::parse(service_cidr)
+            .map(|cidr| {
+                let net = cidr.network();
+                let broadcast = net | !cidr.mask();
                 // skip .0, .1; skip broadcast address
                 (net + 2, broadcast.saturating_sub(1))
             })
@@ -188,19 +213,12 @@ fn service_allocated_cluster_ips(service: &Value, allocated: &mut HashSet<u32>) 
 }
 
 pub async fn rebuild_service_ipam_from_services(
-    db: &dyn DatastoreBackend,
+    db: &(impl ServiceReconcileStore + ?Sized),
     ipam: &ServiceIpam,
 ) -> Result<()> {
-    let svc_list = db
-        .list_resources(
-            "v1",
-            "Service",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let svc_list = db.list_services().await?;
     let mut allocated = HashSet::new();
-    for svc in &svc_list.items {
+    for svc in &svc_list {
         service_allocated_cluster_ips(&svc.data, &mut allocated);
     }
     ipam.replace_allocated(allocated);
@@ -208,7 +226,7 @@ pub async fn rebuild_service_ipam_from_services(
 }
 
 async fn allocate_service_cluster_ip(
-    db: &dyn DatastoreBackend,
+    db: &(impl ServiceReconcileStore + ?Sized),
     service_ipam: &ServiceIpam,
 ) -> Result<String> {
     match service_ipam.allocate() {
@@ -292,21 +310,13 @@ pub fn release_service_allocations_from_resource(
 /// - Bootstrap initialization
 /// - Leader promotion (when this instance becomes the primary)
 pub async fn rebuild_nodeport_allocator_from_services(
-    db: &dyn DatastoreBackend,
+    db: &(impl ServiceReconcileStore + ?Sized),
     alloc: &std::sync::Arc<NodePortAllocator>,
 ) -> Result<()> {
     // Scan all services in all namespaces to mark already-allocated NodePorts
     let mut allocated = HashSet::new();
-    if let Ok(svc_list) = db
-        .list_resources(
-            "v1",
-            "Service",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-    {
-        for svc in &svc_list.items {
+    if let Ok(svc_list) = db.list_services().await {
+        for svc in &svc_list {
             if let Some(ports) = svc.data.pointer("/spec/ports").and_then(|p| p.as_array()) {
                 for port in ports {
                     if let Some(np) = port.get("nodePort").and_then(|n| n.as_u64())
@@ -462,7 +472,7 @@ fn clear_externalname_invalid_fields(spec: &mut serde_json::Map<String, Value>) 
 }
 
 async fn allocate_service_fields_in_object(
-    db: &dyn DatastoreBackend,
+    db: &(impl ServiceReconcileStore + ?Sized),
     service: &mut Value,
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
@@ -553,7 +563,7 @@ async fn allocate_service_fields_in_object(
 }
 
 pub async fn prepare_service_for_create(
-    db: &dyn DatastoreBackend,
+    db: &(impl ServiceReconcileStore + ?Sized),
     service: &mut Value,
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
@@ -563,8 +573,8 @@ pub async fn prepare_service_for_create(
 
 #[cfg(test)]
 pub async fn reconcile_service(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    db: &(impl ServiceControllerStore + ?Sized),
+    pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     service: &Value,
     service_ipam: &ServiceIpam,
 ) -> Result<Value> {
@@ -573,8 +583,8 @@ pub async fn reconcile_service(
 }
 
 pub async fn reconcile_service_with_nodeport(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    db: &(impl ServiceControllerStore + ?Sized),
+    pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     service: &Value,
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
@@ -606,7 +616,7 @@ pub async fn reconcile_service_with_nodeport(
                 return Ok(service.clone());
             }
             Err(err) if attempt + 1 < SERVICE_ALLOC_MAX_ATTEMPTS => {
-                if crate::datastore::errors::is_conflict_error(&err) {
+                if db.service_store_error_is_conflict(&err) {
                     // Transient RV race: `allocate_service_fields_for_api_write`
                     // re-reads fresh Service state (current RV) on the next
                     // attempt, so retry immediately without a delay (matches
@@ -708,7 +718,7 @@ pub async fn reconcile_service_with_nodeport(
 /// as-is; the controller skips endpoint reconciliation) must not treat those
 /// as allocated services.
 pub async fn allocate_service_fields_for_api_write(
-    db: &dyn DatastoreBackend,
+    db: &(impl ServiceReconcileStore + ?Sized),
     service: &Value,
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
@@ -725,14 +735,13 @@ pub async fn allocate_service_fields_for_api_write(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
 
-    let Some(live_service) = db
-        .get_resource("v1", "Service", Some(namespace), name)
-        .await?
-    else {
+    let Some(live_service) = db.get_service(namespace, name).await? else {
         return Ok(None);
     };
-    let service =
-        crate::api::inject_resource_version(live_service.data, live_service.resource_version);
+    let service = crate::controllers::resource_projection::with_resource_version(
+        live_service.data,
+        live_service.resource_version,
+    );
     let metadata = service
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;
@@ -752,10 +761,8 @@ pub async fn allocate_service_fields_for_api_write(
     let needs_update = updated_service != service;
     let (updated_data, updated_rv) = if needs_update {
         let update_result = db
-            .update_resource_with_preconditions(
-                "v1",
-                "Service",
-                Some(namespace),
+            .update_service(
+                namespace,
                 name,
                 updated_service.clone(),
                 update_preconditions,
@@ -772,7 +779,10 @@ pub async fn allocate_service_fields_for_api_write(
         (std::sync::Arc::new(service.clone()), current_rv)
     };
 
-    let service_with_rv = crate::api::inject_resource_version(updated_data.clone(), updated_rv);
+    let service_with_rv = crate::controllers::resource_projection::with_resource_version(
+        updated_data.clone(),
+        updated_rv,
+    );
     Ok(Some(service_with_rv))
 }
 

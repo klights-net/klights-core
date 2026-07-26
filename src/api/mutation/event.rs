@@ -15,9 +15,7 @@ pub struct MutationEvent<'a> {
 }
 
 pub async fn dispatch_mutation_event(
-    registry: &crate::side_effects::SideEffectRegistry,
-    db: &dyn crate::datastore::DatastoreBackend,
-    metrics: &crate::side_effects::SideEffectMetrics,
+    effects: &dyn klights_reconcile_api::ResourceMutationEffectsPort,
     event: MutationEvent<'_>,
 ) {
     let facts = klights_reconcile_api::MutationFacts::new(
@@ -28,100 +26,72 @@ pub async fn dispatch_mutation_event(
     let Some(change) = facts.change() else {
         return;
     };
-    let _ = event.old_resource;
-    match change {
-        klights_reconcile_api::ResourceChange::Deleted => {
-            crate::side_effects::run_delete_hooks_logged(
-                registry,
+    effects
+        .dispatch_resource_mutation_effects(
+            klights_reconcile_api::ResourceMutationEffectsRequest::new(
+                change,
                 event.resource,
-                db,
-                metrics,
+                event.old_resource,
                 event.context,
-            )
-            .await;
-        }
-        klights_reconcile_api::ResourceChange::Created
-        | klights_reconcile_api::ResourceChange::Updated => {
-            crate::side_effects::run_hooks_logged(
-                registry,
-                event.resource,
-                db,
-                metrics,
-                event.context,
-            )
-            .await;
-        }
-    }
+            ),
+        )
+        .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::side_effects::{ErrorPolicy, SideEffect, SideEffectRegistry};
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use klights_reconcile_api::MutationOperation;
-    use serde_json::{Value, json};
+    use klights_reconcile_api::{
+        MutationOperation, ResourceChange, ResourceMutationEffectsFuture,
+        ResourceMutationEffectsPort, ResourceMutationEffectsRequest,
+    };
+    use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct CountingSideEffect {
+    struct CountingMutationEffects {
         apply_count: Arc<AtomicUsize>,
         delete_count: Arc<AtomicUsize>,
     }
 
-    #[async_trait]
-    impl SideEffect for CountingSideEffect {
-        fn name(&self) -> &'static str {
-            "counting"
-        }
-
-        async fn apply(
-            &self,
-            _resource: &Value,
-            _db: &dyn crate::datastore::DatastoreBackend,
-        ) -> Result<()> {
-            self.apply_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn apply_delete(
-            &self,
-            _resource: &Value,
-            _db: &dyn crate::datastore::DatastoreBackend,
-        ) -> Result<()> {
-            self.delete_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+    impl ResourceMutationEffectsPort for CountingMutationEffects {
+        fn dispatch_resource_mutation_effects<'a>(
+            &'a self,
+            request: ResourceMutationEffectsRequest<'a>,
+        ) -> ResourceMutationEffectsFuture<'a> {
+            Box::pin(async move {
+                match request.change() {
+                    ResourceChange::Created | ResourceChange::Updated => {
+                        self.apply_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ResourceChange::Deleted => {
+                        self.delete_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
         }
     }
 
-    fn register_counter(registry: &mut SideEffectRegistry) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    fn counting_effects() -> (CountingMutationEffects, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let apply_count = Arc::new(AtomicUsize::new(0));
         let delete_count = Arc::new(AtomicUsize::new(0));
-        registry.register(
-            "v1",
-            "ConfigMap",
-            Arc::new(CountingSideEffect {
+        (
+            CountingMutationEffects {
                 apply_count: apply_count.clone(),
                 delete_count: delete_count.clone(),
-            }),
-            ErrorPolicy::Warn,
-        );
-        (apply_count, delete_count)
+            },
+            apply_count,
+            delete_count,
+        )
     }
 
     #[tokio::test]
     async fn mutation_event_dispatch_skips_dry_run() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let mut registry = SideEffectRegistry::new();
-        let (apply_count, delete_count) = register_counter(&mut registry);
-        let metrics = crate::side_effects::SideEffectMetrics::new();
+        let (effects, apply_count, delete_count) = counting_effects();
         let resource = json!({"apiVersion": "v1", "kind": "ConfigMap"});
 
         dispatch_mutation_event(
-            &registry,
-            db_handle.as_ref(),
-            &metrics,
+            &effects,
             MutationEvent {
                 operation: MutationOperation::Create,
                 resource: &resource,
@@ -139,16 +109,11 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_event_dispatch_runs_once_for_persisted_update() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let mut registry = SideEffectRegistry::new();
-        let (apply_count, delete_count) = register_counter(&mut registry);
-        let metrics = crate::side_effects::SideEffectMetrics::new();
+        let (effects, apply_count, delete_count) = counting_effects();
         let resource = json!({"apiVersion": "v1", "kind": "ConfigMap"});
 
         dispatch_mutation_event(
-            &registry,
-            db_handle.as_ref(),
-            &metrics,
+            &effects,
             MutationEvent {
                 operation: MutationOperation::Update,
                 resource: &resource,
@@ -166,16 +131,11 @@ mod tests {
 
     #[tokio::test]
     async fn mutation_event_dispatch_uses_delete_hooks_for_hard_delete() {
-        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let mut registry = SideEffectRegistry::new();
-        let (apply_count, delete_count) = register_counter(&mut registry);
-        let metrics = crate::side_effects::SideEffectMetrics::new();
+        let (effects, apply_count, delete_count) = counting_effects();
         let resource = json!({"apiVersion": "v1", "kind": "ConfigMap"});
 
         dispatch_mutation_event(
-            &registry,
-            db_handle.as_ref(),
-            &metrics,
+            &effects,
             MutationEvent {
                 operation: MutationOperation::HardDelete,
                 resource: &resource,

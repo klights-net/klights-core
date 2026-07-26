@@ -1,5 +1,4 @@
 use super::basics::parse_k8s_quantity;
-use super::basics::volumes_root;
 use super::run_blocking_fs_keyed;
 use super::shared::write_projection_file_blocking;
 use crate::kubelet::volume_sources::VolumeSourceReader;
@@ -14,6 +13,7 @@ struct DownwardFileWrite {
 
 pub struct DownwardApiVolumeNsRequest<'a> {
     pub file_process: &'a klights_supervisor::FileProcessExecutor,
+    pub volumes_root: &'a str,
     pub sources: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
     pub pod_dir_id: &'a str,
@@ -21,6 +21,7 @@ pub struct DownwardApiVolumeNsRequest<'a> {
     pub volume_name: &'a str,
     pub default_mode: Option<u32>,
     pub items: &'a serde_json::Value,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 pub struct DownwardApiVolumeWithDbNameRequest<'a> {
@@ -33,6 +34,7 @@ pub struct DownwardApiVolumeWithDbNameRequest<'a> {
     pub volume_name: &'a str,
     pub default_mode: Option<u32>,
     pub items: &'a serde_json::Value,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
 }
 
 fn render_downward_api_volume_blocking(
@@ -51,6 +53,7 @@ fn build_downward_api_writes(
     pod_resource: &serde_json::Value,
     default_mode: Option<u32>,
     items: &serde_json::Value,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 ) -> Result<Vec<DownwardFileWrite>> {
     let default_mode = default_mode.unwrap_or(420); // 0o644
     let items_array = items
@@ -85,7 +88,12 @@ fn build_downward_api_writes(
                 .get("resource")
                 .and_then(|r| r.as_str())
                 .ok_or_else(|| anyhow::anyhow!("resourceFieldRef missing resource"))?;
-            content = extract_resource_field_ref(pod_resource, container_name, resource)?;
+            content = extract_resource_field_ref_with_capacity(
+                pod_resource,
+                container_name,
+                resource,
+                node_capacity,
+            )?;
         }
 
         writes.push(DownwardFileWrite {
@@ -117,6 +125,7 @@ pub async fn refresh_downward_api_volumes(
     file_process: &klights_supervisor::FileProcessExecutor,
     pod: &serde_json::Value,
     volumes_root: &str,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 ) -> Result<()> {
     let namespace = pod
         .get("metadata")
@@ -166,7 +175,7 @@ pub async fn refresh_downward_api_volumes(
                 "{}/{}/volumes/downward-api/{}",
                 volumes_root, pod_dir_id, volume_name
             );
-            let writes = build_downward_api_writes(pod, default_mode, items)?;
+            let writes = build_downward_api_writes(pod, default_mode, items, node_capacity)?;
             render_downward_api_volume_keyed(
                 file_process,
                 "refresh_downward_api_volume_render",
@@ -252,10 +261,9 @@ pub async fn refresh_downward_api_volumes(
 pub async fn create_downward_api_volume_ns(
     request: DownwardApiVolumeNsRequest<'_>,
 ) -> Result<String> {
-    let volumes_root = volumes_root();
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
         file_process: request.file_process,
-        volumes_root: &volumes_root,
+        volumes_root: request.volumes_root,
         sources: request.sources,
         namespace: request.namespace,
         pod_dir_id: request.pod_dir_id,
@@ -263,6 +271,7 @@ pub async fn create_downward_api_volume_ns(
         volume_name: request.volume_name,
         default_mode: request.default_mode,
         items: request.items,
+        node_capacity: request.node_capacity,
     })
     .await
 }
@@ -287,7 +296,12 @@ pub async fn create_downward_api_volume_at(
         "{}/{}/volumes/downward-api/{}",
         volumes_root, pod_name, volume_name
     );
-    let writes = build_downward_api_writes(&pod_resource.data, default_mode, items)?;
+    let writes = build_downward_api_writes(
+        &pod_resource.data,
+        default_mode,
+        items,
+        crate::kubelet::node::NodeCapacity::default(),
+    )?;
     render_downward_api_volume_keyed(
         &file_process,
         "create_downward_api_volume_render",
@@ -319,8 +333,12 @@ pub async fn create_downward_api_volume_at_with_db_name(
         "{}/{}/volumes/downward-api/{}",
         request.volumes_root, request.pod_dir_id, request.volume_name
     );
-    let writes =
-        build_downward_api_writes(&pod_resource.data, request.default_mode, request.items)?;
+    let writes = build_downward_api_writes(
+        &pod_resource.data,
+        request.default_mode,
+        request.items,
+        request.node_capacity,
+    )?;
     render_downward_api_volume_keyed(
         request.file_process,
         "create_downward_api_volume_with_db_name_render",
@@ -412,10 +430,11 @@ pub fn extract_field_ref(pod_data: &serde_json::Value, field_path: &str) -> Resu
 
 /// Extract container resource from resourceFieldRef (e.g., "limits.cpu", "requests.memory")
 /// Returns values in K8s downward API format: CPU in whole cores (ceiling), memory in bytes.
-pub fn extract_resource_field_ref(
+pub fn extract_resource_field_ref_with_capacity(
     pod_data: &serde_json::Value,
     container_name: Option<&str>,
     resource: &str,
+    node_capacity: crate::kubelet::node::NodeCapacity,
 ) -> Result<String> {
     // Get containers array
     let containers = pod_data
@@ -469,15 +488,12 @@ pub fn extract_resource_field_ref(
                 // No limit set — return node allocatable (K8s spec)
                 match resource_name {
                     "memory" => {
-                        let bytes = crate::kubelet::node::memory_ki() * 1024;
+                        let bytes = node_capacity.memory_ki() * 1024;
                         return Ok(bytes.to_string());
                     }
                     "cpu" => {
                         // Node allocatable CPU in cores
-                        let cores = std::thread::available_parallelism()
-                            .map(|n| n.get() as u64)
-                            .unwrap_or(1);
-                        return Ok(cores.to_string());
+                        return Ok(node_capacity.cpu_cores().to_string());
                     }
                     _ => return Ok("0".to_string()),
                 }
@@ -507,4 +523,18 @@ pub fn extract_resource_field_ref(
             .unwrap_or(raw);
         Ok(bytes_str)
     }
+}
+
+#[cfg(test)]
+pub fn extract_resource_field_ref(
+    pod_data: &serde_json::Value,
+    container_name: Option<&str>,
+    resource: &str,
+) -> Result<String> {
+    extract_resource_field_ref_with_capacity(
+        pod_data,
+        container_name,
+        resource,
+        crate::kubelet::node::NodeCapacity::default(),
+    )
 }

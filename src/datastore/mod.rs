@@ -17,7 +17,6 @@ pub(crate) mod position_membership;
 pub mod raft;
 pub mod redb;
 pub(crate) mod replay_retention;
-pub mod resource_version_assignment;
 pub(crate) mod selector;
 pub(crate) mod sequenced;
 pub mod snapshot;
@@ -28,6 +27,7 @@ pub mod status_merge_policy;
 pub mod types;
 
 pub use backend::*;
+pub(crate) use klights_watch::{WatchSignalReceiver, WatchTopic};
 pub use types::*;
 
 #[cfg(test)]

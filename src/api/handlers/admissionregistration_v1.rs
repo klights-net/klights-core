@@ -90,31 +90,15 @@ async fn delete_collection_mutatingwebhookconfigurations(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "admissionregistration.k8s.io/v1",
-            "MutatingWebhookConfiguration",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "admissionregistration.k8s.io/v1",
-                "MutatingWebhookConfiguration",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "admissionregistration.k8s.io/v1",
+        "MutatingWebhookConfiguration",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))
@@ -124,31 +108,15 @@ async fn delete_collection_validatingwebhookconfigurations(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "admissionregistration.k8s.io/v1",
-            "ValidatingWebhookConfiguration",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "admissionregistration.k8s.io/v1",
-                "ValidatingWebhookConfiguration",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "admissionregistration.k8s.io/v1",
+        "ValidatingWebhookConfiguration",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))
@@ -158,31 +126,15 @@ async fn delete_collection_validatingadmissionpolicies(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "admissionregistration.k8s.io/v1",
-            "ValidatingAdmissionPolicy",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "admissionregistration.k8s.io/v1",
-                "ValidatingAdmissionPolicy",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "admissionregistration.k8s.io/v1",
+        "ValidatingAdmissionPolicy",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))
@@ -192,31 +144,15 @@ async fn delete_collection_validatingadmissionpolicybindings(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "admissionregistration.k8s.io/v1",
-            "ValidatingAdmissionPolicyBinding",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "admissionregistration.k8s.io/v1",
-                "ValidatingAdmissionPolicyBinding",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "admissionregistration.k8s.io/v1",
+        "ValidatingAdmissionPolicyBinding",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))

@@ -409,11 +409,16 @@ async fn create_service(
     // F3-04: borrow `body` for the quota check, then move it into the inner
     // handler. Previously the body Value was deep-cloned for every Service
     // create even though the wrapper only needed a non-owning view of it.
-    crate::api::quotas::check_service_type_quota(state.db.as_ref(), &namespace, &body).await?;
+    crate::api::quotas::check_service_type_quota(
+        state.resource_mutation().quota_runtime.as_ref(),
+        &namespace,
+        &body,
+    )
+    .await?;
 
     // F6-02: Check if NodePort allocator is ready before allowing Service mutations.
     // This ensures leader promotion has completed the rebuild before accepting new allocations.
-    if !state.nodeport_alloc.is_ready() {
+    if !state.controller_reconcile().service_allocations.is_ready() {
         return Err(AppError::ServiceUnavailable(
             "NodePort allocator is not ready, please retry".to_string(),
         ));
@@ -440,7 +445,7 @@ async fn update_service(
 ) -> Result<Json<Value>, AppError> {
     // F6-02: Check if NodePort allocator is ready before allowing Service mutations.
     // This ensures leader promotion has completed the rebuild before accepting new allocations.
-    if !state.nodeport_alloc.is_ready() {
+    if !state.controller_reconcile().service_allocations.is_ready() {
         return Err(AppError::ServiceUnavailable(
             "NodePort allocator is not ready, please retry".to_string(),
         ));
@@ -460,18 +465,20 @@ async fn update_service(
     // allocated fields. Endpoint/EndpointSlice reconciliation and the dataplane
     // route sync run asynchronously via the controller dispatcher after the
     // enqueue below — never inline on the request path.
-    let allocated = crate::controllers::service::allocate_service_fields_for_api_write(
-        state.db.as_ref(),
-        &result.0,
-        state.service_ipam.as_ref(),
-        state.nodeport_alloc.as_ref(),
-    )
-    .await
-    .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {}", e)))?;
+    let allocated = state
+        .controller_reconcile()
+        .service_allocations
+        .allocate_after_write(&result.0)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {}", e)))?;
 
     let response = match allocated {
         Some(allocated) => {
-            state.controller_dispatcher.enqueue(&allocated).await;
+            state
+                .controller_reconcile()
+                .controller_dispatcher
+                .enqueue(&allocated)
+                .await;
             allocated
         }
         None => result.0.clone(),
@@ -489,7 +496,7 @@ async fn patch_service(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     // F6-02: Check if NodePort allocator is ready before allowing Service mutations.
     // This ensures leader promotion has completed the rebuild before accepting new allocations.
-    if !state.nodeport_alloc.is_ready() {
+    if !state.controller_reconcile().service_allocations.is_ready() {
         return Err(AppError::ServiceUnavailable(
             "NodePort allocator is not ready, please retry".to_string(),
         ));
@@ -510,18 +517,20 @@ async fn patch_service(
     // allocated fields. Endpoint/EndpointSlice reconciliation and the dataplane
     // route sync run asynchronously via the controller dispatcher after the
     // enqueue below — never inline on the request path.
-    let allocated = crate::controllers::service::allocate_service_fields_for_api_write(
-        state.db.as_ref(),
-        &json_response.0,
-        state.service_ipam.as_ref(),
-        state.nodeport_alloc.as_ref(),
-    )
-    .await
-    .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {}", e)))?;
+    let allocated = state
+        .controller_reconcile()
+        .service_allocations
+        .allocate_after_write(&json_response.0)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {}", e)))?;
 
     let response = match allocated {
         Some(allocated) => {
-            state.controller_dispatcher.enqueue(&allocated).await;
+            state
+                .controller_reconcile()
+                .controller_dispatcher
+                .enqueue(&allocated)
+                .await;
             allocated
         }
         None => json_response.0.clone(),
@@ -533,30 +542,59 @@ async fn delete_service(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let resource = state
-        .db
-        .get_resource("v1", "Service", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Service",
+        Some(&namespace),
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
+
+    crate::api::resource_command_ports::delete_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        "v1",
+        "Service",
+        Some(&namespace),
+        &name,
+        klights_cluster_core::ResourcePreconditions::from_resource(&resource),
+    )
+    .await?;
 
     state
-        .db
-        .delete_resource("v1", "Service", Some(&namespace), &name)
-        .await?;
-
-    crate::controllers::service::release_service_allocations_from_resource(
-        state.service_ipam.as_ref(),
-        state.nodeport_alloc.as_ref(),
-        &resource.data,
-    );
+        .controller_reconcile()
+        .service_allocations
+        .release_resource(&resource.data);
 
     let svc_name = name.clone();
-    if let Err(e) = state
-        .db
-        .delete_resource("v1", "Endpoints", Some(&namespace), &name)
-        .await
+    match crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Endpoints",
+        Some(&namespace),
+        &name,
+    )
+    .await
     {
-        tracing::warn!(namespace = %namespace, name = %name, error = %e, "service delete: associated Endpoints delete failed");
+        Ok(Some(endpoints)) => {
+            if let Err(error) = crate::api::resource_command_ports::delete_non_pod_resource(
+                state.resource_mutation().resource_command.as_ref(),
+                "v1",
+                "Endpoints",
+                Some(&namespace),
+                &name,
+                klights_cluster_core::ResourcePreconditions::from_resource(&endpoints),
+            )
+            .await
+            {
+                tracing::warn!(namespace = %namespace, name = %name, error = ?error, "service delete: associated Endpoints delete failed");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(namespace = %namespace, name = %name, error = ?error, "service delete: associated Endpoints lookup failed");
+        }
     }
 
     let data_with_uid = inject_resource_version(resource.data.clone(), resource.resource_version);
@@ -566,18 +604,20 @@ async fn delete_service(
         .and_then(|u| u.as_str())
         .unwrap_or("")
         .to_string();
-    if let Err(e) = controllers::gc::cascade_delete_with_uid(
-        state.db.as_ref(),
-        &owner_uid,
-        "v1",
-        &svc_name,
-        "Service",
-        Some(namespace.clone()),
-        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
+    if let Err(e) = crate::api::gc_ports::cascade_delete(
+        state.resource_mutation().gc_owner_lifecycle.as_ref(),
+        klights_reconcile_api::GcOwnerIdentity::new(
+            "v1",
+            "Service",
+            Some(namespace.clone()),
+            &svc_name,
+            &owner_uid,
+        ),
     )
     .await
     {
         state
+            .controller_reconcile()
             .metrics
             .cascade_delete_failures_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -585,15 +625,13 @@ async fn delete_service(
     }
 
     state
-        .network
-        .services()
-        .request_services_sync()
+        .pod_node_subresources()
+        .services
+        .request_service_routing_sync()
         .map_err(|error| AppError::Internal(error.to_string()))?;
 
     crate::api::mutation::dispatch_mutation_event(
-        &state.side_effects,
-        state.db.as_ref(),
-        &state.metrics,
+        state.resource_mutation().mutation_effects.as_ref(),
         crate::api::mutation::MutationEvent {
             operation: klights_reconcile_api::MutationOperation::DeleteMark,
             resource: &resource.data,
@@ -617,6 +655,7 @@ async fn create_serviceaccount_token(
     use crate::auth::clock::Clock;
 
     let sa = state
+        .resource_mutation()
         .db
         .get_resource("v1", "ServiceAccount", Some(&namespace), &name)
         .await?
@@ -638,7 +677,7 @@ async fn create_serviceaccount_token(
                 "api".to_string(),
             ]
         });
-    let expiration_seconds = crate::auth::normalize_service_account_token_expiration_seconds(
+    let expiration_seconds = klights_types::normalize_service_account_token_expiration_seconds(
         body.get("spec")
             .and_then(|s| s.get("expirationSeconds"))
             .and_then(|v| v.as_i64()),
@@ -681,8 +720,8 @@ async fn create_serviceaccount_token(
         match kind {
             "Pod" => {
                 // Pod reads go through the pod repository (actor-owned invariant).
-                let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-                    state.pod_repository.as_ref(),
+                let pod = crate::api::pod_repository_ports::get_pod(
+                    state.resource_mutation().pod_repository.as_ref(),
                     &namespace,
                     ref_name,
                 )
@@ -705,6 +744,7 @@ async fn create_serviceaccount_token(
             }
             "Secret" => {
                 let secret = state
+                    .resource_mutation()
                     .db
                     .get_resource("v1", "Secret", Some(&namespace), ref_name)
                     .await?
@@ -739,12 +779,15 @@ async fn create_serviceaccount_token(
         }
     }
 
-    let signing_key_path =
-        crate::paths::service_account_signing_key_path(&state.config.containerd_namespace);
-    let signing_key_pem =
-        crate::auth::read_service_account_signing_key_async(&signing_key_path, &state.file_process)
-            .await
-            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+    let signing_key_path = crate::paths::service_account_signing_key_path(
+        &state.operational().config.containerd_namespace,
+    );
+    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+        &signing_key_path,
+        &state.operational().file_process,
+    )
+    .await
+    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
 
     let sa_uid = sa
         .data
@@ -766,7 +809,8 @@ async fn create_serviceaccount_token(
     let signing_name = name.clone();
     let signing_namespace = namespace.clone();
     let signing_audiences = audiences.clone();
-    let crypto = klights_supervisor::CryptoExecutor::new(state.task_supervisor.clone());
+    let crypto =
+        klights_supervisor::CryptoExecutor::new(state.operational().task_supervisor.clone());
     let token = crypto
         .run_blocking("sign-token-request-service-account-jwt", move || {
             let audience_refs = signing_audiences

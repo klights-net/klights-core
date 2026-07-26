@@ -1,4 +1,6 @@
 use super::*;
+use crate::datastore::DatastoreBackend;
+use crate::resource_quota_controller_adapter::reconcile_resource_quotas_for_namespace;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -13,7 +15,7 @@ async fn make_raft_resourcequota_datastore() -> (
 ) {
     use crate::datastore::backend::DatastoreHandle;
     use crate::datastore::command::StorageCommand;
-    use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+    use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 
     struct InlineProposer {
         inner: DatastoreHandle,
@@ -53,19 +55,17 @@ async fn make_raft_resourcequota_datastore() -> (
             authoring_node: &str,
             _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
         ) -> std::result::Result<
-            crate::kubelet::outbox::OutboxApplyResult,
-            crate::kubelet::outbox::OutboxApplyError,
+            crate::node_outbox::OutboxApplyResult,
+            crate::node_outbox::OutboxApplyError,
         > {
             let payload = OutboxPayload::from_command(command)
                 .encode_protobuf()
-                .map_err(|err| {
-                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
-                })?;
+                .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
             let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                 self.inner.as_ref(),
                 idempotency_key,
                 OutboxOperation::try_from(operation).map_err(|err| {
-                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                    crate::node_outbox::OutboxApplyError::Retryable(err.to_string())
                 })?,
                 bytes::Bytes::from(payload),
                 authoring_node,
@@ -116,7 +116,7 @@ impl crate::kubelet::pod_repository::PodReader for ResourceQuotaConflictPodReade
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::datastore::ResourceList> {
+    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
         if ns == Some("default") && !self.updated.swap(true, Ordering::SeqCst) {
             let current = self
                 .db
@@ -186,7 +186,7 @@ impl crate::kubelet::pod_repository::PodReader for ResourceQuotaStatusConflictPo
         field_selector: Option<&str>,
         limit: Option<i64>,
         continue_token: Option<&str>,
-    ) -> anyhow::Result<crate::datastore::ResourceList> {
+    ) -> anyhow::Result<crate::kubelet::pod_repository::PodResourceList> {
         if ns == Some("default") && !self.updated.swap(true, Ordering::SeqCst) {
             let current = self
                 .db
@@ -221,6 +221,89 @@ impl crate::kubelet::pod_repository::PodReader for ResourceQuotaStatusConflictPo
         self.inner.list_pods_by_owner_uid(ns, owner_uid).await
     }
 }
+
+macro_rules! impl_test_pod_query {
+    ($reader:ty) => {
+        impl klights_pod_api::PodQuery for $reader {
+            fn get_pod(
+                &self,
+                request: klights_pod_api::PodGetRequest,
+            ) -> klights_pod_api::PodRepositoryFuture<'_, Option<klights_cluster_core::Resource>>
+            {
+                Box::pin(async move {
+                    let result = match request.uid() {
+                        Some(uid) => {
+                            crate::kubelet::pod_repository::PodReader::get_pod_for_uid(
+                                self,
+                                request.namespace(),
+                                request.name(),
+                                uid,
+                            )
+                            .await
+                        }
+                        None => {
+                            crate::kubelet::pod_repository::PodReader::get_pod(
+                                self,
+                                request.namespace(),
+                                request.name(),
+                            )
+                            .await
+                        }
+                    };
+                    result.map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })
+                })
+            }
+
+            fn list_pods(
+                &self,
+                request: klights_pod_api::PodListRequest,
+            ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodListResult> {
+                Box::pin(async move {
+                    let list = crate::kubelet::pod_repository::PodReader::list_pods(
+                        self,
+                        request.namespace(),
+                        request.label_selector(),
+                        request.field_selector(),
+                        request.limit(),
+                        request.continue_token(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })?;
+                    klights_pod_api::PodListResult::try_new(
+                        list.items,
+                        list.resource_version,
+                        list.continue_token,
+                        list.remaining_item_count,
+                    )
+                })
+            }
+
+            fn list_pods_by_owner_uid(
+                &self,
+                request: klights_pod_api::PodOwnerListRequest,
+            ) -> klights_pod_api::PodRepositoryFuture<'_, Vec<klights_cluster_core::Resource>> {
+                Box::pin(async move {
+                    crate::kubelet::pod_repository::PodReader::list_pods_by_owner_uid(
+                        self,
+                        request.namespace(),
+                        request.owner_uid(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        klights_pod_api::PodRepositoryError::unavailable(error.to_string())
+                    })
+                })
+            }
+        }
+    };
+}
+
+impl_test_pod_query!(ResourceQuotaConflictPodReader);
+impl_test_pod_query!(ResourceQuotaStatusConflictPodReader);
 
 #[test]
 fn test_parse_resource_quantity_storage_matches_kubernetes_semantics() {

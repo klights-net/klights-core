@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use crate::datastore::raft::types::NodeId;
+use super::types::NodeId;
 
 /// Object-safe membership-change client. Implementations may live on a
 /// raft leader (mutating the local engine) or on a follower that
@@ -38,11 +38,11 @@ pub trait MembershipClient: Send + Sync {
 /// Only useful on a node that is the current raft leader; non-leader
 /// callers should use a forwarding client (added in a later sub-task).
 pub struct RaftNodeMembershipClient {
-    node: Arc<crate::datastore::raft::node::RaftNode>,
+    node: Arc<super::node::RaftNode>,
 }
 
 impl RaftNodeMembershipClient {
-    pub fn new(node: Arc<crate::datastore::raft::node::RaftNode>) -> Self {
+    pub fn new(node: Arc<super::node::RaftNode>) -> Self {
         Self { node }
     }
 }

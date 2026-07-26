@@ -9,11 +9,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::control_plane::client::{
-    LeaderApiClient, LeaderWatch, LeaderWatchError, NodeDataplaneQuery,
-    NodeSubnetAllocationRequest, NodeSubnetQuery, PeerSubnetsQuery, PodCleanupIntentAckRequest,
-    PodCleanupIntentListRequest, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
-    WatchRequest, WatchResumeCursor, legacy_dataplane, legacy_list_response, legacy_node_subnet,
-    legacy_watch_event,
+    LeaderApiClient, legacy_dataplane, legacy_list_response, legacy_node_subnet, legacy_watch_event,
 };
 #[cfg(test)]
 use crate::datastore::command::{CommandMeta, StorageCommand};
@@ -23,22 +19,27 @@ use crate::datastore::{
     AppliedOutboxRecord, CatchUpResource, DatastoreBackend, ListPageRequest, NodeSubnet, PatchKind,
     PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkAllocationLink,
     PodNetworkAllocationPod, PodNetworkAllocationRequest, PodNetworkAllocationSubnet,
-    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
-    PodWorkqueueKind, PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
-    RawWatchEvent, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions, SandboxRef,
-    SnapshotAtRv, WatchReplayPosition, WatchReplayRead, WatchStore, WatchTarget, WatchTargetScope,
+    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult,
+    PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchEvent,
+    PositionedWatchReplay, PositionedWatchReplayRead, RawWatchEvent, Resource, ResourceList,
+    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayPosition,
+    WatchReplayRead, WatchStore, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::watch::{EventType, WatchBus, WatchEvent};
+use klights_leader_api::{
+    LeaderWatch, LeaderWatchError, NodeDataplaneQuery, NodeSubnetAllocationRequest,
+    NodeSubnetQuery, PeerSubnetsQuery, PodCleanupIntentAckRequest, PodCleanupIntentListRequest,
+    ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency, WatchRequest,
+    WatchResumeCursor,
+};
 use klights_types::ResourceKey;
 use klights_watch::{WatchSignal, WatchTopic};
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
 
-fn legacy_pod_cleanup_intent(
-    intent: crate::control_plane::client::PodCleanupIntent,
-) -> PodCleanupIntent {
+fn legacy_pod_cleanup_intent(intent: klights_leader_api::PodCleanupIntent) -> PodCleanupIntent {
     let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
         intent.into_parts();
     let pod_data = Arc::try_unwrap(pod.data).unwrap_or_else(|shared| (*shared).clone());
@@ -1730,14 +1731,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
         &self,
         _node_name: &str,
         _mode: crate::controllers::annotations::NodePeerMode,
-        _hostport_range: Option<crate::networking::types::HostPortRange>,
+        _hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         Ok(())
     }
 
     async fn update_node_dataplane(
         &self,
-        _metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        _metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         self.unsupported("update_node_dataplane")
     }
@@ -1745,7 +1746,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         let request = NodeDataplaneQuery::try_new(node_name).map_err(anyhow::Error::new)?;
         self.cluster_api
             .get_node_dataplane(request)
@@ -1826,31 +1827,32 @@ impl DatastoreBackend for WorkerStoreAdapter {
         node_name: &str,
     ) -> Result<PodSlotAdmissionResult> {
         self.node_local
-            .admit_pod_runtime(pod_uid, namespace, pod_name, node_name)
-            .await?;
-        Ok(PodSlotAdmissionResult::Admitted {
-            resource_version: 0,
-        })
+            .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
+            .await
     }
 
     async fn pod_slot_mark_terminating(
         &self,
-        _namespace: &str,
-        _pod_name: &str,
-        _pod_uid: &str,
-        _node_name: &str,
-    ) -> Result<()> {
-        Ok(())
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotMutationResult> {
+        self.node_local
+            .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
+            .await
     }
 
     async fn pod_slot_clear_if_uid(
         &self,
-        _namespace: &str,
-        _pod_name: &str,
+        namespace: &str,
+        pod_name: &str,
         pod_uid: &str,
         _node_name: &str,
-    ) -> Result<()> {
-        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
+    ) -> Result<PodSlotClearResult> {
+        self.node_local
+            .pod_slot_clear_if_uid(namespace, pod_name, pod_uid)
+            .await
     }
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
@@ -1986,10 +1988,10 @@ impl DatastoreBackend for WorkerStoreAdapter {
         _payload: &[u8],
         _authoring_node: &str,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        crate::node_outbox::OutboxApplyResult,
+        crate::node_outbox::OutboxApplyError,
     > {
-        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+        Err(crate::node_outbox::OutboxApplyError::Retryable(
             "worker-local store does not support leader-side outbox apply".to_string(),
         ))
     }
@@ -2001,10 +2003,10 @@ impl DatastoreBackend for WorkerStoreAdapter {
         _payload: &[u8],
         _authoring_node: &str,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        crate::node_outbox::OutboxApplyError,
     > {
-        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+        Err(crate::node_outbox::OutboxApplyError::Retryable(
             "worker-local store does not support leader-side outbox build".to_string(),
         ))
     }
@@ -2200,7 +2202,7 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
 
     async fn replace_replicated_resource_state(
         &self,
-        _entries: Vec<crate::log_apply::LogApplyCommit>,
+        _entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         _current_rv: i64,
         _watch_event_high_water: Option<i64>,
         _watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
@@ -2554,14 +2556,14 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
         &self,
         _node_name: &str,
         _mode: crate::controllers::annotations::NodePeerMode,
-        _hostport_range: Option<crate::networking::types::HostPortRange>,
+        _hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         Ok(())
     }
 
     async fn update_node_dataplane(
         &self,
-        _metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        _metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         self.unsupported("update_node_dataplane")
     }
@@ -2569,7 +2571,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         let request = NodeDataplaneQuery::try_new(node_name).map_err(anyhow::Error::new)?;
         self.cluster_api
             .get_node_dataplane(request)
@@ -2685,31 +2687,32 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
         node_name: &str,
     ) -> Result<PodSlotAdmissionResult> {
         self.node_local
-            .admit_pod_runtime(pod_uid, namespace, pod_name, node_name)
-            .await?;
-        Ok(PodSlotAdmissionResult::Admitted {
-            resource_version: 0,
-        })
+            .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
+            .await
     }
 
     async fn pod_slot_mark_terminating(
         &self,
-        _namespace: &str,
-        _pod_name: &str,
-        _pod_uid: &str,
-        _node_name: &str,
-    ) -> Result<()> {
-        Ok(())
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotMutationResult> {
+        self.node_local
+            .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
+            .await
     }
 
     async fn pod_slot_clear_if_uid(
         &self,
-        _namespace: &str,
-        _pod_name: &str,
+        namespace: &str,
+        pod_name: &str,
         pod_uid: &str,
         _node_name: &str,
-    ) -> Result<()> {
-        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
+    ) -> Result<PodSlotClearResult> {
+        self.node_local
+            .pod_slot_clear_if_uid(namespace, pod_name, pod_uid)
+            .await
     }
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
@@ -2721,15 +2724,15 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
 mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::control_plane::client::{
-        CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery,
-        LeaderWatch, LeaderWatchFuture, ResourceEvent, ResourceListResult, ResourceQueryFuture,
-        WatchEventType, WatchStream,
-    };
     use crate::datastore::DatastoreBackend;
     use crate::kubelet::pod_lifecycle_router::{
         PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
         PodLifecycleRouteMode,
+    };
+    use klights_leader_api::{
+        CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery,
+        LeaderWatch, LeaderWatchFuture, ResourceEvent, ResourceListResult, ResourceQueryFuture,
+        WatchEventType, WatchStream,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::AtomicUsize;
@@ -2866,10 +2869,10 @@ mod tests {
     #[tokio::test]
     async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
         let cluster_db = crate::datastore::test_support::in_memory().await;
-        let dataplane = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+        let dataplane = klights_cluster_store::DataplanePeerMetadata::try_new(
             "worker-b".to_string(),
-            crate::networking::wireguard::DataplaneMode::Root,
-            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            klights_cluster_store::DataplaneMode::Root,
+            klights_cluster_store::DataplaneEncryption::Disabled,
             None,
             Some("192.0.2.11".to_string()),
             None,
@@ -3762,7 +3765,7 @@ mod tests {
             node_local.clone(),
             "worker-a".to_string(),
         );
-        let outbox = crate::kubelet::outbox::Outbox::new(node_local.clone());
+        let outbox = crate::node_outbox::Outbox::new(node_local.clone());
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -3777,10 +3780,10 @@ mod tests {
             }
         });
 
-        crate::kubelet::events::emit_pod_event_with_outbox(
+        crate::pod_events::emit_pod_event_with_outbox(
             &adapter,
             Some(&outbox),
-            crate::kubelet::events::PodEventRecord {
+            crate::pod_events::PodEventRecord {
                 pod: &pod,
                 reason: "Started",
                 message: "Started container test-container",

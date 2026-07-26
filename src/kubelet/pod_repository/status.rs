@@ -10,14 +10,14 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::control_plane::client::LeaderApiClient;
-use crate::datastore::Resource;
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
-use crate::kubelet::pod_manager::get_cached_host_ip;
+use crate::kubelet::context::HostIpState;
 use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
+use crate::node_outbox::payload::OutboxOperation;
+use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use klights_cluster_core::Resource;
+use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
 use super::state_only_writer::StateOnlyWriter;
@@ -29,7 +29,8 @@ pub(super) struct PodStatusService {
     status_only: Arc<dyn StateOnlyWriter>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
-    cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    host_ip: HostIpState,
     deferred_runtime: DeferredRuntimeReducerHandle,
 }
 
@@ -185,7 +186,8 @@ impl PodStatusService {
         status_only: Arc<dyn StateOnlyWriter>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
-        cluster_api: Option<Arc<dyn LeaderApiClient>>,
+        cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+        host_ip: HostIpState,
     ) -> Self {
         Self {
             store,
@@ -193,6 +195,7 @@ impl PodStatusService {
             mutation_reconcile,
             outbox,
             cluster_api,
+            host_ip,
             deferred_runtime: DeferredRuntimeReducerHandle::default(),
         }
     }
@@ -231,10 +234,10 @@ impl PodStatusService {
     ) -> Result<Resource> {
         let mut pod_resource = if let Some(cluster_api) = &self.cluster_api {
             cluster_api
-                .get_resource(crate::control_plane::client::pod_get_request(
+                .get_resource(klights_leader_api::pod_get_request(
                     ns,
                     name,
-                    crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
                 )?)
                 .await?
         } else {
@@ -274,14 +277,14 @@ impl PodStatusService {
             Some(outbox) => Some(outbox.next_status_stamp().await?),
             None => None,
         };
-        let command = crate::datastore::command::StorageCommand::UpdateStatus {
+        let command = klights_cluster_core::StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some(namespace.to_string()),
             name: pod_resource.name.clone(),
             status: status.clone(),
             expected_rv,
-            preconditions: crate::datastore::ResourcePreconditions {
+            preconditions: klights_cluster_core::ResourcePreconditions {
                 uid: Some(pod_resource.uid.clone()),
                 resource_version: expected_rv,
             },
@@ -541,7 +544,7 @@ impl PodStatusService {
 
             let pod_ip = update.pod_ip.clone();
             let host_ip = if update.host_ip.is_empty() {
-                get_cached_host_ip().to_string()
+                self.host_ip.current().to_string()
             } else {
                 update.host_ip.clone()
             };
@@ -1279,7 +1282,7 @@ impl PodStatusService {
             if let Some(expected) = expected_rv
                 && expected != pod_resource.resource_version
             {
-                return Err(crate::datastore::errors::DatastoreError::conflict(format!(
+                return Err(klights_pod_api::PodRepositoryError::conflict(format!(
                     "resourceVersion precondition failed: expected {} got {}",
                     expected, pod_resource.resource_version
                 ))
@@ -1296,17 +1299,12 @@ impl PodStatusService {
                 status = json!({});
             }
             if ready && !can_publish_probe_ready(&status, container_name) {
-                crate::datastore::diagnostics::log_noop_resource_write(
-                    crate::datastore::diagnostics::NoopResourceWrite {
-                        operation: "probe-readiness",
-                        api_version: "v1",
-                        kind: "Pod",
-                        namespace: Some(ns),
-                        name,
-                        uid: &pod_resource.uid,
-                        resource_version: pod_resource.resource_version,
-                        reason: "successful readiness probe ignored until container is running",
-                    },
+                log_noop_pod_status_write(
+                    ns,
+                    name,
+                    &pod_resource.uid,
+                    pod_resource.resource_version,
+                    "successful readiness probe ignored until container is running",
                 );
                 return Ok(PodStatusWriteResult::unchanged(pod_resource));
             }
@@ -1382,17 +1380,12 @@ impl PodStatusService {
                     ready,
                     "pod status write skipped because probe readiness produced no object change"
                 );
-                crate::datastore::diagnostics::log_noop_resource_write(
-                    crate::datastore::diagnostics::NoopResourceWrite {
-                        operation: "probe-readiness",
-                        api_version: "v1",
-                        kind: "Pod",
-                        namespace: Some(ns),
-                        name,
-                        uid: &pod_resource.uid,
-                        resource_version: pod_resource.resource_version,
-                        reason: "computed pod status unchanged",
-                    },
+                log_noop_pod_status_write(
+                    ns,
+                    name,
+                    &pod_resource.uid,
+                    pod_resource.resource_version,
+                    "computed pod status unchanged",
                 );
                 return Ok(PodStatusWriteResult::unchanged(pod_resource));
             }
@@ -2004,7 +1997,34 @@ fn upsert_terminal_readiness_condition(
 }
 
 fn is_conflict(err: &anyhow::Error) -> bool {
-    crate::datastore::errors::is_conflict_error(err)
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<klights_pod_api::PodRepositoryError>()
+            .is_some_and(|error| {
+                matches!(error, klights_pod_api::PodRepositoryError::Conflict { .. })
+            })
+    })
+}
+
+fn log_noop_pod_status_write(
+    namespace: &str,
+    name: &str,
+    uid: &str,
+    resource_version: i64,
+    reason: &str,
+) {
+    tracing::info!(
+        target: "klights::datastore::noop_update",
+        operation = "probe-readiness",
+        api_version = "v1",
+        kind = "Pod",
+        namespace,
+        name,
+        uid,
+        resource_version,
+        reason,
+        "skipped no-op datastore write"
+    );
 }
 
 fn preserve_restart_fields(

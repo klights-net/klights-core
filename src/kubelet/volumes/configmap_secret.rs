@@ -1,4 +1,3 @@
-use super::basics::volumes_root;
 use super::run_blocking_fs_keyed;
 use super::shared::{
     build_projection_paths, clear_volume_dir_contents_blocking, remove_projection_path_blocking,
@@ -95,6 +94,7 @@ async fn render_projection_volume_keyed(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_config_map_volume(
     file_process: &klights_supervisor::FileProcessExecutor,
+    volumes_root: &str,
     sources: &dyn VolumeSourceReader,
     namespace: &str,
     cm_name: &str,
@@ -103,10 +103,9 @@ pub async fn create_config_map_volume(
     default_mode: Option<u32>,
     items: Option<&serde_json::Value>,
 ) -> Result<String> {
-    let volumes_root = volumes_root();
     create_config_map_volume_at(ConfigMapVolumeAtRequest {
         file_process,
-        volumes_root: &volumes_root,
+        volumes_root,
         sources,
         namespace,
         cm_name,
@@ -235,6 +234,7 @@ async fn render_config_map_resource_to_volume_at(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_secret_volume(
     file_process: &klights_supervisor::FileProcessExecutor,
+    volumes_root: &str,
     sources: &dyn VolumeSourceReader,
     namespace: &str,
     secret_name: &str,
@@ -243,10 +243,9 @@ pub async fn create_secret_volume(
     default_mode: Option<u32>,
     items: Option<&serde_json::Value>,
 ) -> Result<String> {
-    let volumes_root = volumes_root();
     create_secret_volume_at(SecretVolumeAtRequest {
         file_process,
-        volumes_root: &volumes_root,
+        volumes_root,
         sources,
         namespace,
         secret_name,

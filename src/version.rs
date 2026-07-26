@@ -45,15 +45,6 @@ pub fn git_version() -> String {
     GIT_VERSION.to_string()
 }
 
-/// kubeletVersion for Node status.
-pub fn kubelet_version_for_mode(node_mode: &crate::bootstrap::NodeMode) -> String {
-    let mut version = git_version();
-    if matches!(node_mode, crate::bootstrap::NodeMode::Rootless { .. }) {
-        version.push_str(" (rootless)");
-    }
-    version
-}
-
 /// Git commit SHA (from vergen, empty if not built from git)
 pub fn git_commit_hash() -> &'static str {
     option_env!("VERGEN_GIT_SHA").unwrap_or("unknown")

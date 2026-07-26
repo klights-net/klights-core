@@ -477,6 +477,16 @@ impl klights_network_api::ServiceRouter for MockServiceRouter {
     }
 }
 
+impl klights_reconcile_api::ServiceRoutingSync for MockServiceRouter {
+    fn request_service_routing_sync(
+        &self,
+    ) -> Result<(), klights_reconcile_api::ReconcileSinkError> {
+        klights_network_api::ServiceRouter::request_services_sync(self).map_err(|error| {
+            klights_reconcile_api::ReconcileSinkError::unavailable(error.to_string())
+        })
+    }
+}
+
 #[cfg(test)]
 mod peer_endpoint_tests {
     use super::*;

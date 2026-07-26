@@ -20,7 +20,7 @@ mod tests {
         ReplicationEntry, StreamAck, follower_message, leader_message,
     };
 
-    const COMMITTED_APPLY_RV_V1: u64 = 1 << 0;
+    const EXACT_COMMAND_CODEC_V3: u32 = 3;
 
     #[test]
     fn private_stream_envelope_tags_preserve_every_preexisting_payload() {
@@ -166,45 +166,45 @@ mod tests {
     }
 
     #[test]
-    fn metadata_supported_features_defaults_to_zero_and_round_trips_v1() {
-        let legacy = MetadataResponse {
-            cluster_id: "legacy".to_string(),
+    fn metadata_wire_preserves_missing_zero_for_exact_v3_adapter_rejection() {
+        let missing = MetadataResponse {
+            cluster_id: "missing-version".to_string(),
             leader_epoch: 1,
             current_rv: 2,
             current_log_index: 3,
-            supported_features: 0,
+            command_codec_version: 0,
         };
-        let legacy_bytes = legacy.encode_to_vec();
+        let missing_bytes = missing.encode_to_vec();
         assert_eq!(
-            MetadataResponse::decode(legacy_bytes.as_slice())
+            MetadataResponse::decode(missing_bytes.as_slice())
                 .unwrap()
-                .supported_features,
+                .command_codec_version,
             0
         );
 
-        let v1 = MetadataResponse {
-            supported_features: COMMITTED_APPLY_RV_V1,
-            ..legacy
+        let exact_v3 = MetadataResponse {
+            command_codec_version: EXACT_COMMAND_CODEC_V3,
+            ..missing
         };
         assert_eq!(
-            MetadataResponse::decode(v1.encode_to_vec().as_slice())
+            MetadataResponse::decode(exact_v3.encode_to_vec().as_slice())
                 .unwrap()
-                .supported_features,
-            COMMITTED_APPLY_RV_V1
+                .command_codec_version,
+            EXACT_COMMAND_CODEC_V3
         );
     }
 
     #[test]
-    fn join_controlplane_supported_features_round_trip() {
+    fn join_controlplane_command_codec_version_round_trip() {
         let request = JoinAsControlplaneRequest {
-            supported_features: COMMITTED_APPLY_RV_V1,
+            command_codec_version: EXACT_COMMAND_CODEC_V3,
             ..Default::default()
         };
         assert_eq!(
             JoinAsControlplaneRequest::decode(request.encode_to_vec().as_slice())
                 .unwrap()
-                .supported_features,
-            COMMITTED_APPLY_RV_V1
+                .command_codec_version,
+            EXACT_COMMAND_CODEC_V3
         );
     }
 
@@ -220,7 +220,7 @@ mod tests {
                 dataplane_port: 51_820,
                 dataplane_mode: "root".to_string(),
                 dataplane_encryption: "enabled".to_string(),
-                supported_features: 3,
+                command_codec_version: 3,
             })),
         };
         let follower_ack = FollowerMessage {
@@ -291,7 +291,7 @@ mod tests {
             leader_epoch: 1,
             current_rv: 42,
             current_log_index: 7,
-            supported_features: COMMITTED_APPLY_RV_V1,
+            command_codec_version: EXACT_COMMAND_CODEC_V3,
         };
         let entry = ReplicationEntry {
             command_protobuf: vec![1, 2, 3],
@@ -383,15 +383,32 @@ mod tests {
     }
 
     #[test]
+    fn outbox_command_envelope_carries_exact_codec_provenance_before_opaque_payload() {
+        let raw_v2_payload = vec![0x0a, 0x01, b'x', 0x10, 0x02];
+        let envelope = crate::storage::ProtoOutboxCommandEnvelope {
+            codec_version: 3,
+            command_payload: raw_v2_payload.clone(),
+        };
+        assert_eq!(
+            envelope.encode_to_vec(),
+            vec![0x08, 0x03, 0x12, 0x05, 0x0a, 0x01, b'x', 0x10, 0x02]
+        );
+        assert_ne!(envelope.encode_to_vec(), raw_v2_payload);
+        assert_eq!(
+            crate::storage::ProtoOutboxCommandEnvelope::decode(envelope.encode_to_vec().as_slice())
+                .unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
     fn log_apply_wire_tags_remain_stable() {
         let commit = crate::log_apply::ProtoLogApplyCommit {
-            resource_version: 7,
+            resource_version: 0,
             mutations: Vec::new(),
             outbox_watermark: None,
-            resource_version_assignment:
-                crate::log_apply::ProtoResourceVersionAssignment::CommittedApplyV1 as i32,
         };
-        assert_eq!(commit.encode_to_vec(), vec![0x08, 0x07, 0x20, 0x01]);
+        assert_eq!(commit.encode_to_vec(), Vec::<u8>::new());
 
         let mutation = crate::log_apply::ProtoLogApplyMutation {
             mutation: Some(

@@ -22,6 +22,7 @@ use crate::kubelet::pod_repository::types::PodStatusPatchType;
 pub(crate) struct PodSubresourceService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
+    db: crate::datastore::DatastoreHandle,
     controller_dispatcher: ControllerDispatcherSlot,
 }
 
@@ -29,11 +30,13 @@ impl PodSubresourceService {
     pub(crate) fn new(
         store: Arc<PodStore>,
         status_only: Arc<dyn StateOnlyWriter>,
+        db: crate::datastore::DatastoreHandle,
         controller_dispatcher: ControllerDispatcherSlot,
     ) -> Self {
         Self {
             store,
             status_only,
+            db,
             controller_dispatcher,
         }
     }
@@ -76,7 +79,7 @@ impl PodSubresourceService {
         if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
             &previous,
             &updated.data,
-            self.store.db().as_ref(),
+            self.db.as_ref(),
             &self.controller_dispatcher,
         )
         .await
@@ -134,7 +137,7 @@ impl PodSubresourceService {
         if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
             &previous,
             &updated.data,
-            self.store.db().as_ref(),
+            self.db.as_ref(),
             &self.controller_dispatcher,
         )
         .await
@@ -207,9 +210,10 @@ impl crate::kubelet::pod_repository::PodSubresourcePort for PodSubresourceServic
         pod_uid: Option<&str>,
         status: Value,
         expected_rv: i64,
-    ) -> Result<Resource> {
+    ) -> std::result::Result<Resource, klights_pod_api::PodRepositoryError> {
         self.replace_status_from_api_checked(ns, name, pod_uid, status, expected_rv)
             .await
+            .map_err(|error| map_subresource_error(error, ns, name))
     }
 
     async fn patch_status(
@@ -219,9 +223,10 @@ impl crate::kubelet::pod_repository::PodSubresourcePort for PodSubresourceServic
         patch: Value,
         patch_type: PodStatusPatchType,
         expected_rv: i64,
-    ) -> Result<Resource> {
+    ) -> std::result::Result<Resource, klights_pod_api::PodRepositoryError> {
         self.patch_status_from_api(ns, name, patch, patch_type, expected_rv)
             .await
+            .map_err(|error| map_subresource_error(error, ns, name))
     }
 
     async fn update_ephemeral_containers(
@@ -230,10 +235,31 @@ impl crate::kubelet::pod_repository::PodSubresourcePort for PodSubresourceServic
         name: &str,
         containers: Vec<Value>,
         expected_rv: i64,
-    ) -> Result<Resource> {
+    ) -> std::result::Result<Resource, klights_pod_api::PodRepositoryError> {
         self.update_ephemeral_containers(ns, name, containers, expected_rv)
             .await
+            .map_err(|error| map_subresource_error(error, ns, name))
     }
+}
+
+fn map_subresource_error(
+    error: anyhow::Error,
+    namespace: &str,
+    name: &str,
+) -> klights_pod_api::PodRepositoryError {
+    if let Some(mismatch) = error.downcast_ref::<crate::kubelet::pod_repository::PodUidMismatch>() {
+        return klights_pod_api::PodRepositoryError::uid_mismatch(
+            &mismatch.expected,
+            &mismatch.actual,
+        );
+    }
+    if crate::datastore::errors::is_conflict_error(&error) {
+        return klights_pod_api::PodRepositoryError::conflict(error.to_string());
+    }
+    if error.to_string().contains("Pod not found") {
+        return klights_pod_api::PodRepositoryError::not_found(namespace, name);
+    }
+    klights_pod_api::PodRepositoryError::unavailable(error.to_string())
 }
 
 fn patch_type_to_content_type(p: PodStatusPatchType) -> &'static str {

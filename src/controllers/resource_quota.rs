@@ -4,10 +4,22 @@
 //! expecting status.used to reflect the current count. This reconciler scans all
 //! ResourceQuotas in a namespace and updates their status.used fields.
 
-use crate::datastore::DatastoreBackend;
-use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
+
+#[async_trait]
+pub(crate) trait ResourceQuotaRuntime: Send + Sync {
+    async fn list_quota_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: &str,
+    ) -> Result<Vec<Resource>>;
+    async fn list_namespace_pods(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn write_resource_quota_status(&self, resource: &Resource, status: &Value) -> Result<()>;
+}
 
 /// Map from K8s quota resource name to (apiVersion, kind) for counting.
 /// Only covers the resources tracked in spec.hard that we actually serve.
@@ -149,39 +161,35 @@ fn parse_count_quota_key(resource_name: &str) -> Option<(String, String)> {
 }
 
 /// Count Service resources that match a specific type filter.
-async fn count_services_by_type(db: &dyn DatastoreBackend, namespace: &str, svc_type: &str) -> i64 {
-    db.list_resources(
-        "v1",
-        "Service",
-        Some(namespace),
-        crate::datastore::ResourceListQuery::all(),
-    )
-    .await
-    .map(|list| {
-        list.items
-            .iter()
-            .filter(|s| s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some(svc_type))
-            .count() as i64
-    })
-    .unwrap_or(0)
+async fn count_services_by_type(
+    runtime: &dyn ResourceQuotaRuntime,
+    namespace: &str,
+    svc_type: &str,
+) -> i64 {
+    runtime
+        .list_quota_resources("v1", "Service", namespace)
+        .await
+        .map(|items| {
+            items
+                .iter()
+                .filter(|s| s.data.pointer("/spec/type").and_then(|t| t.as_str()) == Some(svc_type))
+                .count() as i64
+        })
+        .unwrap_or(0)
 }
 
 /// Count live (non-deleted) resources of a given kind in a namespace.
 async fn count_resources(
-    db: &dyn DatastoreBackend,
+    runtime: &dyn ResourceQuotaRuntime,
     api_version: &str,
     kind: &str,
     namespace: &str,
 ) -> i64 {
-    db.list_resources(
-        api_version,
-        kind,
-        Some(namespace),
-        crate::datastore::ResourceListQuery::all(),
-    )
-    .await
-    .map(|list| list.items.len() as i64)
-    .unwrap_or(0)
+    runtime
+        .list_quota_resources(api_version, kind, namespace)
+        .await
+        .map(|items| items.len() as i64)
+        .unwrap_or(0)
 }
 
 /// Check if a pod has `deletionTimestamp` set (terminating).
@@ -409,53 +417,17 @@ pub fn calculate_pod_effective_resource_for_key(
     bucket: &str,
     resource_key: &str,
 ) -> i64 {
-    let mut regular_sum = 0_i64;
-    let mut init_max = 0_i64;
-
-    if let Some(containers) = pod.pointer("/spec/containers").and_then(|v| v.as_array()) {
-        for c in containers {
-            let quantity = c
-                .get("resources")
-                .and_then(|r| r.get(bucket))
-                .and_then(|m| m.get(resource_key))
-                .and_then(|v| v.as_str())
-                .and_then(|q| parse_resource_quantity(resource_key, q))
-                .unwrap_or(0);
-            regular_sum += quantity;
-        }
-    }
-
-    if let Some(init_containers) = pod
-        .pointer("/spec/initContainers")
-        .and_then(|v| v.as_array())
-    {
-        for c in init_containers {
-            let quantity = c
-                .get("resources")
-                .and_then(|r| r.get(bucket))
-                .and_then(|m| m.get(resource_key))
-                .and_then(|v| v.as_str())
-                .and_then(|q| parse_resource_quantity(resource_key, q))
-                .unwrap_or(0);
-            init_max = init_max.max(quantity);
-        }
-    }
-
-    regular_sum.max(init_max)
+    klights_types::calculate_pod_effective_resource_for_key(pod, bucket, resource_key)
 }
 
 async fn sum_pod_resource_quota_resource(
-    pod_reader: &dyn PodReader,
+    runtime: &dyn ResourceQuotaRuntime,
     namespace: &str,
     resource_quota: &Value,
     bucket: &'static str,
     resource_key: &str,
 ) -> Option<String> {
-    let pods = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
-        .await
-        .ok()?
-        .items;
+    let pods = runtime.list_namespace_pods(namespace).await.ok()?;
 
     let mut total = 0_i64;
     for pod in pods {
@@ -473,17 +445,14 @@ async fn sum_pod_resource_quota_resource(
     Some(format_resource_quantity(resource_key, total))
 }
 
-async fn sum_pvc_requested_storage(db: &dyn DatastoreBackend, namespace: &str) -> Option<String> {
-    let pvcs = db
-        .list_resources(
-            "v1",
-            "PersistentVolumeClaim",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+async fn sum_pvc_requested_storage(
+    runtime: &dyn ResourceQuotaRuntime,
+    namespace: &str,
+) -> Option<String> {
+    let pvcs = runtime
+        .list_quota_resources("v1", "PersistentVolumeClaim", namespace)
         .await
-        .ok()?
-        .items;
+        .ok()?;
 
     let mut total = 0_i64;
     for pvc in pvcs {
@@ -505,15 +474,12 @@ async fn sum_pvc_requested_storage(db: &dyn DatastoreBackend, namespace: &str) -
 
 /// Count pods that match the given scope selector, or all pods if scopes is empty.
 async fn count_pods_with_scope(
-    pod_reader: &dyn PodReader,
+    runtime: &dyn ResourceQuotaRuntime,
     namespace: &str,
     resource_quota: &Value,
 ) -> i64 {
-    let pods = match pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
-        .await
-    {
-        Ok(list) => list.items,
+    let pods = match runtime.list_namespace_pods(namespace).await {
+        Ok(items) => items,
         Err(_) => return 0,
     };
 
@@ -524,8 +490,7 @@ async fn count_pods_with_scope(
 }
 
 async fn calculate_resource_quota_status(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+    runtime: &dyn ResourceQuotaRuntime,
     namespace: &str,
     rq: &Value,
 ) -> Option<(serde_json::Map<String, Value>, Value)> {
@@ -557,36 +522,36 @@ async fn calculate_resource_quota_status(
                 resource_key,
             } => {
                 if let Some(pod_used) =
-                    sum_pod_resource_quota_resource(pod_reader, namespace, rq, bucket, resource_key)
+                    sum_pod_resource_quota_resource(runtime, namespace, rq, bucket, resource_key)
                         .await
                 {
                     used.insert(resource_name.clone(), json!(pod_used));
                 }
             }
             QuotaUsageKind::PvcRequestedStorage => {
-                if let Some(storage_used) = sum_pvc_requested_storage(db, namespace).await {
+                if let Some(storage_used) = sum_pvc_requested_storage(runtime, namespace).await {
                     used.insert(resource_name.clone(), json!(storage_used));
                 }
             }
             QuotaUsageKind::ServiceNodePorts => {
-                let np = count_services_by_type(db, namespace, "NodePort").await;
-                let lb = count_services_by_type(db, namespace, "LoadBalancer").await;
+                let np = count_services_by_type(runtime, namespace, "NodePort").await;
+                let lb = count_services_by_type(runtime, namespace, "LoadBalancer").await;
                 used.insert(resource_name.clone(), json!((np + lb).to_string()));
             }
             QuotaUsageKind::ServiceLoadBalancers => {
-                let count = count_services_by_type(db, namespace, "LoadBalancer").await;
+                let count = count_services_by_type(runtime, namespace, "LoadBalancer").await;
                 used.insert(resource_name.clone(), json!(count.to_string()));
             }
             QuotaUsageKind::Pods => {
-                let count = count_pods_with_scope(pod_reader, namespace, rq).await;
+                let count = count_pods_with_scope(runtime, namespace, rq).await;
                 used.insert(resource_name.clone(), json!(count.to_string()));
             }
             QuotaUsageKind::CountResource { api_version, kind } => {
-                let count = count_resources(db, api_version, kind, namespace).await;
+                let count = count_resources(runtime, api_version, kind, namespace).await;
                 used.insert(resource_name.clone(), json!(count.to_string()));
             }
             QuotaUsageKind::CountKey { api_version, kind } => {
-                let count = count_resources(db, &api_version, &kind, namespace).await;
+                let count = count_resources(runtime, &api_version, &kind, namespace).await;
                 used.insert(resource_name.clone(), json!(count.to_string()));
             }
         };
@@ -604,31 +569,26 @@ fn resource_quota_status_value(hard: serde_json::Map<String, Value>, used: Value
 
 /// Reconcile all ResourceQuotas in a namespace by updating status.used counts.
 /// Called after any namespaced resource create or delete.
-pub async fn reconcile_resource_quotas_for_namespace(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+pub(crate) async fn reconcile_resource_quotas_with_runtime(
+    runtime: &dyn ResourceQuotaRuntime,
     namespace: &str,
 ) -> Result<()> {
     // List all ResourceQuotas in the namespace
-    let rq_list = db
-        .list_resources(
-            "v1",
-            "ResourceQuota",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
+    let rq_list = runtime
+        .list_quota_resources("v1", "ResourceQuota", namespace)
         .await?;
 
-    for rq_resource in rq_list.items {
+    for rq_resource in rq_list {
         let rq = &rq_resource.data;
 
-        let Some((hard, used_map)) =
-            calculate_resource_quota_status(db, pod_reader, namespace, rq).await
+        let Some((hard, used_map)) = calculate_resource_quota_status(runtime, namespace, rq).await
         else {
             continue;
         };
         let status = resource_quota_status_value(hard, used_map);
-        crate::controllers::common::write_status_for_resource(db, &rq_resource, &status).await?;
+        runtime
+            .write_resource_quota_status(&rq_resource, &status)
+            .await?;
     }
 
     Ok(())

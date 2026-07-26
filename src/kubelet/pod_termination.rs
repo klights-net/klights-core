@@ -39,29 +39,26 @@ pub fn termination_message_policy(container_spec: Option<&Value>) -> &str {
 /// Returns the host-side file path for a container's termination message log.
 /// Pattern mirrors the /etc/hosts host path under KLIGHTS_DATA_ROOT.
 pub fn termination_log_host_path(
-    containerd_ns: &str,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     namespace: &str,
     pod_name: &str,
     container_name: &str,
 ) -> String {
-    crate::paths::containerd_termination_log_path(
-        containerd_ns,
-        namespace,
-        pod_name,
-        container_name,
-    )
-    .to_string_lossy()
-    .into_owned()
+    paths
+        .containerd_termination_log(namespace, pod_name, container_name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn container_log_host_path(
-    containerd_ns: &str,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     namespace: &str,
     pod_name: &str,
     pod_uid: &str,
     container_name: &str,
 ) -> String {
-    crate::paths::pod_log_dir_path(containerd_ns, namespace, pod_name, pod_uid)
+    paths
+        .pod_log_dir(namespace, pod_name, pod_uid)
         .join(container_name)
         .join("0.log")
         .to_string_lossy()
@@ -213,12 +210,12 @@ pub fn read_termination_message_with_fallback(
 
 pub async fn ensure_termination_log_host_file(
     file_process: &klights_supervisor::FileProcessExecutor,
-    containerd_ns: &str,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     namespace: &str,
     pod_name: &str,
     container_name: &str,
 ) -> String {
-    let path = termination_log_host_path(containerd_ns, namespace, pod_name, container_name);
+    let path = termination_log_host_path(paths, namespace, pod_name, container_name);
     crate::kubelet::pod_fs::PodFs::ensure_termination_log(
         file_process,
         std::path::PathBuf::from(&path),
@@ -232,7 +229,11 @@ mod tests {
 
     #[test]
     fn test_termination_log_host_path_returns_expected_path() {
-        let path = termination_log_host_path("klights", "default", "mypod", "mycontainer");
+        let runtime_paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+            crate::paths::data_root_path("klights"),
+        )
+        .unwrap();
+        let path = termination_log_host_path(&runtime_paths, "default", "mypod", "mycontainer");
         assert_eq!(
             path,
             crate::paths::containerd_termination_log_path(

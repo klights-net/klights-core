@@ -23,14 +23,19 @@ use crate::datastore::DatastoreBackend;
 use crate::datastore::command::StorageCommand;
 use crate::replication::protocol::ForwardedResource;
 use klights_reconcile_api::{
-    ControllerReconcileSink, GcPodDeleteSink, ReconcileKey, ServiceReconcileKey,
-    ServiceReconcileSink,
+    ControllerReconcileSink, GcNonPodFinalizationPort, GcPodDeleteSink, ReconcileKey,
+    ServiceReconcileKey, ServiceReconcileSink,
 };
 
+pub struct PodSideEffectSinks<'a> {
+    pub controller: Option<&'a dyn ControllerReconcileSink>,
+    pub service: Option<&'a dyn ServiceReconcileSink>,
+    pub pod_delete: Option<&'a dyn GcPodDeleteSink>,
+    pub non_pod_finalization: Option<&'a dyn GcNonPodFinalizationPort>,
+}
+
 pub async fn handle_applied_pod_side_effects(
-    controller_sink: Option<&dyn ControllerReconcileSink>,
-    service_sink: Option<&dyn ServiceReconcileSink>,
-    gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
+    sinks: PodSideEffectSinks<'_>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     pod_endpoint_effect: crate::datastore::PodEndpointEffect,
@@ -40,17 +45,31 @@ pub async fn handle_applied_pod_side_effects(
     // cascade is the one mandatory delivery in this group: absence or a
     // transient failure must keep the worker's durable outbox item pending so
     // an idempotent replay can use the persisted exact delete receipt.
-    cascade_dependents_after_actor_pod_delete(gc_pod_delete_sink, command, resource, db).await?;
+    cascade_dependents_after_actor_pod_delete(
+        sinks.pod_delete,
+        sinks.non_pod_finalization,
+        command,
+        resource,
+        db,
+    )
+    .await?;
     enqueue_pod_status_side_effects_with_endpoint_change(
-        controller_sink,
-        service_sink,
+        sinks.controller,
+        sinks.service,
         command,
         resource,
         pod_endpoint_effect,
         db,
     )
     .await;
-    finalize_foreground_owners_after_pod_delete(gc_pod_delete_sink, command, resource, db).await;
+    finalize_foreground_owners_after_pod_delete(
+        sinks.pod_delete,
+        sinks.non_pod_finalization,
+        command,
+        resource,
+        db,
+    )
+    .await;
     reconcile_namespace_after_pod_delete(command, resource, db).await;
     Ok(())
 }
@@ -205,6 +224,7 @@ async fn enqueue_service_keys(
 
 async fn finalize_foreground_owners_after_pod_delete(
     gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
+    non_pod_finalization: Option<&dyn GcNonPodFinalizationPort>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
@@ -224,12 +244,16 @@ async fn finalize_foreground_owners_after_pod_delete(
     let Some(gc_pod_delete_sink) = gc_pod_delete_sink else {
         return;
     };
+    let Some(non_pod_finalization) = non_pod_finalization else {
+        return;
+    };
 
     let deleted_resource = resource.clone().into_resource();
     if let Err(err) = crate::controllers::gc::finalize_foreground_owners_after_dependent_delete(
         db,
         &deleted_resource,
         gc_pod_delete_sink,
+        non_pod_finalization,
     )
     .await
     {
@@ -245,6 +269,7 @@ async fn finalize_foreground_owners_after_pod_delete(
 
 async fn cascade_dependents_after_actor_pod_delete(
     gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
+    non_pod_finalization: Option<&dyn GcNonPodFinalizationPort>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
@@ -257,6 +282,9 @@ async fn cascade_dependents_after_actor_pod_delete(
     })?;
     let gc_pod_delete_sink = gc_pod_delete_sink.ok_or_else(|| {
         "committed bound Pod finalization has no dependent-cascade sink".to_string()
+    })?;
+    let non_pod_finalization = non_pod_finalization.ok_or_else(|| {
+        "committed bound Pod finalization has no non-Pod finalization port".to_string()
     })?;
     let namespace = resource.namespace.clone().or_else(|| {
         resource
@@ -281,6 +309,7 @@ async fn cascade_dependents_after_actor_pod_delete(
         &resource.kind,
         namespace,
         gc_pod_delete_sink,
+        non_pod_finalization,
     )
     .await
     .map_err(|error| {
@@ -554,9 +583,14 @@ mod tests {
         let sink = RecordingPodDeleteSink::default();
 
         let missing_sink = handle_applied_pod_side_effects(
-            None,
-            None,
-            None,
+            PodSideEffectSinks {
+                controller: None,
+                service: None,
+                pod_delete: None,
+                non_pod_finalization: Some(
+                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+                ),
+            },
             &command,
             Some(&receipt),
             crate::datastore::PodEndpointEffect::NotApplicable,
@@ -567,9 +601,14 @@ mod tests {
         assert!(missing_sink.contains("no dependent-cascade sink"));
 
         handle_applied_pod_side_effects(
-            None,
-            None,
-            Some(&sink),
+            PodSideEffectSinks {
+                controller: None,
+                service: None,
+                pod_delete: Some(&sink),
+                non_pod_finalization: Some(
+                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+                ),
+            },
             &command,
             Some(&receipt),
             crate::datastore::PodEndpointEffect::NotApplicable,
@@ -578,9 +617,14 @@ mod tests {
         .await
         .unwrap();
         let missing_receipt = handle_applied_pod_side_effects(
-            None,
-            None,
-            Some(&sink),
+            PodSideEffectSinks {
+                controller: None,
+                service: None,
+                pod_delete: Some(&sink),
+                non_pod_finalization: Some(
+                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+                ),
+            },
             &command,
             None,
             crate::datastore::PodEndpointEffect::NotApplicable,
@@ -651,9 +695,14 @@ mod tests {
         let sink = FailOncePodDeleteSink::default();
 
         let first = handle_applied_pod_side_effects(
-            None,
-            None,
-            Some(&sink),
+            PodSideEffectSinks {
+                controller: None,
+                service: None,
+                pod_delete: Some(&sink),
+                non_pod_finalization: Some(
+                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+                ),
+            },
             &command,
             Some(&receipt),
             crate::datastore::PodEndpointEffect::NotApplicable,
@@ -664,9 +713,14 @@ mod tests {
         assert!(first.contains("transient leader-side delete failure"));
 
         handle_applied_pod_side_effects(
-            None,
-            None,
-            Some(&sink),
+            PodSideEffectSinks {
+                controller: None,
+                service: None,
+                pod_delete: Some(&sink),
+                non_pod_finalization: Some(
+                    crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+                ),
+            },
             &command,
             Some(&receipt),
             crate::datastore::PodEndpointEffect::NotApplicable,

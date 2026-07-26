@@ -1,7 +1,39 @@
 use std::path::{Path, PathBuf};
 
-const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024;
-const DEFAULT_MAX_FILES: usize = 5;
+pub const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_FILES: usize = 5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogRotationPolicy {
+    max_size: u64,
+    max_files: usize,
+}
+
+impl LogRotationPolicy {
+    pub fn new(max_size: u64, max_files: usize) -> Option<Self> {
+        (max_size > 0 && max_files >= 2).then_some(Self {
+            max_size,
+            max_files,
+        })
+    }
+
+    pub fn max_size(self) -> u64 {
+        self.max_size
+    }
+
+    pub fn max_files(self) -> usize {
+        self.max_files
+    }
+}
+
+impl Default for LogRotationPolicy {
+    fn default() -> Self {
+        Self {
+            max_size: DEFAULT_MAX_SIZE,
+            max_files: DEFAULT_MAX_FILES,
+        }
+    }
+}
 
 /// Pre-computed plan for one container's log rotation. Pure data: the
 /// caller (under a supervised filesystem boundary) executes the
@@ -43,34 +75,13 @@ pub fn build_rotation_plan(
     })
 }
 
-pub fn get_max_log_size() -> u64 {
-    std::env::var("KLIGHTS_LOG_MAX_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_SIZE)
-}
-
-pub fn get_max_log_files() -> usize {
-    std::env::var("KLIGHTS_LOG_MAX_FILES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_FILES)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
-    }
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -113,38 +124,22 @@ mod tests {
     }
 
     #[test]
-    fn test_get_max_log_size_uses_default() {
-        let _guard = env_lock();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_LOG_MAX_SIZE") };
-        assert_eq!(get_max_log_size(), 10 * 1024 * 1024);
+    fn log_rotation_policy_has_stable_defaults() {
+        let policy = LogRotationPolicy::default();
+        assert_eq!(policy.max_size(), 10 * 1024 * 1024);
+        assert_eq!(policy.max_files(), 5);
     }
 
     #[test]
-    fn test_get_max_log_size_uses_env_var() {
-        let _guard = env_lock();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_LOG_MAX_SIZE", "5242880") };
-        assert_eq!(get_max_log_size(), 5242880);
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_LOG_MAX_SIZE") };
-    }
-
-    #[test]
-    fn test_get_max_log_files_uses_default() {
-        let _guard = env_lock();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_LOG_MAX_FILES") };
-        assert_eq!(get_max_log_files(), 5);
-    }
-
-    #[test]
-    fn test_get_max_log_files_uses_env_var() {
-        let _guard = env_lock();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_LOG_MAX_FILES", "10") };
-        assert_eq!(get_max_log_files(), 10);
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_LOG_MAX_FILES") };
+    fn log_rotation_policy_rejects_non_rotating_limits() {
+        assert_eq!(LogRotationPolicy::new(0, 5), None);
+        assert_eq!(LogRotationPolicy::new(1024, 1), None);
+        assert_eq!(
+            LogRotationPolicy::new(1024, 3),
+            Some(LogRotationPolicy {
+                max_size: 1024,
+                max_files: 3,
+            })
+        );
     }
 }

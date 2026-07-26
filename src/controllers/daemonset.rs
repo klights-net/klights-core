@@ -1,9 +1,34 @@
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_pod_api::{PodOwnerListRequest, PodQuery};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing;
+
+#[async_trait]
+pub trait DaemonSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+    async fn list_controller_revisions(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn create_controller_revision(
+        &self,
+        namespace: &str,
+        name: &str,
+        revision: Value,
+    ) -> Result<Resource>;
+    async fn list_nodes(&self) -> Result<Vec<Resource>>;
+    async fn update_daemonset_status(&self, resource: &Resource, status: Value) -> Result<()>;
+}
+
+#[async_trait]
+pub trait DaemonSetPodMutation: Send + Sync {
+    async fn create_daemonset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> Result<Resource>;
+}
 
 /// Compute a deterministic hash of the pod template for change detection.
 /// Uses SHA256 which is stable across process restarts.
@@ -48,29 +73,22 @@ struct ResolvedControllerRevision {
 }
 
 async fn resolve_controller_revision_for_template(
-    db: &dyn DatastoreBackend,
+    db: &(impl DaemonSetStore + ?Sized),
     namespace: &str,
     daemonset_name: &str,
     daemonset_uid: &str,
     template: &Value,
 ) -> Result<ResolvedControllerRevision> {
     let data = daemonset_template_patch(template);
-    let revisions = db
-        .list_resources(
-            "apps/v1",
-            "ControllerRevision",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let revisions = db.list_controller_revisions(namespace).await?;
     tracing::info!(
         target: "klights::daemonset::controller_revision",
         ds = %daemonset_name,
         ns = %namespace,
-        existing_revisions = revisions.items.len(),
+        existing_revisions = revisions.len(),
         "resolve_controller_revision: listed existing revisions"
     );
-    for revision in revisions.items {
+    for revision in revisions {
         if !crate::controllers::common::is_owned_by(&revision.data, daemonset_uid) {
             continue;
         }
@@ -110,20 +128,13 @@ async fn resolve_controller_revision_for_template(
 }
 
 async fn controller_revision_names_by_hash(
-    db: &dyn DatastoreBackend,
+    db: &(impl DaemonSetStore + ?Sized),
     namespace: &str,
     daemonset_uid: &str,
 ) -> Result<std::collections::HashMap<String, String>> {
-    let revisions = db
-        .list_resources(
-            "apps/v1",
-            "ControllerRevision",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let revisions = db.list_controller_revisions(namespace).await?;
     let mut by_hash = std::collections::HashMap::new();
-    for revision in revisions.items {
+    for revision in revisions {
         if !crate::controllers::common::is_owned_by(&revision.data, daemonset_uid) {
             continue;
         }
@@ -171,6 +182,7 @@ fn deleting_pod_blocks_daemonset_replacement(pod: &Value, current_template_hash:
 #[derive(Debug)]
 struct DaemonSetPodChoice {
     name: String,
+    uid: String,
     hash_matches: bool,
     not_terminating: bool,
     ready: bool,
@@ -181,6 +193,7 @@ struct DaemonSetPodChoice {
 #[derive(Debug)]
 struct DaemonSetPodOnNode {
     name: String,
+    uid: String,
     hash: String,
     available: bool,
 }
@@ -199,9 +212,10 @@ fn pod_ready(pod: &Value) -> bool {
 
 fn duplicate_daemonset_pods_to_delete(
     pods: &[Resource],
+    pod_namespace: &str,
     matching_node_names: &std::collections::HashSet<String>,
     current_template_hash: &str,
-) -> Vec<String> {
+) -> Vec<klights_types::PodIdentity> {
     let mut pods_by_node: std::collections::HashMap<String, Vec<DaemonSetPodChoice>> =
         std::collections::HashMap::new();
 
@@ -220,6 +234,9 @@ fn duplicate_daemonset_pods_to_delete(
         let Some(pod_name) = pod.data.pointer("/metadata/name").and_then(|v| v.as_str()) else {
             continue;
         };
+        let Some(pod_uid) = pod.data.pointer("/metadata/uid").and_then(|v| v.as_str()) else {
+            continue;
+        };
 
         let phase = pod
             .data
@@ -231,6 +248,7 @@ fn duplicate_daemonset_pods_to_delete(
             .or_default()
             .push(DaemonSetPodChoice {
                 name: pod_name.to_string(),
+                uid: pod_uid.to_string(),
                 hash_matches: pod_revision_hash(&pod.data) == Some(current_template_hash),
                 not_terminating: pod.data.pointer("/metadata/deletionTimestamp").is_none(),
                 ready: pod_ready(&pod.data),
@@ -244,7 +262,7 @@ fn duplicate_daemonset_pods_to_delete(
             });
     }
 
-    let mut delete_names = Vec::new();
+    let mut delete_identities = Vec::new();
     for candidates in pods_by_node.values_mut() {
         if candidates.len() <= 1 {
             continue;
@@ -258,10 +276,15 @@ fn duplicate_daemonset_pods_to_delete(
                 .then_with(|| a.creation_timestamp.cmp(&b.creation_timestamp))
                 .then_with(|| a.name.cmp(&b.name))
         });
-        delete_names.extend(candidates.iter().skip(1).map(|pod| pod.name.clone()));
+        delete_identities.extend(
+            candidates
+                .iter()
+                .skip(1)
+                .map(|pod| klights_types::PodIdentity::new(pod_namespace, &pod.name, &pod.uid)),
+        );
     }
-    delete_names.sort();
-    delete_names
+    delete_identities.sort_by(|left, right| left.name.cmp(&right.name));
+    delete_identities
 }
 
 /// Compare two ControllerRevision JSON values while ignoring server-set
@@ -334,7 +357,7 @@ struct DaemonSetRevisionInput<'a> {
 }
 
 async fn ensure_controller_revision(
-    db: &dyn DatastoreBackend,
+    db: &(impl DaemonSetStore + ?Sized),
     input: DaemonSetRevisionInput<'_>,
 ) -> Result<()> {
     let data = daemonset_template_patch(input.template);
@@ -456,13 +479,7 @@ async fn ensure_controller_revision(
                 "creating new ControllerRevision"
             );
             match db
-                .create_resource(
-                    "apps/v1",
-                    "ControllerRevision",
-                    Some(input.namespace),
-                    input.revision_name,
-                    desired,
-                )
+                .create_controller_revision(input.namespace, input.revision_name, desired)
                 .await
             {
                 Ok(resource) => {
@@ -491,39 +508,23 @@ async fn ensure_controller_revision(
 }
 
 async fn has_any_controller_revision(
-    db: &dyn DatastoreBackend,
+    db: &(impl DaemonSetStore + ?Sized),
     namespace: &str,
     daemonset_uid: &str,
 ) -> Result<bool> {
-    let revisions = db
-        .list_resources(
-            "apps/v1",
-            "ControllerRevision",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let revisions = db.list_controller_revisions(namespace).await?;
     Ok(revisions
-        .items
         .iter()
         .any(|revision| crate::controllers::common::is_owned_by(&revision.data, daemonset_uid)))
 }
 
 async fn next_controller_revision_number(
-    db: &dyn DatastoreBackend,
+    db: &(impl DaemonSetStore + ?Sized),
     namespace: &str,
     daemonset_uid: &str,
 ) -> Result<i64> {
-    let revisions = db
-        .list_resources(
-            "apps/v1",
-            "ControllerRevision",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let revisions = db.list_controller_revisions(namespace).await?;
     let max_revision = revisions
-        .items
         .iter()
         .filter(|revision| crate::controllers::common::is_owned_by(&revision.data, daemonset_uid))
         .filter_map(|revision| revision.data.get("revision").and_then(|v| v.as_i64()))
@@ -552,7 +553,7 @@ fn node_matches_template_selector(node: &Value, template: &Value) -> bool {
 }
 
 async fn live_daemonset_active(
-    db: &dyn DatastoreBackend,
+    db: &(impl DaemonSetStore + ?Sized),
     namespace: &str,
     name: &str,
 ) -> Result<bool> {
@@ -571,10 +572,11 @@ async fn live_daemonset_active(
 /// Reconcile a DaemonSet by ensuring one pod exists per node.
 /// Phase 1 (single-node): creates exactly one pod for the local node.
 pub async fn reconcile_daemonset(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    db: &(impl DaemonSetStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
+    pod_writer: &(impl DaemonSetPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     daemonset: &Value,
 ) -> Result<()> {
     let common = crate::controllers::common::controller_common();
@@ -601,6 +603,7 @@ pub async fn reconcile_daemonset(
         db,
         live_resource.clone(),
         pod_delete_sink,
+        non_pod_finalization,
     )
     .await?
     {
@@ -616,8 +619,10 @@ pub async fn reconcile_daemonset(
         }
         _ => live_resource,
     };
-    let daemonset =
-        crate::api::inject_resource_version(live_resource.data, live_resource.resource_version);
+    let daemonset = crate::controllers::resource_projection::with_resource_version(
+        live_resource.data,
+        live_resource.resource_version,
+    );
 
     let metadata = daemonset
         .get("metadata")
@@ -709,16 +714,8 @@ pub async fn reconcile_daemonset(
     // List all nodes, then restrict scheduling to nodes that match the
     // DaemonSet pod template's nodeSelector. Kubernetes DaemonSets do not
     // create pods on nodes that cannot run the template.
-    let node_list = db
-        .list_resources(
-            "v1",
-            "Node",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let node_list = db.list_nodes().await?;
     let matching_nodes: Vec<_> = node_list
-        .items
         .iter()
         .filter(|node| node_matches_template_selector(&node.data, template))
         .collect();
@@ -733,7 +730,9 @@ pub async fn reconcile_daemonset(
         .collect();
 
     // List existing pods owned by this DaemonSet
-    let owned_pod_resources = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let owned_pod_resources = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
 
     // Build map: node_name -> current pod state used for non-surge rolling updates.
     let mut node_to_pod: std::collections::HashMap<String, DaemonSetPodOnNode> =
@@ -765,6 +764,12 @@ pub async fn reconcile_daemonset(
                 node_name.to_string(),
                 DaemonSetPodOnNode {
                     name: pod_name,
+                    uid: pod_resource
+                        .data
+                        .pointer("/metadata/uid")
+                        .and_then(|uid| uid.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     hash: pod_hash,
                     available,
                 },
@@ -790,10 +795,10 @@ pub async fn reconcile_daemonset(
                 }
                 Some(pod) => {
                     if !pod.available {
-                        allowed_replacement_pods.push(pod.name.clone());
+                        allowed_replacement_pods.push((pod.name.clone(), pod.uid.clone()));
                         num_unavailable += 1;
                     } else {
-                        candidate_pods_to_delete.push(pod.name.clone());
+                        candidate_pods_to_delete.push((pod.name.clone(), pod.uid.clone()));
                     }
                 }
             }
@@ -808,14 +813,22 @@ pub async fn reconcile_daemonset(
                 .take(remaining_unavailable),
         );
 
-        for pod_name in old_pods_to_delete {
-            pod_writer.delete_pod(namespace, &pod_name).await?;
+        for (pod_name, pod_uid) in old_pods_to_delete {
+            if !pod_uid.is_empty() {
+                pod_delete_sink
+                    .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                        klights_types::PodIdentity::new(namespace, &pod_name, &pod_uid),
+                    ))
+                    .await?;
+            }
         }
     }
     // OnDelete strategy: do nothing, users must manually delete pods
 
     // Re-list pods after potential deletions
-    let owned_pod_resources_updated = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let owned_pod_resources_updated = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
 
     // Delete Failed/Succeeded pods so replacements can be created
     for pod_resource in &owned_pod_resources_updated {
@@ -833,11 +846,20 @@ pub async fn reconcile_daemonset(
                 .pointer("/metadata/name")
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            if !pod_name.is_empty() {
+            let pod_uid = pod_resource
+                .data
+                .pointer("/metadata/uid")
+                .and_then(|uid| uid.as_str())
+                .unwrap_or("");
+            if !pod_name.is_empty() && !pod_uid.is_empty() {
                 // Surface delete failures so the controller's retry loop can
                 // re-attempt cleanup; silently dropping the error leaves the
                 // Failed/Succeeded pod in place without observability.
-                pod_writer.delete_pod(namespace, pod_name).await?;
+                pod_delete_sink
+                    .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                        klights_types::PodIdentity::new(namespace, pod_name, pod_uid),
+                    ))
+                    .await?;
             }
         }
     }
@@ -845,7 +867,9 @@ pub async fn reconcile_daemonset(
     // Re-list again after deleting terminated pods. Delete pods that are now
     // misscheduled because node labels or the template nodeSelector changed;
     // replacements are created below only for matching nodes.
-    let mut owned_pod_resources_active = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let mut owned_pod_resources_active = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     for pod_resource in &owned_pod_resources_active {
         if pod_is_deleting(&pod_resource.data) {
             continue;
@@ -858,33 +882,52 @@ pub async fn reconcile_daemonset(
             continue;
         };
         if !matching_node_names.contains(node_name)
-            && let Some(pod_name) = pod_resource
-                .data
-                .pointer("/metadata/name")
-                .and_then(|n| n.as_str())
+            && let (Some(pod_name), Some(pod_uid)) = (
+                pod_resource
+                    .data
+                    .pointer("/metadata/name")
+                    .and_then(|n| n.as_str()),
+                pod_resource
+                    .data
+                    .pointer("/metadata/uid")
+                    .and_then(|uid| uid.as_str()),
+            )
         {
-            pod_writer.delete_pod(namespace, pod_name).await?;
+            pod_delete_sink
+                .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                    klights_types::PodIdentity::new(namespace, pod_name, pod_uid),
+                ))
+                .await?;
         }
     }
 
-    owned_pod_resources_active = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    owned_pod_resources_active = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     let duplicate_pod_names = duplicate_daemonset_pods_to_delete(
         &owned_pod_resources_active,
+        namespace,
         &matching_node_names,
         &current_template_hash,
     );
-    for pod_name in &duplicate_pod_names {
+    for pod_identity in &duplicate_pod_names {
         tracing::info!(
             target: "klights::daemonset::reconcile",
             ds = %name,
             ns = %namespace,
-            pod = %pod_name,
+            pod = %pod_identity.name,
             "deleting duplicate DaemonSet pod on node"
         );
-        pod_writer.delete_pod(namespace, pod_name).await?;
+        pod_delete_sink
+            .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                pod_identity.clone(),
+            ))
+            .await?;
     }
     if !duplicate_pod_names.is_empty() {
-        owned_pod_resources_active = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+        owned_pod_resources_active = pod_reader
+            .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+            .await?;
     }
 
     let mut current_node_pods: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -959,13 +1002,15 @@ pub async fn reconcile_daemonset(
         }
 
         pod_writer
-            .create_controller_pod(namespace, &pod_name, node_name, pod)
+            .create_daemonset_pod(namespace, &pod_name, node_name, pod)
             .await?;
     }
 
     // Update DaemonSet status
     let desired = matching_nodes.len() as i64;
-    let final_pod_count = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let final_pod_count = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     let active_final_pods: Vec<_> = final_pod_count
         .iter()
         .filter(|pod| !pod_is_deleting(&pod.data))
@@ -1029,19 +1074,20 @@ pub async fn reconcile_daemonset(
         .get_resource("apps/v1", "DaemonSet", Some(namespace), name)
         .await?
     {
-        Some(r) => crate::api::inject_resource_version(r.data, r.resource_version),
+        Some(resource) => resource,
         None => return Ok(()),
     };
     // Update observedGeneration from the fresh read
     status["observedGeneration"] = json!(
         fresh_ds
+            .data
             .get("metadata")
             .and_then(|m| m.get("generation"))
             .and_then(|g| g.as_i64())
             .unwrap_or(0)
     );
 
-    crate::controllers::common::write_status(db, &fresh_ds, &status).await?;
+    db.update_daemonset_status(&fresh_ds, status).await?;
 
     tracing::info!(
         target: "klights::daemonset::reconcile",

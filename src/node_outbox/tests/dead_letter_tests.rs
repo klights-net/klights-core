@@ -6,11 +6,31 @@ use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::{DeadLetterTestInsert, NodeLocalHandle, OutboxInsert};
 use crate::datastore::node_local::{SqliteNodeLocalDb, selector};
 use crate::datastore::sqlite::{DbExecutor, opener};
-use crate::kubelet::outbox::payload::OutboxPayload;
+use crate::node_outbox::payload::OutboxPayload;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
+}
+
+fn pod_status_classification() -> klights_node_store::OutboxClassification {
+    klights_node_store::OutboxClassification::try_new(
+        klights_node_store::OutboxPriority::Workload,
+        klights_node_store::OutboxSupersedability::PodStatus,
+        klights_node_store::TerminalDeleteClassification::NotTerminalDelete,
+        klights_node_store::OutboxSequencePolicy::PerSubject,
+    )
+    .expect("valid Pod status classification")
+}
+
+fn terminal_delete_classification() -> klights_node_store::OutboxClassification {
+    klights_node_store::OutboxClassification::try_new(
+        klights_node_store::OutboxPriority::Workload,
+        klights_node_store::OutboxSupersedability::Never,
+        klights_node_store::TerminalDeleteClassification::ActorOwnedPodDelete,
+        klights_node_store::OutboxSequencePolicy::PerSubject,
+    )
+    .expect("valid actor-owned terminal delete classification")
 }
 
 async fn node_db() -> NodeLocalHandle {
@@ -96,6 +116,7 @@ async fn dead_letter_after_max_attempts() {
         operation: "PodStatus".to_string(),
         payload_proto: pod_status_payload_bytes("default", "web", "uid-1"),
         next_due_ms: 1000,
+        classification: pod_status_classification(),
     })
     .await
     .expect("enqueue");
@@ -157,7 +178,9 @@ async fn replay_dead_letter_re_enqueues_with_attempt_zero() {
     .expect("insert dead letter");
 
     // Replay it
-    ndb.replay_dead_letter(1).await.expect("replay dead letter");
+    ndb.replay_dead_letter(1, pod_status_classification())
+        .await
+        .expect("replay dead letter");
 
     // Dead letter should be empty
     let dead_rows = ndb.list_dead_letter().await.expect("list dead letter");
@@ -200,6 +223,7 @@ async fn outbox_durability_dead_letter_replay_preserves_stream_position() {
         operation: "PodStatus".to_string(),
         payload_proto: pod_status_payload_bytes("default", "replay-position", "uid-1"),
         next_due_ms: 1_000,
+        classification: pod_status_classification(),
     })
     .await
     .expect("enqueue sequenced row");
@@ -214,7 +238,11 @@ async fn outbox_durability_dead_letter_replay_preserves_stream_position() {
             .await
             .expect("move to dead letter")
     );
-    assert!(ndb.replay_dead_letter(1).await.expect("replay dead letter"));
+    assert!(
+        ndb.replay_dead_letter(1, pod_status_classification())
+            .await
+            .expect("replay dead letter")
+    );
 
     let replayed = ndb
         .claim_next_due_outbox(now_ms() + 86_400_000, 1_000, "replay-lease")
@@ -248,6 +276,7 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
         operation: "PodStatus".to_string(),
         payload_proto: pod_status_payload_bytes("default", "strict-replay", "uid-1"),
         next_due_ms: 1_000,
+        classification: pod_status_classification(),
     })
     .await
     .expect("enqueue stream head");
@@ -264,6 +293,7 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
         operation: "PodMetadata".to_string(),
         payload_proto: pod_delete_payload_bytes("default", "strict-replay", "uid-1"),
         next_due_ms: 1_001,
+        classification: terminal_delete_classification(),
     })
     .await
     .expect("enqueue terminal successor");
@@ -294,7 +324,11 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
         "blocked younger work must not create an idle wake loop after restart"
     );
 
-    assert!(ndb.replay_dead_letter(1).await.expect("replay exact head"));
+    assert!(
+        ndb.replay_dead_letter(1, pod_status_classification())
+            .await
+            .expect("replay exact head")
+    );
     assert!(
         ndb.next_outbox_wake_ms(far_future)
             .await
@@ -309,6 +343,12 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
         .expect("replayed head must be claimable");
     assert_eq!(replayed.idempotency_key, "strict-replay-status");
     assert_eq!(replayed.stream_seq, 1);
+    assert_eq!(
+        replayed.priority_class,
+        klights_node_store::OutboxPriority::Workload.persisted_value()
+    );
+    assert!(replayed.supersedable_pod_status);
+    assert!(!replayed.is_terminal_pod_delete);
     assert!(
         ndb.complete_outbox(replayed.id, "replayed-head")
             .await
@@ -346,7 +386,11 @@ async fn outbox_durability_legacy_dead_letter_gets_one_claim_time_sequence() {
     .await
     .expect("insert legacy dead letter");
 
-    assert!(ndb.replay_dead_letter(1).await.expect("replay legacy row"));
+    assert!(
+        ndb.replay_dead_letter(1, pod_status_classification())
+            .await
+            .expect("replay legacy row")
+    );
     let replayed = ndb
         .claim_next_due_outbox(now_ms() + 86_400_000, 1_000, "legacy-lease")
         .await
@@ -391,12 +435,15 @@ async fn outbox_durability_replay_collision_keeps_dead_letter_for_retry() {
         operation: "PodStatus".to_string(),
         payload_proto: payload,
         next_due_ms: 3_000,
+        classification: pod_status_classification(),
     })
     .await
     .expect("insert colliding live row");
 
     assert!(
-        ndb.replay_dead_letter(1).await.is_err(),
+        ndb.replay_dead_letter(1, pod_status_classification())
+            .await
+            .is_err(),
         "a live idempotency-key collision must fail replay"
     );
     assert_eq!(
@@ -464,6 +511,7 @@ async fn outbox_stats_return_metrics() {
                 &format!("uid-{}", i),
             ),
             next_due_ms: now_ms(),
+            classification: pod_status_classification(),
         })
         .await
         .expect("enqueue stats row");

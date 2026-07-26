@@ -3,8 +3,7 @@ use super::{
     WatchCursorError, WatchDeliveryScope, WatchEvent, WatchEventFilter, WatchReplaySource,
     WindowPolicy,
 };
-use crate::datastore::WatchReplayPosition;
-use klights_watch::{WatchSignalReceiver, WatchTopic};
+use klights_watch::{WatchReplayPosition, WatchSignalReceiver, WatchTopic};
 
 pub struct SignalWatchCursor<S>
 where

@@ -27,31 +27,15 @@ async fn delete_collection_runtimeclasses(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "node.k8s.io/v1",
-            "RuntimeClass",
-            None,
-            crate::datastore::ResourceListQuery::new(
-                query.label_selector.as_deref(),
-                None,
-                None,
-                None,
-            ),
-        )
-        .await?;
-    for resource in list.items {
-        let _ = state
-            .db
-            .delete_resource(
-                "node.k8s.io/v1",
-                "RuntimeClass",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
-    }
+    crate::api::resource_command_ports::delete_non_pod_collection(
+        state.resource_mutation().resource_query.as_ref(),
+        state.resource_mutation().resource_command.as_ref(),
+        "node.k8s.io/v1",
+        "RuntimeClass",
+        None,
+        query.label_selector.as_deref(),
+    )
+    .await?;
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
     ))

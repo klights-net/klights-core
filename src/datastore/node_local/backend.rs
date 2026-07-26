@@ -5,7 +5,8 @@ use tokio::sync::broadcast;
 
 use crate::datastore::{
     PodEndpointEvent, PodEndpointRow, PodNetworkAllocationRequest, PodNetworkEndpoint,
-    PodSlotAdmissionEvent, PodWorkqueueEntry, PodWorkqueueKind,
+    PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult, PodSlotMutationResult,
+    PodWorkqueueEntry, PodWorkqueueKind,
 };
 use klights_types::PodIdentity;
 
@@ -25,6 +26,26 @@ pub trait NodeLocalBackend: Send + Sync {
         &self,
     ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)>;
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent>;
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult>;
+    async fn pod_slot_mark_terminating(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotMutationResult>;
+    async fn pod_slot_clear_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<PodSlotClearResult>;
 
     async fn ensure_node_identity(&self, cluster_id: &str, node_uid: &str) -> Result<()>;
     async fn get_node_meta(&self, key: &str) -> Result<Option<String>>;
@@ -83,7 +104,11 @@ pub trait NodeLocalBackend: Send + Sync {
     async fn list_dead_letter(&self) -> Result<Vec<DeadLetterRow>>;
     async fn get_dead_letter(&self, id: i64) -> Result<Option<DeadLetterRow>>;
     async fn delete_dead_letter(&self, id: i64) -> Result<bool>;
-    async fn replay_dead_letter(&self, id: i64) -> Result<bool>;
+    async fn replay_dead_letter(
+        &self,
+        id: i64,
+        classification: klights_node_store::OutboxClassification,
+    ) -> Result<bool>;
     async fn outbox_stats(&self) -> Result<OutboxStats>;
 
     async fn admit_pod_runtime(
@@ -225,6 +250,36 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         SqliteNodeLocalDb::subscribe_pod_slot_admissions(self)
     }
 
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult> {
+        SqliteNodeLocalDb::pod_slot_try_admit(self, namespace, pod_name, pod_uid, node_name).await
+    }
+
+    async fn pod_slot_mark_terminating(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotMutationResult> {
+        SqliteNodeLocalDb::pod_slot_mark_terminating(self, namespace, pod_name, pod_uid, node_name)
+            .await
+    }
+
+    async fn pod_slot_clear_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<PodSlotClearResult> {
+        SqliteNodeLocalDb::pod_slot_clear_if_uid(self, namespace, pod_name, pod_uid).await
+    }
+
     async fn ensure_node_identity(&self, cluster_id: &str, node_uid: &str) -> Result<()> {
         SqliteNodeLocalDb::ensure_node_identity(self, cluster_id, node_uid).await
     }
@@ -355,8 +410,12 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         SqliteNodeLocalDb::delete_dead_letter(self, id).await
     }
 
-    async fn replay_dead_letter(&self, id: i64) -> Result<bool> {
-        SqliteNodeLocalDb::replay_dead_letter(self, id).await
+    async fn replay_dead_letter(
+        &self,
+        id: i64,
+        classification: klights_node_store::OutboxClassification,
+    ) -> Result<bool> {
+        SqliteNodeLocalDb::replay_dead_letter(self, id, classification).await
     }
 
     async fn outbox_stats(&self) -> Result<OutboxStats> {

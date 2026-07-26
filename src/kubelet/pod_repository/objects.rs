@@ -11,11 +11,11 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::control_plane::client::LeaderApiClient;
-use crate::datastore::command::StorageCommand;
-use crate::datastore::{Resource, ResourcePreconditions};
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use crate::node_outbox::payload::OutboxOperation;
+use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
+use klights_cluster_core::StorageCommand;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
 use super::PodApiPort;
@@ -28,7 +28,7 @@ pub(super) struct PodObjectService {
     api: Arc<dyn PodApiPort>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
-    cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
 }
 
 impl PodObjectService {
@@ -37,7 +37,7 @@ impl PodObjectService {
         api: Arc<dyn PodApiPort>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
-        cluster_api: Option<Arc<dyn LeaderApiClient>>,
+        cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     ) -> Self {
         Self {
             store,
@@ -71,10 +71,10 @@ impl PodObjectService {
     ) -> Result<Resource> {
         let pod = if let Some(cluster_api) = &self.cluster_api {
             cluster_api
-                .get_resource(crate::control_plane::client::pod_get_request(
+                .get_resource(klights_leader_api::pod_get_request(
                     ns,
                     name,
-                    crate::control_plane::client::ResourceQueryConsistency::Cached,
+                    klights_leader_api::ResourceQueryConsistency::Cached,
                 )?)
                 .await?
         } else {
@@ -188,7 +188,7 @@ impl PodObjectService {
                         kind: "Pod".to_string(),
                         namespace: Some(ns.to_string()),
                         name: name.to_string(),
-                        patch_kind: crate::datastore::PatchKind::Merge,
+                        patch_kind: klights_cluster_core::PatchKind::Merge,
                         patch: json!({"metadata": {"ownerReferences": owner_references}}),
                         preconditions: ResourcePreconditions {
                             uid: Some(current.uid.clone()),
@@ -293,7 +293,7 @@ impl PodObjectService {
                     kind: "Pod".to_string(),
                     namespace: Some(ns.to_string()),
                     name: name.to_string(),
-                    patch_kind: crate::datastore::PatchKind::Merge,
+                    patch_kind: klights_cluster_core::PatchKind::Merge,
                     patch: json!({"metadata": {"labels": label_patch}}),
                     preconditions: ResourcePreconditions {
                         uid: Some(current.uid.clone()),
@@ -399,7 +399,7 @@ impl PodObjectService {
                     kind: "Pod".to_string(),
                     namespace: Some(ns.to_string()),
                     name: name.to_string(),
-                    patch_kind: crate::datastore::PatchKind::Merge,
+                    patch_kind: klights_cluster_core::PatchKind::Merge,
                     patch: json!({
                         "metadata": {
                             "annotations": {(SANDBOX_ID_ANNOTATION): sandbox_id}

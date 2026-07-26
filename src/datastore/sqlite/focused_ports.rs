@@ -554,8 +554,8 @@ impl crate::datastore::NetworkMetadataStore for Datastore {
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         crate::datastore::DatastoreBackend::update_node_peer_attributes(
             self,
@@ -568,7 +568,7 @@ impl crate::datastore::NetworkMetadataStore for Datastore {
 
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         crate::datastore::DatastoreBackend::update_node_dataplane(self, metadata).await
     }
@@ -576,7 +576,7 @@ impl crate::datastore::NetworkMetadataStore for Datastore {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         crate::datastore::DatastoreBackend::get_node_dataplane(self, node_name).await
     }
 
@@ -679,7 +679,7 @@ impl crate::datastore::ReplicationStore for Datastore {
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
+        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
@@ -1083,7 +1083,7 @@ impl crate::datastore::PodCleanupStore for Datastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::datastore::PodSlotMutationResult> {
         crate::datastore::DatastoreBackend::pod_slot_mark_terminating(
             self, namespace, pod_name, pod_uid, node_name,
         )
@@ -1096,7 +1096,7 @@ impl crate::datastore::PodCleanupStore for Datastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::datastore::PodSlotClearResult> {
         crate::datastore::DatastoreBackend::pod_slot_clear_if_uid(
             self, namespace, pod_name, pod_uid, node_name,
         )
@@ -1152,19 +1152,6 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         crate::datastore::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
     }
 
-    async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> anyhow::Result<bool> {
-        crate::datastore::DatastoreBackend::delete_uncommitted_applied_outbox_placeholder(
-            self,
-            idempotency_key,
-            reserved_rv,
-        )
-        .await
-    }
-
     async fn apply_outbox_transactionally(
         &self,
         idempotency_key: &str,
@@ -1172,8 +1159,8 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally(
             self,
@@ -1193,8 +1180,8 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark(
             self,
@@ -1216,7 +1203,7 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::CommittedOutboxApply,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
             self,
@@ -1251,8 +1238,8 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox(
             self,
@@ -1272,8 +1259,8 @@ impl crate::datastore::AppliedOutboxStore for Datastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        crate::datastore::sqlite::BuildOutboxOutcome,
-        crate::kubelet::outbox::OutboxApplyError,
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox_with_watermark(
             self,

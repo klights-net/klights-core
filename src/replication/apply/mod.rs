@@ -14,6 +14,7 @@
 use anyhow::{Result, anyhow};
 use klights_cluster_core::{
     CommandMeta, Resource, ResourcePatchRequest, ResourcePreconditions, StorageCommand,
+    subject_key_for_command,
 };
 
 use crate::datastore::AppliedOutboxRecord;
@@ -29,7 +30,7 @@ pub use core::ForwardedApply;
 
 use core::{
     ack_apply, applied_resource_version, current_epoch_millis, entry_for_resource, meta_for_rv,
-    storage_response_for_apply, subject_key_for_command,
+    storage_response_for_apply,
 };
 
 pub(crate) async fn apply_forwarded_command_with_meta(
@@ -554,11 +555,13 @@ pub(crate) async fn apply_forwarded_command(
             hostport_range,
         } => {
             let before_rv = db.get_current_resource_version().await.unwrap_or(0);
-            let peer_mode = crate::controllers::annotations::parse_node_peer_mode(Some(&mode))
-                .unwrap_or(crate::controllers::annotations::NodePeerMode::Root);
+            let peer_mode = match mode.as_str() {
+                "rootless" => klights_network_api::NodePeerMode::Rootless,
+                _ => klights_network_api::NodePeerMode::Root,
+            };
             let hpr = hostport_range
                 .as_deref()
-                .and_then(|value| crate::networking::types::HostPortRange::parse(value).ok());
+                .and_then(|value| klights_types::HostPortRange::parse(value).ok());
             db.update_node_peer_attributes(&node_name, peer_mode, hpr)
                 .await?;
             let rv = resource_version_after_mutation(db, before_rv).await?;
@@ -581,10 +584,10 @@ pub(crate) async fn apply_forwarded_command(
             port,
         } => {
             let before_rv = db.get_current_resource_version().await.unwrap_or(0);
-            let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            let metadata = klights_cluster_store::DataplanePeerMetadata::try_new(
                 node_name.clone(),
-                crate::networking::wireguard::DataplaneMode::parse(&mode)?,
-                crate::networking::wireguard::DataplaneEncryption::parse(Some(&encryption))?,
+                klights_cluster_store::DataplaneMode::parse(&mode)?,
+                klights_cluster_store::DataplaneEncryption::parse(Some(&encryption))?,
                 public_key.clone(),
                 Some(endpoint.clone()),
                 port,
@@ -819,12 +822,10 @@ async fn apply_forwarded_node_routing_metadata(
         return Ok(());
     }
     if name == authoring_node {
-        crate::kubelet::node::stamp_node_routing_metadata_and_external_ip_from_store(
-            db, name, data,
-        )
-        .await?;
+        crate::node_routing_metadata::stamp_and_publish_external_ip_from_store(db, name, data)
+            .await?;
     } else {
-        crate::kubelet::node::stamp_node_routing_metadata_from_store(db, name, data).await?;
+        crate::node_routing_metadata::stamp_from_store(db, name, data).await?;
     }
     Ok(())
 }
@@ -896,7 +897,7 @@ async fn publish_node_routing_metadata_update(
         return Ok(());
     };
     let mut data = (*resource.data).clone();
-    if !crate::kubelet::node::stamp_node_routing_metadata_and_external_ip_from_store(
+    if !crate::node_routing_metadata::stamp_and_publish_external_ip_from_store(
         db, node_name, &mut data,
     )
     .await?
@@ -1647,10 +1648,10 @@ mod tests {
     async fn forwarded_node_create_publishes_external_ip_from_dataplane_endpoint() {
         let db = crate::datastore::test_support::in_memory().await;
         db.update_node_dataplane(
-            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            klights_cluster_store::DataplanePeerMetadata::try_new(
                 "worker-1".to_string(),
-                crate::networking::wireguard::DataplaneMode::Root,
-                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                klights_cluster_store::DataplaneMode::Root,
+                klights_cluster_store::DataplaneEncryption::Enabled,
                 Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                 Some("198.51.100.175".to_string()),
                 Some(7679),

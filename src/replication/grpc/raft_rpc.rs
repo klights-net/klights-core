@@ -198,7 +198,7 @@ pub struct ControlplaneJoinRequest {
     pub as_learner: bool,
     pub storage_incarnation: String,
     pub storage_log_attestation: RaftStorageAttestation,
-    pub supported_features: u64,
+    pub command_codec_version: u32,
     pub node_internal_ip: Option<String>,
     pub node_registration: Option<RemoteNodeRegistrationSnapshot>,
     /// Rolling-upgrade compatibility for a persisted member whose request

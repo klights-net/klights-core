@@ -117,8 +117,9 @@ impl KlightsConfig {
     pub fn from_env_with_namespace_override(
         namespace_override: Option<&str>,
     ) -> anyhow::Result<Self> {
-        use crate::networking::{BridgeName, ClusterCidr, NodeName, PodSubnet};
+        use crate::networking::BridgeName;
         use anyhow::anyhow;
+        use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
         let containerd_namespace = namespace_override.map(str::to_string).unwrap_or_else(|| {
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())

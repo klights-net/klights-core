@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-use crate::kubelet::pod_manager::get_cached_host_ip;
+use crate::kubelet::context::HostIpState;
 use crate::kubelet::pod_startup_error::PodStartupErrorKind;
 use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentWaiter};
 use klights_node_store::{PodNetworkCache, SandboxKey};
@@ -27,6 +27,7 @@ pub(super) struct PodNetworkService {
     cache: Arc<dyn PodNetworkCache>,
     supervisor: Arc<TaskSupervisor>,
     assignment_waiter: Arc<dyn PodNetworkAssignmentWaiter>,
+    host_ip: HostIpState,
 }
 
 impl PodNetworkService {
@@ -34,11 +35,13 @@ impl PodNetworkService {
         cache: Arc<dyn PodNetworkCache>,
         supervisor: Arc<TaskSupervisor>,
         assignment_waiter: Arc<dyn PodNetworkAssignmentWaiter>,
+        host_ip: HostIpState,
     ) -> Self {
         Self {
             cache,
             supervisor,
             assignment_waiter,
+            host_ip,
         }
     }
 
@@ -59,7 +62,7 @@ impl PodNetworkService {
         pod_uid: &str,
         host_network: bool,
     ) -> Result<PodNetworkAssignment> {
-        let host_ip = get_cached_host_ip().to_string();
+        let host_ip = self.host_ip.current().to_string();
         if host_network {
             return Ok(PodNetworkAssignment {
                 pod_ip: host_ip.clone(),

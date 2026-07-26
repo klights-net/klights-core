@@ -696,8 +696,8 @@ async fn test_patch_custom_resource_apply_strict_missing_resource_returns_schema
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let crd_registry = state.crd_registry.clone();
+    let db = state.resource_mutation().db.clone();
+    let crd_registry = state.discovery().crd_registry.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -804,8 +804,8 @@ async fn test_patch_custom_resource_apply_yaml_duplicate_fields_reports_duplicat
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let crd_registry = state.crd_registry.clone();
+    let db = state.resource_mutation().db.clone();
+    let crd_registry = state.discovery().crd_registry.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -916,7 +916,7 @@ async fn test_patch_crd_apply_yaml_create_registers_route_for_strict_custom_reso
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(

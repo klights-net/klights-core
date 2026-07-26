@@ -14,7 +14,6 @@ pub use serde_json::Value;
 pub use std::sync::Arc;
 
 pub use crate::api::{AppError, AppState};
-pub use crate::datastore::DatastoreBackend;
 
 /// Compute the `storageVersionHash` advertised in discovery for a built-in
 /// kind. Upstream emits a base64-encoded hash that clients use only to detect
@@ -34,16 +33,14 @@ pub async fn apiservice_group_versions(
 ) -> Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>, AppError> {
     let mut groups: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
         std::collections::HashMap::new();
-    let list = state
-        .db
-        .list_resources(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    for item in list.items {
+    let list = crate::api::resource_query_ports::list_all_resources(
+        state.resource_mutation().resource_query.as_ref(),
+        "apiregistration.k8s.io/v1",
+        "APIService",
+        None,
+    )
+    .await?;
+    for item in list.into_items() {
         let Some(spec) = item.data.get("spec").and_then(|v| v.as_object()) else {
             continue;
         };

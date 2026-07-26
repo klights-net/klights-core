@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use crate::datastore::WatchTarget;
 use crate::watch::WatchReplaySource;
-use klights_watch::WatchTopic;
+use klights_watch::{WatchTarget, WatchTopic};
 
 pub struct BoxedWatchReplaySource {
     inner: Arc<dyn WatchReplaySource>,
@@ -24,15 +23,15 @@ impl WatchReplaySource for BoxedWatchReplaySource {
         &self,
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::WatchReplayRead<crate::watch::WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::WatchReplayRead<crate::watch::WatchEvent>> {
         self.inner.replay_since_checked(since_rv, limit).await
     }
 
     async fn replay_after_checked(
         &self,
-        position: crate::datastore::WatchReplayPosition,
+        position: klights_watch::WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<crate::watch::WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<crate::watch::WatchEvent>> {
         self.inner.replay_after_checked(position, limit).await
     }
 

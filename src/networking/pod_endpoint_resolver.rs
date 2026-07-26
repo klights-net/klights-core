@@ -284,10 +284,10 @@ mod tests {
         node_local.upsert_endpoint(row).await.unwrap();
         cluster_db
             .update_node_dataplane(
-                crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                klights_cluster_store::DataplanePeerMetadata::try_new(
                     "node-a".to_string(),
-                    crate::networking::wireguard::DataplaneMode::Root,
-                    crate::networking::wireguard::DataplaneEncryption::Enabled,
+                    klights_cluster_store::DataplaneMode::Root,
+                    klights_cluster_store::DataplaneEncryption::Enabled,
                     Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                     Some("192.0.2.10".to_string()),
                     Some(7_679),
@@ -322,10 +322,10 @@ mod tests {
         node_local.upsert_endpoint(row).await.unwrap();
         cluster_db
             .update_node_dataplane(
-                crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                klights_cluster_store::DataplanePeerMetadata::try_new(
                     "node-a".to_string(),
-                    crate::networking::wireguard::DataplaneMode::Rootless,
-                    crate::networking::wireguard::DataplaneEncryption::Disabled,
+                    klights_cluster_store::DataplaneMode::Rootless,
+                    klights_cluster_store::DataplaneEncryption::Disabled,
                     None,
                     Some("192.0.2.10".to_string()),
                     None,
@@ -521,10 +521,10 @@ mod tests {
         let (node_local, cluster_db, resolver) = build_resolver().await;
         cluster_db
             .update_node_dataplane(
-                crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                klights_cluster_store::DataplanePeerMetadata::try_new(
                     "node-a".to_string(),
-                    crate::networking::wireguard::DataplaneMode::Root,
-                    crate::networking::wireguard::DataplaneEncryption::Disabled,
+                    klights_cluster_store::DataplaneMode::Root,
+                    klights_cluster_store::DataplaneEncryption::Disabled,
                     None,
                     Some("192.0.2.10".to_string()),
                     None,

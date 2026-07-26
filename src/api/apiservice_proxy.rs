@@ -53,17 +53,15 @@ async fn find_apiservice_backend_uncached(
     group: &str,
     version: &str,
 ) -> Result<Option<ApiServiceBackend>, AppError> {
-    let list = state
-        .db
-        .list_resources(
-            "apiregistration.k8s.io/v1",
-            "APIService",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let list = crate::api::resource_query_ports::list_all_resources(
+        state.resource_mutation().resource_query.as_ref(),
+        "apiregistration.k8s.io/v1",
+        "APIService",
+        None,
+    )
+    .await?;
 
-    for item in list.items {
+    for item in list.into_items() {
         let Some(spec) = item.data.get("spec").and_then(|s| s.as_object()) else {
             continue;
         };
@@ -118,19 +116,31 @@ pub async fn find_apiservice_backend(
     version: &str,
 ) -> Result<Option<ApiServiceBackend>, AppError> {
     loop {
-        let cache_generation = state.apiservice_proxy_cache.generation();
+        let cache_generation = state.discovery().apiservice_proxy_cache.generation();
         let key = ApiServiceBackendKey {
             group: group.to_string(),
             version: version.to_string(),
         };
 
-        if let Some(cached) = state.apiservice_proxy_cache.backends.read().await.get(&key) {
+        if let Some(cached) = state
+            .discovery()
+            .apiservice_proxy_cache
+            .backends
+            .read()
+            .await
+            .get(&key)
+        {
             return Ok(cached.clone());
         }
 
         let backend = find_apiservice_backend_uncached(state, group, version).await?;
-        let mut backends = state.apiservice_proxy_cache.backends.write().await;
-        if cache_generation != state.apiservice_proxy_cache.generation() {
+        let mut backends = state
+            .discovery()
+            .apiservice_proxy_cache
+            .backends
+            .write()
+            .await;
+        if cache_generation != state.discovery().apiservice_proxy_cache.generation() {
             continue;
         }
         if let Some(cached) = backends.get(&key) {
@@ -171,7 +181,7 @@ impl ApiServiceRequestDispatcher {
         };
 
         let service_target = resolve_service_proxy_target(
-            state.db.as_ref(),
+            state.resource_mutation().resource_query.as_ref(),
             &backend.service_namespace,
             &backend.service_name,
             backend.service_port,
@@ -255,25 +265,30 @@ pub async fn invalidate_apiservice_proxy_cache_for_resource(
     kind: &str,
 ) {
     if api_version == "apiregistration.k8s.io/v1" && kind == "APIService" {
-        state.apiservice_proxy_cache.clear().await;
+        state.discovery().apiservice_proxy_cache.clear().await;
     }
 }
 
 pub async fn resolve_service_endpoint(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     namespace: &str,
     service_name: &str,
     desired_port: u16,
 ) -> Result<(String, u16), AppError> {
-    let endpoints = db
-        .get_resource("v1", "Endpoints", Some(namespace), service_name)
-        .await?
-        .ok_or_else(|| {
-            AppError::BadGateway(format!(
-                "APIService backend Endpoints {}/{} not found",
-                namespace, service_name
-            ))
-        })?;
+    let endpoints = crate::api::resource_query_ports::get_resource(
+        query,
+        "v1",
+        "Endpoints",
+        Some(namespace),
+        service_name,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::BadGateway(format!(
+            "APIService backend Endpoints {}/{} not found",
+            namespace, service_name
+        ))
+    })?;
 
     let subsets = endpoints
         .data
@@ -348,13 +363,13 @@ pub struct ServiceProxyTarget {
 }
 
 pub async fn resolve_service_proxy_target(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     namespace: &str,
     service_name: &str,
     service_port: u16,
 ) -> Result<ServiceProxyTarget, AppError> {
     let (endpoint_ip, endpoint_port) =
-        resolve_service_endpoint(db, namespace, service_name, service_port).await?;
+        resolve_service_endpoint(query, namespace, service_name, service_port).await?;
     let endpoint_addr = format!("{endpoint_ip}:{endpoint_port}")
         .parse::<SocketAddr>()
         .map_err(|e| {
@@ -483,9 +498,9 @@ async fn cached_apiservice_proxy_client(
 ) -> Result<reqwest::Client, AppError> {
     let identity = {
         load_apiservice_proxy_identity(
-            &state.config.containerd_namespace,
-            state.task_supervisor.as_ref(),
-            state.apiservice_proxy_identity_cache.as_ref(),
+            &state.operational().config.containerd_namespace,
+            state.operational().task_supervisor.as_ref(),
+            state.discovery().apiservice_proxy_identity_cache.as_ref(),
         )
         .await
     };
@@ -499,14 +514,26 @@ async fn cached_apiservice_proxy_client(
         has_identity: identity.is_some(),
     };
 
-    let cache_generation = state.apiservice_proxy_cache.generation();
-    if let Some(client) = state.apiservice_proxy_cache.clients.read().await.get(&key) {
+    let cache_generation = state.discovery().apiservice_proxy_cache.generation();
+    if let Some(client) = state
+        .discovery()
+        .apiservice_proxy_cache
+        .clients
+        .read()
+        .await
+        .get(&key)
+    {
         return Ok(client.clone());
     }
 
     let client = build_apiservice_proxy_client(backend, service_target, identity).await?;
-    let mut clients = state.apiservice_proxy_cache.clients.write().await;
-    if cache_generation != state.apiservice_proxy_cache.generation() {
+    let mut clients = state
+        .discovery()
+        .apiservice_proxy_cache
+        .clients
+        .write()
+        .await;
+    if cache_generation != state.discovery().apiservice_proxy_cache.generation() {
         return Ok(client);
     }
     if let Some(client) = clients.get(&key) {

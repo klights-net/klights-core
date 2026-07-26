@@ -36,7 +36,7 @@ pub async fn check_slot_admission(
     } = request;
     let lifecycle_key = lifecycle_key_from_runtime_key(&key);
     match slot_admission.try_admit(&key, node_name).await {
-        Ok(crate::datastore::PodSlotAdmissionResult::Admitted { .. }) => {
+        Ok(klights_node_store::PodSlotAdmissionResult::Admitted { .. }) => {
             let _ = reply_to
                 .route(LifecycleMessage::SlotAdmissionGranted {
                     key: lifecycle_key,
@@ -47,10 +47,10 @@ pub async fn check_slot_admission(
                 })
                 .await;
         }
-        Ok(crate::datastore::PodSlotAdmissionResult::Blocked {
+        Ok(klights_node_store::PodSlotAdmissionResult::Blocked {
             blocking_uid,
             blocking_node,
-            state,
+            state: _,
             ..
         }) => {
             let _ = reply_to
@@ -59,7 +59,6 @@ pub async fn check_slot_admission(
                     operation_id,
                     blocking_uid: blocking_uid.clone(),
                     blocking_node,
-                    state,
                 })
                 .await;
             wait_for_slot_admission_event(slot_admission, key, blocking_uid, reply_to, cancel)
@@ -95,16 +94,14 @@ async fn wait_for_slot_admission_event(
             _ = cancel.cancelled() => {
                 return;
             }
-            event = events.recv() => {
+            event = events.next_event() => {
                 match event {
-                    Ok(crate::datastore::PodSlotAdmissionEvent::Cleared {
-                        namespace,
-                        pod_name,
-                        pod_uid,
+                    Ok(Some(klights_node_store::PodSlotAdmissionEvent::Cleared {
+                        pod,
                         ..
-                    }) if namespace == key.namespace
-                        && pod_name == key.name
-                        && pod_uid == blocking_uid =>
+                    })) if pod.namespace == key.namespace
+                        && pod.name == key.name
+                        && pod.uid == blocking_uid =>
                     {
                         let _ = reply_to
                             .route(LifecycleMessage::SlotAdmissionWake {
@@ -113,11 +110,10 @@ async fn wait_for_slot_admission_event(
                             .await;
                         return;
                     }
-                    Ok(crate::datastore::PodSlotAdmissionEvent::Changed {
-                        namespace,
-                        pod_name,
+                    Ok(Some(klights_node_store::PodSlotAdmissionEvent::Changed {
+                        pod,
                         ..
-                    }) if namespace == key.namespace && pod_name == key.name => {
+                    })) if pod.namespace == key.namespace && pod.name == key.name => {
                         let _ = reply_to
                             .route(LifecycleMessage::SlotAdmissionWake {
                                 key: lifecycle_key_from_runtime_key(&key),
@@ -125,8 +121,9 @@ async fn wait_for_slot_admission_event(
                             .await;
                         return;
                     }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return,
+                    Err(_) => {
                         let _ = reply_to
                             .route(LifecycleMessage::SlotAdmissionWake {
                                 key: lifecycle_key_from_runtime_key(&key),
@@ -134,7 +131,6 @@ async fn wait_for_slot_admission_event(
                             .await;
                         return;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
         }

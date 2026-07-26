@@ -406,26 +406,13 @@ async fn test_configmap_put_integration_full_stack() {
 }
 
 #[tokio::test]
-async fn test_api_build_state_uses_mock_network_provider() {
+async fn test_api_build_state_uses_focused_service_router() {
     let state = build_test_app_state().await;
-    let datapath = state.network.datapath().clone();
-    let result = datapath
-        .cni_add(
-            klights_network_api::CniAddRequest::try_new(
-                "sid-1",
-                klights_types::PodIdentity::new("default", "test-pod", "uid"),
-                "/proc/self/ns/net",
-                "/proc/self/ns/net",
-                false,
-            )
-            .expect("valid mock CNI request"),
-        )
-        .await
-        .expect("mock network cni_add should succeed");
-    assert_eq!(
-        result.ip_addr(),
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-    );
+    state
+        .pod_node_subresources()
+        .services
+        .request_service_routing_sync()
+        .expect("focused mock ServiceRouter should accept a sync request");
 }
 
 #[tokio::test]
@@ -435,7 +422,7 @@ async fn test_list_all_statefulsets_table_includes_ready_and_age_columns() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -499,9 +486,9 @@ async fn test_delete_controller_managed_endpointslice_queues_service_reconcile()
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
-    let controller_dispatcher = state.controller_dispatcher.clone();
+    let db = state.resource_mutation().db.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
+    let controller_dispatcher = state.controller_reconcile().controller_dispatcher.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -679,7 +666,7 @@ async fn test_delete_manual_endpoints_removes_mirrored_endpointslice() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -775,7 +762,7 @@ async fn test_immutable_configmap_update_rejected_with_422() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     // Create namespace
@@ -821,7 +808,7 @@ async fn test_immutable_configmap_patch_rejected_with_422() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1436,7 +1423,7 @@ async fn test_immutable_secret_update_rejected_with_422() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1492,7 +1479,7 @@ async fn test_immutable_secret_set_then_update_rejected_with_422() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1568,7 +1555,7 @@ async fn test_mutable_configmap_update_succeeds() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1695,7 +1682,7 @@ async fn test_pod_lifecycle_debug_endpoint_returns_snapshot_shape() {
     );
     let router = std::sync::Arc::new(
         crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::from_env(
-            app_state.task_supervisor.clone(),
+            app_state.operational().task_supervisor.clone(),
             crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
         ),
     );
@@ -1714,7 +1701,9 @@ async fn test_pod_lifecycle_debug_endpoint_returns_snapshot_shape() {
             },
         )
         .await;
-    app_state.pod_lifecycle_router = Some(router);
+    app_state
+        .pod_node_subresources_mut()
+        .pod_lifecycle_diagnostics = Some(router);
 
     let app = crate::api::build_router(app_state);
     let payload = timeout(Duration::from_secs(1), async {

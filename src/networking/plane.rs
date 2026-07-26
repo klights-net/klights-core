@@ -1,7 +1,8 @@
+use crate::networking::BridgeName;
 use crate::networking::dataplane_health::DataplaneHealth;
 use crate::networking::device_state::{self, LinkKind, LinkState};
-use crate::networking::{BridgeName, NodeName, PodSubnet};
 use anyhow::{Context, Result};
+use klights_types::{NodeName, PodSubnet};
 
 use futures::stream::TryStreamExt;
 use netlink_packet_route::{

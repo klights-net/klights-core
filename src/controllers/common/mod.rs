@@ -3,9 +3,10 @@
 //! Extracted from repeated inline patterns in deployment, replicaset, statefulset,
 //! daemonset, and job controllers.
 
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference as K8sOwnerReference;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -22,6 +23,38 @@ pub trait ConditionBuilder: Send + Sync {
 pub trait PodCounter: Send + Sync {
     fn count_ready_pods(&self, pods: &[Resource]) -> usize;
     fn is_pod_ready(&self, pod: &Value) -> bool;
+}
+
+#[async_trait]
+pub(crate) trait ControllerStatusStore: Send + Sync {
+    async fn get_status_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+
+    async fn update_status(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+
+    fn is_conflict(&self, error: &anyhow::Error) -> bool;
+
+    fn conflict_error(&self, message: &'static str) -> anyhow::Error;
+
+    fn log_noop_status_write(
+        &self,
+        operation: &'static str,
+        resource: &Resource,
+        reason: &'static str,
+    );
 }
 
 pub struct DefaultControllerCommon;
@@ -388,8 +421,9 @@ pub fn build_child_pod(
 ///   `json_set(data, '$.status', ?)`.
 /// - Honors `metadata.resourceVersion` as a CAS guard when present (returns
 ///   409 Conflict on mismatch); skips the check when missing.
-pub async fn write_status<S: Serialize>(
-    db: &dyn DatastoreBackend,
+#[cfg(test)]
+pub(crate) async fn write_status<S: Serialize, Store: ControllerStatusStore + ?Sized>(
+    store: &Store,
     resource: &Value,
     status: &S,
 ) -> Result<Resource> {
@@ -420,24 +454,13 @@ pub async fn write_status<S: Serialize>(
         .and_then(|v| v.as_str())
         .map(str::to_string);
     if resource.get("status") == Some(&status_value)
-        && let Some(current) = db
-            .get_resource(api_version, kind, namespace, name)
+        && let Some(current) = store
+            .get_status_resource(api_version, kind, namespace, name)
             .await
             .context("write_status: read current unchanged resource")?
     {
         if current.data.get("status") == Some(&status_value) {
-            crate::datastore::diagnostics::log_noop_resource_write(
-                crate::datastore::diagnostics::NoopResourceWrite {
-                    operation: "controller_write_status",
-                    api_version,
-                    kind,
-                    namespace,
-                    name,
-                    uid: &current.uid,
-                    resource_version: current.resource_version,
-                    reason: "status unchanged",
-                },
-            );
+            store.log_noop_status_write("controller_write_status", &current, "status unchanged");
             return Ok(current);
         }
         if !same_status_retry_identity(resource, &current.data) {
@@ -445,12 +468,12 @@ pub async fn write_status<S: Serialize>(
                 "write_status: resource spec or generation changed before status fast path"
             ));
         }
-        return Err(status_retry_conflict(
-            "write_status: resource status changed before status fast path",
-        ));
+        return Err(
+            store.conflict_error("write_status: resource status changed before status fast path")
+        );
     }
     write_status_with_retry(
-        db,
+        store,
         StatusWriteRequest {
             api_version,
             kind,
@@ -467,8 +490,11 @@ pub async fn write_status<S: Serialize>(
 
 /// `Resource`-flavored `write_status` for callers that already hold a hydrated
 /// `Resource` row (its `resource_version` column is the canonical CAS guard).
-pub async fn write_status_for_resource<S: Serialize>(
-    db: &dyn DatastoreBackend,
+pub(crate) async fn write_status_for_resource<
+    S: Serialize,
+    Store: ControllerStatusStore + ?Sized,
+>(
+    store: &Store,
     resource: &Resource,
     status: &S,
 ) -> Result<Resource> {
@@ -476,8 +502,8 @@ pub async fn write_status_for_resource<S: Serialize>(
         .context("write_status_for_resource: failed to serialize status payload")?;
     let expected_rv = Some(resource.resource_version);
     if resource.data.get("status") == Some(&status_value)
-        && let Some(current) = db
-            .get_resource(
+        && let Some(current) = store
+            .get_status_resource(
                 &resource.api_version,
                 &resource.kind,
                 resource.namespace.as_deref(),
@@ -487,17 +513,10 @@ pub async fn write_status_for_resource<S: Serialize>(
             .context("write_status_for_resource: read current unchanged resource")?
     {
         if current.data.get("status") == Some(&status_value) {
-            crate::datastore::diagnostics::log_noop_resource_write(
-                crate::datastore::diagnostics::NoopResourceWrite {
-                    operation: "controller_write_status_for_resource",
-                    api_version: &resource.api_version,
-                    kind: &resource.kind,
-                    namespace: resource.namespace.as_deref(),
-                    name: &resource.name,
-                    uid: &current.uid,
-                    resource_version: current.resource_version,
-                    reason: "status unchanged",
-                },
+            store.log_noop_status_write(
+                "controller_write_status_for_resource",
+                &current,
+                "status unchanged",
             );
             return Ok(current);
         }
@@ -506,12 +525,12 @@ pub async fn write_status_for_resource<S: Serialize>(
                 "write_status_for_resource: resource spec or generation changed before status fast path"
             ));
         }
-        return Err(status_retry_conflict(
+        return Err(store.conflict_error(
             "write_status_for_resource: resource status changed before status fast path",
         ));
     }
     write_status_with_retry(
-        db,
+        store,
         StatusWriteRequest {
             api_version: &resource.api_version,
             kind: &resource.kind,
@@ -539,8 +558,8 @@ struct StatusWriteRequest<'a> {
     observed_uid: Option<String>,
 }
 
-async fn write_status_with_retry(
-    db: &dyn DatastoreBackend,
+async fn write_status_with_retry<Store: ControllerStatusStore + ?Sized>(
+    store: &Store,
     request: StatusWriteRequest<'_>,
 ) -> Result<Resource> {
     let StatusWriteRequest {
@@ -557,8 +576,8 @@ async fn write_status_with_retry(
 
     let mut last_err = None;
     for attempt in 0..STATUS_WRITE_MAX_ATTEMPTS {
-        let Some(current) = db
-            .get_resource(api_version, kind, namespace, name)
+        let Some(current) = store
+            .get_status_resource(api_version, kind, namespace, name)
             .await
             .with_context(|| {
                 format!("write_status: reread {api_version}/{kind} {namespace:?}/{name}")
@@ -570,14 +589,14 @@ async fn write_status_with_retry(
             if let Some(observed_uid) = observed_uid.as_deref()
                 && observed_uid != current.uid
             {
-                return Err(status_retry_conflict(
+                return Err(store.conflict_error(
                     "write_status: resource uid mismatch while resource is deleting",
                 ));
             }
             return Ok(current);
         }
-        match db
-            .update_status_only_with_preconditions(
+        match store
+            .update_status(
                 api_version,
                 kind,
                 namespace,
@@ -591,9 +610,9 @@ async fn write_status_with_retry(
             .await
         {
             Ok(updated) => return Ok(updated),
-            Err(err) if is_status_cas_error(&err) && attempt + 1 < STATUS_WRITE_MAX_ATTEMPTS => {
-                let Some(current) = db
-                    .get_resource(api_version, kind, namespace, name)
+            Err(err) if store.is_conflict(&err) && attempt + 1 < STATUS_WRITE_MAX_ATTEMPTS => {
+                let Some(current) = store
+                    .get_status_resource(api_version, kind, namespace, name)
                     .await
                     .with_context(|| {
                         format!("write_status: reread {api_version}/{kind} {namespace:?}/{name}")
@@ -633,14 +652,6 @@ async fn write_status_with_retry(
     Err(last_err
         .unwrap_or_else(|| anyhow!("status CAS retry exhausted without captured conflict"))
         .context("write_status: CAS retries exhausted"))
-}
-
-fn is_status_cas_error(err: &anyhow::Error) -> bool {
-    crate::datastore::errors::is_conflict_error(err)
-}
-
-fn status_retry_conflict(message: &'static str) -> anyhow::Error {
-    crate::datastore::errors::DatastoreError::conflict(message).into()
 }
 
 fn same_status_retry_identity(original: &Value, current: &Value) -> bool {

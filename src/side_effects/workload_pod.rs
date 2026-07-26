@@ -1,67 +1,29 @@
 //! Side effect to reconcile workload controllers after Pod metadata mutations.
 
-use super::{ControllerDispatcherSlot, SideEffect};
 use crate::controllers::workqueue::controller_kind_static;
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::Arc;
-
-/// Enqueues the explicit controller owner of a mutated Pod.
-///
-/// This is intentionally narrow: Pod status writers do not run side effects,
-/// and this hook only follows controller ownerReferences already present on
-/// the Pod. The owning controller remains responsible for release/adoption
-/// during its normal reconcile.
-pub struct WorkloadPodReconcileEffect {
-    controller_dispatcher: ControllerDispatcherSlot,
-}
 
 #[async_trait]
-impl SideEffect for WorkloadPodReconcileEffect {
-    fn name(&self) -> &'static str {
-        "workload_pod_reconcile"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let namespace = resource
-            .pointer("/metadata/namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if namespace.is_empty() {
-            return Ok(());
-        }
-
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            tracing::debug!(
-                "WorkloadPodReconcileEffect skipped for {}: controller dispatcher not yet bound",
-                namespace
-            );
-            return Ok(());
-        };
-
-        dispatcher
-            .enqueue_reconcile_batch(
-                workload_reconcile_keys_for_pod(resource, db, namespace).await?,
-            )
-            .await?;
-
-        Ok(())
-    }
+pub(crate) trait WorkloadPodStore: Send + Sync {
+    async fn get_replica_set(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn list_replica_sets(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn list_replication_controllers(&self, namespace: &str) -> Result<Vec<Resource>>;
 }
 
-pub async fn workload_reconcile_keys_for_pod(
+pub(crate) async fn workload_reconcile_keys_for_pod<Store: WorkloadPodStore + ?Sized>(
     pod: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     namespace: &str,
 ) -> Result<Vec<ReconcileKey>> {
     let mut keys = workload_owner_keys_for_pod(pod, namespace);
-    append_replicaset_parent_controller_keys(pod, db, namespace, &mut keys).await?;
+    append_replicaset_parent_controller_keys(pod, store, namespace, &mut keys).await?;
     if keys.is_empty() && !pod_has_controller_owner(pod) && !pod_is_terminating(pod) {
-        keys.extend(selector_matching_orphan_keys_for_pod(pod, db, namespace).await?);
+        keys.extend(selector_matching_orphan_keys_for_pod(pod, store, namespace).await?);
     }
     Ok(keys)
 }
@@ -97,9 +59,9 @@ pub(crate) fn workload_owner_keys_for_pod(pod: &Value, namespace: &str) -> Vec<R
     keys
 }
 
-async fn append_replicaset_parent_controller_keys(
+async fn append_replicaset_parent_controller_keys<Store: WorkloadPodStore + ?Sized>(
     pod: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     namespace: &str,
     keys: &mut Vec<ReconcileKey>,
 ) -> Result<()> {
@@ -123,10 +85,7 @@ async fn append_replicaset_parent_controller_keys(
         let Some(replica_set_name) = owner.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Some(replica_set) = db
-            .get_resource("apps/v1", "ReplicaSet", Some(namespace), replica_set_name)
-            .await?
-        else {
+        let Some(replica_set) = store.get_replica_set(namespace, replica_set_name).await? else {
             continue;
         };
         let Some(parent_refs) = replica_set
@@ -164,23 +123,15 @@ async fn append_replicaset_parent_controller_keys(
     Ok(())
 }
 
-async fn selector_matching_orphan_keys_for_pod(
+async fn selector_matching_orphan_keys_for_pod<Store: WorkloadPodStore + ?Sized>(
     pod: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     namespace: &str,
 ) -> Result<Vec<ReconcileKey>> {
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
 
-    let replica_sets = db
-        .list_resources(
-            "apps/v1",
-            "ReplicaSet",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    for replica_set in replica_sets.items {
+    for replica_set in store.list_replica_sets(namespace).await? {
         let selector_matches = replica_set
             .data
             .pointer("/spec/selector")
@@ -196,15 +147,7 @@ async fn selector_matching_orphan_keys_for_pod(
         }
     }
 
-    let replication_controllers = db
-        .list_resources(
-            "v1",
-            "ReplicationController",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    for rc in replication_controllers.items {
+    for rc in store.list_replication_controllers(namespace).await? {
         let selector_matches = rc
             .data
             .pointer("/spec/selector")
@@ -248,14 +191,6 @@ fn owner_ref_controller_kind(owner: &Value) -> Option<(&'static str, &'static st
         .and_then(|v| v.as_str())
         .or_else(|| (kind == "ReplicationController").then_some("v1"))?;
     controller_kind_static(api_version, kind)
-}
-
-pub fn workload_pod_reconcile(
-    controller_dispatcher: ControllerDispatcherSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(WorkloadPodReconcileEffect {
-        controller_dispatcher,
-    })
 }
 
 #[cfg(test)]

@@ -9,10 +9,15 @@ async fn process_volumes(
     pod: &serde_json::Value,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+    let paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+        crate::paths::data_root_path(containerd_namespace),
+    )
+    .unwrap();
     let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
         &file_process,
         sources,
-        containerd_namespace,
+        &paths,
+        crate::kubelet::node::NodeCapacity::default(),
     );
     manager
         .process_volumes(pod_dir_id, pod_name, namespace, pod)

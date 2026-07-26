@@ -5,33 +5,35 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use klights_leader_api::{
-    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
+    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
+    LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal, LeaderNodeSubnetAllocation,
+    LeaderOutboxDelivery, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+    NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
+    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
+    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError,
+    OutboxDeliveryFuture, OutboxDeliveryRequest, PeerSubnetsQuery, PeerSubnetsResult,
+    PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
+    PodCleanupIntentListRequest, ProjectedServiceAccountTokenError,
+    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceCommandError,
+    ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult, ResourceEvent,
+    ResourceGetRequest, ResourceListRequest, ResourceListResult, ResourceQueryConsistency,
+    ResourceQueryFuture, WatchRequest, WatchResumeCursor, WatchStream,
 };
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use crate::control_plane::client::Pod;
-use crate::control_plane::client::informer::{InformerCache, scope_for_request};
-use crate::control_plane::client::{
-    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
-    LeaderCacheReadiness, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
-    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
-    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
-    ListRequest, NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery,
-    NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest,
-    NodeLeaseRenewalResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
-    NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
-    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
-    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
-    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
-    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
-    ResourceCommandRequest, ResourceCommandResult, ResourceEvent, ResourceGetRequest,
-    ResourceListRequest, ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture,
-    WatchRequest, WatchResumeCursor, WatchStream, focused_watch_event, legacy_list_request,
-    legacy_watch_event, query_error, query_list_result,
+use super::Pod;
+use super::informer::{InformerCache, scope_for_request};
+use super::{
+    LeaderApiClient, ListRequest, ResourceList, focused_watch_event, legacy_list_request,
+    legacy_list_response, legacy_watch_event, query_error, query_list_result,
 };
-use crate::datastore::{Resource, ResourceList};
 use crate::replication::grpc::client::ReplicationGrpcClient;
+use klights_cluster_core::Resource;
+#[cfg(test)]
+use klights_cluster_core::WatchReplayPosition;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 /// bug-grpc: a worker watch stream that delivers neither an event nor a
@@ -147,9 +149,7 @@ impl RemoteApiClient {
                 ResourceList {
                     items: Vec::new(),
                     resource_version: 0,
-                    watch_replay_position: Some(
-                        crate::datastore::WatchReplayPosition::from_resource_version(0),
-                    ),
+                    watch_replay_position: Some(WatchReplayPosition::from_resource_version(0)),
                     continue_token: None,
                     remaining_item_count: None,
                 },
@@ -392,13 +392,23 @@ impl RemoteApiClient {
     async fn prime_list_scope(
         &self,
         req: ListRequest,
-    ) -> std::result::Result<ResourceList, crate::control_plane::client::ResourceQueryError> {
+    ) -> std::result::Result<ResourceList, klights_leader_api::ResourceQueryError> {
         let grpc = self.grpc.as_ref().ok_or_else(|| {
-            crate::control_plane::client::ResourceQueryError::retryable(
+            klights_leader_api::ResourceQueryError::retryable(
                 "RemoteApiClient missing gRPC transport",
             )
         })?;
-        let list = grpc.list_resources_rpc(req.clone()).await?;
+        let request = klights_leader_api::ResourceListRequest::try_new(
+            req.api_version.clone(),
+            req.kind.clone(),
+            req.namespace.clone(),
+            req.label_selector.clone(),
+            req.field_selector.clone(),
+            req.limit,
+            req.continue_token.clone(),
+            klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+        )?;
+        let list = legacy_list_response(grpc.list_resources_rpc(request).await?);
         self.cache
             .replace_scope(&req, list.clone())
             .await
@@ -473,7 +483,7 @@ impl LeaderResourceQuery for RemoteApiClient {
             let key = request.into_key();
             if consistency == ResourceQueryConsistency::LeaderFresh {
                 let grpc = self.grpc.as_ref().ok_or_else(|| {
-                    crate::control_plane::client::ResourceQueryError::retryable(
+                    klights_leader_api::ResourceQueryError::retryable(
                         "leader-fresh resource query has no gRPC transport",
                     )
                 })?;
@@ -733,7 +743,17 @@ mod tests {
     use serde_json::json;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::control_plane::client::{
+    use crate::datastore::ResourcePreconditions;
+    use crate::datastore::backend::DatastoreHandle;
+    use crate::datastore::command::StorageCommand;
+    use crate::node_outbox::payload::OutboxPayload;
+    use crate::replication::grpc::client::{
+        GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
+    };
+    use crate::replication::protocol::JoinRole;
+    use crate::replication::service::ReplicationService;
+    use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
+    use klights_leader_api::{
         CacheReadinessError, CacheReadinessRequest, LeaderCacheReadiness,
         LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderResourceCommand,
         LeaderResourceQuery, LeaderWatch, LeaderWatchError, NodeDataplaneQuery,
@@ -741,16 +761,6 @@ mod tests {
         ResourceEvent, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
         WatchEventType, WatchRequest, pod_get_request,
     };
-    use crate::datastore::ResourcePreconditions;
-    use crate::datastore::backend::DatastoreHandle;
-    use crate::datastore::command::StorageCommand;
-    use crate::kubelet::outbox::OutboxApplyError;
-    use crate::kubelet::outbox::payload::OutboxPayload;
-    use crate::replication::grpc::client::{
-        GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
-    };
-    use crate::replication::protocol::JoinRole;
-    use crate::replication::service::ReplicationService;
     use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use klights_types::ResourceKey;
@@ -1452,7 +1462,7 @@ mod tests {
             .expect_err("leader-fresh must fail closed without a leader transport");
         assert!(matches!(
             error,
-            crate::control_plane::client::ResourceQueryError::Retryable { .. }
+            klights_leader_api::ResourceQueryError::Retryable { .. }
         ));
         let error = client
             .list_resources(
@@ -1472,7 +1482,7 @@ mod tests {
             .expect_err("leader-fresh LIST must fail closed without a leader transport");
         assert!(matches!(
             error,
-            crate::control_plane::client::ResourceQueryError::Retryable { .. }
+            klights_leader_api::ResourceQueryError::Retryable { .. }
         ));
     }
 

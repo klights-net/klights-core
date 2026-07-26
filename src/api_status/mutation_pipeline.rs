@@ -7,7 +7,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::Value;
 
 use crate::api::{AppError, AppState, apply_patch, inject_resource_version};
-use crate::datastore::{PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions};
+use klights_cluster_core::{
+    PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions, StatusApplyFreshness,
+    StatusApplyOrigin, merge_status_for_apply,
+};
 
 #[derive(Clone, Debug)]
 pub struct StatusMutationTarget {
@@ -215,13 +218,13 @@ impl StatusMutationMergePolicy for ApiSubresourceStatusMergePolicy {
         if let Some(pre_merge) = self.pre_merge {
             pre_merge(current.data.get("status"), status);
         }
-        crate::datastore::status_merge_policy::merge_status_for_apply(
+        merge_status_for_apply(
             &target.api_version,
             &target.kind,
             current.data.as_ref(),
             status,
-            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+            StatusApplyFreshness::Fresh,
+            StatusApplyOrigin::ApiSubresource,
         );
     }
 }
@@ -257,6 +260,7 @@ impl DatastoreStatusMutationWriter {
 impl StatusMutationWriter for DatastoreStatusMutationWriter {
     async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>> {
         self.state
+            .resource_mutation()
             .db
             .get_resource(
                 &target.api_version,
@@ -274,6 +278,7 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         preconditions: ResourcePreconditions,
     ) -> Result<()> {
         self.state
+            .resource_mutation()
             .db
             .update_status_only_with_preconditions(
                 &target.api_version,
@@ -294,6 +299,7 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         preconditions: ResourcePreconditions,
     ) -> Result<()> {
         self.state
+            .resource_mutation()
             .db
             .patch_resource_latest_with_preconditions(
                 &target.api_version,
@@ -560,6 +566,7 @@ impl DatastoreScaleMutationWriter {
 impl ScaleMutationWriter for DatastoreScaleMutationWriter {
     async fn get(&self, target: &ScaleMutationTarget) -> Result<Option<Resource>> {
         self.state
+            .resource_mutation()
             .db
             .get_resource(
                 &target.api_version,
@@ -588,6 +595,7 @@ impl ScaleMutationWriter for DatastoreScaleMutationWriter {
             request
         };
         self.state
+            .resource_mutation()
             .db
             .patch_resource_latest_with_preconditions(
                 &target.api_version,
@@ -601,6 +609,7 @@ impl ScaleMutationWriter for DatastoreScaleMutationWriter {
 
     async fn enqueue_reconcile(&self, resource: &Resource) {
         self.state
+            .controller_reconcile()
             .controller_dispatcher
             .enqueue(&resource.data)
             .await;
@@ -849,7 +858,11 @@ impl DatastoreNamespaceStatusMutationWriter {
 #[async_trait]
 impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
     async fn get(&self, target: &NamespaceStatusMutationTarget) -> Result<Option<Resource>> {
-        self.state.db.get_namespace(&target.name).await
+        self.state
+            .resource_mutation()
+            .db
+            .get_namespace(&target.name)
+            .await
     }
 
     async fn update(
@@ -859,6 +872,7 @@ impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
         expected_rv: i64,
     ) -> Result<Resource> {
         self.state
+            .resource_mutation()
             .db
             .update_namespace(&target.name, body, expected_rv)
             .await

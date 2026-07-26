@@ -20,10 +20,8 @@ pub use self::token::persist_service_account_signing_key;
 pub use self::token::read_service_account_signing_key_async;
 pub use self::token::read_service_account_signing_key_supervised;
 pub use self::token::{
-    BoundServiceAccountToken, DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
-    MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS, ServiceAccountTokenRequest,
+    BoundServiceAccountToken, ServiceAccountTokenRequest,
     generate_sa_token_with_bound_pod_and_clock, generate_sa_token_with_bound_pod_at,
-    normalize_service_account_token_expiration_seconds,
 };
 pub use self::token::{
     SaTokenClaims, decode_serviceaccount_token_with_clock, serviceaccount_groups_from_claims,

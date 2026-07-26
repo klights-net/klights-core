@@ -167,6 +167,35 @@ pub(crate) fn decode_command_protobuf(bytes: &[u8]) -> CodecResult<StorageComman
     StorageCommand::boundary_try_from(proto)
 }
 
+/// Encode a durable outbox payload with explicit command-codec provenance.
+pub(crate) fn encode_outbox_payload_protobuf(
+    payload: &klights_cluster_core::OutboxPayload,
+) -> CodecResult<Vec<u8>> {
+    let command_payload = encode_command_protobuf(payload.command())?;
+    let envelope = ProtoOutboxCommandEnvelope {
+        codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
+        command_payload,
+    };
+    Ok(envelope.encode_to_vec())
+}
+
+/// Decode a durable outbox envelope only after validating its exact command
+/// codec version. The inner command bytes remain opaque to persistence.
+pub(crate) fn decode_outbox_payload_protobuf(
+    bytes: &[u8],
+) -> CodecResult<klights_cluster_core::OutboxPayload> {
+    let envelope = ProtoOutboxCommandEnvelope::decode(bytes)?;
+    if !klights_cluster_core::supports_command_codec_version(envelope.codec_version) {
+        return Err(StorageCodecError::UnsupportedCodecVersion {
+            actual: envelope.codec_version,
+            required: klights_cluster_core::COMMAND_CODEC_VERSION,
+        });
+    }
+    Ok(klights_cluster_core::OutboxPayload::new(
+        decode_command_protobuf(&envelope.command_payload)?,
+    ))
+}
+
 /// Encode `StorageResponse` as protobuf bytes.
 pub(crate) fn encode_response_protobuf(resp: &StorageResponse) -> CodecResult<Vec<u8>> {
     let proto = ProtoStorageResponse::boundary_try_from(resp.clone())?;
@@ -992,6 +1021,39 @@ mod tests {
             )),
         };
         assert!(decode_response_protobuf(&response.encode_to_vec()).is_err());
+    }
+
+    #[test]
+    fn outbox_payload_envelope_round_trips_and_rejects_other_codec_versions() {
+        let command = StorageCommand::DeleteNamespace {
+            name: "stale".to_string(),
+        };
+        let payload = klights_cluster_core::OutboxPayload::new(command.clone());
+        let encoded = encode_outbox_payload_protobuf(&payload).expect("encode outbox envelope");
+        let envelope =
+            ProtoOutboxCommandEnvelope::decode(encoded.as_slice()).expect("decode wire envelope");
+        assert_eq!(envelope.codec_version, COMMAND_CODEC_VERSION);
+        assert_eq!(
+            decode_outbox_payload_protobuf(&encoded)
+                .expect("decode outbox envelope")
+                .into_command(),
+            command
+        );
+
+        for codec_version in [COMMAND_CODEC_VERSION - 1, COMMAND_CODEC_VERSION + 1] {
+            let incompatible = ProtoOutboxCommandEnvelope {
+                codec_version,
+                command_payload: envelope.command_payload.clone(),
+            }
+            .encode_to_vec();
+            assert!(matches!(
+                decode_outbox_payload_protobuf(&incompatible),
+                Err(StorageCodecError::UnsupportedCodecVersion {
+                    actual,
+                    required: COMMAND_CODEC_VERSION,
+                }) if actual == codec_version
+            ));
+        }
     }
 
     fn uid_preconditions(uid: &str) -> ResourcePreconditions {

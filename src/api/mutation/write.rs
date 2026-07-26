@@ -2,8 +2,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::Value;
 
-use crate::api::{AdmissionContextRequest, AppError};
-use crate::datastore::DatastoreBackend;
+use crate::api::AppError;
 
 pub fn prepare_create_metadata(ns: Option<&str>, body: &mut Value, resource_name: &str) {
     crate::api::inject_create_metadata(ns, body, resource_name);
@@ -17,16 +16,9 @@ pub fn prepare_custom_generation_for_update(current: &Value, body: &mut Value) {
     crate::api::increment_generation_for_spec_change(current, body);
 }
 
-pub async fn run_admission(
-    db: &dyn DatastoreBackend,
-    request: AdmissionContextRequest<'_>,
-) -> Result<Value, AppError> {
-    crate::api::run_admission_for_request(db, crate::api::build_admission_context(request)).await
-}
-
 pub enum WriteResult {
     DryRun(Value),
-    Persisted(crate::datastore::Resource),
+    Persisted(klights_cluster_core::Resource),
     PersistedValue(Value),
     Response { status: StatusCode, body: Value },
 }
@@ -50,7 +42,7 @@ impl WriteResult {
         self.into_response_parts(StatusCode::OK).1
     }
 
-    pub fn persisted_resource(&self) -> Option<&crate::datastore::Resource> {
+    pub fn persisted_resource(&self) -> Option<&klights_cluster_core::Resource> {
         match self {
             Self::Persisted(resource) => Some(resource),
             Self::DryRun(_) | Self::PersistedValue(_) | Self::Response { .. } => None,
@@ -77,18 +69,18 @@ pub trait CreateStrategy: Send + Sync {
 
 #[async_trait]
 pub trait UpdateStrategy: Send + Sync {
-    async fn load_current(&self) -> Result<crate::datastore::Resource, AppError>;
+    async fn load_current(&self) -> Result<klights_cluster_core::Resource, AppError>;
 
     async fn prepare_update(
         &self,
-        current: &crate::datastore::Resource,
+        current: &klights_cluster_core::Resource,
         body: Value,
         dry_run: crate::api::mutation::DryRunMode,
     ) -> Result<Value, AppError>;
 
     async fn persist_update(
         &self,
-        current: crate::datastore::Resource,
+        current: klights_cluster_core::Resource,
         body: Value,
         dry_run: crate::api::mutation::DryRunMode,
     ) -> Result<WriteResult, AppError>;
@@ -235,9 +227,9 @@ mod tests {
 
     #[async_trait]
     impl UpdateStrategy for RecordingUpdateStrategy {
-        async fn load_current(&self) -> Result<crate::datastore::Resource, AppError> {
+        async fn load_current(&self) -> Result<klights_cluster_core::Resource, AppError> {
             self.calls.lock().unwrap().push("load_current");
-            Ok(crate::datastore::Resource {
+            Ok(klights_cluster_core::Resource {
                 id: 1,
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
@@ -255,7 +247,7 @@ mod tests {
 
         async fn prepare_update(
             &self,
-            _current: &crate::datastore::Resource,
+            _current: &klights_cluster_core::Resource,
             body: Value,
             _dry_run: crate::api::mutation::DryRunMode,
         ) -> Result<Value, AppError> {
@@ -265,7 +257,7 @@ mod tests {
 
         async fn persist_update(
             &self,
-            _current: crate::datastore::Resource,
+            _current: klights_cluster_core::Resource,
             body: Value,
             dry_run: crate::api::mutation::DryRunMode,
         ) -> Result<WriteResult, AppError> {

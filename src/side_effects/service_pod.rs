@@ -2,57 +2,46 @@
 //! Pod mutations.
 
 use super::ControllerDispatcherSlot;
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use klights_reconcile_api::ServiceReconcileKey;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub async fn service_reconcile_keys_for_pod(
-    pod: &Value,
-    db: &dyn DatastoreBackend,
-    namespace: &str,
-) -> Result<Vec<ServiceReconcileKey>> {
-    service_reconcile_keys_for_pods(&[pod], db, namespace).await
+pub(crate) struct ServiceEndpointState {
+    pub(crate) services: Vec<Resource>,
+    pub(crate) endpoints: Vec<Resource>,
+    pub(crate) endpoint_slices: Vec<Resource>,
 }
 
-async fn service_reconcile_keys_for_pods(
-    pods: &[&Value],
-    db: &dyn DatastoreBackend,
+#[async_trait]
+pub(crate) trait ServicePodStore: Send + Sync {
+    async fn load_service_endpoint_state(&self, namespace: &str) -> Result<ServiceEndpointState>;
+}
+
+pub(crate) async fn service_reconcile_keys_for_pod<Store: ServicePodStore + ?Sized>(
+    pod: &Value,
+    store: &Store,
     namespace: &str,
 ) -> Result<Vec<ServiceReconcileKey>> {
-    let services = db
-        .list_resources(
-            "v1",
-            "Service",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    let endpoints = db
-        .list_resources(
-            "v1",
-            "Endpoints",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    let endpoint_slices = db
-        .list_resources(
-            "discovery.k8s.io/v1",
-            "EndpointSlice",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    let endpoints_by_service: HashMap<String, Arc<Value>> = endpoints
-        .items
+    service_reconcile_keys_for_pods(&[pod], store, namespace).await
+}
+
+async fn service_reconcile_keys_for_pods<Store: ServicePodStore + ?Sized>(
+    pods: &[&Value],
+    store: &Store,
+    namespace: &str,
+) -> Result<Vec<ServiceReconcileKey>> {
+    let state = store.load_service_endpoint_state(namespace).await?;
+    let endpoints_by_service: HashMap<String, Arc<Value>> = state
+        .endpoints
         .into_iter()
         .map(|resource| (resource.name, resource.data))
         .collect();
     let mut slices_by_service: HashMap<String, Vec<Arc<Value>>> = HashMap::new();
-    for slice in endpoint_slices.items {
+    for slice in state.endpoint_slices {
         if slice
             .data
             .pointer("/metadata/labels/endpointslice.kubernetes.io~1managed-by")
@@ -76,7 +65,7 @@ async fn service_reconcile_keys_for_pods(
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
 
-    for service in services.items {
+    for service in state.services {
         if service.data.pointer("/spec/type").and_then(|v| v.as_str()) == Some("ExternalName") {
             continue;
         }
@@ -121,9 +110,9 @@ async fn service_reconcile_keys_for_pods(
     Ok(keys)
 }
 
-pub async fn enqueue_services_after_pod_create(
+pub(crate) async fn enqueue_services_after_pod_create<Store: ServicePodStore + ?Sized>(
     pod: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     controller_dispatcher: &ControllerDispatcherSlot,
 ) -> Result<()> {
     let Some(dispatcher) = controller_dispatcher.service() else {
@@ -134,15 +123,17 @@ pub async fn enqueue_services_after_pod_create(
         .and_then(|v| v.as_str())
         .unwrap_or("default");
     dispatcher
-        .enqueue_service_reconcile_batch(service_reconcile_keys_for_pod(pod, db, namespace).await?)
+        .enqueue_service_reconcile_batch(
+            service_reconcile_keys_for_pod(pod, store, namespace).await?,
+        )
         .await?;
     Ok(())
 }
 
-pub async fn enqueue_services_after_pod_update(
+pub(crate) async fn enqueue_services_after_pod_update<Store: ServicePodStore + ?Sized>(
     previous: &Value,
     updated: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     controller_dispatcher: &ControllerDispatcherSlot,
 ) -> Result<()> {
     if !pod_endpoint_state_changed(previous, updated) {
@@ -158,15 +149,15 @@ pub async fn enqueue_services_after_pod_update(
         .unwrap_or("default");
     dispatcher
         .enqueue_service_reconcile_batch(
-            service_reconcile_keys_for_pods(&[previous, updated], db, namespace).await?,
+            service_reconcile_keys_for_pods(&[previous, updated], store, namespace).await?,
         )
         .await?;
     Ok(())
 }
 
-pub async fn enqueue_services_after_pod_delete(
+pub(crate) async fn enqueue_services_after_pod_delete<Store: ServicePodStore + ?Sized>(
     deleted: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     controller_dispatcher: &ControllerDispatcherSlot,
 ) -> Result<()> {
     let Some(dispatcher) = controller_dispatcher.service() else {
@@ -178,7 +169,7 @@ pub async fn enqueue_services_after_pod_delete(
         .unwrap_or("default");
     dispatcher
         .enqueue_service_reconcile_batch(
-            service_reconcile_keys_for_pod(deleted, db, namespace).await?,
+            service_reconcile_keys_for_pod(deleted, store, namespace).await?,
         )
         .await?;
     Ok(())

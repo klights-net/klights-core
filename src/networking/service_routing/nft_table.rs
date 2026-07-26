@@ -2261,7 +2261,7 @@ impl Verdict {
 mod kernel_compat_tests {
     use super::*;
     use crate::networking::netfilter::{Batch, Netfilter};
-    use crate::networking::{ClusterCidr, PodSubnet};
+    use klights_types::{ClusterCidr, PodSubnet};
     use std::process::Command;
     use std::sync::Arc;
 

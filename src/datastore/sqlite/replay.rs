@@ -6,11 +6,8 @@ use crate::watch::{WatchEvent, WatchReplaySource};
 
 use std::sync::Arc;
 
-use super::{CatchUpResource, WatchReplayRead, WatchTarget};
-use crate::datastore::{
-    PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayPosition,
-    WatchStore,
-};
+use super::{CatchUpResource, WatchReplayRead as StoreWatchReplayRead, WatchTarget};
+use crate::datastore::{PositionedWatchReplayRead as StorePositionedWatchReplayRead, WatchStore};
 
 pub struct DatastoreWatchReplaySource {
     watch_store: Arc<dyn WatchStore>,
@@ -43,46 +40,50 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
         &self,
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<WatchEvent>> {
+    ) -> Result<klights_watch::WatchReplayRead<WatchEvent>> {
         match self
             .watch_store
             .list_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
             .await?
         {
-            WatchReplayRead::Events(events) => Ok(WatchReplayRead::Events(
+            StoreWatchReplayRead::Events(events) => Ok(klights_watch::WatchReplayRead::Events(
                 events
                     .into_iter()
                     .map(CatchUpResource::into_watch_event)
                     .collect(),
             )),
-            WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
+            StoreWatchReplayRead::Expired => Ok(klights_watch::WatchReplayRead::Expired),
         }
     }
 
     async fn replay_after_checked(
         &self,
-        position: WatchReplayPosition,
+        position: klights_watch::WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<WatchEvent>> {
+    ) -> Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
         match self
             .watch_store
             .list_watch_events_after_position_checked_bounded(&self.targets, position, limit)
             .await?
         {
-            PositionedWatchReplayRead::Events(replay) => {
-                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                    next_position: replay.next_position,
-                    events: replay
-                        .events
-                        .into_iter()
-                        .map(|positioned| PositionedWatchEvent {
-                            position: positioned.position,
-                            event: positioned.event.into_watch_event(),
-                        })
-                        .collect(),
-                }))
+            StorePositionedWatchReplayRead::Events(replay) => {
+                Ok(klights_watch::PositionedWatchReplayRead::Events(
+                    klights_watch::PositionedWatchReplay::new(
+                        replay
+                            .events
+                            .into_iter()
+                            .map(|positioned| klights_watch::PositionedWatchEvent {
+                                position: positioned.position,
+                                event: positioned.event.into_watch_event(),
+                            })
+                            .collect(),
+                        replay.next_position,
+                    ),
+                ))
             }
-            PositionedWatchReplayRead::Expired => Ok(PositionedWatchReplayRead::Expired),
+            StorePositionedWatchReplayRead::Expired => {
+                Ok(klights_watch::PositionedWatchReplayRead::Expired)
+            }
         }
     }
 

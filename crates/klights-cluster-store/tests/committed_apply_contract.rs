@@ -15,7 +15,7 @@ impl PrivilegedCommittedRaftApply for FakeCommittedStore {
         request: CommittedRaftApplyRequest,
     ) -> CommittedApplyFuture<'_, CommittedRaftApplyReceipt> {
         Box::pin(async move {
-            assert!(request.commit().mutations.is_empty());
+            assert!(request.commit().mutations().is_empty());
             Ok(CommittedRaftApplyReceipt::new(
                 CommittedApplyOutcome::Visible {
                     resource_version: 17,
@@ -77,7 +77,7 @@ fn committed_apply_and_ledger_read_capabilities_are_distinct_and_object_safe() {
 
 #[test]
 fn committed_apply_request_and_receipt_preserve_canonical_values() {
-    let commit = LogApplyCommit::new(41, Vec::new());
+    let commit = LogApplyCommit::try_new(Vec::new()).unwrap();
     let request = CommittedRaftApplyRequest::new(commit.clone());
     assert_eq!(request.commit(), &commit);
     assert_eq!(request.into_commit(), commit);

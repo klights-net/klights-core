@@ -3,16 +3,28 @@
 //! Computes PDB status fields (expectedPods, currentHealthy, desiredHealthy,
 //! disruptionsAllowed) by scanning pods matching the PDB selector.
 
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
-use crate::kubelet::pod_repository::PodReader;
+use crate::controllers::common::ControllerStatusStore;
 use anyhow::{Context as _, Result};
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::PodEvictionAdmissionOutcome;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
 /// Reconcile a PodDisruptionBudget — update its status fields.
-pub async fn reconcile_pdb(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+#[async_trait]
+pub(crate) trait PdbStore: ControllerStatusStore {
+    async fn list_pdbs(&self, namespace: &str) -> Result<Vec<Resource>>;
+}
+
+#[async_trait]
+pub(crate) trait PdbPodReader: Send + Sync {
+    async fn list_namespace_pods(&self, namespace: &str) -> Result<Vec<Resource>>;
+}
+
+pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
+    store: &Store,
+    pod_reader: &Pods,
     pdb: &Value,
 ) -> Result<()> {
     let metadata = pdb.get("metadata").context("PDB missing metadata")?;
@@ -33,8 +45,8 @@ pub async fn reconcile_pdb(
         // fresher status while this attempt is using an older pod snapshot,
         // the status CAS below conflicts and this loop recomputes from a
         // fresh pod list instead of regressing status.
-        let current = db
-            .get_resource("policy/v1", "PodDisruptionBudget", Some(namespace), name)
+        let current = store
+            .get_status_resource("policy/v1", "PodDisruptionBudget", Some(namespace), name)
             .await?
             .context("PDB not found")?;
         let current_metadata = current
@@ -58,14 +70,11 @@ pub async fn reconcile_pdb(
         };
 
         // List all pods in the namespace
-        let pod_list = pod_reader
-            .list_pods(Some(namespace), None, None, None, None)
-            .await?;
+        let pod_list = pod_reader.list_namespace_pods(namespace).await?;
 
         // Preserve disruptedPods for selected pods that still exist, including
         // the normal eviction window where the pod is terminating.
-        let selector_matching_pods: Vec<&crate::datastore::Resource> = pod_list
-            .items
+        let selector_matching_pods: Vec<&klights_cluster_core::Resource> = pod_list
             .iter()
             .filter(|pod| parsed_selector.matches_resource(&pod.data))
             .collect();
@@ -82,7 +91,7 @@ pub async fn reconcile_pdb(
             disrupted_pods_for_live_matching_pods(&current.data, &live_matching_pod_names);
 
         // Filter pods matching the selector (non-terminating)
-        let matching_pods: Vec<&crate::datastore::Resource> = selector_matching_pods
+        let matching_pods: Vec<&klights_cluster_core::Resource> = selector_matching_pods
             .into_iter()
             .filter(|pod| {
                 // Exclude terminating pods
@@ -117,8 +126,8 @@ pub async fn reconcile_pdb(
             return Ok(());
         }
 
-        match db
-            .update_status_only_with_preconditions(
+        match store
+            .update_status(
                 "policy/v1",
                 "PodDisruptionBudget",
                 Some(namespace),
@@ -132,7 +141,7 @@ pub async fn reconcile_pdb(
             .await
         {
             Ok(_) => return Ok(()),
-            Err(err) if is_cas_error(&err) => {
+            Err(err) if store.is_conflict(&err) => {
                 last_conflict = Some(err);
                 continue;
             }
@@ -214,20 +223,15 @@ fn disrupted_pods_for_live_matching_pods(
 /// Trigger PDB status reconcile for all PodDisruptionBudgets in a namespace.
 /// Called when pods in the namespace are created, updated, or deleted — so PDB
 /// status (disruptionsAllowed, currentHealthy, expectedPods) stays current.
-pub async fn reconcile_pdbs_for_namespace(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+pub(crate) async fn reconcile_pdbs_for_namespace<
+    Store: PdbStore + ?Sized,
+    Pods: PdbPodReader + ?Sized,
+>(
+    store: &Store,
+    pod_reader: &Pods,
     namespace: &str,
 ) {
-    let pdb_list = match db
-        .list_resources(
-            "policy/v1",
-            "PodDisruptionBudget",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-    {
+    let pdb_list = match store.list_pdbs(namespace).await {
         Ok(list) => list,
         Err(e) => {
             tracing::warn!("Failed to list PDBs in {}: {}", namespace, e);
@@ -235,8 +239,8 @@ pub async fn reconcile_pdbs_for_namespace(
         }
     };
 
-    for pdb_resource in pdb_list.items {
-        if let Err(e) = reconcile_pdb(db, pod_reader, &pdb_resource.data).await {
+    for pdb_resource in pdb_list {
+        if let Err(e) = reconcile_pdb(store, pod_reader, &pdb_resource.data).await {
             tracing::warn!(
                 "Failed to reconcile PDB {}/{}: {}",
                 namespace,
@@ -249,6 +253,195 @@ pub async fn reconcile_pdbs_for_namespace(
             );
         }
     }
+}
+
+pub(crate) async fn reconcile_pdbs_for_namespace_checked<
+    Store: PdbStore + ?Sized,
+    Pods: PdbPodReader + ?Sized,
+>(
+    store: &Store,
+    pod_reader: &Pods,
+    namespace: &str,
+) -> Result<()> {
+    for pdb in store.list_pdbs(namespace).await? {
+        reconcile_pdb(store, pod_reader, &pdb.data).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn admit_pod_eviction<Store: PdbStore + ?Sized>(
+    store: &Store,
+    pod: &Resource,
+    dry_run: bool,
+) -> Result<PodEvictionAdmissionOutcome> {
+    if can_ignore_pdb_for_eviction(&pod.data) {
+        return Ok(PodEvictionAdmissionOutcome::Allowed);
+    }
+    let namespace = pod
+        .namespace
+        .as_deref()
+        .context("stored Pod is missing metadata.namespace")?;
+    let pod_name = pod
+        .data
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .context("stored Pod is missing metadata.name")?;
+
+    let matching = store
+        .list_pdbs(namespace)
+        .await?
+        .into_iter()
+        .filter(|pdb| pod_matches_selector(&pod.data, &pdb.data))
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Ok(PodEvictionAdmissionOutcome::MultipleDisruptionBudgets {
+            pdb_names: matching
+                .iter()
+                .filter_map(|pdb| {
+                    pdb.data
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect(),
+        });
+    }
+    let Some(mut pdb) = matching.into_iter().next() else {
+        return Ok(PodEvictionAdmissionOutcome::Allowed);
+    };
+
+    const MAX_CONFLICT_RETRIES: usize = 5;
+    for attempt in 0..MAX_CONFLICT_RETRIES {
+        let pdb_name = pdb
+            .data
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .context("PDB missing metadata.name")?
+            .to_string();
+        let generation = pdb
+            .data
+            .pointer("/metadata/generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let observed_generation = pdb
+            .data
+            .pointer("/status/observedGeneration")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let current_healthy = pdb
+            .data
+            .pointer("/status/currentHealthy")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let desired_healthy = pdb
+            .data
+            .pointer("/status/desiredHealthy")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+
+        if observed_generation < generation {
+            return Ok(PodEvictionAdmissionOutcome::DisruptionBudgetDenied {
+                pdb_name,
+                desired_healthy,
+                current_healthy,
+            });
+        }
+
+        if !is_pod_healthy(&pod.data)
+            && (pdb
+                .data
+                .pointer("/spec/unhealthyPodEvictionPolicy")
+                .and_then(Value::as_str)
+                == Some("AlwaysAllow")
+                || (current_healthy >= desired_healthy && desired_healthy > 0))
+        {
+            return Ok(PodEvictionAdmissionOutcome::Allowed);
+        }
+
+        let disruptions_allowed = pdb
+            .data
+            .pointer("/status/disruptionsAllowed")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if disruptions_allowed < 0 {
+            return Ok(PodEvictionAdmissionOutcome::InvalidDisruptionBudget {
+                pdb_name,
+                message: "disruptionsAllowed is negative".to_string(),
+            });
+        }
+        let disrupted_count = pdb
+            .data
+            .pointer("/status/disruptedPods")
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len);
+        if disrupted_count > 2000 {
+            return Ok(PodEvictionAdmissionOutcome::InvalidDisruptionBudget {
+                pdb_name,
+                message: "disruptedPods map is too large".to_string(),
+            });
+        }
+        if disruptions_allowed == 0 {
+            return Ok(PodEvictionAdmissionOutcome::DisruptionBudgetDenied {
+                pdb_name,
+                desired_healthy,
+                current_healthy,
+            });
+        }
+        if dry_run {
+            return Ok(PodEvictionAdmissionOutcome::Allowed);
+        }
+
+        let mut status = pdb.data.get("status").cloned().unwrap_or_else(|| json!({}));
+        status["disruptionsAllowed"] = json!(disruptions_allowed - 1);
+        if !status.get("disruptedPods").is_some_and(Value::is_object) {
+            status["disruptedPods"] = json!({});
+        }
+        status["disruptedPods"][pod_name] = json!(crate::utils::k8s_timestamp());
+
+        match store
+            .update_status(
+                "policy/v1",
+                "PodDisruptionBudget",
+                Some(namespace),
+                &pdb_name,
+                status,
+                ResourcePreconditions {
+                    uid: Some(pdb.uid.clone()),
+                    resource_version: Some(pdb.resource_version),
+                },
+            )
+            .await
+        {
+            Ok(_) => return Ok(PodEvictionAdmissionOutcome::Allowed),
+            Err(error) if store.is_conflict(&error) && attempt + 1 < MAX_CONFLICT_RETRIES => {
+                pdb = store
+                    .get_status_resource(
+                        "policy/v1",
+                        "PodDisruptionBudget",
+                        Some(namespace),
+                        &pdb_name,
+                    )
+                    .await?
+                    .context("PDB disappeared during eviction admission")?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("bounded PDB admission retry loop always returns")
+}
+
+fn pod_matches_selector(pod: &Value, pdb: &Value) -> bool {
+    let selector = pdb.pointer("/spec/selector").unwrap_or(&Value::Null);
+    klights_types::LabelSelector::from_k8s_selector(selector)
+        .is_ok_and(|selector| selector.matches_resource(pod))
+}
+
+fn can_ignore_pdb_for_eviction(pod: &Value) -> bool {
+    matches!(
+        pod.pointer("/status/phase").and_then(Value::as_str),
+        Some("Succeeded" | "Failed" | "Pending")
+    ) || pod.pointer("/metadata/deletionTimestamp").is_some()
 }
 
 /// A pod is healthy if it is Running with Ready=True, or Succeeded.
@@ -299,14 +492,12 @@ fn parse_int_or_percent(value: &Value, total: i64) -> i64 {
     0
 }
 
-fn is_cas_error(err: &anyhow::Error) -> bool {
-    crate::datastore::errors::is_conflict_error(err)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::datastore::DatastoreBackend;
+    use crate::kubelet::pod_repository::PodReader;
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::{
@@ -429,7 +620,7 @@ mod tests {
             &self,
             ns: &str,
             name: &str,
-        ) -> Result<Option<crate::datastore::Resource>> {
+        ) -> Result<Option<klights_cluster_core::Resource>> {
             self.inner.get_pod(ns, name).await
         }
 
@@ -438,7 +629,7 @@ mod tests {
             ns: &str,
             name: &str,
             uid: &str,
-        ) -> Result<Option<crate::datastore::Resource>> {
+        ) -> Result<Option<klights_cluster_core::Resource>> {
             self.inner.get_pod_for_uid(ns, name, uid).await
         }
 
@@ -449,7 +640,7 @@ mod tests {
             field_selector: Option<&str>,
             limit: Option<i64>,
             continue_token: Option<&str>,
-        ) -> Result<crate::datastore::ResourceList> {
+        ) -> Result<crate::kubelet::pod_repository::PodResourceList> {
             let pods = self
                 .inner
                 .list_pods(ns, label_selector, field_selector, limit, continue_token)
@@ -465,7 +656,7 @@ mod tests {
             &self,
             ns: &str,
             owner_uid: &str,
-        ) -> Result<Vec<crate::datastore::Resource>> {
+        ) -> Result<Vec<klights_cluster_core::Resource>> {
             self.inner.list_pods_by_owner_uid(ns, owner_uid).await
         }
     }
@@ -1196,5 +1387,111 @@ mod tests {
             status["disruptionsAllowed"], 0,
             "1 healthy - 1 minAvailable = 0"
         );
+    }
+
+    #[tokio::test]
+    async fn eviction_admission_atomically_records_live_disruption_but_not_dry_run() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let pdb = create_pdb(
+            &db,
+            "admission-pdb",
+            "default",
+            json!({
+                "minAvailable": 0,
+                "selector": {"matchLabels": {"app": "admission"}}
+            }),
+        )
+        .await;
+        create_pod(
+            &db,
+            "victim",
+            "default",
+            json!({"app": "admission"}),
+            "Running",
+            true,
+        )
+        .await;
+        let pods = crate::controllers::test_utils::pod_repository_for_test(&db);
+        reconcile_pdb(&db, pods.as_ref(), &pdb).await.unwrap();
+        let pod = db
+            .get_resource("v1", "Pod", Some("default"), "victim")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            admit_pod_eviction(&db, &pod, true).await.unwrap(),
+            PodEvictionAdmissionOutcome::Allowed
+        );
+        let dry_status = get_pdb_status(&db, "default", "admission-pdb").await;
+        assert_eq!(dry_status["disruptionsAllowed"], 1);
+        assert!(dry_status.get("disruptedPods").is_none());
+
+        assert_eq!(
+            admit_pod_eviction(&db, &pod, false).await.unwrap(),
+            PodEvictionAdmissionOutcome::Allowed
+        );
+        let live_status = get_pdb_status(&db, "default", "admission-pdb").await;
+        assert_eq!(live_status["disruptionsAllowed"], 0);
+        assert!(
+            live_status
+                .pointer("/disruptedPods/victim")
+                .and_then(Value::as_str)
+                .is_some(),
+            "live admission must reserve the disruption before Pod termination"
+        );
+    }
+
+    #[tokio::test]
+    async fn unhealthy_pod_policy_allows_only_spec_permitted_budget_safe_evictions() {
+        for (name, policy, healthy_count, expected) in [
+            ("if-healthy", None, 2, true),
+            ("if-unhealthy", None, 1, false),
+            ("always", Some("AlwaysAllow"), 1, true),
+        ] {
+            let db = crate::datastore::test_support::in_memory().await;
+            let mut spec = json!({
+                "minAvailable": 2,
+                "selector": {"matchLabels": {"app": name}}
+            });
+            if let Some(policy) = policy {
+                spec["unhealthyPodEvictionPolicy"] = json!(policy);
+            }
+            let pdb = create_pdb(&db, name, "default", spec).await;
+            for index in 0..healthy_count {
+                create_pod(
+                    &db,
+                    &format!("healthy-{index}"),
+                    "default",
+                    json!({"app": name}),
+                    "Running",
+                    true,
+                )
+                .await;
+            }
+            create_pod(
+                &db,
+                "victim",
+                "default",
+                json!({"app": name}),
+                "Running",
+                false,
+            )
+            .await;
+            let pods = crate::controllers::test_utils::pod_repository_for_test(&db);
+            reconcile_pdb(&db, pods.as_ref(), &pdb).await.unwrap();
+            let pod = db
+                .get_resource("v1", "Pod", Some("default"), "victim")
+                .await
+                .unwrap()
+                .unwrap();
+
+            let outcome = admit_pod_eviction(&db, &pod, false).await.unwrap();
+            assert_eq!(
+                matches!(outcome, PodEvictionAdmissionOutcome::Allowed),
+                expected,
+                "unexpected unhealthy admission outcome for {name}: {outcome:?}"
+            );
+        }
     }
 }

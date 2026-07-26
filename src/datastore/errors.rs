@@ -80,6 +80,10 @@ impl OpenError {
 /// across backends.
 #[derive(Debug, thiserror::Error)]
 pub enum DatastoreError {
+    /// Create collided with an existing Kubernetes identity.
+    #[error("{message} (409 Conflict)")]
+    AlreadyExists { message: String },
+
     /// Optimistic-concurrency conflict. Maps to Kubernetes HTTP 409 Conflict.
     #[error("{message} (409 Conflict)")]
     Conflict { message: String },
@@ -90,6 +94,12 @@ pub enum DatastoreError {
 }
 
 impl DatastoreError {
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self::AlreadyExists {
+            message: message.into(),
+        }
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict {
             message: message.into(),

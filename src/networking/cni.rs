@@ -31,7 +31,8 @@ use klights_node_store::{
     SandboxKey,
 };
 
-use super::types::{BridgeName, NodeName, PodSubnet};
+use super::types::BridgeName;
+use klights_types::{NodeName, PodSubnet};
 
 #[derive(Default)]
 pub(crate) struct SandboxOperationLocks {

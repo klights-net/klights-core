@@ -10,10 +10,10 @@ pub trait WatchReplaySource: Send + Sync {
         &self,
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<crate::datastore::WatchReplayRead<super::events::WatchEvent>> {
+    ) -> Result<klights_watch::WatchReplayRead<super::events::WatchEvent>> {
         let mut events = self.replay_since(since_rv).await?;
         events.truncate(limit.get());
-        Ok(crate::datastore::WatchReplayRead::Events(events))
+        Ok(klights_watch::WatchReplayRead::Events(events))
     }
 
     /// Replay after a durable watch-log position. Durable datastore sources
@@ -22,9 +22,9 @@ pub trait WatchReplaySource: Send + Sync {
     /// pages and therefore must not be used by durable production sources.
     async fn replay_after_checked(
         &self,
-        _position: crate::datastore::WatchReplayPosition,
+        _position: klights_watch::WatchReplayPosition,
         _limit: std::num::NonZeroUsize,
-    ) -> Result<crate::datastore::PositionedWatchReplayRead<super::events::WatchEvent>> {
+    ) -> Result<klights_watch::PositionedWatchReplayRead<super::events::WatchEvent>> {
         Err(anyhow::anyhow!(
             "watch replay source does not implement durable positioned replay"
         ))

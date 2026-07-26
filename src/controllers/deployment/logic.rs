@@ -1,8 +1,7 @@
-use crate::datastore::{
-    DatastoreBackend, PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions,
-};
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_pod_api::{PodOwnerListRequest, PodQuery};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use tracing;
@@ -15,6 +14,41 @@ use super::helpers::{
 
 const DESIRED_REPLICAS_ANNOTATION: &str = "deployment.kubernetes.io/desired-replicas";
 const MAX_REPLICAS_ANNOTATION: &str = "deployment.kubernetes.io/max-replicas";
+
+#[async_trait]
+pub trait DeploymentStore:
+    crate::controllers::gc::GcResourceStore
+    + crate::controllers::deployment::DeploymentFinalizeStore
+    + crate::controllers::replicaset::ReplicaSetStore
+    + Send
+    + Sync
+{
+    async fn list_replicasets(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn create_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+        replicaset: Value,
+    ) -> Result<Resource>;
+    async fn patch_replicaset_scale(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: Value,
+        expected_uid: String,
+    ) -> Result<Option<Resource>>;
+    async fn update_deployment_status(&self, resource: &Resource, status: Value) -> Result<()>;
+}
+
+#[async_trait]
+pub trait DeploymentPodMutation: Send + Sync {
+    async fn merge_deployment_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<Resource>;
+}
 
 fn is_rolling_update_strategy(spec: &Value) -> bool {
     spec.get("strategy")
@@ -89,13 +123,15 @@ fn stamp_replicaset_pod_template_hash(replicaset: &mut Value, pod_template_hash:
 }
 
 async fn stamp_existing_replicaset_pods(
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    pod_reader: &(impl PodQuery + ?Sized),
+    pod_writer: &(impl DeploymentPodMutation + ?Sized),
     namespace: &str,
     rs_uid: &str,
     pod_template_hash: &str,
 ) -> Result<()> {
-    let pods = pod_reader.list_pods_by_owner_uid(namespace, rs_uid).await?;
+    let pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, rs_uid)?)
+        .await?;
     for pod in pods {
         if pod
             .data
@@ -106,7 +142,7 @@ async fn stamp_existing_replicaset_pods(
             continue;
         }
         pod_writer
-            .merge_pod_labels(
+            .merge_deployment_pod_labels(
                 namespace,
                 &pod.name,
                 vec![(
@@ -163,7 +199,8 @@ fn active_pod_count(pods: &[Resource]) -> usize {
 }
 
 async fn acknowledge_observed_generation(
-    db: &dyn DatastoreBackend,
+    db: &(impl DeploymentStore + ?Sized),
+    resource: &Resource,
     deployment: &Value,
     metadata: &Value,
 ) -> Result<()> {
@@ -201,15 +238,16 @@ async fn acknowledge_observed_generation(
         }
     }
 
-    crate::controllers::common::write_status(db, deployment, &status).await?;
+    db.update_deployment_status(resource, status).await?;
     Ok(())
 }
 
-struct ZeroReplicaOldReplicaSetRedrive<'a> {
-    db: &'a dyn DatastoreBackend,
-    pod_reader: &'a dyn PodReader,
-    pod_writer: &'a dyn PodObjectWriter,
+struct ZeroReplicaOldReplicaSetRedrive<'a, S: ?Sized, R: ?Sized, W: ?Sized> {
+    db: &'a S,
+    pod_reader: &'a R,
+    pod_writer: &'a W,
     pod_delete_sink: &'a dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
     namespace: &'a str,
     deployment_uid: &'a str,
     current_template: &'a Value,
@@ -217,7 +255,12 @@ struct ZeroReplicaOldReplicaSetRedrive<'a> {
 }
 
 async fn redrive_zero_replica_old_replicasets_with_live_pods(
-    ctx: ZeroReplicaOldReplicaSetRedrive<'_>,
+    ctx: ZeroReplicaOldReplicaSetRedrive<
+        '_,
+        impl DeploymentStore + ?Sized,
+        impl super::DeploymentPodReader + PodQuery + ?Sized,
+        impl DeploymentPodMutation + crate::controllers::replicaset::ReplicaSetPodMutation + ?Sized,
+    >,
     owned_rs_list: &[Resource],
 ) -> Result<()> {
     let common = crate::controllers::common::controller_common();
@@ -243,21 +286,25 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
         let Some(rs_uid) = rs.data.pointer("/metadata/uid").and_then(|u| u.as_str()) else {
             continue;
         };
-        let pods = ctx
-            .pod_reader
-            .list_pods_by_owner_uid(ctx.namespace, rs_uid)
-            .await?;
+        let pods = PodQuery::list_pods_by_owner_uid(
+            ctx.pod_reader,
+            PodOwnerListRequest::try_new(ctx.namespace, rs_uid)?,
+        )
+        .await?;
         if active_pod_count(&pods) == 0 {
             continue;
         }
 
-        let rs_with_metadata =
-            crate::api::inject_resource_version(rs.data.clone(), rs.resource_version);
+        let rs_with_metadata = crate::controllers::resource_projection::with_resource_version(
+            rs.data.clone(),
+            rs.resource_version,
+        );
         crate::controllers::replicaset::reconcile_replicaset(
             ctx.db,
             ctx.pod_reader,
             ctx.pod_writer,
             ctx.pod_delete_sink,
+            ctx.non_pod_finalization,
             &rs_with_metadata,
             ctx.node_name,
         )
@@ -464,7 +511,7 @@ fn plan_rolling_update_once(
 }
 
 async fn scale_replicaset_resource(
-    db: &dyn DatastoreBackend,
+    db: &(impl DeploymentStore + ?Sized),
     namespace: &str,
     rs: &Resource,
     target_replicas: i64,
@@ -487,26 +534,19 @@ async fn scale_replicaset_resource(
         }
     });
 
-    db.patch_resource_latest_with_preconditions(
-        "apps/v1",
-        "ReplicaSet",
-        Some(namespace),
-        &rs.name,
-        ResourcePatchRequest::new(
-            PatchKind::Merge,
-            patch,
-            ResourcePreconditions::uid(rs.uid.clone()),
-        ),
-    )
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("ReplicaSet {} disappeared during scale", rs.name))
+    db.patch_replicaset_scale(namespace, &rs.name, patch, rs.uid.clone())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ReplicaSet {} disappeared during scale", rs.name))
 }
 
 pub async fn reconcile_deployment(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    db: &(impl DeploymentStore + ?Sized),
+    pod_reader: &(impl super::DeploymentPodReader + PodQuery + ?Sized),
+    pod_writer: &(
+         impl DeploymentPodMutation + crate::controllers::replicaset::ReplicaSetPodMutation + ?Sized
+     ),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     deployment: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -539,13 +579,14 @@ pub async fn reconcile_deployment(
     // Re-read the live object from storage. Watch/retry queues can deliver stale
     // snapshots after a Deployment has already been deleted; reconciling that
     // stale payload must not recreate ReplicaSets/Pods.
-    let live_deployment = match db
-        .get_resource("apps/v1", "Deployment", Some(namespace), name)
-        .await?
-    {
-        Some(r) => crate::api::inject_resource_version(r.data, r.resource_version),
+    let live_deployment_resource = match db.get_deployment(namespace, name).await? {
+        Some(resource) => resource,
         None => return Ok(()),
     };
+    let live_deployment = crate::controllers::resource_projection::with_resource_version(
+        live_deployment_resource.data.clone(),
+        live_deployment_resource.resource_version,
+    );
     let deployment = &live_deployment;
     let metadata = deployment
         .get("metadata")
@@ -592,7 +633,8 @@ pub async fn reconcile_deployment(
                 "conditions": [failure_condition]
             });
 
-            crate::controllers::common::write_status(db, deployment, &status).await?;
+            db.update_deployment_status(&live_deployment_resource, status)
+                .await?;
 
             return Ok(());
         }
@@ -621,26 +663,20 @@ pub async fn reconcile_deployment(
                 "conditions": [failure_condition]
             });
 
-            crate::controllers::common::write_status(db, deployment, &status).await?;
+            db.update_deployment_status(&live_deployment_resource, status)
+                .await?;
 
             return Ok(());
         }
     };
 
     // Get all ReplicaSets owned by this deployment
-    let rs_list = db
-        .list_resources(
-            "apps/v1",
-            "ReplicaSet",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let rs_list = db.list_replicasets(namespace).await?;
 
     let mut owned_rs_list = Vec::new();
     let deployment_owner_ref = common.build_owner_ref("apps/v1", "Deployment", name, uid);
 
-    for rs_resource in rs_list.items {
+    for rs_resource in rs_list {
         // Active ReplicaSets: controlled by this Deployment.
         if common.is_controlled_by(&rs_resource.data, uid) {
             owned_rs_list.push(rs_resource);
@@ -779,7 +815,8 @@ pub async fn reconcile_deployment(
     // Initial creates may acknowledge before child Pod creation, but rollouts
     // must wait until the matching new ReplicaSet is visible.
     if owned_rs_list.is_empty() {
-        acknowledge_observed_generation(db, deployment, metadata).await?;
+        acknowledge_observed_generation(db, &live_deployment_resource, deployment, metadata)
+            .await?;
     }
 
     // Check for rollback annotation
@@ -792,15 +829,8 @@ pub async fn reconcile_deployment(
         // Re-query all RSes. Older klights builds may have left
         // non-controller ownerRefs behind, so rollback lookup uses
         // the broader ownership predicate.
-        let all_rs = db
-            .list_resources(
-                "apps/v1",
-                "ReplicaSet",
-                Some(namespace),
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?;
-        let target_rs = all_rs.items.iter().find(|rs| {
+        let all_rs = db.list_replicasets(namespace).await?;
+        let target_rs = all_rs.iter().find(|rs| {
             common.is_owned_by(&rs.data, uid) && {
                 rs.data
                     .get("metadata")
@@ -920,12 +950,16 @@ pub async fn reconcile_deployment(
                     )
                     .await?;
                     let rs_with_metadata =
-                        crate::api::inject_resource_version(updated.data, updated.resource_version);
+                        crate::controllers::resource_projection::with_resource_version(
+                            updated.data,
+                            updated.resource_version,
+                        );
                     crate::controllers::replicaset::reconcile_replicaset(
                         db,
                         pod_reader,
                         pod_writer,
                         pod_delete_sink,
+                        non_pod_finalization,
                         &rs_with_metadata,
                         node_name,
                     )
@@ -934,16 +968,8 @@ pub async fn reconcile_deployment(
             }
 
             // Re-read old RSes to determine whether scale-down has completed.
-            let current_rs = db
-                .list_resources(
-                    "apps/v1",
-                    "ReplicaSet",
-                    Some(namespace),
-                    crate::datastore::ResourceListQuery::all(),
-                )
-                .await?;
+            let current_rs = db.list_replicasets(namespace).await?;
             let total_old_replicas = current_rs
-                .items
                 .iter()
                 .filter(|rs| rs.name != rs_name && common.is_owned_by(&rs.data, uid))
                 .map(|rs| {
@@ -976,12 +1002,16 @@ pub async fn reconcile_deployment(
                 )
                 .await?;
                 let rs_with_metadata =
-                    crate::api::inject_resource_version(updated.data, updated.resource_version);
+                    crate::controllers::resource_projection::with_resource_version(
+                        updated.data,
+                        updated.resource_version,
+                    );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
                     pod_delete_sink,
+                    non_pod_finalization,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -993,16 +1023,8 @@ pub async fn reconcile_deployment(
             let max_surge = get_max_surge(spec, desired_replicas);
             let max_unavailable = get_max_unavailable(spec, desired_replicas);
 
-            let all_rs = db
-                .list_resources(
-                    "apps/v1",
-                    "ReplicaSet",
-                    Some(namespace),
-                    crate::datastore::ResourceListQuery::all(),
-                )
-                .await?;
+            let all_rs = db.list_replicasets(namespace).await?;
             let current_new_rs = all_rs
-                .items
                 .iter()
                 .find(|rs| rs.name == rs_name)
                 .ok_or_else(|| anyhow::anyhow!("New RS {} disappeared during rollout", rs_name))?;
@@ -1011,9 +1033,11 @@ pub async fn reconcile_deployment(
                 .pointer("/metadata/uid")
                 .and_then(|u| u.as_str())
                 .ok_or_else(|| anyhow::anyhow!("New RS {} missing uid", rs_name))?;
-            let new_rs_pods = pod_reader
-                .list_pods_by_owner_uid(namespace, new_rs_uid)
-                .await?;
+            let new_rs_pods = PodQuery::list_pods_by_owner_uid(
+                pod_reader,
+                PodOwnerListRequest::try_new(namespace, new_rs_uid)?,
+            )
+            .await?;
             let new_rs_live_available = common.count_ready_pods(&new_rs_pods) as i64;
             let new_rs_status_available = current_new_rs
                 .data
@@ -1043,7 +1067,6 @@ pub async fn reconcile_deployment(
                 is_new: true,
             });
             for old_rs in all_rs
-                .items
                 .iter()
                 .filter(|rs| rs.name != rs_name && common.is_controlled_by(&rs.data, uid))
             {
@@ -1054,7 +1077,11 @@ pub async fn reconcile_deployment(
                 else {
                     continue;
                 };
-                let pods = pod_reader.list_pods_by_owner_uid(namespace, rs_uid).await?;
+                let pods = PodQuery::list_pods_by_owner_uid(
+                    pod_reader,
+                    PodOwnerListRequest::try_new(namespace, rs_uid)?,
+                )
+                .await?;
                 let live_available = common.count_ready_pods(&pods) as i64;
                 old_rs_active_pod_counts.insert(old_rs.name.clone(), active_pod_count(&pods));
                 let status_available = old_rs
@@ -1089,7 +1116,6 @@ pub async fn reconcile_deployment(
             let mut reconciled_rs_names = std::collections::HashSet::new();
             for target in plan.targets {
                 let rs = all_rs
-                    .items
                     .iter()
                     .find(|rs| rs.name == target.name)
                     .ok_or_else(|| {
@@ -1117,12 +1143,16 @@ pub async fn reconcile_deployment(
                 .await?;
                 reconciled_rs_names.insert(target.name.clone());
                 let rs_with_metadata =
-                    crate::api::inject_resource_version(updated.data, updated.resource_version);
+                    crate::controllers::resource_projection::with_resource_version(
+                        updated.data,
+                        updated.resource_version,
+                    );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
                     pod_delete_sink,
+                    non_pod_finalization,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1130,7 +1160,6 @@ pub async fn reconcile_deployment(
             }
 
             for old_rs in all_rs
-                .items
                 .iter()
                 .filter(|rs| rs.name != rs_name && common.is_controlled_by(&rs.data, uid))
             {
@@ -1151,15 +1180,17 @@ pub async fn reconcile_deployment(
                     continue;
                 }
 
-                let rs_with_metadata = crate::api::inject_resource_version(
-                    old_rs.data.clone(),
-                    old_rs.resource_version,
-                );
+                let rs_with_metadata =
+                    crate::controllers::resource_projection::with_resource_version(
+                        old_rs.data.clone(),
+                        old_rs.resource_version,
+                    );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
                     pod_delete_sink,
+                    non_pod_finalization,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1183,12 +1214,16 @@ pub async fn reconcile_deployment(
                 )
                 .await?;
                 let rs_with_metadata =
-                    crate::api::inject_resource_version(updated.data, updated.resource_version);
+                    crate::controllers::resource_projection::with_resource_version(
+                        updated.data,
+                        updated.resource_version,
+                    );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
                     pod_delete_sink,
+                    non_pod_finalization,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1229,12 +1264,16 @@ pub async fn reconcile_deployment(
                     )
                     .await?;
                     let rs_with_metadata =
-                        crate::api::inject_resource_version(updated.data, updated.resource_version);
+                        crate::controllers::resource_projection::with_resource_version(
+                            updated.data,
+                            updated.resource_version,
+                        );
                     crate::controllers::replicaset::reconcile_replicaset(
                         db,
                         pod_reader,
                         pod_writer,
                         pod_delete_sink,
+                        non_pod_finalization,
                         &rs_with_metadata,
                         node_name,
                     )
@@ -1266,9 +1305,11 @@ pub async fn reconcile_deployment(
                 else {
                     continue;
                 };
-                let pods = pod_reader
-                    .list_pods_by_owner_uid(namespace, old_rs_uid)
-                    .await?;
+                let pods = PodQuery::list_pods_by_owner_uid(
+                    pod_reader,
+                    PodOwnerListRequest::try_new(namespace, old_rs_uid)?,
+                )
+                .await?;
                 let live_available = common.count_ready_pods(&pods) as i64;
                 let status_available = old_rs
                     .data
@@ -1332,12 +1373,16 @@ pub async fn reconcile_deployment(
                 .await?;
                 old_replicas_after_plan.insert(target.name, target.replicas);
                 let rs_with_metadata =
-                    crate::api::inject_resource_version(updated.data, updated.resource_version);
+                    crate::controllers::resource_projection::with_resource_version(
+                        updated.data,
+                        updated.resource_version,
+                    );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
                     pod_reader,
                     pod_writer,
                     pod_delete_sink,
+                    non_pod_finalization,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1428,23 +1473,14 @@ pub async fn reconcile_deployment(
         });
 
         let created_rs = match db
-            .create_resource(
-                "apps/v1",
-                "ReplicaSet",
-                Some(namespace),
-                &rs_name,
-                replicaset.clone(),
-            )
+            .create_replicaset(namespace, &rs_name, replicaset.clone())
             .await
         {
             Ok(rs) => rs,
             Err(e) if e.to_string().contains("already exists") => {
                 // RS with this name already exists — concurrent reconcile created it first.
                 // Adopt it if it's owned by this deployment (idempotent create).
-                match db
-                    .get_resource("apps/v1", "ReplicaSet", Some(namespace), &rs_name)
-                    .await?
-                {
+                match db.get_replicaset(namespace, &rs_name).await? {
                     Some(existing) if common.is_owned_by(&existing.data, uid) => {
                         tracing::debug!(
                             "RS {}/{} already exists and is owned by this deployment — adopting",
@@ -1491,6 +1527,7 @@ pub async fn reconcile_deployment(
             db,
             created_rs.clone(),
             pod_delete_sink,
+            non_pod_finalization,
         )
         .await?
             == crate::controllers::gc::OwnerReferenceReconcile::Deleted
@@ -1499,13 +1536,16 @@ pub async fn reconcile_deployment(
         }
 
         // Reconcile the ReplicaSet to create pods
-        let rs_with_metadata =
-            crate::api::inject_resource_version(created_rs.data, created_rs.resource_version);
+        let rs_with_metadata = crate::controllers::resource_projection::with_resource_version(
+            created_rs.data,
+            created_rs.resource_version,
+        );
         crate::controllers::replicaset::reconcile_replicaset(
             db,
             pod_reader,
             pod_writer,
             pod_delete_sink,
+            non_pod_finalization,
             &rs_with_metadata,
             node_name,
         )
@@ -1514,16 +1554,8 @@ pub async fn reconcile_deployment(
 
     // Re-query owned RS list so any RS created/updated above is included in the count.
     // The original owned_rs_list was captured before RS creation, so it would miss new RS pods.
-    let fresh_rs_list = db
-        .list_resources(
-            "apps/v1",
-            "ReplicaSet",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
+    let fresh_rs_list = db.list_replicasets(namespace).await?;
     let fresh_owned_rs_list: Vec<_> = fresh_rs_list
-        .items
         .into_iter()
         .filter(|rs| common.is_controlled_by(&rs.data, uid))
         .collect();
@@ -1533,6 +1565,7 @@ pub async fn reconcile_deployment(
             pod_reader,
             pod_writer,
             pod_delete_sink,
+            non_pod_finalization,
             namespace,
             deployment_uid: uid,
             current_template: template,
@@ -1572,15 +1605,13 @@ pub async fn reconcile_deployment(
     // Re-read the Deployment to get a fresh RV after the revision annotation
     // write. The `deployment` variable was read at the top of reconcile and is
     // stale after RS scaling, pod operations, and the revision annotation write.
-    let fresh_deployment = match db
-        .get_resource("apps/v1", "Deployment", Some(namespace), name)
-        .await?
-    {
-        Some(r) => crate::api::inject_resource_version(r.data, r.resource_version),
+    let fresh_deployment = match db.get_deployment(namespace, name).await? {
+        Some(resource) => resource,
         None => return Ok(()),
     };
 
     let observed_generation = fresh_deployment
+        .data
         .get("metadata")
         .and_then(|m| m.get("generation"))
         .and_then(|g| g.as_i64())
@@ -1597,7 +1628,8 @@ pub async fn reconcile_deployment(
         "conditions": conditions
     });
 
-    crate::controllers::common::write_status(db, &fresh_deployment, &status).await?;
+    db.update_deployment_status(&fresh_deployment, status)
+        .await?;
 
     Ok(())
 }

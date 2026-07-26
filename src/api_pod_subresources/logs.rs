@@ -1,12 +1,14 @@
 use super::*;
-use crate::datastore::{CurrentResourceVersionStore, WatchStore};
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
+    WatchReplaySource, WindowPolicy,
 };
 use klights_node_api::{NodeLog, NodeLogOptions, NodeLogRequest, NodeLogTarget};
-use klights_watch::WatchTopic;
+use klights_watch::{WatchSignalReceiver, WatchTopic};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{fs as blocking_fs, path::PathBuf};
 #[cfg(test)]
@@ -59,19 +61,58 @@ struct RemotePodLogWebSocketRequest {
 
 #[derive(Clone)]
 pub(crate) struct PodLogFollowWatchSource {
-    watch_store: Arc<dyn WatchStore>,
-    resource_version_store: Arc<dyn CurrentResourceVersionStore>,
+    inner: Arc<dyn PodLogFollowWatchPort>,
 }
 
 impl PodLogFollowWatchSource {
-    pub(crate) fn new<T>(db: Arc<T>) -> Self
-    where
-        T: WatchStore + CurrentResourceVersionStore + Send + Sync + 'static,
-    {
-        Self {
-            watch_store: db.clone(),
-            resource_version_store: db,
-        }
+    pub(crate) fn new(inner: Arc<dyn PodLogFollowWatchPort>) -> Self {
+        Self { inner }
+    }
+}
+
+pub(crate) type PodLogFollowResourceVersionFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>>;
+
+pub(crate) trait PodLogFollowWatchPort: Send + Sync {
+    fn subscribe_pod_watch_signals(&self) -> WatchSignalReceiver;
+    fn pod_watch_replay_source(&self) -> PodLogFollowReplaySource;
+    fn current_resource_version(&self) -> PodLogFollowResourceVersionFuture<'_>;
+}
+
+pub(crate) struct PodLogFollowReplaySource {
+    inner: Arc<dyn WatchReplaySource>,
+}
+
+impl PodLogFollowReplaySource {
+    pub(crate) fn new(inner: Arc<dyn WatchReplaySource>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for PodLogFollowReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        self.inner.replay_since(since_rv).await
+    }
+
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<klights_watch::WatchReplayRead<WatchEvent>> {
+        self.inner.replay_since_checked(since_rv, limit).await
+    }
+
+    async fn replay_after_checked(
+        &self,
+        position: klights_watch::WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
+        self.inner.replay_after_checked(position, limit).await
+    }
+
+    async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
+        self.inner.earliest_retained_rv().await
     }
 }
 
@@ -120,8 +161,8 @@ pub async fn get_pod_log(
     req: Request,
 ) -> Result<Response, AppError> {
     // Get pod from PodRepository
-    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -154,21 +195,30 @@ pub async fn get_pod_log(
     };
 
     // Check if pod is on a remote node — proxy log request via gRPC
-    let remote_node =
-        crate::api_pod_subresources::exec::remote_pod_node_name(&pod_data, &state.config.node_name);
+    let remote_node = crate::api_pod_subresources::exec::remote_pod_node_name(
+        &pod_data,
+        &state.operational().config.node_name,
+    );
     if let Some(node_name) = remote_node {
         let pod_uid = pod_data
             .get("metadata")
             .and_then(|m| m.get("uid"))
             .and_then(|u| u.as_str())
             .ok_or_else(|| AppError::Internal("Pod has no UID".to_string()))?;
-        let node_log: Arc<dyn NodeLog> = state.replication.as_ref().cloned().ok_or_else(|| {
-            AppError::Internal("replication service not available for remote pod log".to_string())
-        })?;
+        let node_log: Arc<dyn NodeLog> = state
+            .operational()
+            .replication
+            .as_ref()
+            .map(|services| services.logs.clone())
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "replication service not available for remote pod log".to_string(),
+                )
+            })?;
         if is_pod_log_websocket_upgrade(req.headers()) {
             return get_remote_pod_log_websocket(RemotePodLogWebSocketRequest {
                 node_log,
-                task_supervisor: state.task_supervisor.clone(),
+                task_supervisor: state.operational().task_supervisor.clone(),
                 namespace,
                 name,
                 pod_uid: pod_uid.to_string(),
@@ -199,7 +249,7 @@ pub async fn get_pod_log(
         .ok_or_else(|| AppError::Internal("Pod has no UID".to_string()))?;
 
     let log_path = crate::paths::pod_log_dir_path(
-        &state.config.containerd_namespace,
+        &state.operational().config.containerd_namespace,
         &namespace,
         &name,
         pod_uid,
@@ -231,8 +281,9 @@ pub async fn get_pod_log(
         let subprotocol = negotiate_pod_log_websocket_subprotocol(req.headers());
 
         let on_upgrade = hyper::upgrade::on(req);
-        let task_supervisor = state.task_supervisor.clone();
+        let task_supervisor = state.operational().task_supervisor.clone();
         if let Err(err) = state
+            .operational()
             .task_supervisor
             .spawn_async(
                 klights_supervisor::TaskCategory::Others,
@@ -291,13 +342,17 @@ pub async fn get_pod_log(
         let stream = follow_log_file_with_termination_watch(
             log_path,
             params,
-            state.task_supervisor.clone(),
+            state.operational().task_supervisor.clone(),
             termination,
         );
         build_text_log_response(axum::body::Body::from_stream(stream))
     } else {
-        let output =
-            build_log_output_bytes(&log_path, &params, state.task_supervisor.as_ref()).await?;
+        let output = build_log_output_bytes(
+            &log_path,
+            &params,
+            state.operational().task_supervisor.as_ref(),
+        )
+        .await?;
 
         build_text_log_response(axum::body::Body::from(output))
     }
@@ -310,12 +365,11 @@ async fn build_pod_log_follow_termination(
     pod_uid: &str,
     container_name: &str,
 ) -> Result<PodLogFollowTermination, AppError> {
-    let pod_event_store = PodLogFollowWatchSource::new(Arc::new(
-        crate::datastore::DatastoreBackendWatchStore::new(state.db.clone()),
-    ));
-    let pod_events = build_pod_log_follow_event_cursor(&pod_event_store).await;
-    let current = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    let pod_events =
+        build_pod_log_follow_event_cursor(&state.pod_node_subresources().pod_log_follow_watch)
+            .await;
+    let current = crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         namespace,
         name,
     )
@@ -378,22 +432,17 @@ async fn build_pod_log_follow_termination(
 
 pub(crate) async fn build_pod_log_follow_event_cursor(
     pod_event_store: &PodLogFollowWatchSource,
-) -> SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource> {
+) -> SignalWatchCursor<PodLogFollowReplaySource> {
     let topic = WatchTopic::new("v1", "Pod");
-    let signal_rx = pod_event_store
-        .watch_store
-        .subscribe_watch_signals(topic.clone());
+    let signal_rx = pod_event_store.inner.subscribe_pod_watch_signals();
     let start_rv = pod_event_store
-        .resource_version_store
-        .get_current_resource_version()
+        .inner
+        .current_resource_version()
         .await
         .unwrap_or(0);
     SignalWatchCursor::new(
         signal_rx,
-        crate::datastore::sqlite::DatastoreWatchReplaySource::new(
-            pod_event_store.watch_store.clone(),
-            vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
-        ),
+        pod_event_store.inner.pod_watch_replay_source(),
         topic,
         WatchDeliveryScope::NamespacedAll,
         start_rv,
@@ -768,8 +817,8 @@ pub struct PodLogFollowTermination {
 }
 
 impl PodLogFollowTermination {
-    pub fn new(
-        pod_events: SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource>,
+    pub(crate) fn new(
+        pod_events: SignalWatchCursor<PodLogFollowReplaySource>,
         namespace: String,
         name: String,
         uid: String,
@@ -811,7 +860,7 @@ impl PodLogFollowTermination {
 }
 
 enum PodLogEventSource {
-    Signal(Box<SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource>>),
+    Signal(Box<SignalWatchCursor<PodLogFollowReplaySource>>),
     #[cfg(test)]
     Broadcast(broadcast::Receiver<WatchEvent>),
 }
@@ -2061,6 +2110,108 @@ mod container_validation_tests {
     #[test]
     fn unknown_container_rejected() {
         assert!(validate_requested_container(&pod(), "nope", "ns", "p").is_err());
+    }
+}
+
+#[cfg(test)]
+mod watch_port_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingReplaySource {
+        positions: Arc<Mutex<Vec<klights_watch::WatchReplayPosition>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WatchReplaySource for RecordingReplaySource {
+        async fn replay_since(&self, _since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn replay_after_checked(
+            &self,
+            position: klights_watch::WatchReplayPosition,
+            _limit: std::num::NonZeroUsize,
+        ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
+            self.positions.lock().unwrap().push(position);
+            Ok(klights_watch::PositionedWatchReplayRead::Events(
+                klights_watch::PositionedWatchReplay::new(Vec::new(), position),
+            ))
+        }
+    }
+
+    struct RecordingWatchPort {
+        receiver: Mutex<Option<WatchSignalReceiver>>,
+        replay: Arc<RecordingReplaySource>,
+        current_rv: i64,
+    }
+
+    impl PodLogFollowWatchPort for RecordingWatchPort {
+        fn subscribe_pod_watch_signals(&self) -> WatchSignalReceiver {
+            self.receiver
+                .lock()
+                .unwrap()
+                .take()
+                .expect("cursor is constructed once")
+        }
+
+        fn pod_watch_replay_source(&self) -> PodLogFollowReplaySource {
+            PodLogFollowReplaySource::new(self.replay.clone())
+        }
+
+        fn current_resource_version(&self) -> PodLogFollowResourceVersionFuture<'_> {
+            Box::pin(async move { Ok(self.current_rv) })
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_cursor_uses_current_rv_as_positioned_replay_handoff() {
+        let (_hub, receiver) = crate::watch::test_signal_channel(4, [WatchTopic::new("v1", "Pod")]);
+        let positions = Arc::new(Mutex::new(Vec::new()));
+        let source = PodLogFollowWatchSource::new(Arc::new(RecordingWatchPort {
+            receiver: Mutex::new(Some(receiver)),
+            replay: Arc::new(RecordingReplaySource {
+                positions: positions.clone(),
+            }),
+            current_rv: 41,
+        }));
+
+        let mut cursor = build_pod_log_follow_event_cursor(&source).await;
+        assert_eq!(cursor.accepted_rv(), 41);
+        assert_eq!(cursor.prime_replay_or_expired().await.unwrap(), 0);
+        assert_eq!(
+            positions.lock().unwrap().as_slice(),
+            [klights_watch::WatchReplayPosition::from_resource_version(
+                41
+            )]
+        );
+    }
+
+    #[test]
+    fn replacement_pod_uid_does_not_terminate_old_log_follow() {
+        let (_tx, receiver) = tokio::sync::broadcast::channel(1);
+        let termination = PodLogFollowTermination::new_for_test(
+            receiver,
+            "default".to_string(),
+            "same-name".to_string(),
+            "old-uid".to_string(),
+            "main".to_string(),
+            false,
+        );
+        let replacement = WatchEvent::deleted(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "same-name",
+                "uid": "replacement-uid"
+            }
+        }));
+
+        assert!(!pod_log_follow_event_is_terminal(
+            &termination,
+            &replacement
+        ));
     }
 }
 

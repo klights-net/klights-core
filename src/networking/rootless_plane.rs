@@ -15,8 +15,9 @@ use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, OnceLock};
 
+use crate::networking::BridgeName;
 use crate::networking::dataplane_health::DataplaneHealth;
-use crate::networking::{BridgeName, NodeName, PodSubnet};
+use klights_types::{NodeName, PodSubnet};
 
 pub struct RootlessNetworkPlane {
     pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,

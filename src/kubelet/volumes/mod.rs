@@ -18,12 +18,9 @@ mod tests_refresh_subpath;
 
 pub use basics::unmount_volume_mounts_under;
 pub use basics::{
-    create_empty_dir, create_empty_dir_for_namespace, empty_dir_volume_path,
-    empty_dir_volume_path_for_namespace, resolve_host_path,
+    create_empty_dir_under_root, empty_dir_volume_path_under_root, resolve_host_path,
 };
-pub use basics::{
-    parse_k8s_quantity, validate_volume_projection_paths, validate_volume_subpaths, volumes_root,
-};
+pub use basics::{parse_k8s_quantity, validate_volume_projection_paths, validate_volume_subpaths};
 pub use blocking::run_blocking_fs_keyed;
 pub use configmap_secret::{create_config_map_volume, create_secret_volume};
 pub use configmap_secret::{
@@ -36,6 +33,11 @@ pub(crate) use projected::{ProjectedVolumeRootRequest, create_projected_volume_u
 
 #[cfg(test)]
 pub use basics::parse_mountinfo_entry;
+#[cfg(test)]
+pub use basics::{
+    create_empty_dir, create_empty_dir_for_namespace, empty_dir_volume_path,
+    empty_dir_volume_path_for_namespace, volumes_root,
+};
 #[cfg(test)]
 pub use blocking::blocking_fs_keyed_call_count;
 #[cfg(test)]

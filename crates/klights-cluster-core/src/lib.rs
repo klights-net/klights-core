@@ -4,6 +4,8 @@ pub mod apply;
 pub mod command;
 pub mod log_apply;
 pub mod membership;
+pub mod node_projection;
+pub mod outbox;
 pub mod recovery;
 pub mod replay;
 pub mod resource;
@@ -11,11 +13,10 @@ pub mod stale_resource;
 pub mod status;
 
 pub use apply::{
-    ApplyPreconditionPolicy, ApplyPreconditionViolation, ApplyPreconditions, CurrentResourceState,
-    ResourceDeleteDecision, ResourceEventType, ResourceWriteDecision, StatusStampDecision,
-    decide_resource_delete, decide_resource_put, decide_status_stamp,
-    resource_bodies_equal_ignoring_metadata_field, resource_client_owned_state_equal,
-    validate_apply_preconditions,
+    ApplyPreconditionViolation, ApplyPreconditions, CurrentResourceState, ResourceDeleteDecision,
+    ResourceEventType, ResourceWriteDecision, StatusStampDecision, decide_resource_delete,
+    decide_resource_put, decide_status_stamp, resource_bodies_equal_ignoring_metadata_field,
+    resource_client_owned_state_equal, validate_apply_preconditions,
 };
 pub use command::{
     COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta, StorageCommand, StorageResponse,
@@ -23,13 +24,13 @@ pub use command::{
 };
 pub use log_apply::{
     ClusterMetaMutation, ClusterMutation, CommittedApplyOutcome, CommittedApplyRejection,
-    InvalidOutboxStreamSequence, LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation,
-    LogApplyNamespaceRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation,
-    LogApplyNodeSubnetRow, LogApplyPodActorFinalization, LogApplyPodCleanupIntentKey,
-    LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
-    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, NoPublicChangeReason,
-    OutboxLedgerMutation, OutboxStreamWatermark, OutboxWatermarkDecision, PodCleanupMutation,
-    ResourceMutation, ResourceVersionAssignment, ResourceVersionAssignmentError,
+    InvalidOutboxStreamSequence, LiveCommitResourceVersionError, LogApplyAppliedOutboxRow,
+    LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
+    LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow, LogApplyPodActorFinalization,
+    LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow, LogApplyResourceKey,
+    LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow, NamespaceMutation,
+    NetworkMutation, NoPublicChangeReason, OutboxLedgerMutation, OutboxStreamWatermark,
+    OutboxWatermarkDecision, PodCleanupMutation, ResourceMutation, SnapshotRestoreOperation,
     UnsupportedClusterMutationVersion, VersionedClusterMutation, WatchHistoryMutation,
     commit_with_outbox_rows_only, decide_outbox_watermark, is_stamped_pod_status_outbox_operation,
     stamped_pod_status_subject_and_stamp,
@@ -37,6 +38,15 @@ pub use log_apply::{
 pub use membership::{
     ClusterMembership, NodeId, RaftShape, merge_controlplane_join_membership_metadata,
     raft_node_id_for_node_name,
+};
+pub use node_projection::{
+    merge_existing_node_mutable_fields, prune_klights_managed_node_role_labels,
+    set_node_external_ip_from_dataplane_annotation, set_node_pod_cidr,
+};
+pub use outbox::{
+    BuildOutboxOutcome, OutboxApplyError, OutboxApplyOutcome, OutboxOperation, OutboxPayload,
+    OutboxPriority, UnknownOutboxOperation, classify_apply_error, classify_apply_error_for_command,
+    pod_target, subject_key_for_command,
 };
 pub use recovery::{ClusterMetadata, MetadataComparison, compare_metadata, needs_confirmation};
 pub use replay::{PositionedWatchEvent, WatchReplayPosition};

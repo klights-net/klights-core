@@ -11,7 +11,7 @@
 use super::*;
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::command::StorageCommand;
-use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 use serde_json::json;
 
 const STATUS_OPS: &[OutboxOperation] = &[

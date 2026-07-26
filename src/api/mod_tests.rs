@@ -3372,7 +3372,10 @@ fn test_watch_event_to_table_secret_includes_object() {
 #[tokio::test]
 async fn test_openapi_v3_discovery_returns_paths() {
     let db = crate::datastore::test_support::in_memory().await;
-    let response = openapi_v3_discovery_with_crds(&db).await;
+    let response = openapi_v3_discovery_with_crds(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
 
     // Must have paths field
     assert!(response["paths"].is_object());
@@ -3395,7 +3398,10 @@ async fn test_openapi_v3_discovery_returns_paths() {
 #[tokio::test]
 async fn test_openapi_v2_returns_swagger() {
     let db = crate::datastore::test_support::in_memory().await;
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
 
     // Must be Swagger 2.0
     assert_eq!(response["swagger"], "2.0");
@@ -3414,7 +3420,10 @@ async fn test_openapi_v2_returns_swagger() {
 #[tokio::test]
 async fn test_openapi_v2_includes_builtin_pod_schema_properties() {
     let db = crate::datastore::test_support::in_memory().await;
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
 
     let pod = response
         .pointer("/definitions/io.k8s.api.core.v1.Pod")
@@ -3496,7 +3505,10 @@ async fn test_openapi_v2_includes_crd_schemas() {
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
 
     // Verify CRD schema is in definitions with reversed domain format
     // "cert-manager.io" becomes "io.cert-manager"
@@ -3566,7 +3578,10 @@ async fn test_openapi_v2_uses_reversed_domain_format_for_crd_keys() {
     .await
     .unwrap();
 
-    let response = openapi_v2(&db).await;
+    let response = openapi_v2(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+    )
+    .await;
     let definitions = response["definitions"].as_object().unwrap();
 
     // Should use reversed domain format with lowercase kind
@@ -4308,7 +4323,7 @@ async fn test_crd_conversion_service_webhook_uses_endpoint_target_port() {
     };
 
     let result = convert_crd_objects_to_requested_version(
-        &db,
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
         "widgets",
@@ -4432,7 +4447,7 @@ async fn test_crd_conversion_skips_objects_already_on_desired_version() {
     };
 
     let result = convert_crd_objects_to_requested_version(
-        &db,
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
         "widgets",
@@ -4539,7 +4554,7 @@ async fn test_crd_conversion_strategy_check_is_case_insensitive() {
     };
 
     let result = convert_crd_objects_to_requested_version(
-        &db,
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
         "widgets",
@@ -4573,7 +4588,7 @@ async fn test_crd_conversion_strategy_none_with_client_config_stamps_requested_v
     };
 
     let result = convert_crd_objects_to_requested_version(
-        &db,
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
         "widgets",
@@ -4667,7 +4682,7 @@ async fn test_crd_conversion_accepts_yaml_conversion_review_response() {
     };
 
     let result = convert_crd_objects_to_requested_version(
-        &db,
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
         &conversion,
         "stable.example.com",
         "widgets",
@@ -5209,15 +5224,17 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
     .unwrap();
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    state.config = std::sync::Arc::new(crate::KlightsConfig {
-        containerd_namespace: unique_ns.clone(),
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    });
+    state.operational_mut().config =
+        crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
+            containerd_namespace: unique_ns.clone(),
+            ..crate::KlightsConfig::from_env().expect("env config valid in test")
+        });
 
     // Phase 2B: SA must exist for UID validation.
     // Create the ServiceAccount before generating the token.
     let sa_uid = uuid::Uuid::new_v4().to_string();
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -5244,7 +5261,7 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
         "sonobuoy-serviceaccount",
         "sonobuoy",
         &["https://kubernetes.default.svc.cluster.local"],
-        crate::auth::DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
+        klights_types::DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
         &sa_uid,
     )
     .unwrap();
@@ -5494,7 +5511,7 @@ async fn test_raft_follower_proxy_forwards_authenticated_client_cert_identity_he
     let mut state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    state.is_raft_leader_rx = Some(std::sync::Arc::new(
+    state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     let app = crate::api::build_router(state);
@@ -5657,7 +5674,7 @@ async fn raft_follower_health_endpoints_bypass_leader_proxy() {
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
 
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.is_raft_leader_rx = Some(std::sync::Arc::new(
+    follower_state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     let app = crate::api::build_router(follower_state);
@@ -5719,8 +5736,9 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     }
 
     let mut leader_state = crate::api::test_support::build_test_app_state().await;
-    leader_state.is_raft_leader_rx = Some(raft_proxy(true));
+    leader_state.operational_mut().is_raft_leader_rx = Some(raft_proxy(true));
     leader_state
+        .resource_mutation_mut()
         .db
         .create_resource(
             "v1",
@@ -5745,6 +5763,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         .await
         .unwrap();
     leader_state
+        .controller_reconcile()
         .node_lease_tracker
         .record_from_lease_object(
             "worker-a",
@@ -5774,8 +5793,9 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     );
 
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.is_raft_leader_rx = Some(raft_proxy(false));
+    follower_state.operational_mut().is_raft_leader_rx = Some(raft_proxy(false));
     follower_state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -5800,6 +5820,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         .await
         .unwrap();
     follower_state
+        .controller_reconcile()
         .node_lease_tracker
         .record_from_lease_object(
             "worker-a",
@@ -5896,7 +5917,7 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
     }
 
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.is_raft_leader_rx = Some(raft_proxy_without_leader());
+    follower_state.operational_mut().is_raft_leader_rx = Some(raft_proxy_without_leader());
 
     for (method, uri, body) in [
         ("GET", "/api/v1/nodes/worker-a", None),
@@ -5931,10 +5952,11 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    follower_state.is_raft_leader_rx = Some(std::sync::Arc::new(
+    follower_state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     follower_state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -6062,7 +6084,7 @@ async fn test_task_supervisor_active_background_and_others_tasks_are_queryable()
     use tower::ServiceExt;
 
     let state = crate::api::test_support::build_test_app_state().await;
-    let task_supervisor = state.task_supervisor.clone();
+    let task_supervisor = state.operational().task_supervisor.clone();
     let app = crate::api::build_router(state);
 
     let (bg_tx, bg_rx) = tokio::sync::oneshot::channel::<()>();
@@ -6341,9 +6363,14 @@ async fn test_check_cr_field_validation_strict_accepts_valid_cr_with_schema_arra
     });
 
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
+    let resource_query = crate::control_plane::client::local::LocalApiClient::new(
+        db_handle,
+        "test-node".to_string(),
+        crate::control_plane::client::local::always_leader_watch(),
+    );
 
     let result = check_cr_field_validation_strict(
-        db_handle.as_ref(),
+        &resource_query,
         "stable.example.com",
         "v1",
         "Widget",
@@ -6412,9 +6439,14 @@ async fn test_resolve_service_proxy_target_uses_dns_hostname() {
     .await
     .unwrap();
 
-    let target = resolve_service_proxy_target(&db, "default", "wardle-service", 443)
-        .await
-        .unwrap();
+    let target = resolve_service_proxy_target(
+        crate::api::test_support::resource_query_for_test_datastore(db.clone()).as_ref(),
+        "default",
+        "wardle-service",
+        443,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(target.host, "wardle-service.default.svc");
     assert_eq!(target.port, 443);

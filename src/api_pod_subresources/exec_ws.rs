@@ -2,13 +2,24 @@ use super::*;
 
 use klights_node_api::{
     ExecStreamChannel, NodeExec, NodeExecFrame, NodeExecSession, NodeExecSyncRequest,
-    NodeExecTarget, exec_error_status_payload_is_terminal,
+    NodeExecTarget,
+};
+
+#[cfg(test)]
+use klights_node_api::exec_error_status_payload_is_terminal;
+
+#[cfg(test)]
+use crate::kubelet::cri_exec::{
+    AttachRequest, ExecRequest, ExecStreamOptions as CriExecStreamOptions,
+    attach_with_created_state_retry, exec_sync_with_created_state_retry,
+    exec_with_created_state_retry,
 };
 
 pub fn remote_exec_error_frame_is_terminal(frame: &NodeExecFrame) -> bool {
     frame.is_terminal()
 }
 
+#[cfg(test)]
 fn spdy_error_stream_frame_is_terminal(stream_id: u32, data: &[u8], fin: bool) -> bool {
     stream_id == 7 && (fin || exec_error_status_payload_is_terminal(data))
 }
@@ -61,6 +72,7 @@ async fn close_websocket_gracefully<S>(
     }
 }
 
+#[cfg(test)]
 pub struct ExecWebSocketRequest {
     pub cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -87,6 +99,7 @@ pub struct RemoteExecWebSocketSyncRequest {
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
+#[cfg(test)]
 pub async fn handle_exec_websocket_tungstenite<S>(
     socket: tokio_tungstenite::WebSocketStream<S>,
     request: ExecWebSocketRequest,
@@ -159,7 +172,7 @@ pub async fn handle_exec_websocket_tungstenite<S>(
                     task_supervisor.as_ref(),
                     AttachRequest {
                         container_id: &container_id,
-                        stream_options: ExecStreamOptions {
+                        stream_options: CriExecStreamOptions {
                             tty,
                             stdin,
                             stdout,
@@ -176,7 +189,7 @@ pub async fn handle_exec_websocket_tungstenite<S>(
                     ExecRequest {
                         container_id: &container_id,
                         command: &command,
-                        stream_options: ExecStreamOptions {
+                        stream_options: CriExecStreamOptions {
                             tty,
                             stdin,
                             stdout,

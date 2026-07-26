@@ -108,6 +108,9 @@ pub struct RuntimeConfig {
     pub node_name: String,
     pub service_cidr: String,
     pub containerd_namespace: String,
+    pub sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs,
+    pub node_capacity: crate::kubelet::node::NodeCapacity,
+    pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
 }
 
 // --- RealPodRuntimeService ---
@@ -144,7 +147,7 @@ use crate::kubelet::pod_runtime::status_helpers::{
 use crate::kubelet::pod_runtime::status_projection;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
-use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_dns_policy;
+use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_runtime_inputs;
 use crate::kubelet::pod_startup_error::PodStartupErrorKind;
 use crate::kubelet::pod_status_builders::{
     build_initial_pending_status, build_pod_initializing_app_statuses,
@@ -176,7 +179,7 @@ pub(super) struct ContainerConfigBuildRequest<'a> {
 }
 
 fn managed_hosts_file_path(
-    containerd_namespace: &str,
+    paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     key: &PodRuntimeKey,
     pod: &serde_json::Value,
 ) -> Option<String> {
@@ -185,7 +188,8 @@ fn managed_hosts_file_path(
     }
 
     Some(
-        crate::paths::containerd_hosts_dir_path(containerd_namespace, &key.namespace, &key.name)
+        paths
+            .containerd_hosts_dir(&key.namespace, &key.name)
             .join("hosts")
             .to_string_lossy()
             .into_owned(),
@@ -305,20 +309,23 @@ impl RealPodRuntimeService {
             self.env_source.as_ref(),
         )
         .await;
-        let subpath_env = crate::kubelet::pod_env::build_subpath_env(
+        let subpath_env = crate::kubelet::pod_env::build_subpath_env_with_capacity(
             request.container,
             request.pod,
             &resolved_env_from,
             &resolved_env,
+            self.config.node_capacity,
         );
-        let mut container_config = crate::kubelet::pod_container_config::build_container_config(
-            request.container,
-            request.pod,
-            request.container_name,
-            request.kubernetes_service_ip,
-            &resolved_env_from,
-            &resolved_env,
-        );
+        let mut container_config =
+            crate::kubelet::pod_container_config::build_container_config_with_capacity(
+                request.container,
+                request.pod,
+                request.container_name,
+                request.kubernetes_service_ip,
+                &resolved_env_from,
+                &resolved_env,
+                self.config.node_capacity,
+            );
         let service_envs = crate::kubelet::pod_service_envs::resolve_service_envs_from_source(
             &request.key.namespace,
             self.env_source.as_ref(),
@@ -351,8 +358,7 @@ impl RealPodRuntimeService {
             }
         }
 
-        let hosts_file_path =
-            managed_hosts_file_path(&self.config.containerd_namespace, request.key, request.pod);
+        let hosts_file_path = managed_hosts_file_path(&self.config.paths, request.key, request.pod);
         append_managed_hosts_mount(&mut container_config.mounts, hosts_file_path.as_deref());
 
         let termination_log_host = self
@@ -419,14 +425,18 @@ impl RealPodRuntimeService {
             .await?;
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
-        let sandbox_config = build_sandbox_config_with_dns_policy(
-            &key.name,
-            &key.namespace,
+        let sandbox_config = build_sandbox_config_with_runtime_inputs(
+            crate::kubelet::pod_sandbox_config::SandboxIdentity {
+                pod_name: &key.name,
+                namespace: &key.namespace,
+                pod_uid: &key.uid,
+                containerd_namespace: &self.config.containerd_namespace,
+            },
             pod_status_ip(pod),
-            &key.uid,
-            &self.config.containerd_namespace,
             &dns_ip,
             pod_spec,
+            &self.config.sandbox_inputs,
+            &self.config.paths,
         );
 
         let new_container_id = self
@@ -1102,14 +1112,18 @@ impl PodRuntimeService for RealPodRuntimeService {
         let dns_ip = crate::service_ips::dns_service_ip(&self.config.service_cidr);
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
-        let sandbox_config = build_sandbox_config_with_dns_policy(
-            &key.name,
-            &key.namespace,
+        let sandbox_config = build_sandbox_config_with_runtime_inputs(
+            crate::kubelet::pod_sandbox_config::SandboxIdentity {
+                pod_name: &key.name,
+                namespace: &key.namespace,
+                pod_uid: &key.uid,
+                containerd_namespace: &self.config.containerd_namespace,
+            },
             "",
-            &key.uid,
-            &self.config.containerd_namespace,
             &dns_ip,
             pod_spec,
+            &self.config.sandbox_inputs,
+            &self.config.paths,
         );
         let container_sandbox_config = sandbox_config.clone();
         let kubernetes_service_ip =
@@ -2423,14 +2437,18 @@ impl PodRuntimeService for RealPodRuntimeService {
             crate::service_ips::kubernetes_service_ip(&self.config.service_cidr);
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
-        let sandbox_config = build_sandbox_config_with_dns_policy(
-            &key.name,
-            &key.namespace,
+        let sandbox_config = build_sandbox_config_with_runtime_inputs(
+            crate::kubelet::pod_sandbox_config::SandboxIdentity {
+                pod_name: &key.name,
+                namespace: &key.namespace,
+                pod_uid: &key.uid,
+                containerd_namespace: &self.config.containerd_namespace,
+            },
             pod_ip,
-            &key.uid,
-            &self.config.containerd_namespace,
             &dns_ip,
             pod_spec,
+            &self.config.sandbox_inputs,
+            &self.config.paths,
         );
         let mut volume_paths: Option<std::collections::HashMap<String, String>> = None;
 
@@ -2696,7 +2714,12 @@ impl PodRuntimeService for RealPodRuntimeService {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(e) if crate::datastore::errors::is_conflict_error(&e) && attempt < 4 => {
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<klights_pod_api::PodRepositoryError>(),
+                        Some(klights_pod_api::PodRepositoryError::Conflict { .. })
+                    ) && attempt < 4 =>
+                {
                     attempt += 1;
                     let _ = self
                         .supervisor

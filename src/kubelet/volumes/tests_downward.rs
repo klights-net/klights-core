@@ -674,6 +674,7 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         volume_name: "podinfo",
         default_mode: None,
         items: &items,
+        node_capacity: crate::kubelet::node::NodeCapacity::default(),
     })
     .await
     .unwrap();
@@ -688,6 +689,7 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &pod_for_refresh.data,
         root,
+        crate::kubelet::node::NodeCapacity::default(),
     )
     .await
     .unwrap();

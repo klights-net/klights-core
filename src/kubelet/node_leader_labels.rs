@@ -1,10 +1,10 @@
-use crate::datastore::{Resource, ResourceList, ResourcePreconditions};
 use anyhow::Result;
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use std::sync::Arc;
 
 #[async_trait::async_trait]
 pub(crate) trait NodeLeaderLabelStore: Send + Sync {
-    async fn list_nodes(&self) -> Result<ResourceList>;
+    async fn list_nodes(&self) -> Result<Vec<Resource>>;
 
     async fn update_node_with_preconditions(
         &self,
@@ -23,8 +23,7 @@ pub(crate) async fn clear_leader_label_from_other_nodes(
     store: &dyn NodeLeaderLabelStore,
     local_node_name: &str,
 ) -> Result<()> {
-    let nodes = store.list_nodes().await?;
-    for node in nodes.items {
+    for node in store.list_nodes().await? {
         if node.name == local_node_name {
             continue;
         }
@@ -67,7 +66,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeLeaderLabelStore for TestNodeLeaderLabelStore {
-        async fn list_nodes(&self) -> Result<ResourceList> {
+        async fn list_nodes(&self) -> Result<Vec<Resource>> {
             self.db
                 .list_resources(
                     "v1",
@@ -76,6 +75,7 @@ mod tests {
                     crate::datastore::ResourceListQuery::all(),
                 )
                 .await
+                .map(|list| list.items)
         }
 
         async fn update_node_with_preconditions(

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PatchKind, Resource};
 
+/// Stable operation label carried by durable actor-owned Pod finalization.
+pub const POD_METADATA_OPERATION: &str = "PodMetadata";
+
 /// Canonical state-machine result for a committed logical delta. The enum
 /// prevents a terminal rejection from simultaneously claiming a visible
 /// mutation or a no-op from manufacturing a new public resourceVersion.
@@ -60,61 +63,77 @@ impl CommittedApplyRejection {
     }
 }
 
-/// One logical cluster-state commit in legacy or committed-apply form.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One logical live cluster-state commit.
+///
+/// This is always a `CommittedApplyV1` template: every public
+/// resourceVersion field is zero until the committed persistence transaction
+/// allocates it exactly once.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LogApplyCommit {
-    pub resource_version: i64,
-    /// Missing fields from pre-envelope JSON/protobuf payloads decode to the
-    /// legacy leader-assigned behavior.
-    #[serde(default)]
-    pub resource_version_assignment: ResourceVersionAssignment,
+    resource_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outbox_watermark: Option<OutboxStreamWatermark>,
-    pub mutations: Vec<LogApplyMutation>,
+    outbox_watermark: Option<OutboxStreamWatermark>,
+    mutations: Vec<LogApplyMutation>,
 }
 
-/// Wire-stable source of a replicated commit's public resourceVersion.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResourceVersionAssignment {
-    #[default]
-    LegacyLeaderAssigned,
-    CommittedApplyV1,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedLogApplyCommit {
+    resource_version: i64,
+    #[serde(default)]
+    outbox_watermark: Option<OutboxStreamWatermark>,
+    mutations: Vec<LogApplyMutation>,
 }
 
-impl ResourceVersionAssignment {
-    pub const fn as_metadata_value(self) -> &'static str {
-        match self {
-            Self::LegacyLeaderAssigned => "legacy_leader_assigned",
-            Self::CommittedApplyV1 => "committed_apply_v1",
-        }
+impl<'de> Deserialize<'de> for LogApplyCommit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SerializedLogApplyCommit::deserialize(deserializer)?;
+        let commit = Self {
+            resource_version: wire.resource_version,
+            outbox_watermark: wire.outbox_watermark,
+            mutations: wire.mutations,
+        };
+        commit
+            .validate_live_template()
+            .map_err(serde::de::Error::custom)?;
+        Ok(commit)
     }
 }
 
-/// Validation failure for the live/snapshot assignment envelope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResourceVersionAssignmentError {
-    LegacyLiveRequiresPositive,
-    CommittedApplyV1LiveRequiresZero,
-    SnapshotRestoreRequiresLegacy,
+/// Operation for restoring exact historical state from an authoritative
+/// snapshot.
+///
+/// This value is deliberately not serializable or versioned. Snapshot
+/// transport carries its own bytes; the restore adapter constructs this
+/// operation only at the typed snapshot-install boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotRestoreOperation {
+    resource_version: i64,
+    outbox_watermark: Option<OutboxStreamWatermark>,
+    mutations: Vec<LogApplyMutation>,
 }
 
-impl fmt::Display for ResourceVersionAssignmentError {
+/// A live committed-apply template contains a pre-assigned public RV.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveCommitResourceVersionError {
+    pub field: &'static str,
+    pub actual: String,
+}
+
+impl fmt::Display for LiveCommitResourceVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::LegacyLiveRequiresPositive => {
-                "legacy leader-assigned live commit requires resourceVersion > 0"
-            }
-            Self::CommittedApplyV1LiveRequiresZero => {
-                "committed-apply-v1 live commit requires resourceVersion == 0"
-            }
-            Self::SnapshotRestoreRequiresLegacy => {
-                "snapshot restore requires legacy leader-assigned resourceVersion envelope"
-            }
-        })
+        write!(
+            f,
+            "live committed-apply template field {} requires resourceVersion 0, got {}",
+            self.field, self.actual
+        )
     }
 }
 
-impl std::error::Error for ResourceVersionAssignmentError {}
+impl std::error::Error for LiveCommitResourceVersionError {}
 
 /// Monotonic identity of one node-outbox stream position.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,220 +144,298 @@ pub struct OutboxStreamWatermark {
 }
 
 impl LogApplyCommit {
-    /// Construct a legacy leader-assigned commit from neutral mutation values.
-    pub fn new(resource_version: i64, mutations: Vec<LogApplyMutation>) -> Self {
-        Self {
-            resource_version,
-            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-            outbox_watermark: None,
-            mutations,
-        }
+    /// Construct one fixed committed-apply template, rejecting any mutation
+    /// that already carries a public RV.
+    pub fn try_new(
+        mutations: Vec<LogApplyMutation>,
+    ) -> Result<Self, LiveCommitResourceVersionError> {
+        Self::try_new_with_watermark(mutations, None)
     }
 
-    pub fn from_cluster_mutations(resource_version: i64, mutations: Vec<ClusterMutation>) -> Self {
-        Self {
-            resource_version,
-            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-            outbox_watermark: None,
-            mutations: mutations
+    pub fn try_new_with_watermark(
+        mutations: Vec<LogApplyMutation>,
+        outbox_watermark: Option<OutboxStreamWatermark>,
+    ) -> Result<Self, LiveCommitResourceVersionError> {
+        let commit = Self {
+            resource_version: 0,
+            outbox_watermark,
+            mutations,
+        };
+        commit.validate_live_template()?;
+        Ok(commit)
+    }
+
+    fn authored(mutations: Vec<LogApplyMutation>) -> Self {
+        Self::try_new(mutations).expect("live commit builders must author only RV-zero templates")
+    }
+
+    pub fn try_from_cluster_mutations(
+        mutations: Vec<ClusterMutation>,
+    ) -> Result<Self, LiveCommitResourceVersionError> {
+        Self::try_new(
+            mutations
                 .into_iter()
                 .map(ClusterMutation::into_log_apply_mutation)
                 .collect(),
-        }
-    }
-
-    pub fn put_resource(resource: &Resource) -> Self {
-        Self::new(
-            resource.resource_version,
-            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                api_version: resource.api_version.clone(),
-                kind: resource.kind.clone(),
-                namespace: resource.namespace.clone(),
-                name: resource.name.clone(),
-                uid: resource.uid.clone(),
-                resource_version: resource.resource_version,
-                data: (*resource.data).clone(),
-                require_absent: false,
-                require_existing: false,
-                precondition_uid: None,
-                precondition_resource_version: None,
-                status_only: false,
-            })],
         )
     }
 
+    pub fn put_resource(resource: &Resource) -> Self {
+        let mut data = (*resource.data).clone();
+        clear_metadata_resource_version(&mut data);
+        Self::authored(vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+            api_version: resource.api_version.clone(),
+            kind: resource.kind.clone(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
+            uid: resource.uid.clone(),
+            resource_version: 0,
+            data,
+            require_absent: false,
+            require_existing: false,
+            precondition_uid: None,
+            precondition_resource_version: None,
+            status_only: false,
+        })])
+    }
+
     pub fn delete_resource(
-        resource_version: i64,
         api_version: impl Into<String>,
         kind: impl Into<String>,
         namespace: Option<String>,
         name: impl Into<String>,
         uid: impl Into<String>,
     ) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
+        Self::authored(vec![LogApplyMutation::DeleteResource(
+            LogApplyResourceKey {
                 api_version: api_version.into(),
                 kind: kind.into(),
                 namespace,
                 name: name.into(),
                 uid: uid.into(),
                 precondition_resource_version: None,
-            })],
-        )
+            },
+        )])
     }
 
     pub fn put_namespace(resource: &Resource) -> Self {
-        Self::new(
-            resource.resource_version,
-            vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
-                name: resource.name.clone(),
-                uid: resource.uid.clone(),
-                resource_version: resource.resource_version,
-                data: (*resource.data).clone(),
-            })],
-        )
+        let mut data = (*resource.data).clone();
+        clear_metadata_resource_version(&mut data);
+        Self::authored(vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+            name: resource.name.clone(),
+            uid: resource.uid.clone(),
+            resource_version: 0,
+            data,
+        })])
     }
 
-    pub fn delete_namespace(resource_version: i64, name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNamespace { name: name.into() }],
-        )
+    pub fn delete_namespace(name: impl Into<String>) -> Self {
+        Self::authored(vec![LogApplyMutation::DeleteNamespace {
+            name: name.into(),
+        }])
     }
 
-    pub fn delete_namespace_contents(resource_version: i64, name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNamespaceContents { name: name.into() }],
-        )
+    pub fn delete_namespace_contents(name: impl Into<String>) -> Self {
+        Self::authored(vec![LogApplyMutation::DeleteNamespaceContents {
+            name: name.into(),
+        }])
     }
 
-    pub fn put_node_subnet_row(resource_version: i64, row: LogApplyNodeSubnetRow) -> Self {
-        Self::new(resource_version, vec![LogApplyMutation::PutNodeSubnet(row)])
+    pub fn put_node_subnet_row(row: LogApplyNodeSubnetRow) -> Self {
+        Self::authored(vec![LogApplyMutation::PutNodeSubnet(row)])
     }
 
-    pub fn delete_node_subnet(resource_version: i64, node_name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNodeSubnet {
-                node_name: node_name.into(),
-            }],
-        )
+    pub fn delete_node_subnet(node_name: impl Into<String>) -> Self {
+        Self::authored(vec![LogApplyMutation::DeleteNodeSubnet {
+            node_name: node_name.into(),
+        }])
     }
 
-    pub fn put_node_dataplane_row(resource_version: i64, row: LogApplyNodeDataplaneRow) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutNodeDataplane(row)],
-        )
+    pub fn put_node_dataplane_row(row: LogApplyNodeDataplaneRow) -> Self {
+        Self::authored(vec![LogApplyMutation::PutNodeDataplane(row)])
     }
 
-    pub fn delete_node_dataplane(resource_version: i64, node_name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNodeDataplane {
-                node_name: node_name.into(),
-            }],
-        )
+    pub fn delete_node_dataplane(node_name: impl Into<String>) -> Self {
+        Self::authored(vec![LogApplyMutation::DeleteNodeDataplane {
+            node_name: node_name.into(),
+        }])
     }
 
-    pub fn advance_resource_version(resource_version: i64) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::AdvanceResourceVersion { resource_version }],
-        )
+    pub fn advance_resource_version() -> Self {
+        Self::authored(vec![LogApplyMutation::AdvanceResourceVersion {
+            resource_version: 0,
+        }])
     }
 
-    pub fn put_applied_outbox_row(resource_version: i64, row: LogApplyAppliedOutboxRow) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutAppliedOutbox(row)],
-        )
+    pub fn put_applied_outbox_row(mut row: LogApplyAppliedOutboxRow) -> Self {
+        row.applied_rv = None;
+        Self::authored(vec![LogApplyMutation::PutAppliedOutbox(row)])
     }
 
-    pub fn put_watch_event(row: LogApplyWatchEventRow) -> Self {
-        Self::new(
-            row.resource_version,
-            vec![LogApplyMutation::PutWatchEvent(row)],
-        )
-    }
-
-    pub fn gc_applied_outbox(
-        resource_version: i64,
-        cutoff_ms: i64,
-        operations: Vec<String>,
-    ) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::GcAppliedOutbox {
-                cutoff_ms,
-                operations,
-            }],
-        )
-    }
-
-    pub fn put_pod_cleanup_intent_row(
-        resource_version: i64,
-        row: LogApplyPodCleanupIntentRow,
-    ) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutPodCleanupIntent(row)],
-        )
-    }
-
-    /// Validate a live replicated commit before state-machine apply.
-    pub const fn validate_live_resource_version_assignment(
-        &self,
-    ) -> Result<(), ResourceVersionAssignmentError> {
-        match self.resource_version_assignment {
-            ResourceVersionAssignment::LegacyLeaderAssigned if self.resource_version > 0 => Ok(()),
-            ResourceVersionAssignment::LegacyLeaderAssigned => {
-                Err(ResourceVersionAssignmentError::LegacyLiveRequiresPositive)
-            }
-            ResourceVersionAssignment::CommittedApplyV1 if self.resource_version == 0 => Ok(()),
-            ResourceVersionAssignment::CommittedApplyV1 => {
-                Err(ResourceVersionAssignmentError::CommittedApplyV1LiveRequiresZero)
-            }
+    pub fn put_watch_event(mut row: LogApplyWatchEventRow) -> Self {
+        row.resource_version = 0;
+        clear_metadata_resource_version(&mut row.data);
+        if let Some(object) = row.data.get_mut("object") {
+            clear_metadata_resource_version(object);
         }
+        Self::authored(vec![LogApplyMutation::PutWatchEvent(row)])
     }
 
-    /// Exact snapshot replay preserves historical RVs and never restamps them.
-    pub const fn validate_snapshot_restore_resource_version_assignment(
-        &self,
-    ) -> Result<(), ResourceVersionAssignmentError> {
-        if matches!(
-            self.resource_version_assignment,
-            ResourceVersionAssignment::LegacyLeaderAssigned
-        ) {
-            Ok(())
-        } else {
-            Err(ResourceVersionAssignmentError::SnapshotRestoreRequiresLegacy)
-        }
+    pub fn gc_applied_outbox(cutoff_ms: i64, operations: Vec<String>) -> Self {
+        Self::authored(vec![LogApplyMutation::GcAppliedOutbox {
+            cutoff_ms,
+            operations,
+        }])
     }
 
-    /// Convert a proposal-time command materialization into a V1 template.
-    /// Preconditions are deliberately retained; every output RV is assigned
-    /// once by the committed persistence transaction.
-    pub fn into_committed_apply_v1_template(mut self) -> Self {
-        self.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
-        self.resource_version = 0;
-        for mutation in &mut self.mutations {
-            match mutation {
-                LogApplyMutation::PutResource(row) => row.resource_version = 0,
-                LogApplyMutation::PatchResourceLatest(row) => row.resource_version = 0,
-                LogApplyMutation::PutNamespace(row) => row.resource_version = 0,
-                LogApplyMutation::PutWatchEvent(row) => row.resource_version = 0,
-                LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
-                LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
-                LogApplyMutation::AdvanceResourceVersion { resource_version } => {
-                    *resource_version = 0;
+    pub fn put_pod_cleanup_intent_row(mut row: LogApplyPodCleanupIntentRow) -> Self {
+        row.resource_version = 0;
+        Self::authored(vec![LogApplyMutation::PutPodCleanupIntent(row)])
+    }
+
+    /// Validate that no public RV was assigned before committed persistence.
+    pub fn validate_live_template(&self) -> Result<(), LiveCommitResourceVersionError> {
+        validate_zero("commit.resource_version", self.resource_version)?;
+        for mutation in &self.mutations {
+            let field_and_value = match mutation {
+                LogApplyMutation::PutResource(row) => {
+                    validate_json_resource_version(
+                        "put_resource.data.metadata.resourceVersion",
+                        row.data.pointer("/metadata/resourceVersion"),
+                    )?;
+                    Some(("put_resource.resource_version", row.resource_version))
                 }
-                _ => {}
+                LogApplyMutation::PatchResourceLatest(row) => {
+                    validate_json_resource_version(
+                        "patch_resource_latest.patch.metadata.resourceVersion",
+                        row.patch.pointer("/metadata/resourceVersion"),
+                    )?;
+                    Some((
+                        "patch_resource_latest.resource_version",
+                        row.resource_version,
+                    ))
+                }
+                LogApplyMutation::PutNamespace(row) => {
+                    validate_json_resource_version(
+                        "put_namespace.data.metadata.resourceVersion",
+                        row.data.pointer("/metadata/resourceVersion"),
+                    )?;
+                    Some(("put_namespace.resource_version", row.resource_version))
+                }
+                LogApplyMutation::PutWatchEvent(row) => {
+                    validate_json_resource_version(
+                        "put_watch_event.data.metadata.resourceVersion",
+                        row.data.pointer("/metadata/resourceVersion"),
+                    )?;
+                    validate_json_resource_version(
+                        "put_watch_event.data.object.metadata.resourceVersion",
+                        row.data.pointer("/object/metadata/resourceVersion"),
+                    )?;
+                    Some(("put_watch_event.resource_version", row.resource_version))
+                }
+                LogApplyMutation::PutPodCleanupIntent(row) => Some((
+                    "put_pod_cleanup_intent.resource_version",
+                    row.resource_version,
+                )),
+                LogApplyMutation::PutAppliedOutbox(row) => row
+                    .applied_rv
+                    .map(|value| ("put_applied_outbox.applied_rv", value)),
+                LogApplyMutation::AdvanceResourceVersion { resource_version } => Some((
+                    "advance_resource_version.resource_version",
+                    *resource_version,
+                )),
+                _ => None,
+            };
+            if let Some((field, value)) = field_and_value {
+                validate_zero(field, value)?;
             }
         }
-        self
+        Ok(())
+    }
+
+    pub const fn resource_version(&self) -> i64 {
+        self.resource_version
+    }
+
+    pub const fn outbox_watermark(&self) -> Option<&OutboxStreamWatermark> {
+        self.outbox_watermark.as_ref()
+    }
+
+    pub fn mutations(&self) -> &[LogApplyMutation] {
+        &self.mutations
+    }
+
+    pub fn into_parts(self) -> (i64, Option<OutboxStreamWatermark>, Vec<LogApplyMutation>) {
+        (self.resource_version, self.outbox_watermark, self.mutations)
+    }
+}
+
+fn validate_zero(field: &'static str, actual: i64) -> Result<(), LiveCommitResourceVersionError> {
+    if actual == 0 {
+        Ok(())
+    } else {
+        Err(LiveCommitResourceVersionError {
+            field,
+            actual: actual.to_string(),
+        })
+    }
+}
+
+fn validate_json_resource_version(
+    field: &'static str,
+    value: Option<&serde_json::Value>,
+) -> Result<(), LiveCommitResourceVersionError> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::Number(value)) if value.as_i64() == Some(0) => Ok(()),
+        Some(serde_json::Value::String(value)) if value == "0" => Ok(()),
+        Some(serde_json::Value::String(value)) => Err(LiveCommitResourceVersionError {
+            field,
+            actual: value.clone(),
+        }),
+        Some(value) => Err(LiveCommitResourceVersionError {
+            field,
+            actual: value.to_string(),
+        }),
+    }
+}
+
+fn clear_metadata_resource_version(data: &mut serde_json::Value) {
+    if let Some(metadata) = data
+        .get_mut("metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        metadata.remove("resourceVersion");
+    }
+}
+
+impl SnapshotRestoreOperation {
+    pub fn new(
+        resource_version: i64,
+        outbox_watermark: Option<OutboxStreamWatermark>,
+        mutations: Vec<LogApplyMutation>,
+    ) -> Self {
+        Self {
+            resource_version,
+            outbox_watermark,
+            mutations,
+        }
+    }
+
+    pub const fn resource_version(&self) -> i64 {
+        self.resource_version
+    }
+
+    pub const fn outbox_watermark(&self) -> Option<&OutboxStreamWatermark> {
+        self.outbox_watermark.as_ref()
+    }
+
+    pub fn mutations(&self) -> &[LogApplyMutation] {
+        &self.mutations
+    }
+
+    pub fn into_parts(self) -> (i64, Option<OutboxStreamWatermark>, Vec<LogApplyMutation>) {
+        (self.resource_version, self.outbox_watermark, self.mutations)
     }
 }
 
@@ -937,67 +1034,81 @@ mod tests {
     }
 
     #[test]
-    fn assignment_validation_and_defaults_are_table_driven() {
+    fn live_template_and_snapshot_restore_are_distinct_contracts() {
         let decoded: LogApplyCommit =
-            serde_json::from_str(r#"{"resource_version":9,"mutations":[]}"#).unwrap();
-        assert_eq!(
-            decoded.resource_version_assignment,
-            ResourceVersionAssignment::LegacyLeaderAssigned
+            serde_json::from_str(r#"{"resource_version":0,"mutations":[]}"#).unwrap();
+        assert!(decoded.validate_live_template().is_ok());
+        assert!(
+            !serde_json::to_string(&decoded)
+                .unwrap()
+                .contains("assignment")
+        );
+        assert!(
+            serde_json::from_str::<LogApplyCommit>(
+                r#"{"resource_version":0,"resource_version_assignment":"LegacyLeaderAssigned","mutations":[]}"#
+            )
+            .is_err(),
+            "a removed assignment profile must not be silently accepted"
         );
 
-        let cases = [
-            (
-                "legacy-positive",
-                ResourceVersionAssignment::LegacyLeaderAssigned,
-                1,
-                None,
-            ),
-            (
-                "legacy-zero",
-                ResourceVersionAssignment::LegacyLeaderAssigned,
-                0,
-                Some(ResourceVersionAssignmentError::LegacyLiveRequiresPositive),
-            ),
-            (
-                "v1-zero",
-                ResourceVersionAssignment::CommittedApplyV1,
-                0,
-                None,
-            ),
-            (
-                "v1-positive",
-                ResourceVersionAssignment::CommittedApplyV1,
-                1,
-                Some(ResourceVersionAssignmentError::CommittedApplyV1LiveRequiresZero),
-            ),
-        ];
-        for (label, assignment, resource_version, expected_error) in cases {
-            let commit = LogApplyCommit {
-                resource_version,
-                resource_version_assignment: assignment,
-                outbox_watermark: None,
-                mutations: Vec::new(),
-            };
-            assert_eq!(
-                commit.validate_live_resource_version_assignment().err(),
-                expected_error,
-                "{label}"
-            );
-            assert_eq!(
-                commit
-                    .validate_snapshot_restore_resource_version_assignment()
-                    .is_ok(),
-                assignment == ResourceVersionAssignment::LegacyLeaderAssigned,
-                "{label}"
-            );
-        }
+        let invalid_live = LogApplyCommit {
+            resource_version: 9,
+            outbox_watermark: None,
+            mutations: Vec::new(),
+        };
+        assert_eq!(
+            invalid_live.validate_live_template(),
+            Err(LiveCommitResourceVersionError {
+                field: "commit.resource_version",
+                actual: "9".into(),
+            })
+        );
+
+        let restore = SnapshotRestoreOperation::new(9, None, Vec::new());
+        assert_eq!(restore.resource_version(), 9);
+
+        let historical_data = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "historical",
+                "namespace": "default",
+                "uid": "historical-uid",
+                "resourceVersion": "9"
+            },
+            "data": {"bytes": "must-remain-exact"}
+        });
+        let historical_mutation = LogApplyMutation::PutResource(LogApplyResourceRow {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "historical".into(),
+            uid: "historical-uid".into(),
+            resource_version: 9,
+            data: historical_data.clone(),
+            require_absent: false,
+            require_existing: false,
+            precondition_uid: None,
+            precondition_resource_version: None,
+            status_only: false,
+        });
+        assert!(
+            LogApplyCommit::try_new(vec![historical_mutation.clone()]).is_err(),
+            "historical public RVs must never enter the live template type"
+        );
+        let restore = SnapshotRestoreOperation::new(9, None, vec![historical_mutation]);
+        let LogApplyMutation::PutResource(restored) = &restore.mutations()[0] else {
+            panic!("snapshot operation changed mutation family")
+        };
+        assert_eq!(restored.resource_version, 9);
+        assert_eq!(restored.data, historical_data);
     }
 
     #[test]
-    fn committed_apply_v1_template_zeroing_is_table_driven() {
-        let commit = LogApplyCommit::new(
-            73,
-            vec![
+    fn fixed_live_constructor_rejects_every_preassigned_rv_field() {
+        let cases = vec![
+            (
+                "put_resource.resource_version",
                 LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".into(),
                     kind: "Pod".into(),
@@ -1012,6 +1123,9 @@ mod tests {
                     precondition_resource_version: Some(72),
                     status_only: true,
                 }),
+            ),
+            (
+                "patch_resource_latest.resource_version",
                 LogApplyMutation::PatchResourceLatest(LogApplyResourcePatch {
                     api_version: "v1".into(),
                     kind: "Pod".into(),
@@ -1025,12 +1139,18 @@ mod tests {
                     precondition_resource_version: Some(72),
                     terminating_pod_unready_timestamp: Some("timestamp".into()),
                 }),
+            ),
+            (
+                "put_namespace.resource_version",
                 LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
                     name: "ns".into(),
                     uid: "ns-uid".into(),
                     resource_version: 73,
                     data: json!({}),
                 }),
+            ),
+            (
+                "put_watch_event.resource_version",
                 LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
                     event_id: Some(3),
                     api_version: "v1".into(),
@@ -1041,6 +1161,9 @@ mod tests {
                     event_type: "MODIFIED".into(),
                     data: json!({}),
                 }),
+            ),
+            (
+                "put_pod_cleanup_intent.resource_version",
                 LogApplyMutation::PutPodCleanupIntent(LogApplyPodCleanupIntentRow {
                     node_name: "node-a".into(),
                     namespace: "default".into(),
@@ -1051,46 +1174,234 @@ mod tests {
                     created_at_ms: 1,
                     pod_data: json!({}),
                 }),
+            ),
+            (
+                "put_applied_outbox.applied_rv",
                 outbox_row("PodStatus", "subject", Some(8)),
+            ),
+            (
+                "advance_resource_version.resource_version",
                 LogApplyMutation::AdvanceResourceVersion {
                     resource_version: 73,
                 },
-            ],
-        )
-        .into_committed_apply_v1_template();
-
-        assert_eq!(commit.resource_version, 0);
-        assert_eq!(
-            commit.resource_version_assignment,
-            ResourceVersionAssignment::CommittedApplyV1
-        );
-        for mutation in &commit.mutations {
-            match mutation {
-                LogApplyMutation::PutResource(row) => {
-                    assert_eq!(row.resource_version, 0);
-                    assert_eq!(row.precondition_uid.as_deref(), Some("uid-a"));
-                    assert_eq!(row.precondition_resource_version, Some(72));
-                }
-                LogApplyMutation::PatchResourceLatest(row) => {
-                    assert_eq!(row.resource_version, 0);
-                    assert_eq!(row.precondition_uid.as_deref(), Some("uid-a"));
-                    assert_eq!(row.precondition_resource_version, Some(72));
-                }
-                LogApplyMutation::PutNamespace(row) => assert_eq!(row.resource_version, 0),
-                LogApplyMutation::PutWatchEvent(row) => {
-                    assert_eq!(row.resource_version, 0);
-                    assert_eq!(row.event_id, Some(3));
-                }
-                LogApplyMutation::PutPodCleanupIntent(row) => {
-                    assert_eq!(row.resource_version, 0)
-                }
-                LogApplyMutation::PutAppliedOutbox(row) => assert_eq!(row.applied_rv, None),
-                LogApplyMutation::AdvanceResourceVersion { resource_version } => {
-                    assert_eq!(*resource_version, 0)
-                }
-                other => panic!("unexpected template mutation: {other:?}"),
-            }
+            ),
+        ];
+        for (expected_field, mutation) in cases {
+            assert_eq!(
+                LogApplyCommit::try_new(vec![mutation]),
+                Err(LiveCommitResourceVersionError {
+                    field: expected_field,
+                    actual: if expected_field == "put_applied_outbox.applied_rv" {
+                        19
+                    } else {
+                        73
+                    }
+                    .to_string(),
+                }),
+                "{expected_field}"
+            );
         }
+
+        let commit = LogApplyCommit::try_new(vec![LogApplyMutation::DeleteNamespace {
+            name: "ns".into(),
+        }])
+        .unwrap();
+        assert_eq!(commit.resource_version(), 0);
+        assert!(commit.validate_live_template().is_ok());
+    }
+
+    #[test]
+    fn fixed_live_constructor_rejects_nested_public_resource_versions() {
+        let cases = vec![
+            (
+                "put_resource.data.metadata.resourceVersion",
+                41,
+                LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "item".into(),
+                    uid: "item-uid".into(),
+                    resource_version: 0,
+                    data: json!({"metadata": {"resourceVersion": "41"}}),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: None,
+                    precondition_resource_version: None,
+                    status_only: false,
+                }),
+            ),
+            (
+                "patch_resource_latest.patch.metadata.resourceVersion",
+                42,
+                LogApplyMutation::PatchResourceLatest(LogApplyResourcePatch {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "item".into(),
+                    resource_version: 0,
+                    patch_kind: PatchKind::Merge,
+                    patch: json!({"metadata": {"resourceVersion": 42}}),
+                    require_existing: true,
+                    precondition_uid: Some("item-uid".into()),
+                    precondition_resource_version: Some(40),
+                    terminating_pod_unready_timestamp: None,
+                }),
+            ),
+            (
+                "put_namespace.data.metadata.resourceVersion",
+                43,
+                LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                    name: "ns".into(),
+                    uid: "ns-uid".into(),
+                    resource_version: 0,
+                    data: json!({"metadata": {"resourceVersion": "43"}}),
+                }),
+            ),
+            (
+                "put_watch_event.data.metadata.resourceVersion",
+                44,
+                LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                    event_id: None,
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "item".into(),
+                    resource_version: 0,
+                    event_type: "MODIFIED".into(),
+                    data: json!({"metadata": {"resourceVersion": "44"}}),
+                }),
+            ),
+            (
+                "put_watch_event.data.object.metadata.resourceVersion",
+                45,
+                LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                    event_id: None,
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "item".into(),
+                    resource_version: 0,
+                    event_type: "MODIFIED".into(),
+                    data: json!({
+                        "type": "MODIFIED",
+                        "object": {"metadata": {"resourceVersion": "45"}}
+                    }),
+                }),
+            ),
+        ];
+
+        for (expected_field, actual, mutation) in cases {
+            assert_eq!(
+                LogApplyCommit::try_new(vec![mutation]),
+                Err(LiveCommitResourceVersionError {
+                    field: expected_field,
+                    actual: actual.to_string(),
+                }),
+                "{expected_field}"
+            );
+        }
+
+        let zero_nested =
+            LogApplyCommit::try_new(vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+                name: "zero".into(),
+                uid: "zero-uid".into(),
+                resource_version: 0,
+                data: json!({"metadata": {"resourceVersion": "0"}}),
+            })])
+            .expect("an explicit nested zero remains an RV-zero template");
+        let mut encoded = serde_json::to_value(zero_nested).unwrap();
+        *encoded
+            .pointer_mut("/mutations/0/PutNamespace/data/metadata/resourceVersion")
+            .expect("serialized namespace RV") = json!("opaque-rv");
+        let error = serde_json::from_value::<LogApplyCommit>(encoded)
+            .expect_err("JSON decode must validate nested public RVs");
+        assert!(
+            error
+                .to_string()
+                .contains("put_namespace.data.metadata.resourceVersion"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fixed_live_builders_clear_observed_nested_resource_versions() {
+        let resource = Resource {
+            id: 1,
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "item".into(),
+            uid: "item-uid".into(),
+            resource_version: 51,
+            data: std::sync::Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "item",
+                    "namespace": "default",
+                    "uid": "item-uid",
+                    "resourceVersion": "51"
+                }
+            })),
+        };
+        let resource_commit = LogApplyCommit::put_resource(&resource);
+        let LogApplyMutation::PutResource(row) = &resource_commit.mutations()[0] else {
+            panic!("resource builder emitted the wrong mutation")
+        };
+        assert!(row.data.pointer("/metadata/resourceVersion").is_none());
+        assert_eq!(
+            resource
+                .data
+                .pointer("/metadata/resourceVersion")
+                .and_then(serde_json::Value::as_str),
+            Some("51"),
+            "live authoring must not mutate the caller's shared resource"
+        );
+
+        let namespace_commit = LogApplyCommit::put_namespace(&Resource {
+            namespace: None,
+            kind: "Namespace".into(),
+            name: "ns".into(),
+            uid: "ns-uid".into(),
+            resource_version: 52,
+            data: std::sync::Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "ns",
+                    "uid": "ns-uid",
+                    "resourceVersion": "52"
+                }
+            })),
+            ..resource.clone()
+        });
+        let LogApplyMutation::PutNamespace(row) = &namespace_commit.mutations()[0] else {
+            panic!("namespace builder emitted the wrong mutation")
+        };
+        assert!(row.data.pointer("/metadata/resourceVersion").is_none());
+
+        let watch_commit = LogApplyCommit::put_watch_event(LogApplyWatchEventRow {
+            event_id: None,
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "item".into(),
+            resource_version: 53,
+            event_type: "MODIFIED".into(),
+            data: json!({
+                "type": "MODIFIED",
+                "object": {"metadata": {"resourceVersion": "53"}}
+            }),
+        });
+        let LogApplyMutation::PutWatchEvent(row) = &watch_commit.mutations()[0] else {
+            panic!("watch builder emitted the wrong mutation")
+        };
+        assert!(
+            row.data
+                .pointer("/object/metadata/resourceVersion")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1176,7 +1487,6 @@ mod tests {
     fn outbox_only_commit_filter_preserves_envelope() {
         let commit = LogApplyCommit {
             resource_version: 0,
-            resource_version_assignment: ResourceVersionAssignment::CommittedApplyV1,
             outbox_watermark: Some(OutboxStreamWatermark {
                 client_id: "worker-a".into(),
                 stream_id: 3,
@@ -1196,10 +1506,6 @@ mod tests {
         );
         let filtered = commit_with_outbox_rows_only(commit);
         assert_eq!(filtered.resource_version, 0);
-        assert_eq!(
-            filtered.resource_version_assignment,
-            ResourceVersionAssignment::CommittedApplyV1
-        );
         assert_eq!(filtered.outbox_watermark.as_ref().unwrap().stream_seq, 9);
         assert_eq!(filtered.mutations.len(), 2);
         assert!(
@@ -1215,7 +1521,11 @@ mod tests {
             outbox_row("PodMetadata", "subject", Some(7)),
         ] {
             assert_eq!(
-                stamped_pod_status_subject_and_stamp(&LogApplyCommit::new(1, vec![invalid])),
+                stamped_pod_status_subject_and_stamp(&LogApplyCommit {
+                    resource_version: 0,
+                    outbox_watermark: None,
+                    mutations: vec![invalid],
+                }),
                 None
             );
         }

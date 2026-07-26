@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -219,6 +219,7 @@ impl DataplanePeerMetadata {
 
 /// Project cluster topology metadata into the canonical runtime peer-route
 /// contract. Topology mode and base64 representation remain outside the port.
+#[cfg(test)]
 pub(crate) fn peer_route_from_metadata(
     metadata: DataplanePeerMetadata,
     peer_pod_cidr: &str,
@@ -240,7 +241,7 @@ pub(crate) fn peer_route_from_metadata(
             let route = klights_network_api::WireGuardPeerRoute::try_new(
                 metadata.node_name,
                 klights_network_api::WireGuardPeerKey::new(public_key.to_bytes()?),
-                SocketAddr::new(metadata.endpoint, port),
+                std::net::SocketAddr::new(metadata.endpoint, port),
                 peer_pod_cidr,
             )
             .map_err(|error| anyhow!(error))?;

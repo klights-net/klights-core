@@ -1,20 +1,55 @@
-use crate::datastore::{
-    DatastoreBackend, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
-};
-use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::{
+    Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+};
+use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-async fn namespace_is_terminating(db: &dyn DatastoreBackend, namespace: &str) -> Result<bool> {
-    let Some(ns) = db.get_namespace(namespace).await? else {
-        return Ok(false);
-    };
-    Ok(ns
-        .data
-        .pointer("/metadata/deletionTimestamp")
-        .and_then(|v| v.as_str())
-        .is_some())
+#[async_trait]
+pub trait EndpointReconcileStore: Send + Sync {
+    async fn endpoint_namespace_is_terminating(&self, namespace: &str) -> Result<bool>;
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>>;
+    async fn list_service_endpoint_slices(
+        &self,
+        namespace: &str,
+        service_name: &str,
+    ) -> Result<Vec<Resource>>;
+    async fn create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+    ) -> Result<Resource>;
+    async fn update_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+    async fn delete_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> Result<()>;
+    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()>;
+    fn endpoint_store_error_is_conflict(&self, error: &anyhow::Error) -> bool;
+    fn endpoint_store_error_is_already_exists(&self, error: &anyhow::Error) -> bool;
 }
 
 /// Resolve a service port's targetPort to the numeric container port.
@@ -494,7 +529,7 @@ fn build_desired_endpointslices(
 }
 
 async fn update_endpoints_with_retry(
-    db: &dyn DatastoreBackend,
+    db: &(impl EndpointReconcileStore + ?Sized),
     namespace: &str,
     service_name: &str,
     endpoints: Value,
@@ -515,7 +550,7 @@ async fn update_endpoints_with_retry(
             .await
         {
             Ok(_) => return Ok(()),
-            Err(e) if crate::datastore::errors::is_conflict_error(&e) && attempt < max_attempts => {
+            Err(e) if db.endpoint_store_error_is_conflict(&e) && attempt < max_attempts => {
                 let refreshed = db
                     .get_resource("v1", "Endpoints", Some(namespace), service_name)
                     .await?;
@@ -531,7 +566,11 @@ async fn update_endpoints_with_retry(
                         .await
                     {
                         Ok(_) => return Ok(()),
-                        Err(create_err) if create_err.to_string().contains("exists") => continue,
+                        Err(create_err)
+                            if db.endpoint_store_error_is_already_exists(&create_err) =>
+                        {
+                            continue;
+                        }
                         Err(create_err) => return Err(create_err),
                     }
                 };
@@ -545,7 +584,7 @@ async fn update_endpoints_with_retry(
                 }
                 preconditions = ResourcePreconditions::from_resource(&resource);
             }
-            Err(e) if crate::datastore::errors::is_conflict_error(&e) => {
+            Err(e) if db.endpoint_store_error_is_conflict(&e) => {
                 anyhow::bail!(
                     "failed to update Endpoints {}/{} after retries: {}",
                     namespace,
@@ -560,7 +599,7 @@ async fn update_endpoints_with_retry(
 }
 
 async fn update_endpointslice_with_retry(
-    db: &dyn DatastoreBackend,
+    db: &(impl EndpointReconcileStore + ?Sized),
     namespace: &str,
     service_name: &str,
     endpointslice_name: &str,
@@ -582,7 +621,7 @@ async fn update_endpointslice_with_retry(
             .await
         {
             Ok(_) => return Ok(()),
-            Err(e) if crate::datastore::errors::is_conflict_error(&e) && attempt < max_attempts => {
+            Err(e) if db.endpoint_store_error_is_conflict(&e) && attempt < max_attempts => {
                 let refreshed = db
                     .get_resource(
                         "discovery.k8s.io/v1",
@@ -603,7 +642,11 @@ async fn update_endpointslice_with_retry(
                         .await
                     {
                         Ok(_) => return Ok(()),
-                        Err(create_err) if create_err.to_string().contains("exists") => continue,
+                        Err(create_err)
+                            if db.endpoint_store_error_is_already_exists(&create_err) =>
+                        {
+                            continue;
+                        }
                         Err(create_err) => return Err(create_err),
                     }
                 };
@@ -618,7 +661,7 @@ async fn update_endpointslice_with_retry(
                 }
                 preconditions = ResourcePreconditions::from_resource(&resource);
             }
-            Err(e) if crate::datastore::errors::is_conflict_error(&e) => {
+            Err(e) if db.endpoint_store_error_is_conflict(&e) => {
                 anyhow::bail!(
                     "failed to update EndpointSlice {}/{} for Service {} after retries: {}",
                     namespace,
@@ -634,7 +677,7 @@ async fn update_endpointslice_with_retry(
 }
 
 async fn create_or_update_endpointslice(
-    db: &dyn DatastoreBackend,
+    db: &(impl EndpointReconcileStore + ?Sized),
     namespace: &str,
     service_name: &str,
     endpointslice_name: &str,
@@ -651,7 +694,7 @@ async fn create_or_update_endpointslice(
         .await
     {
         Ok(_) => Ok(()),
-        Err(create_err) if crate::datastore::errors::is_conflict_error(&create_err) => {
+        Err(create_err) if db.endpoint_store_error_is_conflict(&create_err) => {
             let refreshed = db
                 .get_resource(
                     "discovery.k8s.io/v1",
@@ -689,8 +732,8 @@ async fn create_or_update_endpointslice(
 }
 
 pub async fn reconcile_endpoints(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+    db: &(impl EndpointReconcileStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
     service_name: &str,
     namespace: &str,
     selector: Option<&Value>,
@@ -701,7 +744,7 @@ pub async fn reconcile_endpoints(
         return Ok(());
     };
 
-    if namespace_is_terminating(db, namespace).await? {
+    if db.endpoint_namespace_is_terminating(namespace).await? {
         tracing::debug!(
             namespace = %namespace,
             service = %service_name,
@@ -714,14 +757,20 @@ pub async fn reconcile_endpoints(
         .get_resource("v1", "Endpoints", Some(namespace), service_name)
         .await?;
     let pod_list = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
+        .list_pods(PodListRequest::try_new(
+            Some(namespace.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )?)
         .await?;
     let endpoints = build_desired_endpoints(
         service_name,
         namespace,
         service_ports,
         publish_not_ready,
-        &pod_list.items,
+        pod_list.items(),
         &parsed_selector,
     );
 
@@ -749,7 +798,7 @@ pub async fn reconcile_endpoints(
             .await
         {
             Ok(_) => {}
-            Err(e) if e.to_string().contains("exists") => {
+            Err(e) if db.endpoint_store_error_is_already_exists(&e) => {
                 if let Some(existing) = db
                     .get_resource("v1", "Endpoints", Some(namespace), service_name)
                     .await?
@@ -769,8 +818,8 @@ pub async fn reconcile_endpoints(
 /// EndpointSlice is the newer alternative to Endpoints (discovery.k8s.io/v1).
 /// Creates one EndpointSlice per service with `<service-name>-<hash>` naming.
 pub async fn reconcile_endpointslice(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+    db: &(impl EndpointReconcileStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
     service_name: &str,
     service_uid: &str,
     namespace: &str,
@@ -781,7 +830,7 @@ pub async fn reconcile_endpointslice(
         return Ok(());
     };
 
-    if namespace_is_terminating(db, namespace).await? {
+    if db.endpoint_namespace_is_terminating(namespace).await? {
         tracing::debug!(
             namespace = %namespace,
             service = %service_name,
@@ -791,21 +840,17 @@ pub async fn reconcile_endpointslice(
     }
 
     let pod_list = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
+        .list_pods(PodListRequest::try_new(
+            Some(namespace.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )?)
         .await?;
 
     let existing_slices = db
-        .list_resources(
-            "discovery.k8s.io/v1",
-            "EndpointSlice",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::new(
-                Some(&format!("kubernetes.io/service-name={service_name}")),
-                None,
-                None,
-                None,
-            ),
-        )
+        .list_service_endpoint_slices(namespace, service_name)
         .await?;
 
     let mut desired_names = BTreeSet::new();
@@ -814,13 +859,12 @@ pub async fn reconcile_endpointslice(
         service_uid,
         namespace,
         service_ports,
-        &pod_list.items,
+        pod_list.items(),
         &parsed_selector,
     ) {
         desired_names.insert(endpointslice_name.clone());
 
         let existing = existing_slices
-            .items
             .iter()
             .find(|resource| resource.name == endpointslice_name);
 
@@ -855,7 +899,7 @@ pub async fn reconcile_endpointslice(
         }
     }
 
-    for existing in existing_slices.items {
+    for existing in existing_slices {
         if !desired_names.contains(&existing.name) {
             db.delete_resource_with_preconditions(
                 "discovery.k8s.io/v1",
@@ -872,8 +916,8 @@ pub async fn reconcile_endpointslice(
 }
 
 pub async fn reconcile_service_endpoints_batch(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
+    db: &(impl EndpointReconcileStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
     request: ServiceEndpointBatchReconcileRequest<'_>,
 ) -> Result<()> {
     let ServiceEndpointBatchReconcileRequest {
@@ -888,7 +932,7 @@ pub async fn reconcile_service_endpoints_batch(
         return Ok(());
     };
 
-    if namespace_is_terminating(db, namespace).await? {
+    if db.endpoint_namespace_is_terminating(namespace).await? {
         tracing::debug!(
             namespace = %namespace,
             service = %service_name,
@@ -898,14 +942,20 @@ pub async fn reconcile_service_endpoints_batch(
     }
 
     let pod_list = pod_reader
-        .list_pods(Some(namespace), None, None, None, None)
+        .list_pods(PodListRequest::try_new(
+            Some(namespace.to_string()),
+            None,
+            None,
+            None,
+            None,
+        )?)
         .await?;
     let desired_endpoints = build_desired_endpoints(
         service_name,
         namespace,
         service_ports,
         publish_not_ready,
-        &pod_list.items,
+        pod_list.items(),
         &parsed_selector,
     );
     let desired_slices = build_desired_endpointslices(
@@ -913,7 +963,7 @@ pub async fn reconcile_service_endpoints_batch(
         service_uid,
         namespace,
         service_ports,
-        &pod_list.items,
+        pod_list.items(),
         &parsed_selector,
     );
 
@@ -921,17 +971,7 @@ pub async fn reconcile_service_endpoints_batch(
         .get_resource("v1", "Endpoints", Some(namespace), service_name)
         .await?;
     let existing_slices = db
-        .list_resources(
-            "discovery.k8s.io/v1",
-            "EndpointSlice",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::new(
-                Some(&format!("kubernetes.io/service-name={service_name}")),
-                None,
-                None,
-                None,
-            ),
-        )
+        .list_service_endpoint_slices(namespace, service_name)
         .await?;
 
     let mut operations = Vec::new();
@@ -961,7 +1001,6 @@ pub async fn reconcile_service_endpoints_batch(
     for (slice_name, desired_slice) in desired_slices {
         desired_names.insert(slice_name.clone());
         match existing_slices
-            .items
             .iter()
             .find(|resource| resource.name == slice_name)
         {
@@ -988,7 +1027,7 @@ pub async fn reconcile_service_endpoints_batch(
         }
     }
 
-    for existing in existing_slices.items {
+    for existing in existing_slices {
         if !desired_names.contains(&existing.name) {
             operations.push(ResourceBatchOperation::Delete {
                 api_version: "discovery.k8s.io/v1".to_string(),
@@ -1011,7 +1050,7 @@ pub async fn reconcile_service_endpoints_batch(
 /// (not created by a Service) and creates matching EndpointSlices.
 /// This enables EndpointSlice consumers to work with manually-created Endpoints.
 pub async fn mirror_endpoints_to_endpointslice(
-    db: &dyn DatastoreBackend,
+    db: &(impl EndpointReconcileStore + ?Sized),
     endpoints: &Value,
 ) -> Result<()> {
     let input_metadata = endpoints
@@ -1026,7 +1065,7 @@ pub async fn mirror_endpoints_to_endpointslice(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
 
-    if namespace_is_terminating(db, namespace).await? {
+    if db.endpoint_namespace_is_terminating(namespace).await? {
         tracing::debug!(
             namespace = %namespace,
             "skipping EndpointSlice mirror in terminating namespace"
@@ -1040,8 +1079,10 @@ pub async fn mirror_endpoints_to_endpointslice(
     else {
         return Ok(());
     };
-    let endpoints =
-        crate::api::inject_resource_version(live_endpoints.data, live_endpoints.resource_version);
+    let endpoints = crate::controllers::resource_projection::with_resource_version(
+        live_endpoints.data,
+        live_endpoints.resource_version,
+    );
     let metadata = endpoints
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;
@@ -1235,10 +1276,7 @@ pub async fn mirror_endpoints_to_endpointslice(
                     last_conflict = None;
                     break;
                 }
-                Err(e)
-                    if crate::datastore::errors::is_conflict_error(&e)
-                        && attempt < max_attempts =>
-                {
+                Err(e) if db.endpoint_store_error_is_conflict(&e) && attempt < max_attempts => {
                     last_conflict = Some(e.to_string());
                     let refreshed = db
                         .get_resource(
@@ -1278,7 +1316,7 @@ pub async fn mirror_endpoints_to_endpointslice(
             .await
         {
             Ok(_) => {}
-            Err(e) if e.to_string().contains("exists") => {
+            Err(e) if db.endpoint_store_error_is_already_exists(&e) => {
                 // Concurrent create won — update instead.
                 if let Some(existing) = db
                     .get_resource(
@@ -1309,7 +1347,7 @@ pub async fn mirror_endpoints_to_endpointslice(
 }
 
 pub async fn delete_mirrored_endpointslice_for_endpoints(
-    db: &dyn DatastoreBackend,
+    db: &(impl EndpointReconcileStore + ?Sized),
     endpoints: &Value,
 ) -> Result<()> {
     let metadata = endpoints

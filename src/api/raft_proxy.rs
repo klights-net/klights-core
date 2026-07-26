@@ -162,7 +162,7 @@ pub async fn leader_proxy_middleware(
     }
 
     // Retrieve the proxy state from AppState
-    let Some(proxy) = state.is_raft_leader_rx.clone() else {
+    let Some(proxy) = state.operational().is_raft_leader_rx.clone() else {
         // No raft proxy configured — single-node or worker; pass through
         return next.run(request).await;
     };

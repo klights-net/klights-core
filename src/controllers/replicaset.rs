@@ -1,6 +1,7 @@
-use crate::datastore::DatastoreBackend;
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
 use klights_reconcile_api::GcPodDeleteSink;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -11,6 +12,29 @@ type ReplicaSetReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
 static REPLICASET_RECONCILE_LOCKS: LazyLock<tokio::sync::Mutex<ReplicaSetReconcileLocks>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
+#[async_trait]
+pub trait ReplicaSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
+    async fn get_replicaset(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn update_replicaset_status(&self, resource: &Resource, status: Value) -> Result<()>;
+}
+
+#[async_trait]
+pub trait ReplicaSetPodMutation: Send + Sync {
+    async fn create_replicaset_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> Result<Resource>;
+    async fn replace_replicaset_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_references: Vec<Value>,
+    ) -> Result<Resource>;
+}
+
 async fn replicaset_reconcile_lock(namespace: &str, name: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = REPLICASET_RECONCILE_LOCKS.lock().await;
     locks
@@ -20,10 +44,11 @@ async fn replicaset_reconcile_lock(namespace: &str, name: &str) -> Arc<tokio::sy
 }
 
 pub async fn reconcile_replicaset(
-    db: &dyn DatastoreBackend,
-    pod_reader: &dyn PodReader,
-    pod_writer: &dyn PodObjectWriter,
+    db: &(impl ReplicaSetStore + ?Sized),
+    pod_reader: &(impl PodQuery + ?Sized),
+    pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
     pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     replicaset: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -51,10 +76,7 @@ pub async fn reconcile_replicaset(
     // Re-read the live object from storage. Watch/retry queues can deliver stale
     // snapshots after a ReplicaSet has already been deleted; reconciling that
     // stale payload must not recreate pods.
-    let live_resource = match db
-        .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-        .await?
-    {
+    let live_resource = match db.get_replicaset(namespace, name).await? {
         Some(r) => r,
         None => return Ok(()),
     };
@@ -63,15 +85,13 @@ pub async fn reconcile_replicaset(
         db,
         live_resource.clone(),
         pod_delete_sink,
+        non_pod_finalization,
     )
     .await?
     {
         crate::controllers::gc::OwnerReferenceReconcile::Deleted => return Ok(()),
         crate::controllers::gc::OwnerReferenceReconcile::OwnerReferencesUpdated => {
-            match db
-                .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-                .await?
-            {
+            match db.get_replicaset(namespace, name).await? {
                 Some(r) => r,
                 None => return Ok(()),
             }
@@ -79,8 +99,10 @@ pub async fn reconcile_replicaset(
         _ => live_resource,
     };
 
-    let live_replicaset =
-        crate::api::inject_resource_version(live_resource.data, live_resource.resource_version);
+    let live_replicaset = crate::controllers::resource_projection::with_resource_version(
+        live_resource.data,
+        live_resource.resource_version,
+    );
 
     let metadata = live_replicaset
         .get("metadata")
@@ -109,7 +131,9 @@ pub async fn reconcile_replicaset(
     let owned_by_deployment = replicaset_owned_by_deployment(metadata);
 
     // Fetch pods owned by this RS across every ownerReferences entry.
-    let rs_owned = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let rs_owned = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
 
     // Release pods that no longer match the selector.
     let mut owned_pods = Vec::new();
@@ -127,7 +151,7 @@ pub async fn reconcile_replicaset(
                     .cloned()
                     .unwrap_or_default();
                 pod_writer
-                    .update_pod_owner_references(namespace, &pod.name, owner_refs)
+                    .replace_replicaset_pod_owner_references(namespace, &pod.name, owner_refs)
                     .await?;
             }
         } else if pod_is_active(&pod.data) {
@@ -139,9 +163,16 @@ pub async fn reconcile_replicaset(
     // This path is rare (only when pods exist with no controller owner that match our selector).
     if owned_pods.len() < replicas {
         let all_pods = pod_reader
-            .list_pods(Some(namespace), None, None, None, None)
+            .list_pods(PodListRequest::try_new(
+                Some(namespace.to_string()),
+                None,
+                None,
+                None,
+                None,
+            )?)
             .await?
-            .items;
+            .into_parts()
+            .0;
         for pod in all_pods {
             if pod_owned_by_replicaset(&pod.data, uid) {
                 continue; // already in owned_pods
@@ -161,7 +192,7 @@ pub async fn reconcile_replicaset(
                     .cloned()
                     .unwrap_or_default();
                 pod_writer
-                    .update_pod_owner_references(namespace, &pod.name, owner_refs)
+                    .replace_replicaset_pod_owner_references(namespace, &pod.name, owner_refs)
                     .await?;
                 owned_pods.push(pod);
             }
@@ -177,10 +208,7 @@ pub async fn reconcile_replicaset(
             // Re-check the live RS before each create. A concurrent Deployment
             // reconcile can lower spec.replicas while this loop is in flight;
             // continuing from the stale count would create excess pods.
-            let Some(live_rs) = db
-                .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-                .await?
-            else {
+            let Some(live_rs) = db.get_replicaset(namespace, name).await? else {
                 return Ok(());
             };
             if live_rs
@@ -209,10 +237,7 @@ pub async fn reconcile_replicaset(
         let excess = current_replicas - replicas;
         let mut deleted = 0usize;
         for pod_resource in owned_pods.iter().rev().take(excess) {
-            let Some(live_rs) = db
-                .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-                .await?
-            else {
+            let Some(live_rs) = db.get_replicaset(namespace, name).await? else {
                 return Ok(());
             };
             if live_rs
@@ -243,15 +268,26 @@ pub async fn reconcile_replicaset(
                 .and_then(|m| m.get("namespace"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            if !pod_name.is_empty() && !pod_ns.is_empty() {
-                pod_writer.delete_pod(pod_ns, pod_name).await?;
+            let pod_uid = pod_resource
+                .data
+                .pointer("/metadata/uid")
+                .and_then(|uid| uid.as_str())
+                .unwrap_or("");
+            if !pod_name.is_empty() && !pod_ns.is_empty() && !pod_uid.is_empty() {
+                pod_delete_sink
+                    .request_gc_pod_delete(klights_reconcile_api::GcPodDeleteRequest::new(
+                        klights_types::PodIdentity::new(pod_ns, pod_name, pod_uid),
+                    ))
+                    .await?;
                 deleted += 1;
             }
         }
     }
 
     // Re-query owned pods to get fresh state (may have changed since the scale operations above)
-    let current_owned_pods = pod_reader.list_pods_by_owner_uid(namespace, uid).await?;
+    let current_owned_pods = pod_reader
+        .list_pods_by_owner_uid(PodOwnerListRequest::try_new(namespace, uid)?)
+        .await?;
     let active_current_owned_pods: Vec<_> = current_owned_pods
         .iter()
         .filter(|p| pod_is_active(&p.data))
@@ -264,25 +300,21 @@ pub async fn reconcile_replicaset(
     // Re-read the latest status-bearing snapshot before writing status so a
     // concurrent status-only write is not clobbered by reconcile from a stale
     // payload.
-    let latest_status_resource = db
-        .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-        .await?;
+    let latest_status_resource = db.get_replicaset(namespace, name).await?;
     let latest_status_resource = match latest_status_resource {
         Some(resource) => resource,
         None => return Ok(()),
     };
-    let latest_status_replicaset = crate::api::inject_resource_version(
-        latest_status_resource.data,
-        latest_status_resource.resource_version,
-    );
-    let observed_generation = latest_status_replicaset
+    let observed_generation = latest_status_resource
+        .data
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?
         .get("generation")
         .and_then(|g| g.as_u64())
         .unwrap_or(1);
 
-    let existing_conditions = latest_status_replicaset
+    let existing_conditions = latest_status_resource
+        .data
         .pointer("/status/conditions")
         .and_then(|v| v.as_array())
         .cloned()
@@ -299,7 +331,8 @@ pub async fn reconcile_replicaset(
         status["conditions"] = Value::Array(existing_conditions);
     }
 
-    crate::controllers::common::write_status(db, &latest_status_replicaset, &status).await?;
+    db.update_replicaset_status(&latest_status_resource, status)
+        .await?;
 
     Ok(())
 }
@@ -406,7 +439,7 @@ fn pod_has_controller_owner(pod: &Value) -> bool {
 }
 
 async fn create_pod(
-    pod_writer: &dyn PodObjectWriter,
+    pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
     rs_name: &str,
     rs_uid: &str,
     namespace: &str,
@@ -438,7 +471,7 @@ async fn create_pod(
     )?;
 
     pod_writer
-        .create_controller_pod(namespace, &pod_name, node_name, pod)
+        .create_replicaset_pod(namespace, &pod_name, node_name, pod)
         .await?;
     Ok(())
 }

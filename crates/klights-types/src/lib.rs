@@ -4,6 +4,7 @@ pub mod field_selector;
 pub mod ip;
 pub mod json_patch;
 pub mod label_selector;
+pub mod network;
 pub mod pod_status_merge;
 pub mod quantity;
 pub mod resource_semantics;
@@ -20,6 +21,19 @@ pub struct TlsClientCertificate(pub Vec<u8>);
 /// Common name used by the extension API server request-header client.
 pub const APISERVICE_PROXY_COMMON_NAME: &str = "system:klights:apiservice-proxy";
 
+pub const DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 3_600;
+pub const MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 600;
+pub const MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS: i64 = 365 * 24 * 3_600;
+
+pub fn normalize_service_account_token_expiration_seconds(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS)
+        .clamp(
+            MIN_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
+            MAX_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
+        )
+}
+
 pub use field_selector::{
     FieldRequirement, FieldSelector, FieldSelectorOperator, FieldSelectorParseError,
     default_field_value, resolve_field_value,
@@ -29,13 +43,21 @@ pub use json_patch::apply_merge_patch;
 pub use label_selector::{
     LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,
 };
+pub use network::{
+    ClusterCidr, DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION,
+    DATAPLANE_MODE_ANNOTATION, DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION,
+    HostPortRange, NodeName, NodePeerMode, NodePeerModeParseError, PodHostPortProtocol,
+    PodHostPortSpec, PodSubnet, parse_node_peer_mode, pod_host_port_specs,
+    set_node_dataplane_annotations,
+};
 pub use pod_status_merge::{
     PodStatusOwner, PodStatusPatch, merge_owned_and_preserved_conditions,
     merge_pod_status_for_update,
 };
 pub use quantity::{
-    format_cpu_milli, format_memory_bytes, format_resource_quantity, is_binary_quantity_resource,
-    parse_cpu_milli, parse_decimal_si_quantity, parse_memory_bytes, parse_resource_quantity,
+    calculate_pod_effective_resource_for_key, format_cpu_milli, format_memory_bytes,
+    format_resource_quantity, is_binary_quantity_resource, parse_cpu_milli,
+    parse_decimal_si_quantity, parse_memory_bytes, parse_resource_quantity,
 };
 pub use resource_semantics::{
     has_builtin_status_subresource, is_pod_delete_mark_patch, is_zero_grace_pod_delete_mark_patch,

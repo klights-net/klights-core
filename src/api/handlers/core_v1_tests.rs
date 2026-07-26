@@ -9,7 +9,7 @@
 //! K8s-compatible; endpoint and route work is driven through the controller
 //! dispatcher queue and the coalesced service-route sync.
 
-use crate::networking::test_support::{MockNetworkProvider, MockServiceRouter};
+use crate::networking::test_support::MockServiceRouter;
 use crate::watch::EventType;
 use klights_watch::WatchTopic;
 use serde_json::Value;
@@ -71,16 +71,14 @@ async fn service_patch_enqueues_reconcile_without_route_sync_on_request_path() {
     // SAME double into the controller dispatcher's `services` slot so the
     // ServiceController's coalesced `request_services_sync` (run by the
     // sync-fallback reconcile) is observable on our counter.
-    let provider = Arc::new(MockNetworkProvider::new());
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     let services_dyn = services.clone() as Arc<dyn klights_network_api::ServiceRouter>;
-    state.controller_dispatcher.set_services(services_dyn).await;
-    state.network = Arc::new(crate::networking::Network::new(
-        provider.clone(),
-        provider,
-        services.clone() as Arc<dyn klights_network_api::ServiceRouter>,
-        Arc::new(crate::networking::test_support::MockPodEndpointResolver),
-    ));
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .set_services(services_dyn)
+        .await;
+    state.pod_node_subresources_mut().services = services.clone();
     let app = crate::api::build_router(state);
 
     let db = crate::datastore::test_support::in_memory().await;
@@ -172,7 +170,10 @@ async fn service_create_persists_allocated_fields_in_single_service_write() {
     use tower::ServiceExt;
 
     let state = crate::api::test_support::build_test_app_state().await;
-    let mut watch_rx = state.db.subscribe_watch(WatchTopic::new("v1", "Service"));
+    let mut watch_rx = state
+        .resource_mutation()
+        .db
+        .subscribe_watch(WatchTopic::new("v1", "Service"));
     let app = crate::api::build_router(state);
 
     let create_body = json!({
@@ -277,6 +278,7 @@ async fn service_create_enqueues_exactly_one_service_reconcile() {
     let state = crate::api::test_support::build_test_app_state().await;
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
+        .controller_reconcile()
         .controller_dispatcher
         .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
@@ -314,6 +316,7 @@ async fn service_update_externalname_to_clusterip_enqueues_one_allocated_reconci
     let state = crate::api::test_support::build_test_app_state().await;
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
+        .controller_reconcile()
         .controller_dispatcher
         .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
@@ -439,7 +442,7 @@ async fn service_create_releases_cluster_ip_when_nodeport_allocation_fails() {
 
     let state = crate::api::test_support::build_test_app_state().await;
     for port in 30000..=32767 {
-        state.nodeport_alloc.mark_used(port);
+        state.controller_reconcile().nodeport_alloc.mark_used(port);
     }
     let app = crate::api::build_router(state);
 
@@ -495,10 +498,11 @@ async fn create_service_does_not_enqueue_reconcile_after_allocation_failure() {
     // Exhaust the NodePort range so NodePort allocation inside
     // `prepare_service_for_create` fails for a NodePort Service.
     for port in 30000..=32767 {
-        state.nodeport_alloc.mark_used(port);
+        state.controller_reconcile().nodeport_alloc.mark_used(port);
     }
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
+        .controller_reconcile()
         .controller_dispatcher
         .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
@@ -548,6 +552,7 @@ async fn create_service_success_response_contains_allocated_fields_and_enqueues_
     let state = crate::api::test_support::build_test_app_state().await;
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
+        .controller_reconcile()
         .controller_dispatcher
         .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;

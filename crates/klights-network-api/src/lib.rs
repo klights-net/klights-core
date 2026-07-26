@@ -12,25 +12,79 @@ use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 
 use klights_types::PodIdentity;
+pub use klights_types::{
+    DATAPLANE_ENCRYPTION_ANNOTATION, DATAPLANE_ENDPOINT_ANNOTATION, DATAPLANE_MODE_ANNOTATION,
+    DATAPLANE_PORT_ANNOTATION, DATAPLANE_PUBLIC_KEY_ANNOTATION, NodePeerMode,
+    NodePeerModeParseError, parse_node_peer_mode,
+};
 
 /// Stable Node-annotation keys shared by node publishers and network/control
 /// plane consumers.
 pub const NODE_MODE_ANNOTATION: &str = "klights.io/mode";
 pub const HOSTPORT_RANGE_ANNOTATION: &str = "klights.io/hostport-range";
-pub const DATAPLANE_ENDPOINT_ANNOTATION: &str = "klights.io/dataplane-endpoint";
-pub const DATAPLANE_PORT_ANNOTATION: &str = "klights.io/dataplane-port";
-pub const DATAPLANE_MODE_ANNOTATION: &str = "klights.io/dataplane-mode";
-pub const DATAPLANE_ENCRYPTION_ANNOTATION: &str = "klights.io/dataplane-encryption";
-pub const DATAPLANE_PUBLIC_KEY_ANNOTATION: &str = "klights.io/dataplane-public-key";
 pub const GIT_COMMIT_ANNOTATION: &str = "klights.io/git-commit";
 pub const GRPC_PORT_ANNOTATION: &str = "klights.io/grpc-port";
 pub const DEFAULT_HOSTPORT_RANGE: &str = "30000-32767";
 
-/// Mode dimension projected through Node annotations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NodePeerMode {
-    Root,
-    Rootless,
+/// Immutable network-owned readiness value injected into node publication.
+///
+/// Kubelet status projection consumes this value instead of owning or reaching
+/// the concrete dataplane health tracker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataplaneHealthSnapshot {
+    Healthy,
+    Unavailable { reason: String },
+}
+
+impl DataplaneHealthSnapshot {
+    pub const fn healthy() -> Self {
+        Self::Healthy
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub const fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Healthy => None,
+            Self::Unavailable { reason } => Some(reason),
+        }
+    }
+}
+
+#[cfg(test)]
+mod node_peer_mode_tests {
+    use super::*;
+
+    #[test]
+    fn parser_accepts_root_and_rootless() {
+        assert_eq!(
+            parse_node_peer_mode(Some("root")).unwrap(),
+            NodePeerMode::Root
+        );
+        assert_eq!(
+            parse_node_peer_mode(Some("rootless")).unwrap(),
+            NodePeerMode::Rootless
+        );
+    }
+
+    #[test]
+    fn parser_defaults_missing_mode_to_root() {
+        assert_eq!(parse_node_peer_mode(None).unwrap(), NodePeerMode::Root);
+    }
+
+    #[test]
+    fn parser_rejects_unknown_mode() {
+        let error = parse_node_peer_mode(Some("hybrid")).unwrap_err();
+        assert!(error.to_string().contains("hybrid"));
+    }
 }
 
 /// Object-safe future used by one complete datapath operation.
@@ -668,6 +722,24 @@ pub struct HostPortBinding {
     host_port: u16,
     container_port: u16,
     protocol: HostPortProtocol,
+}
+
+/// Adapt typed Kubernetes resource facts into validated hostPort bindings.
+pub fn host_port_bindings_from_specs(
+    specs: impl IntoIterator<Item = klights_types::PodHostPortSpec>,
+) -> Vec<HostPortBinding> {
+    specs
+        .into_iter()
+        .filter_map(|spec| {
+            let protocol = match spec.protocol {
+                klights_types::PodHostPortProtocol::Tcp => HostPortProtocol::Tcp,
+                klights_types::PodHostPortProtocol::Udp => HostPortProtocol::Udp,
+                klights_types::PodHostPortProtocol::Sctp => HostPortProtocol::Sctp,
+            };
+            HostPortBinding::try_new(spec.host_ip, spec.host_port, spec.container_port, protocol)
+                .ok()
+        })
+        .collect()
 }
 
 impl HostPortBinding {

@@ -1,14 +1,38 @@
-use crate::datastore::command::StorageCommand;
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
 use crate::kubelet::node;
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{Outbox, OutboxSendRoute};
+use crate::kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
+use crate::node_outbox::payload::OutboxOperation;
+use crate::node_outbox::{Outbox, OutboxSendRoute};
 use crate::utils::k8s_time_now;
 use anyhow::{Context, Result};
-use std::sync::Arc;
+use klights_cluster_core::ResourcePreconditions;
+use klights_cluster_core::StorageCommand;
+
+/// Focused persistence capability required by Node registration.
+///
+/// Concrete datastore adaptation is owned by bootstrap composition; kubelet
+/// owns only the registration transaction it needs.
+#[async_trait::async_trait]
+pub(crate) trait NodeRegistrationStore: Send + Sync {
+    async fn get_node(&self, node_name: &str) -> Result<Option<klights_cluster_core::Resource>>;
+
+    async fn stamp_routing_metadata(
+        &self,
+        node_name: &str,
+        node: &mut serde_json::Value,
+    ) -> Result<bool>;
+
+    async fn update_node(
+        &self,
+        node_name: &str,
+        node: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<()>;
+
+    async fn create_node(&self, node_name: &str, node: serde_json::Value) -> Result<()>;
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeRegistrationAddresses {
+pub(crate) struct NodeRegistrationAddresses {
     internal_ip: String,
     external_ip: Option<String>,
 }
@@ -37,7 +61,7 @@ impl NodeRegistrationAddresses {
 /// receive these from the joiner; the leader must never substitute its own
 /// capacity, architecture, kernel, runtime, or build identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeRegistrationHostFacts {
+pub(crate) struct NodeRegistrationHostFacts {
     pub cpu_count: u32,
     pub memory_ki: u64,
     pub architecture: String,
@@ -50,9 +74,13 @@ pub struct NodeRegistrationHostFacts {
 }
 
 impl NodeRegistrationHostFacts {
+    pub fn node_capacity(&self) -> crate::kubelet::node::NodeCapacity {
+        crate::kubelet::node::NodeCapacity::new(self.memory_ki, u64::from(self.cpu_count))
+    }
+
     pub async fn capture_local(
         file_process: &klights_supervisor::FileProcessExecutor,
-        node_mode: &crate::bootstrap::NodeMode,
+        kubelet_version: &str,
     ) -> Self {
         let (host_info, memory_info) = tokio::join!(
             host_node_info(file_process),
@@ -70,7 +98,7 @@ impl NodeRegistrationHostFacts {
             os_image: host_info.os_image,
             kernel_version: host_info.kernel_version,
             container_runtime_version: "containerd://1.7.0".to_string(),
-            kubelet_version: crate::version::kubelet_version_for_mode(node_mode),
+            kubelet_version: kubelet_version.to_string(),
             git_commit: crate::version::GIT_COMMIT_SHORT.to_string(),
         }
     }
@@ -162,12 +190,13 @@ impl NodeRegistrationHostFacts {
 /// Registration metadata and host facts travel together so a remote writer
 /// cannot accidentally combine joiner identity with leader-local host data.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeRegistrationSnapshot {
+pub(crate) struct NodeRegistrationSnapshot {
     pub node_name: String,
     pub node_mode: klights_network_api::NodePeerMode,
-    pub node_role: crate::bootstrap::NodeRole,
+    pub node_role: KubeletNodeRole,
+    pub publish_external_ip: bool,
     pub addresses: NodeRegistrationAddresses,
-    pub raft_shape: Option<crate::datastore::raft::types::RaftShape>,
+    pub raft_shape: Option<klights_cluster_core::RaftShape>,
     pub grpc_port: Option<u16>,
     pub host: NodeRegistrationHostFacts,
 }
@@ -176,26 +205,21 @@ impl NodeRegistrationSnapshot {
     pub async fn capture_local(
         file_process: &klights_supervisor::FileProcessExecutor,
         node_name: &str,
-        node_mode: &crate::bootstrap::NodeMode,
-        node_role: &crate::bootstrap::NodeRole,
+        profile: &NodeRegistrationProfile,
         addresses: NodeRegistrationAddresses,
-        raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
+        raft_shape: Option<&klights_cluster_core::RaftShape>,
         grpc_port: Option<u16>,
     ) -> Self {
-        let peer_mode = match node_mode {
-            crate::bootstrap::NodeMode::Root => klights_network_api::NodePeerMode::Root,
-            crate::bootstrap::NodeMode::Rootless { .. } => {
-                klights_network_api::NodePeerMode::Rootless
-            }
-        };
         Self {
             node_name: node_name.to_string(),
-            node_mode: peer_mode,
-            node_role: node_role.clone(),
+            node_mode: profile.peer_mode(),
+            node_role: profile.role(),
+            publish_external_ip: profile.publish_external_ip(),
             addresses,
             raft_shape: raft_shape.cloned(),
             grpc_port,
-            host: NodeRegistrationHostFacts::capture_local(file_process, node_mode).await,
+            host: NodeRegistrationHostFacts::capture_local(file_process, profile.kubelet_version())
+                .await,
         }
     }
 
@@ -214,7 +238,7 @@ impl NodeRegistrationSnapshot {
 
     pub fn controlplane_as_learner(&self) -> Option<bool> {
         match &self.node_role {
-            crate::bootstrap::NodeRole::Controlplane { as_learner, .. } => Some(*as_learner),
+            KubeletNodeRole::Controlplane { as_learner } => Some(*as_learner),
             _ => None,
         }
     }
@@ -326,101 +350,92 @@ fn unquote_os_release_value(value: &str) -> String {
 /// `klights.io/mode` and `klights.io/hostport-range` annotations so peers
 /// (root + rootless + hybrid) can discover each other's mode through Node
 /// metadata.
-pub async fn register_node(
+#[cfg(test)]
+pub(crate) async fn register_node(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    db: &dyn crate::datastore::DatastoreBackend,
     node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
+    profile: &NodeRegistrationProfile,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
     let snapshot = capture_node_registration_snapshot(
         file_process,
         node_name,
-        node_mode,
-        node_role,
+        profile,
         dataplane_external_ip,
         None,
     )
     .await;
-    register_node_snapshot(db, None, None, dataplane_health, &snapshot).await
+    crate::bootstrap::node_registration_adapter::register_node_snapshot(
+        db,
+        None,
+        dataplane_health,
+        &snapshot,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn register_node_with_outbox(
+#[cfg(test)]
+pub(crate) async fn register_node_with_outbox(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    db: &dyn crate::datastore::DatastoreBackend,
     outbox: &Outbox,
     node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
+    profile: &NodeRegistrationProfile,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
     let snapshot = capture_node_registration_snapshot(
         file_process,
         node_name,
-        node_mode,
-        node_role,
+        profile,
         dataplane_external_ip,
         None,
     )
     .await;
-    register_node_snapshot(db, Some(outbox), None, dataplane_health, &snapshot).await
+    crate::bootstrap::node_registration_adapter::register_node_snapshot(
+        db,
+        Some(outbox),
+        dataplane_health,
+        &snapshot,
+    )
+    .await
 }
 
-pub async fn register_node_at_addresses(
+#[cfg(test)]
+pub(crate) async fn register_node_at_addresses(
     file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
+    db: &dyn crate::datastore::DatastoreBackend,
     node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
+    profile: &NodeRegistrationProfile,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     addresses: &NodeRegistrationAddresses,
 ) -> Result<()> {
     let snapshot = NodeRegistrationSnapshot::capture_local(
         file_process,
         node_name,
-        node_mode,
-        node_role,
+        profile,
         addresses.clone(),
         None,
         None,
     )
     .await;
-    register_node_snapshot(db, None, None, dataplane_health, &snapshot).await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn register_node_with_outbox_at_addresses(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    db: &dyn DatastoreBackend,
-    outbox: &Outbox,
-    node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
-    addresses: &NodeRegistrationAddresses,
-) -> Result<()> {
-    let snapshot = NodeRegistrationSnapshot::capture_local(
-        file_process,
-        node_name,
-        node_mode,
-        node_role,
-        addresses.clone(),
+    crate::bootstrap::node_registration_adapter::register_node_snapshot(
+        db,
         None,
-        None,
+        dataplane_health,
+        &snapshot,
     )
-    .await;
-    register_node_snapshot(db, Some(outbox), None, dataplane_health, &snapshot).await
+    .await
 }
 
+#[cfg(test)]
 async fn capture_node_registration_snapshot(
     file_process: &klights_supervisor::FileProcessExecutor,
     node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
+    profile: &NodeRegistrationProfile,
     dataplane_external_ip: Option<&str>,
     grpc_port: Option<u16>,
 ) -> NodeRegistrationSnapshot {
@@ -428,8 +443,7 @@ async fn capture_node_registration_snapshot(
     NodeRegistrationSnapshot::capture_local(
         file_process,
         node_name,
-        node_mode,
-        node_role,
+        profile,
         NodeRegistrationAddresses::new(node_ip, dataplane_external_ip.map(str::to_string)),
         None,
         grpc_port,
@@ -438,10 +452,9 @@ async fn capture_node_registration_snapshot(
 }
 
 pub(crate) async fn register_node_snapshot(
-    db: &dyn DatastoreBackend,
+    db: &dyn NodeRegistrationStore,
     outbox: Option<&Outbox>,
-    _cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
+    dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     snapshot: &NodeRegistrationSnapshot,
 ) -> Result<()> {
     use klights_network_api::{
@@ -469,7 +482,7 @@ pub(crate) async fn register_node_snapshot(
         serde_json::json!({"type": "Hostname", "address": node_name}),
         serde_json::json!({"type": "InternalIP", "address": node_ip}),
     ];
-    if registration_external_ip_is_ingress_observed(node_role)
+    if snapshot.publish_external_ip
         && let Some(external_ip) = snapshot
             .addresses
             .external_ip()
@@ -587,12 +600,12 @@ pub(crate) async fn register_node_snapshot(
             serde_json::json!(port.to_string()),
         );
     }
-    node::stamp_node_routing_metadata_from_store(db, node_name, &mut node)
+    db.stamp_routing_metadata(node_name, &mut node)
         .await
         .context("Failed to stamp Node routing metadata")?;
 
     if let Some(existing) = db
-        .get_resource("v1", "Node", None, node_name)
+        .get_node(node_name)
         .await
         .context("Failed to read existing Node resource")?
     {
@@ -622,17 +635,13 @@ pub(crate) async fn register_node_snapshot(
             return Ok(());
         }
 
-        let _ = db
-            .update_resource_with_preconditions(
-                "v1",
-                "Node",
-                None,
-                node_name,
-                node,
-                ResourcePreconditions::from_resource(&existing),
-            )
-            .await
-            .context("Failed to update Node resource")?;
+        db.update_node(
+            node_name,
+            node,
+            ResourcePreconditions::from_resource(&existing),
+        )
+        .await
+        .context("Failed to update Node resource")?;
         return Ok(());
     }
 
@@ -660,8 +669,7 @@ pub(crate) async fn register_node_snapshot(
         return Ok(());
     }
 
-    let _ = db
-        .create_resource("v1", "Node", None, node_name, node.clone())
+    db.create_node(node_name, node)
         .await
         .context("Failed to create Node resource")?;
     Ok(())
@@ -669,22 +677,4 @@ pub(crate) async fn register_node_snapshot(
 
 fn node_address_json(address_type: &str, address: &str) -> serde_json::Value {
     serde_json::json!({"type": address_type, "address": address})
-}
-
-fn registration_external_ip_is_ingress_observed(node_role: &crate::bootstrap::NodeRole) -> bool {
-    match node_role {
-        crate::bootstrap::NodeRole::Leader {
-            bootstrap:
-                crate::bootstrap::node_role::LeaderBootstrap::Seed
-                | crate::bootstrap::node_role::LeaderBootstrap::Bootstrap { .. },
-        } => false,
-        crate::bootstrap::NodeRole::Controlplane {
-            leader_endpoints, ..
-        } if leader_endpoints.is_empty() => false,
-        crate::bootstrap::NodeRole::Worker { .. }
-        | crate::bootstrap::NodeRole::Controlplane { .. }
-        | crate::bootstrap::NodeRole::Leader {
-            bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Join { .. },
-        } => true,
-    }
 }

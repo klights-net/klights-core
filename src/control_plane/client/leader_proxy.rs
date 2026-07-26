@@ -28,34 +28,35 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::node_outbox::payload::OutboxOperationExt as _;
 use async_trait::async_trait;
 #[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt as _;
 use klights_leader_api::{
-    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
-};
-use tokio::sync::watch;
-
-use crate::control_plane::client::{
-    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
-    LeaderCacheReadiness, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
-    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness,
+    LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal, LeaderNodeSubnetAllocation,
+    LeaderOutboxDelivery, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
     LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
     NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
     NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
     NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
-    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
-    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
-    PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountTokenFuture,
+    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError,
+    OutboxDeliveryFuture, OutboxDeliveryRequest, PeerSubnetsQuery, PeerSubnetsResult,
+    PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
+    PodCleanupIntentListRequest, ProjectedServiceAccountTokenFuture,
     ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
     ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
     ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture, WatchRequest, WatchStream,
 };
-use crate::datastore::Resource;
+use tokio::sync::watch;
+
+use super::LeaderApiClient;
+use klights_cluster_core::Resource;
 
 #[cfg(test)]
-use crate::control_plane::client::pod_get_request;
+use klights_leader_api::pod_get_request;
 
 struct ArcPair<T: ?Sized> {
     local: Option<Arc<T>>,
@@ -199,7 +200,7 @@ impl LeaderProxyApiClient {
     async fn deliver_test_outbox(
         &self,
         idempotency_key: &str,
-        operation: crate::kubelet::outbox::payload::OutboxOperation,
+        operation: crate::node_outbox::payload::OutboxOperation,
         payload: Bytes,
         client_id: &str,
         stream_id: i64,
@@ -310,7 +311,7 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
             if consistency == ResourceQueryConsistency::LeaderFresh
                 && leadership_rx.has_changed().unwrap_or(true)
             {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                return Err(klights_leader_api::ResourceQueryError::retryable(
                     "leadership changed during leader-fresh resource query",
                 ));
             }
@@ -335,7 +336,7 @@ impl LeaderResourceQuery for LeaderProxyApiClient {
             if consistency == ResourceQueryConsistency::LeaderFresh
                 && leadership_rx.has_changed().unwrap_or(true)
             {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                return Err(klights_leader_api::ResourceQueryError::retryable(
                     "leadership changed during leader-fresh resource query",
                 ));
             }
@@ -507,9 +508,7 @@ impl LeaderResourceQuery for StubRemoteForwarder {
         let message = self.unavailable();
         Box::pin(async move {
             if request.consistency() == ResourceQueryConsistency::LeaderFresh {
-                Err(crate::control_plane::client::ResourceQueryError::retryable(
-                    message,
-                ))
+                Err(klights_leader_api::ResourceQueryError::retryable(message))
             } else {
                 Ok(None)
             }
@@ -523,9 +522,7 @@ impl LeaderResourceQuery for StubRemoteForwarder {
         let message = self.unavailable();
         Box::pin(async move {
             if request.consistency() == ResourceQueryConsistency::LeaderFresh {
-                return Err(crate::control_plane::client::ResourceQueryError::retryable(
-                    message,
-                ));
+                return Err(klights_leader_api::ResourceQueryError::retryable(message));
             }
             ResourceListResult::try_new(
                 Vec::new(),
@@ -579,11 +576,7 @@ impl LeaderProjectedServiceAccountToken for StubRemoteForwarder {
     ) -> ProjectedServiceAccountTokenFuture<'_> {
         let message = self.unavailable();
         Box::pin(async move {
-            Err(
-                crate::control_plane::client::ProjectedServiceAccountTokenError::unavailable(
-                    message,
-                ),
-            )
+            Err(klights_leader_api::ProjectedServiceAccountTokenError::unavailable(message))
         })
     }
 }
@@ -662,9 +655,9 @@ mod tests {
     //! logic is pure and unit-testable.
 
     use super::*;
-    use crate::control_plane::client::node_get_request;
-    use crate::kubelet::outbox::payload::OutboxOperation;
+    use crate::node_outbox::payload::OutboxOperation;
     use klights_cluster_core::StorageCommand;
+    use klights_leader_api::node_get_request;
     use klights_leader_api::{
         LeaderResourceCommand, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
         ResourceCommandResult,
@@ -814,7 +807,7 @@ mod tests {
             self.projected_service_account_token
                 .fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
-                crate::control_plane::client::ProjectedServiceAccountToken::try_new(format!(
+                klights_leader_api::ProjectedServiceAccountToken::try_new(format!(
                     "{}-token",
                     self.name
                 ))
@@ -1342,7 +1335,7 @@ mod tests {
                         .unwrap(),
                 )
                 .await,
-            Err(crate::control_plane::client::ResourceQueryError::Retryable { .. })
+            Err(klights_leader_api::ResourceQueryError::Retryable { .. })
         ));
 
         tx.send(true).expect("promote for watch race");
@@ -1370,7 +1363,7 @@ mod tests {
                         .unwrap(),
                 )
                 .await,
-            Err(crate::control_plane::client::ResourceQueryError::Retryable { .. })
+            Err(klights_leader_api::ResourceQueryError::Retryable { .. })
         ));
 
         local.flap_during_watch(tx);
@@ -1491,7 +1484,7 @@ mod tests {
             ) -> ProjectedServiceAccountTokenFuture<'_> {
                 Box::pin(async {
                     Err(
-                        crate::control_plane::client::ProjectedServiceAccountTokenError::unavailable(
+                        klights_leader_api::ProjectedServiceAccountTokenError::unavailable(
                             "no leader",
                         ),
                     )
@@ -1745,7 +1738,7 @@ mod tests {
     fn pod_status_minimal_payload() -> Bytes {
         use crate::datastore::ResourcePreconditions;
         use crate::datastore::command::StorageCommand;
-        use crate::kubelet::outbox::payload::OutboxPayload;
+        use crate::node_outbox::payload::OutboxPayload;
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),

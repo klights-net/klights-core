@@ -29,7 +29,6 @@ pub struct LeaderStart<'a> {
     pub dispatcher_for_worker: &'a Arc<crate::controller_dispatcher::ControllerDispatcher>,
     pub dispatcher_for_cronjobs: &'a Arc<crate::controller_dispatcher::ControllerDispatcher>,
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
-    pub scheduler_state: &'a Arc<crate::api::AppState>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
@@ -44,7 +43,6 @@ struct LeaderScopedTaskContext {
     dispatcher_for_worker: Arc<crate::controller_dispatcher::ControllerDispatcher>,
     dispatcher_for_cronjobs: Arc<crate::controller_dispatcher::ControllerDispatcher>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
-    scheduler_state: Arc<crate::api::AppState>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     datapath: Arc<dyn klights_network_api::Datapath>,
 }
@@ -58,7 +56,6 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
         pod_repository,
-        scheduler_state,
         cri_for_shutdown,
         datapath,
         is_leader_rx,
@@ -77,7 +74,6 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         dispatcher_for_worker: dispatcher_for_worker.clone(),
         dispatcher_for_cronjobs: dispatcher_for_cronjobs.clone(),
         pod_repository: pod_repository.clone(),
-        scheduler_state: scheduler_state.clone(),
         cri_for_shutdown: cri_for_shutdown.clone(),
         datapath: datapath.clone(),
     };
@@ -191,19 +187,18 @@ async fn start_leader_scoped_tasks(
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
         pod_repository,
-        scheduler_state,
         cri_for_shutdown,
         datapath,
     } = context;
 
     tracing::info!("Acquired leader lease");
-    use crate::{controllers, gc};
+    use crate::gc;
 
     reconcile_kubernetes_service_for_leader(config.as_ref(), &db_handle, datapath.as_ref())
         .await
         .context("reconcile kubernetes Service endpoint for active leader")?;
 
-    let scheduler = controllers::cronjob_scheduler::CronJobScheduler::new(
+    let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
         db_handle.clone(),
         dispatcher_for_cronjobs,
         task_supervisor.clone(),
@@ -248,7 +243,12 @@ async fn start_leader_scoped_tasks(
         "Controller workqueue worker pool started"
     );
 
-    let scheduler_state = scheduler_state.clone();
+    let scheduler_runtime: Arc<dyn crate::controllers::scheduler::SchedulerRuntime> = Arc::new(
+        crate::bootstrap::scheduler_adapter::LeaderSchedulerRuntime::new(
+            db_handle.clone(),
+            pod_repository.clone(),
+        ),
+    );
     let scheduler_cancel = lease_cancel.child_token();
     if let Err(e) = task_supervisor
         .spawn_async(
@@ -256,7 +256,7 @@ async fn start_leader_scoped_tasks(
             "runtime_scheduler_controller",
             async move {
                 crate::controllers::scheduler::run_scheduler_watch(
-                    scheduler_state,
+                    scheduler_runtime,
                     scheduler_cancel,
                 )
                 .await;

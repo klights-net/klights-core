@@ -163,7 +163,13 @@ impl RedbPodSlotStore {
         Ok(result)
     }
 
-    pub async fn mark_terminating(&self, ns: &str, pod: &str, uid: &str, node: &str) -> Result<()> {
+    pub async fn mark_terminating(
+        &self,
+        ns: &str,
+        pod: &str,
+        uid: &str,
+        node: &str,
+    ) -> Result<PodSlotMutationResult> {
         let ns = ns.to_string();
         let pod = pod.to_string();
         let uid = uid.to_string();
@@ -171,7 +177,7 @@ impl RedbPodSlotStore {
         let event_ns = ns.clone();
         let event_pod = pod.clone();
         let event_uid = uid.clone();
-        let event = self
+        let (result, event) = self
             .db_call("pod_slot_mark_terminating_impl", move |db| {
                 let w = db.begin_write()?;
                 let key = pod_slot_key(&ns, &pod);
@@ -202,8 +208,12 @@ impl RedbPodSlotStore {
                     if current_node == node
                         && current_state == PodSlotAdmissionState::Terminating.as_str()
                     {
+                        let resource_version = row
+                            .get("updated_rv")
+                            .and_then(|value| value.as_i64())
+                            .unwrap_or_default();
                         w.commit()?;
-                        return Ok(None);
+                        return Ok((PodSlotMutationResult::Unchanged { resource_version }, None));
                     }
                 }
 
@@ -220,29 +230,40 @@ impl RedbPodSlotStore {
                     table.insert(key.as_str(), serde_json::to_vec(&value)?.as_slice())?;
                 }
                 w.commit()?;
-                Ok(Some(PodSlotAdmissionEvent::Changed {
-                    namespace: event_ns,
-                    pod_name: event_pod,
-                    pod_uid: event_uid,
-                    state: PodSlotAdmissionState::Terminating,
-                    resource_version: rv,
-                }))
+                Ok((
+                    PodSlotMutationResult::Changed {
+                        resource_version: rv,
+                    },
+                    Some(PodSlotAdmissionEvent::Changed {
+                        namespace: event_ns,
+                        pod_name: event_pod,
+                        pod_uid: event_uid,
+                        state: PodSlotAdmissionState::Terminating,
+                        resource_version: rv,
+                    }),
+                ))
             })
             .await?;
         if let Some(event) = event {
             let _ = self.admission_tx.send(event);
         }
-        Ok(())
+        Ok(result)
     }
 
-    pub async fn clear_if_uid(&self, ns: &str, pod: &str, uid: &str, _node: &str) -> Result<()> {
+    pub async fn clear_if_uid(
+        &self,
+        ns: &str,
+        pod: &str,
+        uid: &str,
+        _node: &str,
+    ) -> Result<PodSlotClearResult> {
         let ns = ns.to_string();
         let pod = pod.to_string();
         let uid = uid.to_string();
         let event_ns = ns.clone();
         let event_pod = pod.clone();
         let event_uid = uid.clone();
-        let event = self
+        let (result, event) = self
             .db_call("pod_slot_clear_if_uid_impl", move |db| {
                 let w = db.begin_write()?;
                 let key = pod_slot_key(&ns, &pod);
@@ -252,7 +273,7 @@ impl RedbPodSlotStore {
                 };
                 let Some(bytes) = existing_value else {
                     w.commit()?;
-                    return Ok(None);
+                    return Ok((PodSlotClearResult::NotFound, None));
                 };
                 let row: Value = serde_json::from_slice(&bytes).unwrap_or_default();
                 let current_uid = row
@@ -260,8 +281,30 @@ impl RedbPodSlotStore {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
                 if current_uid != uid {
+                    let blocking_node = row
+                        .get("node_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let state = PodSlotAdmissionState::parse(
+                        row.get("state")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
+                    )?;
+                    let resource_version = row
+                        .get("updated_rv")
+                        .and_then(|value| value.as_i64())
+                        .unwrap_or_default();
                     w.commit()?;
-                    return Ok(None);
+                    return Ok((
+                        PodSlotClearResult::UidMismatch {
+                            blocking_uid: current_uid.to_string(),
+                            blocking_node,
+                            state,
+                            resource_version,
+                        },
+                        None,
+                    ));
                 }
                 let rv = helpers::incr_rv(&w)?;
                 {
@@ -269,18 +312,23 @@ impl RedbPodSlotStore {
                     table.remove(key.as_str())?;
                 }
                 w.commit()?;
-                Ok(Some(PodSlotAdmissionEvent::Cleared {
-                    namespace: event_ns,
-                    pod_name: event_pod,
-                    pod_uid: event_uid,
-                    resource_version: rv,
-                }))
+                Ok((
+                    PodSlotClearResult::Cleared {
+                        resource_version: rv,
+                    },
+                    Some(PodSlotAdmissionEvent::Cleared {
+                        namespace: event_ns,
+                        pod_name: event_pod,
+                        pod_uid: event_uid,
+                        resource_version: rv,
+                    }),
+                ))
             })
             .await?;
         if let Some(event) = event {
             let _ = self.admission_tx.send(event);
         }
-        Ok(())
+        Ok(result)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {

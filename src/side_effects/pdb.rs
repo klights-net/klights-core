@@ -1,68 +1,91 @@
 //! Side effect to update PDB status after Pod mutations.
 
-use super::{PodRepositorySlot, SideEffect};
-use crate::controllers::pdb;
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
-
-/// Updates PodDisruptionBudget status after Pod create/update/delete.
-///
-/// Registered only for `(v1, Pod)` — the registry handles the kind dispatch.
-/// Holds a [`PodRepositorySlot`] so the late-bound `PodRepository` is
-/// resolved at `apply` time (the registry is constructed before the
-/// repository in bootstrap).
-pub struct PDBReconcileEffect {
-    pod_repository: PodRepositorySlot,
-}
 
 #[async_trait]
-impl SideEffect for PDBReconcileEffect {
-    fn name(&self) -> &'static str {
-        "pdb_reconcile"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let namespace = resource
-            .pointer("/metadata/namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if namespace.is_empty() {
-            return Ok(());
-        }
-
-        let Some(pod_repository) = self.pod_repository.get() else {
-            // PodRepository is late-bound from bootstrap; before that point
-            // PDB status reconcile is a no-op (matches the previous registry
-            // construction order where this effect was inert until late wiring).
-            tracing::debug!(
-                "PDBReconcileEffect skipped for {}: PodRepository not yet bound",
-                namespace
-            );
-            return Ok(());
-        };
-
-        pdb::reconcile_pdbs_for_namespace(db, pod_repository.as_ref(), namespace).await;
-        Ok(())
-    }
+pub(crate) trait PdbSideEffectPort: Send + Sync {
+    async fn reconcile_namespace(&self, namespace: &str) -> Result<()>;
 }
 
-/// Create a PDBReconcileEffect instance backed by the supplied late-bound
-/// `PodRepository` slot.
-pub fn pdb_reconcile(pod_repository: PodRepositorySlot) -> Arc<dyn SideEffect> {
-    Arc::new(PDBReconcileEffect { pod_repository })
+pub(crate) fn pdb_event_namespace(resource: &Value) -> Option<&str> {
+    resource
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .filter(|namespace| !namespace.is_empty())
+}
+
+pub(crate) async fn apply_pdb_event<Port: PdbSideEffectPort + ?Sized>(
+    resource: &Value,
+    port: &Port,
+) -> Result<()> {
+    let Some(namespace) = pdb_event_namespace(resource) else {
+        return Ok(());
+    };
+    port.reconcile_namespace(namespace).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct FakePdbPort {
+        namespaces: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PdbSideEffectPort for FakePdbPort {
+        async fn reconcile_namespace(&self, namespace: &str) -> anyhow::Result<()> {
+            self.namespaces.lock().unwrap().push(namespace.to_string());
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn test_pdb_reconcile_name() {
-        let effect = pdb_reconcile(PodRepositorySlot::new());
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = crate::pdb_side_effect_adapter::effect(
+            db_handle,
+            crate::side_effects::PodSideEffectPortsSlot::new(),
+        );
         assert_eq!(effect.name(), "pdb_reconcile");
+    }
+
+    #[tokio::test]
+    async fn namespaced_pod_event_reconciles_exact_namespace() {
+        let port = FakePdbPort {
+            namespaces: Mutex::new(Vec::new()),
+        };
+        apply_pdb_event(
+            &serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "work", "name": "web"}
+            }),
+            &port,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*port.namespaces.lock().unwrap(), vec!["work"]);
+    }
+
+    #[tokio::test]
+    async fn namespace_less_event_does_not_reconcile() {
+        let port = FakePdbPort {
+            namespaces: Mutex::new(Vec::new()),
+        };
+        apply_pdb_event(
+            &serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "web"}
+            }),
+            &port,
+        )
+        .await
+        .unwrap();
+        assert!(port.namespaces.lock().unwrap().is_empty());
     }
 }

@@ -1,46 +1,20 @@
 //! Side effect to enqueue HPAs after target or Pod mutations.
 
-use super::{ControllerDispatcherSlot, SideEffect};
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::Arc;
-
-pub struct HpaReconcileEffect {
-    controller_dispatcher: ControllerDispatcherSlot,
-}
 
 #[async_trait]
-impl SideEffect for HpaReconcileEffect {
-    fn name(&self) -> &'static str {
-        "hpa_reconcile"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            tracing::debug!("HpaReconcileEffect skipped: controller dispatcher not yet bound");
-            return Ok(());
-        };
-
-        dispatcher
-            .enqueue_reconcile_batch(hpa_reconcile_keys_for_resource(resource, db).await?)
-            .await?;
-        Ok(())
-    }
+pub(crate) trait HpaSideEffectStore: Send + Sync {
+    async fn list_hpas(&self, api_version: &'static str, namespace: &str) -> Result<Vec<Resource>>;
 }
 
-pub fn hpa_reconcile(controller_dispatcher: ControllerDispatcherSlot) -> Arc<dyn SideEffect> {
-    Arc::new(HpaReconcileEffect {
-        controller_dispatcher,
-    })
-}
-
-pub async fn hpa_reconcile_keys_for_resource(
+pub(crate) async fn hpa_reconcile_keys_for_resource<Store: HpaSideEffectStore + ?Sized>(
     resource: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
 ) -> Result<Vec<ReconcileKey>> {
     let namespace = resource
         .pointer("/metadata/namespace")
@@ -57,27 +31,41 @@ pub async fn hpa_reconcile_keys_for_resource(
     let kind = resource.get("kind").and_then(|v| v.as_str()).unwrap_or("");
 
     if (api_version, kind) == ("v1", "Pod") {
-        return hpa_reconcile_keys_for_namespace(db, namespace).await;
+        return hpa_reconcile_keys_for_namespace(store, namespace).await;
     }
 
-    hpa_reconcile_keys_for_target(db, namespace, api_version, kind, resource).await
+    hpa_reconcile_keys_for_target(store, namespace, api_version, kind, resource).await
 }
 
-async fn hpa_reconcile_keys_for_namespace(
-    db: &dyn DatastoreBackend,
+async fn hpa_reconcile_keys_for_namespace<Store: HpaSideEffectStore + ?Sized>(
+    store: &Store,
     namespace: &str,
 ) -> Result<Vec<ReconcileKey>> {
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
-    append_hpa_keys_for_version(db, namespace, "autoscaling/v1", None, &mut seen, &mut keys)
-        .await?;
-    append_hpa_keys_for_version(db, namespace, "autoscaling/v2", None, &mut seen, &mut keys)
-        .await?;
+    append_hpa_keys_for_version(
+        store,
+        namespace,
+        "autoscaling/v1",
+        None,
+        &mut seen,
+        &mut keys,
+    )
+    .await?;
+    append_hpa_keys_for_version(
+        store,
+        namespace,
+        "autoscaling/v2",
+        None,
+        &mut seen,
+        &mut keys,
+    )
+    .await?;
     Ok(keys)
 }
 
-async fn hpa_reconcile_keys_for_target(
-    db: &dyn DatastoreBackend,
+async fn hpa_reconcile_keys_for_target<Store: HpaSideEffectStore + ?Sized>(
+    store: &Store,
     namespace: &str,
     api_version: &str,
     kind: &str,
@@ -99,7 +87,7 @@ async fn hpa_reconcile_keys_for_target(
     let mut keys = Vec::new();
     let mut seen = HashSet::new();
     append_hpa_keys_for_version(
-        db,
+        store,
         namespace,
         "autoscaling/v1",
         Some(target),
@@ -108,7 +96,7 @@ async fn hpa_reconcile_keys_for_target(
     )
     .await?;
     append_hpa_keys_for_version(
-        db,
+        store,
         namespace,
         "autoscaling/v2",
         Some(target),
@@ -126,23 +114,15 @@ struct TargetRef<'a> {
     name: &'a str,
 }
 
-async fn append_hpa_keys_for_version(
-    db: &dyn DatastoreBackend,
+async fn append_hpa_keys_for_version<Store: HpaSideEffectStore + ?Sized>(
+    store: &Store,
     namespace: &str,
     hpa_api_version: &'static str,
     target: Option<TargetRef<'_>>,
     seen: &mut HashSet<(&'static str, String)>,
     keys: &mut Vec<ReconcileKey>,
 ) -> Result<()> {
-    let hpas = db
-        .list_resources(
-            hpa_api_version,
-            "HorizontalPodAutoscaler",
-            Some(namespace),
-            ResourceListQuery::all(),
-        )
-        .await?;
-    for hpa in hpas.items {
+    for hpa in store.list_hpas(hpa_api_version, namespace).await? {
         if let Some(target) = target
             && !hpa_targets_resource(&hpa.data, target)
         {

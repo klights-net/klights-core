@@ -20,9 +20,7 @@ async fn dispatch_pod_handler_mutation_event(
     context: &'static str,
 ) {
     crate::api::mutation::dispatch_mutation_event(
-        &state.side_effects,
-        state.db.as_ref(),
-        &state.metrics,
+        state.resource_mutation().mutation_effects.as_ref(),
         crate::api::mutation::MutationEvent {
             operation,
             resource,
@@ -80,10 +78,10 @@ pub async fn list_pods(
         // K8s watch semantics: default watch does NOT replay initial objects.
         // Initial list+watch replay is only enabled when sendInitialEvents=true.
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let db = state.db.clone();
+        let db = state.resource_mutation().db.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            task_supervisor: state.task_supervisor.clone(),
+            task_supervisor: state.operational().task_supervisor.clone(),
             api_version: "v1",
             kind,
             watch_namespace: Some(ns),
@@ -117,52 +115,52 @@ pub async fn list_pods(
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token)?;
 
-    let list_query = crate::datastore::ResourceListQuery::new(
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
+    let list_query = klights_pod_api::PodListRequest::try_new(
+        Some(namespace.clone()),
+        query.label_selector.clone(),
+        query.field_selector.clone(),
         normalized_limit,
-        db_continue_name.as_deref(),
-    );
+        db_continue_name,
+    )
+    .map_err(AppError::from)?;
 
     // Pin paginated continuations / Exact reads to a consistent snapshot, shared
     // with every other list handler. Pods live in the generic resource table, so
     // the snapshot side reads `("v1","Pod")` directly; the live side stays on the
     // PodReader port. See `query::resolve_list_page`.
-    let db_for_snapshot = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
-    let ns_for_snapshot = namespace.clone();
-    let ns_for_live = namespace.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
+    let snapshot_repository = pod_repository.clone();
+    let snapshot_query = list_query.clone();
+    let live_query = list_query;
     let crate::api::query::ResolvedListPage {
         list,
         response_rv,
         continue_resource_version,
     } = crate::api::query::resolve_list_page(
-        state.db.as_ref(),
+        state.resource_mutation().list_resource_versions.as_ref(),
         rv_match,
         continue_resource_version,
         |srv| async move {
-            db_for_snapshot
-                .snapshot_resources_at_rv("v1", "Pod", Some(&ns_for_snapshot), list_query, srv)
-                .await
-                .map_err(AppError::from)
-        },
-        || async move {
-            crate::kubelet::pod_repository::PodReader::list_pods(
-                pod_repository.as_ref(),
-                Some(&ns_for_live),
-                list_query.label_selector,
-                list_query.field_selector,
-                list_query.limit,
-                list_query.continue_token,
+            klights_pod_api::PodSnapshotQuery::snapshot_pods(
+                snapshot_repository.as_ref(),
+                klights_pod_api::PodSnapshotListRequest {
+                    list: snapshot_query,
+                    snapshot_resource_version: srv,
+                },
             )
             .await
             .map_err(AppError::from)
         },
+        || async move {
+            klights_pod_api::PodQuery::list_pods(pod_repository.as_ref(), live_query)
+                .await
+                .map_err(AppError::from)
+        },
     )
     .await?;
 
-    let items: Vec<Value> = list
-        .items
+    let (list_items, _, list_continue_token, remaining_item_count) = list.into_parts();
+    let items: Vec<Value> = list_items
         .into_iter()
         .map(|r| {
             let mut data = inject_resource_version(r.data, r.resource_version);
@@ -183,7 +181,7 @@ pub async fn list_pods(
     let mut metadata = serde_json::json!({
         "resourceVersion": resource_version,
     });
-    if let Some(ref name) = list.continue_token {
+    if let Some(ref name) = list_continue_token {
         // Normal pages keep the session RV; inconsistent recovery pages must
         // keep returning inconsistent tokens.
         let token = crate::api::query::encode_response_continue_token(
@@ -193,7 +191,7 @@ pub async fn list_pods(
         );
         metadata["continue"] = serde_json::json!(token);
     }
-    if let Some(remaining) = list.remaining_item_count {
+    if let Some(remaining) = remaining_item_count {
         metadata["remainingItemCount"] = serde_json::json!(remaining);
     }
     let response = serde_json::json!({
@@ -211,8 +209,8 @@ pub async fn get_pod(
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    match crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
+    match crate::api::pod_repository_ports::get_pod(
+        state.resource_mutation().pod_repository.as_ref(),
         &namespace,
         &name,
     )
@@ -322,20 +320,20 @@ pub async fn delete_pod(
     // always-cascade by not threading the policy here.
     let is_dry_run = delete_intent.dry_run.is_all();
 
-    let outcome = crate::kubelet::pod_repository::PodApiWriter::api_delete_pod(
-        state.pod_repository.as_ref(),
-        &namespace,
-        &name,
-        delete_intent.options,
-        is_dry_run,
+    let outcome = klights_pod_api::PodApiMutation::delete_pod(
+        state.resource_mutation().pod_repository.as_ref(),
+        klights_pod_api::PodApiDeleteRequest {
+            namespace,
+            name,
+            options: delete_intent.options.into(),
+            dry_run: is_dry_run,
+        },
     )
     .await?;
 
     match outcome {
-        crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(v) => {
-            Ok((StatusCode::OK, Json(v)))
-        }
-        crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(r) => {
+        klights_pod_api::PodApiDeleteOutcome::DryRun(v) => Ok((StatusCode::OK, Json(v))),
+        klights_pod_api::PodApiDeleteOutcome::GracefulSet(r) => {
             dispatch_pod_handler_mutation_event(
                 &state,
                 klights_reconcile_api::MutationOperation::DeleteMark,
@@ -405,16 +403,14 @@ pub async fn patch_pod(
     Ok(Json(data))
 }
 
-fn content_type_to_patch_type(
-    content_type: Option<&str>,
-) -> crate::kubelet::pod_repository::PodStatusPatchType {
-    use crate::kubelet::pod_repository::PodStatusPatchType;
+fn content_type_to_patch_type(content_type: Option<&str>) -> klights_pod_api::PodStatusPatchKind {
+    use klights_pod_api::PodStatusPatchKind;
     match content_type {
-        Some("application/json-patch+json") => PodStatusPatchType::JsonPatch,
-        Some("application/strategic-merge-patch+json") => PodStatusPatchType::StrategicMerge,
-        Some("application/apply-patch+yaml") => PodStatusPatchType::ApplyPatch,
+        Some("application/json-patch+json") => PodStatusPatchKind::JsonPatch,
+        Some("application/strategic-merge-patch+json") => PodStatusPatchKind::StrategicMerge,
+        Some("application/apply-patch+yaml") => PodStatusPatchKind::ApplyPatch,
         // Default (application/merge-patch+json, application/json, missing) → MergePatch
-        _ => PodStatusPatchType::MergePatch,
+        _ => PodStatusPatchKind::MergePatch,
     }
 }
 
@@ -425,12 +421,14 @@ pub async fn delete_collection_pods(
 ) -> Result<Json<Value>, AppError> {
     let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(&query)?;
     let is_dry_run = dry_run.is_all();
-    crate::kubelet::pod_repository::PodApiWriter::api_delete_collection_pods(
-        state.pod_repository.as_ref(),
-        &namespace,
-        query.label_selector.as_deref(),
-        None, // field_selector matches today's macro behavior
-        is_dry_run,
+    klights_pod_api::PodApiMutation::delete_collection_pods(
+        state.resource_mutation().pod_repository.as_ref(),
+        klights_pod_api::PodApiDeleteCollectionRequest {
+            namespace: namespace.clone(),
+            label_selector: query.label_selector,
+            field_selector: None, // matches today's macro behavior
+            dry_run: is_dry_run,
+        },
     )
     .await?;
 
@@ -496,10 +494,10 @@ pub async fn list_all_pods(
             .is_some_and(|rv| rv.trim() == "0");
 
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let db = state.db.clone();
+        let db = state.resource_mutation().db.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            task_supervisor: state.task_supervisor.clone(),
+            task_supervisor: state.operational().task_supervisor.clone(),
             api_version: "v1",
             kind,
             watch_namespace: None,
@@ -533,48 +531,50 @@ pub async fn list_all_pods(
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token)?;
 
-    let list_query = crate::datastore::ResourceListQuery::new(
-        query.label_selector.as_deref(),
-        query.field_selector.as_deref(),
+    let list_query = klights_pod_api::PodListRequest::try_new(
+        None,
+        query.label_selector.clone(),
+        query.field_selector.clone(),
         normalized_limit,
-        db_continue_name.as_deref(),
-    );
+        db_continue_name,
+    )
+    .map_err(AppError::from)?;
 
     // Cluster-wide Pod list: same consistent-snapshot path as the namespaced
     // handler, with no namespace scope. See `query::resolve_list_page`.
-    let db_for_snapshot = state.db.clone();
-    let pod_repository = state.pod_repository.clone();
+    let pod_repository = state.resource_mutation().pod_repository.clone();
+    let snapshot_repository = pod_repository.clone();
+    let snapshot_query = list_query.clone();
+    let live_query = list_query;
     let crate::api::query::ResolvedListPage {
         list,
         response_rv,
         continue_resource_version,
     } = crate::api::query::resolve_list_page(
-        state.db.as_ref(),
+        state.resource_mutation().list_resource_versions.as_ref(),
         rv_match,
         continue_resource_version,
         |srv| async move {
-            db_for_snapshot
-                .snapshot_resources_at_rv("v1", "Pod", None, list_query, srv)
-                .await
-                .map_err(AppError::from)
-        },
-        || async move {
-            crate::kubelet::pod_repository::PodReader::list_pods(
-                pod_repository.as_ref(),
-                None, // All namespaces
-                list_query.label_selector,
-                list_query.field_selector,
-                list_query.limit,
-                list_query.continue_token,
+            klights_pod_api::PodSnapshotQuery::snapshot_pods(
+                snapshot_repository.as_ref(),
+                klights_pod_api::PodSnapshotListRequest {
+                    list: snapshot_query,
+                    snapshot_resource_version: srv,
+                },
             )
             .await
             .map_err(AppError::from)
         },
+        || async move {
+            klights_pod_api::PodQuery::list_pods(pod_repository.as_ref(), live_query)
+                .await
+                .map_err(AppError::from)
+        },
     )
     .await?;
 
-    let items: Vec<Value> = list
-        .items
+    let (list_items, _, list_continue_token, remaining_item_count) = list.into_parts();
+    let items: Vec<Value> = list_items
         .into_iter()
         .map(|r| inject_resource_version(r.data, r.resource_version))
         .collect();
@@ -591,7 +591,7 @@ pub async fn list_all_pods(
     let mut metadata = serde_json::json!({
         "resourceVersion": resource_version,
     });
-    if let Some(ref name) = list.continue_token {
+    if let Some(ref name) = list_continue_token {
         let token = crate::api::query::encode_response_continue_token(
             name,
             response_rv,
@@ -599,7 +599,7 @@ pub async fn list_all_pods(
         );
         metadata["continue"] = serde_json::json!(token);
     }
-    if let Some(remaining) = list.remaining_item_count {
+    if let Some(remaining) = remaining_item_count {
         metadata["remainingItemCount"] = serde_json::json!(remaining);
     }
     let response = serde_json::json!({
@@ -645,7 +645,11 @@ struct PodPatchStrategy<'a> {
 #[async_trait]
 impl CreateStrategy for PodCreateStrategy<'_> {
     async fn before_admission(&self, body: Value) -> Result<Value, AppError> {
-        reject_if_namespace_missing_or_terminating(self.state.db.as_ref(), self.namespace).await?;
+        self.state
+            .resource_mutation()
+            .builtin_admission_defaults
+            .ensure_namespace_active(self.namespace.to_string())
+            .await?;
         check_field_validation_strict_typed("v1", "Pod", self.query, &body)?;
         Ok(body)
     }
@@ -669,14 +673,12 @@ impl CreateStrategy for PodCreateStrategy<'_> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let result = crate::kubelet::pod_repository::PodApiWriter::api_create_pod(
-            self.state.pod_repository.as_ref(),
-            crate::kubelet::pod_repository::PodApiCreateRequest {
+        let result = klights_pod_api::PodApiMutation::create_pod(
+            self.state.resource_mutation().pod_repository.as_ref(),
+            klights_pod_api::PodApiCreateRequest {
                 namespace: self.namespace.to_string(),
-                name: String::new(),
                 body,
                 dry_run: dry_run.is_all(),
-                run_admission: true,
             },
         )
         .await
@@ -692,9 +694,9 @@ impl CreateStrategy for PodCreateStrategy<'_> {
 
 #[async_trait]
 impl UpdateStrategy for PodUpdateStrategy<'_> {
-    async fn load_current(&self) -> Result<crate::datastore::Resource, AppError> {
-        crate::kubelet::pod_repository::PodReader::get_pod(
-            self.state.pod_repository.as_ref(),
+    async fn load_current(&self) -> Result<klights_cluster_core::Resource, AppError> {
+        crate::api::pod_repository_ports::get_pod(
+            self.state.resource_mutation().pod_repository.as_ref(),
             self.namespace,
             self.name,
         )
@@ -704,7 +706,7 @@ impl UpdateStrategy for PodUpdateStrategy<'_> {
 
     async fn prepare_update(
         &self,
-        _current: &crate::datastore::Resource,
+        _current: &klights_cluster_core::Resource,
         body: Value,
         _dry_run: crate::api::mutation::DryRunMode,
     ) -> Result<Value, AppError> {
@@ -714,26 +716,26 @@ impl UpdateStrategy for PodUpdateStrategy<'_> {
 
     async fn persist_update(
         &self,
-        current: crate::datastore::Resource,
+        current: klights_cluster_core::Resource,
         body: Value,
         dry_run: crate::api::mutation::DryRunMode,
     ) -> Result<WriteResult, AppError> {
-        let outcome = crate::kubelet::pod_repository::PodApiWriter::api_update_pod(
-            self.state.pod_repository.as_ref(),
-            self.namespace,
-            self.name,
-            body,
-            current,
-            dry_run.is_all(),
+        let outcome = klights_pod_api::PodApiMutation::update_pod(
+            self.state.resource_mutation().pod_repository.as_ref(),
+            klights_pod_api::PodApiUpdateRequest {
+                namespace: self.namespace.to_string(),
+                name: self.name.to_string(),
+                body,
+                current,
+                dry_run: dry_run.is_all(),
+            },
         )
         .await?;
         Ok(match outcome {
-            crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(resource) => {
+            klights_pod_api::PodApiWriteOutcome::Persisted(resource) => {
                 WriteResult::Persisted(resource)
             }
-            crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(value) => {
-                WriteResult::DryRun(value)
-            }
+            klights_pod_api::PodApiWriteOutcome::DryRun(value) => WriteResult::DryRun(value),
         })
     }
 }
@@ -760,8 +762,8 @@ impl PatchStrategy for PodPatchStrategy<'_> {
             // Non-apply patch (merge/strategic/JSON): deep-validate the *merged*
             // result so nested unknown fields are rejected under Strict, matching
             // the generic patch path. Only runs on the opt-in Strict path.
-            let current = crate::kubelet::pod_repository::PodReader::get_pod(
-                self.state.pod_repository.as_ref(),
+            let current = crate::api::pod_repository_ports::get_pod(
+                self.state.resource_mutation().pod_repository.as_ref(),
                 self.namespace,
                 self.name,
             )
@@ -772,22 +774,22 @@ impl PatchStrategy for PodPatchStrategy<'_> {
         }
 
         let patch_type = content_type_to_patch_type(content_type);
-        let outcome = crate::kubelet::pod_repository::PodApiWriter::api_patch_pod(
-            self.state.pod_repository.as_ref(),
-            self.namespace,
-            self.name,
-            patch,
-            patch_type,
-            dry_run.is_all(),
+        let outcome = klights_pod_api::PodApiMutation::patch_pod(
+            self.state.resource_mutation().pod_repository.as_ref(),
+            klights_pod_api::PodApiPatchRequest {
+                namespace: self.namespace.to_string(),
+                name: self.name.to_string(),
+                patch,
+                patch_kind: patch_type,
+                dry_run: dry_run.is_all(),
+            },
         )
         .await?;
         Ok(match outcome {
-            crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(resource) => {
+            klights_pod_api::PodApiWriteOutcome::Persisted(resource) => {
                 WriteResult::Persisted(resource)
             }
-            crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(value) => {
-                WriteResult::DryRun(value)
-            }
+            klights_pod_api::PodApiWriteOutcome::DryRun(value) => WriteResult::DryRun(value),
         })
     }
 }

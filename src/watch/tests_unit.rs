@@ -238,9 +238,9 @@ impl WatchReplaySource for CancellationReplaySource {
 
     async fn replay_after_checked(
         &self,
-        position: crate::datastore::WatchReplayPosition,
+        position: klights_watch::WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
         let call = {
             let mut calls = self
                 .calls
@@ -287,9 +287,9 @@ impl WatchReplaySource for ShortPageReplaySource {
 
     async fn replay_after_checked(
         &self,
-        position: crate::datastore::WatchReplayPosition,
+        position: klights_watch::WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
         let mut call = self
             .calls
             .lock()
@@ -314,8 +314,8 @@ impl WatchReplaySource for ShortPageReplaySource {
             .enumerate()
             .skip(start)
             .take(page_size.min(limit.get()))
-            .map(|(index, event)| crate::datastore::PositionedWatchEvent {
-                position: crate::datastore::WatchReplayPosition {
+            .map(|(index, event)| klights_watch::PositionedWatchEvent {
+                position: klights_watch::WatchReplayPosition {
                     resource_version: event.resource_version().unwrap_or_default(),
                     event_id: index as i64 + 1,
                     resource_version_filter_through_event_id: 0,
@@ -323,14 +323,14 @@ impl WatchReplaySource for ShortPageReplaySource {
                 event: event.clone(),
             })
             .collect();
-        let next_position = crate::datastore::WatchReplayPosition::after_page(
+        let next_position = klights_watch::WatchReplayPosition::after_page(
             position,
             &positioned,
             self.events.len() as i64,
             limit,
         );
-        Ok(crate::datastore::PositionedWatchReplayRead::Events(
-            crate::datastore::PositionedWatchReplay {
+        Ok(klights_watch::PositionedWatchReplayRead::Events(
+            klights_watch::PositionedWatchReplay {
                 events: positioned,
                 next_position,
             },
@@ -365,7 +365,7 @@ impl SignalCursorReplaySource {
 
 #[derive(Clone)]
 struct MalformedPositionReplaySource {
-    replay: crate::datastore::PositionedWatchReplay<WatchEvent>,
+    replay: klights_watch::PositionedWatchReplay<WatchEvent>,
 }
 
 #[async_trait::async_trait]
@@ -376,10 +376,10 @@ impl WatchReplaySource for MalformedPositionReplaySource {
 
     async fn replay_after_checked(
         &self,
-        _position: crate::datastore::WatchReplayPosition,
+        _position: klights_watch::WatchReplayPosition,
         _limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
-        Ok(crate::datastore::PositionedWatchReplayRead::Events(
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
+        Ok(klights_watch::PositionedWatchReplayRead::Events(
             self.replay.clone(),
         ))
     }
@@ -422,15 +422,15 @@ impl WatchReplaySource for SignalCursorReplaySource {
         &self,
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::WatchReplayRead<WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::WatchReplayRead<WatchEvent>> {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((since_rv, limit.get()));
         if self.expired {
-            return Ok(crate::datastore::WatchReplayRead::Expired);
+            return Ok(klights_watch::WatchReplayRead::Expired);
         }
-        Ok(crate::datastore::WatchReplayRead::Events(
+        Ok(klights_watch::WatchReplayRead::Events(
             self.events
                 .iter()
                 .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
@@ -442,15 +442,15 @@ impl WatchReplaySource for SignalCursorReplaySource {
 
     async fn replay_after_checked(
         &self,
-        position: crate::datastore::WatchReplayPosition,
+        position: klights_watch::WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((position.resource_version, limit.get()));
         if self.expired {
-            return Ok(crate::datastore::PositionedWatchReplayRead::Expired);
+            return Ok(klights_watch::PositionedWatchReplayRead::Expired);
         }
         let events: Vec<_> = self
             .events
@@ -464,8 +464,8 @@ impl WatchReplaySource for SignalCursorReplaySource {
                 }
             })
             .take(limit.get())
-            .map(|(index, event)| crate::datastore::PositionedWatchEvent {
-                position: crate::datastore::WatchReplayPosition {
+            .map(|(index, event)| klights_watch::PositionedWatchEvent {
+                position: klights_watch::WatchReplayPosition {
                     resource_version: event.resource_version().unwrap_or_default(),
                     event_id: index as i64 + 1,
                     resource_version_filter_through_event_id: 0,
@@ -473,14 +473,14 @@ impl WatchReplaySource for SignalCursorReplaySource {
                 event: event.clone(),
             })
             .collect();
-        let next_position = crate::datastore::WatchReplayPosition::after_page(
+        let next_position = klights_watch::WatchReplayPosition::after_page(
             position,
             &events,
             self.events.len() as i64,
             limit,
         );
-        Ok(crate::datastore::PositionedWatchReplayRead::Events(
-            crate::datastore::PositionedWatchReplay {
+        Ok(klights_watch::PositionedWatchReplayRead::Events(
+            klights_watch::PositionedWatchReplay {
                 events,
                 next_position,
             },
@@ -506,7 +506,7 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
         &self,
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::WatchReplayRead<WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::WatchReplayRead<WatchEvent>> {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -515,7 +515,7 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(crate::datastore::WatchReplayRead::Events(
+        Ok(klights_watch::WatchReplayRead::Events(
             events
                 .iter()
                 .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
@@ -527,9 +527,9 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
 
     async fn replay_after_checked(
         &self,
-        position: crate::datastore::WatchReplayPosition,
+        position: klights_watch::WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
         self.calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -549,8 +549,8 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
                 }
             })
             .take(limit.get())
-            .map(|(index, event)| crate::datastore::PositionedWatchEvent {
-                position: crate::datastore::WatchReplayPosition {
+            .map(|(index, event)| klights_watch::PositionedWatchEvent {
+                position: klights_watch::WatchReplayPosition {
                     resource_version: event.resource_version().unwrap_or_default(),
                     event_id: index as i64 + 1,
                     resource_version_filter_through_event_id: 0,
@@ -559,14 +559,14 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
             })
             .collect();
         let high_water_event_id = events.len() as i64;
-        let next_position = crate::datastore::WatchReplayPosition::after_page(
+        let next_position = klights_watch::WatchReplayPosition::after_page(
             position,
             &positioned,
             high_water_event_id,
             limit,
         );
-        Ok(crate::datastore::PositionedWatchReplayRead::Events(
-            crate::datastore::PositionedWatchReplay {
+        Ok(klights_watch::PositionedWatchReplayRead::Events(
+            klights_watch::PositionedWatchReplay {
                 events: positioned,
                 next_position,
             },
@@ -690,8 +690,7 @@ async fn signal_cursor_resume_position_retains_scalar_filter_until_anchor_is_cro
         signal_cursor_pod("default", "pod-12", 12),
         signal_cursor_pod("default", "pod-13", 13),
     ]);
-    let start =
-        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 3);
+    let start = klights_watch::WatchReplayPosition::from_resource_version_through_event_id(10, 3);
     let mut cursor = SignalWatchCursor::new_many_at_position(
         rx,
         source,
@@ -707,7 +706,7 @@ async fn signal_cursor_resume_position_retains_scalar_filter_until_anchor_is_cro
     assert_eq!(first.resource_version(), Some(11));
     assert_eq!(
         cursor.processed_position(),
-        crate::datastore::WatchReplayPosition {
+        klights_watch::WatchReplayPosition {
             resource_version: 10,
             event_id: 1,
             resource_version_filter_through_event_id: 3,
@@ -718,15 +717,15 @@ async fn signal_cursor_resume_position_retains_scalar_filter_until_anchor_is_cro
 
 #[tokio::test]
 async fn signal_cursor_rejects_non_strict_events_and_regressing_page_positions() {
-    let start = crate::datastore::WatchReplayPosition {
+    let start = klights_watch::WatchReplayPosition {
         resource_version: 10,
         event_id: 20,
         resource_version_filter_through_event_id: 30,
     };
     let cases = [
-        crate::datastore::PositionedWatchReplay {
-            events: vec![crate::datastore::PositionedWatchEvent {
-                position: crate::datastore::WatchReplayPosition {
+        klights_watch::PositionedWatchReplay {
+            events: vec![klights_watch::PositionedWatchEvent {
+                position: klights_watch::WatchReplayPosition {
                     resource_version: 11,
                     event_id: 20,
                     resource_version_filter_through_event_id: 0,
@@ -735,9 +734,9 @@ async fn signal_cursor_rejects_non_strict_events_and_regressing_page_positions()
             }],
             next_position: start,
         },
-        crate::datastore::PositionedWatchReplay {
+        klights_watch::PositionedWatchReplay {
             events: Vec::new(),
-            next_position: crate::datastore::WatchReplayPosition {
+            next_position: klights_watch::WatchReplayPosition {
                 resource_version: 11,
                 ..start
             },
@@ -1377,12 +1376,12 @@ async fn watch_replay_source_checked_replay_respects_limit() {
         .unwrap();
 
     match replay {
-        crate::datastore::WatchReplayRead::Events(events) => {
+        klights_watch::WatchReplayRead::Events(events) => {
             assert_eq!(events.len(), 2);
             assert_eq!(events[0].resource_version(), Some(11));
             assert_eq!(events[1].resource_version(), Some(12));
         }
-        crate::datastore::WatchReplayRead::Expired => panic!("fixed source should not expire"),
+        klights_watch::WatchReplayRead::Expired => panic!("fixed source should not expire"),
     }
 }
 

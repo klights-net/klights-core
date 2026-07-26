@@ -5,7 +5,6 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_core::action::PodAction;
 use crate::kubelet::pod_lifecycle_core::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind, PodSlotKey,
@@ -14,6 +13,7 @@ use crate::kubelet::pod_lifecycle_core::state::{FinalizationAction, PodPhase};
 use crate::kubelet::pod_lifecycle_core::trace::{LifecycleTraceEntry, LifecycleTraceRing};
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
+use crate::node_outbox::Outbox;
 #[cfg(test)]
 use klights_supervisor::TaskCategoryConfig;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
@@ -23,17 +23,7 @@ use super::registry::{
 };
 use super::state::PodLifecycleState;
 
-const DEFAULT_POD_ACTOR_IDLE_GRACE_SECS: u64 = 30;
-const KLIGHTS_POD_ACTOR_IDLE_GRACE_SECS: &str = "KLIGHTS_POD_ACTOR_IDLE_GRACE_SECS";
-
-pub fn pod_actor_idle_grace_duration() -> Duration {
-    std::env::var(KLIGHTS_POD_ACTOR_IDLE_GRACE_SECS)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_POD_ACTOR_IDLE_GRACE_SECS))
-}
+pub const DEFAULT_POD_ACTOR_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -258,7 +248,7 @@ impl PodLifecycleActor {
             self_removal: None,
             shutdown_token: CancellationToken::new(),
             instance: None,
-            idle_grace: pod_actor_idle_grace_duration(),
+            idle_grace: DEFAULT_POD_ACTOR_IDLE_GRACE,
             slot_admission_gate_enabled: false,
             idle_generation: 0,
             idle_timer_armed_generation: None,

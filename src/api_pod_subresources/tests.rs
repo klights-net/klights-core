@@ -303,12 +303,15 @@ async fn test_remote_websocket_exec_rejects_spdy_upgrade() {
     use tower::ServiceExt;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let remote_node = format!("{}-worker", state.config.node_name);
-    state.replication = Some(Arc::new(crate::replication::ReplicationService::new(
-        state.db.clone(),
-        state.task_supervisor.clone(),
-    )));
+    let remote_node = format!("{}-worker", state.operational().config.node_name);
+    state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
+        Arc::new(crate::replication::ReplicationService::new(
+            state.resource_mutation().db.clone(),
+            state.operational().task_supervisor.clone(),
+        )),
+    ));
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -361,12 +364,15 @@ async fn test_remote_websocket_exec_accepts_upgrade_instead_of_bad_request() {
     use tower::ServiceExt;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let remote_node = format!("{}-worker", state.config.node_name);
-    state.replication = Some(Arc::new(crate::replication::ReplicationService::new(
-        state.db.clone(),
-        state.task_supervisor.clone(),
-    )));
+    let remote_node = format!("{}-worker", state.operational().config.node_name);
+    state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
+        Arc::new(crate::replication::ReplicationService::new(
+            state.resource_mutation().db.clone(),
+            state.operational().task_supervisor.clone(),
+        )),
+    ));
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -427,12 +433,15 @@ async fn test_remote_websocket_attach_accepts_upgrade_instead_of_not_implemented
     use tower::ServiceExt;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let remote_node = format!("{}-worker", state.config.node_name);
-    state.replication = Some(Arc::new(crate::replication::ReplicationService::new(
-        state.db.clone(),
-        state.task_supervisor.clone(),
-    )));
+    let remote_node = format!("{}-worker", state.operational().config.node_name);
+    state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
+        Arc::new(crate::replication::ReplicationService::new(
+            state.resource_mutation().db.clone(),
+            state.operational().task_supervisor.clone(),
+        )),
+    ));
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -493,12 +502,15 @@ async fn test_remote_pod_log_websocket_accepts_upgrade_before_proxying() {
     use tower::ServiceExt;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let remote_node = format!("{}-worker", state.config.node_name);
-    state.replication = Some(Arc::new(crate::replication::ReplicationService::new(
-        state.db.clone(),
-        state.task_supervisor.clone(),
-    )));
+    let remote_node = format!("{}-worker", state.operational().config.node_name);
+    state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
+        Arc::new(crate::replication::ReplicationService::new(
+            state.resource_mutation().db.clone(),
+            state.operational().task_supervisor.clone(),
+        )),
+    ));
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -553,10 +565,10 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
     use tower::ServiceExt;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let remote_node = format!("{}-worker", state.config.node_name);
+    let remote_node = format!("{}-worker", state.operational().config.node_name);
     let replication = Arc::new(crate::replication::ReplicationService::new(
-        state.db.clone(),
-        state.task_supervisor.clone(),
+        state.resource_mutation().db.clone(),
+        state.operational().task_supervisor.clone(),
     ));
     let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
         remote_node.clone(),
@@ -568,8 +580,11 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
     )
     .unwrap();
     let (mut follower_rx, follower_session) = replication.register_follower(metadata).await;
-    state.replication = Some(replication.clone());
+    state.operational_mut().replication = Some(crate::api::ApiRemoteNodeServices::from_test(
+        replication.clone(),
+    ));
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -1409,6 +1424,7 @@ async fn test_pod_log_route_empty_container_spec_returns_bad_request() {
 
     let state = crate::api::test_support::build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -1447,13 +1463,14 @@ async fn follower_raft_proxy_does_not_fallback_local_for_pod_logs_without_leader
     use tower::ServiceExt;
 
     let mut state = crate::api::test_support::build_test_app_state().await;
-    let remote_node = format!("{}-worker", state.config.node_name);
+    let remote_node = format!("{}-worker", state.operational().config.node_name);
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-    state.is_raft_leader_rx = Some(std::sync::Arc::new(
+    state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -1507,6 +1524,7 @@ async fn test_pod_log_route_success_returns_text_plain_body() {
 
     let state = crate::api::test_support::build_test_app_state().await;
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -1528,7 +1546,7 @@ async fn test_pod_log_route_success_returns_text_plain_body() {
         .unwrap();
 
     let log_dir = crate::paths::pod_log_dir_path(
-        &state.config.containerd_namespace,
+        &state.operational().config.containerd_namespace,
         "default",
         "log-success",
         "log-success-uid",
@@ -3708,7 +3726,7 @@ async fn service_delete_denied_leaves_service_endpoints_allocations_and_hooks() 
     let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
         std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     // Create a Service and matching Endpoints directly
     let svc = json!({
@@ -3846,7 +3864,7 @@ async fn pod_create_denied_does_not_persist() {
     let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
         std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
     let state = crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     let body = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"denied-pod","namespace":"default"}});
@@ -3994,6 +4012,7 @@ async fn service_proxy_fails_over_to_reachable_endpoint() {
 
     let state = std::sync::Arc::new(crate::api::test_support::build_test_app_state().await);
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -4010,6 +4029,7 @@ async fn service_proxy_fails_over_to_reachable_endpoint() {
         .unwrap();
     // Two subsets (so each carries its own port): dead first, live second.
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -4070,6 +4090,7 @@ async fn service_proxy_allows_slow_valid_upstream_header_response() {
 
     let state = std::sync::Arc::new(crate::api::test_support::build_test_app_state().await);
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -4085,6 +4106,7 @@ async fn service_proxy_allows_slow_valid_upstream_header_response() {
         .await
         .unwrap();
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",

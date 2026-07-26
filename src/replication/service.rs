@@ -47,6 +47,50 @@ const NODE_METRICS_TIMEOUT: Duration = Duration::from_secs(15);
 const NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
 const POD_LOG_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
 
+pub(crate) trait FollowerDataplane {
+    fn into_follower_dataplane(
+        self,
+    ) -> std::result::Result<NetworkDataplane, klights_leader_api::NetworkTopologyError>;
+}
+
+impl FollowerDataplane for NetworkDataplane {
+    fn into_follower_dataplane(
+        self,
+    ) -> std::result::Result<NetworkDataplane, klights_leader_api::NetworkTopologyError> {
+        Ok(self)
+    }
+}
+
+#[cfg(test)]
+impl FollowerDataplane for crate::networking::wireguard::DataplanePeerMetadata {
+    fn into_follower_dataplane(
+        self,
+    ) -> std::result::Result<NetworkDataplane, klights_leader_api::NetworkTopologyError> {
+        NetworkDataplane::try_new(
+            self.node_name,
+            match self.mode {
+                crate::networking::wireguard::DataplaneMode::Root => {
+                    klights_leader_api::NetworkNodeMode::Root
+                }
+                crate::networking::wireguard::DataplaneMode::Rootless => {
+                    klights_leader_api::NetworkNodeMode::Rootless
+                }
+            },
+            match self.encryption {
+                crate::networking::wireguard::DataplaneEncryption::Enabled => {
+                    klights_leader_api::DataplaneEncryption::WireGuard
+                }
+                crate::networking::wireguard::DataplaneEncryption::Disabled => {
+                    klights_leader_api::DataplaneEncryption::Direct
+                }
+            },
+            self.public_key.as_ref().map(|key| key.as_str()),
+            self.endpoint,
+            self.port,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NodeOperationKind {
     ExecSync,
@@ -122,6 +166,30 @@ pub struct FollowerStatus {
     pub mode: String,
     pub encryption: String,
     pub public_key: Option<String>,
+}
+
+impl klights_leader_api::LeaderFollowerDiagnostics for ReplicationService {
+    fn follower_diagnostics(&self) -> klights_leader_api::FollowerDiagnosticsFuture<'_> {
+        Box::pin(async move {
+            let metrics = self.follower_metrics().await;
+            klights_leader_api::FollowerDiagnostics {
+                follower_count: metrics.follower_count,
+                max_lag: metrics.max_lag,
+                followers: metrics
+                    .followers
+                    .into_iter()
+                    .map(|follower| klights_leader_api::FollowerDiagnostic {
+                        node_name: follower.node_name,
+                        applied_resource_version: follower.applied_rv,
+                        lag: follower.lag,
+                        mode: follower.mode,
+                        encryption: follower.encryption,
+                        public_key: follower.public_key,
+                    })
+                    .collect(),
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -575,7 +643,7 @@ impl ReplicationService {
                     leader_epoch: 0,
                     current_rv: 0,
                     current_log_index: 0,
-                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
                 }
             }
         }
@@ -671,10 +739,10 @@ impl ReplicationService {
         metadata: M,
     ) -> (mpsc::Receiver<FollowerControlMessage>, u64)
     where
-        M: crate::control_plane::client::IntoFocusedDataplane,
+        M: FollowerDataplane,
     {
         let metadata = metadata
-            .into_focused_dataplane()
+            .into_follower_dataplane()
             .expect("validated follower dataplane metadata converts losslessly");
         let node_name = metadata.node_name().to_string();
         let session_id = self.next_follower_session.fetch_add(1, Ordering::Relaxed);

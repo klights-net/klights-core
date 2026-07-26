@@ -1,9 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
-use klights_cluster_core::{
-    PositionedWatchEvent, Resource, ResourceVersionAssignment, WatchReplayPosition,
-};
+use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_cluster_store::{
     AllocatorStateFuture, DurableAllocatorRead, DurableAllocatorState, DurableWatchEvent,
     DurableWatchHistoryRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
@@ -221,11 +219,7 @@ async fn selector_baseline_is_positioned_and_leave_reuses_the_cached_matching_ob
             position: leave_position,
         }),
         Arc::new(FixedAllocator(
-            DurableAllocatorState::try_new(
-                ResourceVersionAssignment::CommittedApplyV1,
-                baseline_position,
-            )
-            .expect("allocator state"),
+            DurableAllocatorState::try_new(baseline_position).expect("allocator state"),
         )),
         Arc::new(WatchSignalHub::new(1)),
         Arc::new(NamespacedScopes),
@@ -282,11 +276,7 @@ async fn selector_baseline_requires_the_exact_complete_unique_matching_snapshot(
                 position: requested,
             }),
             Arc::new(FixedAllocator(
-                DurableAllocatorState::try_new(
-                    ResourceVersionAssignment::CommittedApplyV1,
-                    requested,
-                )
-                .unwrap(),
+                DurableAllocatorState::try_new(requested).unwrap(),
             )),
             Arc::new(WatchSignalHub::new(1)),
             Arc::new(NamespacedScopes),

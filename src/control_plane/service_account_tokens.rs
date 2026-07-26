@@ -1,9 +1,9 @@
-use crate::control_plane::client::{
+use crate::datastore::{Resource, backend::DatastoreBackend};
+use crate::kubelet::pod_repository::store::PodStore;
+use klights_leader_api::{
     ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
     ProjectedServiceAccountTokenRequest,
 };
-use crate::datastore::{Resource, backend::DatastoreBackend};
-use crate::kubelet::pod_repository::store::PodStore;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AuthorizedProjectedServiceAccountTokenClaims {
@@ -48,9 +48,9 @@ pub(crate) async fn authorize_projected_service_account_token(
         service_account_name: request.service_account_name().to_string(),
         namespace: request.namespace().to_string(),
         audiences: request.audiences().to_vec(),
-        expiration_seconds: crate::auth::normalize_service_account_token_expiration_seconds(Some(
-            request.expiration_seconds(),
-        )),
+        expiration_seconds: klights_types::normalize_service_account_token_expiration_seconds(
+            Some(request.expiration_seconds()),
+        ),
         service_account_uid: service_account.uid,
         bound_pod_name,
         bound_pod_uid,

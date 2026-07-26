@@ -12,8 +12,7 @@ use crate::replication::protocol::{
     ForwardedNodeSubnet, ForwardedPodSlotAdmission, ForwardedResource, ReplicationEntry,
 };
 use klights_cluster_core::{
-    COMMAND_CODEC_VERSION, CommandMeta, Resource, ResourceBatchOperation, StorageCommand,
-    StorageResponse,
+    COMMAND_CODEC_VERSION, CommandMeta, Resource, StorageCommand, StorageResponse,
 };
 
 /// Outcome of applying a forwarded command on this replica.
@@ -95,129 +94,6 @@ pub(super) fn storage_response_for_apply(
     }
 }
 
-/// Subject key used for outbox dedup: a stable identifier for the
-/// targeted resource (or a variant name for non-resource commands).
-/// Resource keys include the UID when known so that recreate-after-delete
-/// of the same name is treated as a different subject.
-pub(super) fn subject_key_for_command(command: &StorageCommand) -> String {
-    match command {
-        StorageCommand::CreateResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-        }
-        | StorageCommand::UpdateResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            ..
-        } => resource_subject_key(api_version, kind, namespace.as_deref(), name, data),
-        StorageCommand::UpdateStatus {
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-            ..
-        }
-        | StorageCommand::DeleteResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-        }
-        | StorageCommand::PatchResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-            ..
-        } => resource_key_parts(
-            api_version,
-            kind,
-            namespace.as_deref(),
-            name,
-            preconditions.uid.as_deref(),
-        ),
-        StorageCommand::CreateNamespace { name, data }
-        | StorageCommand::UpdateNamespace { name, data, .. } => {
-            resource_subject_key("v1", "Namespace", None, name, data)
-        }
-        StorageCommand::DeleteNamespace { name }
-        | StorageCommand::DeleteNamespaceContents { name } => {
-            resource_key_parts("v1", "Namespace", None, name, None)
-        }
-        StorageCommand::FinalizeBoundPod {
-            namespace,
-            name,
-            pod_uid,
-            ..
-        } => resource_key_parts("v1", "Pod", Some(namespace), name, Some(pod_uid)),
-        StorageCommand::ApplyResourceBatch { operations } => match operations.first() {
-            Some(ResourceBatchOperation::Put {
-                api_version,
-                kind,
-                namespace,
-                name,
-                ..
-            })
-            | Some(ResourceBatchOperation::Delete {
-                api_version,
-                kind,
-                namespace,
-                name,
-                ..
-            }) => format!(
-                "batch:{api_version}/{kind}/{}/{}",
-                namespace.as_deref().unwrap_or(""),
-                name
-            ),
-            None => "batch:empty".to_string(),
-        },
-        other => other.variant_name().to_string(),
-    }
-}
-
-fn resource_subject_key(
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-    name: &str,
-    data: &serde_json::Value,
-) -> String {
-    resource_key_parts(
-        api_version,
-        kind,
-        namespace,
-        name,
-        data.pointer("/metadata/uid").and_then(|uid| uid.as_str()),
-    )
-}
-
-fn resource_key_parts(
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-    name: &str,
-    uid: Option<&str>,
-) -> String {
-    let mut key = match namespace {
-        Some(namespace) => format!("{api_version}/{kind}/{namespace}/{name}"),
-        None => format!("{api_version}/{kind}/{name}"),
-    };
-    if let Some(uid) = uid.filter(|uid| !uid.is_empty()) {
-        key.push('/');
-        key.push_str(uid);
-    }
-    key
-}
-
 /// Build a replication entry whose meta is sourced from a freshly-mutated
 /// `Resource` (post-create / post-update / post-status path).
 pub(super) fn entry_for_resource(
@@ -289,6 +165,7 @@ mod tests {
     use crate::replication::protocol::{
         ForwardedNodeSubnet, ForwardedPodSlotAdmission, ForwardedResource,
     };
+    use klights_cluster_core::subject_key_for_command;
     use serde_json::json;
 
     fn meta(rv: i64, uid: Option<&str>) -> CommandMeta {

@@ -47,7 +47,7 @@ pub struct PodNetworkAssignment {
 /// and `PodApiWriter::api_patch_pod`.
 ///
 /// Mirrors the four arms of `crate::api::apply_patch` (see
-/// `src/api/helpers.rs`). Do not collapse to `crate::datastore::PatchKind`,
+/// `src/api/helpers.rs`). Do not collapse to `klights_cluster_core::PatchKind`,
 /// which only knows `Merge` and would regress patch semantics on Pod
 /// `/status`.
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +100,7 @@ pub struct PodApiCreateRequest {
 /// caller (post-normalization, with `resourceVersion` injected).
 #[derive(Debug, Clone)]
 pub struct PodApiCreateResult {
-    pub resource: Option<crate::datastore::Resource>,
+    pub resource: Option<klights_cluster_core::Resource>,
     pub body: Value,
 }
 
@@ -109,7 +109,7 @@ pub struct PodApiCreateResult {
 pub enum PodApiUpdateOutcome {
     /// Persisted update; carries the post-write `Resource` (including new
     /// `resource_version`).
-    Persisted(crate::datastore::Resource),
+    Persisted(klights_cluster_core::Resource),
     /// Dry run — no DB write, returns the would-be body.
     DryRun(Value),
 }
@@ -120,7 +120,7 @@ pub enum PodApiDeleteOutcome {
     /// Graceful delete: `deletionTimestamp` and
     /// `deletionGracePeriodSeconds` were set; a UID-bound deferred cleanup
     /// reminder was enqueued to `PodWorkqueue`.
-    GracefulSet(crate::datastore::Resource),
+    GracefulSet(klights_cluster_core::Resource),
     /// Dry run — no DB write, returns the would-be body.
     DryRun(Value),
 }

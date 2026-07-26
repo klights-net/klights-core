@@ -836,33 +836,35 @@ impl crate::kubelet::pod_runtime::store::PodRuntimeStore for MockPodRuntimeStore
         ));
         Ok(())
     }
-
-    async fn get_sandbox_id_by_name(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-    ) -> anyhow::Result<Option<String>> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("get_sandbox_id_by_name:{}/{}", namespace, pod_name));
-        // Return the first match by namespace/name (for name-only lookup tests)
-        let sb = self.sandboxes.lock().unwrap();
-        for ((ns, name, _uid), sid) in sb.iter() {
-            if ns == namespace && name == pod_name {
-                return Ok(Some(sid.clone()));
-            }
-        }
-        Ok(None)
-    }
 }
 
 // --- MockPodSlotAdmission ---
 
 pub struct MockPodSlotAdmission {
     calls: Mutex<Vec<String>>,
-    slot_tx: tokio::sync::broadcast::Sender<crate::datastore::PodSlotAdmissionEvent>,
+    slot_tx: tokio::sync::broadcast::Sender<klights_node_store::PodSlotAdmissionEvent>,
     admitted: Mutex<bool>,
+}
+
+struct MockPodSlotSubscription {
+    receiver: tokio::sync::broadcast::Receiver<klights_node_store::PodSlotAdmissionEvent>,
+}
+
+impl klights_node_store::PodSlotEventSubscription for MockPodSlotSubscription {
+    fn next_event(
+        &mut self,
+    ) -> klights_node_store::RuntimeWorkFuture<'_, Option<klights_node_store::PodSlotAdmissionEvent>>
+    {
+        Box::pin(async move {
+            match self.receiver.recv().await {
+                Ok(event) => Ok(Some(event)),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => Ok(None),
+                Err(error) => Err(klights_node_store::RuntimeWorkError::retryable(
+                    error.to_string(),
+                )),
+            }
+        })
+    }
 }
 
 impl Default for MockPodSlotAdmission {
@@ -896,31 +898,31 @@ impl MockPodSlotAdmission {
 
 #[async_trait::async_trait]
 impl crate::kubelet::pod_runtime::store::PodSlotAdmission for MockPodSlotAdmission {
-    fn subscribe(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::datastore::PodSlotAdmissionEvent> {
-        self.slot_tx.subscribe()
+    fn subscribe(&self) -> Box<dyn klights_node_store::PodSlotEventSubscription> {
+        Box::new(MockPodSlotSubscription {
+            receiver: self.slot_tx.subscribe(),
+        })
     }
 
     async fn try_admit(
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
         node_name: &str,
-    ) -> anyhow::Result<crate::datastore::PodSlotAdmissionResult> {
+    ) -> anyhow::Result<klights_node_store::PodSlotAdmissionResult> {
         self.calls.lock().unwrap().push(format!(
             "try_admit:{}/{}/{}@{}",
             key.namespace, key.name, key.uid, node_name
         ));
         if *self.admitted.lock().unwrap() {
-            Ok(crate::datastore::PodSlotAdmissionResult::Admitted {
-                resource_version: 1,
+            Ok(klights_node_store::PodSlotAdmissionResult::Admitted {
+                observed_pod_version: klights_node_store::ObservedPodVersion::try_new(1)?,
             })
         } else {
-            Ok(crate::datastore::PodSlotAdmissionResult::Blocked {
+            Ok(klights_node_store::PodSlotAdmissionResult::Blocked {
                 blocking_uid: "blocker-uid".into(),
                 blocking_node: "blocker-node".into(),
-                state: crate::datastore::PodSlotAdmissionState::Terminating,
-                resource_version: 1,
+                state: klights_node_store::PodSlotAdmissionState::Terminating,
+                observed_pod_version: klights_node_store::ObservedPodVersion::try_new(1)?,
             })
         }
     }
@@ -2199,6 +2201,12 @@ impl PodRuntimeHarness {
             node_name: "test-node".into(),
             service_cidr: "10.43.128.0/17".into(),
             containerd_namespace: "klights-test".into(),
+            sandbox_inputs: crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs::default(),
+            node_capacity: crate::kubelet::node::NodeCapacity::default(),
+            paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                std::path::PathBuf::from("/tmp/klights-runtime-test"),
+            )
+            .unwrap(),
         })
         .await
     }

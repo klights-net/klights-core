@@ -23,6 +23,8 @@ pub struct NetworkPhase {
     pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
     pub dataplane_health: networking::dataplane_health::DataplaneHealth,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
 }
 
@@ -33,8 +35,8 @@ pub struct NetworkBootArgs<'a> {
     pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
     pub network_cleanup: &'a NetworkCleanup,
-    pub containerd_data_dir: &'a str,
-    pub containerd_state_dir: &'a str,
+    pub runtime_paths: &'a crate::kubelet::runtime_paths::KubeletRuntimePaths,
+    pub runtime_inputs: crate::bootstrap::runtime_inputs::NetworkRuntimeInputs,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy:
         crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -57,8 +59,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         cluster_api,
         node_local,
         network_cleanup,
-        containerd_data_dir,
-        containerd_state_dir,
+        runtime_paths,
+        runtime_inputs,
         supervisor,
         grpc_transport_policy,
         shutdown_token,
@@ -130,9 +132,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     }
 
     let local_pod_subnet = network_boot.local_pod_subnet().to_string();
-    let cluster_cidr = networking::ClusterCidr::parse(&config.cluster_cidr)
+    let cluster_cidr = klights_types::ClusterCidr::parse(&config.cluster_cidr)
         .map_err(|e| anyhow::anyhow!("bad cluster_cidr '{}': {}", config.cluster_cidr, e))?;
-    let service_cidr = networking::ClusterCidr::parse(&config.service_cidr)
+    let service_cidr = klights_types::ClusterCidr::parse(&config.service_cidr)
         .map_err(|e| anyhow::anyhow!("bad service_cidr '{}': {}", config.service_cidr, e))?;
 
     let endpoint_adapter = Arc::new(networking::SqlitePodEndpointResolver::new(
@@ -218,6 +220,11 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     tracing::info!("CNI RPC server started");
 
     // Containerd
+    let cri_transport_policy = klights_node_api::CriTransportPolicy::new(
+        grpc_transport_policy.connect_timeout,
+        grpc_transport_policy.max_message_bytes,
+    );
+    let executable_path = std::env::current_exe().context("resolve klights executable path")?;
     let containerd_manager = if let Some(ref sock) = config.containerd_socket {
         tracing::info!("Using external containerd at {}", sock);
         None
@@ -229,11 +236,12 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
                 bridge_name: &config.bridge_name,
                 pod_subnet: &local_pod_subnet,
                 pod_link_mtu: networking::pod_link_mtu_for_encryption(config.dataplane_encryption),
-                data_dir: containerd_data_dir,
-                state_dir: containerd_state_dir,
                 rootless: is_rootless,
+                executable_path: &executable_path,
+                image_pull_response_timeout: runtime_inputs.image_pull_response_timeout,
+                paths: runtime_paths,
                 task_supervisor: supervisor.clone(),
-                grpc_transport_policy: grpc_transport_policy.clone(),
+                cri_transport_policy,
             },
         )
         .await
@@ -253,7 +261,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let cri_for_pod_watcher = match crate::kubelet::CriClient::connect_with_policy(
         socket,
         &config.containerd_namespace,
-        grpc_transport_policy.as_ref(),
+        &cri_transport_policy,
+        runtime_inputs.image_pull_response_timeout,
     )
     .await
     {
@@ -266,7 +275,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let cri_for_api = match crate::kubelet::CriClient::connect_with_policy(
         socket,
         &config.containerd_namespace,
-        grpc_transport_policy.as_ref(),
+        &cri_transport_policy,
+        runtime_inputs.image_pull_response_timeout,
     )
     .await
     {
@@ -294,7 +304,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         cri_for_api,
         cni_readiness,
         dataplane_health: network_boot.health().clone(),
-        pod_network_cache: node_network,
+        pod_network_cache: node_network.clone(),
+        pod_runtime_store: node_network.clone(),
+        pod_endpoint_store: node_network,
         assignment_waiter,
     })
 }

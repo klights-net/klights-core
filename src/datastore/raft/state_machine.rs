@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use klights_cluster_core::{
+    OutboxApplyError, OutboxApplyOutcome, OutboxOperation, StorageCommand,
+    classify_apply_error_for_command, pod_target,
+};
+use klights_cluster_store::{
+    PodUidPreconditionRead as _, PodUidPreconditionRequest, PodUidPreconditionState,
+};
 use tokio::sync::RwLock;
 
-use crate::datastore::DatastoreBackend;
-use crate::datastore::command::StorageCommand;
-use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+use super::super::DatastoreBackend;
 use crate::replication::protocol::ForwardedResource;
+use crate::storage_wire_codec::decode_outbox_payload_protobuf;
 
 #[derive(Clone)]
 pub struct N1Raft {
@@ -94,20 +99,20 @@ pub async fn propose_outbox_on_backend_with_watermark(
     authoring_node: &str,
     watermark: Option<crate::log_apply::OutboxStreamWatermark>,
 ) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
-    let decoded = OutboxPayload::decode_protobuf(&payload)
+    let decoded = decode_outbox_payload_protobuf(&payload)
         .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
     if operation == OutboxOperation::LeaseRenew {
         crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
             .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
         return Ok(RaftOutboxApply {
-            result: OutboxApplyResult::Applied { applied_rv: 0 },
+            result: OutboxApplyOutcome::Applied { applied_rv: 0 },
             resource: None,
             command: None,
-            pod_endpoint_effect: crate::datastore::PodEndpointEffect::NotApplicable,
+            pod_endpoint_effect: super::super::PodEndpointEffect::NotApplicable,
         });
     }
     if watermark.is_none() {
-        crate::control_plane::client::apply::reject_pod_uid_mismatch(db, &decoded.command).await?;
+        reject_pod_uid_mismatch(db, &decoded.command).await?;
     }
 
     let watermark_present = watermark.is_some();
@@ -142,10 +147,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
         Err(err) => {
             let classified = match err {
                 OutboxApplyError::Retryable(_) => {
-                    crate::control_plane::client::apply::classify_apply_error_for_command(
-                        &decoded.command,
-                        err,
-                    )
+                    classify_apply_error_for_command(&decoded.command, err)
                 }
                 other => other,
             };
@@ -158,7 +160,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
             return Err(classified);
         }
     };
-    let resource_changed = resource_effect == crate::datastore::ResourceMutationEffect::Changed;
+    let resource_changed = resource_effect == super::super::ResourceMutationEffect::Changed;
 
     // T1: All apply results are now propagated (errors surface,
     // AlreadyApplied returns the stored resource). The log_apply
@@ -196,7 +198,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
         resource.as_ref(),
         resource_changed,
     );
-    let newly_applied = matches!(result, OutboxApplyResult::Applied { .. });
+    let newly_applied = matches!(result, OutboxApplyOutcome::Applied { .. });
     let replayable_actor_cascade = durable_actor_finalization && resource.is_some();
     let suppress_side_effect = (!newly_applied && !replayable_actor_cascade)
         || (watermark_present && uid_bound_pod_target && resource.is_none())
@@ -236,6 +238,33 @@ pub async fn propose_outbox_on_backend_with_watermark(
         command,
         pod_endpoint_effect,
     })
+}
+
+async fn reject_pod_uid_mismatch(
+    db: &dyn DatastoreBackend,
+    command: &StorageCommand,
+) -> std::result::Result<(), OutboxApplyError> {
+    let Some((namespace, name, preconditions)) = pod_target(command) else {
+        return Ok(());
+    };
+    let Some(expected_uid) = preconditions.uid.as_deref().filter(|uid| !uid.is_empty()) else {
+        return Ok(());
+    };
+    let request = PodUidPreconditionRequest::new(namespace, name, expected_uid);
+    match db
+        .read_pod_uid_precondition(request)
+        .await
+        .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?
+    {
+        PodUidPreconditionState::Matches => Ok(()),
+        PodUidPreconditionState::Missing => Err(OutboxApplyError::NotFound(format!(
+            "Pod {namespace}/{name} not found"
+        ))),
+        PodUidPreconditionState::Mismatch { actual_uid } => Err(OutboxApplyError::UidMismatch {
+            expected: expected_uid.to_string(),
+            actual: actual_uid,
+        }),
+    }
 }
 
 fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
@@ -295,17 +324,17 @@ fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
 }
 
 pub struct RaftOutboxApply {
-    pub(crate) result: OutboxApplyResult,
+    pub(crate) result: OutboxApplyOutcome,
     pub(crate) resource: Option<ForwardedResource>,
     pub(crate) command: Option<StorageCommand>,
-    pub(crate) pod_endpoint_effect: crate::datastore::PodEndpointEffect,
+    pub(crate) pod_endpoint_effect: super::super::PodEndpointEffect,
 }
 
 impl RaftOutboxApply {
     pub fn applied_resource_version(&self) -> Option<i64> {
         match &self.result {
-            OutboxApplyResult::Applied { applied_rv } => Some(*applied_rv),
-            OutboxApplyResult::AlreadyApplied { applied_rv } => *applied_rv,
+            OutboxApplyOutcome::Applied { applied_rv } => Some(*applied_rv),
+            OutboxApplyOutcome::AlreadyApplied { applied_rv } => *applied_rv,
         }
     }
 }
@@ -442,6 +471,7 @@ mod tests {
 
     use super::*;
     use crate::datastore::ResourcePreconditions;
+    use crate::node_outbox::payload::OutboxPayload;
 
     fn outbox_payload(command: StorageCommand) -> Bytes {
         Bytes::from(
@@ -629,7 +659,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             duplicate.result,
-            OutboxApplyResult::AlreadyApplied { .. }
+            OutboxApplyOutcome::AlreadyApplied { .. }
         ));
         assert!(
             matches!(
@@ -883,13 +913,6 @@ mod tests {
     #[tokio::test]
     async fn stamped_stale_equal_pod_status_ledger_only_has_no_side_effect() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::datastore::DatastoreBackend::set_klights_meta(
-            &db,
-            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
-        )
-        .await
-        .unwrap();
         db.create_resource(
             "v1",
             "Pod",
@@ -959,7 +982,7 @@ mod tests {
             .await
             .expect("same idempotency key replays its durable result");
         assert!(
-            matches!(duplicate.result, OutboxApplyResult::AlreadyApplied { .. }),
+            matches!(duplicate.result, OutboxApplyOutcome::AlreadyApplied { .. }),
             "same idempotency key must be reported as AlreadyApplied"
         );
         assert!(
@@ -1131,7 +1154,7 @@ mod tests {
         .await
         .expect("stale duplicate PodMetadata must consume its stream watermark");
 
-        assert!(matches!(first.result, OutboxApplyResult::Applied { .. }));
+        assert!(matches!(first.result, OutboxApplyOutcome::Applied { .. }));
         let live = db
             .get_resource("v1", "Pod", Some("default"), "adopted-pod")
             .await
@@ -1360,7 +1383,7 @@ mod tests {
         .await
         .expect("terminal duplicate Event must still consume the stream watermark");
 
-        assert!(matches!(first.result, OutboxApplyResult::Applied { .. }));
+        assert!(matches!(first.result, OutboxApplyOutcome::Applied { .. }));
         assert_eq!(
             db.list_outbox_stream_watermarks().await.unwrap(),
             vec![first_watermark]
@@ -1458,7 +1481,7 @@ mod tests {
         .await
         .expect("duplicate NodeRegistration must still consume the stream watermark");
 
-        assert!(matches!(first.result, OutboxApplyResult::Applied { .. }));
+        assert!(matches!(first.result, OutboxApplyOutcome::Applied { .. }));
         assert_eq!(
             db.list_outbox_stream_watermarks().await.unwrap(),
             vec![first_watermark]

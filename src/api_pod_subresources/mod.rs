@@ -1,6 +1,5 @@
 use axum::{
     Json,
-    extract::ws::{Message, WebSocket},
     extract::{Path, Query, RawQuery, Request, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -23,6 +22,7 @@ mod eviction;
 mod exec;
 pub mod exec_spdy;
 mod exec_ws;
+pub(crate) mod local_node_log_runtime;
 pub mod logs;
 mod node_proxy;
 mod portforward;

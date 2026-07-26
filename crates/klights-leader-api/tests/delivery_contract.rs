@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, OutboxOperation};
 use klights_leader_api::{
     LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryOperation,
     OutboxDeliveryRequest, OutboxDeliveryResult,
@@ -17,6 +18,46 @@ impl LeaderOutboxDelivery for ObjectSafeDelivery {
 }
 
 fn assert_object_safe(_: &dyn LeaderOutboxDelivery) {}
+
+#[test]
+fn durable_delivery_maps_the_neutral_outbox_contract_at_the_boundary() {
+    for operation in OutboxOperation::ALL {
+        if operation == OutboxOperation::LeaseRenew {
+            assert!(matches!(
+                OutboxDeliveryOperation::try_from(operation),
+                Err(OutboxDeliveryError::InvalidRequest { .. })
+            ));
+            continue;
+        }
+
+        let delivery = OutboxDeliveryOperation::try_from(operation)
+            .expect("durable neutral operation has a leader delivery representation");
+        assert_eq!(OutboxOperation::from(delivery), operation);
+    }
+
+    assert_eq!(
+        OutboxDeliveryResult::from(OutboxApplyOutcome::Applied { applied_rv: 17 }),
+        OutboxDeliveryResult::Applied { applied_rv: 17 }
+    );
+    assert_eq!(
+        OutboxDeliveryResult::from(OutboxApplyOutcome::AlreadyApplied {
+            applied_rv: Some(19),
+        }),
+        OutboxDeliveryResult::AlreadyApplied {
+            applied_rv: Some(19),
+        }
+    );
+    assert_eq!(
+        OutboxDeliveryError::from(OutboxApplyError::UidMismatch {
+            expected: "old".to_string(),
+            actual: "new".to_string(),
+        }),
+        OutboxDeliveryError::UidMismatch {
+            expected: "old".to_string(),
+            actual: "new".to_string(),
+        }
+    );
+}
 
 #[test]
 fn delivery_port_is_object_safe_and_values_are_send_sync() {

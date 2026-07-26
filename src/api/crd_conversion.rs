@@ -1,7 +1,7 @@
 use crate::api::AppError;
 use crate::api::apiservice_proxy::resolve_service_proxy_target;
-use crate::datastore::{DatastoreBackend, Resource};
 use crate::watch::{EventType, WatchEvent};
+use klights_cluster_core::Resource;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,19 +61,19 @@ pub struct CrdConversionConfig {
 }
 
 pub async fn load_crd_conversion_config(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     group: &str,
     plural: &str,
 ) -> Result<Option<CrdConversionConfig>, AppError> {
     let crd_name = format!("{plural}.{group}");
-    let Some(crd) = db
-        .get_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &crd_name,
-        )
-        .await?
+    let Some(crd) = crate::api::resource_query_ports::get_resource(
+        query,
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &crd_name,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -141,7 +141,7 @@ pub async fn load_crd_conversion_config(
 }
 
 pub async fn convert_crd_objects_to_requested_version(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: &CrdConversionConfig,
     group: &str,
     plural: &str,
@@ -237,7 +237,7 @@ pub async fn convert_crd_objects_to_requested_version(
                 .and_then(|v| u16::try_from(v).ok())
                 .unwrap_or(443);
             let service_target =
-                resolve_service_proxy_target(db, service_namespace, service_name, desired_port)
+                resolve_service_proxy_target(query, service_namespace, service_name, desired_port)
                     .await?;
             let path = service
                 .get("path")
@@ -370,7 +370,7 @@ fn stamp_crd_objects_api_version(objects: Vec<Value>, desired_api_version: &str)
 }
 
 pub async fn gather_custom_resources_across_served_versions(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: &CrdConversionConfig,
     group: &str,
     kind: &str,
@@ -397,25 +397,23 @@ pub async fn gather_custom_resources_across_served_versions(
 
     for served_version in &version_order {
         let api_version = format!("{group}/{served_version}");
-        let list = db
-            .list_resources(
-                &api_version,
-                kind,
-                namespace.clone().as_deref(),
-                crate::datastore::ResourceListQuery::new(
-                    label_selector.clone().as_deref(),
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            .await?;
+        let list = crate::api::resource_query_ports::list_resources(
+            query,
+            &api_version,
+            kind,
+            namespace.as_deref(),
+            label_selector.as_deref(),
+            None,
+            None,
+            None,
+        )
+        .await?;
         safe_snapshot_rv = Some(
             safe_snapshot_rv
-                .map(|rv| rv.min(list.resource_version))
-                .unwrap_or(list.resource_version),
+                .map(|rv| rv.min(list.resource_version()))
+                .unwrap_or(list.resource_version()),
         );
-        for item in list.items {
+        for item in list.into_items() {
             let key = (item.namespace.clone(), item.name.clone());
             match merged.get(&key) {
                 Some(existing) if existing.resource_version >= item.resource_version => {}
@@ -440,7 +438,7 @@ pub async fn gather_custom_resources_across_served_versions(
 }
 
 pub async fn convert_custom_resource_watch_event_to_requested_version(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
     conversion: Option<&CrdConversionConfig>,
     group: &str,
     plural: &str,
@@ -466,7 +464,7 @@ pub async fn convert_custom_resource_watch_event_to_requested_version(
     ))
     .unwrap_or_else(|arc| (*arc).clone());
     let mut converted = convert_crd_objects_to_requested_version(
-        db,
+        query,
         conversion,
         group,
         plural,
@@ -484,7 +482,38 @@ pub async fn convert_custom_resource_watch_event_to_requested_version(
 mod tests {
     use super::*;
     use crate::datastore::sqlite::Datastore;
+    use klights_leader_api::{
+        LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+        ResourceQueryError, ResourceQueryFuture,
+    };
     use serde_json::json;
+
+    struct FailingConversionQuery;
+
+    impl LeaderResourceQuery for FailingConversionQuery {
+        fn get_resource(
+            &self,
+            _request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<Resource>> {
+            Box::pin(async { Err(ResourceQueryError::retryable("leader query unavailable")) })
+        }
+
+        fn list_resources(
+            &self,
+            _request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            Box::pin(async { Err(ResourceQueryError::retryable("leader query unavailable")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn conversion_config_maps_retryable_query_error_to_service_unavailable() {
+        let error = load_crd_conversion_config(&FailingConversionQuery, "example.com", "widgets")
+            .await
+            .expect_err("retryable leader query failure must reach the API caller");
+
+        assert!(matches!(error, AppError::ServiceUnavailable(_)));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conversion_merged_list_rv_does_not_skip_storage_create_between_version_reads() {
@@ -507,10 +536,12 @@ mod tests {
             None,
         );
         let list_db = db.clone();
+        let list_query =
+            crate::api::test_support::resource_query_for_test_datastore(list_db.clone());
         let list_conversion = conversion.clone();
         let list_task = tokio::spawn(async move {
             gather_custom_resources_across_served_versions(
-                &list_db,
+                list_query.as_ref(),
                 &list_conversion,
                 "example.com",
                 "Widget",

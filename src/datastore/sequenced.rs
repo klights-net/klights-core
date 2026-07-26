@@ -24,12 +24,14 @@ use async_trait::async_trait;
 #[cfg(test)]
 use klights_cluster_core::CommandMeta;
 use klights_cluster_core::StorageCommand;
-use klights_leader_api::{OutboxDeliveryError, OutboxDeliveryResult};
+use klights_cluster_core::{
+    OutboxApplyError as OutboxDeliveryError, OutboxApplyOutcome as OutboxDeliveryResult,
+};
 use std::sync::Arc;
 
-use crate::datastore::backend::DatastoreBackend;
+use super::backend::DatastoreBackend;
 #[cfg(test)]
-use crate::datastore::types::ReplicatedCreateOptions;
+use super::types::ReplicatedCreateOptions;
 #[cfg(test)]
 use klights_cluster_core::ResourcePatchRequest;
 
@@ -47,7 +49,7 @@ mod backend_impl;
 //
 // The trait is intentionally narrow: a single method that takes a
 // fully-formed StorageCommand and returns once openraft has committed +
-// applied it. Concrete impl lives in `crate::datastore::raft::node`.
+// applied it. Concrete impl lives in `super::raft::node`.
 // ---------------------------------------------------------------------------
 
 /// Immutable, replication-private handle to the cluster's Raft consensus
@@ -62,7 +64,7 @@ pub(crate) trait RaftProposal: Send + Sync {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
+    ) -> Result<super::raft::types::StorageCommandResult>;
 
     /// T6 step 4c: propose an outbox-flavored write through raft.
     /// Same end result as `propose_command` (build LogApplyCommit →
@@ -85,7 +87,7 @@ pub(crate) trait RaftProposal: Send + Sync {
         command: StorageCommand,
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::datastore::CommittedOutboxApply, OutboxDeliveryError> {
+    ) -> std::result::Result<super::CommittedOutboxApply, OutboxDeliveryError> {
         let result = self
             .propose_outbox_command(
                 idempotency_key,
@@ -96,14 +98,14 @@ pub(crate) trait RaftProposal: Send + Sync {
             )
             .await?;
         let resource_effect = if matches!(result, OutboxDeliveryResult::Applied { .. }) {
-            crate::datastore::ResourceMutationEffect::Changed
+            super::ResourceMutationEffect::Changed
         } else {
-            crate::datastore::ResourceMutationEffect::Unchanged
+            super::ResourceMutationEffect::Unchanged
         };
-        Ok(crate::datastore::CommittedOutboxApply::new(
+        Ok(super::CommittedOutboxApply::new(
             result,
             resource_effect,
-            crate::datastore::PodEndpointEffect::NotApplicable,
+            super::PodEndpointEffect::NotApplicable,
         ))
     }
 }
@@ -155,7 +157,7 @@ impl SequencedDatastore {
     async fn propose_command(
         &self,
         command: StorageCommand,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<super::raft::types::StorageCommandResult> {
         self.proposal.propose_command(command).await
     }
 }
@@ -310,7 +312,7 @@ where
             // apply, and Pod/Node stay typed-merged regardless of freshness.
             let mut clear_stale_resource_version = false;
             if let Some(current) = current.as_ref() {
-                let freshness = crate::datastore::status_merge_policy::apply_status_merge(
+                let freshness = super::status_merge_policy::apply_status_merge(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
@@ -323,7 +325,7 @@ where
                 // so only a non-Pod stale rebase clears the resourceVersion
                 // precondition (otherwise the stale write 409s instead of
                 // converging).
-                if freshness == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+                if freshness == super::status_merge_policy::StatusApplyFreshness::Stale
                     && preconditions.uid.as_deref() == Some(current.uid.as_str())
                     && !(api_version == "v1" && kind == "Pod")
                 {
@@ -388,11 +390,11 @@ where
             mode,
             hostport_range,
         } => {
-            let peer_mode = crate::controllers::annotations::parse_node_peer_mode(Some(&mode))
-                .unwrap_or(crate::controllers::annotations::NodePeerMode::Root);
+            let peer_mode = klights_types::parse_node_peer_mode(Some(&mode))
+                .unwrap_or(klights_types::NodePeerMode::Root);
             let hpr = hostport_range
                 .as_deref()
-                .and_then(|value| crate::networking::types::HostPortRange::parse(value).ok());
+                .and_then(|value| klights_types::HostPortRange::parse(value).ok());
             backend
                 .update_node_peer_attributes(&node_name, peer_mode, hpr)
                 .await?;
@@ -405,10 +407,10 @@ where
             endpoint,
             port,
         } => {
-            let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            let metadata = klights_cluster_store::DataplanePeerMetadata::try_new(
                 node_name,
-                crate::networking::wireguard::DataplaneMode::parse(&mode)?,
-                crate::networking::wireguard::DataplaneEncryption::parse(Some(&encryption))?,
+                klights_cluster_store::DataplaneMode::parse(&mode)?,
+                klights_cluster_store::DataplaneEncryption::parse(Some(&encryption))?,
                 public_key,
                 Some(endpoint),
                 port,

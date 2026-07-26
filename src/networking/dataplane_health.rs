@@ -167,6 +167,17 @@ impl DataplaneHealth {
     pub fn status(&self) -> DataplaneHealthStatus {
         self.lock().status()
     }
+
+    /// Capture the transport-neutral readiness value injected into kubelet
+    /// Node publication.
+    pub fn snapshot(&self) -> klights_network_api::DataplaneHealthSnapshot {
+        match self.status() {
+            DataplaneHealthStatus::Healthy => klights_network_api::DataplaneHealthSnapshot::Healthy,
+            DataplaneHealthStatus::Unavailable { reason } => {
+                klights_network_api::DataplaneHealthSnapshot::Unavailable { reason }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

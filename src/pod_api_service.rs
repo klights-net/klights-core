@@ -6,8 +6,9 @@
 //! `DatastoreHandle` for the non-Pod admission/quota/limitrange helpers
 //! that touch other kinds. `Arc<PodDeleteCoordinator>` carries deferred
 //! UID-bound actor wakeup decisions; the API service never calls
-//! `TaskSupervisor::spawn_delay` directly. `Arc<SideEffectRegistry>` and
-//! `Arc<SideEffectMetrics>` are reserved for post-write hooks.
+//! `TaskSupervisor::spawn_delay` directly. A neutral mutation-effects
+//! capability owns post-write hooks; `Arc<SideEffectMetrics>` remains for
+//! focused scheduling and deletion counters.
 //!
 //! Implementations land in Tasks 11 (create), 12 (update/patch), and 13
 //! (delete + delete-collection).
@@ -30,7 +31,7 @@ use crate::api::{
 };
 use crate::api::{AppError, DeleteOptions};
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
-use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
+use crate::side_effects::SideEffectMetrics;
 use klights_pod_api::{
     PodDeleteOptions, PodDeletePreconditions, PodMutationTarget, PodRepositoryError,
 };
@@ -181,8 +182,7 @@ struct PreemptionVictim {
 struct PreemptionApplyContext<'a> {
     store: &'a PodStore,
     delete_coordinator: &'a PodDeleteCoordinator,
-    side_effects: &'a SideEffectRegistry,
-    metrics: &'a SideEffectMetrics,
+    mutation_effects: &'a dyn klights_reconcile_api::ResourceMutationEffectsPort,
     preemptor_namespace: &'a str,
     preemptor_name: &'a str,
 }
@@ -191,11 +191,13 @@ pub struct PodApiService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
     db: DatastoreHandle,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     supervisor: Arc<TaskSupervisor>,
     delete_coordinator: Arc<PodDeleteCoordinator>,
     gc_reconcile: Arc<dyn PodGcReconcileSink>,
     service_reconcile: Arc<dyn PodServiceReconcileSink>,
-    side_effects: Arc<SideEffectRegistry>,
+    mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
     metrics: Arc<SideEffectMetrics>,
     #[cfg(test)]
     scheduler_bind_gate: std::sync::Mutex<Option<Arc<SchedulerBindGateForTest>>>,
@@ -205,11 +207,13 @@ pub struct PodApiServiceDependencies {
     pub(crate) store: Arc<PodStore>,
     pub status_only: Arc<dyn StateOnlyWriter>,
     pub db: DatastoreHandle,
+    pub resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     pub supervisor: Arc<TaskSupervisor>,
     pub delete_coordinator: Arc<PodDeleteCoordinator>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub service_reconcile: Arc<dyn PodServiceReconcileSink>,
-    pub side_effects: Arc<SideEffectRegistry>,
+    pub mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
     pub metrics: Arc<SideEffectMetrics>,
 }
 
@@ -219,22 +223,26 @@ impl PodApiService {
             store,
             status_only,
             db,
+            resource_query,
+            quota_runtime,
             supervisor,
             delete_coordinator,
             gc_reconcile,
             service_reconcile,
-            side_effects,
+            mutation_effects,
             metrics,
         } = dependencies;
         Self {
             store,
             status_only,
             db,
+            resource_query,
+            quota_runtime,
             supervisor,
             delete_coordinator,
             gc_reconcile,
             service_reconcile,
-            side_effects,
+            mutation_effects,
             metrics,
             #[cfg(test)]
             scheduler_bind_gate: std::sync::Mutex::new(None),
@@ -274,8 +282,19 @@ impl PodApiService {
             run_admission,
         } = request;
 
-        crate::api::reject_if_namespace_missing_or_terminating(self.db.as_ref(), &namespace)
-            .await?;
+        match crate::namespace_admission::create_eligibility(self.db.as_ref(), &namespace).await? {
+            crate::namespace_admission::NamespaceCreateEligibility::Allowed => {}
+            crate::namespace_admission::NamespaceCreateEligibility::Missing => {
+                return Err(AppError::Forbidden(format!(
+                    "namespace {namespace} not found"
+                )));
+            }
+            crate::namespace_admission::NamespaceCreateEligibility::Terminating => {
+                return Err(AppError::Forbidden(format!(
+                    "namespace {namespace} is being terminated"
+                )));
+            }
+        }
 
         if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
             return Err(AppError::UnprocessableEntity(msg));
@@ -321,7 +340,8 @@ impl PodApiService {
             });
         }
 
-        check_resource_quota_for_creation(self.db.as_ref(), &namespace, "Pod", &body).await?;
+        check_resource_quota_for_creation(self.quota_runtime.as_ref(), &namespace, "Pod", &body)
+            .await?;
 
         let resource_name = if name.trim().is_empty() {
             resolve_resource_name(&mut body)?
@@ -445,12 +465,12 @@ impl PodApiService {
         }
 
         normalize_resource_for_storage("v1", "Pod", &mut body);
-        enforce_pod_security_admission(self.db.as_ref(), &namespace, &body).await?;
+        enforce_pod_security_admission(self.resource_query.as_ref(), &namespace, &body).await?;
         let resource = self
             .store
             .create(&namespace, &resource_name, body)
             .await
-            .map_err(|e| -> AppError { e.into() })?;
+            .map_err(map_pod_store_error_to_api)?;
         if let Err(e) = self
             .gc_reconcile
             .reconcile_owner_references(resource.clone(), self as &dyn GcPodDeleteSink)
@@ -486,7 +506,7 @@ impl PodApiService {
             .store
             .list(None, None, None, None, None)
             .await
-            .map_err(|e| -> AppError { e.into() })?;
+            .map_err(map_pod_store_error_to_api)?;
         let candidates = sorted_unbound_pods(initial.items);
 
         for wave in candidates.chunks(SCHED_BIND_CONCURRENCY) {
@@ -550,7 +570,7 @@ impl PodApiService {
             .store
             .list(None, None, None, None, None)
             .await
-            .map_err(|e| -> AppError { e.into() })?;
+            .map_err(map_pod_store_error_to_api)?;
         let namespaces = self
             .db
             .list_resources(
@@ -586,7 +606,7 @@ impl PodApiService {
             .store
             .get(namespace, name)
             .await
-            .map_err(|e| -> AppError { e.into() })?
+            .map_err(map_pod_store_error_to_api)?
         else {
             return Ok(None);
         };
@@ -622,7 +642,7 @@ impl PodApiService {
             .store
             .get(namespace, name)
             .await
-            .map_err(|e| -> AppError { e.into() })?
+            .map_err(map_pod_store_error_to_api)?
         else {
             return Ok(None);
         };
@@ -713,12 +733,12 @@ impl PodApiService {
                     current.resource_version,
                 )
                 .await
-                .map_err(|e| -> AppError { e.into() })?
+                .map_err(map_pod_store_error_to_api)?
         } else if spec_changed {
             self.store
                 .update(namespace, name, body, current.resource_version)
                 .await
-                .map_err(|e| -> AppError { e.into() })?
+                .map_err(map_pod_store_error_to_api)?
         } else {
             current
         };
@@ -733,15 +753,14 @@ impl PodApiService {
                     Some(final_resource.resource_version),
                 )
                 .await
-                .map_err(|e| -> AppError { e.into() })?;
+                .map_err(map_pod_store_error_to_api)?;
         }
         self.wait_scheduler_bind_gate_for_test().await;
         apply_preemption_victims(
             PreemptionApplyContext {
                 store: self.store.as_ref(),
                 delete_coordinator: self.delete_coordinator.as_ref(),
-                side_effects: self.side_effects.as_ref(),
-                metrics: self.metrics.as_ref(),
+                mutation_effects: self.mutation_effects.as_ref(),
                 preemptor_namespace: namespace,
                 preemptor_name: name,
             },
@@ -750,9 +769,9 @@ impl PodApiService {
         .await?;
         if status_changed
             && let Some(message) = decision.unschedulable_message.as_deref()
-            && let Err(e) = crate::kubelet::events::emit_control_plane_pod_event(
+            && let Err(e) = crate::pod_events::emit_control_plane_pod_event(
                 self.db.as_ref(),
-                crate::kubelet::events::PodEventRecord {
+                crate::pod_events::PodEventRecord {
                     pod: &final_resource.data,
                     reason: "FailedScheduling",
                     message,
@@ -809,7 +828,7 @@ impl PodApiService {
             .store
             .get(namespace, name)
             .await
-            .map_err(|e| -> AppError { e.into() })?
+            .map_err(map_pod_store_error_to_api)?
             .ok_or_else(|| AppError::NotFound(format!("pods \"{}\" not found", name)))?;
         ensure_resource_preconditions_match(&current, &binding_resource_preconditions(&binding)?)?;
         if current
@@ -854,7 +873,7 @@ impl PodApiService {
         self.store
             .update_including_status_for_scheduler(namespace, name, body, current.resource_version)
             .await
-            .map_err(|e| -> AppError { e.into() })?;
+            .map_err(map_pod_store_error_to_api)?;
         Ok(())
     }
 
@@ -863,7 +882,7 @@ impl PodApiService {
     /// admission, immutability + quota checks, normalization, then
     /// persists via `store.update(...)` with CAS. The handler keeps the
     /// post-update side-effect calls (`maybe_hard_delete_pod_after_finalizers_drained`,
-    /// `reconcile_owner_refs_after_mutation`, `state.side_effects.run_hooks`).
+    /// `reconcile_owner_refs_after_mutation`, `state.controller_reconcile().side_effects.run_hooks`).
     pub async fn api_update_pod(
         &self,
         ns: &str,
@@ -898,12 +917,13 @@ impl PodApiService {
         .await?;
 
         validate_pod_resource_requirements_immutable(&current.data, &body)?;
-        check_resource_quota_for_pod_update(self.db.as_ref(), ns, &current.data, &body).await?;
+        check_resource_quota_for_pod_update(self.quota_runtime.as_ref(), ns, &current.data, &body)
+            .await?;
         validate_builtin_resource_spec("Pod", &body)?;
 
         normalize_resource_for_storage("v1", "Pod", &mut body);
         preserve_status_from_current(&current.data, &mut body);
-        enforce_pod_security_admission(self.db.as_ref(), ns, &body).await?;
+        enforce_pod_security_admission(self.resource_query.as_ref(), ns, &body).await?;
         let requested_resource_version = body
             .pointer("/metadata/resourceVersion")
             .and_then(Value::as_str)
@@ -918,7 +938,7 @@ impl PodApiService {
             .store
             .update(ns, name, body, requested_resource_version)
             .await
-            .map_err(|e| -> AppError { e.into() })?;
+            .map_err(map_pod_store_error_to_api)?;
         if let Err(err) = self
             .service_reconcile
             .enqueue_after_pod_update(current, resource.clone())
@@ -1017,13 +1037,18 @@ impl PodApiService {
             .await?;
 
             validate_pod_resource_requirements_immutable(&current.data, &patched)?;
-            check_resource_quota_for_pod_update(self.db.as_ref(), ns, &current.data, &patched)
-                .await?;
+            check_resource_quota_for_pod_update(
+                self.quota_runtime.as_ref(),
+                ns,
+                &current.data,
+                &patched,
+            )
+            .await?;
             validate_builtin_resource_spec("Pod", &patched)?;
 
             normalize_resource_for_storage("v1", "Pod", &mut patched);
             preserve_status_from_current(&current.data, &mut patched);
-            enforce_pod_security_admission(self.db.as_ref(), ns, &patched).await?;
+            enforce_pod_security_admission(self.resource_query.as_ref(), ns, &patched).await?;
 
             if dry_run {
                 return Ok(PodApiUpdateOutcome::DryRun(patched));
@@ -1553,7 +1578,7 @@ async fn schedule_pod_on_available_nodes(
     let all_pods = store
         .list(None, None, None, None, None)
         .await
-        .map_err(|e| -> AppError { e.into() })?;
+        .map_err(map_pod_store_error_to_api)?;
 
     let mut node_names: Vec<String> = nodes.items.iter().map(|n| n.name.clone()).collect();
     node_names.sort();
@@ -1638,7 +1663,7 @@ async fn collect_preemption_victims_with_data(
     let pods = store
         .list(None, None, None, None, None)
         .await
-        .map_err(|e| -> AppError { e.into() })?;
+        .map_err(map_pod_store_error_to_api)?;
     let mut victims = Vec::new();
     for resource in pods.items {
         if !pod_counts_toward_node_allocated(&resource.data, node_name, "", "") {
@@ -1724,15 +1749,17 @@ async fn apply_preemption_victims(
                 &hook_resource,
             )
             .await
-            .map_err(|e| -> AppError { e.into() })?;
-        crate::side_effects::run_hooks_logged(
-            ctx.side_effects,
-            &hook_resource,
-            ctx.store.db().as_ref(),
-            ctx.metrics,
-            "pod_preemption_victim",
-        )
-        .await;
+            .map_err(map_pod_store_error_to_api)?;
+        ctx.mutation_effects
+            .dispatch_resource_mutation_effects(
+                klights_reconcile_api::ResourceMutationEffectsRequest::new(
+                    klights_reconcile_api::ResourceChange::Updated,
+                    &hook_resource,
+                    Some(&victim.data),
+                    "pod_preemption_victim",
+                ),
+            )
+            .await;
     }
     Ok(())
 }
@@ -1780,7 +1807,7 @@ async fn write_preemption_termination(
                 let current = store
                     .get(&victim.namespace, &victim.name)
                     .await
-                    .map_err(|e| -> AppError { e.into() })?
+                    .map_err(map_pod_store_error_to_api)?
                     .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
                 resource_version = current.resource_version;
                 data = std::sync::Arc::unwrap_or_clone(current.data);
@@ -2175,6 +2202,13 @@ pub(crate) fn map_api_error_to_pod_repository(
         }
         other => PodRepositoryError::unavailable(format!("{other:?}")),
     }
+}
+
+fn map_pod_store_error_to_api(error: anyhow::Error) -> AppError {
+    if let Some(repository_error) = error.downcast_ref::<PodRepositoryError>() {
+        return AppError::from(repository_error.clone());
+    }
+    AppError::from(error)
 }
 
 #[async_trait]

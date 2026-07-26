@@ -9,6 +9,7 @@ use anyhow::Result;
 use klights_cluster_core::WatchReplayPosition;
 
 use super::generated;
+#[cfg(test)]
 use crate::log_apply::{decode_commit_protobuf, encode_commit_protobuf};
 use crate::storage_wire_codec::{
     decode_command_protobuf, decode_meta_protobuf, encode_command_protobuf, encode_meta_protobuf,
@@ -79,6 +80,7 @@ pub(crate) fn entry_from_proto(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn log_apply_commit_to_proto(
     commit: &crate::log_apply::LogApplyCommit,
 ) -> Result<generated::ReplicationEntry> {
@@ -91,6 +93,7 @@ pub(crate) fn log_apply_commit_to_proto(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn log_apply_commit_from_proto(
     entry: generated::ReplicationEntry,
 ) -> Result<crate::log_apply::LogApplyCommit> {
@@ -182,15 +185,16 @@ mod tests {
     }
 
     #[test]
-    fn log_apply_commit_proto_round_trip_preserves_assignment_and_watermark() {
-        let mut commit = crate::log_apply::LogApplyCommit::new(73, Vec::new());
-        commit.resource_version_assignment =
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1;
-        commit.outbox_watermark = Some(crate::log_apply::OutboxStreamWatermark {
-            client_id: "worker-a".to_string(),
-            stream_id: 8,
-            stream_seq: 13,
-        });
+    fn log_apply_commit_proto_round_trip_preserves_fixed_live_template_and_watermark() {
+        let commit = crate::log_apply::LogApplyCommit::try_new_with_watermark(
+            Vec::new(),
+            Some(crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-a".to_string(),
+                stream_id: 8,
+                stream_seq: 13,
+            }),
+        )
+        .unwrap();
 
         let proto = super::log_apply_commit_to_proto(&commit).unwrap();
         assert!(proto.command_protobuf.is_empty());

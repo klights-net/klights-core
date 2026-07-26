@@ -3,8 +3,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::control_plane::client::{CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness};
-use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
@@ -13,6 +11,7 @@ use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use crate::kubelet::reconciler::cri_inventory::{
     CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox, diff_cri_inventory,
 };
+use klights_leader_api::{CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CriStreamLifecycle {
@@ -25,29 +24,42 @@ pub enum CriStreamLifecycle {
 
 pub struct CriReconnectReconciler {
     node_name: String,
-    cluster_api: Arc<dyn LeaderApiClient>,
+    resource_query: Arc<dyn LeaderResourceQuery>,
     cache_readiness: Arc<dyn LeaderCacheReadiness>,
-    node_local: NodeLocalHandle,
+    pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     cri: Arc<dyn CriRuntime>,
     container_control: Arc<dyn ContainerRuntimeControl>,
     router: Arc<PodLifecycleRouter>,
 }
 
+pub struct CriReconnectDependencies {
+    pub resource_query: Arc<dyn LeaderResourceQuery>,
+    pub cache_readiness: Arc<dyn LeaderCacheReadiness>,
+    pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
+    pub cri: Arc<dyn CriRuntime>,
+    pub container_control: Arc<dyn ContainerRuntimeControl>,
+    pub router: Arc<PodLifecycleRouter>,
+}
+
 impl CriReconnectReconciler {
-    pub fn new(
-        node_name: String,
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
-        cri: Arc<dyn CriRuntime>,
-        container_control: Arc<dyn ContainerRuntimeControl>,
-        router: Arc<PodLifecycleRouter>,
-    ) -> Self {
-        let cache_readiness: Arc<dyn LeaderCacheReadiness> = cluster_api.clone();
+    pub fn new(node_name: String, dependencies: CriReconnectDependencies) -> Self {
+        let CriReconnectDependencies {
+            resource_query,
+            cache_readiness,
+            pod_runtime_store,
+            pod_endpoint_store,
+            cri,
+            container_control,
+            router,
+        } = dependencies;
         Self {
             node_name,
-            cluster_api,
+            resource_query,
             cache_readiness,
-            node_local,
+            pod_runtime_store,
+            pod_endpoint_store,
             cri,
             container_control,
             router,
@@ -66,12 +78,12 @@ impl CriReconnectReconciler {
             .await
             .context("wait for pod cache before CRI reconnect reconcile")?;
 
-        let runtime_rows = self.node_local.list_pod_runtime().await?;
+        let runtime_rows = self.pod_runtime_store.list_pod_runtime().await?;
         let leader_pods = self
-            .cluster_api
-            .list_resources(crate::control_plane::client::pods_on_node_list_request(
+            .resource_query
+            .list_resources(klights_leader_api::pods_on_node_list_request(
                 &self.node_name,
-                crate::control_plane::client::ResourceQueryConsistency::Cached,
+                klights_leader_api::ResourceQueryConsistency::Cached,
             )?)
             .await?
             .into_items()
@@ -127,8 +139,16 @@ impl CriReconnectReconciler {
                         OrphanReason::LeaderDeletedWhileDown,
                     )
                     .await?;
-                    self.node_local.delete_pod_runtime_for_uid(&key.uid).await?;
-                    self.node_local.delete_endpoint_for_uid(&key.uid).await?;
+                    self.pod_runtime_store
+                        .delete_pod_runtime_for_uid(klights_node_store::RuntimePodUid::try_new(
+                            key.uid.clone(),
+                        )?)
+                        .await?;
+                    self.pod_endpoint_store
+                        .delete_endpoint_for_uid(klights_node_store::PodUidKey::try_new(
+                            key.uid.clone(),
+                        )?)
+                        .await?;
                 }
                 CriInventoryAction::ReattachExistingSandbox { key, pod, .. }
                 | CriInventoryAction::RecreateMissingSandbox { key, pod } => {

@@ -9,6 +9,12 @@ use klights_node_api::{
     NodeExecSession, NodeExecTarget, exec_error_status_payload_is_terminal,
 };
 
+#[cfg(test)]
+use crate::kubelet::cri_exec::{
+    AttachRequest, ExecRequest, ExecStreamOptions as CriExecStreamOptions,
+    attach_with_created_state_retry, exec_with_created_state_retry,
+};
+
 const SPDY_UPGRADE_VALUE: &str = "SPDY/3.1";
 const SPDY_PROTOCOL_HEADER: &str = "X-Stream-Protocol-Version";
 const OPTIONAL_STREAM_NEGOTIATION_GRACE: std::time::Duration =
@@ -23,6 +29,7 @@ pub struct SpdyExecStreamRequest {
     pub attach: bool,
 }
 
+#[cfg(test)]
 pub struct LocalExecSpdyRequest {
     pub cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -260,6 +267,7 @@ where
     .await
 }
 
+#[cfg(test)]
 struct LocalSpdyExecTarget<'a> {
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -298,12 +306,14 @@ impl ContainerdSpdyBridgeState {
     }
 }
 
+#[cfg(test)]
 fn spdy_stream_error_is_unexpected_eof(err: &anyhow::Error) -> bool {
     err.downcast_ref::<std::io::Error>()
         .map(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 async fn bridge_containerd_spdy_to_client<S>(
     client_spdy: &SpdyExec,
     client_stream: &mut S,
@@ -321,7 +331,7 @@ where
                 target.task_supervisor.as_ref(),
                 AttachRequest {
                     container_id: target.container_id,
-                    stream_options: ExecStreamOptions {
+                    stream_options: CriExecStreamOptions {
                         tty: target.request.tty,
                         stdin: target.request.stdin,
                         stdout: target.request.stdout,
@@ -338,7 +348,7 @@ where
                 ExecRequest {
                     container_id: target.container_id,
                     command: target.command,
-                    stream_options: ExecStreamOptions {
+                    stream_options: CriExecStreamOptions {
                         tty: target.request.tty,
                         stdin: target.request.stdin,
                         stdout: target.request.stdout,
@@ -543,6 +553,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub async fn handle_local_exec_spdy<S>(mut client_stream: S, request: LocalExecSpdyRequest)
 where
     S: AsyncRead + AsyncWrite + Unpin,

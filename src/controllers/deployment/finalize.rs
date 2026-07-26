@@ -1,9 +1,30 @@
 use crate::controllers::common::{condition_from_status, preserve_condition_timestamps};
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use anyhow::Result;
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
 use serde_json::{Value, json};
 
 use super::helpers::templates_match;
+
+#[async_trait]
+pub trait DeploymentFinalizeStore: Send + Sync {
+    async fn get_deployment(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+
+    async fn patch_deployment_revision(
+        &self,
+        namespace: &str,
+        name: &str,
+        revision: String,
+        expected_uid: String,
+    ) -> Result<()>;
+
+    async fn delete_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected_uid: String,
+    ) -> Result<()>;
+}
 
 pub fn build_conditions_and_revision(
     available_pods: i64,
@@ -95,8 +116,8 @@ pub fn build_conditions_and_revision(
     (conditions, current_revision)
 }
 
-pub(super) async fn apply_revision_and_gc(
-    db: &dyn DatastoreBackend,
+pub(super) async fn apply_revision_and_gc<S: DeploymentFinalizeStore + ?Sized>(
+    store: &S,
     namespace: &str,
     deployment_name: &str,
     spec: &Value,
@@ -105,31 +126,12 @@ pub(super) async fn apply_revision_and_gc(
     current_revision: Option<String>,
 ) -> Result<()> {
     if let Some(rev) = current_revision {
-        let Some(deployment) = db
-            .get_resource("apps/v1", "Deployment", Some(namespace), deployment_name)
-            .await?
-        else {
+        let Some(deployment) = store.get_deployment(namespace, deployment_name).await? else {
             return Ok(());
         };
-        let annotation_patch = json!({
-            "metadata": {
-                "annotations": {
-                    "deployment.kubernetes.io/revision": rev
-                }
-            }
-        });
-        db.patch_resource_latest_with_preconditions(
-            "apps/v1",
-            "Deployment",
-            Some(namespace),
-            deployment_name,
-            crate::datastore::ResourcePatchRequest::new(
-                crate::datastore::PatchKind::Merge,
-                annotation_patch,
-                ResourcePreconditions::uid(deployment.uid),
-            ),
-        )
-        .await?;
+        store
+            .patch_deployment_revision(namespace, deployment_name, rev, deployment.uid)
+            .await?;
     }
 
     let revision_history_limit = spec
@@ -186,14 +188,9 @@ pub(super) async fn apply_revision_and_gc(
                 rs_name,
                 revision_history_limit
             );
-            db.delete_resource_with_preconditions(
-                "apps/v1",
-                "ReplicaSet",
-                Some(namespace),
-                rs_name,
-                ResourcePreconditions::uid(rs.uid.clone()),
-            )
-            .await?;
+            store
+                .delete_replicaset(namespace, rs_name, rs.uid.clone())
+                .await?;
         }
     }
 

@@ -216,7 +216,7 @@ async fn test_apiservice_proxy_cache_invalidates_on_apiservice_update() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     for (name, port) in [
@@ -442,9 +442,9 @@ async fn test_apiservice_status_reconciles_after_backend_service_and_endpoints_c
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let dispatcher = state.controller_dispatcher.clone();
-    let db = state.db.clone();
-    let node_name = state.config.node_name.clone();
+    let dispatcher = state.controller_reconcile().controller_dispatcher.clone();
+    let db = state.resource_mutation().db.clone();
+    let node_name = state.operational().config.node_name.clone();
     let cancel = CancellationToken::new();
     let worker = tokio::spawn(dispatcher.run_worker(db, node_name, cancel.clone()));
     let app = crate::api::build_router(state);
@@ -576,9 +576,9 @@ async fn test_apiservice_status_recovers_from_endpointslice_update() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let dispatcher = state.controller_dispatcher.clone();
-    let db = state.db.clone();
-    let node_name = state.config.node_name.clone();
+    let dispatcher = state.controller_reconcile().controller_dispatcher.clone();
+    let db = state.resource_mutation().db.clone();
+    let node_name = state.operational().config.node_name.clone();
     let cancel = CancellationToken::new();
     let worker = tokio::spawn(dispatcher.run_worker(db.clone(), node_name, cancel.clone()));
     let app = crate::api::build_router(state);
@@ -820,7 +820,7 @@ async fn test_apiservice_proxy_cache_invalidates_on_apiservice_delete() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1078,7 +1078,7 @@ async fn test_apiservice_discovery_cache_healthy_after_delete_and_recreate() {
     .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1429,7 +1429,7 @@ async fn test_discovery_and_subresource_forwarding_remain_consistent_after_apise
     }
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1721,7 +1721,7 @@ async fn test_apiservice_proxy_resolves_endpoints_fresh_with_cached_backend() {
     .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -1871,7 +1871,7 @@ async fn test_apiservice_proxy_filters_sensitive_forwarded_headers() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let bootstrap_token = crate::bootstrap::bootstrap_token::generate_bootstrap_token();
     crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
         db.as_ref(),
@@ -2019,7 +2019,7 @@ async fn test_apiservice_discovery_proxy_passthroughs_non_json_payloads() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2137,7 +2137,7 @@ async fn test_apiservice_subresource_requests_are_forwarded_to_apiservice_backen
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2248,7 +2248,7 @@ async fn test_cluster_apiservice_subresource_requests_are_forwarded_to_apiservic
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2364,7 +2364,7 @@ async fn test_apiservice_subresource_nested_path_and_query_is_forwarded_to_apise
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2476,7 +2476,7 @@ async fn test_apiservice_subresource_patch_body_and_headers_forwarded_to_apiserv
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     let bootstrap_token = crate::bootstrap::bootstrap_token::generate_bootstrap_token();
     crate::bootstrap::bootstrap_token::create_scoped_bootstrap_token_secret_for_test(
@@ -2657,7 +2657,7 @@ async fn test_local_crd_subresource_prefer_local_crd_even_with_conflicting_apise
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     let crd = json!({
@@ -2890,7 +2890,7 @@ async fn test_aggregated_discovery_includes_apiservice_backed_resources() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3032,7 +3032,7 @@ async fn test_apiservice_discovery_passthroughs_non_json_payload() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3157,7 +3157,7 @@ async fn test_apiservice_with_ca_bundle_on_non_443_uses_tls_transport() {
     let ca_bundle = base64::engine::general_purpose::STANDARD.encode(cert.cert.pem().as_bytes());
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3258,7 +3258,7 @@ async fn test_apiservice_insecure_skip_tls_verify_uses_https_with_invalid_cert_a
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3363,7 +3363,7 @@ async fn test_apiservice_ca_bundle_verifies_https_backend() {
     let backend_request = spawn_apiservice_tls_backend(listener, cert, key, response).await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3461,7 +3461,7 @@ async fn test_apiservice_plain_http_backend_is_not_supported() {
     let backend_request = spawn_apiservice_plain_backend(listener, response).await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3573,7 +3573,7 @@ async fn test_apiservice_tls_failure_does_not_retry_plain_http() {
     let good_request = spawn_apiservice_plain_backend(good_backend_listener, good_response).await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3680,7 +3680,7 @@ async fn test_apiservice_subresource_options_is_forwarded_to_backend() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3788,7 +3788,7 @@ async fn test_apiservice_subresource_head_is_forwarded_to_backend() {
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3886,7 +3886,7 @@ async fn test_apiservice_invalid_ca_bundle_returns_bad_gateway() {
             .to_vec();
     let backend_request = spawn_apiservice_plain_backend(listener, response).await;
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -3997,7 +3997,7 @@ async fn test_apiservice_tls_backend_without_ca_or_insecure_skip_returns_bad_gat
             .await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -4088,7 +4088,7 @@ async fn test_apiservice_proxy_negative_backend_cache_invalidates_on_create() {
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     let cache_miss = app
@@ -4221,12 +4221,14 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     .unwrap();
 
     let mut state = build_test_app_state().await;
-    state.config = std::sync::Arc::new(crate::KlightsConfig {
-        containerd_namespace: unique_ns.clone(),
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    });
+    state.operational_mut().config =
+        crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
+            containerd_namespace: unique_ns.clone(),
+            ..crate::KlightsConfig::from_env().expect("env config valid in test")
+        });
     let sa_uid = "sa-uid-jwt-test";
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -4405,13 +4407,13 @@ async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
     let namespace = format!("tokenreview-rejected-{}", uuid::Uuid::new_v4());
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
-    state.config = std::sync::Arc::new(config);
+    state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     let signing_key = crate::auth::generate_ca_full().unwrap().3;
     let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
     crate::auth::persist_service_account_signing_key(
         &signing_key_path,
         &signing_key,
-        state.task_supervisor.as_ref(),
+        state.operational().task_supervisor.as_ref(),
     )
     .await
     .unwrap();
@@ -4553,10 +4555,11 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
     .unwrap();
 
     let mut state = build_test_app_state().await;
-    state.config = std::sync::Arc::new(crate::KlightsConfig {
-        containerd_namespace: unique_ns.clone(),
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    });
+    state.operational_mut().config =
+        crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
+            containerd_namespace: unique_ns.clone(),
+            ..crate::KlightsConfig::from_env().expect("env config valid in test")
+        });
 
     let pod_name = "pod-service-account-test";
     let pod_uid = "3e4f1b0f-d09c-4b14-a2cc-a5fd867eb5b1";
@@ -4564,6 +4567,7 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
     // Bound-token validation requires the SA and bound pod to exist with the
     // token's UIDs (mirrors the request auth path).
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -4576,6 +4580,7 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
         .await
         .unwrap();
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -5063,7 +5068,7 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
     let namespace = format!("tokenreview-missing-key-{}", uuid::Uuid::new_v4());
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
-    state.config = std::sync::Arc::new(config);
+    state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     state.oidc_authenticator = Some(Arc::new(RejectingOidc));
     state.webhook_authenticator = Some(Arc::new(RejectingWebhook));
     let app = crate::api::build_router(state);
@@ -5217,13 +5222,13 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
     let namespace = format!("tokenreview-oidc-key-{}", uuid::Uuid::new_v4());
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
-    state.config = Arc::new(config);
+    state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     let signing_key = crate::auth::generate_ca_full().unwrap().3;
     let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
     crate::auth::persist_service_account_signing_key(
         &signing_key_path,
         &signing_key,
-        state.task_supervisor.as_ref(),
+        state.operational().task_supervisor.as_ref(),
     )
     .await
     .unwrap();
@@ -5299,10 +5304,11 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
     .unwrap();
 
     let mut state = build_test_app_state().await;
-    state.config = std::sync::Arc::new(crate::KlightsConfig {
-        containerd_namespace: unique_ns.clone(),
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    });
+    state.operational_mut().config =
+        crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
+            containerd_namespace: unique_ns.clone(),
+            ..crate::KlightsConfig::from_env().expect("env config valid in test")
+        });
 
     let node_name = "dallas-vm-1.us-south1-a.c.klights.internal";
     let pod_name = "pod-service-account-test";
@@ -5310,6 +5316,7 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
     let node_uid = "node-uid-tokenreview";
     let sa_uid = "sa-uid-tokenreview-node";
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -5322,6 +5329,7 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
         .await
         .unwrap();
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -5334,6 +5342,7 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
         .await
         .unwrap();
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -5430,14 +5439,16 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
     .unwrap();
 
     let mut state = build_test_app_state().await;
-    state.config = std::sync::Arc::new(crate::KlightsConfig {
-        containerd_namespace: unique_ns.clone(),
-        ..crate::KlightsConfig::from_env().expect("env config valid in test")
-    });
+    state.operational_mut().config =
+        crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
+            containerd_namespace: unique_ns.clone(),
+            ..crate::KlightsConfig::from_env().expect("env config valid in test")
+        });
     // SA exists, but the bound pod was deleted: TokenReview must not report the
     // token as authenticated (parity with the request auth path).
     let sa_uid = "sa-uid-gone";
     state
+        .resource_mutation()
         .db
         .create_resource(
             "v1",
@@ -6422,8 +6433,8 @@ async fn test_crd_get_non_storage_version_uses_conversion_webhook() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let registry = state.crd_registry.clone();
+    let db = state.resource_mutation().db.clone();
+    let registry = state.discovery().crd_registry.clone();
     let app = crate::api::build_router(state);
 
     let crd = json!({
@@ -6556,8 +6567,8 @@ async fn test_crd_list_non_storage_version_converts_heterogeneous_storage() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let registry = state.crd_registry.clone();
+    let db = state.resource_mutation().db.clone();
+    let registry = state.discovery().crd_registry.clone();
     let app = crate::api::build_router(state);
 
     let crd = json!({
@@ -8272,7 +8283,7 @@ async fn test_cluster_custom_resource_watch_skips_stale_backlog_event_when_rv_ze
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
 
     let crd = json!({
@@ -9851,6 +9862,7 @@ async fn apiservice_proxy_denies_request_before_backend_contact() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiregistration.k8s.io/v1",
@@ -9873,6 +9885,7 @@ async fn apiservice_proxy_denies_request_before_backend_contact() {
         }]
     });
     state
+        .resource_mutation()
         .db
         .create_resource("v1", "Endpoints", Some("default"), "testsvc", endpoints)
         .await
@@ -9882,7 +9895,7 @@ async fn apiservice_proxy_denies_request_before_backend_contact() {
     let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
         std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
     let mut deny_state = build_test_app_state().await;
-    deny_state.db = state.db.clone();
+    deny_state.resource_mutation_mut().db = state.resource_mutation().db.clone();
     deny_state.authorizer = authorizer;
     let app = crate::api::build_router(deny_state);
 
@@ -9988,6 +10001,7 @@ async fn apiservice_proxy_forwards_real_caller_identity_headers() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiregistration.k8s.io/v1",
@@ -10009,6 +10023,7 @@ async fn apiservice_proxy_forwards_real_caller_identity_headers() {
         }]
     });
     state
+        .resource_mutation()
         .db
         .create_resource("v1", "Endpoints", Some("default"), "testsvc2", endpoints)
         .await
@@ -10017,7 +10032,7 @@ async fn apiservice_proxy_forwards_real_caller_identity_headers() {
     let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
         std::sync::Arc::new(crate::auth::authorizer::AllowAllAuthorizer);
     let mut test_state = build_test_app_state().await;
-    test_state.db = state.db.clone();
+    test_state.resource_mutation_mut().db = state.resource_mutation().db.clone();
     test_state.authorizer = authorizer;
     let app = crate::api::build_router(test_state);
 
@@ -10095,6 +10110,7 @@ async fn custom_resource_operations_denied_with_deny_authorizer() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -10108,6 +10124,7 @@ async fn custom_resource_operations_denied_with_deny_authorizer() {
 
     // Register in CRD registry so the local path is taken (not proxy fallback)
     state
+        .discovery()
         .crd_registry
         .register(crate::controllers::crd::CrdResourceInfo {
             group: "example-auth.com".to_string(),
@@ -10218,6 +10235,7 @@ async fn custom_resource_allowed_identity_gets_normal_response() {
         }
     });
     state
+        .resource_mutation()
         .db
         .create_resource(
             "apiextensions.k8s.io/v1",
@@ -10230,6 +10248,7 @@ async fn custom_resource_allowed_identity_gets_normal_response() {
         .unwrap();
 
     state
+        .discovery()
         .crd_registry
         .register(crate::controllers::crd::CrdResourceInfo {
             group: "example-allow.com".to_string(),
@@ -10347,7 +10366,7 @@ async fn apiservice_backed_custom_resource_denied_before_backend_contact() {
     let authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer> =
         std::sync::Arc::new(crate::auth::authorizer::DenyAuthorizer);
     let state = build_test_app_state_with_authorizer(authorizer).await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
 
     // Set up Service, Endpoints, and APIService directly in the DB
     // (bypassing the API to avoid the DenyAuthorizer blocking setup)
@@ -10540,7 +10559,7 @@ async fn apiservice_proxy_rejects_oversized_response_without_full_buffering() {
     });
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     db.create_resource(
         "v1",
         "Service",
@@ -10640,7 +10659,7 @@ async fn apiservice_proxy_preserves_status_headers_and_body_below_response_limit
         spawn_apiservice_tls_backend_for_service(listener, "ok-svc", "default", response).await;
 
     let state = build_test_app_state().await;
-    let db = state.db.clone();
+    let db = state.resource_mutation().db.clone();
     db.create_resource(
         "v1", "Service", Some("default"), "ok-svc",
         json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "ok-svc", "namespace": "default"}, "spec": {"ports": [{"port": port}]}}),

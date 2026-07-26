@@ -55,13 +55,14 @@ pub struct BootstrapRunArgs<'a> {
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
-    pub _node_local: crate::datastore::node_local::handle::NodeLocalHandle,
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
+    pub pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    pub pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
     pub replication_service_for_router: Option<Arc<crate::replication::ReplicationService>>,
-    pub outbox_runtime: Arc<crate::kubelet::outbox::Outbox>,
+    pub outbox_runtime: Arc<crate::node_outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-    pub node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
+    pub node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     pub network: Arc<crate::networking::Network>,
     pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
@@ -71,6 +72,7 @@ pub struct BootstrapRunArgs<'a> {
     pub cri_for_pod_watcher: Option<CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<CriClient>>>,
     pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
+    pub runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy:
         crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -101,7 +103,7 @@ struct BootstrapNodeLeaderLabelStore {
 
 #[async_trait::async_trait]
 impl crate::kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeLeaderLabelStore {
-    async fn list_nodes(&self) -> Result<crate::datastore::ResourceList> {
+    async fn list_nodes(&self) -> Result<Vec<klights_cluster_core::Resource>> {
         self.db
             .list_resources(
                 "v1",
@@ -110,6 +112,7 @@ impl crate::kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeL
                 crate::datastore::ResourceListQuery::all(),
             )
             .await
+            .map(|list| list.items)
     }
 
     async fn update_node_with_preconditions(
@@ -294,8 +297,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         db,
         cluster_api,
         remote_api_client,
-        _node_local,
         pod_network_cache,
+        pod_runtime_store: node_pod_runtime_store,
+        pod_endpoint_store: node_pod_endpoint_store,
         assignment_waiter,
         replication_service_for_router,
         outbox_runtime,
@@ -309,6 +313,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         cri_for_pod_watcher,
         cri_for_api,
         cni_readiness,
+        runtime_paths,
         supervisor,
         grpc_transport_policy,
         shutdown_token,
@@ -450,7 +455,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await;
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = Arc::new(crate::side_effects::default_registry(
+    let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
         metrics.clone(),
         Some(services.clone()),
         Some(supervisor.clone()),
@@ -458,6 +463,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     ));
     side_effects.set_controller_dispatcher(controller_dispatcher.clone());
     local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
+    local_api_client.set_non_pod_finalization(Arc::new(
+        crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
+    ));
 
     let scheduling_mode = if has_leader_election {
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
@@ -504,39 +512,71 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             Some(is_leader_rx.clone()),
         )
     };
-    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
+    let pod_slot_backend = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
         kubelet_db_handle.clone(),
     ));
+    let pod_slot_adapter =
+        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(pod_slot_backend);
+    let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
+    let kubelet_capacity =
+        crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
+            &kubelet_file_process,
+            crate::version::GIT_VERSION,
+        )
+        .await
+        .node_capacity();
+    let sandbox_inputs =
+        crate::bootstrap::runtime_inputs::capture_sandbox_inputs(&kubelet_file_process, node_mode)
+            .await;
+    let kubelet_runtime_network = crate::kubelet::context::KubeletRuntimeNetworkServices::new(
+        network.datapath().clone(),
+        network.peering().clone(),
+        services.clone(),
+    );
+    let kubelet_status_delivery = crate::kubelet::context::KubeletStatusDeliveryServices::new(
+        cluster_api.clone(),
+        cluster_api.clone(),
+        cluster_api.clone(),
+        cluster_api.clone(),
+        outbox_runtime.clone(),
+    );
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
             repository_parts: pod_repository_parts,
             supervisor: supervisor.clone(),
-            outbox: Some(outbox_runtime.clone()),
-            cluster_api: Some(cluster_api.clone()),
+            outbox: Some(kubelet_status_delivery.outbox.clone()),
+            resource_query: Some(kubelet_status_delivery.resource_query.clone()),
+            projected_tokens: Some(kubelet_status_delivery.projected_tokens.clone()),
             node_name: config.node_name.clone(),
             service_cidr: config.service_cidr.clone(),
             lifecycle_concurrency: crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+            pod_actor_idle_grace:
+                crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            sandbox_inputs,
+            node_capacity: kubelet_capacity,
+            paths: runtime_paths.clone(),
             lifecycle_route_mode: crate::kubelet::pod_lifecycle_router::PodLifecycleRouteMode::Actor,
             cri: cri_for_pod_watcher.clone().map(SharedCriClient::new),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
             probe_manager: None,
-            datapath: Some(network.datapath().clone()),
+            datapath: Some(kubelet_runtime_network.datapath.clone()),
             service_router: Some(services.clone()),
             runtime_node_role,
             runtime_service: None,
             runtime_store: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
-                    pod_runtime_store.clone(),
+                    node_pod_runtime_store.clone(),
                 ),
             ),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    pod_runtime_store,
+                    pod_slot_adapter.clone(),
+                    pod_slot_adapter,
                     config.node_name.clone(),
                 ),
             ),
-            event_sink: Arc::new(crate::kubelet::pod_runtime::events::RealPodEventSink::new(
+            event_sink: Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
                 Some(outbox_runtime.clone()),
                 kubelet_db_handle.clone(),
             )),
@@ -594,7 +634,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let pod_start_retry_state: crate::kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
         tokio::sync::Mutex::new(crate::kubelet::pod_creation_state::PodStartRetryState::new()),
     );
-    side_effects.set_pod_repository(api_pod_repository.clone());
+    side_effects.set_pod_ports(api_pod_repository.clone(), api_pod_repository.clone());
     let oidc_authenticator = compose_oidc_authenticator(config, supervisor.as_ref())
         .await
         .context("failed to build OIDC authenticator")?;
@@ -676,76 +716,192 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ),
         );
     let node_port_forward = crate::portforward::local_node_port_forward(supervisor.clone());
-    let watcher_state = Arc::new(api::AppState {
-        db: db_handle.clone(),
-        bootstrap_token_authenticator: Arc::new(
-            crate::api::auth_middleware::DatastoreBootstrapTokenAuthenticator::new(
+    let api_role = match &cli.role {
+        crate::bootstrap::NodeRole::Leader { .. } => crate::api::ApiNodeRole::Leader,
+        crate::bootstrap::NodeRole::Controlplane {
+            leader_endpoints,
+            as_learner,
+            ..
+        } => crate::api::ApiNodeRole::Controlplane {
+            leader_endpoints: leader_endpoints.clone(),
+            as_learner: *as_learner,
+        },
+        crate::bootstrap::NodeRole::Worker {
+            leader_endpoints, ..
+        } => crate::api::ApiNodeRole::Worker {
+            leader_endpoints: leader_endpoints.clone(),
+        },
+    };
+    let api_replication = replication_service_for_router.clone().map(|replication| {
+        crate::api::ApiRemoteNodeServices::new(
+            replication.clone(),
+            replication.clone(),
+            replication,
+        )
+    });
+    let api_config = Arc::new(crate::api::ApiOperationalConfig::new(
+        config.node_name.clone(),
+        config.containerd_namespace.clone(),
+        config.anonymous_auth,
+        config.cluster_cidr.clone(),
+    ));
+    let finalizer_lifecycle =
+        crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new(
+            db_handle.clone(),
+            api_pod_repository.clone(),
+            side_effects.clone(),
+            metrics.clone(),
+        );
+    let mutation_effects =
+        crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
+            side_effects.clone(),
+            metrics.clone(),
+        );
+    let list_resource_versions =
+        crate::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
+    let gc_owner_lifecycle = crate::gc_delete_adapter::GcOwnerLifecycleAdapter::new(
+        db_handle.clone(),
+        api_pod_repository.clone(),
+    );
+    let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
+        db_handle.clone(),
+        klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+        supervisor.clone(),
+        config.containerd_namespace.clone(),
+    );
+    let watcher_state = Arc::new(api::AppState::new(
+        crate::api::ApiAuthPolicy::new(
+            std::sync::Arc::new(
+                crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
+                    rbac_policy_store.clone(),
+                    node_policy_store,
+                ),
+            ),
+            crate::audit::default_audit_sink(),
+            std::sync::Arc::new(crate::api_priority_fairness::ApiPriorityFairness::new()),
+            rbac_policy_store,
+            crate::api::ApiAuthenticators::new(
+                Arc::new(
+                    crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
+                        db_handle.clone(),
+                    ),
+                ),
+                oidc_authenticator,
+                webhook_authenticator,
+            ),
+            cluster_ca_pem.map(std::sync::Arc::new),
+        ),
+        crate::api::ApiResourceMutationServices {
+            db: db_handle.clone(),
+            resource_query: cluster_api.clone(),
+            resource_command: local_api_client.clone(),
+            finalizer_lifecycle,
+            mutation_effects,
+            list_resource_versions,
+            namespace_lists: crate::list_query_adapter::DatastoreNamespaceListPort::new(
                 db_handle.clone(),
             ),
+            quota_runtime:
+                crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
+                    db_handle.clone(),
+                ),
+            admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                db_handle.clone(),
+            ),
+            custom_resource_reads:
+                crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
+                    db_handle.clone(),
+                    supervisor.clone(),
+                ),
+            builtin_admission_defaults: generated_handler_adapter.clone(),
+            generated_lifecycle: generated_handler_adapter.clone(),
+            generated_mutations: generated_handler_adapter.clone(),
+            generated_watch: generated_handler_adapter,
+            gc_owner_lifecycle: Arc::new(gc_owner_lifecycle),
+            pod_repository: api_pod_repository.clone(),
+        },
+        crate::api::ApiDiscoveryAggregationServices::new(
+            crd_registry,
+            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(api::apiservice_proxy::ApiServiceProxyCache::default()),
         ),
-        cluster_api: cluster_api.clone(),
-        crd_registry,
-        mode: node_mode.clone(),
-        role: cli.role.clone(),
-        replication: replication_service_for_router.clone(),
-        network: network.clone(),
-        config: Arc::clone(config),
-        service_ipam,
-        nodeport_alloc,
-        cri: None,
-        metrics_provider: metrics_provider.clone(),
-        node_port_forward,
-        controller_dispatcher,
-        side_effects,
-        metrics,
-        apiservice_proxy_identity_cache: Arc::new(tokio::sync::OnceCell::new()),
-        apiservice_proxy_cache: Arc::new(api::apiservice_proxy::ApiServiceProxyCache::default()),
-        task_supervisor: supervisor.clone(),
-        file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-        pod_repository: api_pod_repository.clone(),
-        outbox: outbox_runtime.clone(),
-        node_lease_tracker: node_lease_tracker.clone(),
-        pod_lifecycle_router: Some(pod_lifecycle_router.clone()),
-        pod_probe_manager: pod_subsystem.probe_manager.clone(),
-        pod_lifecycle_rx: Some(pod_lifecycle_rx.clone()),
-        pod_start_retry_state: Some(pod_start_retry_state.clone()),
-        is_raft_leader_rx: raft_leader_proxy,
-        authorizer: std::sync::Arc::new(
-            crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
-                rbac_policy_store.clone(),
-                node_policy_store,
+        crate::api::ApiControllerReconcileServices::new(
+            crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
+                db_handle.clone(),
+                service_ipam.clone(),
+                nodeport_alloc.clone(),
+            ),
+            #[cfg(test)]
+            service_ipam.clone(),
+            #[cfg(test)]
+            nodeport_alloc.clone(),
+            controller_dispatcher.clone(),
+            metrics,
+            node_lease_tracker.clone(),
+        ),
+        crate::api::ApiPodNodeSubresourceServices::new(
+            Arc::new(
+                crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(
+                    services.clone(),
+                ),
+            ),
+            crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                    crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+                )),
+            )),
+            None,
+            metrics_provider.clone(),
+            node_port_forward,
+            Some(pod_lifecycle_router.clone()),
+            Some(pod_lifecycle_router.clone()),
+            Some(
+                crate::bootstrap::operational_adapters::ApiPodStartRetryDiagnostics::new(
+                    pod_start_retry_state.clone(),
+                ),
             ),
         ),
-        audit_sink: crate::audit::default_audit_sink(),
-        api_priority_fairness: std::sync::Arc::new(
-            crate::api_priority_fairness::ApiPriorityFairness::new(),
+        crate::api::ApiOperationalServices::new(
+            api_role,
+            api_replication,
+            api_config,
+            crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
+                db_handle.clone(),
+            ),
+            supervisor.clone(),
+            klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+            raft_leader_proxy,
         ),
-        rbac_policy_store,
-        oidc_authenticator,
-        webhook_authenticator,
-        cluster_ca_pem: cluster_ca_pem.map(std::sync::Arc::new),
-    });
-    watcher_state
-        .controller_dispatcher
+    ));
+    controller_dispatcher
         .set_pod_repository(api_pod_repository.clone())
         .await;
-    let kubelet_context = Arc::new(crate::kubelet::context::KubeletContext {
-        cluster_api: cluster_api.clone(),
-        node_local: _node_local.clone(),
-        outbox: outbox_runtime.clone(),
-        task_supervisor: supervisor.clone(),
-        file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-        config: Arc::clone(config),
-        network: network.clone(),
-        pod_repository: pod_repository.clone(),
-        pod_lifecycle_router: pod_lifecycle_router.clone(),
-        pod_probe_manager: pod_subsystem
-            .probe_manager
-            .clone()
-            .expect("PodSubsystem must construct ProbeManager"),
-        pod_lifecycle_rx: pod_lifecycle_rx.clone(),
-        pod_start_retry_state: pod_start_retry_state.clone(),
-    });
+    let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
+        config.service_cidr.clone(),
+        config.node_name.clone(),
+        config.containerd_namespace.clone(),
+        crate::kubelet::log_rotation::LogRotationPolicy::default(),
+        kubelet_capacity,
+        runtime_paths,
+    )
+    .context("kubelet configuration")?;
+    let kubelet_services = Arc::new(crate::kubelet::context::KubeletServices::new(
+        crate::kubelet::context::KubeletLifecycleServices::new(
+            pod_repository.clone(),
+            pod_lifecycle_router.clone(),
+            pod_lifecycle_rx.clone(),
+            pod_start_retry_state.clone(),
+        ),
+        kubelet_runtime_network,
+        kubelet_status_delivery,
+        crate::kubelet::context::KubeletLocalExecutionServices::new(
+            node_pod_runtime_store,
+            node_pod_endpoint_store,
+            supervisor.clone(),
+            kubelet_file_process,
+            kubelet_config,
+        ),
+    ));
 
     let node_lifecycle_start_resource_version = if has_leader_election {
         db.get_current_resource_version().await.unwrap_or(0)
@@ -779,21 +935,22 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             node_ip.to_string(),
             config.external_endpoint.clone(),
         );
+        let registration_profile =
+            crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
         let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
-            &kubelet_context.file_process,
+            &kubelet_services.local_execution().file_process,
             &config.node_name,
-            node_mode,
-            &cli.role,
+            &registration_profile,
             registration_addresses,
             initial_raft_shape.as_ref(),
             grpc_port,
         )
         .await;
-        kubelet::node::register_node_snapshot(
+        let registration_health = dataplane_health.snapshot();
+        crate::bootstrap::node_registration_adapter::register_node_snapshot(
             db,
             Some(&outbox_runtime),
-            None,
-            Some(dataplane_health),
+            Some(&registration_health),
             &registration,
         )
         .await
@@ -850,9 +1007,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let node_name = config.node_name.clone();
         let node_ip_task = node_ip.to_string();
         let external_endpoint_task = config.external_endpoint.clone();
-        let node_mode_task = node_mode.clone();
-        let role_task = cli.role.clone();
-        let file_process_task = kubelet_context.file_process.clone();
+        let registration_profile_task =
+            crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
+        let file_process_task = kubelet_services.local_execution().file_process;
         let is_leader_tx_task = is_leader_tx.clone();
         let leader_addr_tx_task = leader_addr_tx.clone();
         let grpc_port_task = if cli.role.runs_full_stack() {
@@ -957,17 +1114,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         let registration = crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
                             &file_process_task,
                             &node_name,
-                            &node_mode_task,
-                            &role_task,
+                            &registration_profile_task,
                             registration_addresses,
                             Some(&shape),
                             grpc_port_task,
                         )
                         .await;
-                        let res = crate::kubelet::node::register_node_snapshot(
+                        let res =
+                            crate::bootstrap::node_registration_adapter::register_node_snapshot(
                             db_handle_task.as_ref(),
                             Some(&outbox_task),
-                            None,
                             None,
                             &registration,
                         )
@@ -1025,9 +1181,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     services.request_services_sync()?;
 
     if leader_lease.is_some() {
-        controllers::coredns::bootstrap_coredns(
+        crate::coredns_bootstrap_adapter::bootstrap_coredns(
             db,
-            watcher_state.pod_repository.clone(),
+            watcher_state.resource_mutation().pod_repository.clone(),
+            &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
             config.tls_port,
             &config.service_cidr,
             &config.containerd_namespace,
@@ -1036,27 +1193,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .context("Failed to bootstrap CoreDNS")?;
     }
-    controllers::service::rebuild_service_ipam_from_services(
-        db,
-        watcher_state.service_ipam.as_ref(),
-    )
-    .await
-    .context("Failed to rebuild Service ClusterIP allocator after bootstrap services")?;
-    controllers::service::rebuild_nodeport_allocator_from_services(
-        db,
-        &watcher_state.nodeport_alloc,
-    )
-    .await
-    .context("Failed to rebuild NodePort allocator after bootstrap services")?;
+    controllers::service::rebuild_service_ipam_from_services(db, service_ipam.as_ref())
+        .await
+        .context("Failed to rebuild Service ClusterIP allocator after bootstrap services")?;
+    controllers::service::rebuild_nodeport_allocator_from_services(db, &nodeport_alloc)
+        .await
+        .context("Failed to rebuild NodePort allocator after bootstrap services")?;
 
-    controllers::crd::load_existing_crds(db, &watcher_state.crd_registry)
+    controllers::crd::load_existing_crds(db, &watcher_state.discovery().crd_registry)
         .await
         .context("Failed to load existing CRDs")?;
 
     let crd_registry_watch_handle = {
         let dbh = db_handle.clone();
-        let registry = watcher_state.crd_registry.clone();
-        let supervisor_for_task = supervisor.clone();
+        let registry = watcher_state.discovery().crd_registry.clone();
+        let crd_runtime = crate::crd_registry_adapter::new_runtime(dbh);
         let cancel = shutdown_token.clone();
         supervisor
             .spawn_async(
@@ -1064,9 +1215,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 "runtime_crd_registry_watch",
                 async move {
                     controllers::crd::run_crd_registry_watch_with_components(
-                        dbh,
+                        crd_runtime,
                         registry,
-                        supervisor_for_task,
                         cancel,
                     )
                     .await;
@@ -1078,17 +1228,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Spawn pod watcher
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
-        let ctx = kubelet_context.clone();
+        let ctx = kubelet_services.clone();
         let watch_source = Arc::new(
             crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
                 crate::datastore::DatastoreBackendWatchStore::new(kubelet_db_handle.clone()),
             )),
         );
         let volume_events = Arc::new(
-            crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+            crate::bootstrap::kubelet_ports::LeaderPersistentVolumeEventHandler::new(
                 kubelet_db_handle.clone(),
                 is_leader_rx.clone(),
-                ctx.file_process.clone(),
+                ctx.local_execution().file_process,
             ),
         );
         let cancel = shutdown_token.clone();
@@ -1098,9 +1248,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     klights_supervisor::TaskCategory::Background,
                     "runtime_pod_watcher",
                     async move {
-                        kubelet::pod_manager::run_pod_watcher_with_context(
+                        kubelet::pod_manager::run_pod_watcher_with_services(
                             runtime_ports,
-                            ctx,
+                            ctx.lifecycle(),
+                            ctx.status_delivery(),
+                            ctx.local_execution(),
                             watch_source,
                             volume_events,
                             cancel,
@@ -1150,26 +1302,31 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let state = watcher_state.clone();
         let cancel = shutdown_token.clone();
         let health = dataplane_health.clone();
-        let leader_ports = crate::bootstrap::network_adapters::FocusedNetworkLeaderPorts::new(
-            state.cluster_api.clone(),
-        );
+        let leader_ports =
+            crate::bootstrap::network_adapters::FocusedNetworkLeaderPorts::new(cluster_api.clone());
         let topology = leader_ports.topology();
         let query = leader_ports.resource_query();
         let watch = leader_ports.watch();
-        let projection = crate::controllers::node_subnet::DatastorePeerTopologyProjection::new(
-            state.db.clone(),
-            state.config.node_name.clone(),
-            state.config.cluster_cidr.clone(),
-            state.is_raft_leader_rx.clone(),
-        );
+        let projection =
+            crate::node_subnet_controller_adapter::DatastorePeerTopologyProjection::new(
+                state.resource_mutation().db.clone(),
+                state.operational().config.node_name.clone(),
+                state.operational().config.cluster_cidr.clone(),
+                state.operational().is_raft_leader_rx.clone(),
+            );
         let node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
             Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
-                state.config.node_name.clone(),
+                state.operational().config.node_name.clone(),
                 query.clone(),
-                state.outbox.clone(),
+                kubelet_services.status_delivery().outbox.clone(),
             ));
-        let node_name = state.config.node_name.clone();
-        let peering = state.network.peering().clone();
+        let readiness_publisher =
+            crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
+                query.clone(),
+                node_status,
+            );
+        let node_name = state.operational().config.node_name.clone();
+        let peering = kubelet_services.runtime_network().peering;
         let peer_supervisor = supervisor.clone();
         supervisor
             .spawn_async(
@@ -1184,8 +1341,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         node_name,
                         peering,
                         peer_supervisor,
-                        Some(health),
-                        node_status,
+                        Some(Arc::new(health)),
+                        readiness_publisher,
                         cancel,
                     )
                     .await;
@@ -1213,7 +1370,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     klights_supervisor::TaskCategory::Background,
                     "runtime_node_lifecycle_controller",
                     async move {
-                        controllers::node_lifecycle::run_node_lifecycle_controller(
+                        crate::node_lifecycle_controller_adapter::run_node_lifecycle_controller(
                             state,
                             node_lifecycle_status,
                             cancel,
@@ -1237,12 +1394,18 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // scheduler after failover, or duplicate the scheduler on the seed.
     let scheduler_controller_handle = None;
 
-    let dispatcher_for_worker = watcher_state.controller_dispatcher.clone();
+    let dispatcher_for_worker = controller_dispatcher.clone();
 
-    let state_with_cri = api::AppState {
-        cri: cri_for_api,
-        ..(*watcher_state).clone()
-    };
+    let local_node_exec = cri_for_api.map(|cri| {
+        let runtime: Arc<dyn klights_node_api::NodeExecRuntime> = Arc::new(
+            crate::kubelet::remote_runtime::CriNodeExecRuntime::new(cri, supervisor.clone()),
+        );
+        crate::bootstrap::operational_adapters::InProcessNodeExec::new(runtime, supervisor.clone())
+            as Arc<dyn klights_node_api::NodeExec>
+    });
+    let state_with_cri = (*watcher_state)
+        .clone()
+        .with_local_node_exec(local_node_exec);
     let app = if let Some(rs) = replication_service_for_router {
         // P3-11c: if raft mode is active on this leader-class boot,
         // wire the RaftNode-backed Raft RPC dispatcher and the
@@ -1256,10 +1419,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     crate::datastore::raft::node::RaftNodeRpcRouter::from_node(rn.as_ref()),
                 );
                 let handler: Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler> =
-                    Arc::new(crate::datastore::raft::node::RaftNodeJoinHandler::new(
-                        rn.clone(),
-                        db_handle.clone(),
-                    ));
+                    Arc::new(
+                        crate::bootstrap::controlplane_join_handler::RaftNodeJoinHandler::new(
+                            rn.clone(),
+                            db_handle.clone(),
+                        ),
+                    );
                 (Some(router), Some(handler))
             }
             None => (None, None),
@@ -1282,16 +1447,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 local_api_client.clone(),
                 authenticated_projected_token,
             );
-            let snapshot_capture = Arc::new(
-                crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new_capture(
-                    db_handle.clone(),
-                ),
-            );
             crate::replication::grpc::server::mount_service_full_production(
                 api::build_router(state_with_cri),
                 rs,
                 grpc_ports,
-                snapshot_capture,
                 Arc::new(
                     crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
                         supervisor.clone(),

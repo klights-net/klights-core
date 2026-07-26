@@ -1,200 +1,19 @@
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
-use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
-use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
-use crate::side_effects::{PodRepositorySlot, SideEffect};
-use klights_supervisor::TaskSupervisor;
-
-const NODE_NOT_READY_TAINT_KEY: &str = "node.kubernetes.io/not-ready";
-const NODE_NOT_READY_TAINT_EFFECT: &str = "NoExecute";
-const NODE_NOT_READY_TAINT_VALUE: &str = "true";
-
-pub fn node_taint_manager(
-    pod_repository: PodRepositorySlot,
-    task_supervisor: Option<Arc<TaskSupervisor>>,
-    db: Option<DatastoreHandle>,
-) -> Arc<dyn SideEffect> {
-    Arc::new(NodeTaintManager {
-        pod_repository,
-        task_supervisor,
-        db,
-    })
-}
-
-struct NodeTaintManager {
-    pod_repository: PodRepositorySlot,
-    task_supervisor: Option<Arc<TaskSupervisor>>,
-    db: Option<DatastoreHandle>,
-}
-
-#[async_trait]
-impl SideEffect for NodeTaintManager {
-    fn name(&self) -> &'static str {
-        "node_taint_manager"
-    }
-
-    async fn apply(&self, node: &Value, _db: &dyn DatastoreBackend) -> Result<()> {
-        reconcile_node_noexecute_taints(
-            self.pod_repository.clone(),
-            self.task_supervisor.clone(),
-            self.db.clone(),
-            node,
-        )
-        .await
-    }
-}
-
-async fn reconcile_node_noexecute_taints(
-    pod_slot: PodRepositorySlot,
-    task_supervisor: Option<Arc<TaskSupervisor>>,
-    db: Option<DatastoreHandle>,
-    node: &Value,
-) -> Result<()> {
-    let node_name = node
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if node_name.is_empty() {
-        return Ok(());
-    }
-
-    let taints = noexecute_taints(node);
-    if taints.is_empty() {
-        return Ok(());
-    }
-
-    let Some(pods) = pod_slot.get() else {
-        tracing::debug!("node_taint_manager: pod repository is not bound yet");
-        return Ok(());
-    };
-
-    for pod in pods.list_pods(None, None, None, None, None).await?.items {
-        if pod.data.pointer("/spec/nodeName").and_then(|v| v.as_str()) != Some(node_name) {
-            continue;
-        }
-        if pod
-            .data
-            .pointer("/metadata/deletionTimestamp")
-            .and_then(|v| v.as_str())
-            .is_some()
-        {
-            continue;
-        }
-
-        let action = eviction_action_for_pod(&pod.data, &taints);
-        match action {
-            EvictionAction::None => {}
-            EvictionAction::Now => {
-                evict_pod(pod_slot.clone(), std::sync::Arc::unwrap_or_clone(pod.data)).await;
-            }
-            EvictionAction::After(delay) => {
-                let Some(supervisor) = task_supervisor.clone() else {
-                    continue;
-                };
-                let pod_slot_for_task = pod_slot.clone();
-                let db_for_task = db.clone();
-                let node_name_for_task = node_name.to_string();
-                let namespace = pod
-                    .data
-                    .pointer("/metadata/namespace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("default")
-                    .to_string();
-                let name = pod
-                    .data
-                    .pointer("/metadata/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                let _ = supervisor
-                    .spawn_delay("node_taint_noexecute_eviction", delay, async move {
-                        recheck_and_evict_pod(
-                            pod_slot_for_task,
-                            db_for_task,
-                            node_name_for_task,
-                            namespace,
-                            name,
-                        )
-                        .await;
-                    })
-                    .await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn recheck_and_evict_pod(
-    pod_slot: PodRepositorySlot,
-    db: Option<DatastoreHandle>,
-    node_name: String,
-    namespace: String,
-    name: String,
-) {
-    let Some(pods) = pod_slot.get() else {
-        return;
-    };
-    let Some(db) = db else {
-        return;
-    };
-    let Ok(Some(node)) = db.get_resource("v1", "Node", None, &node_name).await else {
-        return;
-    };
-
-    let Ok(Some(pod)) = pods.get_pod(&namespace, &name).await else {
-        return;
-    };
-    if pod
-        .data
-        .pointer("/metadata/deletionTimestamp")
-        .and_then(|v| v.as_str())
-        .is_some()
-    {
-        return;
-    }
-
-    let taints = noexecute_taints(&node.data);
-    if !matches!(
-        eviction_action_for_pod(&pod.data, &taints),
-        EvictionAction::None
-    ) {
-        evict_pod(pod_slot, std::sync::Arc::unwrap_or_clone(pod.data)).await;
-    }
-}
-
-async fn evict_pod(pod_slot: PodRepositorySlot, pod: Value) {
-    let Some(repository) = pod_slot.get() else {
-        return;
-    };
-    let namespace = pod
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
-    let Some(name) = pod.pointer("/metadata/name").and_then(|v| v.as_str()) else {
-        return;
-    };
-    if let Err(err) = repository.delete_pod(namespace, name).await {
-        tracing::warn!(namespace, name, error = %err, "node_taint_manager: pod eviction failed");
-    }
-}
+pub(crate) const NODE_NOT_READY_TAINT_KEY: &str = "node.kubernetes.io/not-ready";
+pub(crate) const NODE_NOT_READY_TAINT_EFFECT: &str = "NoExecute";
+pub(crate) const NODE_NOT_READY_TAINT_VALUE: &str = "true";
 
 #[derive(Debug, PartialEq, Eq)]
-enum EvictionAction {
+pub(crate) enum EvictionAction {
     None,
     Now,
     After(Duration),
 }
 
-fn eviction_action_for_pod(pod: &Value, taints: &[Value]) -> EvictionAction {
+pub(crate) fn eviction_action_for_pod(pod: &Value, taints: &[Value]) -> EvictionAction {
     if taints.is_empty() {
         return EvictionAction::None;
     }
@@ -233,7 +52,7 @@ fn eviction_action_for_pod(pod: &Value, taints: &[Value]) -> EvictionAction {
     })
 }
 
-fn noexecute_taints(node: &Value) -> Vec<Value> {
+pub(crate) fn noexecute_taints(node: &Value) -> Vec<Value> {
     let mut taints = node
         .pointer("/spec/taints")
         .and_then(|v| v.as_array())
@@ -302,6 +121,8 @@ fn toleration_matches_taint(toleration: &Value, taint: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::side_effects::PodSideEffectPortsSlot;
+    use klights_supervisor::TaskSupervisor;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -363,9 +184,14 @@ mod tests {
         let node = create_node(&db, vec![noexecute_taint()]).await;
         create_pod(&db, "untolerated", json!([])).await;
 
-        reconcile_node_noexecute_taints(slot, None, Some(db_handle), &node.data)
-            .await
-            .unwrap();
+        crate::node_taint_manager_side_effect_adapter::reconcile_node_noexecute_taints(
+            slot,
+            None,
+            Some(db_handle),
+            &node.data,
+        )
+        .await
+        .unwrap();
 
         let pod = db
             .get_resource("v1", "Pod", Some("default"), "untolerated")
@@ -398,9 +224,14 @@ mod tests {
         .await;
         create_pod(&db, "ready-unknown", json!([])).await;
 
-        reconcile_node_noexecute_taints(slot, None, Some(db_handle), &node.data)
-            .await
-            .unwrap();
+        crate::node_taint_manager_side_effect_adapter::reconcile_node_noexecute_taints(
+            slot,
+            None,
+            Some(db_handle),
+            &node.data,
+        )
+        .await
+        .unwrap();
 
         let pod = db
             .get_resource("v1", "Pod", Some("default"), "ready-unknown")
@@ -430,7 +261,7 @@ mod tests {
         )
         .await;
 
-        reconcile_node_noexecute_taints(
+        crate::node_taint_manager_side_effect_adapter::reconcile_node_noexecute_taints(
             slot,
             Some(supervisor.clone()),
             Some(db_handle),
@@ -471,7 +302,7 @@ mod tests {
         )
         .await;
 
-        reconcile_node_noexecute_taints(
+        crate::node_taint_manager_side_effect_adapter::reconcile_node_noexecute_taints(
             slot,
             Some(supervisor.clone()),
             Some(db_handle),
@@ -510,7 +341,7 @@ mod tests {
     async fn fixture() -> (
         crate::datastore::sqlite::Datastore,
         crate::datastore::DatastoreHandle,
-        PodRepositorySlot,
+        PodSideEffectPortsSlot,
         Arc<TaskSupervisor>,
     ) {
         let db = crate::datastore::test_support::in_memory().await;
@@ -526,8 +357,8 @@ mod tests {
             side_effects,
             metrics,
         ));
-        let slot = PodRepositorySlot::new();
-        slot.set(repository);
+        let slot = PodSideEffectPortsSlot::new();
+        slot.set(repository.clone(), repository);
         (db, db_handle, slot, supervisor)
     }
 

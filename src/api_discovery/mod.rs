@@ -40,6 +40,16 @@ pub use self::scheduling_v1::*;
 pub use self::shared::*;
 pub use self::storage_v1::*;
 
+pub async fn register_crd_from_value(
+    registry: &klights_leader_api::CrdRegistry,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    for info in klights_leader_api::resource_infos_from_value(value)? {
+        registry.register(info).await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests_api_discovery_core;
 #[cfg(test)]

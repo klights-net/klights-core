@@ -48,7 +48,11 @@ async fn create_poddisruptionbudget(
     )
     .await?;
 
-    state.controller_dispatcher.enqueue(&result.1.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&result.1.0)
+        .await;
 
     Ok(result)
 }
@@ -69,7 +73,11 @@ async fn update_poddisruptionbudget(
     )
     .await?;
 
-    state.controller_dispatcher.enqueue(&result.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&result.0)
+        .await;
 
     Ok(result)
 }
@@ -93,7 +101,11 @@ async fn patch_poddisruptionbudget(
     .await?;
 
     let (_status, json_response) = &result;
-    state.controller_dispatcher.enqueue(&json_response.0).await;
+    state
+        .controller_reconcile()
+        .controller_dispatcher
+        .enqueue(&json_response.0)
+        .await;
 
     Ok(result)
 }

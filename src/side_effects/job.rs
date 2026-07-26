@@ -1,59 +1,21 @@
 //! Side effect to reconcile Jobs after Pod mutations.
 
-use super::{ControllerDispatcherSlot, PodRepositorySlot, SideEffect};
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
-use std::sync::Arc;
-
-/// Reconciles namespace Jobs after Pod create/update/delete events.
-///
-/// Job ownership is driven by Pod state as well as Job spec. A direct Pod
-/// update can orphan or relabel a Pod, so the Job controller must run from the
-/// Pod mutation path instead of waiting for another Job update.
-pub struct JobReconcileEffect {
-    _pod_repository: PodRepositorySlot,
-    controller_dispatcher: ControllerDispatcherSlot,
-}
 
 #[async_trait]
-impl SideEffect for JobReconcileEffect {
-    fn name(&self) -> &'static str {
-        "job_reconcile"
-    }
-
-    async fn apply(&self, resource: &Value, db: &dyn DatastoreBackend) -> Result<()> {
-        let namespace = resource
-            .pointer("/metadata/namespace")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if namespace.is_empty() {
-            return Ok(());
-        }
-
-        let Some(dispatcher) = self.controller_dispatcher.get() else {
-            tracing::debug!(
-                "JobReconcileEffect skipped for {}: controller dispatcher not yet bound",
-                namespace
-            );
-            return Ok(());
-        };
-
-        dispatcher
-            .enqueue_reconcile_batch(job_reconcile_keys_for_pod(resource, db, namespace).await?)
-            .await?;
-
-        Ok(())
-    }
+pub(crate) trait JobSideEffectStore: Send + Sync {
+    async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>>;
 }
 
-pub async fn job_reconcile_keys_for_pod(
+pub(crate) async fn job_reconcile_keys_for_pod<Store: JobSideEffectStore + ?Sized>(
     pod: &Value,
-    db: &dyn DatastoreBackend,
+    store: &Store,
     namespace: &str,
-) -> Result<Vec<klights_reconcile_api::ReconcileKey>> {
+) -> Result<Vec<ReconcileKey>> {
     let mut keys = Vec::new();
     if let Some(owner_refs) = pod
         .pointer("/metadata/ownerReferences")
@@ -70,9 +32,7 @@ pub async fn job_reconcile_keys_for_pod(
                     .map(|api_version| api_version == "batch/v1")
                     .unwrap_or(true);
             if is_job && let Some(name) = owner.get("name").and_then(|v| v.as_str()) {
-                keys.push(klights_reconcile_api::ReconcileKey::namespaced(
-                    "batch/v1", "Job", namespace, name,
-                ));
+                keys.push(ReconcileKey::namespaced("batch/v1", "Job", namespace, name));
             }
         }
         if !keys.is_empty() {
@@ -83,20 +43,12 @@ pub async fn job_reconcile_keys_for_pod(
     let pod_labels = pod
         .pointer("/metadata/labels")
         .and_then(|labels| labels.as_object());
-    let jobs = db
-        .list_resources(
-            "batch/v1",
-            "Job",
-            Some(namespace),
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    for job in jobs.items {
+    for job in store.list_jobs(namespace).await? {
         let selector_matches = job_selector_for_pod_side_effect(&job.data)
             .map(|selector| selector.matches_labels(pod_labels))
             .unwrap_or(false);
         if selector_matches {
-            keys.push(klights_reconcile_api::ReconcileKey::namespaced(
+            keys.push(ReconcileKey::namespaced(
                 "batch/v1", "Job", namespace, &job.name,
             ));
         }
@@ -119,25 +71,15 @@ fn job_selector_for_pod_side_effect(job: &Value) -> Option<klights_types::LabelS
     klights_types::LabelSelector::from_k8s_selector(&selector).ok()
 }
 
-/// Create a JobReconcileEffect instance backed by the supplied late-bound
-/// `PodRepository` slot.
-pub fn job_reconcile(
-    pod_repository: PodRepositorySlot,
-    controller_dispatcher: ControllerDispatcherSlot,
-) -> Arc<dyn SideEffect> {
-    Arc::new(JobReconcileEffect {
-        _pod_repository: pod_repository,
-        controller_dispatcher,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[tokio::test]
     async fn test_job_reconcile_name() {
-        let effect = job_reconcile(PodRepositorySlot::new(), ControllerDispatcherSlot::new());
+        let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let effect = crate::job_side_effect_adapter::effect(
+            db_handle,
+            crate::side_effects::ControllerDispatcherSlot::new(),
+        );
         assert_eq!(effect.name(), "job_reconcile");
     }
 }

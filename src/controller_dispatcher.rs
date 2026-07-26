@@ -1,4 +1,4 @@
-//! Controller dispatcher for unified reconciliation
+//! Root controller-dispatcher composition for unified reconciliation.
 //!
 //! This module provides a centralized dispatcher that routes resource reconciliation
 //! to the appropriate controller based on the resource's apiVersion and kind.
@@ -18,7 +18,6 @@ use crate::controllers::{
     apiservice_controller::APIServiceController,
     daemonset_controller::DaemonSetController,
     deployment_controller::DeploymentController,
-    hpa_controller::HpaController,
     job_controller::JobController,
     pdb_controller::PDBController,
     pvc_controller::PVCController,
@@ -30,6 +29,7 @@ use crate::controllers::{
     workqueue::{Key, MAX_RETRY_ATTEMPTS, WorkQueue, backoff_for, controller_kind_static},
 };
 use crate::datastore::DatastoreHandle;
+use crate::hpa_controller_adapter::HpaController;
 use crate::kubelet::pod_repository::PodRepository;
 use anyhow::{Context as _, Result};
 use klights_reconcile_api::{
@@ -610,11 +610,37 @@ impl ControllerDispatcher {
                 Some(metrics_provider) => ctx.with_metrics_provider(metrics_provider),
                 None => ctx,
             };
+            let ctx = ctx.with_non_pod_finalization(Arc::new(
+                crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
+            ));
             controller.reconcile(resource.clone(), ctx).await?;
         }
         // If no controller is registered, that's fine - not all resources need reconciliation
 
         Ok(())
+    }
+}
+
+impl klights_reconcile_api::ControllerDispatcherPort for ControllerDispatcher {
+    fn enqueue<'a>(
+        &'a self,
+        resource: &'a serde_json::Value,
+    ) -> klights_reconcile_api::ControllerDispatchFuture<'a, ()> {
+        Box::pin(async move { self.enqueue(resource).await })
+    }
+
+    fn enqueue_reconcile(
+        &self,
+        key: klights_reconcile_api::ReconcileKey,
+    ) -> klights_reconcile_api::ControllerDispatchFuture<'_, ()> {
+        Box::pin(async move { self.enqueue_reconcile_key(key).await })
+    }
+
+    fn pending_reconcile_keys(
+        &self,
+    ) -> klights_reconcile_api::ControllerDispatchFuture<'_, Vec<klights_reconcile_api::ReconcileKey>>
+    {
+        Box::pin(async move { self.pending_reconcile_keys().await })
     }
 }
 

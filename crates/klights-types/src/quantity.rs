@@ -186,6 +186,49 @@ pub fn parse_resource_quantity(resource_key: &str, quantity: &str) -> Option<i64
     }
 }
 
+/// Kubernetes Pod effective resource usage for one requests/limits key.
+///
+/// Regular containers add together, while init containers contribute their
+/// maximum. The effective value is the larger of those two totals.
+pub fn calculate_pod_effective_resource_for_key(
+    pod: &serde_json::Value,
+    bucket: &str,
+    resource_key: &str,
+) -> i64 {
+    let regular_sum = pod
+        .pointer("/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|container| {
+            container
+                .get("resources")
+                .and_then(|resources| resources.get(bucket))
+                .and_then(|resources| resources.get(resource_key))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|quantity| parse_resource_quantity(resource_key, quantity))
+        })
+        .sum::<i64>();
+
+    let init_max = pod
+        .pointer("/spec/initContainers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|container| {
+            container
+                .get("resources")
+                .and_then(|resources| resources.get(bucket))
+                .and_then(|resources| resources.get(resource_key))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|quantity| parse_resource_quantity(resource_key, quantity))
+        })
+        .max()
+        .unwrap_or(0);
+
+    regular_sum.max(init_max)
+}
+
 pub fn format_cpu_milli(milli: i64) -> String {
     if milli % 1000 == 0 {
         (milli / 1000).to_string()

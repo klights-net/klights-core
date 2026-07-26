@@ -5,26 +5,27 @@ use async_trait::async_trait;
 #[cfg(test)]
 use klights_cluster_core::CommandMeta;
 use klights_cluster_core::{
-    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
-    StorageCommand, WatchReplayPosition,
+    OutboxApplyError as OutboxDeliveryError, OutboxApplyOutcome as OutboxDeliveryResult, PatchKind,
+    Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, StorageCommand,
+    WatchReplayPosition,
 };
-use klights_leader_api::{OutboxDeliveryError, OutboxDeliveryResult};
 use serde_json::Value;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 
-use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::errors::DatastoreError;
-use crate::datastore::types::{
+use super::super::backend::DatastoreBackend;
+use super::super::errors::DatastoreError;
+use super::super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PodCleanupIntent,
     PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
-    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplayRead,
-    RawWatchEvent, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SandboxRef,
-    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+    PodSlotAdmissionResult, PodSlotClearResult, PodSlotMutationResult, PodWorkqueueEntry,
+    PodWorkqueueKind, PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata,
+    ResourceList, ResourceListQuery, SandboxRef, SnapshotAtRv, WatchReplayFloor, WatchReplayRead,
+    WatchTarget,
 };
 #[cfg(test)]
-use crate::datastore::types::{PendingWatchEvent, ReplicatedCreateOptions};
-use klights_watch::WatchTopic;
+use super::super::types::{PendingWatchEvent, ReplicatedCreateOptions};
+use super::super::{WatchSignalReceiver, WatchTopic};
 
 use super::SequencedDatastore;
 #[cfg(test)]
@@ -62,32 +63,32 @@ fn reject_application_committed_apply<T>(operation: &'static str) -> Result<T> {
 impl DatastoreBackend for SequencedDatastore {
     async fn read_durable_allocator_observation(
         &self,
-    ) -> Result<crate::datastore::DurableAllocatorObservation> {
+    ) -> Result<super::super::DurableAllocatorObservation> {
         self.passive.read_durable_allocator_observation().await
     }
 
     async fn read_cluster_metadata_observation(
         &self,
-    ) -> Result<crate::datastore::ClusterMetadataObservation> {
+    ) -> Result<super::super::ClusterMetadataObservation> {
         self.passive.read_cluster_metadata_observation().await
     }
     async fn acquire_snapshot_exclusive_fence(
         &self,
-    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
+    ) -> Result<Option<super::super::backend::SnapshotExclusiveFence>> {
         self.passive.acquire_snapshot_exclusive_fence().await
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
-    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
+    ) -> Result<Option<super::super::backend::SnapshotMutationFence>> {
         self.passive.acquire_snapshot_mutation_fence().await
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> WatchSignalReceiver {
         if true {
             self.passive.subscribe_watch_signals(topic)
         } else {
-            klights_watch::WatchSignalReceiver::closed()
+            WatchSignalReceiver::closed()
         }
     }
 
@@ -108,7 +109,7 @@ impl DatastoreBackend for SequencedDatastore {
 
     async fn replace_replicated_resource_state(
         &self,
-        _entries: Vec<crate::log_apply::LogApplyCommit>,
+        _entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         _current_rv: i64,
         _watch_event_high_water: Option<i64>,
         _watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -127,7 +128,7 @@ impl DatastoreBackend for SequencedDatastore {
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: crate::log_apply::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<super::super::raft::types::StorageCommandResult> {
         reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
@@ -148,14 +149,14 @@ impl DatastoreBackend for SequencedDatastore {
     ) -> Result<Resource> {
         if api_version == "v1"
             && kind == "Pod"
-            && crate::datastore::pod_serviceaccount::should_inject_serviceaccount_volume(
+            && super::super::pod_serviceaccount::should_inject_serviceaccount_volume(
                 self.passive.as_ref(),
                 &data,
                 namespace,
             )
             .await
         {
-            crate::datastore::pod_serviceaccount::inject_serviceaccount_volume(&mut data);
+            super::super::pod_serviceaccount::inject_serviceaccount_volume(&mut data);
         }
         let command = StorageCommand::CreateResource {
             api_version: api_version.to_string(),
@@ -546,7 +547,7 @@ impl DatastoreBackend for SequencedDatastore {
             )
         })?;
         match applied.applied_mutation {
-            Some(crate::datastore::raft::types::AppliedMutation::Resource(mut resource)) => {
+            Some(super::super::raft::types::AppliedMutation::Resource(mut resource)) => {
                 let Some(metadata) = std::sync::Arc::make_mut(&mut resource.data)
                     .pointer_mut("/metadata")
                     .and_then(serde_json::Value::as_object_mut)
@@ -960,12 +961,12 @@ impl DatastoreBackend for SequencedDatastore {
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
         let mode_value = match mode {
-            crate::controllers::annotations::NodePeerMode::Root => "root",
-            crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
+            klights_types::NodePeerMode::Root => "root",
+            klights_types::NodePeerMode::Rootless => "rootless",
         }
         .to_string();
         self.propose_command(StorageCommand::UpdateNodePeerAttributes {
@@ -978,7 +979,7 @@ impl DatastoreBackend for SequencedDatastore {
     }
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
         let command = StorageCommand::UpdateNodeDataplane {
             node_name: metadata.node_name.clone(),
@@ -995,7 +996,7 @@ impl DatastoreBackend for SequencedDatastore {
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         self.passive.get_node_dataplane(node_name).await
     }
 
@@ -1086,7 +1087,7 @@ impl DatastoreBackend for SequencedDatastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotMutationResult> {
         self.passive
             .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
             .await
@@ -1098,7 +1099,7 @@ impl DatastoreBackend for SequencedDatastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> Result<PodSlotClearResult> {
         self.passive
             .pod_slot_clear_if_uid(namespace, pod_name, pod_uid, node_name)
             .await
@@ -1285,16 +1286,6 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.list_applied_outbox().await
     }
 
-    async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> Result<bool> {
-        self.passive
-            .delete_uncommitted_applied_outbox_placeholder(idempotency_key, reserved_rv)
-            .await
-    }
-
     async fn apply_outbox_transactionally(
         &self,
         idempotency_key: &str,
@@ -1302,8 +1293,8 @@ impl DatastoreBackend for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
-        let command = match crate::storage_wire_codec::decode_command_protobuf(payload) {
-            Ok(command) => command,
+        let command = match crate::storage_wire_codec::decode_outbox_payload_protobuf(payload) {
+            Ok(payload) => payload.into_command(),
             Err(err) => {
                 return Err(OutboxDeliveryError::Retryable(err.to_string()));
             }
@@ -1326,8 +1317,9 @@ impl DatastoreBackend for SequencedDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
-        let command = crate::storage_wire_codec::decode_command_protobuf(payload)
-            .map_err(|err| OutboxDeliveryError::Retryable(err.to_string()))?;
+        let command = crate::storage_wire_codec::decode_outbox_payload_protobuf(payload)
+            .map_err(|err| OutboxDeliveryError::Retryable(err.to_string()))?
+            .into_command();
         if operation == NODE_LEASE_RENEW_OPERATION {
             crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
                 .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
@@ -1351,16 +1343,17 @@ impl DatastoreBackend for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::datastore::CommittedOutboxApply, OutboxDeliveryError> {
-        let command = crate::storage_wire_codec::decode_command_protobuf(payload)
-            .map_err(|err| OutboxDeliveryError::Retryable(err.to_string()))?;
+    ) -> std::result::Result<super::super::CommittedOutboxApply, OutboxDeliveryError> {
+        let command = crate::storage_wire_codec::decode_outbox_payload_protobuf(payload)
+            .map_err(|err| OutboxDeliveryError::Retryable(err.to_string()))?
+            .into_command();
         if operation == NODE_LEASE_RENEW_OPERATION {
             crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
                 .map_err(|err| OutboxDeliveryError::ConflictTerminal(err.to_string()))?;
-            return Ok(crate::datastore::CommittedOutboxApply::new(
+            return Ok(super::super::CommittedOutboxApply::new(
                 OutboxDeliveryResult::Applied { applied_rv: 0 },
-                crate::datastore::ResourceMutationEffect::Unchanged,
-                crate::datastore::PodEndpointEffect::NotApplicable,
+                super::super::ResourceMutationEffect::Unchanged,
+                super::super::PodEndpointEffect::NotApplicable,
             ));
         }
         self.proposal
@@ -1391,8 +1384,7 @@ impl DatastoreBackend for SequencedDatastore {
         operation: &str,
         payload: &[u8],
         authoring_node: &str,
-    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
-    {
+    ) -> std::result::Result<klights_cluster_core::BuildOutboxOutcome, OutboxDeliveryError> {
         self.passive
             .build_log_apply_commit_for_outbox(idempotency_key, operation, payload, authoring_node)
             .await
@@ -1405,8 +1397,7 @@ impl DatastoreBackend for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
-    {
+    ) -> std::result::Result<klights_cluster_core::BuildOutboxOutcome, OutboxDeliveryError> {
         self.passive
             .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
@@ -1448,7 +1439,7 @@ impl DatastoreBackend for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::ResourceStore for SequencedDatastore {
+impl super::super::ResourceStore for SequencedDatastore {
     async fn create_resource(
         &self,
         api_version: &str,
@@ -1457,7 +1448,7 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
         name: &str,
         data: Value,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::create_resource(
+        super::super::DatastoreBackend::create_resource(
             self,
             api_version,
             kind,
@@ -1475,8 +1466,7 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        crate::datastore::DatastoreBackend::get_resource(self, api_version, kind, namespace, name)
-            .await
+        super::super::DatastoreBackend::get_resource(self, api_version, kind, namespace, name).await
     }
 
     async fn delete_resource(
@@ -1486,14 +1476,8 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
+        super::super::DatastoreBackend::delete_resource(self, api_version, kind, namespace, name)
+            .await
     }
 
     async fn delete_resource_with_preconditions(
@@ -1504,7 +1488,7 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
         name: &str,
         preconditions: ResourcePreconditions,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_resource_with_preconditions(
+        super::super::DatastoreBackend::delete_resource_with_preconditions(
             self,
             api_version,
             kind,
@@ -1524,7 +1508,7 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
         data: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_resource(
+        super::super::DatastoreBackend::update_resource(
             self,
             api_version,
             kind,
@@ -1545,7 +1529,7 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
         data: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_resource_with_preconditions(
+        super::super::DatastoreBackend::update_resource_with_preconditions(
             self,
             api_version,
             kind,
@@ -1559,14 +1543,14 @@ impl crate::datastore::ResourceStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::CurrentResourceVersionStore for SequencedDatastore {
+impl super::super::CurrentResourceVersionStore for SequencedDatastore {
     async fn get_current_resource_version(&self) -> Result<i64> {
-        crate::datastore::DatastoreBackend::get_current_resource_version(self).await
+        super::super::DatastoreBackend::get_current_resource_version(self).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::ResourceListStore for SequencedDatastore {
+impl super::super::ResourceListStore for SequencedDatastore {
     async fn list_resources_page(
         &self,
         api_version: &str,
@@ -1576,7 +1560,7 @@ impl crate::datastore::ResourceListStore for SequencedDatastore {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        crate::datastore::DatastoreBackend::list_resources_page(
+        super::super::DatastoreBackend::list_resources_page(
             self,
             api_version,
             kind,
@@ -1594,7 +1578,7 @@ impl crate::datastore::ResourceListStore for SequencedDatastore {
         kind: String,
         namespaced: bool,
     ) -> Result<Vec<(Option<String>, String)>> {
-        crate::datastore::DatastoreBackend::list_resource_keys_for_scope(
+        super::super::DatastoreBackend::list_resource_keys_for_scope(
             self,
             api_version,
             kind,
@@ -1605,18 +1589,18 @@ impl crate::datastore::ResourceListStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::NamespaceStore for SequencedDatastore {
+impl super::super::NamespaceStore for SequencedDatastore {
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::create_namespace(self, name, data).await
+        super::super::DatastoreBackend::create_namespace(self, name, data).await
     }
 
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        crate::datastore::DatastoreBackend::get_namespace(self, name).await
+        super::super::DatastoreBackend::get_namespace(self, name).await
     }
 
     #[cfg(test)]
     async fn seed_namespace_for_test(&self, name: &str) {
-        crate::datastore::DatastoreBackend::seed_namespace_for_test(self, name).await
+        super::super::DatastoreBackend::seed_namespace_for_test(self, name).await
     }
 
     async fn list_namespaces(
@@ -1624,8 +1608,7 @@ impl crate::datastore::NamespaceStore for SequencedDatastore {
         label_selector: Option<&str>,
         field_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        crate::datastore::DatastoreBackend::list_namespaces(self, label_selector, field_selector)
-            .await
+        super::super::DatastoreBackend::list_namespaces(self, label_selector, field_selector).await
     }
 
     async fn list_namespaces_page(
@@ -1634,7 +1617,7 @@ impl crate::datastore::NamespaceStore for SequencedDatastore {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        crate::datastore::DatastoreBackend::list_namespaces_page(
+        super::super::DatastoreBackend::list_namespaces_page(
             self,
             label_selector,
             field_selector,
@@ -1649,31 +1632,31 @@ impl crate::datastore::NamespaceStore for SequencedDatastore {
         data: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_namespace(self, name, data, expected_rv).await
+        super::super::DatastoreBackend::update_namespace(self, name, data, expected_rv).await
     }
 
     async fn delete_namespace(&self, name: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_namespace(self, name).await
+        super::super::DatastoreBackend::delete_namespace(self, name).await
     }
 
     async fn delete_namespace_observed_rv(&self, name: &str) -> Result<i64> {
-        crate::datastore::DatastoreBackend::delete_namespace_observed_rv(self, name).await
+        super::super::DatastoreBackend::delete_namespace_observed_rv(self, name).await
     }
 
     async fn delete_namespace_contents(&self, name: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_namespace_contents(self, name).await
+        super::super::DatastoreBackend::delete_namespace_contents(self, name).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::WatchHistoryStore for SequencedDatastore {
+impl super::super::WatchHistoryStore for SequencedDatastore {
     async fn list_cluster_resources_modified_since(
         &self,
         api_version: &str,
         kind: &str,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        crate::datastore::DatastoreBackend::list_cluster_resources_modified_since(
+        super::super::DatastoreBackend::list_cluster_resources_modified_since(
             self,
             api_version,
             kind,
@@ -1689,7 +1672,7 @@ impl crate::datastore::WatchHistoryStore for SequencedDatastore {
         namespace: Option<&str>,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        crate::datastore::DatastoreBackend::list_resources_modified_since(
+        super::super::DatastoreBackend::list_resources_modified_since(
             self,
             api_version,
             kind,
@@ -1700,7 +1683,7 @@ impl crate::datastore::WatchHistoryStore for SequencedDatastore {
     }
 
     async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        crate::datastore::DatastoreBackend::list_all_watch_events_since(self, since_rv).await
+        super::super::DatastoreBackend::list_all_watch_events_since(self, since_rv).await
     }
 
     async fn list_all_watch_events_since_paged(
@@ -1710,7 +1693,7 @@ impl crate::datastore::WatchHistoryStore for SequencedDatastore {
         after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        crate::datastore::DatastoreBackend::list_all_watch_events_since_paged(
+        super::super::DatastoreBackend::list_all_watch_events_since_paged(
             self,
             since_rv,
             after_resource_version,
@@ -1721,7 +1704,7 @@ impl crate::datastore::WatchHistoryStore for SequencedDatastore {
     }
 
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
-        crate::datastore::DatastoreBackend::list_watch_replay_floors(self).await
+        super::super::DatastoreBackend::list_watch_replay_floors(self).await
     }
 
     async fn list_watch_replay_floors_paged(
@@ -1729,33 +1712,31 @@ impl crate::datastore::WatchHistoryStore for SequencedDatastore {
         after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<WatchReplayFloor>> {
-        crate::datastore::DatastoreBackend::list_watch_replay_floors_paged(self, after, limit).await
+        super::super::DatastoreBackend::list_watch_replay_floors_paged(self, after, limit).await
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        crate::datastore::DatastoreBackend::list_deleted_watch_events_since(self, since_rv).await
+        super::super::DatastoreBackend::list_deleted_watch_events_since(self, since_rv).await
     }
 
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
-        crate::datastore::DatastoreBackend::advance_resource_version_after(self, min_rv).await
+        super::super::DatastoreBackend::advance_resource_version_after(self, min_rv).await
     }
 
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        crate::datastore::DatastoreBackend::watch_events_gc_prunable_count(
-            self, max_rows, batch_cap,
-        )
-        .await
+        super::super::DatastoreBackend::watch_events_gc_prunable_count(self, max_rows, batch_cap)
+            .await
     }
 
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        crate::datastore::DatastoreBackend::gc_watch_events(self, max_rows, batch_cap).await
+        super::super::DatastoreBackend::gc_watch_events(self, max_rows, batch_cap).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::NamespaceContentStore for SequencedDatastore {
+impl super::super::NamespaceContentStore for SequencedDatastore {
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await
+        super::super::DatastoreBackend::list_namespace_resources(self, namespace).await
     }
 
     async fn list_namespace_resources_of_kind(
@@ -1763,7 +1744,7 @@ impl crate::datastore::NamespaceContentStore for SequencedDatastore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_namespace_resources_of_kind(self, namespace, kind)
+        super::super::DatastoreBackend::list_namespace_resources_of_kind(self, namespace, kind)
             .await
     }
 
@@ -1772,25 +1753,25 @@ impl crate::datastore::NamespaceContentStore for SequencedDatastore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_namespace_resources_excluding_kind(
+        super::super::DatastoreBackend::list_namespace_resources_excluding_kind(
             self, namespace, kind,
         )
         .await
     }
 
     async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
-        crate::datastore::DatastoreBackend::count_namespace_resources(self, namespace).await
+        super::super::DatastoreBackend::count_namespace_resources(self, namespace).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::OwnershipStore for SequencedDatastore {
+impl super::super::OwnershipStore for SequencedDatastore {
     async fn find_owned_resources(
         &self,
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::find_owned_resources(self, owner_uid, namespace).await
+        super::super::DatastoreBackend::find_owned_resources(self, owner_uid, namespace).await
     }
 
     async fn list_resources_by_owner_uid(
@@ -1800,7 +1781,7 @@ impl crate::datastore::OwnershipStore for SequencedDatastore {
         namespace: Option<&str>,
         owner_uid: &str,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_resources_by_owner_uid(
+        super::super::DatastoreBackend::list_resources_by_owner_uid(
             self,
             api_version,
             kind,
@@ -1817,7 +1798,7 @@ impl crate::datastore::OwnershipStore for SequencedDatastore {
         owner_kind: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::find_owned_by_name_kind_empty_uid(
+        super::super::DatastoreBackend::find_owned_by_name_kind_empty_uid(
             self,
             owner_api_version,
             owner_name,
@@ -1829,7 +1810,7 @@ impl crate::datastore::OwnershipStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::StatusStore for SequencedDatastore {
+impl super::super::StatusStore for SequencedDatastore {
     async fn update_status_only(
         &self,
         api_version: &str,
@@ -1839,7 +1820,7 @@ impl crate::datastore::StatusStore for SequencedDatastore {
         status: Value,
         expected_rv: Option<i64>,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_status_only(
+        super::super::DatastoreBackend::update_status_only(
             self,
             api_version,
             kind,
@@ -1860,7 +1841,7 @@ impl crate::datastore::StatusStore for SequencedDatastore {
         status: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_status_only_with_preconditions(
+        super::super::DatastoreBackend::update_status_only_with_preconditions(
             self,
             api_version,
             kind,
@@ -1874,18 +1855,18 @@ impl crate::datastore::StatusStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::MetaStore for SequencedDatastore {
+impl super::super::MetaStore for SequencedDatastore {
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
+        super::super::DatastoreBackend::get_klights_meta(self, key).await
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::set_klights_meta(self, key, value).await
+        super::super::DatastoreBackend::set_klights_meta(self, key, value).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::NetworkStore for SequencedDatastore {
+impl super::super::NetworkStore for SequencedDatastore {
     async fn record_sandbox(
         &self,
         namespace: &str,
@@ -1893,18 +1874,18 @@ impl crate::datastore::NetworkStore for SequencedDatastore {
         pod_uid: &str,
         sandbox_id: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::record_sandbox(
+        super::super::DatastoreBackend::record_sandbox(
             self, namespace, pod_name, pod_uid, sandbox_id,
         )
         .await
     }
 
     async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        crate::datastore::DatastoreBackend::get_sandbox(self, namespace, pod_name).await
+        super::super::DatastoreBackend::get_sandbox(self, namespace, pod_name).await
     }
 
     async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_sandbox(self, namespace, pod_name).await
+        super::super::DatastoreBackend::delete_sandbox(self, namespace, pod_name).await
     }
 
     async fn delete_sandbox_for_uid(
@@ -1914,33 +1895,33 @@ impl crate::datastore::NetworkStore for SequencedDatastore {
         pod_uid: &str,
         sandbox_id: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_sandbox_for_uid(
+        super::super::DatastoreBackend::delete_sandbox_for_uid(
             self, namespace, pod_name, pod_uid, sandbox_id,
         )
         .await
     }
 
     async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_pod_network(self, sandbox_id).await
+        super::super::DatastoreBackend::delete_pod_network(self, sandbox_id).await
     }
 
     async fn get_pod_network(
         &self,
         sandbox_id: &str,
-    ) -> Result<Option<crate::datastore::PodNetworkEndpoint>> {
-        crate::datastore::DatastoreBackend::get_pod_network(self, sandbox_id).await
+    ) -> Result<Option<super::super::PodNetworkEndpoint>> {
+        super::super::DatastoreBackend::get_pod_network(self, sandbox_id).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
+impl super::super::NetworkMetadataStore for SequencedDatastore {
     async fn get_sandbox_for_uid(
         &self,
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<Option<String>> {
-        crate::datastore::DatastoreBackend::get_sandbox_for_uid(self, namespace, pod_name, pod_uid)
+        super::super::DatastoreBackend::get_sandbox_for_uid(self, namespace, pod_name, pod_uid)
             .await
     }
 
@@ -1949,11 +1930,9 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
-    ) -> Result<Option<crate::datastore::PodNetworkEndpoint>> {
-        crate::datastore::DatastoreBackend::get_pod_network_for_pod(
-            self, namespace, pod_name, pod_uid,
-        )
-        .await
+    ) -> Result<Option<super::super::PodNetworkEndpoint>> {
+        super::super::DatastoreBackend::get_pod_network_for_pod(self, namespace, pod_name, pod_uid)
+            .await
     }
 
     async fn ipam_allocate_and_record_pod_network(
@@ -1965,7 +1944,7 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
         veth_host: &str,
         netns_path: &str,
     ) -> Result<(String, u32)> {
-        crate::datastore::DatastoreBackend::ipam_allocate_and_record_pod_network(
+        super::super::DatastoreBackend::ipam_allocate_and_record_pod_network(
             self,
             sandbox_id,
             pod,
@@ -1977,12 +1956,12 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
         .await
     }
 
-    async fn list_sandboxes(&self) -> Result<Vec<crate::datastore::SandboxRef>> {
-        crate::datastore::DatastoreBackend::list_sandboxes(self).await
+    async fn list_sandboxes(&self) -> Result<Vec<super::super::SandboxRef>> {
+        super::super::DatastoreBackend::list_sandboxes(self).await
     }
 
     async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        crate::datastore::DatastoreBackend::list_pod_network_sandbox_ids(self).await
+        super::super::DatastoreBackend::list_pod_network_sandbox_ids(self).await
     }
 
     async fn allocate_node_subnet(
@@ -1990,23 +1969,18 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<crate::datastore::NodeSubnet> {
-        crate::datastore::DatastoreBackend::allocate_node_subnet(
-            self,
-            node_name,
-            cluster_cidr,
-            node_ip,
-        )
-        .await
+    ) -> Result<super::super::NodeSubnet> {
+        super::super::DatastoreBackend::allocate_node_subnet(self, node_name, cluster_cidr, node_ip)
+            .await
     }
 
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
-        mode: crate::controllers::annotations::NodePeerMode,
-        hostport_range: Option<crate::networking::types::HostPortRange>,
+        mode: klights_types::NodePeerMode,
+        hostport_range: Option<klights_types::HostPortRange>,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::update_node_peer_attributes(
+        super::super::DatastoreBackend::update_node_peer_attributes(
             self,
             node_name,
             mode,
@@ -2017,56 +1991,50 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
 
     async fn update_node_dataplane(
         &self,
-        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+        metadata: klights_cluster_store::DataplanePeerMetadata,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::update_node_dataplane(self, metadata).await
+        super::super::DatastoreBackend::update_node_dataplane(self, metadata).await
     }
 
     async fn get_node_dataplane(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-        crate::datastore::DatastoreBackend::get_node_dataplane(self, node_name).await
+    ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
+        super::super::DatastoreBackend::get_node_dataplane(self, node_name).await
     }
 
-    async fn get_node_subnet(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<crate::datastore::NodeSubnet>> {
-        crate::datastore::DatastoreBackend::get_node_subnet(self, node_name).await
+    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<super::super::NodeSubnet>> {
+        super::super::DatastoreBackend::get_node_subnet(self, node_name).await
     }
 
-    async fn list_peer_subnets(
-        &self,
-        my_node_name: &str,
-    ) -> Result<Vec<crate::datastore::NodeSubnet>> {
-        crate::datastore::DatastoreBackend::list_peer_subnets(self, my_node_name).await
+    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<super::super::NodeSubnet>> {
+        super::super::DatastoreBackend::list_peer_subnets(self, my_node_name).await
     }
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_node_subnet(self, node_name).await
+        super::super::DatastoreBackend::delete_node_subnet(self, node_name).await
     }
 
     async fn pod_endpoint_get_by_pod_ip(
         &self,
         pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<crate::datastore::PodEndpointRow>> {
-        crate::datastore::DatastoreBackend::pod_endpoint_get_by_pod_ip(self, pod_ip).await
+    ) -> Result<Option<super::super::PodEndpointRow>> {
+        super::super::DatastoreBackend::pod_endpoint_get_by_pod_ip(self, pod_ip).await
     }
 
-    async fn pod_endpoint_list_all(&self) -> Result<Vec<crate::datastore::PodEndpointRow>> {
-        crate::datastore::DatastoreBackend::pod_endpoint_list_all(self).await
+    async fn pod_endpoint_list_all(&self) -> Result<Vec<super::super::PodEndpointRow>> {
+        super::super::DatastoreBackend::pod_endpoint_list_all(self).await
     }
 
     fn subscribe_pod_endpoints(
         &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::datastore::PodEndpointEvent> {
-        crate::datastore::DatastoreBackend::subscribe_pod_endpoints(self)
+    ) -> tokio::sync::broadcast::Receiver<super::super::PodEndpointEvent> {
+        super::super::DatastoreBackend::subscribe_pod_endpoints(self)
     }
 }
 
 #[async_trait]
-impl crate::datastore::PodWorkqueueStore for SequencedDatastore {
+impl super::super::PodWorkqueueStore for SequencedDatastore {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -2076,7 +2044,7 @@ impl crate::datastore::PodWorkqueueStore for SequencedDatastore {
         min_delay_ms: i64,
         last_error: Option<&str>,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_enqueue(
+        super::super::DatastoreBackend::pod_workqueue_enqueue(
             self,
             kind,
             pod,
@@ -2089,15 +2057,15 @@ impl crate::datastore::PodWorkqueueStore for SequencedDatastore {
     }
 
     async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        crate::datastore::DatastoreBackend::pod_workqueue_peek_next_due(self).await
+        super::super::DatastoreBackend::pod_workqueue_peek_next_due(self).await
     }
 
     async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        crate::datastore::DatastoreBackend::pod_workqueue_claim_due(self, now_ms).await
+        super::super::DatastoreBackend::pod_workqueue_claim_due(self, now_ms).await
     }
 
     async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_complete(self, id).await
+        super::super::DatastoreBackend::pod_workqueue_complete(self, id).await
     }
 
     async fn pod_workqueue_record_failure(
@@ -2106,34 +2074,29 @@ impl crate::datastore::PodWorkqueueStore for SequencedDatastore {
         min_delay_ms: i64,
         error: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_record_failure(
-            self,
-            row,
-            min_delay_ms,
-            error,
-        )
-        .await
+        super::super::DatastoreBackend::pod_workqueue_record_failure(self, row, min_delay_ms, error)
+            .await
     }
 
     async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_dead_letter(self, id, error).await
+        super::super::DatastoreBackend::pod_workqueue_dead_letter(self, id, error).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::ReplicationStore for SequencedDatastore {
+impl super::super::ReplicationStore for SequencedDatastore {
     #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
         meta: CommandMeta,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_replicated_command(self, command, meta).await
+        super::super::DatastoreBackend::apply_replicated_command(self, command, meta).await
     }
 
     async fn replace_replicated_resource_state(
         &self,
-        _entries: Vec<crate::log_apply::LogApplyCommit>,
+        _entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
         _current_rv: i64,
         _watch_event_high_water: Option<i64>,
         _watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -2152,7 +2115,7 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: crate::log_apply::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+    ) -> Result<super::super::raft::types::StorageCommandResult> {
         reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
@@ -2164,7 +2127,7 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
     }
 
     async fn current_log_apply_index(&self) -> Result<i64> {
-        crate::datastore::DatastoreBackend::current_log_apply_index(self).await
+        super::super::DatastoreBackend::current_log_apply_index(self).await
     }
 
     #[cfg(test)]
@@ -2177,7 +2140,7 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
         data: Value,
         options: ReplicatedCreateOptions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::apply_replicated_create_resource(
+        super::super::DatastoreBackend::apply_replicated_create_resource(
             self,
             api_version,
             kind,
@@ -2191,32 +2154,32 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
+impl super::super::DurableRecoveryStore for SequencedDatastore {
     async fn read_durable_allocator_observation(
         &self,
-    ) -> Result<crate::datastore::DurableAllocatorObservation> {
-        crate::datastore::DatastoreBackend::read_durable_allocator_observation(self).await
+    ) -> Result<super::super::DurableAllocatorObservation> {
+        super::super::DatastoreBackend::read_durable_allocator_observation(self).await
     }
 
     async fn read_cluster_metadata_observation(
         &self,
-    ) -> Result<crate::datastore::ClusterMetadataObservation> {
-        crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
+    ) -> Result<super::super::ClusterMetadataObservation> {
+        super::super::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
 
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
+        super::super::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
     }
 
     async fn begin_pinned_snapshot_capture_with_anchor(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
+        anchor: &dyn super::super::backend::SnapshotCaptureAnchor,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
+        super::super::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
             self, request, anchor,
         )
         .await
@@ -2224,37 +2187,37 @@ impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::BackendLifecycleStore for SequencedDatastore {
+impl super::super::BackendLifecycleStore for SequencedDatastore {
     async fn acquire_snapshot_exclusive_fence(
         &self,
-    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
-        crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self).await
+    ) -> Result<Option<super::super::backend::SnapshotExclusiveFence>> {
+        super::super::DatastoreBackend::acquire_snapshot_exclusive_fence(self).await
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
-    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
-        crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(self).await
+    ) -> Result<Option<super::super::backend::SnapshotMutationFence>> {
+        super::super::DatastoreBackend::acquire_snapshot_mutation_fence(self).await
     }
 
     fn close(&self) {
-        crate::datastore::DatastoreBackend::close(self);
+        super::super::DatastoreBackend::close(self);
     }
 }
 
 #[cfg(test)]
-impl crate::datastore::TestWatchStore for SequencedDatastore {
+impl super::super::TestWatchStore for SequencedDatastore {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
-        crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
+        super::super::DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
-        crate::datastore::DatastoreBackend::broadcast_watch_event(self, pending);
+        super::super::DatastoreBackend::broadcast_watch_event(self, pending);
     }
 }
 
 #[async_trait]
-impl crate::datastore::ClusterResourceQueryStore for SequencedDatastore {
+impl super::super::ClusterResourceQueryStore for SequencedDatastore {
     async fn list_resources(
         &self,
         api_version: &str,
@@ -2262,14 +2225,8 @@ impl crate::datastore::ClusterResourceQueryStore for SequencedDatastore {
         namespace: Option<&str>,
         query: ResourceListQuery<'_>,
     ) -> Result<ResourceList> {
-        crate::datastore::DatastoreBackend::list_resources(
-            self,
-            api_version,
-            kind,
-            namespace,
-            query,
-        )
-        .await
+        super::super::DatastoreBackend::list_resources(self, api_version, kind, namespace, query)
+            .await
     }
 
     async fn list_resources_for_watch_targets(
@@ -2277,7 +2234,7 @@ impl crate::datastore::ClusterResourceQueryStore for SequencedDatastore {
         targets: &[WatchTarget],
         label_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        crate::datastore::DatastoreBackend::list_resources_for_watch_targets(
+        super::super::DatastoreBackend::list_resources_for_watch_targets(
             self,
             targets,
             label_selector,
@@ -2286,12 +2243,12 @@ impl crate::datastore::ClusterResourceQueryStore for SequencedDatastore {
     }
 
     async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_cluster_resources(self).await
+        super::super::DatastoreBackend::list_cluster_resources(self).await
     }
 }
 
 #[async_trait]
-impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
+impl super::super::LeaderResourceMutationStore for SequencedDatastore {
     async fn update_main_resource_with_preconditions(
         &self,
         api_version: &str,
@@ -2301,7 +2258,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
         data: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_main_resource_with_preconditions(
+        super::super::DatastoreBackend::update_main_resource_with_preconditions(
             self,
             api_version,
             kind,
@@ -2314,7 +2271,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_resource_batch(self, operations).await
+        super::super::DatastoreBackend::apply_resource_batch(self, operations).await
     }
 
     async fn delete_resource_with_preconditions_observed_rv(
@@ -2325,7 +2282,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
         name: &str,
         preconditions: ResourcePreconditions,
     ) -> Result<i64> {
-        crate::datastore::DatastoreBackend::delete_resource_with_preconditions_observed_rv(
+        super::super::DatastoreBackend::delete_resource_with_preconditions_observed_rv(
             self,
             api_version,
             kind,
@@ -2345,7 +2302,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
         preconditions: ResourcePreconditions,
         grace_seconds: i64,
     ) -> Result<Option<Resource>> {
-        crate::datastore::DatastoreBackend::mark_for_delete_without_watch(
+        super::super::DatastoreBackend::mark_for_delete_without_watch(
             self,
             api_version,
             kind,
@@ -2366,7 +2323,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
         preconditions: ResourcePreconditions,
         grace_seconds: i64,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::delete_resource_without_watch_with_tombstone(
+        super::super::DatastoreBackend::delete_resource_without_watch_with_tombstone(
             self,
             api_version,
             kind,
@@ -2387,7 +2344,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
         patch_kind: PatchKind,
         patch: Value,
     ) -> Result<Option<Resource>> {
-        crate::datastore::DatastoreBackend::patch_resource_latest(
+        super::super::DatastoreBackend::patch_resource_latest(
             self,
             api_version,
             kind,
@@ -2407,7 +2364,7 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
         name: &str,
         request: ResourcePatchRequest,
     ) -> Result<Option<Resource>> {
-        crate::datastore::DatastoreBackend::patch_resource_latest_with_preconditions(
+        super::super::DatastoreBackend::patch_resource_latest_with_preconditions(
             self,
             api_version,
             kind,
@@ -2420,14 +2377,14 @@ impl crate::datastore::LeaderResourceMutationStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::WatchMaintenanceStore for SequencedDatastore {
+impl super::super::WatchMaintenanceStore for SequencedDatastore {
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<crate::datastore::WatchReplayRead<RawWatchEvent>> {
-        crate::datastore::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
+    ) -> Result<super::super::WatchReplayRead<RawWatchEvent>> {
+        super::super::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
             self, targets, since_rv, limit,
         )
         .await
@@ -2441,7 +2398,7 @@ impl crate::datastore::WatchMaintenanceStore for SequencedDatastore {
         query: ResourceListQuery<'_>,
         snapshot_rv: i64,
     ) -> Result<SnapshotAtRv> {
-        crate::datastore::DatastoreBackend::snapshot_resources_at_rv(
+        super::super::DatastoreBackend::snapshot_resources_at_rv(
             self,
             api_version,
             kind,
@@ -2458,7 +2415,7 @@ impl crate::datastore::WatchMaintenanceStore for SequencedDatastore {
         through_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        crate::datastore::DatastoreBackend::list_all_watch_events_after_id_bounded(
+        super::super::DatastoreBackend::list_all_watch_events_after_id_bounded(
             self, after_id, through_id, limit,
         )
         .await
@@ -2466,7 +2423,7 @@ impl crate::datastore::WatchMaintenanceStore for SequencedDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::PodCleanupStore for SequencedDatastore {
+impl super::super::PodCleanupStore for SequencedDatastore {
     async fn move_pod_to_cleanup_intent(
         &self,
         node_name: &str,
@@ -2475,7 +2432,7 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::move_pod_to_cleanup_intent(
+        super::super::DatastoreBackend::move_pod_to_cleanup_intent(
             self, node_name, namespace, pod_name, pod_uid, reason,
         )
         .await
@@ -2485,7 +2442,7 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
         &self,
         node_name: &str,
     ) -> Result<Vec<PodCleanupIntent>> {
-        crate::datastore::DatastoreBackend::list_pod_cleanup_intents_for_node(self, node_name).await
+        super::super::DatastoreBackend::list_pod_cleanup_intents_for_node(self, node_name).await
     }
 
     async fn delete_pod_cleanup_intent(
@@ -2496,15 +2453,14 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_pod_cleanup_intent(
+        super::super::DatastoreBackend::delete_pod_cleanup_intent(
             self, node_name, namespace, pod_name, pod_uid, reason,
         )
         .await
     }
 
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_pod_cleanup_intents_for_node(self, node_name)
-            .await
+        super::super::DatastoreBackend::delete_pod_cleanup_intents_for_node(self, node_name).await
     }
 
     async fn pod_slot_try_admit(
@@ -2514,7 +2470,7 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<PodSlotAdmissionResult> {
-        crate::datastore::DatastoreBackend::pod_slot_try_admit(
+        super::super::DatastoreBackend::pod_slot_try_admit(
             self, namespace, pod_name, pod_uid, node_name,
         )
         .await
@@ -2526,8 +2482,8 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_slot_mark_terminating(
+    ) -> Result<PodSlotMutationResult> {
+        super::super::DatastoreBackend::pod_slot_mark_terminating(
             self, namespace, pod_name, pod_uid, node_name,
         )
         .await
@@ -2539,28 +2495,28 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
         pod_name: &str,
         pod_uid: &str,
         node_name: &str,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_slot_clear_if_uid(
+    ) -> Result<PodSlotClearResult> {
+        super::super::DatastoreBackend::pod_slot_clear_if_uid(
             self, namespace, pod_name, pod_uid, node_name,
         )
         .await
     }
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        crate::datastore::DatastoreBackend::subscribe_pod_slot_admissions(self)
+        super::super::DatastoreBackend::subscribe_pod_slot_admissions(self)
     }
 }
 
 #[async_trait]
-impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
+impl super::super::AppliedOutboxStore for SequencedDatastore {
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
-        crate::datastore::DatastoreBackend::applied_outbox_gc_prunable_count(self, cutoff_ms).await
+        super::super::DatastoreBackend::applied_outbox_gc_prunable_count(self, cutoff_ms).await
     }
 
     async fn list_outbox_stream_watermarks(
         &self,
     ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
-        crate::datastore::DatastoreBackend::list_outbox_stream_watermarks(self).await
+        super::super::DatastoreBackend::list_outbox_stream_watermarks(self).await
     }
 
     async fn list_outbox_stream_watermarks_paged(
@@ -2568,7 +2524,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
-        crate::datastore::DatastoreBackend::list_outbox_stream_watermarks_paged(self, after, limit)
+        super::super::DatastoreBackend::list_outbox_stream_watermarks_paged(self, after, limit)
             .await
     }
 
@@ -2576,15 +2532,15 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         &self,
         idempotency_key: &str,
     ) -> Result<Option<AppliedOutboxRecord>> {
-        crate::datastore::DatastoreBackend::get_applied_outbox(self, idempotency_key).await
+        super::super::DatastoreBackend::get_applied_outbox(self, idempotency_key).await
     }
 
     async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
-        crate::datastore::DatastoreBackend::insert_applied_outbox(self, record).await
+        super::super::DatastoreBackend::insert_applied_outbox(self, record).await
     }
 
     async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
-        crate::datastore::DatastoreBackend::list_applied_outbox(self).await
+        super::super::DatastoreBackend::list_applied_outbox(self).await
     }
 
     async fn list_applied_outbox_paged(
@@ -2592,20 +2548,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<AppliedOutboxRecord>> {
-        crate::datastore::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
-    }
-
-    async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> Result<bool> {
-        crate::datastore::DatastoreBackend::delete_uncommitted_applied_outbox_placeholder(
-            self,
-            idempotency_key,
-            reserved_rv,
-        )
-        .await
+        super::super::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
     }
 
     async fn apply_outbox_transactionally(
@@ -2615,7 +2558,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
     ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
-        crate::datastore::DatastoreBackend::apply_outbox_transactionally(
+        super::super::DatastoreBackend::apply_outbox_transactionally(
             self,
             idempotency_key,
             operation,
@@ -2633,7 +2576,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
-        crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark(
+        super::super::DatastoreBackend::apply_outbox_transactionally_with_watermark(
             self,
             idempotency_key,
             operation,
@@ -2651,8 +2594,8 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::datastore::CommittedOutboxApply, OutboxDeliveryError> {
-        crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
+    ) -> std::result::Result<super::super::CommittedOutboxApply, OutboxDeliveryError> {
+        super::super::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
             self,
             idempotency_key,
             operation,
@@ -2669,7 +2612,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         operation: &str,
         authoring_node: &str,
     ) -> Result<crate::log_apply::LogApplyCommit> {
-        crate::datastore::DatastoreBackend::build_log_apply_commit_for_command(
+        super::super::DatastoreBackend::build_log_apply_commit_for_command(
             self,
             command,
             operation,
@@ -2684,9 +2627,8 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         operation: &str,
         payload: &[u8],
         authoring_node: &str,
-    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
-    {
-        crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox(
+    ) -> std::result::Result<klights_cluster_core::BuildOutboxOutcome, OutboxDeliveryError> {
+        super::super::DatastoreBackend::build_log_apply_commit_for_outbox(
             self,
             idempotency_key,
             operation,
@@ -2703,9 +2645,8 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::datastore::sqlite::BuildOutboxOutcome, OutboxDeliveryError>
-    {
-        crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox_with_watermark(
+    ) -> std::result::Result<klights_cluster_core::BuildOutboxOutcome, OutboxDeliveryError> {
+        super::super::DatastoreBackend::build_log_apply_commit_for_outbox_with_watermark(
             self,
             idempotency_key,
             operation,
@@ -2717,6 +2658,6 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        crate::datastore::DatastoreBackend::gc_applied_outbox(self, now_ms, ttl_ms).await
+        super::super::DatastoreBackend::gc_applied_outbox(self, now_ms, ttl_ms).await
     }
 }

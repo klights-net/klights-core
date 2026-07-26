@@ -65,7 +65,7 @@ impl NodeSubnetAllocator {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<crate::networking::PodSubnet> {
+    ) -> Result<klights_types::PodSubnet> {
         let max_attempts = self.retry.max_attempts.max(1);
         let mut attempt = 1usize;
 
@@ -74,7 +74,7 @@ impl NodeSubnetAllocator {
                 .map_err(anyhow::Error::new)?;
             match self.allocation.allocate_node_subnet(request).await {
                 Ok(result) => {
-                    return crate::networking::PodSubnet::parse(result.into_subnet().subnet())
+                    return klights_types::PodSubnet::parse(result.into_subnet().subnet())
                         .map_err(anyhow::Error::msg);
                 }
                 Err(err) => {
@@ -104,12 +104,12 @@ impl NodeSubnetAllocator {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<crate::networking::PodSubnet> {
+    ) -> Result<klights_types::PodSubnet> {
         let query = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
         match self.topology.get_node_subnet(query).await {
             Ok(result) if result.as_ref().is_some() => {
                 let subnet =
-                    crate::networking::PodSubnet::parse(result.as_ref().expect("checked").subnet())
+                    klights_types::PodSubnet::parse(result.as_ref().expect("checked").subnet())
                         .map_err(anyhow::Error::msg)?;
                 tracing::info!(
                     node = node_name,
@@ -149,13 +149,13 @@ mod tests {
     use super::*;
     use crate::control_plane::client::focused_node_subnet;
     use crate::datastore::NodeSubnet;
-    use crate::networking::{NodeName, PodSubnet};
     use klights_leader_api::{
         NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
         NodeSubnetAllocationFuture, NodeSubnetAllocationResult, NodeSubnetResult, PeerSubnetsQuery,
         PeerSubnetsResult,
     };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_types::{NodeName, PodSubnet};
     use std::collections::VecDeque;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
