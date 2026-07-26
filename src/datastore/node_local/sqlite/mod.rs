@@ -288,10 +288,13 @@ impl SqliteNodeLocalDb {
         let node_name = node_name.to_string();
         let now = now_ms();
         self.db_call("node_local:pod_runtime_admit", move |conn| {
-            conn.execute(
+            let updated = conn.execute(
                 queries::POD_RUNTIME_ADMIT,
                 rusqlite::params![pod_uid, namespace, pod_name, node_name, now],
             )?;
+            if updated != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
+            }
             Ok(())
         })
         .await
@@ -561,18 +564,32 @@ impl SqliteNodeLocalDb {
         Ok(result)
     }
 
-    pub async fn record_sandbox(&self, pod_uid: &str, sandbox_id: &str) -> Result<()> {
+    pub async fn record_owned_sandbox(
+        &self,
+        pod_uid: &str,
+        namespace: &str,
+        pod_name: &str,
+        node_name: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
         let pod_uid = pod_uid.to_string();
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+        let node_name = node_name.to_string();
         let sandbox_id = sandbox_id.to_string();
-        self.db_call("node_local:pod_runtime_record_sandbox", move |conn| {
-            conn.execute(
-                queries::POD_RUNTIME_RECORD_SANDBOX,
-                rusqlite::params![pod_uid, sandbox_id],
+        let now = now_ms();
+        self.db_call("node_local:pod_runtime_record_owned_sandbox", move |conn| {
+            let updated = conn.execute(
+                queries::POD_RUNTIME_RECORD_OWNED_SANDBOX,
+                rusqlite::params![pod_uid, namespace, pod_name, node_name, sandbox_id, now],
             )?;
+            if updated != 1 {
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
+            }
             Ok(())
         })
         .await
-        .map_err(|e| anyhow!("pod_runtime record sandbox failed: {e}"))
+        .map_err(|e| anyhow!("pod_runtime record owned sandbox failed: {e}"))
     }
 
     pub async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()> {

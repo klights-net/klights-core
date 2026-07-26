@@ -118,7 +118,14 @@ pub trait NodeLocalBackend: Send + Sync {
         pod_name: &str,
         node_name: &str,
     ) -> Result<()>;
-    async fn record_sandbox(&self, pod_uid: &str, sandbox_id: &str) -> Result<()>;
+    async fn record_owned_sandbox(
+        &self,
+        pod_uid: &str,
+        namespace: &str,
+        pod_name: &str,
+        node_name: &str,
+        sandbox_id: &str,
+    ) -> Result<()>;
     async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()>;
     async fn delete_pod_runtime_for_uid(&self, pod_uid: &str) -> Result<()>;
     async fn get_pod_runtime(&self, pod_uid: &str) -> Result<Option<PodRuntimeRow>>;
@@ -432,8 +439,18 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         SqliteNodeLocalDb::admit_pod_runtime(self, pod_uid, namespace, pod_name, node_name).await
     }
 
-    async fn record_sandbox(&self, pod_uid: &str, sandbox_id: &str) -> Result<()> {
-        SqliteNodeLocalDb::record_sandbox(self, pod_uid, sandbox_id).await
+    async fn record_owned_sandbox(
+        &self,
+        pod_uid: &str,
+        namespace: &str,
+        pod_name: &str,
+        node_name: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        SqliteNodeLocalDb::record_owned_sandbox(
+            self, pod_uid, namespace, pod_name, node_name, sandbox_id,
+        )
+        .await
     }
 
     async fn record_cgroup(&self, pod_uid: &str, cgroup_path: &str) -> Result<()> {

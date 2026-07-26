@@ -209,38 +209,46 @@ impl PodRuntimeAdmission {
     }
 }
 
-/// UID-qualified sandbox update for an admitted runtime row.
+/// UID-qualified runtime ownership and sandbox record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PodRuntimeSandbox {
-    pod_uid: String,
+    pod: PodIdentity,
+    node_name: String,
     sandbox_id: String,
 }
 
 impl PodRuntimeSandbox {
     pub fn try_new(
-        pod_uid: impl Into<String>,
+        pod: PodIdentity,
+        node_name: impl Into<String>,
         sandbox_id: impl Into<String>,
     ) -> Result<Self, RuntimeWorkError> {
-        let pod_uid = pod_uid.into();
+        let node_name = node_name.into();
         let sandbox_id = sandbox_id.into();
-        require_nonempty(&pod_uid, "pod_uid")?;
+        validate_pod_identity(&pod)?;
+        require_nonempty(&node_name, "node_name")?;
         require_nonempty(&sandbox_id, "sandbox_id")?;
         Ok(Self {
-            pod_uid,
+            pod,
+            node_name,
             sandbox_id,
         })
     }
 
-    pub fn pod_uid(&self) -> &str {
-        &self.pod_uid
+    pub const fn pod(&self) -> &PodIdentity {
+        &self.pod
+    }
+
+    pub fn node_name(&self) -> &str {
+        &self.node_name
     }
 
     pub fn sandbox_id(&self) -> &str {
         &self.sandbox_id
     }
 
-    pub fn into_parts(self) -> (String, String) {
-        (self.pod_uid, self.sandbox_id)
+    pub fn into_parts(self) -> (PodIdentity, String, String) {
+        (self.pod, self.node_name, self.sandbox_id)
     }
 }
 
@@ -866,8 +874,8 @@ pub type RuntimeWorkFuture<'a, T> =
 
 /// UID-bound pod runtime bookkeeping persistence.
 pub trait PodRuntimeStore: Send + Sync {
-    /// Inserts by Pod UID or refreshes identity/node fields without resetting
-    /// the original creation timestamp.
+    /// Inserts by Pod UID or confirms the same immutable identity/node owner
+    /// without resetting the original creation timestamp.
     fn admit_pod_runtime(&self, admission: PodRuntimeAdmission) -> RuntimeWorkFuture<'_, ()>;
     fn record_sandbox(&self, sandbox: PodRuntimeSandbox) -> RuntimeWorkFuture<'_, ()>;
     fn record_cgroup(&self, cgroup: PodRuntimeCgroup) -> RuntimeWorkFuture<'_, ()>;

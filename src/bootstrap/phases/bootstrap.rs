@@ -567,6 +567,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             runtime_store: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
                     node_pod_runtime_store.clone(),
+                    config.node_name.clone(),
                 ),
             ),
             slot_admission: Arc::new(

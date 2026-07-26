@@ -1359,9 +1359,8 @@ impl DatastoreBackend for WorkerStoreAdapter {
         sandbox_id: &str,
     ) -> Result<()> {
         self.node_local
-            .admit_pod_runtime(pod_uid, namespace, pod_name, &self.node_name)
-            .await?;
-        self.node_local.record_sandbox(pod_uid, sandbox_id).await
+            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id)
+            .await
     }
 
     async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
@@ -2423,9 +2422,8 @@ impl crate::datastore::NetworkStore for WorkerStoreAdapter {
         sandbox_id: &str,
     ) -> Result<()> {
         self.node_local
-            .admit_pod_runtime(pod_uid, namespace, pod_name, &self.node_name)
-            .await?;
-        self.node_local.record_sandbox(pod_uid, sandbox_id).await
+            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id)
+            .await
     }
 
     async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {

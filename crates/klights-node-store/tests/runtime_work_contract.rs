@@ -155,8 +155,9 @@ fn runtime_values_preserve_uid_identity_sandbox_cgroup_and_timestamps() {
     assert_eq!(admission.pod(), &pod());
     assert_eq!(admission.node_name(), "node/raw");
 
-    let sandbox = PodRuntimeSandbox::try_new("uid/raw", "sandbox/raw").unwrap();
-    assert_eq!(sandbox.pod_uid(), "uid/raw");
+    let sandbox = PodRuntimeSandbox::try_new(pod(), "node/raw", "sandbox/raw").unwrap();
+    assert_eq!(sandbox.pod(), &pod());
+    assert_eq!(sandbox.node_name(), "node/raw");
     assert_eq!(sandbox.sandbox_id(), "sandbox/raw");
 
     let cgroup = PodRuntimeCgroup::try_new("uid/raw", "/cgroup/raw").unwrap();
@@ -343,9 +344,9 @@ fn slot_values_preserve_uid_cas_observed_version_state_and_event_identity() {
 #[test]
 fn invalid_and_operational_errors_remain_distinct() {
     assert!(matches!(
-        PodRuntimeSandbox::try_new("", "sandbox"),
+        PodRuntimeSandbox::try_new(PodIdentity::new("default", "pod", ""), "node", "sandbox"),
         Err(RuntimeWorkError::InvalidInput {
-            field: "pod_uid",
+            field: "pod.uid",
             ..
         })
     ));

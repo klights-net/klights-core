@@ -608,15 +608,17 @@ impl RealPodRuntimeService {
             .await
             .map_err(|e| anyhow::anyhow!("sandbox creation failed: {:#}", e))?;
 
-        if let Err(e) = self.store.record_sandbox(key, &sandbox_id).await {
-            tracing::warn!(
-                namespace = key.namespace,
-                name = key.name,
-                uid = key.uid,
-                sandbox_id = sandbox_id,
-                "Failed to record sandbox in store (will use annotation fallback): {}",
-                e
-            );
+        if let Err(record_error) = self.store.record_sandbox(key, &sandbox_id).await {
+            let rollback_error = self.cri.remove_pod_sandbox(&sandbox_id).await.err();
+            if let Some(rollback_error) = rollback_error {
+                return Err(anyhow::anyhow!(
+                    "failed to persist UID-qualified sandbox ownership: {record_error:#}; \
+                     failed to roll back unowned sandbox {sandbox_id}: {rollback_error:#}"
+                ));
+            }
+            return Err(anyhow::anyhow!(
+                "failed to persist UID-qualified sandbox ownership: {record_error:#}"
+            ));
         }
         Ok(sandbox_id)
     }

@@ -762,6 +762,7 @@ impl crate::kubelet::pod_runtime::network::PodNetworkRuntime for MockPodNetworkR
 pub struct MockPodRuntimeStore {
     sandboxes: Mutex<std::collections::HashMap<(String, String, String), String>>,
     calls: Mutex<Vec<String>>,
+    record_failure: Mutex<Option<String>>,
 }
 
 impl Default for MockPodRuntimeStore {
@@ -775,6 +776,7 @@ impl MockPodRuntimeStore {
         Self {
             sandboxes: Mutex::new(std::collections::HashMap::new()),
             calls: Mutex::new(Vec::new()),
+            record_failure: Mutex::new(None),
         }
     }
 
@@ -784,6 +786,10 @@ impl MockPodRuntimeStore {
 
     pub fn recorded_calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    pub fn fail_record_sandbox(&self, message: impl Into<String>) {
+        *self.record_failure.lock().unwrap() = Some(message.into());
     }
 }
 
@@ -798,6 +804,9 @@ impl crate::kubelet::pod_runtime::store::PodRuntimeStore for MockPodRuntimeStore
             "record_sandbox:{}/{}/{}={}",
             key.namespace, key.name, key.uid, sandbox_id
         ));
+        if let Some(message) = self.record_failure.lock().unwrap().clone() {
+            anyhow::bail!("{message}");
+        }
         self.sandboxes.lock().unwrap().insert(
             (key.namespace.clone(), key.name.clone(), key.uid.clone()),
             sandbox_id.to_string(),

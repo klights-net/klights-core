@@ -39,18 +39,33 @@ pub trait PodSlotAdmission: Send + Sync {
 /// Production runtime store adapter over the datastore backend.
 pub struct RealPodRuntimeStore {
     store: Arc<dyn klights_node_store::PodRuntimeStore>,
+    node_name: String,
 }
 
 impl RealPodRuntimeStore {
-    pub fn new(store: Arc<dyn klights_node_store::PodRuntimeStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<dyn klights_node_store::PodRuntimeStore>,
+        node_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            store,
+            node_name: node_name.into(),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl PodRuntimeStore for RealPodRuntimeStore {
     async fn record_sandbox(&self, key: &PodRuntimeKey, sandbox_id: &str) -> anyhow::Result<()> {
-        let sandbox = klights_node_store::PodRuntimeSandbox::try_new(&key.uid, sandbox_id)?;
+        // This adapter owns the node-local runtime row lifecycle. Persist
+        // identity, node ownership, and sandbox in one node-store command so a
+        // successful startup can always be recovered and reconciled. The UID
+        // primary key prevents same-name replacement aliasing.
+        let sandbox = klights_node_store::PodRuntimeSandbox::try_new(
+            klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
+            self.node_name.clone(),
+            sandbox_id,
+        )?;
         self.store
             .record_sandbox(sandbox)
             .await

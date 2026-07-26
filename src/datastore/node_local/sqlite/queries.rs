@@ -10,10 +10,18 @@ pub(super) const POD_RUNTIME_ADMIT: &str = "INSERT INTO pod_runtime \
      ON CONFLICT(pod_uid) DO UPDATE SET \
        namespace = excluded.namespace, \
        pod_name = excluded.pod_name, \
-       node_name = excluded.node_name";
+       node_name = excluded.node_name \
+     WHERE pod_runtime.namespace = excluded.namespace \
+       AND pod_runtime.pod_name = excluded.pod_name \
+       AND pod_runtime.node_name = excluded.node_name";
 
-pub(super) const POD_RUNTIME_RECORD_SANDBOX: &str = "UPDATE pod_runtime \
-     SET sandbox_id = ?2 WHERE pod_uid = ?1";
+pub(super) const POD_RUNTIME_RECORD_OWNED_SANDBOX: &str = "INSERT INTO pod_runtime \
+     (pod_uid, namespace, pod_name, node_name, sandbox_id, created_ms) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     ON CONFLICT(pod_uid) DO UPDATE SET sandbox_id = excluded.sandbox_id \
+     WHERE pod_runtime.namespace = excluded.namespace \
+       AND pod_runtime.pod_name = excluded.pod_name \
+       AND pod_runtime.node_name = excluded.node_name";
 pub(super) const POD_RUNTIME_RECORD_CGROUP: &str = "UPDATE pod_runtime \
      SET cgroup_path = ?2 WHERE pod_uid = ?1";
 pub(super) const POD_RUNTIME_DELETE_UID: &str = "DELETE FROM pod_runtime WHERE pod_uid = ?1";

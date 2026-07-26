@@ -540,8 +540,9 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     let pod_runtime_store = node_local_runtime_store().await;
     admit_runtime_key(&pod_runtime_store, &old_key).await;
     admit_runtime_key(&pod_runtime_store, &new_key).await;
-    let store =
-        Arc::new(crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store));
+    let store = Arc::new(
+        crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store, "node-1"),
+    );
     let runtime = crate::kubelet::pod_runtime::network::RealPodNetworkRuntime::new(
         datapath.clone(),
         repository,
@@ -2293,11 +2294,7 @@ async fn start_pod_partial_container_create_failure_rolls_back_sandbox_with_pari
 }
 
 #[tokio::test]
-async fn real_runtime_start_pod_sandbox_record_failure_uses_annotation_fallback() {
-    // This test verifies that when the runtime store fails to record a sandbox,
-    // the code falls back to writing the sandbox-id annotation via the repository.
-    // We can't easily make MockPodRuntimeStore fail (it always succeeds), but
-    // we can verify that even on success, both paths don't conflict.
+async fn real_runtime_start_pod_propagates_uid_qualified_sandbox_record_failure() {
     let harness = PodRuntimeHarness::new().await;
     let pod = pod_with_pull_policy("ns", "pod", "uid-fb", "nginx", "Never");
     harness
@@ -2306,26 +2303,35 @@ async fn real_runtime_start_pod_sandbox_record_failure_uses_annotation_fallback(
         .await
         .unwrap();
     let key = PodRuntimeKey::new("ns", "pod", "uid-fb");
-    let result = harness
+    harness
+        .store
+        .fail_record_sandbox("injected owned sandbox persistence failure");
+    let error = harness
         .runtime
         .start_pod(key, Some(pod), CancellationToken::new())
         .await
-        .unwrap();
+        .expect_err("sandbox ownership persistence failure must fail startup");
+    assert!(
+        error
+            .to_string()
+            .contains("injected owned sandbox persistence failure"),
+        "unexpected startup error: {error:#}"
+    );
 
-    match result {
-        PodStartResult::Started {
-            sandbox_id: Some(_),
-        } => {}
-        other => panic!("expected Started with sandbox_id, got {:?}", other),
-    }
-
-    // Store must have been called to record sandbox.
     let store_calls = harness.store.recorded_calls();
     assert!(
         store_calls
             .iter()
-            .any(|s| s.contains("record_sandbox") && s.contains("uid-fb")),
-        "store record_sandbox must be attempted"
+            .any(|call| call == "record_sandbox:ns/pod/uid-fb=sandbox-0001"),
+        "startup must invoke the UID-qualified ownership/record contract: {store_calls:?}"
+    );
+    assert!(
+        harness.cri.recorded_calls().iter().any(|call| matches!(
+            &call.operation,
+            MockCriOperation::RemovePodSandbox(sandbox_id)
+                if sandbox_id == "sandbox-0001"
+        )),
+        "an unpersisted external sandbox must be rolled back"
     );
 }
 
@@ -4895,16 +4901,51 @@ async fn shared_cri_runtime_implements_container_runtime_control_with_parity() {
 #[tokio::test]
 async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
     let pod_runtime_store = node_local_runtime_store().await;
+    let persisted_runtime_store = pod_runtime_store.clone();
     let key = PodRuntimeKey::new("ns", "test-pod", "uid-1");
-    admit_runtime_key(&pod_runtime_store, &key).await;
-    let store = crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store);
+    let store =
+        crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store, "node-1");
 
-    // Record sandbox.
+    // Production startup has no separate node-local runtime admission step.
+    // Recording the sandbox must establish the UID-qualified runtime
+    // ownership needed by every later reconcile.
     store.record_sandbox(&key, "sandbox-abc").await.unwrap();
 
     // Retrieve by UID.
     let found = store.get_sandbox_id(&key).await.unwrap();
     assert_eq!(found.as_deref(), Some("sandbox-abc"));
+    let persisted = klights_node_store::PodRuntimeStore::get_pod_runtime(
+        persisted_runtime_store.as_ref(),
+        klights_node_store::RuntimePodUid::try_new(&key.uid).unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("recording a sandbox must persist runtime ownership");
+    assert_eq!(persisted.pod().namespace, key.namespace);
+    assert_eq!(persisted.pod().name, key.name);
+    assert_eq!(persisted.pod().uid, key.uid);
+    assert_eq!(persisted.node_name(), "node-1");
+    assert_eq!(persisted.sandbox_id(), Some("sandbox-abc"));
+
+    let conflicting_key = PodRuntimeKey::new("other-ns", "other-pod", "uid-1");
+    let conflict = store
+        .record_sandbox(&conflicting_key, "sandbox-conflict")
+        .await
+        .expect_err("one Pod UID must not be rebound to conflicting runtime ownership");
+    assert!(
+        conflict.to_string().contains("sandbox"),
+        "unexpected ownership conflict: {conflict:#}"
+    );
+    let after_conflict = klights_node_store::PodRuntimeStore::get_pod_runtime(
+        persisted_runtime_store.as_ref(),
+        klights_node_store::RuntimePodUid::try_new(&key.uid).unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("ownership conflict must preserve the original runtime row");
+    assert_eq!(after_conflict.pod().namespace, key.namespace);
+    assert_eq!(after_conflict.pod().name, key.name);
+    assert_eq!(after_conflict.sandbox_id(), Some("sandbox-abc"));
 
     // Delete by UID.
     store.delete_sandbox(&key).await.unwrap();

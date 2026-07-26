@@ -489,6 +489,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             runtime_store: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
                     pod_runtime_store.clone(),
+                    config.node_name.clone(),
                 ),
             ),
             slot_admission: std::sync::Arc::new(

@@ -452,9 +452,9 @@ impl PodRuntimeStore for NodeLocalNetworkAdapter {
 
     fn record_sandbox(&self, sandbox: PodRuntimeSandbox) -> RuntimeWorkFuture<'_, ()> {
         Box::pin(async move {
-            let (pod_uid, sandbox_id) = sandbox.into_parts();
+            let (pod, node_name, sandbox_id) = sandbox.into_parts();
             self.backend
-                .record_sandbox(&pod_uid, &sandbox_id)
+                .record_owned_sandbox(&pod.uid, &pod.namespace, &pod.name, &node_name, &sandbox_id)
                 .await
                 .map_err(runtime_error)
         })
@@ -551,7 +551,7 @@ mod tests {
             .await
             .unwrap();
         adapter
-            .record_sandbox(PodRuntimeSandbox::try_new("uid-a", "sandbox-a").unwrap())
+            .record_sandbox(PodRuntimeSandbox::try_new(pod.clone(), "node-a", "sandbox-a").unwrap())
             .await
             .unwrap();
 
