@@ -1091,7 +1091,7 @@ mod tests {
             lease
                 .pointer("/spec/leaseDurationSeconds")
                 .and_then(|value| value.as_i64()),
-            Some(crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS),
+            Some(klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS),
             "advertised leaseDurationSeconds must derive from the canonical node-lease constant"
         );
     }

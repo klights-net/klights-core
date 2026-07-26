@@ -20,8 +20,8 @@
 //! from drifting.
 
 use crate::datastore::DatastoreBackend;
-use crate::datastore::command::StorageCommand;
 use crate::replication::protocol::ForwardedResource;
+use klights_cluster_core::command::StorageCommand;
 use klights_reconcile_api::{
     ControllerReconcileSink, GcNonPodFinalizationPort, GcPodDeleteSink, ReconcileKey,
     ServiceReconcileKey, ServiceReconcileSink,
@@ -402,8 +402,8 @@ mod tests {
 
     use crate::controller_dispatcher::ControllerDispatcher;
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::command::StorageCommand;
     use crate::replication::protocol::ForwardedResource;
+    use klights_cluster_core::command::StorageCommand;
     use klights_types::PodIdentity;
     use serde_json::json;
 

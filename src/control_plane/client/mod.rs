@@ -596,8 +596,8 @@ mod tests {
         ));
     }
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::command::StorageCommand;
     use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+    use klights_cluster_core::command::StorageCommand;
     use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
     use klights_leader_api::{
         OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
@@ -893,7 +893,7 @@ mod tests {
             .expect("terminal ledger row");
         assert!(matches!(
             crate::storage_wire_codec::decode_response_protobuf(&ledger.result_proto),
-            Ok(crate::datastore::command::StorageResponse::Error { message })
+            Ok(klights_cluster_core::command::StorageResponse::Error { message })
                 if message.contains("delivery UID mismatch")
         ));
         assert_eq!(

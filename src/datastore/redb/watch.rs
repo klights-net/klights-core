@@ -11,6 +11,7 @@ use serde_json::{Value, value::RawValue};
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::{helpers, tables};
 use crate::datastore::types::*;
+use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;

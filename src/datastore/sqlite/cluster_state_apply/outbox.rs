@@ -1,5 +1,5 @@
 use super::super::queries;
-use crate::log_apply::LogApplyAppliedOutboxRow;
+use klights_cluster_core::LogApplyAppliedOutboxRow;
 
 pub(in crate::datastore::sqlite) struct OutboxLedgerStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,

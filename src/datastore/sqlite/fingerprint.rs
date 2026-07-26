@@ -37,7 +37,7 @@ pub(super) const SCHEMA_FINGERPRINT: &str =
 /// - The DB exists and the stored fingerprint matches.
 ///
 /// Returns `Err(OpenError::SchemaMismatch)` if the stored fingerprint differs.
-pub(super) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Result<(), OpenError> {
+pub(crate) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Result<(), OpenError> {
     let stored: Option<String> = conn
         .query_row(queries::META_SELECT, ["schema_fingerprint"], |row| {
             row.get(0)
@@ -76,7 +76,7 @@ pub(super) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Resu
 ///
 /// Corruption detection runs once at boot before any `DatastoreBackend`
 /// method is reachable. A non-"ok" result produces `OpenError::Corrupt`.
-pub(super) fn check_integrity(
+pub(crate) fn check_integrity(
     conn: &rusqlite::Connection,
     db_path: &Path,
 ) -> Result<(), OpenError> {

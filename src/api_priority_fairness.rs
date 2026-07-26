@@ -53,6 +53,7 @@ pub async fn admit_request(
         .cloned()
         .unwrap_or_else(AuthenticatedIdentity::anonymous);
     match state
+        .auth_policy()
         .api_priority_fairness
         .admit(
             state.resource_mutation().resource_query.as_ref(),

@@ -343,6 +343,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
         db_handle: &db_handle,
         kubelet_db_handle: &kubelet_db_handle,
+        node_local: node_local.clone(),
         worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
         db,
@@ -390,6 +391,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         leader_election,
         db_handle: &db_handle,
+        node_local: node_local.clone(),
         task_supervisor: &task_supervisor,
         dispatcher_for_worker: &dispatcher_for_worker,
         dispatcher_for_cronjobs: &dispatcher_for_cronjobs,
@@ -781,7 +783,7 @@ mod tests {
             crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
                 .expect("decode dataplane outbox payload");
         match payload.command {
-            crate::datastore::command::StorageCommand::UpdateNodeDataplane {
+            klights_cluster_core::command::StorageCommand::UpdateNodeDataplane {
                 node_name,
                 mode,
                 encryption,

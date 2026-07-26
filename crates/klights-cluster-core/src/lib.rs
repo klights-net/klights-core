@@ -19,8 +19,9 @@ pub use apply::{
     resource_client_owned_state_equal, validate_apply_preconditions,
 };
 pub use command::{
-    COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta, StorageCommand, StorageResponse,
-    supports_command_codec_version,
+    COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta,
+    DEFAULT_NODE_LEASE_DURATION_SECONDS, LeaseRenewCommandError, StorageCommand, StorageResponse,
+    supports_command_codec_version, validate_lease_renew_command,
 };
 pub use log_apply::{
     ClusterMetaMutation, ClusterMutation, CommittedApplyOutcome, CommittedApplyRejection,
@@ -51,8 +52,9 @@ pub use outbox::{
 pub use recovery::{ClusterMetadata, MetadataComparison, compare_metadata, needs_confirmation};
 pub use replay::{PositionedWatchEvent, WatchReplayPosition};
 pub use resource::{
-    PatchKind, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourceEventObject,
-    ResourceIdentityError, ResourcePatchRequest, ResourcePreconditions,
+    PatchKind, PodEndpointState, Resource, ResourceBatchOperation, ResourceBatchPutMode,
+    ResourceEventObject, ResourceIdentityError, ResourcePatchRequest, ResourcePreconditions,
+    pod_endpoint_state, pod_endpoint_state_changed,
 };
 pub use stale_resource::apply_same_uid_stale_full_resource_policy;
 pub use status::set_node_external_ip;

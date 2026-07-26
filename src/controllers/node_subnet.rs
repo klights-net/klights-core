@@ -1871,7 +1871,7 @@ mod tests {
                 _operation: &str,
                 _command: StorageCommand,
                 _authoring_node: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
                 Err(OutboxApplyError::Retryable("not the leader".to_string()))
             }

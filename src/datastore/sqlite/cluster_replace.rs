@@ -1,21 +1,18 @@
 use super::cluster_state_apply::{ApplyEffects, RaftClusterStateApplier};
 use super::{Datastore, queries};
-use crate::datastore::types::{
-    AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata, Resource,
-    WatchReplayPosition,
-};
-use crate::log_apply::{
-    ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark,
-    SnapshotRestoreOperation,
+use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
+use anyhow::{Result, anyhow};
+use klights_cluster_core::{
+    ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark, Resource,
+    SnapshotRestoreOperation, WatchReplayPosition,
 };
 #[cfg(test)]
-use crate::log_apply::{
+use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow,
     LogApplyWatchEventRow,
 };
 #[cfg(test)]
-use crate::log_apply::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
-use anyhow::{Result, anyhow};
+use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
 use klights_cluster_store::{
     CLUSTER_ID_META_KEY as KEY_CLUSTER_ID, LEADER_EPOCH_META_KEY as KEY_LEADER_EPOCH,
     RAFT_LEADER_HINT_META_KEY as KEY_RAFT_LEADER_HINT, RAFT_TERM_META_KEY as KEY_RAFT_TERM,
@@ -623,8 +620,8 @@ fn pod_endpoint_effect(
         return crate::datastore::PodEndpointEffect::NotApplicable;
     }
     if before.zip(after).is_some_and(|(before, after)| {
-        crate::pod_endpoint_state::pod_endpoint_state(before)
-            .differs_from(&crate::pod_endpoint_state::pod_endpoint_state(after))
+        klights_cluster_core::pod_endpoint_state(before)
+            .differs_from(&klights_cluster_core::pod_endpoint_state(after))
     }) {
         crate::datastore::PodEndpointEffect::Changed
     } else {
@@ -769,8 +766,8 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                 && resource.api_version == "v1"
                 && resource.kind == "Pod"
             {
-                let result_proto = crate::storage_wire_codec::encode_response_protobuf(
-                    &crate::datastore::command::StorageResponse::Resource {
+                let result_proto = klights_cluster_datastore::encode_outbox_response(
+                    &klights_cluster_core::command::StorageResponse::Resource {
                         resource_version: resource.resource_version,
                         data: (*resource.data).clone(),
                     },
@@ -835,8 +832,8 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             }
             if let Some(mut row) = outbox_template {
                 row.applied_rv = None;
-                row.result_proto = crate::storage_wire_codec::encode_response_protobuf(
-                    &crate::datastore::command::StorageResponse::Error {
+                row.result_proto = klights_cluster_datastore::encode_outbox_response(
+                    &klights_cluster_core::command::StorageResponse::Error {
                         message: message.clone(),
                     },
                 )
@@ -1102,7 +1099,7 @@ fn resolve_bound_pod_finalizations_in_tx(
             continue;
         }
         resolved.push(LogApplyMutation::PutWatchEvent(
-            crate::log_apply::LogApplyWatchEventRow {
+            klights_cluster_core::LogApplyWatchEventRow {
                 event_id: None,
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
@@ -1121,7 +1118,7 @@ fn resolve_bound_pod_finalizations_in_tx(
             },
         ));
         resolved.push(LogApplyMutation::DeleteResource(
-            crate::log_apply::LogApplyResourceKey {
+            klights_cluster_core::LogApplyResourceKey {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some(finalization.namespace),
@@ -1294,25 +1291,25 @@ fn stamp_provisional_resource_version_in_tx(
                     row.applied_rv = Some(rv);
                 }
                 if row.result_proto.is_empty()
-                    || crate::storage_wire_codec::decode_response_protobuf(&row.result_proto)
+                    || klights_cluster_datastore::decode_outbox_response(&row.result_proto)
                         .is_ok_and(|response| {
                             matches!(
                                 response,
-                                crate::datastore::command::StorageResponse::Ack { .. }
+                                klights_cluster_core::command::StorageResponse::Ack { .. }
                             )
                         })
-                    || crate::storage_wire_codec::decode_response_protobuf(&row.result_proto)
+                    || klights_cluster_datastore::decode_outbox_response(&row.result_proto)
                         .is_ok_and(|response| {
                             matches!(
                                 response,
-                                crate::datastore::command::StorageResponse::Ack {
+                                klights_cluster_core::command::StorageResponse::Ack {
                                     resource_version: 0
                                 }
                             )
                         })
                 {
-                    row.result_proto = crate::storage_wire_codec::encode_response_protobuf(
-                        &crate::datastore::command::StorageResponse::Ack {
+                    row.result_proto = klights_cluster_datastore::encode_outbox_response(
+                        &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: rv,
                         },
                     )
@@ -1350,8 +1347,8 @@ fn applied_outbox_record_in_tx(
 fn storage_result_from_applied_outbox(
     row: &AppliedOutboxRecord,
 ) -> tokio_rusqlite::Result<crate::datastore::raft::types::StorageCommandResult> {
-    match crate::storage_wire_codec::decode_response_protobuf(&row.result_proto) {
-        Ok(crate::datastore::command::StorageResponse::Error { message }) => {
+    match klights_cluster_datastore::decode_outbox_response(&row.result_proto) {
+        Ok(klights_cluster_core::command::StorageResponse::Error { message }) => {
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
                 error_message: Some(message),
@@ -1361,7 +1358,7 @@ fn storage_result_from_applied_outbox(
                 pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
             })
         }
-        Ok(crate::datastore::command::StorageResponse::Resource {
+        Ok(klights_cluster_core::command::StorageResponse::Resource {
             resource_version,
             data,
         }) => {
@@ -1530,7 +1527,7 @@ mod tests {
         name: &str,
         uid: &str,
     ) -> LogApplyCommit {
-        crate::log_apply::test_live_commit(
+        crate::replication::log_apply_wire::test_live_commit(
             0,
             vec![
                 LogApplyMutation::PutResource(LogApplyResourceRow {
@@ -1558,8 +1555,8 @@ mod tests {
                     operation: "PodStatus".to_string(),
                     first_seen_ms: status_stamp,
                     applied_rv: None,
-                    result_proto: crate::storage_wire_codec::encode_response_protobuf(
-                        &crate::datastore::command::StorageResponse::Ack {
+                    result_proto: klights_cluster_datastore::encode_outbox_response(
+                        &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
                     )
@@ -1644,10 +1641,10 @@ mod tests {
     }
 
     fn applied_outbox_ack_rv(row: &AppliedOutboxRecord) -> i64 {
-        match crate::storage_wire_codec::decode_response_protobuf(&row.result_proto)
+        match klights_cluster_datastore::decode_outbox_response(&row.result_proto)
             .expect("decode applied-outbox response")
         {
-            crate::datastore::command::StorageResponse::Ack { resource_version } => {
+            klights_cluster_core::command::StorageResponse::Ack { resource_version } => {
                 resource_version
             }
             other => panic!("expected Ack response, got {other:?}"),
@@ -1661,10 +1658,12 @@ mod tests {
         enable_committed_apply_v1(&db).await;
 
         let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![v1_resource("v1-one", "v1-one-uid")],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![v1_resource("v1-one", "v1-one-uid")],
+                ),
+            ))
             .await
             .unwrap();
         let rv = result.applied_rv.unwrap();
@@ -1715,10 +1714,12 @@ mod tests {
             10
         );
         let applied = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![v1_resource("after-snapshot", "after-snapshot-uid")],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![v1_resource("after-snapshot", "after-snapshot-uid")],
+                ),
+            ))
             .await
             .unwrap();
         assert!(applied.applied_rv.unwrap() > 10);
@@ -2036,13 +2037,15 @@ mod tests {
         let db = Datastore::new_in_memory().await.unwrap();
         enable_committed_apply_v1(&db).await;
         let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![
-                    v1_resource("v1-left", "v1-left-uid"),
-                    v1_resource("v1-right", "v1-right-uid"),
-                ],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![
+                        v1_resource("v1-left", "v1-left-uid"),
+                        v1_resource("v1-right", "v1-right-uid"),
+                    ],
+                ),
+            ))
             .await
             .unwrap();
         let rv = result.applied_rv.unwrap();
@@ -2090,7 +2093,7 @@ mod tests {
             .unwrap()
             .len();
         let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(committed_apply_v1(crate::replication::log_apply_wire::test_live_commit(
                 0,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".into(), kind: "ConfigMap".into(), namespace: Some("default".into()), name: "stale-put".into(), uid: current.uid.clone(), resource_version: 0,
@@ -2137,24 +2140,26 @@ mod tests {
             .unwrap()
             .len();
         let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![LogApplyMutation::PatchResourceLatest(
-                    LogApplyResourcePatch {
-                        api_version: "v1".into(),
-                        kind: "ConfigMap".into(),
-                        namespace: Some("default".into()),
-                        name: "stale-patch".into(),
-                        resource_version: 0,
-                        patch_kind: crate::datastore::PatchKind::Merge,
-                        patch: serde_json::json!({"data":{"v":"stale"}}),
-                        require_existing: true,
-                        precondition_uid: Some("stale-patch-uid".into()),
-                        precondition_resource_version: Some(created.resource_version),
-                        terminating_pod_unready_timestamp: None,
-                    },
-                )],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![LogApplyMutation::PatchResourceLatest(
+                        LogApplyResourcePatch {
+                            api_version: "v1".into(),
+                            kind: "ConfigMap".into(),
+                            namespace: Some("default".into()),
+                            name: "stale-patch".into(),
+                            resource_version: 0,
+                            patch_kind: crate::datastore::PatchKind::Merge,
+                            patch: serde_json::json!({"data":{"v":"stale"}}),
+                            require_existing: true,
+                            precondition_uid: Some("stale-patch-uid".into()),
+                            precondition_resource_version: Some(created.resource_version),
+                            terminating_pod_unready_timestamp: None,
+                        },
+                    )],
+                ),
+            ))
             .await
             .unwrap();
         assert_eq!(result.applied_rv, None);
@@ -2192,17 +2197,19 @@ mod tests {
             .unwrap()
             .len();
         let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
-                    api_version: "v1".into(),
-                    kind: "ConfigMap".into(),
-                    namespace: Some("default".into()),
-                    name: "stale-delete".into(),
-                    uid: "stale-delete-uid".into(),
-                    precondition_resource_version: Some(created.resource_version),
-                })],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
+                        api_version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                        namespace: Some("default".into()),
+                        name: "stale-delete".into(),
+                        uid: "stale-delete-uid".into(),
+                        precondition_resource_version: Some(created.resource_version),
+                    })],
+                ),
+            ))
             .await
             .unwrap();
         assert_eq!(result.applied_rv, None);
@@ -2236,7 +2243,7 @@ mod tests {
             .await
             .unwrap()
             .len();
-        let result = db.apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(0, vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+        let result = db.apply_raft_log_apply_commit(committed_apply_v1(crate::replication::log_apply_wire::test_live_commit(0, vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version:"v1".into(), kind:"Pod".into(), namespace:Some("default".into()), name:"stale-status".into(), uid:"stale-status-uid".into(), resource_version:0,
             data:serde_json::json!({"metadata":{"name":"stale-status","namespace":"default","uid":"stale-status-uid"},"spec":{"nodeName":"node-a"},"status":{"phase":"Failed"}}), require_absent:false, require_existing:true, precondition_uid:Some("stale-status-uid".into()), precondition_resource_version:Some(created.resource_version), status_only:true,
         })]))).await.unwrap();
@@ -2515,10 +2522,12 @@ mod tests {
         .unwrap();
         let before_conflict = db.get_current_resource_version().await.unwrap();
         let conflict = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![v1_resource("v1-existing", "new-uid")],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![v1_resource("v1-existing", "new-uid")],
+                ),
+            ))
             .await
             .unwrap();
         assert!(conflict.error_message.is_some());
@@ -2528,21 +2537,21 @@ mod tests {
             before_conflict
         );
 
-        let outbox = crate::log_apply::LogApplyAppliedOutboxRow {
+        let outbox = klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "v1-duplicate".to_string(),
             subject_key: "v1/Pod/default/test".to_string(),
             operation: "PodStatus".to_string(),
             first_seen_ms: 1,
             applied_rv: None,
-            result_proto: crate::storage_wire_codec::encode_response_protobuf(
-                &crate::datastore::command::StorageResponse::Ack {
+            result_proto: klights_cluster_datastore::encode_outbox_response(
+                &klights_cluster_core::command::StorageResponse::Ack {
                     resource_version: 0,
                 },
             )
             .unwrap(),
             status_stamp: None,
         };
-        let commit = committed_apply_v1(crate::log_apply::test_live_commit(
+        let commit = committed_apply_v1(crate::replication::log_apply_wire::test_live_commit(
             0,
             vec![LogApplyMutation::PutAppliedOutbox(outbox)],
         ));
@@ -2586,14 +2595,14 @@ mod tests {
         let rv_before = db.get_current_resource_version().await.unwrap();
         let watch_position_before = db.current_watch_replay_position().await.unwrap();
         let ledger = |key: &str| {
-            LogApplyMutation::PutAppliedOutbox(crate::log_apply::LogApplyAppliedOutboxRow {
+            LogApplyMutation::PutAppliedOutbox(klights_cluster_core::LogApplyAppliedOutboxRow {
                 idempotency_key: key.to_string(),
                 subject_key: "v1/ConfigMap/default/terminal-existing".to_string(),
                 operation: "PodStatus".to_string(),
                 first_seen_ms: 1,
                 applied_rv: None,
-                result_proto: crate::storage_wire_codec::encode_response_protobuf(
-                    &crate::datastore::command::StorageResponse::Ack {
+                result_proto: klights_cluster_datastore::encode_outbox_response(
+                    &klights_cluster_core::command::StorageResponse::Ack {
                         resource_version: 0,
                     },
                 )
@@ -2649,8 +2658,8 @@ mod tests {
             .unwrap()
             .expect("terminal decision ledger row");
         assert!(matches!(
-            crate::storage_wire_codec::decode_response_protobuf(&terminal_row.result_proto),
-            Ok(crate::datastore::command::StorageResponse::Error { .. })
+            klights_cluster_datastore::decode_outbox_response(&terminal_row.result_proto),
+            Ok(klights_cluster_core::command::StorageResponse::Error { .. })
         ));
 
         let successor = LogApplyCommit::try_new_with_watermark(
@@ -3228,7 +3237,7 @@ mod tests {
         .await
         .unwrap();
 
-        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             5,
             vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                 api_version: "v1".to_string(),
@@ -3263,7 +3272,7 @@ mod tests {
         // Replay the stale UID-A delete commit. With UID-qualified
         // deletes this must be a no-op; without the guard it would hit
         // by (api_version, kind, namespace, name) and remove UID-B's row.
-        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             7,
             vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                 api_version: "v1".to_string(),
@@ -3324,7 +3333,7 @@ mod tests {
         .unwrap();
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 10,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "apps/v1".to_string(),
@@ -3410,7 +3419,7 @@ mod tests {
             }
         });
 
-        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             7,
             vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
                 event_id: None,
@@ -3486,7 +3495,7 @@ mod tests {
             "data": {"state": "leader-watch-history"}
         });
 
-        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             7,
             vec![
                 LogApplyMutation::PutResource(LogApplyResourceRow {
@@ -3556,7 +3565,7 @@ mod tests {
         });
         let expected_watch_payload = explicit_payload.clone();
 
-        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             11,
             vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
                 event_id: None,
@@ -3607,19 +3616,21 @@ mod tests {
         });
 
         let result = db
-            .apply_raft_log_apply_commit(committed_apply_v1(crate::log_apply::test_live_commit(
-                0,
-                vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
-                    event_id: None,
-                    api_version: "v1".to_string(),
-                    kind: "ConfigMap".to_string(),
-                    namespace: Some("default".to_string()),
-                    name: "v1-watch-resource-shape".to_string(),
-                    resource_version: 0,
-                    event_type: "ADDED".to_string(),
-                    data: resource_shape_payload,
-                })],
-            )))
+            .apply_raft_log_apply_commit(committed_apply_v1(
+                crate::replication::log_apply_wire::test_live_commit(
+                    0,
+                    vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                        event_id: None,
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "v1-watch-resource-shape".to_string(),
+                        resource_version: 0,
+                        event_type: "ADDED".to_string(),
+                        data: resource_shape_payload,
+                    })],
+                ),
+            ))
             .await
             .unwrap();
         let applied_rv = result
@@ -3730,7 +3741,7 @@ mod tests {
         .unwrap();
         // Strict committed apply validates the raw precondition before normalization.
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 50,
                 vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                     api_version: "v1".to_string(),
@@ -3786,7 +3797,7 @@ mod tests {
         .expect("corrupt stored JSON");
 
         let err = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 60,
                 vec![LogApplyMutation::DeleteNamespace {
                     name: "corrupt-delete-ns".to_string(),
@@ -3820,7 +3831,7 @@ mod tests {
         .await
         .unwrap();
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 60,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -3910,7 +3921,7 @@ mod tests {
         .unwrap();
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 60,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "apps/v1".to_string(),
@@ -3968,7 +3979,7 @@ mod tests {
     async fn stale_same_uid_generationless_committed_put_preserves_newer_configmap_state() {
         let db = crate::datastore::test_support::in_memory().await;
         let seed = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 10,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -3998,7 +4009,7 @@ mod tests {
             .await
             .expect("seed generation-less ConfigMap from raft");
 
-        db.apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             20,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -4030,7 +4041,7 @@ mod tests {
         assert!(seed.error_message.is_none());
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 30,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -4121,7 +4132,7 @@ mod tests {
         .expect("status update advances RV before stale-precondition scale PUT apply");
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 60,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "apps/v1".to_string(),
@@ -4252,7 +4263,7 @@ mod tests {
         );
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 60,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -4386,7 +4397,7 @@ mod tests {
         .unwrap();
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 60,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -4529,7 +4540,7 @@ mod tests {
         .unwrap();
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 72,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -4657,7 +4668,7 @@ mod tests {
         .unwrap();
 
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 61,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "apps/v1".to_string(),
@@ -4752,7 +4763,7 @@ mod tests {
         // Committed patch has precondition_rv=888 (leader rv). Follower has rv=1. The patch
         // must still be applied to the current local state.
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 70,
                 vec![LogApplyMutation::PatchResourceLatest(
                     LogApplyResourcePatch {
@@ -4761,7 +4772,7 @@ mod tests {
                         namespace: Some("default".to_string()),
                         name: "patch-target".to_string(),
                         resource_version: 70,
-                        patch_kind: crate::datastore::types::PatchKind::Merge,
+                        patch_kind: klights_cluster_core::PatchKind::Merge,
                         patch: serde_json::json!({"data": {"added": "by-patch"}}),
                         precondition_uid: Some("cm-patch".to_string()),
                         precondition_resource_version: Some(1),
@@ -4815,7 +4826,7 @@ mod tests {
         // (no error_message). Without the fix the conflict is swallowed with error_message set,
         // which is the "advanced index with divergence" bug.
         let result = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 75,
                 vec![LogApplyMutation::PatchResourceLatest(
                     LogApplyResourcePatch {
@@ -4824,7 +4835,7 @@ mod tests {
                         namespace: Some("default".to_string()),
                         name: "diverge-cm".to_string(),
                         resource_version: 75,
-                        patch_kind: crate::datastore::types::PatchKind::Merge,
+                        patch_kind: klights_cluster_core::PatchKind::Merge,
                         patch: serde_json::json!({"data": {"state": "reconciled"}}),
                         precondition_uid: Some("cm-div".to_string()),
                         precondition_resource_version: Some(1),
@@ -4853,7 +4864,7 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         // Apply a committed PUT once to establish local state.
         let first = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 80,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -4889,7 +4900,7 @@ mod tests {
 
         // Re-apply the identical commit (simulating restart or redundant delivery).
         let second = db
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 80,
                 vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                     api_version: "v1".to_string(),
@@ -4992,7 +5003,7 @@ mod tests {
         .await
         .unwrap();
 
-        db.apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             30,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "batch/v1".to_string(),
@@ -5086,7 +5097,7 @@ mod tests {
 
         // Leader backend has the resource deleted (empty). Committed delete arrives via log.
         let result = follower
-            .apply_raft_log_apply_commit(crate::log_apply::test_live_commit(
+            .apply_raft_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
                 100,
                 vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
                     api_version: "v1".to_string(),
@@ -5119,7 +5130,7 @@ mod tests {
     /// cluster.db rows (api_version, kind, namespace, name, uid, rv, data).
     #[tokio::test]
     async fn committed_apply_json_and_protobuf_paths_produce_identical_rows() {
-        let commit = crate::log_apply::test_live_commit(
+        let commit = crate::replication::log_apply_wire::test_live_commit(
             110,
             vec![LogApplyMutation::PutResource(LogApplyResourceRow {
                 api_version: "v1".to_string(),
@@ -5148,8 +5159,9 @@ mod tests {
         );
 
         // JSON path
-        let json_bytes = crate::log_apply::encode_commit_json(&commit).unwrap();
-        let commit_from_json = crate::log_apply::decode_commit_json(&json_bytes).unwrap();
+        let json_bytes = crate::replication::log_apply_wire::encode_commit_json(&commit).unwrap();
+        let commit_from_json =
+            crate::replication::log_apply_wire::decode_commit_json(&json_bytes).unwrap();
         let db_json = crate::datastore::test_support::in_memory().await;
         db_json
             .apply_raft_log_apply_commit(commit_from_json)
@@ -5162,8 +5174,10 @@ mod tests {
             .expect("json path must materialise row");
 
         // Protobuf path
-        let proto_bytes = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
-        let commit_from_proto = crate::log_apply::decode_commit_protobuf(&proto_bytes).unwrap();
+        let proto_bytes =
+            crate::replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
+        let commit_from_proto =
+            crate::replication::log_apply_wire::decode_commit_protobuf(&proto_bytes).unwrap();
         let db_proto = crate::datastore::test_support::in_memory().await;
         db_proto
             .apply_raft_log_apply_commit(commit_from_proto)
@@ -5197,7 +5211,7 @@ mod tests {
         let mut watch =
             db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "ConfigMap"));
         let key = "cancel-after-commit";
-        let commit = committed_apply_v1(crate::log_apply::test_live_commit(
+        let commit = committed_apply_v1(crate::replication::log_apply_wire::test_live_commit(
             0,
             vec![
                 v1_resource("cancelled-apply", "cancelled-uid"),
@@ -5207,8 +5221,8 @@ mod tests {
                     operation: "Create".to_string(),
                     first_seen_ms: 1,
                     applied_rv: None,
-                    result_proto: crate::storage_wire_codec::encode_response_protobuf(
-                        &crate::datastore::command::StorageResponse::Ack {
+                    result_proto: klights_cluster_datastore::encode_outbox_response(
+                        &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
                     )

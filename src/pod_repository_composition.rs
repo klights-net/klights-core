@@ -61,6 +61,7 @@ pub enum PodSchedulingMode {
 #[derive(Clone)]
 pub struct PodRepositoryBuildConfig {
     pub db: DatastoreHandle,
+    pub node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
     pub supervisor: Arc<TaskSupervisor>,
     pub side_effects: Arc<SideEffectRegistry>,
     pub metrics: Arc<SideEffectMetrics>,
@@ -80,7 +81,9 @@ struct RootPodRepositoryAdapterFactory {
 
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
-    db: DatastoreHandle,
+    node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
+    test_rows: Arc<std::sync::Mutex<Vec<crate::datastore::PodWorkqueueEntry>>>,
+    test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
 struct RootPodPersistence {
@@ -409,35 +412,81 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         min_delay_ms: i64,
         last_error: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.db
-            .pod_workqueue_enqueue(
-                legacy_workqueue_kind(kind),
-                pod,
+        if let Some(node_local) = &self.node_local {
+            return node_local
+                .enqueue_workqueue(
+                    legacy_workqueue_kind(kind),
+                    pod,
+                    payload,
+                    attempt_count,
+                    min_delay_ms,
+                    last_error,
+                )
+                .await;
+        }
+        let id = self
+            .test_next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.test_rows
+            .lock()
+            .unwrap()
+            .push(crate::datastore::PodWorkqueueEntry {
+                id,
+                kind: legacy_workqueue_kind(kind),
+                namespace: pod.namespace.clone(),
+                name: pod.name.clone(),
+                uid: pod.uid.clone(),
                 payload,
                 attempt_count,
-                min_delay_ms,
-                last_error,
-            )
-            .await
+                next_attempt_at_ms: now_ms.saturating_add(min_delay_ms),
+            });
+        let _ = last_error;
+        Ok(())
     }
 
     async fn peek_next_due(&self) -> anyhow::Result<Option<i64>> {
-        self.db.pod_workqueue_peek_next_due().await
+        if let Some(node_local) = &self.node_local {
+            return node_local.peek_workqueue_next_due().await;
+        }
+        Ok(self
+            .test_rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|row| row.next_attempt_at_ms)
+            .min())
     }
 
     async fn claim_due(
         &self,
         now_ms: i64,
     ) -> anyhow::Result<Option<crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry>> {
-        Ok(self
-            .db
-            .pod_workqueue_claim_due(now_ms)
-            .await?
-            .map(focused_workqueue_entry))
+        if let Some(node_local) = &self.node_local {
+            return Ok(node_local
+                .claim_workqueue_due(now_ms)
+                .await?
+                .map(focused_workqueue_entry));
+        }
+        let mut rows = self.test_rows.lock().unwrap();
+        let candidate = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.next_attempt_at_ms <= now_ms)
+            .min_by_key(|(_, row)| (row.next_attempt_at_ms, row.id))
+            .map(|(index, _)| index);
+        Ok(candidate.map(|index| focused_workqueue_entry(rows.remove(index))))
     }
 
     async fn complete(&self, id: i64) -> anyhow::Result<()> {
-        self.db.pod_workqueue_complete(id).await
+        if let Some(node_local) = &self.node_local {
+            return node_local.complete_workqueue(id).await;
+        }
+        self.test_rows.lock().unwrap().retain(|row| row.id != id);
+        Ok(())
     }
 
     async fn record_failure(
@@ -446,13 +495,29 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         min_delay_ms: i64,
         error: &str,
     ) -> anyhow::Result<()> {
-        self.db
-            .pod_workqueue_record_failure(legacy_workqueue_entry(row), min_delay_ms, error)
-            .await
+        let row = legacy_workqueue_entry(row);
+        let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
+        self.enqueue(
+            match row.kind {
+                crate::datastore::PodWorkqueueKind::Pod => {
+                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
+                }
+                crate::datastore::PodWorkqueueKind::Namespace => {
+                    crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
+                }
+            },
+            &pod,
+            row.payload,
+            row.attempt_count.saturating_add(1),
+            min_delay_ms,
+            Some(error),
+        )
+        .await
     }
 
     async fn dead_letter(&self, id: i64, error: &str) -> anyhow::Result<()> {
-        self.db.pod_workqueue_dead_letter(id, error).await
+        let _ = error;
+        self.complete(id).await
     }
 }
 
@@ -513,6 +578,7 @@ pub(crate) fn build_pod_repository_parts(
 ) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
     let PodRepositoryBuildConfig {
         db,
+        node_local,
         supervisor,
         side_effects,
         metrics,
@@ -537,7 +603,11 @@ pub(crate) fn build_pod_repository_parts(
     });
     PodRepository::build_parts_with_adapters(
         Arc::new(RootPodPersistence { db: db.clone() }),
-        RootPodWorkqueuePersistence { db: db.clone() },
+        RootPodWorkqueuePersistence {
+            node_local,
+            test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
+            test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+        },
         PodRepositoryRuntimeDependencies {
             supervisor,
             metrics: metrics.clone(),

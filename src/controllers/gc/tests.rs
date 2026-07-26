@@ -3011,7 +3011,8 @@ async fn rc_background_delete_drives_all_running_children_to_finalization() {
         .unwrap();
     }
 
-    let repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let (repo, node_local) =
+        crate::controllers::test_utils::pod_repository_with_node_local_for_test(&db).await;
     let needs_more = owner_cascade_sweep_once(
         &db,
         rc_uid,
@@ -3031,7 +3032,7 @@ async fn rc_background_delete_drives_all_running_children_to_finalization() {
 
     let mut queued = std::collections::HashSet::new();
     for _ in 0..10 {
-        let Some(row) = db.pod_workqueue_claim_due(i64::MAX).await.unwrap() else {
+        let Some(row) = node_local.claim_workqueue_due(i64::MAX).await.unwrap() else {
             break;
         };
         if row.namespace == "ed-finalize" {

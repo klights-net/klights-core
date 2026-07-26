@@ -16,7 +16,7 @@
 //!   * Second pass: `pod_sandboxes` rows whose sandbox_id is not in the CRI
 //!     list get dropped, along with their matching `pod_networks` rows.
 
-use crate::datastore::DatastoreHandle;
+use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup;
 use crate::kubelet::cri::CriClient;
 use crate::kubelet::pod_repository::PodReader;
@@ -32,7 +32,7 @@ use tokio::sync::Mutex;
 pub const MAX_PER_TICK: usize = 64;
 
 pub struct SandboxGc {
-    db: DatastoreHandle,
+    node_local: NodeLocalHandle,
     cri: Arc<Mutex<CriClient>>,
     pod_reader: Arc<dyn PodReader>,
     containerd_ns: String,
@@ -44,7 +44,7 @@ pub struct SandboxGc {
 
 impl SandboxGc {
     pub fn new(
-        db: DatastoreHandle,
+        node_local: NodeLocalHandle,
         cri: Arc<Mutex<CriClient>>,
         pod_reader: Arc<dyn PodReader>,
         containerd_ns: impl Into<String>,
@@ -52,7 +52,7 @@ impl SandboxGc {
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self {
-            db,
+            node_local,
             cri,
             pod_reader,
             containerd_ns: containerd_ns.into(),
@@ -168,11 +168,7 @@ impl SandboxGc {
 
             // Best-effort SQLite cleanup. Use UID+sandbox-id qualification so
             // GC for an old orphan cannot delete a replacement Pod's sandbox row.
-            if let Err(e) = self
-                .db
-                .delete_sandbox_for_uid(&meta.namespace, &meta.name, &meta.uid, &sandbox.id)
-                .await
-            {
+            if let Err(e) = self.delete_runtime_for_match(&meta.uid, &sandbox.id).await {
                 tracing::debug!(
                     ns = %meta.namespace,
                     name = %meta.name,
@@ -180,7 +176,11 @@ impl SandboxGc {
                     "sandbox_gc: SQLite delete_sandbox_for_uid failed"
                 );
             }
-            if let Err(e) = self.db.delete_pod_network(&sandbox.id).await {
+            if let Err(e) = self
+                .node_local
+                .delete_network_for_sandbox(&sandbox.id)
+                .await
+            {
                 tracing::debug!(
                     sandbox_id = %sandbox.id,
                     error = %e,
@@ -196,30 +196,27 @@ impl SandboxGc {
         // Second pass: drop SQLite pod_sandboxes rows whose sandbox_id has
         // disappeared from CRI. Records were never the leak themselves; this
         // just keeps the table from accumulating dead entries.
-        match self.db.list_sandboxes().await {
+        match self.node_local.list_pod_runtime().await {
             Ok(rows) => {
                 for sb in rows {
-                    if !live_sandbox_ids.contains(&sb.sandbox_id) {
+                    let Some(sandbox_id) = sb.sandbox_id else {
+                        continue;
+                    };
+                    if !live_sandbox_ids.contains(&sandbox_id) {
                         if !cleanup_pod_cgroup_for_gc(
                             &self.file_process,
                             &self.containerd_ns,
                             &sb.pod_uid,
-                            &sb.sandbox_id,
+                            &sandbox_id,
                             "stale sandbox row",
                         )
                         .await
                         {
                             continue;
                         }
-                        stale_sandbox_row_ids.insert(sb.sandbox_id.clone());
+                        stale_sandbox_row_ids.insert(sandbox_id.clone());
                         if let Err(e) = self
-                            .db
-                            .delete_sandbox_for_uid(
-                                &sb.namespace,
-                                &sb.pod_name,
-                                &sb.pod_uid,
-                                &sb.sandbox_id,
-                            )
+                            .delete_runtime_for_match(&sb.pod_uid, &sandbox_id)
                             .await
                         {
                             tracing::debug!(
@@ -247,14 +244,18 @@ impl SandboxGc {
         let live_ids_for_network_cleanup =
             pod_network_cleanup_live_ids(&live_sandbox_ids, refresh_result);
 
-        match self.db.list_pod_network_sandbox_ids().await {
+        match self.node_local.list_networks().await {
             Ok(sandbox_ids) => {
                 for sandbox_id in pod_network_cleanup_candidates(
                     sandbox_ids,
                     &live_ids_for_network_cleanup,
                     &stale_sandbox_row_ids,
                 ) {
-                    if let Err(e) = self.db.delete_pod_network(&sandbox_id).await {
+                    if let Err(e) = self
+                        .node_local
+                        .delete_network_for_sandbox(&sandbox_id)
+                        .await
+                    {
                         tracing::debug!(
                             sandbox_id = %sandbox_id,
                             error = %e,
@@ -277,6 +278,16 @@ impl SandboxGc {
             );
         }
         Ok(removed)
+    }
+
+    async fn delete_runtime_for_match(&self, pod_uid: &str, sandbox_id: &str) -> Result<()> {
+        let Some(row) = self.node_local.get_pod_runtime(pod_uid).await? else {
+            return Ok(());
+        };
+        if row.sandbox_id.as_deref() == Some(sandbox_id) {
+            self.node_local.delete_pod_runtime_for_uid(pod_uid).await?;
+        }
+        Ok(())
     }
 }
 

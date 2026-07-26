@@ -760,10 +760,10 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
 
     // Raft stamps the next sequential rv: the delete lands above the list rv.
     let delete_rv = list.resource_version + 1;
-    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
         delete_rv,
-        vec![crate::log_apply::LogApplyMutation::DeleteResource(
-            crate::log_apply::LogApplyResourceKey {
+        vec![klights_cluster_core::LogApplyMutation::DeleteResource(
+            klights_cluster_core::LogApplyResourceKey {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),
@@ -811,12 +811,12 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         .await
         .unwrap();
 
-    let command = crate::datastore::command::StorageCommand::DeleteResource {
+    let command = klights_cluster_core::command::StorageCommand::DeleteResource {
         api_version: "v1".to_string(),
         kind: "ConfigMap".to_string(),
         namespace: Some("default".to_string()),
         name: "cm-pending-delete".to_string(),
-        preconditions: crate::datastore::types::ResourcePreconditions::uid(created.uid.clone()),
+        preconditions: klights_cluster_core::ResourcePreconditions::uid(created.uid.clone()),
     };
     let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
@@ -825,7 +825,7 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         .build_log_apply_commit_for_outbox(
             "pending-delete-list-watch",
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -839,10 +839,10 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         panic!("expected a fresh delete commit");
     };
 
-    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
         delete_rv + 1,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),

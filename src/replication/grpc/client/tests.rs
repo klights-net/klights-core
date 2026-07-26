@@ -8,17 +8,17 @@ mod cases {
 
     use crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime;
     use crate::datastore::backend::DatastoreHandle;
-    use crate::datastore::command::{
-        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
-    };
     use crate::replication::grpc::client::{
         ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };
     use crate::replication::grpc::client::{ConnectDispatchContext, dispatch_leader_message};
-    use crate::replication::grpc::generated::{self, follower_message, leader_message};
     use crate::replication::protocol::{JoinRole, ReplicationEntry, StreamItem};
     use crate::replication::service::ReplicationService;
     use futures::StreamExt as _;
+    use klights_cluster_core::command::{
+        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
+    };
+    use klights_internal_protobuf::{self, follower_message, leader_message};
     use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
     use klights_node_api::{
         ExecStreamChannel, ExecStreamOptions, NodeExec, NodeExecFrame, NodeExecRequest,
@@ -57,7 +57,7 @@ mod cases {
     #[test]
     fn watch_request_wire_preserves_absent_and_explicit_zero_resource_version() {
         for expected in [None, Some(0)] {
-            let request = generated::WatchResourcesRequest {
+            let request = klights_internal_protobuf::WatchResourcesRequest {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: None,
@@ -68,8 +68,10 @@ mod cases {
             };
             let bytes = prost::Message::encode_to_vec(&request);
             let decoded =
-                <generated::WatchResourcesRequest as prost::Message>::decode(bytes.as_slice())
-                    .expect("decode WatchResourcesRequest");
+                <klights_internal_protobuf::WatchResourcesRequest as prost::Message>::decode(
+                    bytes.as_slice(),
+                )
+                .expect("decode WatchResourcesRequest");
             assert_eq!(
                 decoded.start_resource_version, expected,
                 "fresh-watch absence and explicit Kubernetes RV=0 are distinct wire intents"
@@ -168,11 +170,13 @@ mod cases {
 
     #[test]
     fn node_metrics_worker_wire_conversions_preserve_fields_and_errors() {
-        let routed = super::super::node_metrics_request_from_proto(generated::NodeMetricsRequest {
-            request_id: "metrics-worker-3".to_string(),
-            node_name: "worker-3".to_string(),
-            pod_uids: vec!["uid-a".to_string(), "uid-b".to_string()],
-        })
+        let routed = super::super::node_metrics_request_from_proto(
+            klights_internal_protobuf::NodeMetricsRequest {
+                request_id: "metrics-worker-3".to_string(),
+                node_name: "worker-3".to_string(),
+                pod_uids: vec!["uid-a".to_string(), "uid-b".to_string()],
+            },
+        )
         .unwrap();
         assert_eq!(routed.request_id, "metrics-worker-3");
         assert_eq!(routed.request.target().node_name(), "worker-3");
@@ -314,14 +318,15 @@ mod cases {
 
     #[test]
     fn outbox_transport_terminal_decisions_require_typed_consumed_responses() {
-        let response_error =
-            super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
+        let response_error = super::super::decode_apply_outbox_response(
+            klights_internal_protobuf::ApplyOutboxResponse {
                 already_applied: true,
                 applied_rv: 41,
                 error: Some("conflict".to_string()),
                 error_type: Some("ConflictTerminal".to_string()),
-            })
-            .expect_err("success evidence and a terminal decision are contradictory");
+            },
+        )
+        .expect_err("success evidence and a terminal decision are contradictory");
         assert!(matches!(
             &response_error,
             klights_leader_api::OutboxDeliveryError::CorruptResponse { .. }
@@ -345,12 +350,14 @@ mod cases {
 
     #[test]
     fn outbox_response_codec_preserves_absent_already_applied_resource_version() {
-        let decoded = super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
-            already_applied: true,
-            applied_rv: 0,
-            error: None,
-            error_type: None,
-        })
+        let decoded = super::super::decode_apply_outbox_response(
+            klights_internal_protobuf::ApplyOutboxResponse {
+                already_applied: true,
+                applied_rv: 0,
+                error: None,
+                error_type: None,
+            },
+        )
         .expect("zero is the stable wire encoding for an absent replay RV");
         assert_eq!(
             decoded,
@@ -360,12 +367,14 @@ mod cases {
 
     #[test]
     fn outbox_response_codec_rejects_zero_resource_version_for_new_apply() {
-        let error = super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
-            already_applied: false,
-            applied_rv: 0,
-            error: None,
-            error_type: None,
-        })
+        let error = super::super::decode_apply_outbox_response(
+            klights_internal_protobuf::ApplyOutboxResponse {
+                already_applied: false,
+                applied_rv: 0,
+                error: None,
+                error_type: None,
+            },
+        )
         .expect_err("a new committed apply must carry a positive public resourceVersion");
         assert!(matches!(
             &error,
@@ -388,20 +397,21 @@ mod cases {
                 },
             ),
         ] {
-            let decoded =
-                super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
+            let decoded = super::super::decode_apply_outbox_response(
+                klights_internal_protobuf::ApplyOutboxResponse {
                     already_applied,
                     applied_rv: 19,
                     error: None,
                     error_type: None,
-                })
-                .expect("positive wire resourceVersion");
+                },
+            )
+            .expect("positive wire resourceVersion");
             assert_eq!(decoded, expected);
         }
     }
 
-    fn resource_object() -> generated::ResourceObject {
-        generated::ResourceObject {
+    fn resource_object() -> klights_internal_protobuf::ResourceObject {
+        klights_internal_protobuf::ResourceObject {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -425,11 +435,11 @@ mod cases {
     #[test]
     fn get_response_rejects_presence_contradictions() {
         for response in [
-            generated::GetResourceResponse {
+            klights_internal_protobuf::GetResourceResponse {
                 found: true,
                 resource: None,
             },
-            generated::GetResourceResponse {
+            klights_internal_protobuf::GetResourceResponse {
                 found: false,
                 resource: Some(resource_object()),
             },
@@ -473,13 +483,13 @@ mod cases {
 
     #[test]
     fn list_response_rejects_negative_or_contradictory_metadata() {
-        let base = || generated::ListResourcesResponse {
+        let base = || klights_internal_protobuf::ListResourcesResponse {
             items: vec![resource_object()],
             total: 1,
             continue_token: None,
             resource_version: 42,
             remaining_item_count: None,
-            watch_replay_position: Some(generated::WatchReplayPosition {
+            watch_replay_position: Some(klights_internal_protobuf::WatchReplayPosition {
                 resource_version: 42,
                 event_id: 9,
                 resource_version_filter_through_event_id: 9,
@@ -505,9 +515,9 @@ mod cases {
 
     #[test]
     fn watch_wire_decode_preserves_event_id_and_rejects_unknown_type() {
-        let wire = |event_type: &str| generated::WatchEvent {
+        let wire = |event_type: &str| klights_internal_protobuf::WatchEvent {
             event_type: event_type.to_string(),
-            resource: Some(generated::ResourceObject {
+            resource: Some(klights_internal_protobuf::ResourceObject {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
@@ -526,7 +536,7 @@ mod cases {
                 }))
                 .expect("encode test Pod"),
             }),
-            resume_position: Some(generated::WatchReplayPosition {
+            resume_position: Some(klights_internal_protobuf::WatchReplayPosition {
                 resource_version: 42,
                 event_id: 92,
                 resource_version_filter_through_event_id: 0,
@@ -651,8 +661,7 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
 
-        let mut request =
-            tonic::Request::new(crate::replication::grpc::generated::MetadataRequest {});
+        let mut request = tonic::Request::new(klights_internal_protobuf::MetadataRequest {});
         client.add_join_token(&mut request).unwrap();
 
         assert!(
@@ -663,7 +672,7 @@ mod cases {
         assert_eq!(client.join_request().token, "");
         assert_eq!(
             client.join_request().command_codec_version,
-            crate::log_apply::COMMAND_CODEC_VERSION,
+            klights_cluster_core::COMMAND_CODEC_VERSION,
             "every worker stream handshake must advertise exact codec v3"
         );
     }
@@ -686,9 +695,9 @@ mod cases {
         let (stream_tx, _stream_rx) = tokio::sync::mpsc::channel(1);
 
         dispatch_leader_message(
-            generated::LeaderMessage {
+            klights_internal_protobuf::LeaderMessage {
                 payload: Some(leader_message::Payload::ObserveLeaderEndpointRequest(
-                    generated::ObserveLeaderEndpointRequest {},
+                    klights_internal_protobuf::ObserveLeaderEndpointRequest {},
                 )),
             },
             &outbound,
@@ -2024,7 +2033,7 @@ mod cases {
         );
         assert_eq!(
             db.list_outbox_stream_watermarks().await.unwrap(),
-            vec![crate::log_apply::OutboxStreamWatermark {
+            vec![klights_cluster_core::OutboxStreamWatermark {
                 client_id: "client".to_string(),
                 stream_id: 1,
                 stream_seq: 1,
@@ -2472,7 +2481,7 @@ mod cases {
     #[test]
     fn cleanup_intent_wire_decode_rejects_noncanonical_pod_snapshot_with_typed_error() {
         let error = crate::replication::grpc::client::pod_cleanup_intent_from_proto(
-            crate::replication::grpc::generated::PodCleanupIntentObject {
+            klights_internal_protobuf::PodCleanupIntentObject {
                 node_name: "worker-1".to_string(),
                 namespace: "default".to_string(),
                 pod_name: "web".to_string(),
@@ -3573,7 +3582,7 @@ mod cases {
 
     #[test]
     fn node_subnet_wire_decode_rejects_redundancy_and_shape_mismatches() {
-        let valid = generated::NodeSubnetObject {
+        let valid = klights_internal_protobuf::NodeSubnetObject {
             node_name: "node-a".to_string(),
             subnet: "10.42.1.0/24".to_string(),
             subnet_base_int: u32::from(std::net::Ipv4Addr::new(10, 42, 1, 0)),
@@ -3585,23 +3594,23 @@ mod cases {
         assert!(crate::replication::grpc::client::node_subnet_from_proto(valid.clone()).is_ok());
 
         for invalid in [
-            generated::NodeSubnetObject {
+            klights_internal_protobuf::NodeSubnetObject {
                 subnet: "10.42.1.0/25".to_string(),
                 ..valid.clone()
             },
-            generated::NodeSubnetObject {
+            klights_internal_protobuf::NodeSubnetObject {
                 subnet_base_int: u32::from(std::net::Ipv4Addr::new(10, 42, 9, 0)),
                 ..valid.clone()
             },
-            generated::NodeSubnetObject {
+            klights_internal_protobuf::NodeSubnetObject {
                 gateway_ip: "10.42.1.1".to_string(),
                 ..valid.clone()
             },
-            generated::NodeSubnetObject {
+            klights_internal_protobuf::NodeSubnetObject {
                 mode: "unknown".to_string(),
                 ..valid.clone()
             },
-            generated::NodeSubnetObject {
+            klights_internal_protobuf::NodeSubnetObject {
                 mode: "rootless".to_string(),
                 ..valid
             },
@@ -3615,7 +3624,7 @@ mod cases {
 
     #[test]
     fn dataplane_wire_decode_rejects_unknown_and_overlay_shaped_direct_routes() {
-        let direct = generated::DataplaneMetadataObject {
+        let direct = klights_internal_protobuf::DataplaneMetadataObject {
             node_name: "node-a".to_string(),
             mode: "root".to_string(),
             encryption: "disabled".to_string(),
@@ -3628,19 +3637,19 @@ mod cases {
         );
 
         for invalid in [
-            generated::DataplaneMetadataObject {
+            klights_internal_protobuf::DataplaneMetadataObject {
                 mode: "unknown".to_string(),
                 ..direct.clone()
             },
-            generated::DataplaneMetadataObject {
+            klights_internal_protobuf::DataplaneMetadataObject {
                 encryption: "unknown".to_string(),
                 ..direct.clone()
             },
-            generated::DataplaneMetadataObject {
+            klights_internal_protobuf::DataplaneMetadataObject {
                 public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
                 ..direct.clone()
             },
-            generated::DataplaneMetadataObject {
+            klights_internal_protobuf::DataplaneMetadataObject {
                 port: Some(7_679),
                 ..direct
             },

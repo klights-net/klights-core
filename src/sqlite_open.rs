@@ -22,7 +22,7 @@ use anyhow::{Result, anyhow};
 use crate::datastore::errors::OpenError;
 use klights_supervisor::TaskSupervisor;
 
-use super::{fingerprint, queries, schema};
+use crate::datastore::sqlite::{fingerprint, queries, schema};
 
 /// PRAGMA + key application profile selected at open time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +364,7 @@ pub fn apply_key(conn: &rusqlite::Connection, key: &[u8]) -> rusqlite::Result<()
 
 /// Read the SQLCipher key from a file via the supervisor's file-category
 /// blocking pool.
+#[cfg(feature = "sqlcipher")]
 pub async fn read_key_file(
     supervisor: &std::sync::Arc<TaskSupervisor>,
     path: &std::path::Path,
@@ -395,7 +396,19 @@ pub async fn read_key_file(
 /// the WAL file is present but the main database file is missing.
 /// SQLite would silently create a new empty DB, potentially masking
 /// data loss. The opener must fail explicitly so the operator knows.
-pub fn check_orphaned_wal(db_path: &Path) -> Result<(), OpenError> {
+pub async fn check_orphaned_wal(supervisor: &Arc<TaskSupervisor>, db_path: &Path) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    supervisor
+        .clone()
+        .run_blocking_file("opener:check_orphaned_wal", move || {
+            check_orphaned_wal_blocking(&db_path)
+        })
+        .await
+        .map_err(|error| anyhow!("check_orphaned_wal supervisor error: {error}"))??;
+    Ok(())
+}
+
+fn check_orphaned_wal_blocking(db_path: &Path) -> Result<(), OpenError> {
     let wal_path = {
         let mut s = db_path.as_os_str().to_owned();
         s.push("-wal");
@@ -414,6 +427,34 @@ pub fn check_orphaned_wal(db_path: &Path) -> Result<(), OpenError> {
         });
     }
     Ok(())
+}
+
+pub async fn persistent_datastore_sizes(
+    supervisor: &Arc<TaskSupervisor>,
+    db_path: &Path,
+) -> Result<(u64, u64)> {
+    let db_path = db_path.to_path_buf();
+    supervisor
+        .clone()
+        .run_blocking_file("opener:persistent_datastore_sizes", move || {
+            let db_size = std::fs::metadata(&db_path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let mut wal_path = db_path.as_os_str().to_owned();
+            wal_path.push("-wal");
+            let wal_path = PathBuf::from(wal_path);
+            let wal_size = std::fs::metadata(wal_path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            (db_size, wal_size)
+        })
+        .await
+        .map_err(|error| anyhow!("persistent_datastore_sizes supervisor error: {error}"))
+}
+
+#[cfg(test)]
+pub fn check_orphaned_wal_for_test(db_path: &Path) -> Result<(), OpenError> {
+    check_orphaned_wal_blocking(db_path)
 }
 
 /// Run corruption and schema fingerprint checks on a freshly-opened connection.

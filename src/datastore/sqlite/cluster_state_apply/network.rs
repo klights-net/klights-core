@@ -1,5 +1,5 @@
 use super::super::queries;
-use crate::log_apply::{
+use klights_cluster_core::{
     LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
 };
 use klights_types::{ClusterCidr, NodeName, PodSubnet};

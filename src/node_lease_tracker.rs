@@ -8,7 +8,7 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::utils::k8s_time_format;
 
-pub const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 = 30;
+use klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS;
 pub const DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS: i64 = 8;
 pub const DEFAULT_NODE_LEASE_MISSED_HEARTBEATS: i64 = 3;
 pub const DEFAULT_NODE_LEASE_GRACE_SECONDS: i64 =
@@ -109,7 +109,7 @@ impl NodeLeaseTracker {
         command: &StorageCommand,
         authoring_node: &str,
     ) -> Result<NodeLeaseObservation> {
-        ensure_lease_renew_command(command, authoring_node)?;
+        klights_cluster_core::validate_lease_renew_command(command, authoring_node)?;
         let (name, data) = match command {
             StorageCommand::CreateResource { name, data, .. }
             | StorageCommand::UpdateResource { name, data, .. } => (name, data),
@@ -167,44 +167,6 @@ impl Default for NodeLeaseTracker {
     fn default() -> Self {
         Self::new()
     }
-}
-
-pub fn ensure_lease_renew_command(command: &StorageCommand, authoring_node: &str) -> Result<()> {
-    let (api_version, kind, namespace, name) = match command {
-        StorageCommand::CreateResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            ..
-        }
-        | StorageCommand::UpdateResource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            ..
-        } => (api_version, kind, namespace, name),
-        _ => {
-            return Err(anyhow!(
-                "LeaseRenew must carry a Lease create/update command"
-            ));
-        }
-    };
-    if api_version != "coordination.k8s.io/v1"
-        || kind != "Lease"
-        || namespace.as_deref() != Some("kube-node-lease")
-    {
-        return Err(anyhow!(
-            "LeaseRenew must target coordination.k8s.io/v1 Lease in kube-node-lease"
-        ));
-    }
-    if name != authoring_node {
-        return Err(anyhow!(
-            "LeaseRenew authoring node {authoring_node} cannot renew Lease {name}"
-        ));
-    }
-    Ok(())
 }
 
 fn parse_renew_time(raw: &str) -> Result<DateTime<Utc>> {

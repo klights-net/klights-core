@@ -95,11 +95,11 @@ impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
 }
 
 pub struct DatastorePodSlotAdapter {
-    store: Arc<dyn crate::datastore::PodCleanupStore>,
+    store: crate::datastore::node_local::NodeLocalHandle,
 }
 
 impl DatastorePodSlotAdapter {
-    pub fn new(store: Arc<dyn crate::datastore::PodCleanupStore>) -> Arc<Self> {
+    pub fn new(store: crate::datastore::node_local::NodeLocalHandle) -> Arc<Self> {
         Arc::new(Self { store })
     }
 }
@@ -191,10 +191,10 @@ impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
         request: klights_node_store::PodSlotAdmissionRequest,
     ) -> klights_node_store::RuntimeWorkFuture<'_, klights_node_store::PodSlotClearResult> {
         Box::pin(async move {
-            let (pod, node_name) = request.into_parts();
+            let (pod, _node_name) = request.into_parts();
             let result = self
                 .store
-                .pod_slot_clear_if_uid(&pod.namespace, &pod.name, &pod.uid, &node_name)
+                .pod_slot_clear_if_uid(&pod.namespace, &pod.name, &pod.uid)
                 .await
                 .map_err(|error| {
                     klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())

@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
 #[cfg(test)]
-use crate::datastore::{DatastoreHandle, PodWorkqueueEntry as LegacyPodWorkqueueEntry};
+use crate::datastore::PodWorkqueueEntry as LegacyPodWorkqueueEntry;
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
@@ -113,7 +113,7 @@ fn legacy_entry(row: PodWorkqueueEntry) -> LegacyPodWorkqueueEntry {
 
 #[cfg(test)]
 #[async_trait::async_trait]
-impl PodWorkqueuePersistence for crate::datastore::DatastoreHandle {
+impl PodWorkqueuePersistence for crate::datastore::node_local::NodeLocalHandle {
     async fn enqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -124,7 +124,7 @@ impl PodWorkqueuePersistence for crate::datastore::DatastoreHandle {
         last_error: Option<&str>,
     ) -> Result<()> {
         self.as_ref()
-            .pod_workqueue_enqueue(
+            .enqueue_workqueue(
                 legacy_kind(kind),
                 pod,
                 payload,
@@ -136,19 +136,19 @@ impl PodWorkqueuePersistence for crate::datastore::DatastoreHandle {
     }
 
     async fn peek_next_due(&self) -> Result<Option<i64>> {
-        self.as_ref().pod_workqueue_peek_next_due().await
+        self.as_ref().peek_workqueue_next_due().await
     }
 
     async fn claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
         Ok(self
             .as_ref()
-            .pod_workqueue_claim_due(now_ms)
+            .claim_workqueue_due(now_ms)
             .await?
             .map(focused_entry))
     }
 
     async fn complete(&self, id: i64) -> Result<()> {
-        self.as_ref().pod_workqueue_complete(id).await
+        self.as_ref().complete_workqueue(id).await
     }
 
     async fn record_failure(
@@ -157,13 +157,23 @@ impl PodWorkqueuePersistence for crate::datastore::DatastoreHandle {
         min_delay_ms: i64,
         error: &str,
     ) -> Result<()> {
+        let row = legacy_entry(row);
+        let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
         self.as_ref()
-            .pod_workqueue_record_failure(legacy_entry(row), min_delay_ms, error)
+            .enqueue_workqueue(
+                row.kind,
+                &pod,
+                row.payload,
+                row.attempt_count.saturating_add(1),
+                min_delay_ms,
+                Some(error),
+            )
             .await
     }
 
     async fn dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        self.as_ref().pod_workqueue_dead_letter(id, error).await
+        let _ = error;
+        self.as_ref().complete_workqueue(id).await
     }
 }
 
@@ -1173,34 +1183,44 @@ mod tests {
         }
     }
 
-    async fn test_workqueue() -> (Arc<PodWorkqueue>, DatastoreHandle) {
+    async fn test_workqueue() -> (
+        Arc<PodWorkqueue>,
+        crate::datastore::DatastoreHandle,
+        crate::datastore::node_local::NodeLocalHandle,
+    ) {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new_leader(
             store,
-            db.clone(),
+            node_local.clone(),
             supervisor,
             metrics,
             crate::control_plane::client::local::always_leader_watch(),
         );
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
-        (workqueue, db)
+        (workqueue, db, node_local)
     }
 
-    async fn test_non_leader_workqueue() -> (Arc<PodWorkqueue>, DatastoreHandle) {
+    async fn test_non_leader_workqueue() -> (
+        Arc<PodWorkqueue>,
+        crate::datastore::DatastoreHandle,
+        crate::datastore::node_local::NodeLocalHandle,
+    ) {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let metrics = SideEffectMetrics::new();
-        let workqueue = PodWorkqueue::new(store, db.clone(), supervisor, metrics);
+        let workqueue = PodWorkqueue::new(store, node_local.clone(), supervisor, metrics);
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
-        (workqueue, db)
+        (workqueue, db, node_local)
     }
 
     #[tokio::test]
@@ -1210,10 +1230,11 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let (leader_tx, leader_rx) = tokio::sync::watch::channel(false);
         let workqueue = PodWorkqueue::new_leader(
             store,
-            db.clone(),
+            node_local.clone(),
             supervisor.clone(),
             SideEffectMetrics::new(),
             leader_rx,
@@ -1243,7 +1264,13 @@ mod tests {
                 .is_some(),
             "follower must not process or lose the terminating Pod"
         );
-        assert!(db.pod_workqueue_peek_next_due().await.unwrap().is_none());
+        assert!(
+            node_local
+                .peek_workqueue_next_due()
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         leader_tx.send(true).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1338,7 +1365,7 @@ mod tests {
     async fn deferred_pod_delete_removes_unscheduled_terminating_pod_directly() {
         // HR#11 exception: an unscheduled Pod (never bound to a node) has no
         // kubelet actor; the leader removes the row directly.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1370,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_leader_workqueue_cannot_remove_unscheduled_pod_row() {
-        let (workqueue, db) = test_non_leader_workqueue().await;
+        let (workqueue, db, _node_local) = test_non_leader_workqueue().await;
         let created = db
             .create_resource(
                 "v1",
@@ -1412,7 +1439,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_pod_delete_waits_for_kubelet_cleanup_while_uid_still_exists() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1449,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_pod_delete_wakes_local_actor_for_live_uid() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1490,7 +1517,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminating_pod_is_finalized_even_when_live_watch_event_is_dropped() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1552,7 +1579,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_pod_delete_is_uid_bound_and_preserves_replacement_pod() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1589,7 +1616,7 @@ mod tests {
         // the leader. The worker's Pod watch/actor owns finalization; the
         // leader-side workqueue only keeps a UID-bound reminder alive until
         // that actor-owned finalization removes the row.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
 
         db.create_resource(
             "v1",
@@ -1637,7 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_pod_workqueue_resignals_gc_delete_on_retry() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
 
         db.create_resource(
             "v1",
@@ -1680,7 +1707,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_pod_resignal_throttled_to_every_30_seconds() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
 
         db.create_resource(
             "v1",
@@ -1746,7 +1773,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_pod_without_deletion_timestamp_is_marked_on_first_retry() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
 
         db.create_resource(
             "v1",
@@ -1784,7 +1811,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_pod_resignal_is_uid_bound_and_self_extinguishes_when_row_removed() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1835,7 +1862,7 @@ mod tests {
         // Durability backstop: the remote deferred delete keeps the workqueue
         // entry alive (Err -> retry) while the Pod row still exists, and
         // completes (Ok) only once the actor-owned path has removed the row.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         db.create_resource(
             "v1",
             "Pod",
@@ -1879,7 +1906,7 @@ mod tests {
         // When local node is unknown but a target is specified, the deferred
         // delete still must not fall back to a leader-side hard-delete. It
         // keeps retrying until the target actor removes the row.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         *workqueue.local_node_name.lock().unwrap() = None;
 
         db.create_resource(
@@ -1910,7 +1937,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_pod_delete_skips_if_local_node_unknown_when_pod_has_node_name() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         *workqueue.local_node_name.lock().unwrap() = None;
         db.create_resource(
             "v1",
@@ -1942,7 +1969,7 @@ mod tests {
         // Regression: namespace termination must enqueue workqueue entries
         // for ALL terminating pods, including those on remote nodes. Remote
         // entries are actor-owned reminders, not leader hard-deletes.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
@@ -1980,7 +2007,7 @@ mod tests {
 
         let mut claimed_rows = Vec::new();
         loop {
-            let row = db.pod_workqueue_claim_due(i64::MAX).await.unwrap();
+            let row = _node_local.claim_workqueue_due(i64::MAX).await.unwrap();
             if let Some(row) = row {
                 claimed_rows.push(row);
                 continue;
@@ -2001,7 +2028,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_deferred_delete_records_uid_bound_retry_row() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, _db, _node_local) = test_workqueue().await;
         let before = now_ms();
 
         workqueue
@@ -2014,8 +2041,8 @@ mod tests {
             .await
             .unwrap();
 
-        let due = db
-            .pod_workqueue_peek_next_due()
+        let due = _node_local
+            .peek_workqueue_next_due()
             .await
             .unwrap()
             .expect("deferred delete must be recorded in the durable workqueue");
@@ -2023,7 +2050,7 @@ mod tests {
             due >= before + 40,
             "deferred delete should not be due before the requested delay"
         );
-        let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
+        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
@@ -2042,7 +2069,7 @@ mod tests {
 
     #[tokio::test]
     async fn enqueue_deferred_delete_with_target_node_records_target_in_payload() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, _db, _node_local) = test_workqueue().await;
         let before = now_ms();
 
         workqueue
@@ -2056,8 +2083,8 @@ mod tests {
             .await
             .unwrap();
 
-        let due = db
-            .pod_workqueue_peek_next_due()
+        let due = _node_local
+            .peek_workqueue_next_due()
             .await
             .unwrap()
             .expect("deferred delete must be recorded in the durable workqueue");
@@ -2065,7 +2092,7 @@ mod tests {
             due >= before + 40,
             "deferred delete should not be due before the requested delay"
         );
-        let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
+        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
@@ -2083,7 +2110,7 @@ mod tests {
         // Regression test: a deferred delete for a pod on a remote node
         // must not be silently dropped, must not wake the local actor, and
         // must not hard-delete through a leader-side outbox.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
 
         db.create_resource(
             "v1",
@@ -2104,19 +2131,24 @@ mod tests {
         let router = test_router(&supervisor, executor.clone());
         workqueue.set_lifecycle_router_for_node(router, "node-a".to_string());
 
-        db.pod_workqueue_enqueue(
-            crate::datastore::PodWorkqueueKind::Pod,
-            &klights_types::PodIdentity::new("default", "remote-pod", "uid-old"),
-            json!({"target_node": "node-b"}),
-            0,
-            0,
-            None,
-        )
-        .await
-        .unwrap();
+        _node_local
+            .enqueue_workqueue(
+                crate::datastore::PodWorkqueueKind::Pod,
+                &klights_types::PodIdentity::new("default", "remote-pod", "uid-old"),
+                json!({"target_node": "node-b"}),
+                0,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let due = db.pod_workqueue_peek_next_due().await.unwrap().unwrap();
-        let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
+        let due = _node_local
+            .peek_workqueue_next_due()
+            .await
+            .unwrap()
+            .unwrap();
+        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         workqueue.clone().run_retry(focused_entry(row)).await;
 
         // The local actor must NOT be woken for a remote pod.
@@ -2134,7 +2166,8 @@ mod tests {
         // for retry rather than completed. The target worker's actor is the
         // only terminal delete owner for a picked-up Pod.
         assert!(
-            db.pod_workqueue_claim_due(i64::MAX)
+            _node_local
+                .claim_workqueue_due(i64::MAX)
                 .await
                 .unwrap()
                 .is_some(),
@@ -2144,7 +2177,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_finalizes_pod_from_durable_intent_without_restart() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         *workqueue.local_node_name.lock().unwrap() = Some("node-b".to_string());
         db.create_resource(
             "v1",
@@ -2165,19 +2198,24 @@ mod tests {
         let router = test_router(&supervisor, executor.clone());
         workqueue.set_lifecycle_router_for_node(router, "node-b".to_string());
 
-        db.pod_workqueue_enqueue(
-            crate::datastore::PodWorkqueueKind::Pod,
-            &klights_types::PodIdentity::new("default", "worker-pod", "uid-old"),
-            json!({"target_node": "node-b"}),
-            0,
-            0,
-            None,
-        )
-        .await
-        .unwrap();
+        _node_local
+            .enqueue_workqueue(
+                crate::datastore::PodWorkqueueKind::Pod,
+                &klights_types::PodIdentity::new("default", "worker-pod", "uid-old"),
+                json!({"target_node": "node-b"}),
+                0,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let due = db.pod_workqueue_peek_next_due().await.unwrap().unwrap();
-        let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
+        let due = _node_local
+            .peek_workqueue_next_due()
+            .await
+            .unwrap()
+            .unwrap();
+        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         workqueue
             .run_pod_delete_full_with_target_node(
                 row.namespace.clone(),
@@ -2218,7 +2256,7 @@ mod tests {
     async fn enqueue_deferred_delete_does_not_skip_remote_target() {
         // Regression test: enqueue_deferred_delete_with_target_node must
         // NOT silently drop entries for remote-targeted pods.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, _db, _node_local) = test_workqueue().await;
 
         workqueue
             .enqueue_deferred_delete_with_target_node(
@@ -2231,12 +2269,16 @@ mod tests {
             .await
             .unwrap();
 
-        let due = db.pod_workqueue_peek_next_due().await.unwrap();
+        let due = _node_local.peek_workqueue_next_due().await.unwrap();
         assert!(
             due.is_some(),
             "remote-targeted deferred delete must be enqueued in the workqueue"
         );
-        let row = db.pod_workqueue_claim_due(i64::MAX).await.unwrap().unwrap();
+        let row = _node_local
+            .claim_workqueue_due(i64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "remote-pod");
         assert_eq!(row.uid, "uid-old");
@@ -2250,7 +2292,7 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_termination_enqueues_uid_bound_delete_for_unscheduled_pod() {
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
         workqueue.set_namespace_termination_sink(Arc::new(
             crate::pod_reconcile_adapter::PodReconcileAdapter::new(
                 db.clone(),
@@ -2314,8 +2356,8 @@ mod tests {
             "unexpected namespace retry error: {err:#}"
         );
 
-        let row = db
-            .pod_workqueue_claim_due(now_ms() + 1_000)
+        let row = _node_local
+            .claim_workqueue_due(now_ms() + 1_000)
             .await
             .unwrap()
             .expect("namespace termination must enqueue actor-owned Pod delete work");
@@ -2349,7 +2391,7 @@ mod tests {
         // pod with a custom finalizer, deletes the namespace, and expects the
         // pod to still exist (with deletionTimestamp) while the ConfigMap
         // does NOT have deletionTimestamp.
-        let (workqueue, db) = test_workqueue().await;
+        let (workqueue, db, _node_local) = test_workqueue().await;
 
         let mut remote_pod = pod_with_uid_on_node("finalizer-pod", "uid-f", true, "node-b");
         remote_pod["metadata"]["finalizers"] = json!(["test-finalizer"]);
@@ -2373,19 +2415,24 @@ mod tests {
         workqueue.set_lifecycle_router_for_node(router, "node-a".to_string());
 
         // Enqueue as if namespace termination did it.
-        db.pod_workqueue_enqueue(
-            crate::datastore::PodWorkqueueKind::Pod,
-            &klights_types::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
-            json!({"target_node": "node-b"}),
-            0,
-            0,
-            None,
-        )
-        .await
-        .unwrap();
+        _node_local
+            .enqueue_workqueue(
+                crate::datastore::PodWorkqueueKind::Pod,
+                &klights_types::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
+                json!({"target_node": "node-b"}),
+                0,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let due = db.pod_workqueue_peek_next_due().await.unwrap().unwrap();
-        let row = db.pod_workqueue_claim_due(due).await.unwrap().unwrap();
+        let due = _node_local
+            .peek_workqueue_next_due()
+            .await
+            .unwrap()
+            .unwrap();
+        let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
         workqueue.clone().run_retry(focused_entry(row)).await;
 
         // The pod must STILL exist in the datastore — remote leader workqueue
@@ -2406,7 +2453,7 @@ mod tests {
 
         // The workqueue entry must be re-enqueued for retry (not completed),
         // because the pod still has finalizers.
-        let retry_row = db.pod_workqueue_claim_due(i64::MAX).await.unwrap();
+        let retry_row = _node_local.claim_workqueue_due(i64::MAX).await.unwrap();
         assert!(
             retry_row.is_some(),
             "remote pod with finalizers must be re-enqueued for retry"
@@ -2424,9 +2471,10 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let cancel = supervisor.root_cancellation_token();
         let metrics = SideEffectMetrics::new();
-        let workqueue = PodWorkqueue::new(store, db.clone(), supervisor.clone(), metrics);
+        let workqueue = PodWorkqueue::new(store, node_local, supervisor.clone(), metrics);
 
         // Enqueue a deferred delete to trigger reconciler start.
         // The reconciler will fail to process it (no lifecycle_router set)

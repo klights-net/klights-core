@@ -7,10 +7,12 @@ mod cases {
     #![allow(clippy::await_holding_lock)]
     use super::super::*;
     use crate::datastore::backend::DatastoreBackend;
-    use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId};
     use crate::datastore::errors::OpenError;
-    use crate::datastore::types::*;
     use async_trait::async_trait;
+    use klights_cluster_core::command::{COMMAND_CODEC_VERSION, CommandId};
+    use klights_cluster_core::{
+        PatchKind, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+    };
     use serde_json::{Value, json};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,7 +78,7 @@ mod cases {
                 operation: &str,
                 command: StorageCommand,
                 authoring_node: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
@@ -129,7 +131,7 @@ mod cases {
             _operation: &str,
             _command: StorageCommand,
             _authoring_node: &str,
-            _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+            _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
         ) -> std::result::Result<
             crate::node_outbox::OutboxApplyResult,
             crate::node_outbox::OutboxApplyError,
@@ -176,7 +178,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_log_apply_commit(
                 &ds,
-                crate::log_apply::test_live_commit(1, Vec::new()),
+                crate::replication::log_apply_wire::test_live_commit(1, Vec::new()),
             )
             .await
             .expect_err("application facade must reject legacy committed apply"),
@@ -185,7 +187,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit(
                 &ds,
-                crate::log_apply::test_live_commit(2, Vec::new()),
+                crate::replication::log_apply_wire::test_live_commit(2, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply"),
@@ -194,7 +196,7 @@ mod cases {
         assert_application_apply_rejected(
             DatastoreBackend::apply_raft_log_apply_commit_outcome(
                 &ds,
-                crate::log_apply::test_live_commit(3, Vec::new()),
+                crate::replication::log_apply_wire::test_live_commit(3, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply outcomes"),
@@ -217,7 +219,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_log_apply_commit(
                 &ds,
-                crate::log_apply::test_live_commit(4, Vec::new()),
+                crate::replication::log_apply_wire::test_live_commit(4, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject legacy committed apply"),
@@ -226,7 +228,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit(
                 &ds,
-                crate::log_apply::test_live_commit(5, Vec::new()),
+                crate::replication::log_apply_wire::test_live_commit(5, Vec::new()),
             )
             .await
             .expect_err("replication compatibility facade must reject Raft committed apply"),
@@ -235,7 +237,7 @@ mod cases {
         assert_application_apply_rejected(
             crate::datastore::ReplicationStore::apply_raft_log_apply_commit_outcome(
                 &ds,
-                crate::log_apply::test_live_commit(6, Vec::new()),
+                crate::replication::log_apply_wire::test_live_commit(6, Vec::new()),
             )
             .await
             .expect_err(
@@ -248,11 +250,6 @@ mod cases {
             passive.get_current_resource_version().await.unwrap(),
             0,
             "denied application-side apply must not mutate passive storage"
-        );
-        assert_eq!(
-            passive.current_log_apply_index().await.unwrap(),
-            0,
-            "denied application-side apply must not advance passive apply state"
         );
     }
 
@@ -520,10 +517,10 @@ mod cases {
             .await
             .expect("seed existing resource");
         let ds = inner;
-        let commit = crate::log_apply::test_live_commit(
+        let commit = crate::replication::log_apply_wire::test_live_commit(
             0,
-            vec![crate::log_apply::LogApplyMutation::PutResource(
-                crate::log_apply::LogApplyResourceRow {
+            vec![klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),
@@ -673,35 +670,6 @@ mod cases {
             calls.lock().unwrap().as_slice(),
             &["AdvanceResourceVersion"],
             "RV-only metadata writes must route through the raft proposer"
-        );
-    }
-
-    #[tokio::test]
-    async fn raft_mode_pod_slot_admissions_remain_node_local() {
-        let inner: crate::datastore::backend::DatastoreHandle =
-            Arc::new(crate::datastore::test_support::in_memory().await);
-        let ds = SequencedDatastore::new(inner.clone(), Arc::new(PanicProposal));
-        let before = inner.get_current_resource_version().await.unwrap();
-
-        let admitted = ds
-            .pod_slot_try_admit("default", "slot-pod", "slot-uid", "node-a")
-            .await
-            .expect("pod slot admit is node-local and must not require raft proposer");
-        assert!(matches!(
-            admitted,
-            PodSlotAdmissionResult::Admitted { resource_version } if resource_version > 0
-        ));
-        ds.pod_slot_mark_terminating("default", "slot-pod", "slot-uid", "node-a")
-            .await
-            .expect("pod slot termination is node-local and must not require raft proposer");
-        ds.pod_slot_clear_if_uid("default", "slot-pod", "slot-uid", "node-a")
-            .await
-            .expect("pod slot clear is node-local and must not require raft proposer");
-
-        assert_eq!(
-            inner.get_current_resource_version().await.unwrap(),
-            before,
-            "node-local pod slot mutations must not allocate cluster resourceVersion"
         );
     }
 
@@ -2081,11 +2049,11 @@ mod cases {
 
         let follower = crate::datastore::test_support::in_memory().await;
         follower
-            .apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&deleted))
+            .apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&deleted))
             .await
             .unwrap();
         follower
-            .apply_log_apply_commit(crate::log_apply::LogApplyCommit::delete_resource(
+            .apply_log_apply_commit(klights_cluster_core::LogApplyCommit::delete_resource(
                 "v1",
                 "ConfigMap",
                 Some("default".to_string()),
@@ -2095,7 +2063,7 @@ mod cases {
             .await
             .unwrap();
         follower
-            .apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&later))
+            .apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&later))
             .await
             .expect("later write must not collide with the delete watch event RV");
     }
@@ -2160,7 +2128,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "lease-renew-key",
                 crate::node_outbox::payload::OutboxOperation::LeaseRenew.as_str(),
-                &payload,
+                crate::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
@@ -2196,7 +2164,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "create-from-outbox-key",
                 crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
-                &payload,
+                crate::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
@@ -2222,12 +2190,12 @@ mod cases {
     /// StorageCommand variant to a corresponding Datastore method.
     #[tokio::test]
     async fn datastore_applier_maps_all_variants() {
-        use crate::datastore::command::StorageCommand;
+        use klights_cluster_core::command::StorageCommand;
 
         let db = Arc::new(crate::datastore::test_support::in_memory().await);
-        let meta = crate::datastore::command::CommandMeta {
-            command_id: crate::datastore::command::CommandId("test".into()),
-            codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
+        let meta = klights_cluster_core::command::CommandMeta {
+            command_id: klights_cluster_core::command::CommandId("test".into()),
+            codec_version: klights_cluster_core::command::COMMAND_CODEC_VERSION,
             resource_version: 1,
             uid: None,
             timestamp_ms: 0,
@@ -2325,7 +2293,7 @@ mod cases {
                 operation: &str,
                 command: StorageCommand,
                 authoring_node: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
@@ -2408,7 +2376,7 @@ mod cases {
                 _operation: &str,
                 _command: StorageCommand,
                 _authoring_node: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
@@ -2489,7 +2457,7 @@ mod cases {
                 operation: &str,
                 command: StorageCommand,
                 authoring_node: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
@@ -2535,7 +2503,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "outbox-key",
                 crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-                &payload,
+                crate::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
@@ -2605,7 +2573,7 @@ mod cases {
                 operation: &str,
                 command: StorageCommand,
                 authoring_node: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
@@ -2876,10 +2844,10 @@ mod cases {
 
     #[tokio::test]
     async fn ensure_cluster_metadata_command_applies_cluster_id_once() {
-        use crate::datastore::command::{
+        use crate::datastore::sequenced::apply_command_to_backend;
+        use klights_cluster_core::command::{
             COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
         };
-        use crate::datastore::sequenced::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let meta = CommandMeta {
@@ -2940,8 +2908,8 @@ mod cases {
 
     #[test]
     fn ensure_cluster_metadata_protobuf_round_trip() {
-        use crate::datastore::command::StorageCommand;
         use crate::storage_wire_codec as codec;
+        use klights_cluster_core::command::StorageCommand;
 
         let cmd = StorageCommand::EnsureClusterMetadata {
             cluster_id: "round-trip-uuid".into(),
@@ -2966,7 +2934,7 @@ mod cases {
         impl super::super::RaftProposal for FollowerProposer {
             async fn propose_command(
                 &self,
-                _command: crate::datastore::command::StorageCommand,
+                _command: klights_cluster_core::command::StorageCommand,
             ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 Err(anyhow::anyhow!(
                     "not the leader; forward to current raft leader"
@@ -2976,9 +2944,9 @@ mod cases {
                 &self,
                 _k: &str,
                 _o: &str,
-                _c: crate::datastore::command::StorageCommand,
+                _c: klights_cluster_core::command::StorageCommand,
                 _a: &str,
-                _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+                _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
             ) -> std::result::Result<
                 crate::node_outbox::OutboxApplyResult,
                 crate::node_outbox::OutboxApplyError,
@@ -3034,7 +3002,12 @@ mod cases {
         .encode_protobuf()
         .unwrap();
         let err = ds
-            .apply_outbox_transactionally("key", "PodStatus", &payload, "worker-1")
+            .apply_outbox_transactionally(
+                "key",
+                "PodStatus",
+                crate::storage_wire_codec::test_outbox_command(&payload),
+                "worker-1",
+            )
             .await
             .expect_err("follower outbox must reject");
         assert!(

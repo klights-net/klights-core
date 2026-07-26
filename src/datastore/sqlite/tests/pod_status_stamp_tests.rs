@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::datastore::ResourcePreconditions;
-use crate::datastore::command::StorageCommand;
-use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::node_outbox::payload::OutboxOperation;
+use klights_cluster_core::command::StorageCommand;
 use serde_json::json;
 
 const STATUS_OPS: &[OutboxOperation] = &[
@@ -44,8 +44,8 @@ async fn create_running_pod(db: &Datastore, uid: &str) {
     .expect("create pod");
 }
 
-fn status_payload(status: serde_json::Value, uid: &str, stamp: Option<i64>) -> Vec<u8> {
-    let command = StorageCommand::UpdateStatus {
+fn status_payload(status: serde_json::Value, uid: &str, stamp: Option<i64>) -> StorageCommand {
+    StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
         namespace: Some("default".to_string()),
@@ -57,10 +57,7 @@ fn status_payload(status: serde_json::Value, uid: &str, stamp: Option<i64>) -> V
             resource_version: None,
         },
         observed_status_stamp: stamp,
-    };
-    OutboxPayload::from_command(command)
-        .encode_protobuf()
-        .expect("encode payload")
+    }
 }
 
 async fn live_status_message(db: &Datastore) -> Option<String> {
@@ -84,7 +81,7 @@ async fn stale_status_retry_does_not_clobber_newer_status_for_all_ops() {
         db.apply_outbox_transactionally(
             "key-newer",
             op.as_str(),
-            &status_payload(
+            status_payload(
                 json!({"phase": "Running", "message": "newer"}),
                 "uid-1",
                 Some(200),
@@ -100,7 +97,7 @@ async fn stale_status_retry_does_not_clobber_newer_status_for_all_ops() {
         db.apply_outbox_transactionally(
             "key-stale",
             op.as_str(),
-            &status_payload(
+            status_payload(
                 json!({"phase": "Running", "message": "stale"}),
                 "uid-1",
                 Some(100),
@@ -127,7 +124,7 @@ async fn in_order_status_snapshots_apply_for_all_ops() {
         db.apply_outbox_transactionally(
             "key-first",
             op.as_str(),
-            &status_payload(
+            status_payload(
                 json!({"phase": "Running", "message": "first"}),
                 "uid-1",
                 Some(100),
@@ -140,7 +137,7 @@ async fn in_order_status_snapshots_apply_for_all_ops() {
         db.apply_outbox_transactionally(
             "key-second",
             op.as_str(),
-            &status_payload(
+            status_payload(
                 json!({"phase": "Running", "message": "second"}),
                 "uid-1",
                 Some(200),
@@ -188,7 +185,7 @@ async fn status_snapshot_preserves_live_non_kubelet_condition() {
     db.apply_outbox_transactionally(
         "key-runtime",
         OutboxOperation::PodStatus.as_str(),
-        &status_payload(
+        status_payload(
             json!({
                 "phase": "Running",
                 "conditions": [
@@ -242,7 +239,7 @@ async fn equal_stamp_snapshot_is_treated_as_already_applied() {
     db.apply_outbox_transactionally(
         "key-a",
         OutboxOperation::PodStatus.as_str(),
-        &status_payload(
+        status_payload(
             json!({"phase": "Running", "message": "a"}),
             "uid-1",
             Some(200),
@@ -258,7 +255,7 @@ async fn equal_stamp_snapshot_is_treated_as_already_applied() {
     db.apply_outbox_transactionally(
         "key-b",
         OutboxOperation::PodStatus.as_str(),
-        &status_payload(
+        status_payload(
             json!({"phase": "Running", "message": "b"}),
             "uid-1",
             Some(200),
@@ -280,7 +277,7 @@ async fn uid_mismatch_remains_terminal_under_gate() {
         .apply_outbox_transactionally(
             "key-mismatch",
             OutboxOperation::PodStatus.as_str(),
-            &status_payload(
+            status_payload(
                 json!({"phase": "Running", "message": "wrong-uid"}),
                 "uid-OTHER",
                 Some(500),
@@ -310,7 +307,7 @@ async fn unstamped_status_keeps_last_writer_wins() {
     db.apply_outbox_transactionally(
         "key-1",
         OutboxOperation::PodStatus.as_str(),
-        &status_payload(json!({"phase": "Running", "message": "one"}), "uid-1", None),
+        status_payload(json!({"phase": "Running", "message": "one"}), "uid-1", None),
         "worker-a",
     )
     .await
@@ -318,7 +315,7 @@ async fn unstamped_status_keeps_last_writer_wins() {
     db.apply_outbox_transactionally(
         "key-2",
         OutboxOperation::PodStatus.as_str(),
-        &status_payload(json!({"phase": "Running", "message": "two"}), "uid-1", None),
+        status_payload(json!({"phase": "Running", "message": "two"}), "uid-1", None),
         "worker-a",
     )
     .await

@@ -101,7 +101,6 @@ fn passive_store_open_request(config: &KlightsConfig) -> PassiveStoreOpenRequest
         (BackendKind::Sqlite, true) => PassiveStoreOpenRequest::SqliteInMemory,
         (BackendKind::Sqlite, false) => PassiveStoreOpenRequest::SqlitePersistent {
             cluster_db_path: &config.cluster_db_path,
-            node_db_path: &config.node_db_path,
             db_key_file: config.db_key_file.as_deref(),
         },
         (BackendKind::Redb, true) => PassiveStoreOpenRequest::RedbInMemory,
@@ -437,7 +436,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 if !is_joining_controlplane && uses_leader_runtime(role) && needs_seed_metadata {
                     let cluster_id = uuid::Uuid::new_v4().to_string();
                     raft.propose_command(
-                        crate::datastore::command::StorageCommand::EnsureClusterMetadata {
+                        klights_cluster_core::command::StorageCommand::EnsureClusterMetadata {
                             cluster_id: cluster_id.clone(),
                         },
                     )
@@ -1198,12 +1197,10 @@ mod tests {
                     false,
                     PassiveStoreOpenRequest::SqlitePersistent {
                         cluster_db_path,
-                        node_db_path,
                         db_key_file,
                     },
                 ) => {
                     assert_eq!(cluster_db_path, config.cluster_db_path);
-                    assert_eq!(node_db_path, config.node_db_path);
                     assert_eq!(db_key_file, config.db_key_file.as_deref());
                 }
                 (

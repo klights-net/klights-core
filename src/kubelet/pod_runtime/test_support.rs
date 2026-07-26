@@ -2245,14 +2245,17 @@ impl PodRuntimeHarness {
         let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
         let metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics> =
             crate::side_effects::SideEffectMetrics::new();
+        let node_local =
+            crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: handle.clone(),
+                node_local: Some(node_local.clone()),
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,
                 pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
-                    handle.clone(),
+                    node_local,
                 ),
                 assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode:
@@ -2461,7 +2464,7 @@ impl super::super::pod_cluster_runtime::NodeRuntimeView for FakeNode {
 /// Records forwarded status updates for multi-node tests.
 type StatusForward = (PodRuntimeKey, serde_json::Value);
 /// Records enqueued storage commands for multi-node tests.
-type StorageCommandRecord = (PodRuntimeKey, crate::datastore::command::StorageCommand);
+type StorageCommandRecord = (PodRuntimeKey, klights_cluster_core::command::StorageCommand);
 
 /// Fake cluster implementing `ClusterRuntimeView` and `ReplicationRuntime`
 /// for multi-node tests.
@@ -2550,7 +2553,7 @@ impl super::super::pod_cluster_runtime::ReplicationRuntime for FakeCluster {
     async fn enqueue_storage_command(
         &self,
         key: &PodRuntimeKey,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
     ) -> anyhow::Result<()> {
         self.storage_commands
             .lock()

@@ -42,23 +42,26 @@ fn require_success<'a>(
 pub async fn cleanup_pod_sandboxes(
     file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut crate::kubelet::CriClient,
-    db: &dyn crate::datastore::DatastoreBackend,
+    node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
     network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
 ) -> Result<()> {
     let mut sandbox_ids = std::collections::HashSet::new();
-    let sandboxes = db.list_sandboxes().await?;
+    let sandboxes = node_local.list_pod_runtime().await?;
     tracing::info!("Stopping {} recorded pod sandboxes", sandboxes.len());
 
     for sb in sandboxes {
-        sandbox_ids.insert(sb.sandbox_id.clone());
+        let Some(sandbox_id) = sb.sandbox_id.as_deref() else {
+            continue;
+        };
+        sandbox_ids.insert(sandbox_id.to_string());
         cleanup_one_pod_sandbox(
             file_process,
             cri,
-            db,
+            node_local,
             network,
             containerd_ns,
-            &sb.sandbox_id,
+            sandbox_id,
             Some((&sb.namespace, &sb.pod_name, &sb.pod_uid)),
         )
         .await;
@@ -71,7 +74,7 @@ pub async fn cleanup_pod_sandboxes(
                     cleanup_one_pod_sandbox(
                         file_process,
                         cri,
-                        db,
+                        node_local,
                         network,
                         containerd_ns,
                         &sandbox.id,
@@ -96,7 +99,7 @@ pub async fn cleanup_pod_sandboxes(
 async fn cleanup_one_pod_sandbox(
     file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut crate::kubelet::CriClient,
-    db: &dyn crate::datastore::DatastoreBackend,
+    node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
     network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
     sandbox_id: &str,
@@ -139,8 +142,10 @@ async fn cleanup_one_pod_sandbox(
                 );
             }
             if let Some((namespace, pod_name, pod_uid)) = owner
-                && let Err(e) =
-                    delete_shutdown_sandbox_row(db, namespace, pod_name, pod_uid, sandbox_id).await
+                && let Err(e) = delete_shutdown_sandbox_row(
+                    node_local, namespace, pod_name, pod_uid, sandbox_id,
+                )
+                .await
             {
                 tracing::warn!(
                     "Failed to delete sandbox SQLite row for {}/{}: {}",
@@ -155,18 +160,22 @@ async fn cleanup_one_pod_sandbox(
 }
 
 async fn delete_shutdown_sandbox_row(
-    db: &dyn crate::datastore::DatastoreBackend,
-    namespace: &str,
-    pod_name: &str,
+    node_local: &dyn crate::datastore::node_local::NodeLocalBackend,
+    _namespace: &str,
+    _pod_name: &str,
     pod_uid: &str,
     sandbox_id: &str,
 ) -> Result<()> {
-    if !pod_uid.trim().is_empty() {
-        db.delete_sandbox_for_uid(namespace, pod_name, pod_uid, sandbox_id)
-            .await
-    } else {
-        db.delete_sandbox(namespace, pod_name).await
+    if pod_uid.trim().is_empty() {
+        return Ok(());
     }
+    let Some(runtime) = node_local.get_pod_runtime(pod_uid).await? else {
+        return Ok(());
+    };
+    if runtime.sandbox_id.as_deref() == Some(sandbox_id) {
+        node_local.delete_pod_runtime_for_uid(pod_uid).await?;
+    }
+    Ok(())
 }
 
 /// Extract shm mount points for a given containerd state directory from mount output.
@@ -1027,31 +1036,50 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
 
     #[tokio::test]
     async fn shutdown_cleanup_deletes_only_matching_sandbox_uid() {
-        let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "shutdown-test-node-local",
+        )
+        .await
+        .unwrap();
+        node_local
+            .record_owned_sandbox("uid-a", "default", "same-name", "node-a", "sandbox-a", 1)
             .await
             .unwrap();
-        db.record_sandbox("default", "same-name", "uid-a", "sandbox-a")
-            .await
-            .unwrap();
-        db.record_sandbox("default", "same-name", "uid-b", "sandbox-b")
+        node_local
+            .record_owned_sandbox("uid-b", "default", "same-name", "node-a", "sandbox-b", 2)
             .await
             .unwrap();
 
-        delete_shutdown_sandbox_row(&db, "default", "same-name", "uid-a", "sandbox-a")
-            .await
-            .unwrap();
+        delete_shutdown_sandbox_row(
+            node_local.as_ref(),
+            "default",
+            "same-name",
+            "uid-a",
+            "sandbox-a",
+        )
+        .await
+        .unwrap();
 
-        assert!(
-            db.get_sandbox_for_uid("default", "same-name", "uid-a")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(node_local.get_pod_runtime("uid-a").await.unwrap().is_none());
         assert_eq!(
-            db.get_sandbox_for_uid("default", "same-name", "uid-b")
-                .await
-                .unwrap(),
-            Some("sandbox-b".to_string())
+            node_local.get_pod_runtime("uid-b").await.unwrap(),
+            Some(crate::datastore::node_local::PodRuntimeRow {
+                pod_uid: "uid-b".to_string(),
+                namespace: "default".to_string(),
+                pod_name: "same-name".to_string(),
+                node_name: "node-a".to_string(),
+                sandbox_id: Some("sandbox-b".to_string()),
+                cgroup_path: None,
+                created_ms: 2,
+                started_ms: None,
+            })
         );
     }
 }

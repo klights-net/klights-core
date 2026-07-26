@@ -1,7 +1,7 @@
 //! Encode/decode boundary for the replication apply path.
 //!
 //! Currently the apply pipeline calls free `encode_*_protobuf` /
-//! `decode_*_protobuf` functions in `crate::datastore::command` directly.
+//! `decode_*_protobuf` functions in `klights_cluster_core::command` directly.
 //! This module introduces a `CommandCodec` trait so that:
 //!
 //! 1. `apply::mod` can take `&dyn CommandCodec` and tests can swap in a
@@ -10,7 +10,7 @@
 //!    route through the same trait.
 //!
 //! The default impl `ProtobufCommandCodec` preserves today's behavior
-//! bit-for-bit by delegating to the existing `datastore::command`
+//! bit-for-bit by delegating to the canonical cluster command codec
 //! functions; no on-wire change.
 
 use klights_cluster_core::{CommandMeta, StorageCommand, StorageResponse};
@@ -62,8 +62,8 @@ impl CommandCodec for ProtobufCommandCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId};
-    use crate::datastore::types::ResourcePreconditions;
+    use klights_cluster_core::ResourcePreconditions;
+    use klights_cluster_core::command::{COMMAND_CODEC_VERSION, CommandId};
     use serde_json::json;
 
     fn codec() -> ProtobufCommandCodec {

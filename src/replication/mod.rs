@@ -12,6 +12,7 @@
 #[cfg(test)]
 pub mod apply;
 pub mod grpc;
+pub mod log_apply_wire;
 pub mod protocol;
 pub mod service;
 #[cfg(test)]

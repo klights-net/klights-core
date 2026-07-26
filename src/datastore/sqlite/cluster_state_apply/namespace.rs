@@ -3,7 +3,7 @@ use super::super::crud::helpers::{
 };
 use super::super::{create_pending_watch_event, queries};
 use crate::datastore::types::PendingWatchEvent;
-use crate::log_apply::LogApplyNamespaceRow;
+use klights_cluster_core::LogApplyNamespaceRow;
 use rusqlite::OptionalExtension;
 
 pub(in crate::datastore::sqlite) struct NamespaceStateApplier<'tx, 'conn> {

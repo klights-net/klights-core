@@ -2,7 +2,7 @@ use super::super::crud::helpers::{
     WatchEventInsert, WatchEventPayload, insert_watch_event_in_conn,
 };
 use super::super::{create_pending_watch_event, gc::gc_watch_events_in_tx};
-use crate::log_apply::LogApplyWatchEventRow;
+use klights_cluster_core::LogApplyWatchEventRow;
 
 pub(in crate::datastore::sqlite) struct WatchHistoryStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,

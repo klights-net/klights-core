@@ -2025,6 +2025,7 @@ dependencies = [
  "k8s-openapi",
  "klights-auth",
  "klights-cluster-core",
+ "klights-cluster-datastore",
  "klights-cluster-store",
  "klights-internal-protobuf",
  "klights-kube-protobuf",
@@ -2125,6 +2126,13 @@ dependencies = [
 [[package]]
 name = "klights-cluster-datastore"
 version = "0.0.0"
+dependencies = [
+ "klights-cluster-core",
+ "klights-internal-protobuf",
+ "prost",
+ "serde_json",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "klights-cluster-store"

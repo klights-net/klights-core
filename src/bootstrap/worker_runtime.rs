@@ -427,6 +427,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let pod_repository_parts = crate::pod_repository_composition::build_pod_repository_parts(
         crate::pod_repository_composition::PodRepositoryBuildConfig {
             db: db.clone(),
+            node_local: Some(node_local.clone()),
             supervisor: task_supervisor.clone(),
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
@@ -461,7 +462,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         outbox.clone(),
     );
     let pod_slot_adapter =
-        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(db.clone());
+        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local.clone());
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
             repository_parts: pod_repository_parts,

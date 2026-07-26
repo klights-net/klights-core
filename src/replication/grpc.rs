@@ -1,8 +1,3 @@
-// TEMPORARY(Phase 4.1): root keeps the generated bridge for current consumers.
-// REMOVE: Phase 12A removes this bridge after generated API migration.
-pub(crate) use klights_internal_protobuf as generated;
-pub(crate) use klights_internal_protobuf::FILE_DESCRIPTOR_SET;
-
 pub mod client;
 pub mod fanout;
 pub mod raft_rpc;
@@ -34,7 +29,7 @@ pub fn watch_replay_expired_status(
     accepted_resource_version: i64,
     message: impl Into<String>,
 ) -> tonic::Status {
-    let details = generated::WatchReplayExpiredDetails {
+    let details = klights_internal_protobuf::WatchReplayExpiredDetails {
         reason: WATCH_REPLAY_EXPIRED_REASON.to_string(),
         accepted_resource_version,
     }
@@ -75,7 +70,9 @@ fn typed_watch_replay_expired_resource_version(status: &tonic::Status) -> Option
     if reason != WATCH_REPLAY_EXPIRED_REASON {
         return None;
     }
-    let Ok(details) = generated::WatchReplayExpiredDetails::decode(status.details()) else {
+    let Ok(details) =
+        klights_internal_protobuf::WatchReplayExpiredDetails::decode(status.details())
+    else {
         return None;
     };
     (details.reason == WATCH_REPLAY_EXPIRED_REASON).then_some(details.accepted_resource_version)

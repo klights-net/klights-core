@@ -8,24 +8,24 @@
 use anyhow::Result;
 use klights_cluster_core::WatchReplayPosition;
 
-use super::generated;
 #[cfg(test)]
-use crate::log_apply::{decode_commit_protobuf, encode_commit_protobuf};
+use crate::replication::log_apply_wire::{decode_commit_protobuf, encode_commit_protobuf};
 use crate::storage_wire_codec::{
     decode_command_protobuf, decode_meta_protobuf, encode_command_protobuf, encode_meta_protobuf,
 };
+use klights_internal_protobuf;
 
 pub(crate) fn resource_command_request_to_proto(
     request: &klights_leader_api::ResourceCommandRequest,
-) -> Result<generated::SubmitResourceCommandRequest> {
-    Ok(generated::SubmitResourceCommandRequest {
+) -> Result<klights_internal_protobuf::SubmitResourceCommandRequest> {
+    Ok(klights_internal_protobuf::SubmitResourceCommandRequest {
         command_protobuf: encode_command_protobuf(request.command())?,
         codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
     })
 }
 
 pub(crate) fn resource_command_request_from_proto(
-    request: generated::SubmitResourceCommandRequest,
+    request: klights_internal_protobuf::SubmitResourceCommandRequest,
 ) -> std::result::Result<
     klights_leader_api::ResourceCommandRequest,
     klights_leader_api::ResourceCommandError,
@@ -41,8 +41,8 @@ pub(crate) fn resource_command_request_from_proto(
 
 pub(crate) fn watch_replay_position_to_proto(
     position: WatchReplayPosition,
-) -> generated::WatchReplayPosition {
-    generated::WatchReplayPosition {
+) -> klights_internal_protobuf::WatchReplayPosition {
+    klights_internal_protobuf::WatchReplayPosition {
         resource_version: position.resource_version,
         event_id: position.event_id,
         resource_version_filter_through_event_id: position.resource_version_filter_through_event_id,
@@ -50,7 +50,7 @@ pub(crate) fn watch_replay_position_to_proto(
 }
 
 pub(crate) fn watch_replay_position_from_proto(
-    position: &generated::WatchReplayPosition,
+    position: &klights_internal_protobuf::WatchReplayPosition,
 ) -> WatchReplayPosition {
     WatchReplayPosition {
         resource_version: position.resource_version,
@@ -61,8 +61,8 @@ pub(crate) fn watch_replay_position_from_proto(
 
 pub(crate) fn entry_to_proto(
     entry: &crate::replication::protocol::ReplicationEntry,
-) -> Result<generated::ReplicationEntry> {
-    Ok(generated::ReplicationEntry {
+) -> Result<klights_internal_protobuf::ReplicationEntry> {
+    Ok(klights_internal_protobuf::ReplicationEntry {
         command_protobuf: encode_command_protobuf(&entry.command)?,
         meta_protobuf: encode_meta_protobuf(&entry.meta)?,
         log_index: 0,
@@ -72,7 +72,7 @@ pub(crate) fn entry_to_proto(
 }
 
 pub(crate) fn entry_from_proto(
-    entry: generated::ReplicationEntry,
+    entry: klights_internal_protobuf::ReplicationEntry,
 ) -> Result<crate::replication::protocol::ReplicationEntry> {
     Ok(crate::replication::protocol::ReplicationEntry {
         command: decode_command_protobuf(&entry.command_protobuf)?,
@@ -82,9 +82,9 @@ pub(crate) fn entry_from_proto(
 
 #[cfg(test)]
 pub(crate) fn log_apply_commit_to_proto(
-    commit: &crate::log_apply::LogApplyCommit,
-) -> Result<generated::ReplicationEntry> {
-    Ok(generated::ReplicationEntry {
+    commit: &klights_cluster_core::LogApplyCommit,
+) -> Result<klights_internal_protobuf::ReplicationEntry> {
+    Ok(klights_internal_protobuf::ReplicationEntry {
         command_protobuf: Vec::new(),
         meta_protobuf: Vec::new(),
         log_index: 0,
@@ -95,8 +95,8 @@ pub(crate) fn log_apply_commit_to_proto(
 
 #[cfg(test)]
 pub(crate) fn log_apply_commit_from_proto(
-    entry: generated::ReplicationEntry,
-) -> Result<crate::log_apply::LogApplyCommit> {
+    entry: klights_internal_protobuf::ReplicationEntry,
+) -> Result<klights_cluster_core::LogApplyCommit> {
     decode_commit_protobuf(&entry.commit_protobuf)
 }
 
@@ -104,7 +104,7 @@ pub(crate) fn log_apply_commit_from_proto(
 mod tests {
     use serde_json::json;
 
-    use crate::datastore::command::{
+    use klights_cluster_core::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
     use klights_leader_api::ResourceCommandRequest;
@@ -119,7 +119,7 @@ mod tests {
         let encoded = super::watch_replay_position_to_proto(position);
         assert_eq!(super::watch_replay_position_from_proto(&encoded), position);
 
-        let invalid = super::generated::WatchReplayPosition {
+        let invalid = klights_internal_protobuf::WatchReplayPosition {
             resource_version: -1,
             event_id: -2,
             resource_version_filter_through_event_id: -3,
@@ -186,9 +186,9 @@ mod tests {
 
     #[test]
     fn log_apply_commit_proto_round_trip_preserves_fixed_live_template_and_watermark() {
-        let commit = crate::log_apply::LogApplyCommit::try_new_with_watermark(
+        let commit = klights_cluster_core::LogApplyCommit::try_new_with_watermark(
             Vec::new(),
-            Some(crate::log_apply::OutboxStreamWatermark {
+            Some(klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-a".to_string(),
                 stream_id: 8,
                 stream_seq: 13,

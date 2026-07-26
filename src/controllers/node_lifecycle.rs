@@ -37,7 +37,7 @@ pub trait NodeLostPodLifecycleSink: Send + Sync {
 
 #[cfg(test)]
 const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 =
-    crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS;
+    klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS;
 const NODE_STATUS_UNKNOWN_REASON: &str = "NodeStatusUnknown";
 const NODE_STATUS_UNKNOWN_MESSAGE: &str = "Kubelet stopped posting node status.";
 const NODE_READY_REASON: &str = "KubeletReady";
@@ -2157,7 +2157,7 @@ mod tests {
             deadline,
             renew
                 + chrono::Duration::seconds(
-                    crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS
+                    klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS
                 ),
             "missing leaseDurationSeconds should fall back to the canonical node-lease duration"
         );
@@ -2857,7 +2857,7 @@ mod tests {
         assert_eq!(
             next,
             Some(std::time::Duration::from_secs(
-                crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS as u64
+                klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS as u64
             )),
             "already-unknown pre-start leases should wait through startup grace for the worker's next heartbeat"
         );

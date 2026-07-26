@@ -77,7 +77,7 @@ pub(crate) trait RaftProposal: Send + Sync {
         operation: &str,
         command: StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError>;
 
     async fn propose_outbox_command_effect(
@@ -86,7 +86,7 @@ pub(crate) trait RaftProposal: Send + Sync {
         operation: &str,
         command: StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<super::CommittedOutboxApply, OutboxDeliveryError> {
         let result = self
             .propose_outbox_command(
@@ -312,7 +312,7 @@ where
             // apply, and Pod/Node stay typed-merged regardless of freshness.
             let mut clear_stale_resource_version = false;
             if let Some(current) = current.as_ref() {
-                let freshness = super::status_merge_policy::apply_status_merge(
+                let freshness = klights_cluster_core::apply_status_merge(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
@@ -325,7 +325,7 @@ where
                 // so only a non-Pod stale rebase clears the resourceVersion
                 // precondition (otherwise the stale write 409s instead of
                 // converging).
-                if freshness == super::status_merge_policy::StatusApplyFreshness::Stale
+                if freshness == klights_cluster_core::StatusApplyFreshness::Stale
                     && preconditions.uid.as_deref() == Some(current.uid.as_str())
                     && !(api_version == "v1" && kind == "Pod")
                 {
@@ -420,35 +420,10 @@ where
         StorageCommand::DeleteNodeSubnet { node_name } => {
             backend.delete_node_subnet(&node_name).await?;
         }
-        StorageCommand::PodSlotTryAdmit {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-        } => {
-            backend
-                .pod_slot_try_admit(&namespace, &pod_name, &pod_uid, &node_name)
-                .await?;
-        }
-        StorageCommand::PodSlotMarkTerminating {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-        } => {
-            backend
-                .pod_slot_mark_terminating(&namespace, &pod_name, &pod_uid, &node_name)
-                .await?;
-        }
-        StorageCommand::PodSlotClearIfUid {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-        } => {
-            backend
-                .pod_slot_clear_if_uid(&namespace, &pod_name, &pod_uid, &node_name)
-                .await?;
+        StorageCommand::PodSlotTryAdmit { .. }
+        | StorageCommand::PodSlotMarkTerminating { .. }
+        | StorageCommand::PodSlotClearIfUid { .. } => {
+            anyhow::bail!("node-local pod-slot commands cannot apply to cluster storage");
         }
         StorageCommand::MovePodToCleanupIntent {
             node_name,

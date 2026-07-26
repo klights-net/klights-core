@@ -9,21 +9,19 @@ mod applier;
 mod cluster_replace;
 mod cluster_state_apply;
 mod crud;
-mod executor;
 mod filters;
-mod fingerprint;
+pub(crate) mod fingerprint;
 mod focused_ports;
 mod gc;
 mod merge_patch;
-pub mod opener;
 pub(super) mod owner_ref_index;
 mod position_membership;
-mod queries;
+pub(crate) mod queries;
 mod replay;
 mod replay_floor;
 mod resource_shape;
 mod rv_helpers;
-mod schema;
+pub(crate) mod schema;
 pub(crate) mod scope;
 mod selector_index;
 mod snapshot_capture;
@@ -59,21 +57,24 @@ impl std::fmt::Debug for Datastore {
 // Re-export types and trait surface so `use super::*;` in submodules picks
 // them up the same way the legacy `db/mod.rs` exposed them.
 pub use super::backend::{
-    DatastoreBackend, DatastoreHandle, NamespaceStore, NetworkStore, ResourceStore, WatchStore,
+    DatastoreBackend, DatastoreHandle, NamespaceStore, ResourceStore, WatchStore,
 };
 pub use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, NodeSubnet, PatchKind, PendingWatchEvent, PodCleanupIntent, PodEndpointEvent,
+    ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent, PodEndpointEvent,
     PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
     PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult,
     PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplay, PositionedWatchReplayRead,
     RawWatchEvent, ReplicatedCreateOptions, ReplicatedMembershipState, ReplicatedSnapshotMetadata,
-    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayPosition, WatchTarget,
-    WatchTargetScope,
+    ResourceList, ResourceListQuery, SandboxRef, SnapshotAtRv, WatchTarget, WatchTargetScope,
+};
+use klights_cluster_core::{
+    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
+    WatchReplayPosition,
 };
 
-pub use executor::DbExecutor;
+use crate::sqlite_boundary::DbExecutor;
+use crate::sqlite_open as opener;
 pub use replay::DatastoreWatchReplaySource;
 pub use watch::create_pending_watch_event;
 pub use watch::publish_pending;
@@ -109,7 +110,6 @@ const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 pub struct Datastore {
     executor: DbExecutor,
     read_executor: DbExecutor,
-    node_local: crate::datastore::node_local::SqliteNodeLocalDb,
     watch_bus: std::sync::Arc<WatchBus>,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
@@ -143,7 +143,7 @@ use klights_cluster_core::BuildOutboxOutcome;
 
 enum BuildOutboxTxnOutcome {
     Built {
-        commit: crate::log_apply::LogApplyCommit,
+        commit: klights_cluster_core::LogApplyCommit,
         rv: i64,
         terminal_error: Option<klights_cluster_core::OutboxApplyError>,
     },
@@ -222,7 +222,7 @@ impl Datastore {
 
     fn normalize_ledger_only_outbox_commit_in_tx(
         tx: &rusqlite::Transaction<'_>,
-        commit: &crate::log_apply::LogApplyCommit,
+        commit: &klights_cluster_core::LogApplyCommit,
         rv: &mut i64,
     ) -> tokio_rusqlite::Result<bool> {
         let ledger_only = commit.mutations().is_empty();
@@ -233,7 +233,7 @@ impl Datastore {
     }
 
     fn append_applied_outbox_ledger_mutation(
-        commit: &mut crate::log_apply::LogApplyCommit,
+        commit: &mut klights_cluster_core::LogApplyCommit,
         idempotency_key: String,
         subject_key: String,
         operation: String,
@@ -241,9 +241,11 @@ impl Datastore {
         status_stamp: Option<i64>,
         terminal_error: Option<&klights_cluster_core::OutboxApplyError>,
     ) {
-        use crate::log_apply::{ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation};
-        use crate::storage_wire_codec::encode_response_protobuf;
         use klights_cluster_core::StorageResponse;
+        use klights_cluster_core::{
+            ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation,
+        };
+        use klights_cluster_datastore::encode_outbox_response;
 
         let response = terminal_error.map_or_else(
             || StorageResponse::Ack {
@@ -254,7 +256,7 @@ impl Datastore {
             },
         );
 
-        let replacement = crate::log_apply::LogApplyCommit::try_new(Vec::new())
+        let replacement = klights_cluster_core::LogApplyCommit::try_new(Vec::new())
             .expect("empty live commit is valid");
         let previous = std::mem::replace(commit, replacement);
         let (_, watermark, mut mutations) = previous.into_parts();
@@ -266,20 +268,21 @@ impl Datastore {
                     operation,
                     first_seen_ms,
                     applied_rv: None,
-                    result_proto: encode_response_protobuf(&response).unwrap_or_default(),
+                    result_proto: encode_outbox_response(&response).unwrap_or_default(),
                     status_stamp: status_stamp.filter(|stamp| *stamp > 0),
                 },
             ))
             .into_log_apply_mutation(),
         );
-        *commit = crate::log_apply::LogApplyCommit::try_new_with_watermark(mutations, watermark)
-            .expect("appended outbox ledger row is RV-zero");
+        *commit =
+            klights_cluster_core::LogApplyCommit::try_new_with_watermark(mutations, watermark)
+                .expect("appended outbox ledger row is RV-zero");
     }
 
     fn author_live_commit(
         candidate_resource_version: i64,
-        mut mutations: Vec<crate::log_apply::LogApplyMutation>,
-    ) -> tokio_rusqlite::Result<crate::log_apply::LogApplyCommit> {
+        mut mutations: Vec<klights_cluster_core::LogApplyMutation>,
+    ) -> tokio_rusqlite::Result<klights_cluster_core::LogApplyCommit> {
         fn clear_metadata_resource_version(data: &mut serde_json::Value) {
             if let Some(metadata) = data
                 .pointer_mut("/metadata")
@@ -291,39 +294,41 @@ impl Datastore {
 
         for mutation in &mut mutations {
             let observed = match mutation {
-                crate::log_apply::LogApplyMutation::PutResource(row) => {
+                klights_cluster_core::LogApplyMutation::PutResource(row) => {
                     clear_metadata_resource_version(&mut row.data);
                     let observed = row.resource_version;
                     row.resource_version = 0;
                     Some(observed)
                 }
-                crate::log_apply::LogApplyMutation::PatchResourceLatest(row) => {
+                klights_cluster_core::LogApplyMutation::PatchResourceLatest(row) => {
                     let observed = row.resource_version;
                     row.resource_version = 0;
                     Some(observed)
                 }
-                crate::log_apply::LogApplyMutation::PutNamespace(row) => {
+                klights_cluster_core::LogApplyMutation::PutNamespace(row) => {
                     clear_metadata_resource_version(&mut row.data);
                     let observed = row.resource_version;
                     row.resource_version = 0;
                     Some(observed)
                 }
-                crate::log_apply::LogApplyMutation::PutWatchEvent(row) => {
+                klights_cluster_core::LogApplyMutation::PutWatchEvent(row) => {
                     clear_metadata_resource_version(&mut row.data);
                     let observed = row.resource_version;
                     row.resource_version = 0;
                     Some(observed)
                 }
-                crate::log_apply::LogApplyMutation::PutPodCleanupIntent(row) => {
+                klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(row) => {
                     let observed = row.resource_version;
                     row.resource_version = 0;
                     Some(observed)
                 }
-                crate::log_apply::LogApplyMutation::PutAppliedOutbox(row) => {
+                klights_cluster_core::LogApplyMutation::PutAppliedOutbox(row) => {
                     row.applied_rv = None;
                     None
                 }
-                crate::log_apply::LogApplyMutation::AdvanceResourceVersion { resource_version } => {
+                klights_cluster_core::LogApplyMutation::AdvanceResourceVersion {
+                    resource_version,
+                } => {
                     let observed = *resource_version;
                     *resource_version = 0;
                     Some(observed)
@@ -336,42 +341,43 @@ impl Datastore {
                 ));
             }
         }
-        crate::log_apply::LogApplyCommit::try_new(mutations).map_err(|error| {
+        klights_cluster_core::LogApplyCommit::try_new(mutations).map_err(|error| {
             crate::datastore::sqlite::cluster_replace::other_error(error.to_string())
         })
     }
 
     fn author_live_commit_from_cluster_mutations(
         candidate_resource_version: i64,
-        mutations: Vec<crate::log_apply::ClusterMutation>,
-    ) -> tokio_rusqlite::Result<crate::log_apply::LogApplyCommit> {
+        mutations: Vec<klights_cluster_core::ClusterMutation>,
+    ) -> tokio_rusqlite::Result<klights_cluster_core::LogApplyCommit> {
         Self::author_live_commit(
             candidate_resource_version,
             mutations
                 .into_iter()
-                .map(crate::log_apply::ClusterMutation::into_log_apply_mutation)
+                .map(klights_cluster_core::ClusterMutation::into_log_apply_mutation)
                 .collect(),
         )
     }
 
     fn set_live_commit_watermark(
-        commit: &mut crate::log_apply::LogApplyCommit,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        commit: &mut klights_cluster_core::LogApplyCommit,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) {
-        let replacement = crate::log_apply::LogApplyCommit::try_new(Vec::new())
+        let replacement = klights_cluster_core::LogApplyCommit::try_new(Vec::new())
             .expect("empty live commit is valid");
         let previous = std::mem::replace(commit, replacement);
         let (_, _, mutations) = previous.into_parts();
-        *commit = crate::log_apply::LogApplyCommit::try_new_with_watermark(mutations, watermark)
-            .expect("watermarked live commit remains RV-zero");
+        *commit =
+            klights_cluster_core::LogApplyCommit::try_new_with_watermark(mutations, watermark)
+                .expect("watermarked live commit remains RV-zero");
     }
 
     fn is_bound_pod_finalization_delivery(
-        command: &crate::datastore::command::StorageCommand,
+        command: &klights_cluster_core::command::StorageCommand,
         operation: &str,
     ) -> bool {
-        use crate::datastore::command::StorageCommand;
         use klights_cluster_core::OutboxOperation;
+        use klights_cluster_core::command::StorageCommand;
 
         if operation != OutboxOperation::PodMetadata.as_str() {
             return false;
@@ -381,12 +387,11 @@ impl Datastore {
 
     fn build_log_apply_commit_in_tx_from_command(
         tx: &rusqlite::Transaction<'_>,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
         resource_version_hint: Option<i64>,
-    ) -> tokio_rusqlite::Result<(crate::log_apply::LogApplyCommit, i64)> {
-        use crate::datastore::command::StorageCommand;
+    ) -> tokio_rusqlite::Result<(klights_cluster_core::LogApplyCommit, i64)> {
         use crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error;
         use crate::datastore::sqlite::resource_shape::{
             ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
@@ -394,15 +399,16 @@ impl Datastore {
             preserve_server_metadata_fields_from_existing, validate_metadata_uid_immutable,
             validate_resource_preconditions,
         };
-        use crate::datastore::types::{
-            ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
-        };
-        use crate::log_apply::{
+        use klights_cluster_core::command::StorageCommand;
+        use klights_cluster_core::{
             ClusterMetaMutation, ClusterMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
             LogApplyNodeSubnetAllocation, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
             LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow,
             NamespaceMutation, NetworkMutation, OutboxLedgerMutation, PodCleanupMutation,
             ResourceMutation, WatchHistoryMutation,
+        };
+        use klights_cluster_core::{
+            ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
         };
         use serde_json::Value;
 
@@ -684,7 +690,7 @@ impl Datastore {
                 // The merge is a no-op for a fresh non-Pod apply, so merging
                 // unconditionally is safe; Pod (`apply_against_latest`) and
                 // Node stay typed-merged regardless of freshness.
-                crate::datastore::status_merge_policy::apply_status_merge(
+                klights_cluster_core::apply_status_merge(
                     &api_version,
                     &kind,
                     &live,
@@ -969,7 +975,7 @@ impl Datastore {
                     rv,
                     vec![ClusterMutation::Resource(
                         ResourceMutation::FinalizeBoundPod(
-                            crate::log_apply::LogApplyPodActorFinalization {
+                            klights_cluster_core::LogApplyPodActorFinalization {
                                 namespace,
                                 name,
                                 pod_uid: current_uid,
@@ -1510,18 +1516,6 @@ impl Datastore {
         self.read_executor.call_raw(query_name, f).await
     }
 
-    pub async fn node_db_call<T, F>(
-        &self,
-        query_name: &'static str,
-        f: F,
-    ) -> tokio_rusqlite::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
-    {
-        self.node_local.db_call(query_name, f).await
-    }
-
     pub async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -1568,14 +1562,14 @@ impl Datastore {
 
     pub async fn list_outbox_stream_watermarks(
         &self,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         self.read_db_call("db_outbox_stream_watermarks_list_all", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT client_id, stream_id, last_seq FROM outbox_stream_watermarks \
                  ORDER BY client_id ASC, stream_id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(crate::log_apply::OutboxStreamWatermark {
+                Ok(klights_cluster_core::OutboxStreamWatermark {
                     client_id: row.get(0)?,
                     stream_id: row.get(1)?,
                     stream_seq: row.get(2)?,
@@ -1591,7 +1585,7 @@ impl Datastore {
         &self,
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
             return Err(anyhow!(
                 "outbox-watermark page limit {} exceeds {}",
@@ -1617,7 +1611,7 @@ impl Datastore {
                     limit,
                 ],
                 |row| {
-                    Ok(crate::log_apply::OutboxStreamWatermark {
+                    Ok(klights_cluster_core::OutboxStreamWatermark {
                         client_id: row.get(0)?,
                         stream_id: row.get(1)?,
                         stream_seq: row.get(2)?,
@@ -1693,7 +1687,8 @@ impl Datastore {
         if operations.is_empty() {
             return Ok(());
         }
-        let command = crate::datastore::command::StorageCommand::ApplyResourceBatch { operations };
+        let command =
+            klights_cluster_core::command::StorageCommand::ApplyResourceBatch { operations };
         // Build + apply in one IMMEDIATE transaction. The builder authors only
         // an RV-zero template; committed apply allocates the public RV in the
         // same transaction that writes the rows.
@@ -1726,7 +1721,7 @@ impl Datastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        let command = crate::datastore::command::StorageCommand::MovePodToCleanupIntent {
+        let command = klights_cluster_core::command::StorageCommand::MovePodToCleanupIntent {
             node_name: node_name.to_string(),
             namespace: namespace.to_string(),
             pod_name: pod_name.to_string(),
@@ -1798,7 +1793,7 @@ impl Datastore {
         pod_uid: &str,
         reason: &str,
     ) -> Result<()> {
-        let command = crate::datastore::command::StorageCommand::DeletePodCleanupIntent {
+        let command = klights_cluster_core::command::StorageCommand::DeletePodCleanupIntent {
             node_name: node_name.to_string(),
             namespace: namespace.to_string(),
             pod_name: pod_name.to_string(),
@@ -1810,16 +1805,17 @@ impl Datastore {
     }
 
     pub async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
-        let command = crate::datastore::command::StorageCommand::DeletePodCleanupIntentsForNode {
-            node_name: node_name.to_string(),
-        };
+        let command =
+            klights_cluster_core::command::StorageCommand::DeletePodCleanupIntentsForNode {
+                node_name: node_name.to_string(),
+            };
         self.apply_cluster_maintenance_command(command, node_name)
             .await
     }
 
     async fn apply_cluster_maintenance_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> Result<()> {
         let authoring_node = authoring_node.to_string();
@@ -1844,10 +1840,6 @@ impl Datastore {
         Ok(())
     }
 
-    pub async fn current_log_apply_index(&self) -> Result<i64> {
-        self.node_local.current_log_apply_index().await
-    }
-
     /// T1.4: build (without applying) a `LogApplyCommit` for regular raft writes.
     ///
     /// This variant intentionally skips outbox idempotency side effects and is used
@@ -1856,10 +1848,10 @@ impl Datastore {
     /// `build_log_apply_commit_in_tx_from_command`.
     pub async fn build_log_apply_commit_for_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
-    ) -> Result<crate::log_apply::LogApplyCommit> {
+    ) -> Result<klights_cluster_core::LogApplyCommit> {
         let operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
 
@@ -1891,23 +1883,18 @@ impl Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<BuildOutboxOutcome, klights_cluster_core::OutboxApplyError> {
         use klights_cluster_core::{OutboxApplyError, OutboxOperation, subject_key_for_command};
 
-        let decoded = crate::storage_wire_codec::decode_outbox_payload_protobuf(payload)
-            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
         if operation == OutboxOperation::LeaseRenew.as_str() {
-            crate::node_lease_tracker::ensure_lease_renew_command(
-                decoded.command(),
-                authoring_node,
-            )
-            .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
+            klights_cluster_core::validate_lease_renew_command(&command, authoring_node)
+                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
             return Ok(BuildOutboxOutcome::LeaseRenewShortcircuit);
         }
-        let subject_key = subject_key_for_command(decoded.command());
-        let status_stamp = Self::pod_status_stamp_of(decoded.command());
+        let subject_key = subject_key_for_command(&command);
+        let status_stamp = Self::pod_status_stamp_of(&command);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1930,7 +1917,7 @@ impl Datastore {
                     Self::outbox_materialization_resource_version_hint_in_tx(&tx)?;
                 let (mut commit, mut rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
-                    decoded.into_command(),
+                    command,
                     &claim_operation,
                     &authoring_node_owned,
                     resource_version_hint,
@@ -1989,34 +1976,29 @@ impl Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<BuildOutboxOutcome, klights_cluster_core::OutboxApplyError> {
         if watermark.is_none() {
             return self
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     operation,
-                    payload,
+                    command,
                     authoring_node,
                 )
                 .await;
         }
         use klights_cluster_core::{OutboxApplyError, OutboxOperation, subject_key_for_command};
 
-        let decoded = crate::storage_wire_codec::decode_outbox_payload_protobuf(payload)
-            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
         if operation == OutboxOperation::LeaseRenew.as_str() {
-            crate::node_lease_tracker::ensure_lease_renew_command(
-                decoded.command(),
-                authoring_node,
-            )
-            .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
+            klights_cluster_core::validate_lease_renew_command(&command, authoring_node)
+                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
             return Ok(BuildOutboxOutcome::LeaseRenewShortcircuit);
         }
-        let subject_key = subject_key_for_command(decoded.command());
-        let status_stamp = Self::pod_status_stamp_of(decoded.command());
+        let subject_key = subject_key_for_command(&command);
+        let status_stamp = Self::pod_status_stamp_of(&command);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2077,7 +2059,7 @@ impl Datastore {
                 if let Some(terminal_error) =
                     Self::terminal_error_for_stale_uid_bound_pod_in_tx(
                         &tx,
-                        decoded.command(),
+                        &command,
                     )?
                 {
                     // A stale UID-bound Pod delivery consumes only its durable
@@ -2106,7 +2088,7 @@ impl Datastore {
                 if Self::should_consume_watermark_for_idempotent_existing_create_in_tx(
                     &tx,
                     &claim_operation,
-                    decoded.command(),
+                    &command,
                 )? {
                     let rv = resource_version_hint.expect("fixed contract always has a candidate");
                     let mut commit = Self::author_live_commit(rv, Vec::new())?;
@@ -2129,7 +2111,7 @@ impl Datastore {
                 }
                 let (mut commit, mut rv) = match Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
-                    decoded.into_command(),
+                    command,
                     &claim_operation,
                     &authoring_node_owned,
                     resource_version_hint,
@@ -2204,7 +2186,7 @@ impl Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
@@ -2213,7 +2195,7 @@ impl Datastore {
         self.apply_outbox_transactionally_effect(
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
         )
         .await
@@ -2224,7 +2206,7 @@ impl Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<
         crate::datastore::CommittedOutboxApply,
@@ -2233,22 +2215,17 @@ impl Datastore {
         use klights_cluster_core::{
             OutboxApplyError, OutboxApplyOutcome, OutboxOperation, subject_key_for_command,
         };
-        let decoded = crate::storage_wire_codec::decode_outbox_payload_protobuf(payload)
-            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
         if operation == OutboxOperation::LeaseRenew.as_str() {
-            crate::node_lease_tracker::ensure_lease_renew_command(
-                decoded.command(),
-                authoring_node,
-            )
-            .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
+            klights_cluster_core::validate_lease_renew_command(&command, authoring_node)
+                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
             return Ok(crate::datastore::CommittedOutboxApply::new(
                 OutboxApplyOutcome::Applied { applied_rv: 0 },
                 crate::datastore::ResourceMutationEffect::Unchanged,
                 crate::datastore::PodEndpointEffect::NotApplicable,
             ));
         }
-        let pod_target = match decoded.command() {
-            crate::datastore::command::StorageCommand::UpdateStatus {
+        let pod_target = match &command {
+            klights_cluster_core::command::StorageCommand::UpdateStatus {
                 api_version,
                 kind,
                 namespace,
@@ -2258,8 +2235,8 @@ impl Datastore {
             _ => None,
         };
         let is_pod_status = pod_target.is_some();
-        let subject_key = subject_key_for_command(decoded.command());
-        let status_stamp = Self::pod_status_stamp_of(decoded.command());
+        let subject_key = subject_key_for_command(&command);
+        let status_stamp = Self::pod_status_stamp_of(&command);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2334,7 +2311,7 @@ impl Datastore {
                 )?;
                 let mutation = Self::apply_outbox_command_in_tx(
                     &tx,
-                    decoded.into_command(),
+                    command,
                     &claim_operation,
                     &authoring_node,
                 )?;
@@ -2343,8 +2320,8 @@ impl Datastore {
                     crate::datastore::PodEndpointEffect::NotApplicable
                 } else if pod_before.as_ref().zip(pod_after.as_ref()).is_some_and(
                     |(before, after)| {
-                        crate::pod_endpoint_state::pod_endpoint_state(before)
-                            .differs_from(&crate::pod_endpoint_state::pod_endpoint_state(after))
+                        klights_cluster_core::pod_endpoint_state(before)
+                            .differs_from(&klights_cluster_core::pod_endpoint_state(after))
                     },
                 ) {
                     crate::datastore::PodEndpointEffect::Changed
@@ -2439,12 +2416,12 @@ impl Datastore {
     ///   - The applied outbox result is derived from the same committed mutation data
     fn apply_outbox_command_in_tx(
         tx: &rusqlite::Transaction<'_>,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
     ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
-        use crate::storage_wire_codec::encode_response_protobuf;
         use klights_cluster_core::StorageResponse;
+        use klights_cluster_datastore::encode_outbox_response;
 
         let durable_actor_cascade = Self::is_bound_pod_finalization_delivery(&command, operation);
         let candidate_rv = Self::current_resource_version_in_tx(tx)?.saturating_add(1);
@@ -2481,7 +2458,7 @@ impl Datastore {
                 resource_version: applied_rv,
             }
         };
-        let result_proto = encode_response_protobuf(&response).unwrap_or_default();
+        let result_proto = encode_outbox_response(&response).unwrap_or_default();
         Ok(AtomicOutboxMutation {
             applied_rv: Some(applied_rv),
             result_proto,
@@ -2691,13 +2668,13 @@ impl Datastore {
         api_version: &str,
         kind: &str,
         live: &mut Value,
-        patch_kind: crate::datastore::types::PatchKind,
+        patch_kind: klights_cluster_core::PatchKind,
         patch: Value,
     ) -> tokio_rusqlite::Result<()> {
         let _ = (api_version, kind);
         let existing = live.clone();
         match patch_kind {
-            crate::datastore::types::PatchKind::Merge => {
+            klights_cluster_core::PatchKind::Merge => {
                 klights_types::apply_merge_patch(live, &patch);
             }
         }
@@ -2716,7 +2693,7 @@ impl Datastore {
         node_name: &str,
         metadata: &klights_cluster_store::DataplanePeerMetadata,
         resource_version: i64,
-    ) -> tokio_rusqlite::Result<Option<crate::log_apply::LogApplyResourceRow>> {
+    ) -> tokio_rusqlite::Result<Option<klights_cluster_core::LogApplyResourceRow>> {
         let Some((_current_rv, current_uid, current_bytes)) = tx
             .query_row(
                 queries::CLUSTER_GET_DATA_FOR_DELETE,
@@ -2758,7 +2735,7 @@ impl Datastore {
             return Ok(None);
         }
 
-        Ok(Some(crate::log_apply::LogApplyResourceRow {
+        Ok(Some(klights_cluster_core::LogApplyResourceRow {
             api_version: "v1".to_string(),
             kind: "Node".to_string(),
             namespace: None,
@@ -2778,9 +2755,9 @@ impl Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
         klights_cluster_core::OutboxApplyError,
@@ -2788,7 +2765,7 @@ impl Datastore {
         self.apply_outbox_transactionally_with_watermark_effect(
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )
@@ -2800,9 +2777,9 @@ impl Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::CommittedOutboxApply,
         klights_cluster_core::OutboxApplyError,
@@ -2815,17 +2792,16 @@ impl Datastore {
                 .apply_outbox_transactionally_effect(
                     idempotency_key,
                     operation,
-                    payload,
+                    command,
                     authoring_node,
                 )
                 .await;
         }
-
         match self
             .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
                 operation,
-                payload,
+                command,
                 authoring_node,
                 watermark,
             )
@@ -2890,7 +2866,7 @@ impl Datastore {
     fn should_consume_watermark_for_idempotent_existing_create_in_tx(
         tx: &rusqlite::Transaction<'_>,
         operation: &str,
-        command: &crate::datastore::command::StorageCommand,
+        command: &klights_cluster_core::command::StorageCommand,
     ) -> tokio_rusqlite::Result<bool> {
         let idempotent_create = operation
             == klights_cluster_core::OutboxOperation::EventCreate.as_str()
@@ -2898,7 +2874,7 @@ impl Datastore {
         if !idempotent_create {
             return Ok(false);
         }
-        let crate::datastore::command::StorageCommand::CreateResource {
+        let klights_cluster_core::command::StorageCommand::CreateResource {
             api_version,
             kind,
             namespace,
@@ -2920,7 +2896,7 @@ impl Datastore {
 
     fn terminal_error_for_stale_uid_bound_pod_in_tx(
         tx: &rusqlite::Transaction<'_>,
-        command: &crate::datastore::command::StorageCommand,
+        command: &klights_cluster_core::command::StorageCommand,
     ) -> tokio_rusqlite::Result<Option<klights_cluster_core::OutboxApplyError>> {
         let Some((namespace, name, expected_uid)) = Self::uid_bound_pod_target(command) else {
             return Ok(None);
@@ -2941,9 +2917,9 @@ impl Datastore {
     }
 
     fn uid_bound_pod_target(
-        command: &crate::datastore::command::StorageCommand,
+        command: &klights_cluster_core::command::StorageCommand,
     ) -> Option<(&str, &str, &str)> {
-        use crate::datastore::command::StorageCommand;
+        use klights_cluster_core::command::StorageCommand;
         let (api_version, kind, namespace, name, preconditions) = match command {
             StorageCommand::UpdateStatus {
                 api_version,
@@ -3020,8 +2996,10 @@ impl Datastore {
         if record.result_proto.is_empty() {
             return Ok(None);
         }
-        match crate::storage_wire_codec::decode_response_protobuf(&record.result_proto) {
-            Ok(crate::datastore::command::StorageResponse::Error { message }) => Ok(Some(message)),
+        match klights_cluster_datastore::decode_outbox_response(&record.result_proto) {
+            Ok(klights_cluster_core::command::StorageResponse::Error { message }) => {
+                Ok(Some(message))
+            }
             Ok(_) => Ok(None),
             Err(err) => Err(klights_cluster_core::OutboxApplyError::Retryable(format!(
                 "decode cached applied_outbox response: {err}"
@@ -3038,8 +3016,8 @@ impl Datastore {
         let Some(record) = record else {
             return Ok(None);
         };
-        match crate::storage_wire_codec::decode_response_protobuf(&record.result_proto) {
-            Ok(crate::datastore::command::StorageResponse::Resource {
+        match klights_cluster_datastore::decode_outbox_response(&record.result_proto) {
+            Ok(klights_cluster_core::command::StorageResponse::Resource {
                 resource_version,
                 data,
             }) => {
@@ -3104,9 +3082,9 @@ impl Datastore {
     /// Worker-observed status stamp carried by a Pod status outbox command, if
     /// any. Used by the outer apply paths to persist the stamp in the
     /// idempotency ledger so the gate can compare future snapshots.
-    fn pod_status_stamp_of(command: &crate::datastore::command::StorageCommand) -> Option<i64> {
+    fn pod_status_stamp_of(command: &klights_cluster_core::command::StorageCommand) -> Option<i64> {
         match command {
-            crate::datastore::command::StorageCommand::UpdateStatus {
+            klights_cluster_core::command::StorageCommand::UpdateStatus {
                 observed_status_stamp,
                 ..
             } => *observed_status_stamp,
@@ -3254,7 +3232,6 @@ impl Datastore {
     async fn from_executors(
         executor: DbExecutor,
         read_executor: DbExecutor,
-        node_local: crate::datastore::node_local::SqliteNodeLocalDb,
         snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
     ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
@@ -3263,7 +3240,6 @@ impl Datastore {
         Ok(Self {
             executor,
             read_executor,
-            node_local,
             watch_bus: std::sync::Arc::new(WatchBus::new(1024)),
             pod_endpoint_tx,
             pod_slot_admission_tx,
@@ -3278,34 +3254,12 @@ impl Datastore {
         })
     }
 
-    async fn open_node_local_sqlite(
-        path: Option<&std::path::Path>,
-        supervisor: std::sync::Arc<TaskSupervisor>,
-        key_file: Option<&std::path::Path>,
-        connection_key: &'static str,
-    ) -> Result<crate::datastore::node_local::SqliteNodeLocalDb> {
-        let opts = match path {
-            Some(path) => opener::OpenOpts::node_disk(path.to_path_buf()),
-            None => opener::OpenOpts::node_in_memory(),
-        }
-        .with_key_file(key_file)?;
-        let executor = DbExecutor::open_with_opts(opts, supervisor, connection_key).await?;
-        crate::datastore::node_local::SqliteNodeLocalDb::from_executor(executor)
-    }
-
     async fn from_executor(executor: DbExecutor) -> Result<Self> {
         let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
             snapshot_capture::SqliteSnapshotFactory::new(opts, executor.task_supervisor())
         });
         let read_executor = executor.read_lane_clone();
-        let node_local = Self::open_node_local_sqlite(
-            None,
-            executor.task_supervisor(),
-            None,
-            "sqlite:node-local-memory",
-        )
-        .await?;
-        Self::from_executors(executor, read_executor, node_local, snapshot_factory).await
+        Self::from_executors(executor, read_executor, snapshot_factory).await
     }
 
     /// Production constructor — open a persistent on-disk database.
@@ -3316,7 +3270,6 @@ impl Datastore {
     /// (requires the `sqlcipher` cargo feature).
     pub async fn new_persistent_paths(
         cluster_db_path: &std::path::Path,
-        node_db_path: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
         key_file: Option<&std::path::Path>,
     ) -> Result<Self> {
@@ -3354,29 +3307,10 @@ impl Datastore {
         })?;
         let snapshot_factory =
             snapshot_capture::SqliteSnapshotFactory::new(read_opts, supervisor.clone());
-        let node_local = Self::open_node_local_sqlite(
-            Some(node_db_path),
-            supervisor,
-            key_file,
-            "sqlite:node-local",
-        )
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "failed to open persistent node-local datastore at {}: {}",
-                node_db_path.display(),
-                e
-            )
-        })?;
-        let ds = Self::from_executors(executor, read_executor, node_local, Some(snapshot_factory))
-            .await?;
+        let ds = Self::from_executors(executor, read_executor, Some(snapshot_factory)).await?;
 
         // Log DB size at startup for operator triage (DSB-05).
-        let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-        let mut wal_path = db_path.as_os_str().to_owned();
-        wal_path.push("-wal");
-        let wal_path = std::path::PathBuf::from(wal_path);
-        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let (db_size, wal_size) = opener::persistent_datastore_sizes(&supervisor, &db_path).await?;
         tracing::info!(
             db_path = %db_path.display(),
             db_size_bytes = db_size,
@@ -3398,7 +3332,6 @@ impl Datastore {
     ) -> Result<Self> {
         Self::new_persistent_paths(
             &db_root.join("sqlite").join("cluster.db"),
-            &db_root.join("sqlite").join("node.db"),
             supervisor,
             key_file,
         )
@@ -3417,10 +3350,7 @@ impl Datastore {
             .snapshot_open_opts()
             .map(|opts| snapshot_capture::SqliteSnapshotFactory::new(opts, supervisor.clone()));
         let read_executor = executor.read_lane_clone();
-        let node_local =
-            Self::open_node_local_sqlite(None, supervisor, None, "sqlite:node-local-memory")
-                .await?;
-        Self::from_executors(executor, read_executor, node_local, snapshot_factory).await
+        Self::from_executors(executor, read_executor, snapshot_factory).await
     }
 
     /// Shared production + test constructor when an externally-created
@@ -3632,7 +3562,7 @@ impl DatastoreBackend for Datastore {
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
+        entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
@@ -3649,20 +3579,23 @@ impl DatastoreBackend for Datastore {
         .await
     }
 
-    async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
+    async fn apply_log_apply_commit(
+        &self,
+        commit: klights_cluster_core::LogApplyCommit,
+    ) -> Result<()> {
         Datastore::apply_log_apply_commit(self, commit).await
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         Datastore::apply_raft_log_apply_commit(self, commit).await
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
         Datastore::apply_raft_log_apply_commit_outcome(self, commit).await
     }
@@ -3991,97 +3924,6 @@ impl DatastoreBackend for Datastore {
         Datastore::delete_namespace_observed_rv(self, name).await
     }
 
-    async fn pod_workqueue_enqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &klights_types::PodIdentity,
-        payload: Value,
-        attempt_count: i64,
-        min_delay_ms: i64,
-        last_error: Option<&str>,
-    ) -> Result<()> {
-        Datastore::pod_workqueue_enqueue(
-            self,
-            kind,
-            pod,
-            payload,
-            attempt_count,
-            min_delay_ms,
-            last_error,
-        )
-        .await
-    }
-
-    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        Datastore::pod_workqueue_peek_next_due(self).await
-    }
-
-    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        Datastore::pod_workqueue_claim_due(self, now_ms).await
-    }
-
-    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        Datastore::pod_workqueue_complete(self, id).await
-    }
-
-    async fn pod_workqueue_record_failure(
-        &self,
-        row: PodWorkqueueEntry,
-        min_delay_ms: i64,
-        error: &str,
-    ) -> Result<()> {
-        Datastore::pod_workqueue_record_failure(self, row, min_delay_ms, error).await
-    }
-
-    async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        Datastore::pod_workqueue_dead_letter(self, id, error).await
-    }
-
-    async fn record_sandbox(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        sandbox_id: &str,
-    ) -> Result<()> {
-        Datastore::record_sandbox(self, namespace, pod_name, pod_uid, sandbox_id).await
-    }
-
-    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        Datastore::get_sandbox(self, namespace, pod_name).await
-    }
-
-    async fn get_sandbox_for_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<String>> {
-        if pod_uid.is_empty() {
-            Datastore::get_sandbox(self, namespace, pod_name).await
-        } else {
-            Datastore::get_sandbox_for_uid(self, namespace, pod_name, pod_uid).await
-        }
-    }
-
-    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
-        Datastore::delete_sandbox(self, namespace, pod_name).await
-    }
-
-    async fn delete_sandbox_for_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        sandbox_id: &str,
-    ) -> Result<()> {
-        Datastore::delete_sandbox_for_uid(self, namespace, pod_name, pod_uid, sandbox_id).await
-    }
-
-    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
-        Datastore::delete_pod_network(self, sandbox_id).await
-    }
-
     async fn find_owned_resources(
         &self,
         owner_uid: &str,
@@ -4374,40 +4216,6 @@ impl DatastoreBackend for Datastore {
         Datastore::delete_pod_cleanup_intents_for_node(self, node_name).await
     }
 
-    async fn pod_slot_try_admit(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotAdmissionResult> {
-        Datastore::pod_slot_try_admit(self, namespace, pod_name, pod_uid, node_name).await
-    }
-
-    async fn pod_slot_mark_terminating(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotMutationResult> {
-        Datastore::pod_slot_mark_terminating(self, namespace, pod_name, pod_uid, node_name).await
-    }
-
-    async fn pod_slot_clear_if_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotClearResult> {
-        Datastore::pod_slot_clear_if_uid(self, namespace, pod_name, pod_uid, node_name).await
-    }
-
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        Datastore::subscribe_pod_slot_admissions(self)
-    }
-
     async fn patch_resource_latest(
         &self,
         api_version: &str,
@@ -4448,48 +4256,6 @@ impl DatastoreBackend for Datastore {
         .await
     }
 
-    async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
-        Datastore::get_pod_network(self, sandbox_id).await
-    }
-
-    async fn get_pod_network_for_pod(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        Datastore::get_pod_network_for_pod(self, namespace, pod_name, pod_uid).await
-    }
-
-    async fn ipam_allocate_and_record_pod_network(
-        &self,
-        sandbox_id: &str,
-        pod: &klights_types::PodIdentity,
-        subnet_base_int: u32,
-        subnet_size: u32,
-        veth_host: &str,
-        netns_path: &str,
-    ) -> Result<(String, u32)> {
-        Datastore::ipam_allocate_and_record_pod_network(
-            self,
-            sandbox_id,
-            pod,
-            subnet_base_int,
-            subnet_size,
-            veth_host,
-            netns_path,
-        )
-        .await
-    }
-
-    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
-        Datastore::list_sandboxes(self).await
-    }
-
-    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        Datastore::list_pod_network_sandbox_ids(self).await
-    }
-
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         Datastore::watch_events_gc_prunable_count(self, max_rows, batch_cap).await
     }
@@ -4500,21 +4266,6 @@ impl DatastoreBackend for Datastore {
 
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         Datastore::gc_watch_events(self, max_rows, batch_cap).await
-    }
-
-    async fn pod_endpoint_get_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>> {
-        Datastore::pod_endpoint_get_by_pod_ip(self, pod_ip).await
-    }
-
-    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
-        Datastore::pod_endpoint_list_all(self).await
-    }
-
-    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        Datastore::subscribe_pod_endpoints(self)
     }
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -4547,7 +4298,7 @@ impl DatastoreBackend for Datastore {
 
     async fn list_outbox_stream_watermarks(
         &self,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         Datastore::list_outbox_stream_watermarks(self).await
     }
 
@@ -4555,7 +4306,7 @@ impl DatastoreBackend for Datastore {
         &self,
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         Datastore::list_outbox_stream_watermarks_paged(self, after, limit).await
     }
 
@@ -4586,7 +4337,7 @@ impl DatastoreBackend for Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
@@ -4596,7 +4347,7 @@ impl DatastoreBackend for Datastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
         )
         .await
@@ -4606,9 +4357,9 @@ impl DatastoreBackend for Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
         klights_cluster_core::OutboxApplyError,
@@ -4617,7 +4368,7 @@ impl DatastoreBackend for Datastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )
@@ -4628,9 +4379,9 @@ impl DatastoreBackend for Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::CommittedOutboxApply,
         klights_cluster_core::OutboxApplyError,
@@ -4639,7 +4390,7 @@ impl DatastoreBackend for Datastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )
@@ -4648,10 +4399,10 @@ impl DatastoreBackend for Datastore {
 
     async fn build_log_apply_commit_for_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
-    ) -> Result<crate::log_apply::LogApplyCommit> {
+    ) -> Result<klights_cluster_core::LogApplyCommit> {
         Datastore::build_log_apply_commit_for_command(self, command, operation, authoring_node)
             .await
     }
@@ -4660,14 +4411,14 @@ impl DatastoreBackend for Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<BuildOutboxOutcome, klights_cluster_core::OutboxApplyError> {
         Datastore::build_log_apply_commit_for_outbox(
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
         )
         .await
@@ -4677,15 +4428,15 @@ impl DatastoreBackend for Datastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<BuildOutboxOutcome, klights_cluster_core::OutboxApplyError> {
         Datastore::build_log_apply_commit_for_outbox_with_watermark(
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )
@@ -4694,10 +4445,6 @@ impl DatastoreBackend for Datastore {
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
         Datastore::gc_applied_outbox(self, now_ms, ttl_ms).await
-    }
-
-    async fn current_log_apply_index(&self) -> Result<i64> {
-        Datastore::current_log_apply_index(self).await
     }
 }
 

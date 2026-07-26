@@ -29,8 +29,8 @@ async fn node_local_runtime_store()
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let executor = crate::datastore::sqlite::DbExecutor::open_with_opts(
-        crate::datastore::sqlite::opener::OpenOpts::node_in_memory(),
+    let executor = crate::sqlite_boundary::DbExecutor::open_with_opts(
+        crate::sqlite_open::OpenOpts::node_in_memory(),
         supervisor,
         "sqlite:pod-runtime-test",
     )
@@ -520,13 +520,16 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
+    let node_local =
+        crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: db.clone(),
+            node_local: Some(node_local.clone()),
             supervisor,
             side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(db.clone()),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
@@ -1118,13 +1121,16 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     ));
     let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
     let metrics = crate::side_effects::SideEffectMetrics::new();
+    let node_local =
+        crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: handle.clone(),
+            node_local: Some(node_local.clone()),
             supervisor,
             side_effects,
             metrics,
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(handle),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,
@@ -3872,8 +3878,8 @@ fn fake_worker_owns_only_pods_scheduled_to_its_node() {
 
 #[tokio::test]
 async fn fake_cluster_records_worker_status_forward_to_leader() {
-    use crate::datastore::command::StorageCommand;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+    use klights_cluster_core::command::StorageCommand;
 
     let cluster = FakeCluster::new();
 
@@ -5033,11 +5039,12 @@ async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
 
 #[tokio::test]
 async fn real_pod_slot_admission_admits_and_clears_slot() {
-    let ds = crate::datastore::test_support::in_memory().await;
-    let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(Arc::new(
-        ds,
-    )
-        as Arc<dyn crate::datastore::PodCleanupStore>);
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let node_local = crate::kubelet::pod_repository::test_node_local_store(supervisor).await;
+    let pod_slot_adapter =
+        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local);
     let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
         pod_slot_adapter.clone(),
         pod_slot_adapter,
@@ -5065,11 +5072,12 @@ async fn real_pod_slot_admission_admits_and_clears_slot() {
 
 #[tokio::test]
 async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
-    let ds = crate::datastore::test_support::in_memory().await;
-    let pod_slot_adapter = crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(Arc::new(
-        ds,
-    )
-        as Arc<dyn crate::datastore::PodCleanupStore>);
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let node_local = crate::kubelet::pod_repository::test_node_local_store(supervisor).await;
+    let pod_slot_adapter =
+        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local);
     let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
         pod_slot_adapter.clone(),
         pod_slot_adapter,
@@ -5144,7 +5152,7 @@ async fn real_replication_runtime_enqueue_is_noop_in_single_node() {
     let repo = fixture_pod_repository().await;
     let replication = crate::kubelet::pod_cluster_runtime::RealReplicationRuntime::new(repo);
     let key = PodRuntimeKey::new("ns", "pod", "uid");
-    let cmd = crate::datastore::command::StorageCommand::create_resource(
+    let cmd = klights_cluster_core::command::StorageCommand::create_resource(
         "v1",
         "Pod",
         Some("ns"),
@@ -10492,13 +10500,16 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
+    let node_local =
+        crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: db.clone(),
+            node_local: Some(node_local.clone()),
             supervisor: supervisor.clone(),
             side_effects: std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new()),
             metrics: crate::side_effects::SideEffectMetrics::new(),
-            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(db.clone()),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(node_local),
             assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
             scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
             outbox: None,

@@ -284,7 +284,7 @@ fn build_desired_endpoints(
     let mut subset_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
 
     for pod_resource in pods {
-        let endpoint_state = crate::pod_endpoint_state::pod_endpoint_state(&pod_resource.data);
+        let endpoint_state = klights_cluster_core::pod_endpoint_state(&pod_resource.data);
         if pod_is_terminating(&pod_resource.data) || endpoint_state.is_terminal() {
             continue;
         }
@@ -406,7 +406,7 @@ fn build_desired_endpointslices(
     let mut slice_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
 
     for pod_resource in pods {
-        let endpoint_state = crate::pod_endpoint_state::pod_endpoint_state(&pod_resource.data);
+        let endpoint_state = klights_cluster_core::pod_endpoint_state(&pod_resource.data);
         if pod_is_terminating(&pod_resource.data) || endpoint_state.is_terminal() {
             continue;
         }

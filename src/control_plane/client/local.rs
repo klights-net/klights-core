@@ -29,13 +29,13 @@ use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::cluster_store_adapter::{
     DatastoreClusterResourceRead, DatastoreDurableAllocatorRead, DatastoreDurableWatchHistory,
 };
-use crate::datastore::command::StorageCommand;
 use crate::datastore::sequenced::WriteRejection;
 use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::node_outbox::OutboxApplyError;
 #[cfg(test)]
 use crate::node_outbox::payload::OutboxOperationExt as _;
+use klights_cluster_core::command::StorageCommand;
 
 #[cfg(test)]
 type ProjectedTokenAsyncBoundary = Arc<
@@ -705,7 +705,7 @@ pub(crate) async fn submit_resource_command_to_store(
     request: ResourceCommandRequest,
 ) -> std::result::Result<ResourceCommandResult, ResourceCommandError> {
     use crate::datastore::ResourcePatchRequest;
-    use crate::datastore::command::StorageCommand;
+    use klights_cluster_core::command::StorageCommand;
 
     let result = match request.into_command() {
         StorageCommand::CreateResource {
@@ -1385,10 +1385,10 @@ mod inner_gate_tests {
 
     use super::*;
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::command::StorageCommand;
     use crate::datastore::{DatastoreBackend, ReplicatedCreateOptions, ResourceListQuery};
     use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
     use futures::StreamExt as _;
+    use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
     use klights_leader_api::{
         LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,

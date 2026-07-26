@@ -13,7 +13,11 @@ pub async fn pod_lifecycle_debug_dump(
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Authorize: non-resource URL /debug/klights/pod-lifecycle
     let request = AuthorizationRequest::non_resource("get", "/debug/klights/pod-lifecycle");
-    let decision = state.authorizer.authorize(&identity, &request).await;
+    let decision = state
+        .auth_policy()
+        .authorizer
+        .authorize(&identity, &request)
+        .await;
     if !decision.allowed {
         return Err(AppError::Forbidden(if decision.denied {
             decision.reason

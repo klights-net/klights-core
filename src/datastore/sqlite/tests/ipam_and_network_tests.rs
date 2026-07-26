@@ -1,13 +1,13 @@
 use super::*;
-use crate::datastore::command::StorageCommand;
-use crate::log_apply::LogApplyMutation;
 use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 use klights_cluster_core::BuildOutboxOutcome;
+use klights_cluster_core::LogApplyMutation;
+use klights_cluster_core::command::StorageCommand;
 use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use serde_json::json;
 use std::net::Ipv4Addr;
 
-use crate::log_apply::{
+use klights_cluster_core::{
     LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
 };
 
@@ -201,7 +201,7 @@ async fn build_update_node_dataplane_log_apply_does_not_mutate_leader_node() {
         .build_log_apply_commit_for_outbox(
             "dataplane-node-a",
             OutboxOperation::NodeDataplane.as_str(),
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "node-a",
         )
         .await
@@ -301,7 +301,7 @@ async fn node_registration_outbox_uses_dataplane_annotation_for_external_ip() {
         .build_log_apply_commit_for_outbox(
             "node-registration-node-a",
             OutboxOperation::NodeRegistration.as_str(),
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "node-a",
         )
         .await
@@ -349,8 +349,10 @@ async fn raft_node_subnet_replay_is_deterministic() {
         mode: "root".to_string(),
         hostport_range: Some("30000-30100".to_string()),
     };
-    let put_commit =
-        crate::log_apply::test_live_commit(1, vec![LogApplyMutation::PutNodeSubnet(put.clone())]);
+    let put_commit = crate::replication::log_apply_wire::test_live_commit(
+        1,
+        vec![LogApplyMutation::PutNodeSubnet(put.clone())],
+    );
     leader
         .apply_log_apply_commit(put_commit.clone())
         .await
@@ -376,7 +378,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         "node subnet rows must be deterministic between leader and follower after put replay",
     );
 
-    let allocate_commit = crate::log_apply::test_live_commit(
+    let allocate_commit = crate::replication::log_apply_wire::test_live_commit(
         2,
         vec![LogApplyMutation::AllocateNodeSubnet(
             LogApplyNodeSubnetAllocation {
@@ -426,7 +428,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         "node subnet rows must match between leader and follower after allocation replay",
     );
 
-    let delete_commit = crate::log_apply::test_live_commit(
+    let delete_commit = crate::replication::log_apply_wire::test_live_commit(
         3,
         vec![LogApplyMutation::DeleteNodeSubnet {
             node_name: "node-alpha".to_string(),
@@ -481,8 +483,10 @@ async fn raft_node_dataplane_replay_is_deterministic() {
         endpoint: "10.99.0.10".to_string(),
         port: Some(51820),
     };
-    let put_commit =
-        crate::log_apply::test_live_commit(1, vec![LogApplyMutation::PutNodeDataplane(put)]);
+    let put_commit = crate::replication::log_apply_wire::test_live_commit(
+        1,
+        vec![LogApplyMutation::PutNodeDataplane(put)],
+    );
     leader
         .apply_log_apply_commit(put_commit.clone())
         .await
@@ -507,7 +511,7 @@ async fn raft_node_dataplane_replay_is_deterministic() {
         "node_dataplane replay must be byte-identical between leader and follower",
     );
 
-    let delete_commit = crate::log_apply::test_live_commit(
+    let delete_commit = crate::replication::log_apply_wire::test_live_commit(
         2,
         vec![LogApplyMutation::DeleteNodeDataplane {
             node_name: "node-gamma".to_string(),

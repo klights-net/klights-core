@@ -248,7 +248,7 @@ impl ReplicationGrpcMemberFeatureProbe {
             leader_epoch: 0,
             current_rv: 0,
             current_log_index: 0,
-            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+            command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
         })
     }
 }
@@ -295,7 +295,7 @@ mod tests {
             .expect("the local member must not require a self gRPC connection");
         assert_eq!(
             metadata.command_codec_version,
-            crate::log_apply::COMMAND_CODEC_VERSION
+            klights_cluster_core::COMMAND_CODEC_VERSION
         );
         assert!(
             ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local + 1)

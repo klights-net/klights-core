@@ -242,7 +242,7 @@ pub async fn enqueue_worker_dataplane_metadata_outbox(
                 uid: None,
             },
             pod_uid: String::new(),
-            command: crate::datastore::command::StorageCommand::UpdateNodeDataplane {
+            command: klights_cluster_core::command::StorageCommand::UpdateNodeDataplane {
                 node_name: node_name.to_string(),
                 mode: match dataplane.mode {
                     klights_leader_api::NetworkNodeMode::Root => "root",

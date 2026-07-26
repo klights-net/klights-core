@@ -44,12 +44,7 @@ pub(super) fn schema_check(db: &Database) -> Result<(), OpenError> {
     check!(tables::OUTBOX_STREAM_WATERMARKS);
     check!(tables::RESOURCES_BY_OWNER);
     check!(tables::RV_TO_KEY);
-    check!(tables::POD_SANDBOXES);
-    check!(tables::POD_NETWORKS);
     check!(tables::NODE_SUBNETS);
-    check!(tables::POD_SLOT_ADMISSIONS);
-    check!(tables::POD_ENDPOINTS);
-    check!(tables::POD_WORKQUEUE);
     check!(tables::META);
 
     Ok(())

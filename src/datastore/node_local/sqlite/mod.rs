@@ -8,12 +8,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
-use crate::datastore::sqlite::DbExecutor;
 use crate::datastore::{
     PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkAllocationRequest,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
     PodSlotClearResult, PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind,
 };
+use crate::sqlite_boundary::DbExecutor;
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 

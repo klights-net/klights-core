@@ -176,8 +176,8 @@ pub(crate) async fn enqueue_services_after_pod_delete<Store: ServicePodStore + ?
 }
 
 pub fn pod_endpoint_state_changed(previous: &Value, updated: &Value) -> bool {
-    crate::pod_endpoint_state::pod_endpoint_state(previous)
-        .differs_from(&crate::pod_endpoint_state::pod_endpoint_state(updated))
+    klights_cluster_core::pod_endpoint_state(previous)
+        .differs_from(&klights_cluster_core::pod_endpoint_state(updated))
 }
 
 fn pod_identity(pod: &Value) -> (&str, Option<&str>) {

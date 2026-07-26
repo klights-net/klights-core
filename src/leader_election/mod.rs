@@ -164,7 +164,8 @@ mod tests {
     // T2: RaftLeaderLease tests
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::datastore::raft::node::RaftNode;
-    use crate::datastore::sqlite::{DbExecutor, opener};
+    use crate::sqlite_boundary::DbExecutor;
+    use crate::sqlite_open as opener;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     async fn fresh_raft_node(id: u64) -> RaftNode {

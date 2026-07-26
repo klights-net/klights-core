@@ -196,7 +196,15 @@ pub(crate) fn decode_outbox_payload_protobuf(
     ))
 }
 
+#[cfg(test)]
+pub(crate) fn test_outbox_command(bytes: &[u8]) -> StorageCommand {
+    decode_outbox_payload_protobuf(bytes)
+        .expect("test outbox payload must decode")
+        .into_command()
+}
+
 /// Encode `StorageResponse` as protobuf bytes.
+#[cfg(test)]
 pub(crate) fn encode_response_protobuf(resp: &StorageResponse) -> CodecResult<Vec<u8>> {
     let proto = ProtoStorageResponse::boundary_try_from(resp.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
@@ -205,6 +213,7 @@ pub(crate) fn encode_response_protobuf(resp: &StorageResponse) -> CodecResult<Ve
 }
 
 /// Decode `StorageResponse` from protobuf bytes.
+#[cfg(test)]
 pub(crate) fn decode_response_protobuf(bytes: &[u8]) -> CodecResult<StorageResponse> {
     let proto: ProtoStorageResponse = prost::Message::decode(bytes)?;
     StorageResponse::boundary_try_from(proto)
@@ -990,7 +999,7 @@ impl BoundaryTryFrom<ProtoCommandError> for CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::command::COMMAND_CODEC_VERSION;
+    use klights_cluster_core::command::COMMAND_CODEC_VERSION;
     use prost::Message;
     use serde_json::json;
 

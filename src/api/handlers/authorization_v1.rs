@@ -124,7 +124,11 @@ pub(crate) async fn create_self_subject_access_review(
     let spec = take_spec(&mut decoded);
 
     let decision = if let Some(request) = build_request_from_sar_spec(&spec) {
-        state.authorizer.authorize(&identity, &request).await
+        state
+            .auth_policy()
+            .authorizer
+            .authorize(&identity, &request)
+            .await
     } else {
         // No attributes specified: check if identity is authenticated
         AuthorizationDecision {
@@ -171,7 +175,11 @@ pub(crate) async fn create_subject_access_review(
         None,
     );
 
-    let review_decision = state.authorizer.authorize(&identity, &review_request).await;
+    let review_decision = state
+        .auth_policy()
+        .authorizer
+        .authorize(&identity, &review_request)
+        .await;
     if !review_decision.allowed {
         let reason = if let Some(err) = review_decision.evaluation_error.as_ref() {
             format!("cannot review other subjects: {err}")
@@ -186,7 +194,11 @@ pub(crate) async fn create_subject_access_review(
     let decision = if let Some(request) = build_request_from_sar_spec(&spec) {
         // SubjectAccessReview evaluates the subject described by spec, not the caller.
         let eval_identity = build_subject_identity_from_sar_spec(&spec);
-        state.authorizer.authorize(&eval_identity, &request).await
+        state
+            .auth_policy()
+            .authorizer
+            .authorize(&eval_identity, &request)
+            .await
     } else {
         AuthorizationDecision {
             allowed: !identity.username.starts_with("system:anonymous"),
@@ -226,6 +238,7 @@ pub(crate) async fn create_self_subject_rules_review(
     let namespace = spec.get("namespace").and_then(|v| v.as_str());
 
     let (effective_resource, effective_non_resource, incomplete) = state
+        .auth_policy()
         .rbac_policy_store
         .enumerate_effective_rules(&identity, namespace)
         .await;
@@ -311,7 +324,11 @@ pub(crate) async fn create_local_subject_access_review(
     let decision = if let Some(request) = build_request_from_sar_spec(&spec) {
         // LocalSubjectAccessReview evaluates the subject described by spec, not the caller.
         let eval_identity = build_subject_identity_from_sar_spec(&spec);
-        state.authorizer.authorize(&eval_identity, &request).await
+        state
+            .auth_policy()
+            .authorizer
+            .authorize(&eval_identity, &request)
+            .await
     } else {
         AuthorizationDecision {
             allowed: !identity.username.starts_with("system:anonymous"),

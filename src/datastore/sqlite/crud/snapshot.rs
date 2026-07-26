@@ -18,7 +18,8 @@ use serde_json::Value;
 use super::super::queries;
 use super::super::scope::use_namespaced_table;
 use super::*;
-use crate::datastore::types::{Resource, ResourceList, ResourceListQuery, SnapshotAtRv};
+use crate::datastore::types::{ResourceList, ResourceListQuery, SnapshotAtRv};
+use klights_cluster_core::Resource;
 use klights_types::LabelSelector;
 
 /// Per-key history facts derived from `watch_events`, relative to the requested

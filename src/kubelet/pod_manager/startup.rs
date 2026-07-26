@@ -87,12 +87,11 @@ mod tests {
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
+                node_local: None,
                 supervisor: supervisor.clone(),
                 side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
                 metrics: crate::side_effects::SideEffectMetrics::new(),
-                pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
-                    db_handle.clone(),
-                ),
+                pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
                 assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode:
                     crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,

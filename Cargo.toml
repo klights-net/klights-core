@@ -52,6 +52,7 @@ publish = false
 [workspace.dependencies]
 klights-types = { path = "crates/klights-types" }
 klights-cluster-core = { path = "crates/klights-cluster-core" }
+klights-cluster-datastore = { path = "crates/klights-cluster-datastore" }
 klights-cluster-store = { path = "crates/klights-cluster-store" }
 klights-leader-api = { path = "crates/klights-leader-api" }
 klights-watch = { path = "crates/klights-watch" }
@@ -192,6 +193,7 @@ vergen = { workspace = true }
 [dependencies]
 klights-types = { workspace = true }
 klights-cluster-core = { workspace = true }
+klights-cluster-datastore = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-leader-api = { workspace = true }
 klights-watch = { workspace = true }

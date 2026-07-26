@@ -5,9 +5,9 @@ use klights_leader_api::{
 
 use crate::datastore::DatastoreBackend;
 use crate::datastore::ResourcePreconditions;
-use crate::datastore::command::StorageCommand;
-use crate::log_apply::OutboxStreamWatermark;
 use crate::node_outbox::payload::OutboxOperation;
+use klights_cluster_core::OutboxStreamWatermark;
+use klights_cluster_core::command::StorageCommand;
 
 #[cfg(test)]
 pub async fn apply_outbox_transactionally(
@@ -38,8 +38,13 @@ pub async fn apply_outbox_transactionally(
             other => klights_cluster_core::OutboxApplyError::Retryable(other.to_string()),
         })?;
 
-    db.apply_outbox_transactionally(idempotency_key, operation.as_str(), payload, authoring_node)
-        .await
+    db.apply_outbox_transactionally(
+        idempotency_key,
+        operation.as_str(),
+        decoded.command,
+        authoring_node,
+    )
+    .await
 }
 
 /// Run GC on the applied_outbox idempotency ledger. Prunes all entries older

@@ -4,7 +4,7 @@
 
 use crate::datastore::errors::OpenError;
 use crate::datastore::sqlite::Datastore;
-use crate::log_apply::{
+use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
     LogApplyNodeSubnetRow, LogApplyPodCleanupIntentRow, LogApplyResourceRow, LogApplyWatchEventRow,
 };
@@ -172,7 +172,7 @@ fn wal_present_but_main_missing_fails_open() {
 
     // The opener should detect the orphaned WAL and refuse to open.
     // SQLite would silently create a new empty DB, masking potential data loss.
-    let err = opener::check_orphaned_wal(&path).expect_err("should detect orphaned WAL");
+    let err = opener::check_orphaned_wal_for_test(&path).expect_err("should detect orphaned WAL");
     let OpenError::Corrupt { path: p, details } = err else {
         panic!("expected Corrupt, got: {:?}", err);
     };
@@ -748,7 +748,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
 async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
-    let derived_resource_commit = crate::log_apply::test_live_commit(
+    let derived_resource_commit = crate::replication::log_apply_wire::test_live_commit(
         30,
         vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version: "v1".to_string(),
@@ -776,7 +776,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let seed_watch_10 = crate::log_apply::test_live_commit(
+    let seed_watch_10 = crate::replication::log_apply_wire::test_live_commit(
         10,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -790,7 +790,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let seed_watch_20 = crate::log_apply::test_live_commit(
+    let seed_watch_20 = crate::replication::log_apply_wire::test_live_commit(
         20,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -804,7 +804,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let mixed_commit = crate::log_apply::test_live_commit(
+    let mixed_commit = crate::replication::log_apply_wire::test_live_commit(
         60,
         vec![
             LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
@@ -913,7 +913,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         ],
     );
 
-    let gc_commit = crate::log_apply::test_live_commit(
+    let gc_commit = crate::replication::log_apply_wire::test_live_commit(
         61,
         vec![LogApplyMutation::GcWatchEvents {
             max_rows: 2,

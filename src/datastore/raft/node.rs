@@ -15,9 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use klights_cluster_core::{
-    OutboxApplyError, OutboxApplyOutcome, OutboxOperation, OutboxPayload, StorageCommand,
-};
+use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, OutboxOperation, StorageCommand};
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{ChangeMembers, Config, Raft};
@@ -187,7 +185,7 @@ async fn verify_command_codec_v3_members(
                 node_id,
                 message: err.to_string(),
             })?;
-        if metadata.command_codec_version != crate::log_apply::COMMAND_CODEC_VERSION {
+        if metadata.command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
             return Err(CommandCodecV3PreflightError::Unsupported { node_id });
         }
     }
@@ -324,7 +322,7 @@ impl RaftNode {
         // primary safeguard; this static bound is belt-and-suspenders.
         const _: () = assert!(
             RAFT_ELECTION_TIMEOUT_MAX_MS
-                < (crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS as u64) * 1000
+                < (klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS as u64) * 1000
         );
         let config = Arc::new(
             Config {
@@ -592,16 +590,16 @@ impl RaftNode {
         if codec_activated {
             return Ok(());
         }
-        let commit = crate::log_apply::LogApplyCommit::try_from_cluster_mutations(vec![
-            crate::log_apply::ClusterMutation::ClusterMeta(
-                crate::log_apply::ClusterMetaMutation::PutKlightsMeta {
+        let commit = klights_cluster_core::LogApplyCommit::try_from_cluster_mutations(vec![
+            klights_cluster_core::ClusterMutation::ClusterMeta(
+                klights_cluster_core::ClusterMetaMutation::PutKlightsMeta {
                     key: KEY_COMMAND_CODEC_ACTIVATION_VERSION.to_string(),
                     value: COMMAND_CODEC_ACTIVATION_VALUE.to_string(),
                 },
             ),
         ])
         .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
-        let bytes = crate::log_apply::encode_commit_protobuf(&commit)
+        let bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
             .map_err(|err| CommandCodecV3ActivationError::Apply(err.to_string()))?;
         let result = self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
@@ -711,14 +709,15 @@ impl RaftNode {
         node_id: NodeId,
         admission: &RaftMemberAdmission,
     ) -> Result<()> {
-        let mutation = crate::log_apply::ClusterMutation::ClusterMeta(
-            crate::log_apply::ClusterMetaMutation::PutKlightsMeta {
+        let mutation = klights_cluster_core::ClusterMutation::ClusterMeta(
+            klights_cluster_core::ClusterMetaMutation::PutKlightsMeta {
                 key: Self::member_admission_meta_key(node_id),
                 value: serde_json::to_string(admission)?,
             },
         );
-        let commit = crate::log_apply::LogApplyCommit::try_from_cluster_mutations(vec![mutation])?;
-        let bytes = crate::log_apply::encode_commit_protobuf(&commit)?;
+        let commit =
+            klights_cluster_core::LogApplyCommit::try_from_cluster_mutations(vec![mutation])?;
+        let bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)?;
         let result = self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
             .await?;
@@ -1200,7 +1199,7 @@ fn local_commit_materialization_allowed(
 impl super::super::sequenced::RaftProposal for RaftNode {
     async fn propose_command(
         &self,
-        command: super::super::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
     ) -> Result<super::types::StorageCommandResult> {
         self.command_codec_v3_activation
             .ensure_command_codec_v3_activated()?;
@@ -1215,8 +1214,8 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             .backend
             .build_log_apply_commit_for_command(command, operation.as_str(), &self.authoring_node)
             .await
-            .context("build log_apply commit for raft propose")?;
-        let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit)
+            .map_err(map_commit_materialization_error)?;
+        let entry_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
             .context("encode LogApplyCommit for raft propose")?;
         let apply_result = match self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(entry_bytes))
@@ -1253,9 +1252,9 @@ impl super::super::sequenced::RaftProposal for RaftNode {
         &self,
         idempotency_key: &str,
         operation: &str,
-        command: super::super::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<OutboxApplyOutcome, OutboxApplyError> {
         self.propose_outbox_command_effect(
             idempotency_key,
@@ -1272,9 +1271,9 @@ impl super::super::sequenced::RaftProposal for RaftNode {
         &self,
         idempotency_key: &str,
         operation: &str,
-        command: super::super::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<super::super::CommittedOutboxApply, OutboxApplyError> {
         use klights_cluster_core::BuildOutboxOutcome;
         if let Err(err) = self
@@ -1307,19 +1306,12 @@ impl super::super::sequenced::RaftProposal for RaftNode {
                 )
             })?
         };
-        let payload_bytes =
-            crate::storage_wire_codec::encode_outbox_payload_protobuf(&OutboxPayload::new(command))
-                .map_err(|err| {
-                    OutboxApplyError::Retryable(format!(
-                        "encode StorageCommand for raft outbox propose: {err}"
-                    ))
-                })?;
         let outcome = self
             .backend
             .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
                 operation,
-                payload_bytes.as_ref(),
+                command,
                 authoring_node,
                 watermark,
             )
@@ -1364,11 +1356,12 @@ impl super::super::sequenced::RaftProposal for RaftNode {
                 .with_committed_resource(committed_resource));
             }
         };
-        let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit).map_err(|err| {
-            OutboxApplyError::Retryable(format!(
-                "encode LogApplyCommit for raft outbox propose: {err}"
-            ))
-        })?;
+        let entry_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+            .map_err(|err| {
+                OutboxApplyError::Retryable(format!(
+                    "encode LogApplyCommit for raft outbox propose: {err}"
+                ))
+            })?;
         let apply_result = match self
             .propose_materialized_commit(StorageCommandPayload::from_bytes(entry_bytes))
             .await
@@ -1404,6 +1397,27 @@ impl super::super::sequenced::RaftProposal for RaftNode {
             pod_endpoint_effect,
         )
         .with_committed_resource(committed_resource))
+    }
+}
+
+/// Preserve Kubernetes storage semantics when a backend rejects proposal
+/// materialization. SQLite work crosses an FFI boundary and therefore carries
+/// semantic failures inside a database error string; adding anyhow context
+/// directly would hide the nested 409/404 from `AppError::from`, which
+/// intentionally uses the top-level display string.
+fn map_commit_materialization_error(error: anyhow::Error) -> anyhow::Error {
+    let contextual = error.context("build log_apply commit for raft propose");
+    let diagnostic = format!("{contextual:#}");
+    let lower = diagnostic.to_ascii_lowercase();
+
+    if lower.contains("already exists") && super::super::errors::is_conflict_error(&contextual) {
+        super::super::errors::DatastoreError::already_exists(diagnostic).into()
+    } else if super::super::errors::is_conflict_error(&contextual) {
+        super::super::errors::DatastoreError::conflict(diagnostic).into()
+    } else if lower.contains("not found") {
+        super::super::errors::DatastoreError::not_found(diagnostic).into()
+    } else {
+        contextual
     }
 }
 
@@ -1794,7 +1808,7 @@ impl RaftNodeJoinHandler {
 #[cfg(test)]
 #[cfg(any())]
 fn validate_command_codec_v3_join(command_codec_version: u32) -> std::result::Result<(), String> {
-    if command_codec_version != crate::log_apply::COMMAND_CODEC_VERSION {
+    if command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
         return Err(
             "joining voters and learners must advertise exact command codec version 3".to_string(),
         );
@@ -1949,7 +1963,8 @@ mod tests {
         RaftNodeJoinHandler, validate_command_codec_v3_join,
     };
     use crate::datastore::node_local::SqliteNodeLocalDb;
-    use crate::datastore::sqlite::{DbExecutor, opener};
+    use crate::sqlite_boundary::DbExecutor;
+    use crate::sqlite_open as opener;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn storage_attestation(
@@ -2074,8 +2089,8 @@ mod tests {
         ];
         let all_capable = FeatureProbe {
             replies: [
-                (1, Ok(crate::log_apply::COMMAND_CODEC_VERSION)),
-                (2, Ok(crate::log_apply::COMMAND_CODEC_VERSION)),
+                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
+                (2, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
             ]
             .into_iter()
             .collect(),
@@ -2085,9 +2100,12 @@ mod tests {
             .expect("all current members support exact codec v3");
 
         let missing = FeatureProbe {
-            replies: [(1, Ok(crate::log_apply::COMMAND_CODEC_VERSION)), (2, Ok(2))]
-                .into_iter()
-                .collect(),
+            replies: [
+                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
+                (2, Ok(2)),
+            ]
+            .into_iter()
+            .collect(),
         };
         assert!(matches!(
             verify_command_codec_v3_members(members.clone(), &missing).await,
@@ -2096,7 +2114,7 @@ mod tests {
 
         let unavailable = FeatureProbe {
             replies: [
-                (1, Ok(crate::log_apply::COMMAND_CODEC_VERSION)),
+                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
                 (2, Err(anyhow::anyhow!("transport unavailable"))),
             ]
             .into_iter()
@@ -2116,8 +2134,8 @@ mod tests {
         ];
         let compatible = FeatureProbe {
             replies: [
-                (1, Ok(crate::log_apply::COMMAND_CODEC_VERSION)),
-                (2, Ok(crate::log_apply::COMMAND_CODEC_VERSION)),
+                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
+                (2, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
             ]
             .into_iter()
             .collect(),
@@ -2127,9 +2145,12 @@ mod tests {
             .expect("all restored members advertise codec v3");
 
         let old_learner = FeatureProbe {
-            replies: [(1, Ok(crate::log_apply::COMMAND_CODEC_VERSION)), (2, Ok(2))]
-                .into_iter()
-                .collect(),
+            replies: [
+                (1, Ok(klights_cluster_core::COMMAND_CODEC_VERSION)),
+                (2, Ok(2)),
+            ]
+            .into_iter()
+            .collect(),
         };
         assert!(matches!(
             verify_command_codec_v3_members(members, &old_learner).await,
@@ -2147,7 +2168,7 @@ mod tests {
             .await
             .unwrap();
         let probe = FeatureProbe {
-            replies: [(701, Ok(crate::log_apply::COMMAND_CODEC_VERSION))]
+            replies: [(701, Ok(klights_cluster_core::COMMAND_CODEC_VERSION))]
                 .into_iter()
                 .collect(),
         };
@@ -2181,7 +2202,7 @@ mod tests {
     async fn codec_v3_activation_rejects_nonleader_and_failed_preflight_without_write() {
         let (not_leader, _backend) = fresh_node(702).await;
         let probe = FeatureProbe {
-            replies: [(702, Ok(crate::log_apply::COMMAND_CODEC_VERSION))]
+            replies: [(702, Ok(klights_cluster_core::COMMAND_CODEC_VERSION))]
                 .into_iter()
                 .collect(),
         };
@@ -2283,7 +2304,7 @@ mod tests {
 
     #[test]
     fn direct_node_resource_update_is_not_classified_as_node_status() {
-        let command = crate::datastore::command::StorageCommand::UpdateResource {
+        let command = klights_cluster_core::command::StorageCommand::UpdateResource {
             api_version: "v1".to_string(),
             kind: "Node".to_string(),
             namespace: None,
@@ -2725,21 +2746,23 @@ mod tests {
         );
 
         let err = nodes[follower_idx]
-            .propose_command(crate::datastore::command::StorageCommand::CreateResource {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                name: "follower-local-claim-regression".into(),
-                data: serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": {
-                        "name": "follower-local-claim-regression",
-                        "namespace": "default"
-                    },
-                    "data": {"k": "v"}
-                }),
-            })
+            .propose_command(
+                klights_cluster_core::command::StorageCommand::CreateResource {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "follower-local-claim-regression".into(),
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "follower-local-claim-regression",
+                            "namespace": "default"
+                        },
+                        "data": {"k": "v"}
+                    }),
+                },
+            )
             .await
             .expect_err("follower proposer must refuse before building a local commit");
         let msg = err.to_string();
@@ -2803,21 +2826,23 @@ mod tests {
         node.raft.shutdown().await.expect("shutdown raft core");
 
         let err = node
-            .propose_command(crate::datastore::command::StorageCommand::CreateResource {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                name: "rejected-materialized-commit".into(),
-                data: serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": {
-                        "name": "rejected-materialized-commit",
-                        "namespace": "default"
-                    },
-                    "data": {"k": "v"}
-                }),
-            })
+            .propose_command(
+                klights_cluster_core::command::StorageCommand::CreateResource {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "rejected-materialized-commit".into(),
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "rejected-materialized-commit",
+                            "namespace": "default"
+                        },
+                        "data": {"k": "v"}
+                    }),
+                },
+            )
             .await
             .expect_err("stopped raft core should reject client_write after materialization");
         assert!(
@@ -2975,7 +3000,7 @@ mod tests {
             .expect("become leader");
 
         let subnet_command = |node_name: &'static str, node_ip: &'static str| {
-            crate::datastore::command::StorageCommand::AllocateNodeSubnet {
+            klights_cluster_core::command::StorageCommand::AllocateNodeSubnet {
                 node_name: node_name.into(),
                 subnet: "10.50.0.0/16".into(),
                 node_ip: node_ip.into(),
@@ -2989,15 +3014,17 @@ mod tests {
         a.expect("first subnet proposal");
         b.expect("second subnet proposal");
 
-        node.propose_command(crate::datastore::command::StorageCommand::CreateResource {
-            api_version: "v1".into(),
-            kind: "ConfigMap".into(),
-            namespace: Some("default".into()),
-            name: "after-subnet".into(),
-            data: serde_json::json!({
-                "metadata": {"name": "after-subnet", "namespace": "default"}
-            }),
-        })
+        node.propose_command(
+            klights_cluster_core::command::StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                name: "after-subnet".into(),
+                data: serde_json::json!({
+                    "metadata": {"name": "after-subnet", "namespace": "default"}
+                }),
+            },
+        )
         .await
         .expect("raft still accepts writes after concurrent subnet proposals");
 
@@ -3036,7 +3063,7 @@ mod tests {
             .await
             .expect("become leader");
 
-        let subnet_command = crate::datastore::command::StorageCommand::AllocateNodeSubnet {
+        let subnet_command = klights_cluster_core::command::StorageCommand::AllocateNodeSubnet {
             node_name: "mn-worker-placeholder-check".into(),
             subnet: "10.60.0.0/16".into(),
             node_ip: "10.99.0.99".into(),
@@ -3045,7 +3072,7 @@ mod tests {
             .await
             .expect("propose subnet command");
 
-        node.propose_command(crate::datastore::command::StorageCommand::CreateResource {
+        node.propose_command(klights_cluster_core::command::StorageCommand::CreateResource {
             api_version: "v1".into(),
             kind: "ConfigMap".into(),
             namespace: Some("default".into()),
@@ -3092,7 +3119,7 @@ mod tests {
             .expect("become leader");
 
         let runtime_class_create =
-            |uid: &'static str| crate::datastore::command::StorageCommand::CreateResource {
+            |uid: &'static str| klights_cluster_core::command::StorageCommand::CreateResource {
                 api_version: "node.k8s.io/v1".into(),
                 kind: "RuntimeClass".into(),
                 namespace: None,
@@ -3290,7 +3317,7 @@ mod tests {
                 high_watermark: None,
                 current_boundary: None,
             },
-            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+            command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
             node_internal_ip: node_internal_ip.map(str::to_string),
             node_registration: Some(
                 crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
@@ -3421,7 +3448,7 @@ mod tests {
                                 },
                             ),
                         },
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     node_internal_ip: None,
                     node_registration: None,
                     legacy_node_git_commit: Some("legacyrejoin".to_string()),
@@ -4475,8 +4502,8 @@ mod tests {
     // ── Task 2: Bound In-Flight Raft Proposals With Flow Control ────────────────────────────
 
     /// Helper: build a small CreateResource StorageCommand for propose_command tests.
-    fn propose_create_command(uid: &str) -> crate::datastore::command::StorageCommand {
-        crate::datastore::command::StorageCommand::CreateResource {
+    fn propose_create_command(uid: &str) -> klights_cluster_core::command::StorageCommand {
+        klights_cluster_core::command::StorageCommand::CreateResource {
             api_version: "node.k8s.io/v1".into(),
             kind: "RuntimeClass".into(),
             namespace: None,
@@ -4493,8 +4520,8 @@ mod tests {
     fn propose_node_registration_command(
         node_name: &str,
         uid: &str,
-    ) -> crate::datastore::command::StorageCommand {
-        crate::datastore::command::StorageCommand::CreateResource {
+    ) -> klights_cluster_core::command::StorageCommand {
+        klights_cluster_core::command::StorageCommand::CreateResource {
             api_version: "v1".into(),
             kind: "Node".into(),
             namespace: None,
@@ -4828,6 +4855,117 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
+    /// CSI lifecycle updates use client-go's `RetryOnConflict`: a GET may race
+    /// the PV binder, and the stale PUT must therefore surface Kubernetes 409
+    /// rather than hiding the materialization CAS failure behind HTTP 500.
+    #[tokio::test]
+    async fn stale_csi_pv_update_materialization_surfaces_conflict() {
+        use crate::datastore::sequenced::RaftProposal;
+
+        let (node, backend) = fresh_node(75).await;
+        node.bootstrap_single_voter("https://10.99.0.75:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+
+        let pv_name = "pv-csi-lifecycle";
+        node.propose_command(
+            klights_cluster_core::command::StorageCommand::CreateResource {
+                api_version: "v1".into(),
+                kind: "PersistentVolume".into(),
+                namespace: None,
+                name: pv_name.into(),
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolume",
+                    "metadata": {
+                        "name": pv_name,
+                        "uid": "pv-csi-lifecycle-uid",
+                        "labels": {"e2e-pv-pool": "pv-csi-lifecycle"}
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "capacity": {"storage": "1Gi"},
+                        "csi": {
+                            "driver": "inline-driver-csi-lifecycle",
+                            "volumeHandle": "e2e-conformance"
+                        },
+                        "persistentVolumeReclaimPolicy": "Retain",
+                        "storageClassName": "pv-csi-lifecycle",
+                        "volumeMode": "Filesystem"
+                    }
+                }),
+            },
+        )
+        .await
+        .expect("create CSI PV");
+
+        // This is the object returned by the conformance test's GET.
+        let stale_client_read = backend
+            .get_resource("v1", "PersistentVolume", None, pv_name)
+            .await
+            .unwrap()
+            .expect("PV exists");
+
+        // The binder wins the race and advances resourceVersion.
+        let mut binder_update = (*stale_client_read.data).clone();
+        binder_update["spec"]["claimRef"] = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "name": "pvc-csi-lifecycle",
+            "namespace": "pv-csi-lifecycle",
+            "uid": "pvc-csi-lifecycle-uid"
+        });
+        node.propose_command(
+            klights_cluster_core::command::StorageCommand::UpdateResource {
+                api_version: "v1".into(),
+                kind: "PersistentVolume".into(),
+                namespace: None,
+                name: pv_name.into(),
+                data: binder_update,
+                expected_rv: stale_client_read.resource_version,
+                preconditions: crate::datastore::ResourcePreconditions::from_resource(
+                    &stale_client_read,
+                ),
+            },
+        )
+        .await
+        .expect("binder update wins");
+
+        // The CSI conformance client adds one label to its stale GET result.
+        let mut client_update = (*stale_client_read.data).clone();
+        client_update["metadata"]["labels"][pv_name] = serde_json::json!("updated");
+        let error = node
+            .propose_command(
+                klights_cluster_core::command::StorageCommand::UpdateResource {
+                    api_version: "v1".into(),
+                    kind: "PersistentVolume".into(),
+                    namespace: None,
+                    name: pv_name.into(),
+                    data: client_update,
+                    expected_rv: stale_client_read.resource_version,
+                    preconditions: crate::datastore::ResourcePreconditions::from_resource(
+                        &stale_client_read,
+                    ),
+                },
+            )
+            .await
+            .expect_err("stale CSI update must be retryable as a conflict");
+
+        assert!(
+            format!("{error:#}").contains("build log_apply commit for raft propose"),
+            "preserve the proposal materialization context: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("409 Conflict"),
+            "top-level API conversion must see a retryable conflict, got: {error:#}"
+        );
+
+        node.shutdown().await.unwrap();
+    }
+
     /// Integration test: even when propose_command would fail at the consensus
     /// `client_write` stage (no leader / leadership lost), the RAII permit guard
     /// must still release. We exercise this by manually exhausting permits inside
@@ -4935,7 +5073,7 @@ mod tests {
             .propose_outbox_command_effect(
                 "raft-actor-delete-receipt",
                 OutboxOperation::PodMetadata.as_str(),
-                crate::datastore::command::StorageCommand::FinalizeBoundPod {
+                klights_cluster_core::command::StorageCommand::FinalizeBoundPod {
                     namespace: "default".to_string(),
                     name: "receipt".to_string(),
                     pod_uid: "receipt-uid".to_string(),

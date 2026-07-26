@@ -7,7 +7,6 @@
 pub mod backend;
 pub mod backend_kind;
 pub(crate) mod cluster_store_adapter;
-pub mod command;
 pub mod diagnostics;
 pub mod domain;
 pub mod errors;
@@ -22,11 +21,13 @@ pub(crate) mod sequenced;
 pub mod snapshot;
 pub(crate) mod snapshot_export;
 pub mod sqlite;
-pub mod stale_apply_policy;
-pub mod status_merge_policy;
 pub mod types;
 
 pub use backend::*;
+pub use klights_cluster_core::{
+    PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
+    ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
+};
 pub(crate) use klights_watch::{WatchSignalReceiver, WatchTopic};
 pub use types::*;
 

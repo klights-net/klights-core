@@ -8,6 +8,91 @@ use serde_json::Value;
 
 use klights_types::ResourceKey;
 
+/// Borrowed Kubernetes Pod facts that affect Service endpoint output.
+#[derive(Clone, Copy, Debug)]
+pub struct PodEndpointState<'a, T: ?Sized> {
+    ready: bool,
+    terminal: bool,
+    labels: Option<&'a T>,
+    pod_ip: Option<&'a T>,
+    pod_ips: Option<&'a T>,
+    deletion_timestamp: Option<&'a T>,
+}
+
+impl<'a, T: ?Sized> PodEndpointState<'a, T> {
+    pub const fn new(
+        ready: bool,
+        terminal: bool,
+        labels: Option<&'a T>,
+        pod_ip: Option<&'a T>,
+        pod_ips: Option<&'a T>,
+        deletion_timestamp: Option<&'a T>,
+    ) -> Self {
+        Self {
+            ready,
+            terminal,
+            labels,
+            pod_ip,
+            pod_ips,
+            deletion_timestamp,
+        }
+    }
+
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+impl<T: PartialEq + ?Sized> PodEndpointState<'_, T> {
+    pub fn differs_from(&self, updated: &PodEndpointState<'_, T>) -> bool {
+        self.ready != updated.ready
+            || self.terminal != updated.terminal
+            || self.labels != updated.labels
+            || self.pod_ip != updated.pod_ip
+            || self.pod_ips != updated.pod_ips
+            || self.deletion_timestamp != updated.deletion_timestamp
+    }
+}
+
+pub fn pod_endpoint_state(pod: &Value) -> PodEndpointState<'_, Value> {
+    let status = pod.get("status");
+    let metadata = pod.get("metadata");
+    let ready = status
+        .and_then(|status| status.get("conditions"))
+        .and_then(Value::as_array)
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition.get("type").and_then(Value::as_str) == Some("Ready"))
+        })
+        .and_then(|condition| condition.get("status"))
+        .and_then(Value::as_str)
+        == Some("True");
+    let terminal = matches!(
+        status
+            .and_then(|status| status.get("phase"))
+            .and_then(Value::as_str),
+        Some("Failed" | "Succeeded")
+    );
+
+    PodEndpointState::new(
+        ready,
+        terminal,
+        metadata.and_then(|metadata| metadata.get("labels")),
+        status.and_then(|status| status.get("podIP")),
+        status.and_then(|status| status.get("podIPs")),
+        metadata.and_then(|metadata| metadata.get("deletionTimestamp")),
+    )
+}
+
+pub fn pod_endpoint_state_changed(previous: &Value, updated: &Value) -> bool {
+    pod_endpoint_state(previous).differs_from(&pod_endpoint_state(updated))
+}
+
 /// Missing identity fields rejected at resource normalization boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceIdentityError {
@@ -290,6 +375,33 @@ mod tests {
             resource_version: 1,
             data: Arc::new(json!({"spec": {"x": 1}, "status": {"y": 2}})),
         }
+    }
+
+    #[test]
+    fn pod_endpoint_state_compares_only_endpoint_relevant_facts() {
+        let base = json!({
+            "metadata": {"labels": {"app": "web"}},
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.2",
+                "podIPs": [{"ip": "10.42.0.2"}],
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let ready = pod_endpoint_state(&base);
+        assert!(ready.is_ready());
+        assert!(!ready.is_terminal());
+        assert!(!ready.differs_from(&pod_endpoint_state(&base)));
+        assert!(pod_endpoint_state_changed(
+            &base,
+            &json!({"metadata": {"labels": {"app": "api"}}, "status": base["status"]})
+        ));
+        assert!(pod_endpoint_state(&json!({"status": {"phase": "Failed"}})).is_terminal());
+        assert!(
+            !pod_endpoint_state(&json!({"status": {"phase": "Failed"}})).differs_from(
+                &pod_endpoint_state(&json!({"status": {"phase": "Succeeded"}}))
+            )
+        );
     }
 
     #[test]

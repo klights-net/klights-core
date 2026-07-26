@@ -160,11 +160,11 @@ pub(super) fn current_epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId};
-    use crate::datastore::types::ResourcePreconditions;
     use crate::replication::protocol::{
         ForwardedNodeSubnet, ForwardedPodSlotAdmission, ForwardedResource,
     };
+    use klights_cluster_core::ResourcePreconditions;
+    use klights_cluster_core::command::{COMMAND_CODEC_VERSION, CommandId};
     use klights_cluster_core::subject_key_for_command;
     use serde_json::json;
 
@@ -316,7 +316,7 @@ mod tests {
             kind: "ConfigMap".into(),
             namespace: Some("default".into()),
             name: "foo".into(),
-            patch_kind: crate::datastore::types::PatchKind::Merge,
+            patch_kind: klights_cluster_core::PatchKind::Merge,
             patch: json!({}),
             preconditions: ResourcePreconditions {
                 uid: Some("u-6".into()),

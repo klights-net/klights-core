@@ -864,14 +864,9 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let db = Datastore::new_persistent_paths(
-            &root.path().join("cluster.db"),
-            &root.path().join("node.db"),
-            supervisor,
-            None,
-        )
-        .await
-        .unwrap();
+        let db = Datastore::new_persistent_paths(&root.path().join("cluster.db"), supervisor, None)
+            .await
+            .unwrap();
         db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "pinned-cluster")
             .await
             .unwrap();
@@ -1018,7 +1013,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = DbExecutor::open_with_opts(
-            crate::datastore::sqlite::opener::OpenOpts::in_memory(),
+            crate::sqlite_open::OpenOpts::in_memory(),
             supervisor,
             "snapshot-rollback-failure",
         )

@@ -37,7 +37,7 @@ pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
         },
         "spec": {
             "holderIdentity": node_name,
-            "leaseDurationSeconds": crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS,
+            "leaseDurationSeconds": klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS,
             "renewTime": k8s_microtime_now()
         }
     })
@@ -175,7 +175,7 @@ async fn renew_lease_with_client(
     let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
         node_name,
         k8s_microtime_now(),
-        crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS,
+        klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS,
     )?;
     client
         .renew_node_lease(request)

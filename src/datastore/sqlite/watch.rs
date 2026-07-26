@@ -10,8 +10,9 @@ use klights_watch::{WatchSignal, WatchTopic};
 
 use super::{
     CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
-    RawWatchEvent, Resource,
+    RawWatchEvent,
 };
+use klights_cluster_core::Resource;
 
 /// Free function to publish a pending watch event after DB commit.
 ///

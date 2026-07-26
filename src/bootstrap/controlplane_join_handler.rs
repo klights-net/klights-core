@@ -183,7 +183,7 @@ impl RaftNodeJoinHandler {
 pub(crate) fn validate_command_codec_v3_join(
     command_codec_version: u32,
 ) -> std::result::Result<(), String> {
-    if command_codec_version != crate::log_apply::COMMAND_CODEC_VERSION {
+    if command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
         return Err(
             "joining voters and learners must advertise exact command codec version 3".to_string(),
         );

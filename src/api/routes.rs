@@ -724,6 +724,7 @@ async fn klights_status_handler(
 mod status_tests {
     use axum::body::Body;
     use axum::http::Request;
+    use axum::{Router, middleware, routing::get};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -896,6 +897,76 @@ mod status_tests {
             .unwrap();
         // K8s protobuf wire format: "k8s\0" magic prefix.
         assert_eq!(&body[..4], &[0x6b, 0x38, 0x73, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn raft_materialization_conflict_maps_to_json_and_protobuf_status() {
+        use prost::Message as _;
+
+        let app = Router::new()
+            .route(
+                "/conflict",
+                get(|| async {
+                    let diagnostic = "build log_apply commit for raft propose: \
+                        build log_apply commit failed: Rusqlite(\"resourceVersion \
+                        precondition failed: expected 1 got 2 (409 Conflict)\")";
+                    let error: anyhow::Error =
+                        crate::datastore::errors::DatastoreError::conflict(diagnostic).into();
+                    Err::<(), crate::api::AppError>(crate::api::AppError::from(error))
+                }),
+            )
+            .layer(middleware::from_fn(super::negotiate_error_protobuf));
+
+        for (accept, expect_protobuf) in [
+            ("application/json", false),
+            ("application/vnd.kubernetes.protobuf", true),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/conflict")
+                        .header("accept", accept)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+
+            if expect_protobuf {
+                assert_eq!(content_type, "application/vnd.kubernetes.protobuf");
+                assert_eq!(&body[..4], b"k8s\0");
+                let envelope = klights_kube_protobuf::Unknown::decode(&body[4..]).unwrap();
+                let status =
+                    klights_kube_protobuf::apimachinery::pkg::apis::meta::v1::Status::decode(
+                        &*envelope.raw,
+                    )
+                    .unwrap();
+                assert_eq!(status.code, Some(409));
+                assert_eq!(status.reason.as_deref(), Some("Conflict"));
+                assert!(status.message.as_deref().is_some_and(|message| {
+                    message.contains("build log_apply commit for raft propose")
+                }));
+            } else {
+                assert!(content_type.starts_with("application/json"));
+                let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(status["code"], 409);
+                assert_eq!(status["reason"], "Conflict");
+                assert!(status["message"].as_str().is_some_and(|message| {
+                    message.contains("build log_apply commit for raft propose")
+                }));
+            }
+        }
     }
 
     #[tokio::test]

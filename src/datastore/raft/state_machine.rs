@@ -55,7 +55,7 @@ impl N1Raft {
         operation: OutboxOperation,
         payload: Bytes,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
         let applied = propose_outbox_on_backend_with_watermark(
             self.backend.as_ref(),
@@ -97,12 +97,12 @@ pub async fn propose_outbox_on_backend_with_watermark(
     operation: OutboxOperation,
     payload: Bytes,
     authoring_node: &str,
-    watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
 ) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
     let decoded = decode_outbox_payload_protobuf(&payload)
         .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
     if operation == OutboxOperation::LeaseRenew {
-        crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
+        klights_cluster_core::validate_lease_renew_command(&decoded.command, authoring_node)
             .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
         return Ok(RaftOutboxApply {
             result: OutboxApplyOutcome::Applied { applied_rv: 0 },
@@ -137,7 +137,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
         .apply_outbox_transactionally_with_watermark_effect(
             idempotency_key,
             operation.as_str(),
-            payload.as_ref(),
+            decoded.command.clone(),
             authoring_node,
             watermark,
         )
@@ -840,7 +840,7 @@ mod tests {
         .await
         .unwrap();
         let rv_before = db.get_current_resource_version().await.unwrap();
-        let watermark = crate::log_apply::OutboxStreamWatermark {
+        let watermark = klights_cluster_core::OutboxStreamWatermark {
             client_id: "worker-client".to_string(),
             stream_id: 11,
             stream_seq: 1,
@@ -898,7 +898,7 @@ mod tests {
                 }),
             }),
             "worker-a",
-            Some(crate::log_apply::OutboxStreamWatermark {
+            Some(klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
                 stream_id: 11,
                 stream_seq: 2,
@@ -953,7 +953,7 @@ mod tests {
                     observed_status_stamp: Some(stamp),
                 }),
                 "worker-a",
-                Some(crate::log_apply::OutboxStreamWatermark {
+                Some(klights_cluster_core::OutboxStreamWatermark {
                     client_id: "worker-client".to_string(),
                     stream_id: 119,
                     stream_seq,
@@ -1050,7 +1050,7 @@ mod tests {
         }
         assert_eq!(
             db.list_outbox_stream_watermarks().await.unwrap(),
-            vec![crate::log_apply::OutboxStreamWatermark {
+            vec![klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
                 stream_id: 119,
                 stream_seq: 3,
@@ -1127,7 +1127,7 @@ mod tests {
         .await
         .expect("relabel Pod before stale duplicate adoption reaches leader");
 
-        let first_watermark = crate::log_apply::OutboxStreamWatermark {
+        let first_watermark = klights_cluster_core::OutboxStreamWatermark {
             client_id: "worker-client".to_string(),
             stream_id: 84,
             stream_seq: 1,
@@ -1183,7 +1183,7 @@ mod tests {
                 }),
             }),
             "worker-a",
-            Some(crate::log_apply::OutboxStreamWatermark {
+            Some(klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
                 stream_id: 84,
                 stream_seq: 2,
@@ -1280,7 +1280,7 @@ mod tests {
                 },
             }),
             "worker-a",
-            Some(crate::log_apply::OutboxStreamWatermark {
+            Some(klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
                 stream_id: 85,
                 stream_seq: 1,
@@ -1348,7 +1348,7 @@ mod tests {
         .await
         .expect("seed duplicate Event");
 
-        let first_watermark = crate::log_apply::OutboxStreamWatermark {
+        let first_watermark = klights_cluster_core::OutboxStreamWatermark {
             client_id: "worker-client".to_string(),
             stream_id: 54,
             stream_seq: 1,
@@ -1414,7 +1414,7 @@ mod tests {
                 }),
             }),
             "worker-a",
-            Some(crate::log_apply::OutboxStreamWatermark {
+            Some(klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
                 stream_id: 54,
                 stream_seq: 2,
@@ -1453,7 +1453,7 @@ mod tests {
         .await
         .expect("seed duplicate Node");
 
-        let first_watermark = crate::log_apply::OutboxStreamWatermark {
+        let first_watermark = klights_cluster_core::OutboxStreamWatermark {
             client_id: "worker-client".to_string(),
             stream_id: 62,
             stream_seq: 1,
@@ -1500,7 +1500,7 @@ mod tests {
                 }),
             }),
             "mn-replica",
-            Some(crate::log_apply::OutboxStreamWatermark {
+            Some(klights_cluster_core::OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
                 stream_id: 62,
                 stream_seq: 2,

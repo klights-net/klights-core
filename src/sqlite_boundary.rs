@@ -7,12 +7,13 @@ use klights_supervisor::{TaskCategory, TaskSupervisor};
 use thiserror::Error;
 use tokio_rusqlite::Connection;
 
-use super::opener::{
-    self, OpenOpts, OpenPath, apply_pragmas, apply_read_pragmas,
+use crate::datastore::errors::OpenError;
+use crate::sqlite_open as opener;
+use crate::sqlite_open::{
+    OpenOpts, OpenPath, apply_pragmas, apply_read_pragmas,
     check_db_health_for as check_db_health_for_executor, ensure_root_only,
     init_schema_for as init_schema_for_executor,
 };
-use crate::datastore::errors::OpenError;
 
 /// Allow `OpenError` to convert to `tokio_rusqlite::Error` for use in
 /// the supervised DB call path.  This is the SQLite-specific error bridge;
@@ -161,7 +162,7 @@ impl DbExecutor {
             }
             OpenPath::Disk(path) => {
                 // Detect orphaned WAL before SQLite silently creates a new DB.
-                opener::check_orphaned_wal(path)?;
+                opener::check_orphaned_wal(&task_supervisor, path).await?;
                 ensure_root_only(&task_supervisor, path, opts.allow_existing_perms).await?;
                 Connection::open(path).await?
             }
@@ -225,7 +226,7 @@ impl DbExecutor {
     ) -> anyhow::Result<Self> {
         let (db_path, flags) = match &opts.path {
             OpenPath::Disk(path) => {
-                opener::check_orphaned_wal(path)?;
+                opener::check_orphaned_wal(&task_supervisor, path).await?;
                 ensure_root_only(&task_supervisor, path, opts.allow_existing_perms).await?;
                 (
                     path.clone(),

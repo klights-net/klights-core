@@ -1020,14 +1020,9 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let db = Datastore::new_persistent_paths(
-            &root.path().join("cluster.db"),
-            &root.path().join("node.db"),
-            supervisor,
-            None,
-        )
-        .await
-        .unwrap();
+        let db = Datastore::new_persistent_paths(&root.path().join("cluster.db"), supervisor, None)
+            .await
+            .unwrap();
         (root, db)
     }
 
@@ -1285,8 +1280,8 @@ mod tests {
                     operation: "PodStatus".to_string(),
                     first_seen_ms: status_stamp,
                     applied_rv: None,
-                    result_proto: crate::storage_wire_codec::encode_response_protobuf(
-                        &crate::datastore::command::StorageResponse::Ack {
+                    result_proto: klights_cluster_datastore::encode_outbox_response(
+                        &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
                     )
@@ -2097,7 +2092,27 @@ mod tests {
         )
         .await
         .expect("seed divergent cluster row");
-        db.record_sandbox("default", "local-pod", "local-pod-uid", "local-sandbox")
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:authoritative-restore-node-local-test",
+        )
+        .await
+        .expect("open node-local store");
+        node_local
+            .record_owned_sandbox(
+                "local-pod-uid",
+                "default",
+                "local-pod",
+                "node-a",
+                "local-sandbox",
+                0,
+            )
             .await
             .expect("seed node-local sandbox state");
 
@@ -2213,7 +2228,11 @@ mod tests {
             7
         );
         assert_eq!(
-            db.get_sandbox("default", "local-pod").await.unwrap(),
+            node_local
+                .get_pod_runtime("local-pod-uid")
+                .await
+                .unwrap()
+                .and_then(|row| row.sandbox_id),
             Some("local-sandbox".to_string()),
             "cluster restore must preserve node-local runtime state"
         );
@@ -2652,8 +2671,8 @@ mod tests {
     #[tokio::test]
     async fn capture_keyset_pages_every_unbounded_family_without_gaps_or_duplicates() {
         let db = Datastore::new_in_memory().await.unwrap();
-        let result_proto = crate::storage_wire_codec::encode_response_protobuf(
-            &crate::datastore::command::StorageResponse::Ack {
+        let result_proto = klights_cluster_datastore::encode_outbox_response(
+            &klights_cluster_core::command::StorageResponse::Ack {
                 resource_version: 1,
             },
         )
@@ -2795,8 +2814,8 @@ mod tests {
     #[tokio::test]
     async fn capture_restores_every_durable_family_and_preserves_outbox_dedupe() {
         let source = Datastore::new_in_memory().await.unwrap();
-        let result_proto = crate::storage_wire_codec::encode_response_protobuf(
-            &crate::datastore::command::StorageResponse::Ack {
+        let result_proto = klights_cluster_datastore::encode_outbox_response(
+            &klights_cluster_core::command::StorageResponse::Ack {
                 resource_version: 7,
             },
         )
@@ -3078,7 +3097,7 @@ mod tests {
         let before = destination_ledger.current_apply_position().await.unwrap();
         let duplicate = destination_ledger
             .apply_committed_raft(CommittedRaftApplyRequest::new(
-                crate::log_apply::test_live_commit(
+                crate::replication::log_apply_wire::test_live_commit(
                     0,
                     vec![LogApplyMutation::PutAppliedOutbox(outbox)],
                 ),

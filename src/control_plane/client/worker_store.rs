@@ -6,28 +6,25 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use crate::control_plane::client::{
     LeaderApiClient, legacy_dataplane, legacy_list_response, legacy_node_subnet, legacy_watch_event,
 };
-#[cfg(test)]
-use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::datastore::replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 use crate::datastore::{
     AppliedOutboxRecord, CatchUpResource, DatastoreBackend, ListPageRequest, NodeSubnet, PatchKind,
-    PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkAllocationLink,
-    PodNetworkAllocationPod, PodNetworkAllocationRequest, PodNetworkAllocationSubnet,
-    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult,
-    PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchEvent,
-    PositionedWatchReplay, PositionedWatchReplayRead, RawWatchEvent, Resource, ResourceList,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayPosition,
-    WatchReplayRead, WatchStore, WatchTarget, WatchTargetScope,
+    PodCleanupIntent, PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
+    RawWatchEvent, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
+    SnapshotAtRv, WatchReplayPosition, WatchReplayRead, WatchStore, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::watch::{EventType, WatchBus, WatchEvent};
+#[cfg(test)]
+use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_leader_api::{
     LeaderWatch, LeaderWatchError, NodeDataplaneQuery, NodeSubnetAllocationRequest,
     NodeSubnetQuery, PeerSubnetsQuery, PodCleanupIntentAckRequest, PodCleanupIntentListRequest,
@@ -1043,14 +1040,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
 
     async fn apply_raft_log_apply_commit(
         &self,
-        _commit: crate::log_apply::LogApplyCommit,
+        _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.unsupported("apply_raft_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
-        _commit: crate::log_apply::LogApplyCommit,
+        _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
         self.unsupported("apply_raft_log_apply_commit_outcome")
     }
@@ -1300,120 +1297,6 @@ impl DatastoreBackend for WorkerStoreAdapter {
 
     async fn delete_namespace(&self, _name: &str) -> Result<()> {
         self.unsupported("delete_namespace")
-    }
-
-    async fn pod_workqueue_enqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &klights_types::PodIdentity,
-        payload: Value,
-        attempt_count: i64,
-        min_delay_ms: i64,
-        last_error: Option<&str>,
-    ) -> Result<()> {
-        self.node_local
-            .enqueue_workqueue(kind, pod, payload, attempt_count, min_delay_ms, last_error)
-            .await
-    }
-
-    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        self.node_local.peek_workqueue_next_due().await
-    }
-
-    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        self.node_local.claim_workqueue_due(now_ms).await
-    }
-
-    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        self.node_local.complete_workqueue(id).await
-    }
-
-    async fn pod_workqueue_record_failure(
-        &self,
-        row: PodWorkqueueEntry,
-        min_delay_ms: i64,
-        error: &str,
-    ) -> Result<()> {
-        let pod = klights_types::PodIdentity::new(&row.namespace, &row.name, &row.uid);
-        self.node_local
-            .enqueue_workqueue(
-                row.kind,
-                &pod,
-                row.payload,
-                row.attempt_count.saturating_add(1),
-                min_delay_ms,
-                Some(error),
-            )
-            .await
-    }
-
-    async fn pod_workqueue_dead_letter(&self, id: i64, _error: &str) -> Result<()> {
-        self.node_local.complete_workqueue(id).await
-    }
-
-    async fn record_sandbox(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        sandbox_id: &str,
-    ) -> Result<()> {
-        self.node_local
-            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id, 0)
-            .await
-            .map_err(anyhow::Error::from)
-    }
-
-    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        Ok(self
-            .node_local
-            .list_pod_runtime_by_namespace(namespace)
-            .await?
-            .into_iter()
-            .find(|row| row.pod_name == pod_name)
-            .and_then(|row| row.sandbox_id))
-    }
-
-    async fn get_sandbox_for_uid(
-        &self,
-        _namespace: &str,
-        _pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .node_local
-            .get_pod_runtime(pod_uid)
-            .await?
-            .and_then(|row| row.sandbox_id))
-    }
-
-    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
-        for row in self
-            .node_local
-            .list_pod_runtime_by_namespace(namespace)
-            .await?
-            .into_iter()
-            .filter(|row| row.pod_name == pod_name)
-        {
-            self.node_local
-                .delete_pod_runtime_for_uid(&row.pod_uid)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn delete_sandbox_for_uid(
-        &self,
-        _namespace: &str,
-        _pod_name: &str,
-        pod_uid: &str,
-        _sandbox_id: &str,
-    ) -> Result<()> {
-        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
-    }
-
-    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
-        self.node_local.delete_network_for_sandbox(sandbox_id).await
     }
 
     async fn find_owned_resources(
@@ -1819,46 +1702,6 @@ impl DatastoreBackend for WorkerStoreAdapter {
         Ok(())
     }
 
-    async fn pod_slot_try_admit(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotAdmissionResult> {
-        self.node_local
-            .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
-            .await
-    }
-
-    async fn pod_slot_mark_terminating(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotMutationResult> {
-        self.node_local
-            .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
-            .await
-    }
-
-    async fn pod_slot_clear_if_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        _node_name: &str,
-    ) -> Result<PodSlotClearResult> {
-        self.node_local
-            .pod_slot_clear_if_uid(namespace, pod_name, pod_uid)
-            .await
-    }
-
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        self.node_local.subscribe_pod_slot_admissions()
-    }
-
     async fn patch_resource_latest(
         &self,
         _api_version: &str,
@@ -1882,59 +1725,6 @@ impl DatastoreBackend for WorkerStoreAdapter {
         self.unsupported("patch_resource_latest_with_preconditions")
     }
 
-    async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
-        self.node_local.get_network_for_sandbox(sandbox_id).await
-    }
-
-    async fn get_pod_network_for_pod(
-        &self,
-        _namespace: &str,
-        _pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        self.node_local.get_network_for_uid(pod_uid).await
-    }
-
-    async fn ipam_allocate_and_record_pod_network(
-        &self,
-        sandbox_id: &str,
-        pod: &klights_types::PodIdentity,
-        subnet_base_int: u32,
-        subnet_size: u32,
-        veth_host: &str,
-        netns_path: &str,
-    ) -> Result<(String, u32)> {
-        self.node_local
-            .reserve_ip_and_insert_network(PodNetworkAllocationRequest::new(
-                sandbox_id,
-                PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
-                PodNetworkAllocationSubnet::new(subnet_base_int, subnet_size),
-                PodNetworkAllocationLink::new(veth_host, netns_path),
-            ))
-            .await
-    }
-
-    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
-        Ok(self
-            .node_local
-            .list_pod_runtime()
-            .await?
-            .into_iter()
-            .filter_map(|row| {
-                Some(SandboxRef {
-                    namespace: row.namespace,
-                    pod_name: row.pod_name,
-                    pod_uid: row.pod_uid,
-                    sandbox_id: row.sandbox_id?,
-                })
-            })
-            .collect())
-    }
-
-    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        self.node_local.list_networks().await
-    }
-
     async fn watch_events_gc_prunable_count(
         &self,
         _max_rows: i64,
@@ -1945,21 +1735,6 @@ impl DatastoreBackend for WorkerStoreAdapter {
 
     async fn gc_watch_events(&self, _max_rows: i64, _batch_cap: i64) -> Result<usize> {
         Ok(0)
-    }
-
-    async fn pod_endpoint_get_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>> {
-        self.node_local.get_endpoint_by_pod_ip(pod_ip).await
-    }
-
-    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
-        self.node_local.list_endpoints_all().await
-    }
-
-    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        self.node_local.subscribe_pod_endpoints()
     }
 
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
@@ -1985,7 +1760,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         &self,
         _idempotency_key: &str,
         _operation: &str,
-        _payload: &[u8],
+        _command: klights_cluster_core::command::StorageCommand,
         _authoring_node: &str,
     ) -> std::result::Result<
         crate::node_outbox::OutboxApplyResult,
@@ -2000,7 +1775,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         &self,
         _idempotency_key: &str,
         _operation: &str,
-        _payload: &[u8],
+        _command: klights_cluster_core::command::StorageCommand,
         _authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::BuildOutboxOutcome,
@@ -2202,7 +1977,7 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
 
     async fn replace_replicated_resource_state(
         &self,
-        _entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
+        _entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
         _current_rv: i64,
         _watch_event_high_water: Option<i64>,
         _watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
@@ -2213,27 +1988,23 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
 
     async fn apply_log_apply_commit(
         &self,
-        _commit: crate::log_apply::LogApplyCommit,
+        _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<()> {
         self.unsupported("apply_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
-        _commit: crate::log_apply::LogApplyCommit,
+        _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.unsupported("apply_raft_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
-        _commit: crate::log_apply::LogApplyCommit,
+        _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
         self.unsupported("apply_raft_log_apply_commit_outcome")
-    }
-
-    async fn current_log_apply_index(&self) -> Result<i64> {
-        Ok(0)
     }
 
     #[cfg(test)]
@@ -2247,58 +2018,6 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
         _options: crate::datastore::types::ReplicatedCreateOptions,
     ) -> Result<Resource> {
         self.unsupported("apply_replicated_create_resource")
-    }
-}
-
-#[async_trait]
-impl crate::datastore::PodWorkqueueStore for WorkerStoreAdapter {
-    async fn pod_workqueue_enqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &klights_types::PodIdentity,
-        payload: Value,
-        attempt_count: i64,
-        min_delay_ms: i64,
-        last_error: Option<&str>,
-    ) -> Result<()> {
-        self.node_local
-            .enqueue_workqueue(kind, pod, payload, attempt_count, min_delay_ms, last_error)
-            .await
-    }
-
-    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        self.node_local.peek_workqueue_next_due().await
-    }
-
-    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        self.node_local.claim_workqueue_due(now_ms).await
-    }
-
-    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        self.node_local.complete_workqueue(id).await
-    }
-
-    async fn pod_workqueue_record_failure(
-        &self,
-        row: PodWorkqueueEntry,
-        min_delay_ms: i64,
-        error: &str,
-    ) -> Result<()> {
-        let pod = klights_types::PodIdentity::new(&row.namespace, &row.name, &row.uid);
-        self.node_local
-            .enqueue_workqueue(
-                row.kind,
-                &pod,
-                row.payload,
-                row.attempt_count.saturating_add(1),
-                min_delay_ms,
-                Some(error),
-            )
-            .await
-    }
-
-    async fn pod_workqueue_dead_letter(&self, id: i64, _error: &str) -> Result<()> {
-        self.node_local.complete_workqueue(id).await
     }
 }
 
@@ -2414,128 +2133,7 @@ impl crate::datastore::MetaStore for WorkerStoreAdapter {
 }
 
 #[async_trait]
-impl crate::datastore::NetworkStore for WorkerStoreAdapter {
-    async fn record_sandbox(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        sandbox_id: &str,
-    ) -> Result<()> {
-        self.node_local
-            .record_owned_sandbox(pod_uid, namespace, pod_name, &self.node_name, sandbox_id, 0)
-            .await
-            .map_err(anyhow::Error::from)
-    }
-
-    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        Ok(self
-            .node_local
-            .list_pod_runtime_by_namespace(namespace)
-            .await?
-            .into_iter()
-            .find(|row| row.pod_name == pod_name)
-            .and_then(|row| row.sandbox_id))
-    }
-
-    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
-        for row in self
-            .node_local
-            .list_pod_runtime_by_namespace(namespace)
-            .await?
-            .into_iter()
-            .filter(|row| row.pod_name == pod_name)
-        {
-            self.node_local
-                .delete_pod_runtime_for_uid(&row.pod_uid)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn delete_sandbox_for_uid(
-        &self,
-        _namespace: &str,
-        _pod_name: &str,
-        pod_uid: &str,
-        _sandbox_id: &str,
-    ) -> Result<()> {
-        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
-    }
-
-    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
-        self.node_local.delete_network_for_sandbox(sandbox_id).await
-    }
-
-    async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
-        self.node_local.get_network_for_sandbox(sandbox_id).await
-    }
-}
-
-#[async_trait]
 impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
-    async fn get_sandbox_for_uid(
-        &self,
-        _namespace: &str,
-        _pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .node_local
-            .get_pod_runtime(pod_uid)
-            .await?
-            .and_then(|row| row.sandbox_id))
-    }
-
-    async fn get_pod_network_for_pod(
-        &self,
-        _namespace: &str,
-        _pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        self.node_local.get_network_for_uid(pod_uid).await
-    }
-
-    async fn ipam_allocate_and_record_pod_network(
-        &self,
-        sandbox_id: &str,
-        pod: &klights_types::PodIdentity,
-        subnet_base_int: u32,
-        subnet_size: u32,
-        veth_host: &str,
-        netns_path: &str,
-    ) -> Result<(String, u32)> {
-        self.node_local
-            .reserve_ip_and_insert_network(PodNetworkAllocationRequest::new(
-                sandbox_id,
-                PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
-                PodNetworkAllocationSubnet::new(subnet_base_int, subnet_size),
-                PodNetworkAllocationLink::new(veth_host, netns_path),
-            ))
-            .await
-    }
-
-    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
-        Ok(self
-            .node_local
-            .list_pod_runtime()
-            .await?
-            .into_iter()
-            .filter_map(|row| {
-                Some(SandboxRef {
-                    namespace: row.namespace,
-                    pod_name: row.pod_name,
-                    pod_uid: row.pod_uid,
-                    sandbox_id: row.sandbox_id?,
-                })
-            })
-            .collect())
-    }
-
-    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        self.node_local.list_networks().await
-    }
-
     async fn allocate_node_subnet(
         &self,
         node_name: &str,
@@ -2611,21 +2209,6 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
     async fn delete_node_subnet(&self, _node_name: &str) -> Result<()> {
         Ok(())
     }
-
-    async fn pod_endpoint_get_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>> {
-        self.node_local.get_endpoint_by_pod_ip(pod_ip).await
-    }
-
-    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
-        self.node_local.list_endpoints_all().await
-    }
-
-    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        self.node_local.subscribe_pod_endpoints()
-    }
 }
 
 #[async_trait]
@@ -2677,46 +2260,6 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
         let _ = node_name;
         Ok(())
-    }
-
-    async fn pod_slot_try_admit(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotAdmissionResult> {
-        self.node_local
-            .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
-            .await
-    }
-
-    async fn pod_slot_mark_terminating(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotMutationResult> {
-        self.node_local
-            .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
-            .await
-    }
-
-    async fn pod_slot_clear_if_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        _node_name: &str,
-    ) -> Result<PodSlotClearResult> {
-        self.node_local
-            .pod_slot_clear_if_uid(namespace, pod_name, pod_uid)
-            .await
-    }
-
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        self.node_local.subscribe_pod_slot_admissions()
     }
 }
 
@@ -4373,24 +3916,17 @@ mod tests {
             .expect("pod exists");
         assert_eq!(pod.uid, "uid-1");
 
-        adapter
-            .record_sandbox("default", "web", "uid-1", "sandbox-1")
+        node_local
+            .record_owned_sandbox("uid-1", "default", "web", "worker-a", "sandbox-1", 0)
             .await
             .expect("record sandbox in node-local store");
         assert_eq!(
-            adapter
-                .get_sandbox_for_uid("default", "web", "uid-1")
+            node_local
+                .get_pod_runtime("uid-1")
                 .await
-                .expect("read worker sandbox"),
+                .expect("read worker sandbox")
+                .and_then(|row| row.sandbox_id),
             Some("sandbox-1".to_string())
-        );
-        assert_eq!(
-            cluster_db
-                .get_sandbox_for_uid("default", "web", "uid-1")
-                .await
-                .expect("cluster runtime lookup must stay empty"),
-            None,
-            "worker runtime rows must not be written to cluster storage"
         );
     }
 
@@ -4760,16 +4296,10 @@ mod tests {
         )
         .await
         .expect("open node-local");
-        let adapter = WorkerStoreAdapter::new(
-            Arc::new(HandoffLeaderApi),
-            node_local,
-            "worker-a".to_string(),
-        );
-
         let pod = klights_types::PodIdentity::new("default", "stuck", "uid-stuck");
-        adapter
-            .pod_workqueue_enqueue(
-                PodWorkqueueKind::Pod,
+        node_local
+            .enqueue_workqueue(
+                crate::datastore::PodWorkqueueKind::Pod,
                 &pod,
                 serde_json::json!({"source": "test"}),
                 3,
@@ -4778,23 +4308,32 @@ mod tests {
             )
             .await
             .expect("enqueue workqueue row");
-        let claimed = adapter
-            .pod_workqueue_claim_due(i64::MAX)
+        let claimed = node_local
+            .claim_workqueue_due(i64::MAX)
             .await
             .expect("claim workqueue row")
             .expect("workqueue row exists");
 
-        adapter
-            .pod_workqueue_record_failure(claimed, 0, "missed delete")
+        let claimed_pod =
+            klights_types::PodIdentity::new(&claimed.namespace, &claimed.name, &claimed.uid);
+        node_local
+            .enqueue_workqueue(
+                claimed.kind,
+                &claimed_pod,
+                claimed.payload,
+                claimed.attempt_count.saturating_add(1),
+                0,
+                Some("missed delete"),
+            )
             .await
             .expect("record worker-local failure");
 
-        let retried = adapter
-            .pod_workqueue_claim_due(i64::MAX)
+        let retried = node_local
+            .claim_workqueue_due(i64::MAX)
             .await
             .expect("claim retried workqueue row")
             .expect("failure must requeue worker-local pod delete work");
-        assert_eq!(retried.kind, PodWorkqueueKind::Pod);
+        assert_eq!(retried.kind, crate::datastore::PodWorkqueueKind::Pod);
         assert_eq!(retried.namespace, "default");
         assert_eq!(retried.name, "stuck");
         assert_eq!(retried.uid, "uid-stuck");

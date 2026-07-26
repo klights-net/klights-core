@@ -10,7 +10,7 @@
 #[cfg(feature = "sqlcipher")]
 mod encrypted {
     use crate::datastore::sqlite::Datastore;
-    use crate::datastore::sqlite::opener;
+    use crate::sqlite_open as opener;
     use std::io::Write;
 
     fn write_key_file(dir: &std::path::Path, key: &[u8]) -> std::path::PathBuf {

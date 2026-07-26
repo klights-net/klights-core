@@ -9,7 +9,7 @@
 //! - `Node = RaftMemberNode` — carries the API endpoint URL so peers can drive
 //!   `RaftNetwork` without consulting an external membership directory.
 //! - `D = StorageCommandPayload` — opaque bytes carrying a serialized
-//!   `super::super::command::StorageCommand` (protobuf), the unit of
+//!   `klights_cluster_core::StorageCommand` (protobuf), the unit of
 //!   replication. The Raft state machine deserializes inside `apply`.
 //! - `R = StorageCommandResult` — result of applying a command on the
 //!   leader, returned to the proposer.

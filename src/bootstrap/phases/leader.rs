@@ -25,6 +25,7 @@ pub struct LeaderStart<'a> {
     /// (not the raft leader), controller startup is skipped cleanly.
     pub leader_election: Option<Arc<dyn LeaderElection>>,
     pub db_handle: &'a DatastoreHandle,
+    pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub task_supervisor: &'a Arc<TaskSupervisor>,
     pub dispatcher_for_worker: &'a Arc<crate::controller_dispatcher::ControllerDispatcher>,
     pub dispatcher_for_cronjobs: &'a Arc<crate::controller_dispatcher::ControllerDispatcher>,
@@ -39,6 +40,7 @@ pub struct LeaderStart<'a> {
 struct LeaderScopedTaskContext {
     config: Arc<KlightsConfig>,
     db_handle: DatastoreHandle,
+    node_local: crate::datastore::node_local::NodeLocalHandle,
     task_supervisor: Arc<TaskSupervisor>,
     dispatcher_for_worker: Arc<crate::controller_dispatcher::ControllerDispatcher>,
     dispatcher_for_cronjobs: Arc<crate::controller_dispatcher::ControllerDispatcher>,
@@ -52,6 +54,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         config,
         leader_election,
         db_handle,
+        node_local,
         task_supervisor,
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
@@ -70,6 +73,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),
+        node_local: node_local.clone(),
         task_supervisor: task_supervisor.clone(),
         dispatcher_for_worker: dispatcher_for_worker.clone(),
         dispatcher_for_cronjobs: dispatcher_for_cronjobs.clone(),
@@ -183,6 +187,7 @@ async fn start_leader_scoped_tasks(
     let LeaderScopedTaskContext {
         config,
         db_handle,
+        node_local,
         task_supervisor,
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
@@ -275,7 +280,7 @@ async fn start_leader_scoped_tasks(
     let mut sched = gc::GcScheduler::new(std::time::Duration::from_secs(gc_interval));
     if let Some(cri_arc) = cri_for_shutdown {
         sched.register(Arc::new(gc::sandbox_gc::SandboxGc::new(
-            db_handle.clone(),
+            node_local.clone(),
             cri_arc.clone(),
             pod_repository.clone(),
             config.containerd_namespace.clone(),

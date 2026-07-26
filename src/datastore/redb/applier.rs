@@ -9,8 +9,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::sequenced::DatastoreApplier;
+use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 
@@ -131,13 +131,13 @@ impl DatastoreApplier for RedbDatastore {
                         .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                         .await?
                 {
-                    crate::datastore::status_merge_policy::merge_status_for_apply(
+                    klights_cluster_core::merge_status_for_apply(
                         &api_version,
                         &kind,
                         current.data.as_ref(),
                         &mut status,
-                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
-                        crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox,
+                        klights_cluster_core::StatusApplyFreshness::Stale,
+                        klights_cluster_core::StatusApplyOrigin::KubeletOutbox,
                     );
                 }
                 let mut preconditions = preconditions;
@@ -220,35 +220,14 @@ impl DatastoreApplier for RedbDatastore {
             StorageCommand::DeleteNodeSubnet { node_name } => {
                 self.network.delete_node_subnet(&node_name).await?;
             }
-            StorageCommand::PodSlotTryAdmit {
-                namespace,
-                pod_name,
-                pod_uid,
-                node_name,
-            } => {
-                self.pod_slots
-                    .try_admit(&namespace, &pod_name, &pod_uid, &node_name)
-                    .await?;
+            StorageCommand::PodSlotTryAdmit { .. } => {
+                anyhow::bail!("node-local pod-slot commands cannot apply to cluster redb");
             }
-            StorageCommand::PodSlotMarkTerminating {
-                namespace,
-                pod_name,
-                pod_uid,
-                node_name,
-            } => {
-                self.pod_slots
-                    .mark_terminating(&namespace, &pod_name, &pod_uid, &node_name)
-                    .await?;
+            StorageCommand::PodSlotMarkTerminating { .. } => {
+                anyhow::bail!("node-local pod-slot commands cannot apply to cluster redb");
             }
-            StorageCommand::PodSlotClearIfUid {
-                namespace,
-                pod_name,
-                pod_uid,
-                node_name,
-            } => {
-                self.pod_slots
-                    .clear_if_uid(&namespace, &pod_name, &pod_uid, &node_name)
-                    .await?;
+            StorageCommand::PodSlotClearIfUid { .. } => {
+                anyhow::bail!("node-local pod-slot commands cannot apply to cluster redb");
             }
             StorageCommand::AdvanceResourceVersion { min_rv, .. } => {
                 self.rv_store.advance_rv(min_rv).await?;

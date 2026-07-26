@@ -4,12 +4,13 @@ use anyhow::{Result, anyhow};
 use rusqlite::ToSql;
 use serde_json::Value;
 
-use super::{Datastore, Resource, ResourceList, SnapshotAtRv, WatchReplayPosition, WatchTarget};
+use super::{Datastore, ResourceList, SnapshotAtRv, WatchTarget};
 use crate::datastore::WatchTargetScope;
 use crate::datastore::position_membership::{
     MembershipHistoryEvent, MembershipReconstructor, ReconstructedMembership,
     apply_membership_selectors, resource_from_history, sort_for_watch_targets,
 };
+use klights_cluster_core::{Resource, WatchReplayPosition};
 
 impl Datastore {
     pub async fn snapshot_resources_at_position(

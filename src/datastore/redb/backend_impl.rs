@@ -4,11 +4,10 @@
 //! Methods that need combined logic (preconditions + delete, get_namespace, etc.)
 //! are implemented inline.
 
-use std::net::Ipv4Addr;
-
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::Value;
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use ::redb::{ReadableDatabase, ReadableTable};
@@ -17,6 +16,10 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
+use klights_cluster_core::{
+    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
+    WatchReplayPosition,
+};
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 #[cfg(test)]
@@ -41,7 +44,7 @@ fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Vec<u8>> {
 pub(super) fn decode_outbox_watermark_key(
     key: &[u8],
     stream_seq: i64,
-) -> Result<crate::log_apply::OutboxStreamWatermark> {
+) -> Result<klights_cluster_core::OutboxStreamWatermark> {
     if key.len() < 10 || key[key.len() - 9] != 0 {
         return Err(anyhow!("corrupt redb outbox-watermark key"));
     }
@@ -58,7 +61,7 @@ pub(super) fn decode_outbox_watermark_key(
     if stream_seq <= 0 {
         return Err(anyhow!("corrupt redb outbox stream sequence {stream_seq}"));
     }
-    Ok(crate::log_apply::OutboxStreamWatermark {
+    Ok(klights_cluster_core::OutboxStreamWatermark {
         client_id,
         stream_id,
         stream_seq,
@@ -238,7 +241,7 @@ impl DatastoreBackend for RedbDatastore {
 
     async fn apply_raft_log_apply_commit(
         &self,
-        _commit: crate::log_apply::LogApplyCommit,
+        _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         Err(anyhow!(
             "redb backend does not support raft log-apply commit replay"
@@ -548,55 +551,6 @@ impl DatastoreBackend for RedbDatastore {
     async fn delete_namespace(&self, n: &str) -> Result<()> {
         self.namespaces.delete_ns_impl(n).await
     }
-    async fn pod_workqueue_enqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &klights_types::PodIdentity,
-        payload: Value,
-        ac: i64,
-        md: i64,
-        le: Option<&str>,
-    ) -> Result<()> {
-        self.workqueue.enqueue(kind, pod, payload, ac, md, le).await
-    }
-    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        self.workqueue.peek_next_due().await
-    }
-    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        self.workqueue.claim_due(now_ms).await
-    }
-    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        self.workqueue.complete(id).await
-    }
-    async fn pod_workqueue_record_failure(
-        &self,
-        row: PodWorkqueueEntry,
-        md: i64,
-        e: &str,
-    ) -> Result<()> {
-        self.workqueue.record_failure(row, md, e).await
-    }
-    async fn pod_workqueue_dead_letter(&self, id: i64, e: &str) -> Result<()> {
-        self.workqueue.dead_letter(id, e).await
-    }
-    async fn record_sandbox(&self, ns: &str, pn: &str, pu: &str, si: &str) -> Result<()> {
-        self.sandboxes.record(ns, pn, pu, si).await
-    }
-    async fn get_sandbox(&self, ns: &str, pn: &str) -> Result<Option<String>> {
-        self.sandboxes.get_for_pod(ns, pn).await
-    }
-    async fn get_sandbox_for_uid(&self, ns: &str, pn: &str, pu: &str) -> Result<Option<String>> {
-        self.sandboxes.get_for_uid(ns, pn, pu).await
-    }
-    async fn delete_sandbox(&self, ns: &str, pn: &str) -> Result<()> {
-        self.sandboxes.delete_for_pod(ns, pn).await
-    }
-    async fn delete_sandbox_for_uid(&self, ns: &str, pn: &str, pu: &str, si: &str) -> Result<()> {
-        self.sandboxes.delete_for_uid(ns, pn, pu, si).await
-    }
-    async fn delete_pod_network(&self, sid: &str) -> Result<()> {
-        self.network.delete_pnet(sid).await
-    }
     async fn find_owned_resources(&self, o: &str, ns: Option<&str>) -> Result<Vec<Resource>> {
         self.resources.find_owned(o, ns).await
     }
@@ -832,36 +786,6 @@ impl DatastoreBackend for RedbDatastore {
     async fn delete_node_subnet(&self, n: &str) -> Result<()> {
         self.network.delete_node_subnet(n).await
     }
-    async fn pod_slot_try_admit(
-        &self,
-        ns: &str,
-        pod: &str,
-        uid: &str,
-        node: &str,
-    ) -> Result<PodSlotAdmissionResult> {
-        self.pod_slots.try_admit(ns, pod, uid, node).await
-    }
-    async fn pod_slot_mark_terminating(
-        &self,
-        ns: &str,
-        pod: &str,
-        uid: &str,
-        node: &str,
-    ) -> Result<PodSlotMutationResult> {
-        self.pod_slots.mark_terminating(ns, pod, uid, node).await
-    }
-    async fn pod_slot_clear_if_uid(
-        &self,
-        ns: &str,
-        pod: &str,
-        uid: &str,
-        node: &str,
-    ) -> Result<PodSlotClearResult> {
-        self.pod_slots.clear_if_uid(ns, pod, uid, node).await
-    }
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        self.pod_slots.subscribe()
-    }
     async fn patch_resource_latest(
         &self,
         a: &str,
@@ -915,41 +839,6 @@ impl DatastoreBackend for RedbDatastore {
         self.patch_resource_latest(a, k, ns, n, patch_kind, patch)
             .await
     }
-    async fn get_pod_network(&self, sid: &str) -> Result<Option<PodNetworkEndpoint>> {
-        self.network.get_pnet(sid).await
-    }
-    async fn get_pod_network_for_pod(
-        &self,
-        ns: &str,
-        pn: &str,
-        pu: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        self.network.get_pnet_for_pod(ns, pn, pu).await
-    }
-    async fn ipam_allocate_and_record_pod_network(
-        &self,
-        sid: &str,
-        pod: &klights_types::PodIdentity,
-        sb: u32,
-        ss: u32,
-        vh: &str,
-        np: &str,
-    ) -> Result<(String, u32)> {
-        self.network
-            .ipam_alloc(PodNetworkAllocationRequest::new(
-                sid,
-                PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
-                PodNetworkAllocationSubnet::new(sb, ss),
-                PodNetworkAllocationLink::new(vh, np),
-            ))
-            .await
-    }
-    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
-        self.sandboxes.list_all().await
-    }
-    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        self.network.list_pnet_sandbox_ids().await
-    }
     async fn watch_events_gc_prunable_count(&self, m: i64, b: i64) -> Result<usize> {
         self.watch_store.gc_watch_prunable_count(m, b).await
     }
@@ -985,7 +874,7 @@ impl DatastoreBackend for RedbDatastore {
 
     async fn list_outbox_stream_watermarks(
         &self,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         self.accessor
             .call("redb_outbox_stream_watermarks_list_all", |db| {
                 let read = db.begin_read()?;
@@ -1004,7 +893,7 @@ impl DatastoreBackend for RedbDatastore {
         &self,
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
             return Err(anyhow::anyhow!(
                 "outbox-watermark page limit {} exceeds {}",
@@ -1044,16 +933,6 @@ impl DatastoreBackend for RedbDatastore {
                 Ok(rows)
             })
             .await
-    }
-
-    async fn pod_endpoint_get_by_pod_ip(&self, ip: Ipv4Addr) -> Result<Option<PodEndpointRow>> {
-        self.network.pod_endpoint_get_by_pod_ip(ip).await
-    }
-    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
-        self.network.pod_endpoint_list_all().await
-    }
-    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        self.network.subscribe_endpoints()
     }
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
@@ -1246,7 +1125,7 @@ impl DatastoreBackend for RedbDatastore {
         &self,
         _idempotency_key: &str,
         _operation: &str,
-        _payload: &[u8],
+        _command: klights_cluster_core::command::StorageCommand,
         _authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
@@ -1261,7 +1140,7 @@ impl DatastoreBackend for RedbDatastore {
         &self,
         _idempotency_key: &str,
         _operation: &str,
-        _payload: &[u8],
+        _command: klights_cluster_core::command::StorageCommand,
         _authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::BuildOutboxOutcome,
@@ -1758,106 +1637,7 @@ impl crate::datastore::MetaStore for RedbDatastore {
 }
 
 #[async_trait]
-impl crate::datastore::NetworkStore for RedbDatastore {
-    async fn record_sandbox(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        sandbox_id: &str,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::record_sandbox(
-            self, namespace, pod_name, pod_uid, sandbox_id,
-        )
-        .await
-    }
-
-    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
-        crate::datastore::DatastoreBackend::get_sandbox(self, namespace, pod_name).await
-    }
-
-    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_sandbox(self, namespace, pod_name).await
-    }
-
-    async fn delete_sandbox_for_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        sandbox_id: &str,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_sandbox_for_uid(
-            self, namespace, pod_name, pod_uid, sandbox_id,
-        )
-        .await
-    }
-
-    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_pod_network(self, sandbox_id).await
-    }
-
-    async fn get_pod_network(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<crate::datastore::PodNetworkEndpoint>> {
-        crate::datastore::DatastoreBackend::get_pod_network(self, sandbox_id).await
-    }
-}
-
-#[async_trait]
 impl crate::datastore::NetworkMetadataStore for RedbDatastore {
-    async fn get_sandbox_for_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<String>> {
-        crate::datastore::DatastoreBackend::get_sandbox_for_uid(self, namespace, pod_name, pod_uid)
-            .await
-    }
-
-    async fn get_pod_network_for_pod(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<crate::datastore::PodNetworkEndpoint>> {
-        crate::datastore::DatastoreBackend::get_pod_network_for_pod(
-            self, namespace, pod_name, pod_uid,
-        )
-        .await
-    }
-
-    async fn ipam_allocate_and_record_pod_network(
-        &self,
-        sandbox_id: &str,
-        pod: &klights_types::PodIdentity,
-        subnet_base_int: u32,
-        subnet_size: u32,
-        veth_host: &str,
-        netns_path: &str,
-    ) -> Result<(String, u32)> {
-        crate::datastore::DatastoreBackend::ipam_allocate_and_record_pod_network(
-            self,
-            sandbox_id,
-            pod,
-            subnet_base_int,
-            subnet_size,
-            veth_host,
-            netns_path,
-        )
-        .await
-    }
-
-    async fn list_sandboxes(&self) -> Result<Vec<crate::datastore::SandboxRef>> {
-        crate::datastore::DatastoreBackend::list_sandboxes(self).await
-    }
-
-    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
-        crate::datastore::DatastoreBackend::list_pod_network_sandbox_ids(self).await
-    }
-
     async fn allocate_node_subnet(
         &self,
         node_name: &str,
@@ -1919,78 +1699,6 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
         crate::datastore::DatastoreBackend::delete_node_subnet(self, node_name).await
     }
-
-    async fn pod_endpoint_get_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<crate::datastore::PodEndpointRow>> {
-        crate::datastore::DatastoreBackend::pod_endpoint_get_by_pod_ip(self, pod_ip).await
-    }
-
-    async fn pod_endpoint_list_all(&self) -> Result<Vec<crate::datastore::PodEndpointRow>> {
-        crate::datastore::DatastoreBackend::pod_endpoint_list_all(self).await
-    }
-
-    fn subscribe_pod_endpoints(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::datastore::PodEndpointEvent> {
-        crate::datastore::DatastoreBackend::subscribe_pod_endpoints(self)
-    }
-}
-
-#[async_trait]
-impl crate::datastore::PodWorkqueueStore for RedbDatastore {
-    async fn pod_workqueue_enqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &klights_types::PodIdentity,
-        payload: Value,
-        attempt_count: i64,
-        min_delay_ms: i64,
-        last_error: Option<&str>,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_enqueue(
-            self,
-            kind,
-            pod,
-            payload,
-            attempt_count,
-            min_delay_ms,
-            last_error,
-        )
-        .await
-    }
-
-    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        crate::datastore::DatastoreBackend::pod_workqueue_peek_next_due(self).await
-    }
-
-    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        crate::datastore::DatastoreBackend::pod_workqueue_claim_due(self, now_ms).await
-    }
-
-    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_complete(self, id).await
-    }
-
-    async fn pod_workqueue_record_failure(
-        &self,
-        row: PodWorkqueueEntry,
-        min_delay_ms: i64,
-        error: &str,
-    ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_record_failure(
-            self,
-            row,
-            min_delay_ms,
-            error,
-        )
-        .await
-    }
-
-    async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_dead_letter(self, id, error).await
-    }
 }
 
 #[async_trait]
@@ -1998,15 +1706,15 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
     #[cfg(test)]
     async fn apply_replicated_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
-        meta: crate::datastore::command::CommandMeta,
+        command: klights_cluster_core::command::StorageCommand,
+        meta: klights_cluster_core::command::CommandMeta,
     ) -> Result<()> {
         crate::datastore::DatastoreBackend::apply_replicated_command(self, command, meta).await
     }
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::SnapshotRestoreOperation>,
+        entries: Vec<klights_cluster_core::SnapshotRestoreOperation>,
         current_rv: i64,
         watch_event_high_water: Option<i64>,
         watch_replay_floors: Option<Vec<WatchReplayFloor>>,
@@ -2023,26 +1731,25 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
         .await
     }
 
-    async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
+    async fn apply_log_apply_commit(
+        &self,
+        commit: klights_cluster_core::LogApplyCommit,
+    ) -> Result<()> {
         crate::datastore::DatastoreBackend::apply_log_apply_commit(self, commit).await
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 
     async fn apply_raft_log_apply_commit_outcome(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_outcome(self, commit).await
-    }
-
-    async fn current_log_apply_index(&self) -> Result<i64> {
-        crate::datastore::DatastoreBackend::current_log_apply_index(self).await
     }
 
     #[cfg(test)]
@@ -2384,49 +2091,6 @@ impl crate::datastore::PodCleanupStore for RedbDatastore {
         crate::datastore::DatastoreBackend::delete_pod_cleanup_intents_for_node(self, node_name)
             .await
     }
-
-    async fn pod_slot_try_admit(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotAdmissionResult> {
-        crate::datastore::DatastoreBackend::pod_slot_try_admit(
-            self, namespace, pod_name, pod_uid, node_name,
-        )
-        .await
-    }
-
-    async fn pod_slot_mark_terminating(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotMutationResult> {
-        crate::datastore::DatastoreBackend::pod_slot_mark_terminating(
-            self, namespace, pod_name, pod_uid, node_name,
-        )
-        .await
-    }
-
-    async fn pod_slot_clear_if_uid(
-        &self,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        node_name: &str,
-    ) -> Result<PodSlotClearResult> {
-        crate::datastore::DatastoreBackend::pod_slot_clear_if_uid(
-            self, namespace, pod_name, pod_uid, node_name,
-        )
-        .await
-    }
-
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        crate::datastore::DatastoreBackend::subscribe_pod_slot_admissions(self)
-    }
 }
 
 #[async_trait]
@@ -2437,7 +2101,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
 
     async fn list_outbox_stream_watermarks(
         &self,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         crate::datastore::DatastoreBackend::list_outbox_stream_watermarks(self).await
     }
 
@@ -2445,7 +2109,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+    ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
         crate::datastore::DatastoreBackend::list_outbox_stream_watermarks_paged(self, after, limit)
             .await
     }
@@ -2477,7 +2141,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
@@ -2487,7 +2151,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
         )
         .await
@@ -2497,9 +2161,9 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         klights_cluster_core::OutboxApplyOutcome,
         klights_cluster_core::OutboxApplyError,
@@ -2508,7 +2172,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )
@@ -2519,9 +2183,9 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::CommittedOutboxApply,
         klights_cluster_core::OutboxApplyError,
@@ -2530,7 +2194,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )
@@ -2539,10 +2203,10 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
 
     async fn build_log_apply_commit_for_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
-    ) -> Result<crate::log_apply::LogApplyCommit> {
+    ) -> Result<klights_cluster_core::LogApplyCommit> {
         crate::datastore::DatastoreBackend::build_log_apply_commit_for_command(
             self,
             command,
@@ -2556,7 +2220,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
     ) -> std::result::Result<
         klights_cluster_core::BuildOutboxOutcome,
@@ -2566,7 +2230,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
         )
         .await
@@ -2576,9 +2240,9 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         idempotency_key: &str,
         operation: &str,
-        payload: &[u8],
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         klights_cluster_core::BuildOutboxOutcome,
         klights_cluster_core::OutboxApplyError,
@@ -2587,7 +2251,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
             self,
             idempotency_key,
             operation,
-            payload,
+            command,
             authoring_node,
             watermark,
         )

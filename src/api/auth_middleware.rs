@@ -138,12 +138,13 @@ pub(crate) async fn authenticate_token_for_review(
 ) -> Result<crate::auth::middleware::ReviewedTokenIdentity, AuthenticationError> {
     let resources = ApiAuthResources { state };
     let clock = SystemClock;
+    let auth_policy = state.auth_policy();
     let runtime = AuthnRuntime::new(
-        state.bootstrap_token_authenticator.as_ref(),
+        auth_policy.bootstrap_token_authenticator.as_ref(),
         &resources,
         &resources,
-        state.oidc_authenticator.as_deref(),
-        state.webhook_authenticator.as_deref(),
+        auth_policy.oidc_authenticator.as_deref(),
+        auth_policy.webhook_authenticator.as_deref(),
         &clock,
         &state.operational().task_supervisor,
         false,
@@ -184,12 +185,13 @@ pub async fn authenticate_request(
 
     let resources = ApiAuthResources { state: &state };
     let clock = SystemClock;
+    let auth_policy = state.auth_policy();
     let runtime = AuthnRuntime::new(
-        state.bootstrap_token_authenticator.as_ref(),
+        auth_policy.bootstrap_token_authenticator.as_ref(),
         &resources,
         &resources,
-        state.oidc_authenticator.as_deref(),
-        state.webhook_authenticator.as_deref(),
+        auth_policy.oidc_authenticator.as_deref(),
+        auth_policy.webhook_authenticator.as_deref(),
         &clock,
         &state.operational().task_supervisor,
         state.operational().config.anonymous_auth,
@@ -205,7 +207,7 @@ pub async fn authenticate_request(
     let authenticated_identity = if is_trusted_proxy {
         if let Some(cert_der) = forwarded_client_cert {
             match authenticate_forwarded_client_cert(
-                state.cluster_ca_pem.as_deref().map(String::as_str),
+                auth_policy.cluster_ca_pem.as_deref().map(String::as_str),
                 &cert_der,
                 &state.operational().task_supervisor,
             )
@@ -230,7 +232,7 @@ pub async fn authenticate_request(
         Err(error) => return AppError::from(error).into_response(),
     };
     let effective_identity = match crate::auth::impersonation::effective_identity(
-        state.authorizer.as_ref(),
+        auth_policy.authorizer.as_ref(),
         &authenticated_identity,
         impersonation,
     )
@@ -260,8 +262,12 @@ pub async fn authorize_request(state: Arc<AppState>, request: Request, next: Nex
         .cloned()
         .unwrap_or_else(AuthenticatedIdentity::anonymous);
 
-    let decision = state.authorizer.authorize(&identity, &authorization).await;
-    state
+    let auth_policy = state.auth_policy();
+    let decision = auth_policy
+        .authorizer
+        .authorize(&identity, &authorization)
+        .await;
+    auth_policy
         .audit_sink
         .record(crate::audit::AuditEvent::authorization(
             &identity,

@@ -15,13 +15,7 @@ use std::sync::Arc;
 use crate::watch::WatchEvent;
 use klights_types::{NodeName, PodSubnet};
 
-// TEMPORARY(Phase 5.1): one compatibility facade preserves root datastore
-// source paths while adjacent cluster semantics are extracted.
-// REMOVE(Phase 5.5): import these canonical values from klights-cluster-core.
-pub use klights_cluster_core::{
-    PatchKind, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourcePatchRequest,
-    ResourcePreconditions,
-};
+use klights_cluster_core::Resource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PodSlotAdmissionState {
@@ -108,6 +102,36 @@ pub struct PodCleanupIntent {
     pub resource_version: i64,
     pub created_at_ms: i64,
     pub pod_data: Value,
+}
+
+impl From<PodCleanupIntent> for klights_cluster_core::LogApplyPodCleanupIntentRow {
+    fn from(row: PodCleanupIntent) -> Self {
+        Self {
+            node_name: row.node_name,
+            namespace: row.namespace,
+            pod_name: row.pod_name,
+            pod_uid: row.pod_uid,
+            reason: row.reason,
+            resource_version: row.resource_version,
+            created_at_ms: row.created_at_ms,
+            pod_data: row.pod_data,
+        }
+    }
+}
+
+impl From<klights_cluster_core::LogApplyPodCleanupIntentRow> for PodCleanupIntent {
+    fn from(row: klights_cluster_core::LogApplyPodCleanupIntentRow) -> Self {
+        Self {
+            node_name: row.node_name,
+            namespace: row.namespace,
+            pod_name: row.pod_name,
+            pod_uid: row.pod_uid,
+            reason: row.reason,
+            resource_version: row.resource_version,
+            created_at_ms: row.created_at_ms,
+            pod_data: row.pod_data,
+        }
+    }
 }
 
 /// Leader metadata stamped into a replica backup during full snapshot restore.
@@ -387,8 +411,7 @@ pub enum WatchReplayRead<T = CatchUpResource> {
     Expired,
 }
 
-pub use klights_cluster_core::PositionedWatchEvent;
-pub use klights_cluster_core::WatchReplayPosition;
+use klights_cluster_core::{PositionedWatchEvent, WatchReplayPosition};
 
 #[derive(Clone, Debug)]
 pub struct PositionedWatchReplay<T> {
@@ -755,6 +778,34 @@ pub struct AppliedOutboxRecord {
     pub result_proto: Vec<u8>,
     #[serde(default)]
     pub status_stamp: Option<i64>,
+}
+
+impl From<AppliedOutboxRecord> for klights_cluster_core::LogApplyAppliedOutboxRow {
+    fn from(record: AppliedOutboxRecord) -> Self {
+        Self {
+            idempotency_key: record.idempotency_key,
+            subject_key: record.subject_key,
+            operation: record.operation,
+            first_seen_ms: record.first_seen_ms,
+            applied_rv: record.applied_rv,
+            result_proto: record.result_proto,
+            status_stamp: record.status_stamp,
+        }
+    }
+}
+
+impl From<klights_cluster_core::LogApplyAppliedOutboxRow> for AppliedOutboxRecord {
+    fn from(row: klights_cluster_core::LogApplyAppliedOutboxRow) -> Self {
+        Self {
+            idempotency_key: row.idempotency_key,
+            subject_key: row.subject_key,
+            operation: row.operation,
+            first_seen_ms: row.first_seen_ms,
+            applied_rv: row.applied_rv,
+            result_proto: row.result_proto,
+            status_stamp: row.status_stamp,
+        }
+    }
 }
 
 /// Internal-only event emitted by `pod_endpoints` CRUD calls.

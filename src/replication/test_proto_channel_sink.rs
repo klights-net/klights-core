@@ -3,7 +3,7 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::log_apply::SnapshotRestoreOperation;
+use klights_cluster_core::SnapshotRestoreOperation;
 
 type StreamItem = std::result::Result<SnapshotRestoreOperation, tonic::Status>;
 

@@ -44,8 +44,7 @@ pub(crate) async fn apply_forwarded_command_with_meta(
         meta.codec_version,
         klights_cluster_core::COMMAND_CODEC_VERSION
     );
-    if crate::node_lease_tracker::ensure_lease_renew_command(&command, &meta.authoring_node).is_ok()
-    {
+    if klights_cluster_core::validate_lease_renew_command(&command, &meta.authoring_node).is_ok() {
         return Ok(ForwardedApply::already_applied());
     }
     let idempotency_key = meta.command_id.0.as_str();
@@ -81,7 +80,7 @@ pub(crate) async fn apply_forwarded_command(
     command: StorageCommand,
     authoring_node: String,
 ) -> Result<ForwardedApply> {
-    if crate::node_lease_tracker::ensure_lease_renew_command(&command, &authoring_node).is_ok() {
+    if klights_cluster_core::validate_lease_renew_command(&command, &authoring_node).is_ok() {
         return Ok(ForwardedApply::already_applied());
     }
     match command {
@@ -241,7 +240,7 @@ pub(crate) async fn apply_forwarded_command(
                 .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                 .await?
             {
-                let freshness = crate::datastore::status_merge_policy::apply_status_merge(
+                let freshness = klights_cluster_core::apply_status_merge(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
@@ -254,7 +253,7 @@ pub(crate) async fn apply_forwarded_command(
                 // Pod status is deduped via observed_status_stamp, so only a
                 // non-Pod stale rebase clears the resourceVersion precondition
                 // (otherwise the stale forward 409s instead of converging).
-                if freshness == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+                if freshness == klights_cluster_core::StatusApplyFreshness::Stale
                     && preconditions.uid.as_deref() == Some(current.uid.as_str())
                     && !(api_version == "v1" && kind == "Pod")
                 {
@@ -618,87 +617,10 @@ pub(crate) async fn apply_forwarded_command(
                 authoring_node,
             ))
         }
-        StorageCommand::PodSlotTryAdmit {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-        } => {
-            let result = db
-                .pod_slot_try_admit(&namespace, &pod_name, &pod_uid, &node_name)
-                .await?;
-            let rv = match &result {
-                crate::datastore::types::PodSlotAdmissionResult::Admitted { resource_version }
-                | crate::datastore::types::PodSlotAdmissionResult::Blocked {
-                    resource_version,
-                    ..
-                } => *resource_version,
-            };
-            let entry = if matches!(
-                result,
-                crate::datastore::types::PodSlotAdmissionResult::Admitted { .. }
-            ) {
-                Some(ReplicationEntry {
-                    command: StorageCommand::PodSlotTryAdmit {
-                        namespace,
-                        pod_name,
-                        pod_uid,
-                        node_name,
-                    },
-                    meta: meta_for_rv(rv, None, authoring_node),
-                })
-            } else {
-                None
-            };
-            Ok(ForwardedApply {
-                entry,
-                resource: None,
-                node_subnet: None,
-                pod_slot_admission: Some(result.into()),
-                already_applied: false,
-            })
-        }
-        StorageCommand::PodSlotMarkTerminating {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-        } => {
-            let before_rv = db.get_current_resource_version().await.unwrap_or(0);
-            db.pod_slot_mark_terminating(&namespace, &pod_name, &pod_uid, &node_name)
-                .await?;
-            let rv = resource_version_after_mutation(db, before_rv).await?;
-            Ok(ack_apply(
-                StorageCommand::PodSlotMarkTerminating {
-                    namespace,
-                    pod_name,
-                    pod_uid,
-                    node_name,
-                },
-                rv,
-                authoring_node,
-            ))
-        }
-        StorageCommand::PodSlotClearIfUid {
-            namespace,
-            pod_name,
-            pod_uid,
-            node_name,
-        } => {
-            let before_rv = db.get_current_resource_version().await.unwrap_or(0);
-            db.pod_slot_clear_if_uid(&namespace, &pod_name, &pod_uid, &node_name)
-                .await?;
-            let rv = resource_version_after_mutation(db, before_rv).await?;
-            Ok(ack_apply(
-                StorageCommand::PodSlotClearIfUid {
-                    namespace,
-                    pod_name,
-                    pod_uid,
-                    node_name,
-                },
-                rv,
-                authoring_node,
-            ))
+        StorageCommand::PodSlotTryAdmit { .. }
+        | StorageCommand::PodSlotMarkTerminating { .. }
+        | StorageCommand::PodSlotClearIfUid { .. } => {
+            anyhow::bail!("node-local pod-slot commands cannot apply to cluster storage");
         }
         StorageCommand::MovePodToCleanupIntent {
             node_name,
@@ -932,8 +854,8 @@ async fn resource_version_after_mutation(db: &dyn DatastoreBackend, before_rv: i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta};
-    use crate::datastore::types::ResourcePreconditions;
+    use klights_cluster_core::ResourcePreconditions;
+    use klights_cluster_core::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta};
     use serde_json::json;
 
     #[tokio::test]

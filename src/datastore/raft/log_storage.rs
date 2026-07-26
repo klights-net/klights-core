@@ -267,7 +267,8 @@ mod tests {
     use super::*;
     use crate::datastore::node_local::sqlite::SqliteNodeLocalDb;
     use crate::datastore::raft::types::{NodeId, StorageCommandPayload};
-    use crate::datastore::sqlite::{DbExecutor, opener};
+    use crate::sqlite_boundary::DbExecutor;
+    use crate::sqlite_open as opener;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::{Entry, EntryPayload, LeaderId};
 

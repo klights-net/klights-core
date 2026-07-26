@@ -12,7 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::datastore::command::{COMMAND_CODEC_VERSION, supports_command_codec_version};
+use klights_cluster_core::command::{COMMAND_CODEC_VERSION, supports_command_codec_version};
 
 // ---------------------------------------------------------------------------
 // Snapshot envelope types

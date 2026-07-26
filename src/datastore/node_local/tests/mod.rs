@@ -5,11 +5,12 @@ use crate::datastore::node_local::{
     NodeLocalBackend, NodeLocalDb, NodeLocalHandle, OutboxFailureDisposition, OutboxInsert,
     SqliteNodeLocalDb, selector,
 };
-use crate::datastore::sqlite::{DbExecutor, opener};
 use crate::datastore::{
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
     PodSlotMutationResult,
 };
+use crate::sqlite_boundary::DbExecutor;
+use crate::sqlite_open as opener;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn pod_status_classification() -> klights_node_store::OutboxClassification {
@@ -920,10 +921,17 @@ async fn sqlite_backend_implements_node_local_backend() {
 }
 
 #[tokio::test]
-async fn selector_returns_sqlite_node_local_handle() {
+async fn selector_creates_sqlite_node_db_and_node_local_schema() {
+    let directory = tempfile::tempdir().expect("node-local selector fixture");
+    std::fs::set_permissions(
+        directory.path(),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .expect("secure node-local fixture directory");
+    let path = directory.path().join("node.db");
     let handle = selector::open_node_local(
         BackendKind::Sqlite,
-        None,
+        Some(&path),
         supervisor(),
         None,
         "sqlite:node-local-selector-test",
@@ -932,6 +940,19 @@ async fn selector_returns_sqlite_node_local_handle() {
     .expect("open sqlite node-local");
 
     assert_eq!(handle.backend_name(), "sqlite");
+    assert!(path.is_file(), "node-local selector must create node.db");
+    handle
+        .set_node_meta("schema-owner", "node-local")
+        .await
+        .expect("node-local selector must initialize the node metadata table");
+    assert_eq!(
+        handle
+            .get_node_meta("schema-owner")
+            .await
+            .expect("read initialized node metadata table")
+            .as_deref(),
+        Some("node-local")
+    );
 }
 
 #[tokio::test]

@@ -76,11 +76,11 @@ impl SqliteRaftStateMachine {
     }
 }
 
-fn commit_activates_command_codec_v3(commit: &crate::log_apply::LogApplyCommit) -> bool {
+fn commit_activates_command_codec_v3(commit: &klights_cluster_core::LogApplyCommit) -> bool {
     commit.mutations().iter().any(|mutation| {
         matches!(
             mutation,
-            crate::log_apply::LogApplyMutation::PutKlightsMeta { key, value }
+            klights_cluster_core::LogApplyMutation::PutKlightsMeta { key, value }
                 if key == super::node::KEY_COMMAND_CODEC_ACTIVATION_VERSION
                     && value == super::node::COMMAND_CODEC_ACTIVATION_VALUE
         )
@@ -236,8 +236,10 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                     // through the same `apply_log_apply_commit` →
                     // `apply_commit_in_tx` path so cluster.db state is
                     // byte-identical across the cluster.
-                    let commit = crate::log_apply::decode_commit_protobuf(payload.as_slice())
-                        .map_err(|e| apply_err(log_id, e))?;
+                    let commit = crate::replication::log_apply_wire::decode_commit_protobuf(
+                        payload.as_slice(),
+                    )
+                    .map_err(|e| apply_err(log_id, e))?;
                     let activates_command_codec_v3 = commit_activates_command_codec_v3(&commit);
                     let port =
                         super::super::cluster_store_adapter::DatastoreCommittedRaftApply::new(
@@ -367,7 +369,8 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 mod tests {
     use super::*;
     use crate::datastore::node_local::SqliteNodeLocalDb;
-    use crate::datastore::sqlite::{DbExecutor, opener};
+    use crate::sqlite_boundary::DbExecutor;
+    use crate::sqlite_open as opener;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::{Entry, EntryPayload, LeaderId, Membership};
@@ -726,11 +729,11 @@ mod tests {
         seed_snapshot_identity(&backend).await;
         let entries = (1..=crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE as i64)
             .map(|event_id| {
-                crate::log_apply::SnapshotRestoreOperation::new(
+                klights_cluster_core::SnapshotRestoreOperation::new(
                     1_000 + event_id,
                     None,
-                    vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
-                        crate::log_apply::LogApplyWatchEventRow {
+                    vec![klights_cluster_core::LogApplyMutation::PutWatchEvent(
+                        klights_cluster_core::LogApplyWatchEventRow {
                             event_id: Some(event_id),
                             api_version: "v1".to_string(),
                             kind: "ConfigMap".to_string(),
@@ -775,9 +778,9 @@ mod tests {
                 "uid": "late-resource-uid"
             }
         });
-        let commit = crate::log_apply::LogApplyCommit::try_new(vec![
-            crate::log_apply::LogApplyMutation::PutResource(
-                crate::log_apply::LogApplyResourceRow {
+        let commit = klights_cluster_core::LogApplyCommit::try_new(vec![
+            klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),
@@ -792,8 +795,8 @@ mod tests {
                     status_only: false,
                 },
             ),
-            crate::log_apply::LogApplyMutation::PutWatchEvent(
-                crate::log_apply::LogApplyWatchEventRow {
+            klights_cluster_core::LogApplyMutation::PutWatchEvent(
+                klights_cluster_core::LogApplyWatchEventRow {
                     event_id: Some(513),
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
@@ -806,7 +809,7 @@ mod tests {
             ),
         ])
         .expect("post-anchor live commit must be an RV-zero template");
-        let payload = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
+        let payload = crate::replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
         let apply_task = tokio::spawn(async move {
             state_machine
                 .apply(vec![Entry::<TypeConfig> {
@@ -829,10 +832,10 @@ mod tests {
         assert!(
             !decoded.operations.iter().any(|operation| {
                 operation.mutations().iter().any(|mutation| match mutation {
-                    crate::log_apply::LogApplyMutation::PutResource(row) => {
+                    klights_cluster_core::LogApplyMutation::PutResource(row) => {
                         row.name == "late-resource"
                     }
-                    crate::log_apply::LogApplyMutation::PutWatchEvent(row) => {
+                    klights_cluster_core::LogApplyMutation::PutWatchEvent(row) => {
                         row.name == "late-resource"
                     }
                     _ => false,
@@ -860,11 +863,11 @@ mod tests {
         seed_snapshot_identity(&destination).await;
         let entries = (1..=crate::datastore::snapshot_export::SNAPSHOT_EMIT_PAGE_SIZE as i64)
             .map(|event_id| {
-                crate::log_apply::SnapshotRestoreOperation::new(
+                klights_cluster_core::SnapshotRestoreOperation::new(
                     event_id,
                     None,
-                    vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
-                        crate::log_apply::LogApplyWatchEventRow {
+                    vec![klights_cluster_core::LogApplyMutation::PutWatchEvent(
+                        klights_cluster_core::LogApplyWatchEventRow {
                         event_id: Some(event_id),
                         api_version: "v1".to_string(),
                         kind: "ConfigMap".to_string(),
@@ -1332,7 +1335,7 @@ mod tests {
         let max_emitted_rv = data
             .operations
             .iter()
-            .map(crate::log_apply::SnapshotRestoreOperation::resource_version)
+            .map(klights_cluster_core::SnapshotRestoreOperation::resource_version)
             .max()
             .unwrap_or(0);
         assert!(
@@ -1430,7 +1433,7 @@ mod tests {
     }
 
     fn resource_fingerprint_row(
-        resource: crate::datastore::types::Resource,
+        resource: klights_cluster_core::Resource,
     ) -> (
         String,
         String,
@@ -1462,10 +1465,10 @@ mod tests {
             Arc::new(crate::datastore::test_support::in_memory().await);
         let mut sm = build_sm_with_backend(backend.clone()).await;
 
-        let commit = crate::log_apply::test_live_commit(
+        let commit = crate::replication::log_apply_wire::test_live_commit(
             1,
-            vec![crate::log_apply::LogApplyMutation::PutResource(
-                crate::log_apply::LogApplyResourceRow {
+            vec![klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),
@@ -1491,8 +1494,8 @@ mod tests {
                 },
             )],
         );
-        let payload_bytes =
-            crate::log_apply::encode_commit_protobuf(&commit).expect("encode LogApplyCommit");
+        let payload_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+            .expect("encode LogApplyCommit");
 
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(LeaderId::new(3, 10), 1),
@@ -1528,10 +1531,10 @@ mod tests {
             .await
             .expect("establish a list snapshot rv above the raft log index");
 
-        let commit = crate::log_apply::test_live_commit(
+        let commit = crate::replication::log_apply_wire::test_live_commit(
             0,
-            vec![crate::log_apply::LogApplyMutation::PutResource(
-                crate::log_apply::LogApplyResourceRow {
+            vec![klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),
@@ -1556,8 +1559,8 @@ mod tests {
                 },
             )],
         );
-        let payload_bytes =
-            crate::log_apply::encode_commit_protobuf(&commit).expect("encode LogApplyCommit");
+        let payload_bytes = crate::replication::log_apply_wire::encode_commit_protobuf(&commit)
+            .expect("encode LogApplyCommit");
         let entry = Entry::<TypeConfig> {
             log_id: LogId::new(LeaderId::new(3, 10), 42),
             payload: EntryPayload::Normal(
@@ -1618,10 +1621,10 @@ mod tests {
             Some("Pending")
         );
 
-        let commit = crate::log_apply::test_live_commit(
+        let commit = crate::replication::log_apply_wire::test_live_commit(
             0,
-            vec![crate::log_apply::LogApplyMutation::PutResource(
-                crate::log_apply::LogApplyResourceRow {
+            vec![klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
                     api_version: "v1".into(),
                     kind: "Pod".into(),
                     namespace: Some("guestbook".into()),
@@ -1637,7 +1640,7 @@ mod tests {
                 },
             )],
         );
-        let payload = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
+        let payload = crate::replication::log_apply_wire::encode_commit_protobuf(&commit).unwrap();
         let mut sm = build_sm_with_backend(backend.clone()).await;
         let result = sm
             .apply(vec![Entry::<TypeConfig> {

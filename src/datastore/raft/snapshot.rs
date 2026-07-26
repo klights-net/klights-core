@@ -60,22 +60,22 @@ pub(crate) struct RaftSnapshotData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_membership: Option<RaftSnapshotMembership>,
     #[serde(default, alias = "commits", with = "snapshot_operations_serde")]
-    pub operations: Vec<crate::log_apply::SnapshotRestoreOperation>,
+    pub operations: Vec<klights_cluster_core::SnapshotRestoreOperation>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SnapshotOperationWire {
     resource_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    outbox_watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    mutations: Vec<crate::log_apply::LogApplyMutation>,
+    outbox_watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    mutations: Vec<klights_cluster_core::LogApplyMutation>,
 }
 
 mod snapshot_operations_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     use super::SnapshotOperationWire;
-    use crate::log_apply::SnapshotRestoreOperation;
+    use klights_cluster_core::SnapshotRestoreOperation;
 
     pub(super) fn serialize<S>(
         operations: &[SnapshotRestoreOperation],
@@ -426,7 +426,7 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
 
     fn write_operation(
         &mut self,
-        operation: &crate::log_apply::SnapshotRestoreOperation,
+        operation: &klights_cluster_core::SnapshotRestoreOperation,
     ) -> Result<(), SnapshotPersistenceError> {
         if self.floors_open {
             return Err(SnapshotPersistenceError::persistence_failed(
@@ -569,16 +569,18 @@ impl<'a, W: Write + Send> RaftJsonSnapshotEncoder<'a, W> {
             }
             SnapshotCapturePageKind::AppliedOutbox => {
                 for row in page.into_applied_outbox().expect("page kind checked") {
-                    self.write_operation(&crate::log_apply::SnapshotRestoreOperation::new(
+                    self.write_operation(&klights_cluster_core::SnapshotRestoreOperation::new(
                         current_rv,
                         None,
-                        vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)],
+                        vec![klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
+                            row,
+                        )],
                     ))?;
                 }
             }
             SnapshotCapturePageKind::OutboxWatermarks => {
                 for outbox_watermark in page.into_outbox_watermarks().expect("page kind checked") {
-                    self.write_operation(&crate::log_apply::SnapshotRestoreOperation::new(
+                    self.write_operation(&klights_cluster_core::SnapshotRestoreOperation::new(
                         current_rv,
                         Some(outbox_watermark),
                         Vec::new(),
@@ -873,7 +875,7 @@ mod tests {
                 .operations
                 .iter()
                 .any(|operation| operation.mutations().iter().any(|m| {
-                    matches!(m, crate::log_apply::LogApplyMutation::PutResource(row)
+                    matches!(m, klights_cluster_core::LogApplyMutation::PutResource(row)
                     if row.name == "cm-stream-test")
                 })),
             "snapshot must contain the ConfigMap"
@@ -883,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn authoritative_stream_preserves_rv_event_floor_and_outbox_families() {
         let db = test_support::in_memory().await;
-        let outbox = crate::log_apply::LogApplyAppliedOutboxRow {
+        let outbox = klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "snapshot-ledger".into(),
             subject_key: "v1/ConfigMap/default/item/uid".into(),
             operation: "Update".into(),
@@ -892,16 +894,16 @@ mod tests {
             result_proto: vec![1, 2, 3],
             status_stamp: None,
         };
-        let watermark = crate::log_apply::OutboxStreamWatermark {
+        let watermark = klights_cluster_core::OutboxStreamWatermark {
             client_id: "worker-a".into(),
             stream_id: 4,
             stream_seq: 1,
         };
         db.replace_replicated_resource_state(
-            vec![crate::log_apply::SnapshotRestoreOperation::new(
+            vec![klights_cluster_core::SnapshotRestoreOperation::new(
                 7,
                 Some(watermark.clone()),
-                vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
+                vec![klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
                     outbox.clone(),
                 )],
             )],
@@ -962,7 +964,7 @@ mod tests {
             operation.mutations().iter().any(|mutation| {
                 matches!(
                     mutation,
-                    crate::log_apply::LogApplyMutation::PutAppliedOutbox(row)
+                    klights_cluster_core::LogApplyMutation::PutAppliedOutbox(row)
                         if row == &outbox
                 )
             })

@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::datastore::redb::tables;
-use crate::datastore::types::*;
+use klights_cluster_core::{Resource, ResourcePreconditions, WatchReplayPosition};
 
 /// Deserialize a redb value body into an Arc<Value>.
 pub fn body_val(body: &[u8]) -> std::sync::Arc<Value> {
@@ -363,74 +363,9 @@ pub fn resource_in_ns(_key_bytes: &[u8], rv: u64, body: &[u8]) -> Option<Resourc
     })
 }
 
-/// Parse a PodEndpointRow from a JSON value.
-pub fn parse_pod_endpoint(v: &Value) -> Result<PodEndpointRow> {
-    fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-        value
-            .get(field)
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("pod endpoint field {field} must be a string"))
-    }
-
-    fn optional_port(value: &Value, field: &str) -> Result<Option<u16>> {
-        let Some(raw) = value.get(field) else {
-            return Ok(None);
-        };
-        if raw.is_null() {
-            return Ok(None);
-        }
-        let raw = raw
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("pod endpoint field {field} must be an integer"))?;
-        u16::try_from(raw)
-            .ok()
-            .filter(|port| *port != 0)
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("pod endpoint field {field} outside 1..=65535"))
-    }
-
-    fn required_i64(value: &Value, field: &str) -> Result<i64> {
-        value
-            .get(field)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow::anyhow!("pod endpoint field {field} must be an integer"))
-    }
-
-    let mode_str = required_string(v, "mode")?;
-    let pod_ip_str = required_string(v, "pod_ip")?;
-    let pod_ip = pod_ip_str
-        .parse()
-        .map_err(|error| anyhow::anyhow!("invalid pod endpoint pod_ip {pod_ip_str:?}: {error}"))?;
-    let node_ip_str = match v.get("node_ip") {
-        None | Some(Value::Null) => pod_ip_str,
-        Some(Value::String(value)) if value.is_empty() => pod_ip_str,
-        Some(Value::String(value)) => value,
-        Some(_) => {
-            return Err(anyhow::anyhow!(
-                "pod endpoint field node_ip must be a string"
-            ));
-        }
-    };
-    let node_ip = node_ip_str.parse().map_err(|error| {
-        anyhow::anyhow!("invalid pod endpoint node_ip {node_ip_str:?}: {error}")
-    })?;
-    Ok(PodEndpointRow {
-        pod_uid: required_string(v, "pod_uid")?.to_string(),
-        namespace: required_string(v, "namespace")?.to_string(),
-        pod_name: required_string(v, "pod_name")?.to_string(),
-        node_name: required_string(v, "node_name")?.to_string(),
-        mode: PodEndpointMode::parse(mode_str)?,
-        pod_ip,
-        node_ip,
-        host_port_tcp: optional_port(v, "host_port_tcp")?,
-        host_port_udp: optional_port(v, "host_port_udp")?,
-        generation: required_i64(v, "generation")?,
-        updated_at: required_i64(v, "updated_at")?,
-    })
-}
-
 /// Current time in milliseconds since epoch.
-pub fn now_ms() -> i64 {
+#[cfg(test)]
+fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

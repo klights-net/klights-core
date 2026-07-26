@@ -1129,9 +1129,11 @@ async fn test_serviceaccount_watch_modified_via_replicated_apply() {
             }
         })),
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&sa_resource))
-        .await
-        .expect("replicated create apply");
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
+        &sa_resource,
+    ))
+    .await
+    .expect("replicated create apply");
 
     // rv-less label-selector watch, exactly as the conformance client opens it.
     let watch_resp = app
@@ -1174,7 +1176,7 @@ async fn test_serviceaccount_watch_modified_via_replicated_apply() {
         })),
         ..sa_resource.clone()
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&patched))
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&patched))
         .await
         .expect("replicated patch apply");
 
@@ -1270,9 +1272,11 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
             }
         })),
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&sa_resource))
-        .await
-        .expect("replicated create apply");
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
+        &sa_resource,
+    ))
+    .await
+    .expect("replicated create apply");
 
     let watch_resp = app
         .clone()
@@ -1297,8 +1301,8 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
 
     // Apply the patch as a PatchResourceLatest merge mutation, exactly the
     // conformance strategic-merge body.
-    let patch_mutation = crate::log_apply::LogApplyMutation::PatchResourceLatest(
-        crate::log_apply::LogApplyResourcePatch {
+    let patch_mutation = klights_cluster_core::LogApplyMutation::PatchResourceLatest(
+        klights_cluster_core::LogApplyResourcePatch {
             api_version: "v1".into(),
             kind: "ServiceAccount".into(),
             namespace: Some("svcaccounts-patch".into()),
@@ -1313,7 +1317,7 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
         },
     );
     db.apply_log_apply_commit(
-        crate::log_apply::LogApplyCommit::try_new(vec![patch_mutation]).unwrap(),
+        klights_cluster_core::LogApplyCommit::try_new(vec![patch_mutation]).unwrap(),
     )
     .await
     .expect("replicated patch-latest apply");
@@ -1647,9 +1651,11 @@ async fn test_serviceaccount_watch_modified_survives_broadcast_lag() {
             }
         })),
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&sa_resource))
-        .await
-        .expect("replicated create apply");
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
+        &sa_resource,
+    ))
+    .await
+    .expect("replicated create apply");
 
     let watch_resp = app
         .clone()
@@ -1697,7 +1703,7 @@ async fn test_serviceaccount_watch_modified_survives_broadcast_lag() {
                 }
             })),
         };
-        db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&other))
+        db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&other))
             .await
             .expect("flood apply");
     }
@@ -1720,7 +1726,7 @@ async fn test_serviceaccount_watch_modified_survives_broadcast_lag() {
         })),
         ..sa_resource.clone()
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&patched))
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&patched))
         .await
         .expect("replicated patch apply");
 
@@ -1837,9 +1843,11 @@ async fn test_serviceaccount_watch_modified_when_baseline_empty() {
             }
         })),
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&sa_resource))
-        .await
-        .expect("create apply");
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
+        &sa_resource,
+    ))
+    .await
+    .expect("create apply");
 
     rv += 1;
     let patched = crate::datastore::Resource {
@@ -1857,7 +1865,7 @@ async fn test_serviceaccount_watch_modified_when_baseline_empty() {
         })),
         ..sa_resource.clone()
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&patched))
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&patched))
         .await
         .expect("patch apply");
 
@@ -6739,7 +6747,7 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
     assert_eq!(watch_resp.status(), StatusCode::OK);
     let mut stream = watch_resp.into_body().into_data_stream();
 
-    let command = crate::datastore::command::StorageCommand::UpdateStatus {
+    let command = klights_cluster_core::command::StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
         namespace: Some(namespace.to_string()),
@@ -6771,7 +6779,7 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
         .build_log_apply_commit_for_outbox(
             "guestbook-watch-raft-status",
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             node,
         )
         .await
@@ -7839,7 +7847,7 @@ async fn test_rv_less_selector_watch_delivers_live_added_below_establishment_flo
     let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
 
     let create_rv = floor - 1;
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
         &crate::datastore::Resource {
             id: 0,
             api_version: "v1".into(),
@@ -8171,7 +8179,7 @@ async fn test_selector_watch_from_list_rv_delivers_baseline_delete_below_floor()
             "data": {"k": "v"}
         })),
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&cm))
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&cm))
         .await
         .expect("replicated create apply");
 
@@ -8262,9 +8270,9 @@ async fn test_selector_watch_from_list_rv_delivers_baseline_delete_below_floor()
         "test setup requires delete rv above object rv but below list rv"
     );
     db.apply_log_apply_commit(
-        crate::log_apply::LogApplyCommit::try_new(vec![
-            crate::log_apply::LogApplyMutation::DeleteResource(
-                crate::log_apply::LogApplyResourceKey {
+        klights_cluster_core::LogApplyCommit::try_new(vec![
+            klights_cluster_core::LogApplyMutation::DeleteResource(
+                klights_cluster_core::LogApplyResourceKey {
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some(namespace.to_string()),
@@ -9372,7 +9380,7 @@ async fn test_crd_watchlist_emits_initial_events_end_bookmark() {
         .await
         .unwrap()
         .saturating_add(1);
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
         &crate::datastore::Resource {
             id: 0,
             api_version: "selwatch.example.com/v1".into(),
@@ -9523,7 +9531,7 @@ async fn test_rv_less_selector_cr_watch_delivers_live_added_below_establishment_
     let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
 
     let create_rv = floor - 1;
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(
         &crate::datastore::Resource {
             id: 0,
             api_version: "selwatch.example.com/v1".into(),
@@ -9644,7 +9652,7 @@ async fn test_rv_selector_cr_watch_delivers_baseline_delete_below_floor() {
             }
         })),
     };
-    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&cr))
+    db.apply_log_apply_commit(klights_cluster_core::LogApplyCommit::put_resource(&cr))
         .await
         .expect("replicated CR create apply");
 
@@ -9729,9 +9737,9 @@ async fn test_rv_selector_cr_watch_delivers_baseline_delete_below_floor() {
     let delete_rv = list_rv - 1;
     assert!(delete_rv > create_rv);
     db.apply_log_apply_commit(
-        crate::log_apply::LogApplyCommit::try_new(vec![
-            crate::log_apply::LogApplyMutation::DeleteResource(
-                crate::log_apply::LogApplyResourceKey {
+        klights_cluster_core::LogApplyCommit::try_new(vec![
+            klights_cluster_core::LogApplyMutation::DeleteResource(
+                klights_cluster_core::LogApplyResourceKey {
                     api_version: "selwatch.example.com/v1".to_string(),
                     kind: "Selw".to_string(),
                     namespace: Some(namespace.to_string()),

@@ -1,5 +1,4 @@
-//! `RedbNetworkStore` — IPAM allocation, pod network endpoint management,
-//! node subnet management, and pod endpoint tracking.
+//! `RedbNetworkStore` — cluster-owned node subnet and dataplane metadata.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -8,10 +7,8 @@ use std::sync::Arc;
 use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use tokio::sync::broadcast;
 
 use crate::datastore::redb::accessor::RedbAccessor;
-use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
 use klights_types::HostPortRange;
@@ -20,18 +17,11 @@ use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
 pub struct RedbNetworkStore {
     pub accessor: Arc<RedbAccessor>,
-    endpoint_tx: broadcast::Sender<PodEndpointEvent>,
 }
 
 impl RedbNetworkStore {
-    pub fn new(
-        accessor: Arc<RedbAccessor>,
-        endpoint_tx: broadcast::Sender<PodEndpointEvent>,
-    ) -> Self {
-        Self {
-            accessor,
-            endpoint_tx,
-        }
+    pub fn new(accessor: Arc<RedbAccessor>) -> Self {
+        Self { accessor }
     }
 
     async fn db_call<T, F>(&self, label: &str, f: F) -> Result<T>
@@ -40,142 +30,6 @@ impl RedbNetworkStore {
         F: FnOnce(&::redb::Database) -> Result<T> + Send + 'static,
     {
         self.accessor.call(label, f).await
-    }
-
-    // -----------------------------------------------------------------------
-    // IPAM / pod network
-    // -----------------------------------------------------------------------
-
-    pub async fn ipam_alloc(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<(String, u32)> {
-        let request = request.into_owned();
-        self.db_call("ipam_alloc_impl", move |db| {
-            let request = request.as_borrowed();
-            if request.subnet.size < 4 {
-                return Err(anyhow!("subnet too small for pod IPAM"));
-            }
-            let start = request.subnet.base_int + 2;
-            let end = request.subnet.base_int + request.subnet.size - 2;
-            if start > end {
-                return Err(anyhow!("subnet has no usable pod IPs"));
-            }
-
-            let w = db.begin_write()?;
-
-            let existing_bytes: Option<Vec<u8>> = {
-                let t = w.open_table(tables::POD_NETWORKS)?;
-                let opt = t.get(request.sandbox_id)?;
-                opt.map(|g| g.value().to_vec())
-            };
-            if let Some(bytes) = existing_bytes {
-                let existing = parse_pod_network_value(&bytes)?;
-                w.commit()?;
-                return Ok((existing.ip.to_string(), existing.ip_int));
-            }
-
-            let mut used = BTreeSet::new();
-            {
-                let t = w.open_table(tables::POD_NETWORKS)?;
-                for e in t.iter()? {
-                    let (_, value) = e?;
-                    used.insert(parse_pod_network_value(value.value())?.ip_int);
-                }
-            }
-            let ip_int = (start..=end)
-                .find(|i| !used.contains(i))
-                .ok_or_else(|| anyhow!("no free IP"))?;
-            let ip = Ipv4Addr::from(ip_int);
-            {
-                let mut t = w.open_table(tables::POD_NETWORKS)?;
-                let v = serde_json::json!({
-                    "ip": ip.to_string(),
-                    "ip_int": ip_int,
-                    "veth": request.link.veth_host,
-                    "netns": request.link.netns_path,
-                    "ns": request.pod.namespace,
-                    "pod": request.pod.name,
-                    "uid": request.pod.uid,
-                });
-                t.insert(request.sandbox_id, serde_json::to_vec(&v)?.as_slice())?;
-            }
-            w.commit()?;
-            Ok((ip.to_string(), ip_int))
-        })
-        .await
-    }
-
-    pub async fn get_pnet(&self, sid: &str) -> Result<Option<PodNetworkEndpoint>> {
-        let sid_owned = sid.to_string();
-        self.db_call("get_pnet_impl", move |db| {
-            let sid: &str = &sid_owned;
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::POD_NETWORKS)?;
-            match t.get(sid)? {
-                Some(value) => Ok(Some(parse_pod_network_value(value.value())?.endpoint())),
-                None => Ok(None),
-            }
-        })
-        .await
-    }
-
-    pub async fn get_pnet_for_pod(
-        &self,
-        ns: &str,
-        pod_name: &str,
-        pod_uid: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        let ns_owned = ns.to_string();
-        let pod_name_owned = pod_name.to_string();
-        let pod_uid_owned = pod_uid.to_string();
-        self.db_call("get_pnet_for_pod_impl", move |db| {
-            let ns: &str = &ns_owned;
-            let pod_name: &str = &pod_name_owned;
-            let pod_uid: &str = &pod_uid_owned;
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::POD_NETWORKS)?;
-            for e in t.iter()? {
-                let (_, val) = e?;
-                let network = parse_pod_network_value(val.value())?;
-                if network.namespace == ns
-                    && network.pod_name == pod_name
-                    && network.pod_uid == pod_uid
-                {
-                    return Ok(Some(network.endpoint()));
-                }
-            }
-            Ok(None)
-        })
-        .await
-    }
-
-    pub async fn delete_pnet(&self, sid: &str) -> Result<()> {
-        let sid_owned = sid.to_string();
-        self.db_call("delete_pnet_impl", move |db| {
-            let sid: &str = &sid_owned;
-            let w = db.begin_write()?;
-            {
-                let mut t = w.open_table(tables::POD_NETWORKS)?;
-                t.remove(sid)?;
-            }
-            Ok(w.commit()?)
-        })
-        .await
-    }
-
-    pub async fn list_pnet_sandbox_ids(&self) -> Result<Vec<String>> {
-        self.db_call("list_pnet_sandbox_ids_impl", move |db| {
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::POD_NETWORKS)?;
-            let mut ids = Vec::new();
-            for e in t.iter()? {
-                let (k, _) = e?;
-                ids.push(k.value().to_string());
-            }
-            Ok(ids)
-        })
-        .await
     }
 
     // -----------------------------------------------------------------------
@@ -445,98 +299,9 @@ impl RedbNetworkStore {
         })
         .await
     }
-
-    // -----------------------------------------------------------------------
-    // Pod endpoints
-    // -----------------------------------------------------------------------
-
-    pub async fn pod_endpoint_get_by_pod_ip(
-        &self,
-        pod_ip: Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>> {
-        self.db_call("pod_endpoint_get_by_pod_ip_impl", move |db| {
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::POD_ENDPOINTS)?;
-            for e in t.iter()? {
-                let (_, val) = e?;
-                let v: Value = serde_json::from_slice(val.value())
-                    .map_err(|error| anyhow!("malformed persisted pod endpoint JSON: {error}"))?;
-                let endpoint = helpers::parse_pod_endpoint(&v)?;
-                if endpoint.pod_ip == pod_ip {
-                    return Ok(Some(endpoint));
-                }
-            }
-            Ok(None)
-        })
-        .await
-    }
-
-    pub async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
-        self.db_call("pod_endpoint_list_all_impl", move |db| {
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::POD_ENDPOINTS)?;
-            let mut rows = Vec::new();
-            for e in t.iter()? {
-                let (_, val) = e?;
-                let v: Value = serde_json::from_slice(val.value())
-                    .map_err(|error| anyhow!("malformed persisted pod endpoint JSON: {error}"))?;
-                rows.push(helpers::parse_pod_endpoint(&v)?);
-            }
-            rows.sort_by(|a, b| a.pod_uid.cmp(&b.pod_uid));
-            Ok(rows)
-        })
-        .await
-    }
-
-    pub fn subscribe_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        self.endpoint_tx.subscribe()
-    }
 }
 
 // Standalone helpers
-
-struct PersistedPodNetwork {
-    ip: Ipv4Addr,
-    ip_int: u32,
-    veth_host: String,
-    netns_path: String,
-    namespace: String,
-    pod_name: String,
-    pod_uid: String,
-}
-
-impl PersistedPodNetwork {
-    fn endpoint(self) -> PodNetworkEndpoint {
-        PodNetworkEndpoint {
-            ip_addr: self.ip.to_string(),
-            veth_host: self.veth_host,
-            netns_path: self.netns_path,
-        }
-    }
-}
-
-fn parse_pod_network_value(body: &[u8]) -> Result<PersistedPodNetwork> {
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|error| anyhow!("malformed persisted pod network JSON: {error}"))?;
-    let ip: Ipv4Addr = required_persisted_string(&value, "pod network", "ip")?
-        .parse()
-        .map_err(|error| anyhow!("invalid persisted pod network IP: {error}"))?;
-    let ip_int = required_persisted_u32(&value, "pod network", "ip_int")?;
-    if ip_int != u32::from(ip) {
-        return Err(anyhow!(
-            "persisted pod network ip_int does not match its IP address"
-        ));
-    }
-    Ok(PersistedPodNetwork {
-        ip,
-        ip_int,
-        veth_host: required_persisted_string(&value, "pod network", "veth")?.to_string(),
-        netns_path: required_persisted_string(&value, "pod network", "netns")?.to_string(),
-        namespace: required_persisted_string(&value, "pod network", "ns")?.to_string(),
-        pod_name: required_persisted_string(&value, "pod network", "pod")?.to_string(),
-        pod_uid: required_persisted_string(&value, "pod network", "uid")?.to_string(),
-    })
-}
 
 struct PersistedNodeSubnet {
     subnet: PodSubnet,
@@ -688,12 +453,8 @@ fn parse_peer_mode(s: &str) -> Result<NodePeerMode> {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::broadcast;
-
     use crate::datastore::redb::accessor::RedbAccessor;
-    use crate::datastore::redb::helpers;
     use crate::datastore::redb::open_boundary;
-    use crate::datastore::redb::sandbox::RedbSandboxStore;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;
@@ -702,138 +463,7 @@ mod tests {
         let db = open_boundary::open_in_memory_blocking().unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        let (tx, _) = broadcast::channel(256);
-        RedbNetworkStore::new(accessor, tx)
-    }
-
-    fn ipam_request<'a>(
-        sandbox_id: &'a str,
-        pod_name: &'a str,
-        pod_uid: &'a str,
-        subnet_size: u32,
-    ) -> PodNetworkAllocationRequest<'a> {
-        PodNetworkAllocationRequest::new(
-            sandbox_id,
-            PodNetworkAllocationPod::new("ns", pod_name, pod_uid),
-            PodNetworkAllocationSubnet::new(0x0a000000, subnet_size),
-            PodNetworkAllocationLink::new("veth0", "/ns"),
-        )
-    }
-
-    #[test]
-    fn parse_peer_mode_rejects_unknown_values() {
-        assert_eq!(parse_peer_mode("root").unwrap(), NodePeerMode::Root);
-        assert!(parse_peer_mode("garbage").is_err());
-        assert!(parse_peer_mode("").is_err());
-    }
-
-    #[test]
-    fn parse_peer_mode_rootless() {
-        assert_eq!(parse_peer_mode("rootless").unwrap(), NodePeerMode::Rootless);
-    }
-
-    #[test]
-    fn parse_pod_endpoint_infers_node_ip_from_pod_ip() {
-        let v = serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"encrypted_direct","pod_ip":"10.0.0.1","generation":1,"updated_at":2});
-        let row = helpers::parse_pod_endpoint(&v).unwrap();
-        assert_eq!(row.node_ip, std::net::Ipv4Addr::new(10, 0, 0, 1));
-    }
-
-    #[test]
-    fn parse_pod_endpoint_explicit_node_ip() {
-        let v = serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"encrypted_direct","pod_ip":"10.0.0.1","node_ip":"192.168.0.1","generation":1,"updated_at":2});
-        let row = helpers::parse_pod_endpoint(&v).unwrap();
-        assert_eq!(row.node_ip, std::net::Ipv4Addr::new(192, 168, 0, 1));
-    }
-
-    #[test]
-    fn parse_pod_endpoint_host_ports() {
-        let v = serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"hostport","pod_ip":"10.0.0.1","node_ip":"192.0.2.1","host_port_tcp":8080,"host_port_udp":9090,"generation":1,"updated_at":2});
-        let row = helpers::parse_pod_endpoint(&v).unwrap();
-        assert_eq!(row.host_port_tcp, Some(8080));
-        assert_eq!(row.host_port_udp, Some(9090));
-    }
-
-    #[test]
-    fn parse_pod_endpoint_rejects_malformed_mode_ip_and_ports() {
-        let cases = [
-            (
-                "unknown mode",
-                serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"vxlan","pod_ip":"10.0.0.1","generation":1,"updated_at":2}),
-            ),
-            (
-                "invalid pod IP",
-                serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"encrypted_direct","pod_ip":"not-an-ip","generation":1,"updated_at":2}),
-            ),
-            (
-                "invalid node IP",
-                serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"hostport","pod_ip":"10.0.0.1","node_ip":"not-an-ip","host_port_tcp":8080,"generation":1,"updated_at":2}),
-            ),
-            (
-                "zero port",
-                serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"hostport","pod_ip":"10.0.0.1","node_ip":"192.0.2.1","host_port_tcp":0,"generation":1,"updated_at":2}),
-            ),
-            (
-                "negative port",
-                serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"hostport","pod_ip":"10.0.0.1","node_ip":"192.0.2.1","host_port_udp":-1,"generation":1,"updated_at":2}),
-            ),
-            (
-                "oversized port",
-                serde_json::json!({"pod_uid":"u","namespace":"ns","pod_name":"p","node_name":"n","mode":"hostport","pod_ip":"10.0.0.1","node_ip":"192.0.2.1","host_port_tcp":65536,"generation":1,"updated_at":2}),
-            ),
-        ];
-        for (name, value) in cases {
-            assert!(
-                helpers::parse_pod_endpoint(&value).is_err(),
-                "{name} must be rejected instead of normalized: {value}"
-            );
-        }
-    }
-
-    async fn insert_raw_pod_endpoint(store: &RedbNetworkStore, key: &str, body: &[u8]) {
-        let key = key.to_string();
-        let body = body.to_vec();
-        store
-            .accessor
-            .call("insert_raw_pod_endpoint_test", move |db| {
-                let write = db.begin_write()?;
-                {
-                    let mut table = write.open_table(tables::POD_ENDPOINTS)?;
-                    table.insert(key.as_str(), body.as_slice())?;
-                }
-                Ok(write.commit()?)
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn insert_raw_pod_network(store: &RedbNetworkStore, key: &str, body: &[u8]) {
-        let key = key.to_string();
-        let body = body.to_vec();
-        store
-            .accessor
-            .call("insert_raw_pod_network_test", move |db| {
-                let write = db.begin_write()?;
-                {
-                    let mut table = write.open_table(tables::POD_NETWORKS)?;
-                    table.insert(key.as_str(), body.as_slice())?;
-                }
-                Ok(write.commit()?)
-            })
-            .await
-            .unwrap();
-    }
-
-    fn valid_pod_network_value() -> Value {
-        serde_json::json!({
-            "ip": "10.0.0.2",
-            "ip_int": 0x0a000002_u32,
-            "veth": "veth0",
-            "netns": "/ns",
-            "ns": "ns",
-            "pod": "pod",
-            "uid": "uid",
-        })
+        RedbNetworkStore::new(accessor)
     }
 
     fn valid_node_subnet_value() -> Value {
@@ -885,19 +515,6 @@ mod tests {
             })
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn pod_endpoint_read_and_list_reject_malformed_json() {
-        let s = store();
-        insert_raw_pod_endpoint(&s, "broken", b"{not-json").await;
-
-        assert!(s.pod_endpoint_list_all().await.is_err());
-        assert!(
-            s.pod_endpoint_get_by_pod_ip(Ipv4Addr::new(10, 0, 0, 1))
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]
@@ -1209,170 +826,5 @@ mod tests {
                 "{name} must be rejected"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn ipam_alloc_idempotent() {
-        let s = store();
-        let (ip1, int1) = s
-            .ipam_alloc(ipam_request("s1", "p", "u", 256))
-            .await
-            .unwrap();
-        let (ip2, int2) = s
-            .ipam_alloc(ipam_request("s1", "p", "u", 256))
-            .await
-            .unwrap();
-        assert_eq!(ip1, ip2);
-        assert_eq!(int1, int2);
-    }
-
-    #[tokio::test]
-    async fn pod_network_paths_reject_corrupt_persisted_rows() {
-        let mut cases: Vec<(String, Vec<u8>)> =
-            vec![("malformed JSON".to_string(), b"{not-json".to_vec())];
-
-        for field in ["ip", "ip_int", "veth", "netns", "ns", "pod", "uid"] {
-            let mut missing = valid_pod_network_value();
-            missing.as_object_mut().unwrap().remove(field);
-            cases.push((
-                format!("missing {field}"),
-                serde_json::to_vec(&missing).unwrap(),
-            ));
-
-            let mut wrong_type = valid_pod_network_value();
-            wrong_type[field] = Value::Bool(true);
-            cases.push((
-                format!("wrong-type {field}"),
-                serde_json::to_vec(&wrong_type).unwrap(),
-            ));
-        }
-
-        for (name, ip_int) in [
-            ("negative ip_int", serde_json::json!(-1)),
-            (
-                "ip_int outside u32",
-                serde_json::json!(u64::from(u32::MAX) + 1),
-            ),
-            ("IP/ip_int mismatch", serde_json::json!(0x0a000003_u32)),
-        ] {
-            let mut value = valid_pod_network_value();
-            value["ip_int"] = ip_int;
-            cases.push((name.to_string(), serde_json::to_vec(&value).unwrap()));
-        }
-
-        for (name, body) in cases {
-            let s = store();
-            insert_raw_pod_network(&s, "corrupt", &body).await;
-            assert!(
-                s.ipam_alloc(ipam_request("corrupt", "pod", "uid", 256))
-                    .await
-                    .is_err(),
-                "{name} must fail idempotent allocation"
-            );
-            assert!(
-                s.ipam_alloc(ipam_request("fresh", "fresh", "fresh-uid", 256))
-                    .await
-                    .is_err(),
-                "{name} must fail the used-address scan"
-            );
-            assert!(
-                s.get_pnet("corrupt").await.is_err(),
-                "{name} must fail get-by-sandbox"
-            );
-            assert!(
-                s.get_pnet_for_pod("ns", "pod", "uid").await.is_err(),
-                "{name} must fail get-by-pod"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn valid_persisted_pod_network_row_remains_compatible() {
-        let s = store();
-        let body = serde_json::to_vec(&valid_pod_network_value()).unwrap();
-        insert_raw_pod_network(&s, "legacy", &body).await;
-
-        let existing = s
-            .ipam_alloc(ipam_request("legacy", "pod", "uid", 256))
-            .await
-            .unwrap();
-        assert_eq!(existing, ("10.0.0.2".to_string(), 0x0a000002));
-
-        let by_sandbox = s.get_pnet("legacy").await.unwrap().unwrap();
-        let by_pod = s
-            .get_pnet_for_pod("ns", "pod", "uid")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(by_sandbox, by_pod);
-        assert_eq!(by_sandbox.ip_addr, "10.0.0.2");
-
-        let fresh = s
-            .ipam_alloc(ipam_request("fresh", "fresh", "fresh-uid", 256))
-            .await
-            .unwrap();
-        assert_ne!(fresh.1, 0x0a000002);
-    }
-
-    #[tokio::test]
-    async fn ipam_alloc_uses_first_free_ip() {
-        let s = store();
-        let (ip1, _) = s
-            .ipam_alloc(ipam_request("s1", "p1", "u1", 256))
-            .await
-            .unwrap();
-        let (ip2, _) = s
-            .ipam_alloc(ipam_request("s2", "p2", "u2", 256))
-            .await
-            .unwrap();
-        assert_ne!(ip1, ip2);
-    }
-
-    #[tokio::test]
-    async fn ipam_alloc_exhaustion_errors() {
-        let s = store();
-        // Tiny subnet: only 2 usable IPs (subnet_base+2 .. subnet_base+sz-2)
-        // sz=4 means range is 2..2 = empty
-        let err = s
-            .ipam_alloc(ipam_request("s1", "p", "u", 3))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("no free")
-                || err.to_string().contains("usable")
-                || err.to_string().contains("too small")
-        );
-    }
-
-    #[tokio::test]
-    async fn sandbox_record_and_get_by_uid() {
-        let s = RedbSandboxStore::new(store().accessor.clone());
-        s.record("ns", "pod", "uid-1", "sid-abc").await.unwrap();
-        let got = s.get_for_uid("ns", "pod", "uid-1").await.unwrap();
-        assert_eq!(got.as_deref(), Some("sid-abc"));
-    }
-
-    #[tokio::test]
-    async fn sandbox_get_for_pod_returns_newest() {
-        let s = RedbSandboxStore::new(store().accessor.clone());
-        s.record("ns", "pod", "uid-a", "sid-old").await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        s.record("ns", "pod", "uid-b", "sid-new").await.unwrap();
-        let newest = s.get_for_pod("ns", "pod").await.unwrap();
-        assert_eq!(newest.as_deref(), Some("sid-new"));
-    }
-
-    #[tokio::test]
-    async fn sandbox_delete_for_uid_only_removes_matching_sid() {
-        let s = RedbSandboxStore::new(store().accessor.clone());
-        s.record("ns", "pod", "uid-1", "sid-a").await.unwrap();
-        s.delete_for_uid("ns", "pod", "uid-1", "sid-wrong")
-            .await
-            .unwrap();
-        assert!(s.get_for_uid("ns", "pod", "uid-1").await.unwrap().is_some());
-        s.delete_for_uid("ns", "pod", "uid-1", "sid-a")
-            .await
-            .unwrap();
-        assert!(s.get_for_uid("ns", "pod", "uid-1").await.unwrap().is_none());
     }
 }

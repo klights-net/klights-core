@@ -5,7 +5,8 @@ use anyhow::Result;
 
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{NodeLocalHandle, SqliteNodeLocalDb};
-use crate::datastore::sqlite::{DbExecutor, opener};
+use crate::sqlite_boundary::DbExecutor;
+use crate::sqlite_open as opener;
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use klights_supervisor::TaskSupervisor;
 

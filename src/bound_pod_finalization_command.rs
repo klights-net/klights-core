@@ -4,7 +4,7 @@
 //! subsystems construct this authority-bearing command only through this
 //! composition-root capability.
 
-use crate::datastore::command::StorageCommand;
+use klights_cluster_core::command::StorageCommand;
 
 pub(crate) fn author(
     namespace: String,

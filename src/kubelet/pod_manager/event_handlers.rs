@@ -708,16 +708,35 @@ mod tests {
         ))
     }
 
-    fn fixture_pod_repo(
+    async fn fixture_pod_repo(
         db_handle: crate::datastore::DatastoreHandle,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Arc<crate::kubelet::pod_repository::PodRepository> {
-        let pod_repo = Arc::new(crate::kubelet::pod_repository::PodRepository::new(
-            db_handle,
-            supervisor.clone(),
-            Arc::new(crate::side_effects::SideEffectRegistry::new()),
-            crate::side_effects::SideEffectMetrics::new(),
-        ));
+    ) -> (
+        Arc<crate::kubelet::pod_repository::PodRepository>,
+        crate::datastore::node_local::NodeLocalHandle,
+    ) {
+        let node_local =
+            crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
+        let pod_repo = Arc::new(
+            crate::kubelet::pod_repository::PodRepository::build_parts(
+                crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+                    db: db_handle,
+                    node_local: Some(node_local.clone()),
+                    supervisor: supervisor.clone(),
+                    side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
+                    metrics: crate::side_effects::SideEffectMetrics::new(),
+                    pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
+                        node_local.clone(),
+                    ),
+                    assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+                    scheduling_mode:
+                        crate::kubelet::pod_repository::PodSchedulingMode::InlineSingleNode,
+                    outbox: None,
+                    cluster_api: None,
+                },
+            )
+            .repository,
+        );
 
         let registry = Arc::new(crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
             supervisor,
@@ -735,7 +754,7 @@ mod tests {
             ),
         );
         pod_repo.set_pod_lifecycle_router_for_node(router, "worker-a".to_string());
-        pod_repo
+        (pod_repo, node_local)
     }
 
     #[test]
@@ -795,7 +814,7 @@ mod tests {
     async fn namespace_termination_event_enqueues_actor_delete_for_terminating_local_pod() {
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
-        let pod_repo = fixture_pod_repo(db_handle.clone(), supervisor);
+        let (pod_repo, node_local) = fixture_pod_repo(db_handle.clone(), supervisor).await;
 
         db.create_resource(
             "v1",
@@ -837,8 +856,8 @@ mod tests {
         )
         .await;
 
-        let row = db_handle
-            .pod_workqueue_claim_due(i64::MAX)
+        let row = node_local
+            .claim_workqueue_due(i64::MAX)
             .await
             .expect("claim pod workqueue row")
             .expect("namespace termination event must enqueue local actor delete work");
@@ -859,7 +878,7 @@ mod tests {
 
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
-        let pod_repo = fixture_pod_repo(db_handle.clone(), supervisor.clone());
+        let (pod_repo, _node_local) = fixture_pod_repo(db_handle.clone(), supervisor.clone()).await;
         let pod_cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents> =
             Arc::new(crate::control_plane::client::local::LocalApiClient::new(
                 db_handle.clone(),

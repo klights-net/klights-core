@@ -63,13 +63,13 @@ impl PodSubresourceService {
             ));
         }
         let mut status = status;
-        crate::datastore::status_merge_policy::merge_status_for_apply(
+        klights_cluster_core::merge_status_for_apply(
             "v1",
             "Pod",
             current.data.as_ref(),
             &mut status,
-            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+            klights_cluster_core::StatusApplyFreshness::Fresh,
+            klights_cluster_core::StatusApplyOrigin::ApiSubresource,
         );
         let previous = std::sync::Arc::unwrap_or_clone(current.data);
         let updated = self
@@ -121,13 +121,13 @@ impl PodSubresourceService {
         )
         .map_err(|e| anyhow!("apply_patch failed: {e:?}"))?;
         let mut next_status = patched.get("status").cloned().unwrap_or(Value::Null);
-        crate::datastore::status_merge_policy::merge_status_for_apply(
+        klights_cluster_core::merge_status_for_apply(
             "v1",
             "Pod",
             current.data.as_ref(),
             &mut next_status,
-            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+            klights_cluster_core::StatusApplyFreshness::Fresh,
+            klights_cluster_core::StatusApplyOrigin::ApiSubresource,
         );
         let previous = std::sync::Arc::unwrap_or_clone(current.data);
         let updated = self

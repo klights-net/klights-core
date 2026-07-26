@@ -7,7 +7,7 @@ use super::NodeSubnet;
 
 /// Standalone function that initializes the schema on a raw connection.
 /// Used by the opener in `executor.rs::open_with_opts`.
-pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+pub(crate) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
 
     // Namespaced resources: namespace is NOT NULL, UNIQUE(api_version, kind, namespace, name).

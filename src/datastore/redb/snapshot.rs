@@ -9,11 +9,11 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::datastore::command::COMMAND_CODEC_VERSION;
 use crate::datastore::snapshot::{
     DatastoreSnapshotter, SnapshotEntry, SnapshotEnvelope, SnapshotTable,
     compute_schema_fingerprint,
 };
+use klights_cluster_core::command::COMMAND_CODEC_VERSION;
 
 use super::RedbDatastore;
 use super::tables;
@@ -336,7 +336,6 @@ mod tests {
     use super::*;
     use crate::datastore::backend::DatastoreBackend;
     use crate::datastore::redb::RedbDatastore;
-    use klights_types::PodIdentity;
     use serde_json::json;
 
     async fn fresh_redb() -> RedbDatastore {
@@ -437,21 +436,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_excludes_node_local_tables() {
         let db = fresh_redb().await;
-
-        // Create node-local state
-        db.record_sandbox("ns1", "pod1", "uid1", "sid1")
-            .await
-            .unwrap();
-        db.ipam_allocate_and_record_pod_network(
-            "sid1",
-            &PodIdentity::new("ns1", "pod1", "uid1"),
-            0x0A2A0100,
-            256,
-            "veth0",
-            "/ns/sid1",
-        )
-        .await
-        .unwrap();
 
         // Snapshot
         let envelope = db.snapshot().await.unwrap();

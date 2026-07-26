@@ -542,6 +542,74 @@ pub enum CommandError {
     Internal { message: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseRenewCommandError {
+    NotLeaseMutation,
+    InvalidTarget,
+    AuthoringNodeMismatch {
+        authoring_node: String,
+        lease_name: String,
+    },
+}
+
+impl std::fmt::Display for LeaseRenewCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotLeaseMutation => {
+                formatter.write_str("LeaseRenew must carry a Lease create/update command")
+            }
+            Self::InvalidTarget => formatter.write_str(
+                "LeaseRenew must target coordination.k8s.io/v1 Lease in kube-node-lease",
+            ),
+            Self::AuthoringNodeMismatch {
+                authoring_node,
+                lease_name,
+            } => write!(
+                formatter,
+                "LeaseRenew authoring node {authoring_node} cannot renew Lease {lease_name}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LeaseRenewCommandError {}
+
+pub fn validate_lease_renew_command(
+    command: &StorageCommand,
+    authoring_node: &str,
+) -> Result<(), LeaseRenewCommandError> {
+    let (api_version, kind, namespace, name) = match command {
+        StorageCommand::CreateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        }
+        | StorageCommand::UpdateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } => (api_version, kind, namespace, name),
+        _ => return Err(LeaseRenewCommandError::NotLeaseMutation),
+    };
+    if api_version != "coordination.k8s.io/v1"
+        || kind != "Lease"
+        || namespace.as_deref() != Some("kube-node-lease")
+    {
+        return Err(LeaseRenewCommandError::InvalidTarget);
+    }
+    if name != authoring_node {
+        return Err(LeaseRenewCommandError::AuthoringNodeMismatch {
+            authoring_node: authoring_node.to_string(),
+            lease_name: name.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Serde helper that serializes `serde_json::Value` as its native JSON value.
 pub mod serde_bytes_base64 {
     pub fn serialize<S: serde::Serializer>(
@@ -705,3 +773,6 @@ mod tests {
         assert_eq!(command_id.to_string(), "test-123");
     }
 }
+/// Kubernetes' default node lease duration used by authored Lease objects and
+/// admission freshness checks.
+pub const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 = 30;

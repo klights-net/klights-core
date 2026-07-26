@@ -66,6 +66,38 @@ pub fn pod_repository_for_test(
     ))
 }
 
+pub async fn pod_repository_with_node_local_for_test(
+    db: &crate::datastore::sqlite::Datastore,
+) -> (
+    Arc<crate::kubelet::pod_repository::PodRepository>,
+    crate::datastore::node_local::NodeLocalHandle,
+) {
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
+    ));
+    let node_local =
+        crate::kubelet::pod_repository::test_node_local_store(supervisor.clone()).await;
+    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+    let repository = crate::kubelet::pod_repository::PodRepository::build_parts(
+        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+            db: db_handle,
+            node_local: Some(node_local.clone()),
+            supervisor,
+            side_effects: Arc::new(crate::side_effects::SideEffectRegistry::new()),
+            metrics: crate::side_effects::SideEffectMetrics::new(),
+            pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
+                node_local.clone(),
+            ),
+            assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+            scheduling_mode: crate::kubelet::pod_repository::PodSchedulingMode::InlineSingleNode,
+            outbox: None,
+            cluster_api: None,
+        },
+    )
+    .repository;
+    (Arc::new(repository), node_local)
+}
+
 /// Build the leader/deferred `PodRepository` shape used by multinode controller
 /// wiring, where metadata writes go through the outbox before the local store
 /// observes them.

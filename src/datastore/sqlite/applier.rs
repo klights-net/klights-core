@@ -12,8 +12,8 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 
-use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::sequenced::DatastoreApplier;
+use klights_cluster_core::command::{CommandMeta, StorageCommand};
 
 use super::Datastore;
 
@@ -138,7 +138,7 @@ impl DatastoreApplier for Datastore {
                     .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                     .await?
                 {
-                    let freshness = crate::datastore::status_merge_policy::apply_status_merge(
+                    let freshness = klights_cluster_core::apply_status_merge(
                         &api_version,
                         &kind,
                         current.data.as_ref(),
@@ -150,8 +150,7 @@ impl DatastoreApplier for Datastore {
                     // Pod status is deduped via the observed_status_stamp
                     // outbox, so only a non-Pod stale rebase clears the
                     // resourceVersion precondition.
-                    if freshness
-                        == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+                    if freshness == klights_cluster_core::StatusApplyFreshness::Stale
                         && preconditions.uid.as_deref() == Some(current.uid.as_str())
                         && !(api_version == "v1" && kind == "Pod")
                     {
@@ -234,32 +233,10 @@ impl DatastoreApplier for Datastore {
             StorageCommand::DeleteNodeSubnet { node_name } => {
                 self.delete_node_subnet(&node_name).await?;
             }
-            StorageCommand::PodSlotTryAdmit {
-                namespace,
-                pod_name,
-                pod_uid,
-                node_name,
-            } => {
-                self.pod_slot_try_admit(&namespace, &pod_name, &pod_uid, &node_name)
-                    .await?;
-            }
-            StorageCommand::PodSlotMarkTerminating {
-                namespace,
-                pod_name,
-                pod_uid,
-                node_name,
-            } => {
-                self.pod_slot_mark_terminating(&namespace, &pod_name, &pod_uid, &node_name)
-                    .await?;
-            }
-            StorageCommand::PodSlotClearIfUid {
-                namespace,
-                pod_name,
-                pod_uid,
-                node_name,
-            } => {
-                self.pod_slot_clear_if_uid(&namespace, &pod_name, &pod_uid, &node_name)
-                    .await?;
+            StorageCommand::PodSlotTryAdmit { .. }
+            | StorageCommand::PodSlotMarkTerminating { .. }
+            | StorageCommand::PodSlotClearIfUid { .. } => {
+                anyhow::bail!("node-local pod-slot commands cannot apply to cluster.db");
             }
             StorageCommand::MovePodToCleanupIntent {
                 node_name,

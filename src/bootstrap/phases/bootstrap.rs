@@ -49,6 +49,7 @@ pub struct BootstrapRunArgs<'a> {
     pub skip_seed_bootstrap: bool,
     pub db_handle: &'a DatastoreHandle,
     pub kubelet_db_handle: &'a DatastoreHandle,
+    pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub worker_store_adapter:
         Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
@@ -292,6 +293,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         skip_seed_bootstrap,
         db_handle,
         kubelet_db_handle,
+        node_local,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
         db,
@@ -492,6 +494,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     });
     let pod_repository_build_config = crate::pod_repository_composition::PodRepositoryBuildConfig {
         db: kubelet_db_handle.clone(),
+        node_local: Some(node_local.clone()),
         supervisor: supervisor.clone(),
         side_effects: side_effects.clone(),
         metrics: metrics.clone(),
@@ -512,11 +515,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             Some(is_leader_rx.clone()),
         )
     };
-    let pod_slot_backend = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
-        kubelet_db_handle.clone(),
-    ));
     let pod_slot_adapter =
-        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(pod_slot_backend);
+        crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local.clone());
     let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
     let kubelet_capacity =
         crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
@@ -608,6 +608,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let parts = crate::pod_repository_composition::build_pod_repository_parts(
             crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
+                node_local: Some(node_local.clone()),
                 supervisor: supervisor.clone(),
                 side_effects: side_effects.clone(),
                 metrics: metrics.clone(),

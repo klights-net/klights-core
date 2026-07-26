@@ -1,10 +1,5 @@
 use serde_json::Value;
 
-#[deprecated(
-    note = "use klights_reconcile_api::MutationOperation; remove in Phase 18.2 compatibility cleanup"
-)]
-pub type MutationOperation = klights_reconcile_api::MutationOperation;
-
 pub struct MutationEvent<'a> {
     pub operation: klights_reconcile_api::MutationOperation,
     pub resource: &'a Value,

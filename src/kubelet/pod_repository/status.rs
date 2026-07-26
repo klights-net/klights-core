@@ -622,10 +622,7 @@ impl PodStatusService {
                             .await;
                     }
                     let endpoint_state_changed = changed
-                        && crate::pod_endpoint_state::pod_endpoint_state_changed(
-                            &pod,
-                            &updated.data,
-                        );
+                        && klights_cluster_core::pod_endpoint_state_changed(&pod, &updated.data);
                     return Ok(PodStatusWriteResult {
                         resource: updated,
                         changed,
@@ -988,7 +985,7 @@ impl PodStatusService {
                         .await;
                     }
                     let endpoint_state_changed = changed
-                        && crate::pod_endpoint_state::pod_endpoint_state_changed(
+                        && klights_cluster_core::pod_endpoint_state_changed(
                             &pod_resource.data,
                             &updated.data,
                         );
@@ -1224,10 +1221,7 @@ impl PodStatusService {
             &updated,
         );
         let endpoint_state_changed = changed
-            && crate::pod_endpoint_state::pod_endpoint_state_changed(
-                &pod_resource.data,
-                &updated.data,
-            );
+            && klights_cluster_core::pod_endpoint_state_changed(&pod_resource.data, &updated.data);
         Ok(PodStatusWriteResult {
             resource: updated,
             changed,
@@ -1428,7 +1422,7 @@ impl PodStatusService {
                         .await;
                     }
                     let endpoint_state_changed = changed
-                        && crate::pod_endpoint_state::pod_endpoint_state_changed(
+                        && klights_cluster_core::pod_endpoint_state_changed(
                             &pod_resource.data,
                             &updated.data,
                         );
@@ -1590,10 +1584,7 @@ impl PodStatusService {
                 .await;
         }
         let endpoint_state_changed = changed
-            && crate::pod_endpoint_state::pod_endpoint_state_changed(
-                &pod_resource.data,
-                &updated.data,
-            );
+            && klights_cluster_core::pod_endpoint_state_changed(&pod_resource.data, &updated.data);
         Ok(PodStatusWriteResult {
             resource: updated,
             changed,

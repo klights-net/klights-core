@@ -10,8 +10,9 @@ use super::super::crud::helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
 use super::super::{create_pending_watch_event, owner_ref_index, queries, selector_index};
-use crate::datastore::types::{PatchKind, PendingWatchEvent};
-use crate::log_apply::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
+use crate::datastore::types::PendingWatchEvent;
+use klights_cluster_core::PatchKind;
+use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
 use rusqlite::OptionalExtension;
 
 pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {
@@ -564,17 +565,17 @@ fn merge_status_only_row_with_existing(
         .precondition_resource_version
         .is_some_and(|expected_rv| expected_rv < *current_rv)
     {
-        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+        klights_cluster_core::StatusApplyFreshness::Stale
     } else {
-        crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh
+        klights_cluster_core::StatusApplyFreshness::Fresh
     };
-    crate::datastore::status_merge_policy::merge_status_for_apply(
+    klights_cluster_core::merge_status_for_apply(
         &row.api_version,
         &row.kind,
         &live,
         &mut status,
         freshness,
-        crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply,
+        klights_cluster_core::StatusApplyOrigin::ReplicatedApply,
     );
     let Some(live_obj) = live.as_object_mut() else {
         return Err(other_error(
@@ -595,7 +596,7 @@ fn merge_status_only_row_with_existing(
         &row.api_version,
         &row.kind,
     );
-    if freshness == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+    if freshness == klights_cluster_core::StatusApplyFreshness::Stale
         && row.precondition_uid.as_deref() == Some(current_uid.as_str())
     {
         row.precondition_resource_version = None;
@@ -707,7 +708,7 @@ fn preserve_same_uid_server_metadata_from_existing(
         .precondition_resource_version
         .is_some_and(|expected| expected != *current_rv)
     {
-        crate::datastore::stale_apply_policy::apply_same_uid_stale_full_resource_policy(
+        klights_cluster_core::apply_same_uid_stale_full_resource_policy(
             &row.api_version,
             &row.kind,
             &mut row.data,

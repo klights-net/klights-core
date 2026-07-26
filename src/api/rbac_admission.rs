@@ -162,6 +162,7 @@ async fn holder_rules(
     namespace: Option<&str>,
 ) -> Vec<PolicyRule> {
     let (resource_rules, non_resource_rules, _incomplete) = state
+        .auth_policy()
         .rbac_policy_store
         .enumerate_effective_rules(identity, namespace)
         .await;
@@ -235,7 +236,12 @@ async fn has_verb(
 ) -> bool {
     let request =
         AuthorizationRequest::resource(verb, RBAC_GROUP, "v1", resource, None, namespace, name);
-    state.authorizer.authorize(identity, &request).await.allowed
+    state
+        .auth_policy()
+        .authorizer
+        .authorize(identity, &request)
+        .await
+        .allowed
 }
 
 fn api_group_of(api_version: &str) -> &str {

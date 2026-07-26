@@ -26,7 +26,7 @@ use klights_cluster_core::Resource;
 
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{NodeSubnet, PodCleanupIntent};
-use crate::log_apply::{
+use klights_cluster_core::{
     ClusterMutation, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
     LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
     NamespaceMutation, NetworkMutation, PodCleanupMutation, ResourceMutation,
@@ -128,7 +128,7 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
     }
 
     let cluster_resources = db.list_cluster_resources().await?;
-    let mut node_names = Vec::new();
+    let mut node_names: Vec<String> = Vec::new();
     for resource in cluster_resources {
         if resource.api_version.is_empty()
             || resource.kind.is_empty()
@@ -531,7 +531,7 @@ pub(crate) fn cluster_pod_cleanup_mutation_from_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_apply::LogApplyCommit;
+    use klights_cluster_core::LogApplyCommit;
 
     // ---- Snapshot generation tests ----
 
@@ -601,7 +601,7 @@ mod tests {
             entries.iter().any(|entry| {
                 matches!(
                     entry.mutations().first(),
-                    Some(crate::log_apply::LogApplyMutation::PutResource(row))
+                    Some(klights_cluster_core::LogApplyMutation::PutResource(row))
                         if row.api_version == "v1"
                         && row.kind == "ConfigMap"
                         && row.namespace.as_deref() == Some("default")
@@ -649,7 +649,7 @@ mod tests {
                 entry.resource_version() == delete_rv
                     && matches!(
                         entry.mutations().first(),
-                        Some(crate::log_apply::LogApplyMutation::DeleteResource(key))
+                        Some(klights_cluster_core::LogApplyMutation::DeleteResource(key))
                             if key.api_version == "v1"
                             && key.kind == "ConfigMap"
                             && key.namespace.as_deref() == Some("default")
@@ -886,7 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_generation_preserves_outbox_stream_watermarks() {
-        use crate::log_apply::OutboxStreamWatermark;
+        use klights_cluster_core::OutboxStreamWatermark;
 
         let leader = crate::datastore::test_support::in_memory().await;
         let watermark = OutboxStreamWatermark {
@@ -1032,7 +1032,7 @@ mod tests {
             "snapshot install must restore the authoritative RV counter"
         );
 
-        let command = crate::datastore::command::StorageCommand::CreateResource {
+        let command = klights_cluster_core::command::StorageCommand::CreateResource {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
             namespace: Some("default".to_string()),
@@ -1061,7 +1061,7 @@ mod tests {
         assert!(
             !commit.mutations().iter().any(|mutation| matches!(
                 mutation,
-                crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+                klights_cluster_core::LogApplyMutation::PutAppliedOutbox(_)
             )),
             "generic post-snapshot commit must not emit applied_outbox mutations"
         );
@@ -1088,12 +1088,15 @@ mod tests {
         assert_eq!(loaded.resource_version, applied);
     }
 
-    fn pod_status_payload(status: serde_json::Value, uid: &str, stamp: i64) -> Vec<u8> {
+    fn pod_status_payload(
+        status: serde_json::Value,
+        uid: &str,
+        stamp: i64,
+    ) -> klights_cluster_core::command::StorageCommand {
         use crate::datastore::ResourcePreconditions;
-        use crate::datastore::command::StorageCommand;
-        use crate::node_outbox::payload::OutboxPayload;
+        use klights_cluster_core::command::StorageCommand;
 
-        let command = StorageCommand::UpdateStatus {
+        StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -1105,10 +1108,7 @@ mod tests {
                 resource_version: None,
             },
             observed_status_stamp: Some(stamp),
-        };
-        OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .expect("encode pod status payload")
+        }
     }
 
     async fn create_pod_for_status_snapshot(db: &crate::datastore::sqlite::Datastore, uid: &str) {
@@ -1145,8 +1145,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pod_status_replay_rejected_after_snapshot_install() {
-        use crate::log_apply::OutboxStreamWatermark;
         use klights_cluster_core::BuildOutboxOutcome;
+        use klights_cluster_core::OutboxStreamWatermark;
 
         let leader = crate::datastore::test_support::in_memory().await;
         create_pod_for_status_snapshot(&leader, "uid-1").await;
@@ -1160,7 +1160,7 @@ mod tests {
             .build_log_apply_commit_for_outbox_with_watermark(
                 "status-newer",
                 crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-                &pod_status_payload(
+                pod_status_payload(
                     serde_json::json!({"phase": "Running", "message": "newer"}),
                     "uid-1",
                     200,
@@ -1207,7 +1207,7 @@ mod tests {
             .build_log_apply_commit_for_outbox_with_watermark(
                 "status-stale-after-snapshot",
                 crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-                &pod_status_payload(
+                pod_status_payload(
                     serde_json::json!({"phase": "Running", "message": "stale"}),
                     "uid-1",
                     100,
@@ -1420,7 +1420,7 @@ mod tests {
                     && entry.mutations().iter().any(|m| {
                         matches!(
                             m,
-                            crate::log_apply::LogApplyMutation::PutNodeSubnet(row)
+                            klights_cluster_core::LogApplyMutation::PutNodeSubnet(row)
                                 if row.node_name == "leader"
                                 && row.subnet == subnet.subnet.to_string()
                                 && row.node_ip == "192.0.2.1"
@@ -1435,7 +1435,7 @@ mod tests {
                     && entry.mutations().iter().any(|m| {
                         matches!(
                             m,
-                            crate::log_apply::LogApplyMutation::PutNodeDataplane(row)
+                            klights_cluster_core::LogApplyMutation::PutNodeDataplane(row)
                                 if row.node_name == "leader"
                                 && row.endpoint == "192.0.2.1"
                                 && row.port == Some(51_820)
@@ -1471,7 +1471,7 @@ mod tests {
                 entry.resource_version() == node.resource_version
                     && matches!(
                         entry.mutations().first(),
-                        Some(crate::log_apply::LogApplyMutation::PutResource(row))
+                        Some(klights_cluster_core::LogApplyMutation::PutResource(row))
                             if row.api_version == "v1"
                             && row.kind == "Node"
                             && row.namespace.is_none()
@@ -1514,7 +1514,7 @@ mod tests {
         let has_staged = entries.iter().any(|e| {
             matches!(
                 e.mutations().first(),
-                Some(crate::log_apply::LogApplyMutation::PutResource(row)) if row.name == "staged"
+                Some(klights_cluster_core::LogApplyMutation::PutResource(row)) if row.name == "staged"
             )
         });
         assert!(has_staged, "snapshot must contain 'staged' resource");

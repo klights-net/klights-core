@@ -631,8 +631,7 @@ impl ReplicationService {
             Ok(observation) => {
                 let m = observation.into_parts().0;
                 let mut metadata = MetadataResponse::from(m);
-                // T3: `current_log_apply_index` always returns 0.
-                // The raft `last_applied` is the authoritative index.
+                // The raft `last_applied` is the authoritative log index.
                 metadata.current_log_index = 0;
                 metadata
             }
@@ -643,7 +642,7 @@ impl ReplicationService {
                     leader_epoch: 0,
                     current_rv: 0,
                     current_log_index: 0,
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 }
             }
         }
@@ -1515,7 +1514,7 @@ impl NodeMetrics for ReplicationService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::command::{
+    use klights_cluster_core::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
     use klights_node_api::ExecStreamChannel;

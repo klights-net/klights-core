@@ -19,14 +19,14 @@ fn temp_db_dir() -> (TempDir, PathBuf) {
 }
 
 #[test]
-fn open_fresh_creates_state_redb_with_all_tables() {
+fn open_fresh_creates_cluster_tables_without_node_local_tables() {
     let (_dir, path) = temp_db_dir();
     let db = redb::open(&RedbOpenOpts {
         path: path.clone(),
         cache_size: 40 * 1024 * 1024,
     })
     .expect("open fresh");
-    // Verify all expected tables exist.
+    // Verify every cluster-store table exists.
     let r = db.begin_read().expect("read txn");
     let tables = r.list_tables().expect("list tables");
     let names: Vec<String> = tables.map(|t| t.name().to_string()).collect();
@@ -37,17 +37,25 @@ fn open_fresh_creates_state_redb_with_all_tables() {
         "watch_events",
         "resources_by_owner",
         "rv_to_key",
-        "pod_sandboxes",
-        "pod_networks",
         "node_subnets",
-        "pod_slot_admissions",
-        "pod_endpoints",
-        "pod_workqueue",
+        "pod_cleanup_intents",
         "meta",
     ] {
         assert!(
             names.iter().any(|n| n.as_str() == *expected),
             "missing table: {expected}"
+        );
+    }
+    for node_local in &[
+        "pod_sandboxes",
+        "pod_networks",
+        "pod_slot_admissions",
+        "pod_endpoints",
+        "pod_workqueue",
+    ] {
+        assert!(
+            !names.iter().any(|name| name == node_local),
+            "cluster store must not create node-local table: {node_local}"
         );
     }
 }

@@ -5,7 +5,6 @@ use tracing::Level;
 use crate::watch::WatchEvent;
 
 const WATCH_REPLAY_DECODE_WARN_MS: u128 = 10;
-const LOG_APPLY_DECODE_WARN_MS: u128 = 25;
 const LOG_APPLY_COMMIT_WARN_MS: u128 = 50;
 const LARGE_JSON_WARN_BYTES: usize = 512 * 1024;
 
@@ -110,33 +109,6 @@ pub fn log_slow_watch_replay_decode(entry: SlowWatchReplayDecode<'_>) {
         resource_version,
         event_type,
         "slow datastore JSON decode"
-    );
-}
-
-pub fn log_slow_log_apply_decode(
-    format: &str,
-    elapsed: Duration,
-    data_len: usize,
-    resource_version: i64,
-    mutation_count: usize,
-) {
-    if !should_log_slow_path(
-        elapsed,
-        data_len,
-        LOG_APPLY_DECODE_WARN_MS,
-        LARGE_JSON_WARN_BYTES,
-    ) {
-        return;
-    }
-    tracing::warn!(
-        target: "klights::datastore::slowdown",
-        operation = "log_apply_decode",
-        format,
-        elapsed_ms = elapsed.as_millis(),
-        data_len,
-        resource_version,
-        mutation_count,
-        "slow log_apply decode"
     );
 }
 

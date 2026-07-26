@@ -9,10 +9,10 @@ use tokio::sync::Mutex;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::{NodeLocalHandle, selector};
 use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::node_outbox::{DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject};
+use klights_cluster_core::command::StorageCommand;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {

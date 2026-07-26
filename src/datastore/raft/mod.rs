@@ -25,7 +25,7 @@ mod tests {
 
     fn pod_status_payload(ns: &str, name: &str, uid: &str) -> Bytes {
         crate::node_outbox::payload::OutboxPayload::from_command(
-            crate::datastore::command::StorageCommand::UpdateStatus {
+            klights_cluster_core::command::StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some(ns.to_string()),

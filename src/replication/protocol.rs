@@ -72,12 +72,12 @@ pub fn require_exact_command_codec(
     command_codec_version: u32,
     peer: &str,
 ) -> std::result::Result<(), String> {
-    if command_codec_version == crate::log_apply::COMMAND_CODEC_VERSION {
+    if command_codec_version == klights_cluster_core::COMMAND_CODEC_VERSION {
         Ok(())
     } else {
         Err(format!(
             "{peer} must advertise exact command codec version {} (received {command_codec_version})",
-            crate::log_apply::COMMAND_CODEC_VERSION,
+            klights_cluster_core::COMMAND_CODEC_VERSION,
         ))
     }
 }
@@ -89,7 +89,7 @@ impl From<ClusterMetadata> for MetadataResponse {
             leader_epoch: m.leader_epoch,
             current_rv: m.current_rv,
             current_log_index: 0,
-            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+            command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
         }
     }
 }
@@ -341,7 +341,7 @@ impl ForwardedPodSlotAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId};
+    use klights_cluster_core::command::{COMMAND_CODEC_VERSION, CommandId};
 
     fn sample_meta() -> CommandMeta {
         CommandMeta {
@@ -425,13 +425,13 @@ mod tests {
         assert_eq!(resp.current_log_index, 0);
         assert_eq!(
             resp.command_codec_version,
-            crate::log_apply::COMMAND_CODEC_VERSION
+            klights_cluster_core::COMMAND_CODEC_VERSION
         );
         assert_eq!(
             serde_json::from_str::<MetadataResponse>(&serde_json::to_string(&resp).unwrap())
                 .unwrap()
                 .command_codec_version,
-            crate::log_apply::COMMAND_CODEC_VERSION
+            klights_cluster_core::COMMAND_CODEC_VERSION
         );
         assert!(
             serde_json::from_str::<MetadataResponse>(
@@ -444,9 +444,12 @@ mod tests {
 
     #[test]
     fn command_codec_v3_is_an_exact_fail_closed_version() {
-        assert!(require_exact_command_codec(crate::log_apply::COMMAND_CODEC_VERSION, "v3").is_ok());
         assert!(
-            require_exact_command_codec(crate::log_apply::COMMAND_CODEC_VERSION - 1, "v2").is_err()
+            require_exact_command_codec(klights_cluster_core::COMMAND_CODEC_VERSION, "v3").is_ok()
+        );
+        assert!(
+            require_exact_command_codec(klights_cluster_core::COMMAND_CODEC_VERSION - 1, "v2")
+                .is_err()
         );
         assert!(require_exact_command_codec(0, "legacy").is_err());
     }

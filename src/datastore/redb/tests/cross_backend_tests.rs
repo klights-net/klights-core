@@ -10,7 +10,7 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::RedbDatastore;
 use crate::datastore::sqlite::Datastore as SqliteDs;
 use crate::datastore::types::*;
-use klights_types::PodIdentity;
+use klights_cluster_core::{PatchKind, ResourcePreconditions, WatchReplayPosition};
 
 async fn sqlite_db() -> SqliteDs {
     SqliteDs::new_in_memory().await.unwrap()
@@ -426,91 +426,6 @@ parametrize_backends!(delete_resource, |db| {
             .unwrap()
             .is_none()
     );
-});
-
-parametrize_backends!(pod_slot_try_admit_inserts_empty_slot, |db| {
-    let result = db
-        .pod_slot_try_admit("default", "slot-pod", "uid-a", "node-a")
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        result,
-        PodSlotAdmissionResult::Admitted { resource_version } if resource_version > 0
-    ));
-});
-
-parametrize_backends!(pod_slot_try_admit_same_uid_idempotent, |db| {
-    let first = db
-        .pod_slot_try_admit("default", "slot-pod", "uid-a", "node-a")
-        .await
-        .unwrap();
-    let second = db
-        .pod_slot_try_admit("default", "slot-pod", "uid-a", "node-a")
-        .await
-        .unwrap();
-
-    assert_eq!(first, second);
-});
-
-parametrize_backends!(
-    pod_slot_try_admit_different_uid_blocked_without_write,
-    |db| {
-        db.pod_slot_try_admit("default", "slot-pod", "uid-a", "node-a")
-            .await
-            .unwrap();
-        let blocked = db
-            .pod_slot_try_admit("default", "slot-pod", "uid-b", "node-b")
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            blocked,
-            PodSlotAdmissionResult::Blocked {
-                ref blocking_uid,
-                ref blocking_node,
-                state: PodSlotAdmissionState::Admitted,
-                ..
-            } if blocking_uid.as_str() == "uid-a" && blocking_node.as_str() == "node-a"
-        ));
-
-        let still_blocked = db
-            .pod_slot_try_admit("default", "slot-pod", "uid-b", "node-b")
-            .await
-            .unwrap();
-        assert_eq!(blocked, still_blocked);
-    }
-);
-
-parametrize_backends!(pod_slot_mark_terminating_different_uid_conflicts, |db| {
-    db.pod_slot_try_admit("default", "slot-pod", "uid-a", "node-a")
-        .await
-        .unwrap();
-    let err = db
-        .pod_slot_mark_terminating("default", "slot-pod", "uid-b", "node-b")
-        .await
-        .expect_err("different UID must not overwrite admission row");
-    assert!(
-        crate::datastore::errors::is_conflict_error(&err),
-        "expected conflict, got {err:#}"
-    );
-});
-
-parametrize_backends!(pod_slot_clear_if_uid_does_not_clear_replacement, |db| {
-    db.pod_slot_try_admit("default", "slot-pod", "uid-a", "node-a")
-        .await
-        .unwrap();
-    db.pod_slot_clear_if_uid("default", "slot-pod", "uid-b", "node-b")
-        .await
-        .unwrap();
-    let blocked = db
-        .pod_slot_try_admit("default", "slot-pod", "uid-b", "node-b")
-        .await
-        .unwrap();
-    assert!(matches!(
-        blocked,
-        PodSlotAdmissionResult::Blocked { blocking_uid, .. } if blocking_uid == "uid-a"
-    ));
 });
 
 parametrize_backends!(create_duplicate_returns_error, |db| {
@@ -1787,19 +1702,6 @@ parametrize_backends!(list_resource_keys_for_scope, |db| {
     assert_eq!(ns_keys[0].0.as_deref(), Some("default"));
 });
 
-parametrize_backends!(pod_endpoint_empty, |db| {
-    assert!(
-        db.pod_endpoint_get_by_pod_ip(std::net::Ipv4Addr::new(10, 42, 0, 5))
-            .await
-            .unwrap()
-            .is_none()
-    );
-});
-
-parametrize_backends!(subscribe_pod_endpoints, |db| {
-    let _rx = db.subscribe_pod_endpoints();
-});
-
 // ---- Redb-only tests (exercise redb-specific codepaths) ----
 
 #[tokio::test]
@@ -1858,149 +1760,6 @@ async fn redb_patch_resource() {
 }
 
 #[tokio::test]
-async fn redb_sandbox_lifecycle() {
-    let db = redb_db().await;
-    db.record_sandbox("default", "mypod", "pod-uid-1", "sid-123")
-        .await
-        .unwrap();
-    assert_eq!(
-        db.get_sandbox("default", "mypod").await.unwrap(),
-        Some("sid-123".to_string())
-    );
-    assert_eq!(
-        db.get_sandbox_for_uid("default", "mypod", "pod-uid-1")
-            .await
-            .unwrap(),
-        Some("sid-123".to_string())
-    );
-    assert!(
-        db.get_sandbox_for_uid("default", "mypod", "wrong-uid")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let sandboxes = db.list_sandboxes().await.unwrap();
-    assert_eq!(sandboxes.len(), 1);
-    assert_eq!(sandboxes[0].pod_uid, "pod-uid-1");
-    db.delete_sandbox_for_uid("default", "mypod", "wrong-uid", "sid-123")
-        .await
-        .unwrap();
-    assert_eq!(
-        db.get_sandbox("default", "mypod").await.unwrap(),
-        Some("sid-123".to_string()),
-        "UID-qualified delete must not remove a replacement/mismatched row"
-    );
-    db.delete_sandbox_for_uid("default", "mypod", "pod-uid-1", "sid-123")
-        .await
-        .unwrap();
-    assert!(db.get_sandbox("default", "mypod").await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn redb_concurrent_sandbox_insert_different_uids_both_survive() {
-    let db = redb_db().await;
-    db.record_sandbox("default", "mypod", "uid-a", "sid-a")
-        .await
-        .unwrap();
-    db.record_sandbox("default", "mypod", "uid-b", "sid-b")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        db.get_sandbox_for_uid("default", "mypod", "uid-a")
-            .await
-            .unwrap(),
-        Some("sid-a".to_string())
-    );
-    assert_eq!(
-        db.get_sandbox_for_uid("default", "mypod", "uid-b")
-            .await
-            .unwrap(),
-        Some("sid-b".to_string())
-    );
-
-    let sandboxes = db.list_sandboxes().await.unwrap();
-    assert_eq!(sandboxes.len(), 2);
-}
-
-#[tokio::test]
-async fn redb_record_sandbox_same_uid_replaces_same_uid_only() {
-    let db = redb_db().await;
-    db.record_sandbox("default", "mypod", "uid-a", "sid-old")
-        .await
-        .unwrap();
-    db.record_sandbox("default", "mypod", "uid-b", "sid-b")
-        .await
-        .unwrap();
-    db.record_sandbox("default", "mypod", "uid-a", "sid-new")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        db.get_sandbox_for_uid("default", "mypod", "uid-a")
-            .await
-            .unwrap(),
-        Some("sid-new".to_string())
-    );
-    assert_eq!(
-        db.get_sandbox_for_uid("default", "mypod", "uid-b")
-            .await
-            .unwrap(),
-        Some("sid-b".to_string())
-    );
-}
-
-#[tokio::test]
-async fn redb_ipam() {
-    let db = redb_db().await;
-    db.record_sandbox("default", "pod1", "uid1", "sid1")
-        .await
-        .unwrap();
-    let subnet_base: u32 = 0x0A2A0100;
-    let pod = PodIdentity::new("default", "pod1", "uid1");
-    let (ip, ip_int) = db
-        .ipam_allocate_and_record_pod_network(
-            "sid1",
-            &pod,
-            subnet_base,
-            256,
-            "veth0",
-            "/var/run/netns/sid1",
-        )
-        .await
-        .unwrap();
-    assert!(!ip.is_empty());
-    let (ip2, ip2_int) = db
-        .ipam_allocate_and_record_pod_network(
-            "sid1",
-            &pod,
-            subnet_base,
-            256,
-            "veth0",
-            "/var/run/netns/sid1",
-        )
-        .await
-        .unwrap();
-    assert_eq!(ip, ip2);
-    assert_eq!(ip_int, ip2_int);
-    assert!(db.get_pod_network("sid1").await.unwrap().is_some());
-    assert!(
-        db.get_pod_network_for_pod("default", "pod1", "uid1")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        db.list_pod_network_sandbox_ids()
-            .await
-            .unwrap()
-            .contains(&"sid1".to_string())
-    );
-    db.delete_pod_network("sid1").await.unwrap();
-    assert!(db.get_pod_network("sid1").await.unwrap().is_none());
-}
-
-#[tokio::test]
 async fn redb_node_subnet() {
     let db = redb_db().await;
     let ns = db
@@ -2043,54 +1802,6 @@ parametrize_backends!(node_dataplane_metadata_round_trip, |db| {
 });
 
 #[tokio::test]
-async fn redb_workqueue() {
-    let db = redb_db().await;
-    let pod = klights_types::PodIdentity::new("default", "mypod", "uid1");
-    db.pod_workqueue_enqueue(
-        PodWorkqueueKind::Pod,
-        &pod,
-        json!({"key":"val"}),
-        0,
-        0,
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(db.pod_workqueue_peek_next_due().await.unwrap().is_some());
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let entry = db.pod_workqueue_claim_due(now).await.unwrap().unwrap();
-    assert_eq!(entry.name, "mypod");
-    assert!(db.pod_workqueue_claim_due(now).await.unwrap().is_none());
-    db.pod_workqueue_record_failure(entry, 100, "test error")
-        .await
-        .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let future = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let e = db.pod_workqueue_claim_due(future).await.unwrap().unwrap();
-    db.pod_workqueue_complete(e.id).await.unwrap();
-    let ns_pod = klights_types::PodIdentity::new("", "myns", "uid2");
-    db.pod_workqueue_enqueue(PodWorkqueueKind::Namespace, &ns_pod, json!({}), 0, 0, None)
-        .await
-        .unwrap();
-    let far = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-        + 60_000;
-    let e2 = db.pod_workqueue_claim_due(far).await.unwrap().unwrap();
-    db.pod_workqueue_dead_letter(e2.id, "permanent failure")
-        .await
-        .unwrap();
-    assert!(db.pod_workqueue_peek_next_due().await.unwrap().is_none());
-}
-
-#[tokio::test]
 async fn redb_find_owned_by_name_kind_empty_uid() {
     let db = redb_db().await;
     db.create_resource("apps/v1", "Deployment", Some("default"), "mydep",
@@ -2112,10 +1823,10 @@ async fn redb_find_owned_by_name_kind_empty_uid() {
 
 #[tokio::test]
 async fn redb_delete_resource_with_tombstone_command_stamps_and_watches_deleted_row() {
-    use crate::datastore::command::{
+    use crate::datastore::sequenced::DatastoreApplier;
+    use klights_cluster_core::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::datastore::sequenced::DatastoreApplier;
 
     let db = redb_db().await;
     let created = db

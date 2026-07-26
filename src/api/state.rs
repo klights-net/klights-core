@@ -335,6 +335,10 @@ impl AppState {
         &self.resource_mutation
     }
 
+    pub(crate) fn auth_policy(&self) -> &ApiAuthPolicy {
+        &self.auth_policy
+    }
+
     pub(crate) fn discovery(&self) -> &ApiDiscoveryAggregationServices {
         &self.discovery
     }

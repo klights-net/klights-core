@@ -631,8 +631,8 @@ mod tests {
     #[tokio::test]
     async fn test_resolver_lag_relist_failure_is_observable_and_fresh_retry_is_authoritative() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let executor = crate::datastore::sqlite::DbExecutor::open_with_opts(
-            crate::datastore::sqlite::opener::OpenOpts::node_in_memory(),
+        let executor = crate::sqlite_boundary::DbExecutor::open_with_opts(
+            crate::sqlite_open::OpenOpts::node_in_memory(),
             supervisor,
             "sqlite:pod-endpoint-resolver-failure-test",
         )

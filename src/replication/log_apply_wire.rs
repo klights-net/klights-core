@@ -1,4 +1,4 @@
-//! Ordered log-apply core shared by promotable replicas now and Raft learners later.
+//! Replication wire adapter for the canonical ordered log-apply domain.
 //!
 //! The core is deliberately port-based: sources provide durable ordered
 //! entries, targets install snapshots and apply entries, and the follower
@@ -11,9 +11,13 @@ use anyhow::Result;
 use klights_internal_protobuf::log_apply::*;
 use prost::Message;
 
-use crate::datastore::types::{AppliedOutboxRecord, NodeSubnet, PatchKind, PodCleanupIntent};
-use crate::networking::wireguard::DataplanePeerMetadata;
-pub mod mutation;
+use klights_cluster_core::{
+    LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
+    LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
+    LogApplyPodActorFinalization, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
+    LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow,
+    OutboxStreamWatermark, PatchKind,
+};
 
 trait WireFrom<T>: Sized {
     fn wire_from(value: T) -> Self;
@@ -57,62 +61,6 @@ where
 
 // T3: `KEY_LAST_APPLIED_INDEX`, `KEY_LAST_APPLIED_RV` removed —
 // the `log_apply_entries` table and its checkpoint are gone.
-
-pub use klights_cluster_core::{
-    COMMAND_CODEC_VERSION, ClusterMetaMutation, ClusterMutation, LogApplyAppliedOutboxRow,
-    LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
-    LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow, LogApplyPodActorFinalization,
-    LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow, LogApplyResourceKey,
-    LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow, NamespaceMutation,
-    NetworkMutation, OutboxLedgerMutation, OutboxStreamWatermark, PodCleanupMutation,
-    ResourceMutation, SnapshotRestoreOperation, VersionedClusterMutation, WatchHistoryMutation,
-};
-
-impl From<&NodeSubnet> for LogApplyNodeSubnetRow {
-    fn from(row: &NodeSubnet) -> Self {
-        Self {
-            node_name: row.node_name.as_str().to_string(),
-            subnet: row.subnet.to_string(),
-            subnet_base_int: row.subnet_base_int,
-            gateway_ip: row.gateway_ip.to_string(),
-            node_ip: row.node_ip.to_string(),
-            mode: match row.mode {
-                crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
-                crate::controllers::annotations::NodePeerMode::Rootless => "rootless".to_string(),
-            },
-            hostport_range: row.hostport_range.as_ref().map(ToString::to_string),
-        }
-    }
-}
-
-impl From<&DataplanePeerMetadata> for LogApplyNodeDataplaneRow {
-    fn from(row: &DataplanePeerMetadata) -> Self {
-        Self {
-            node_name: row.node_name.clone(),
-            mode: row.mode.as_str().to_string(),
-            encryption: row.encryption.as_str().to_string(),
-            public_key: row.public_key.as_ref().map(ToString::to_string),
-            endpoint: row.endpoint.to_string(),
-            port: row.port,
-        }
-    }
-}
-
-pub fn put_node_subnet(row: &NodeSubnet) -> LogApplyCommit {
-    LogApplyCommit::put_node_subnet_row(row.into())
-}
-
-pub fn put_node_dataplane(row: &DataplanePeerMetadata) -> LogApplyCommit {
-    LogApplyCommit::put_node_dataplane_row(row.into())
-}
-
-pub fn put_applied_outbox(record: AppliedOutboxRecord) -> LogApplyCommit {
-    LogApplyCommit::put_applied_outbox_row(record.into())
-}
-
-pub fn put_pod_cleanup_intent(row: PodCleanupIntent) -> LogApplyCommit {
-    LogApplyCommit::put_pod_cleanup_intent_row(row.into())
-}
 
 #[cfg(test)]
 pub(crate) fn test_live_commit(
@@ -161,64 +109,6 @@ pub(crate) fn test_live_commit(
     LogApplyCommit::try_new(mutations).expect("test live commit must be an RV-zero template")
 }
 
-impl From<PodCleanupIntent> for LogApplyPodCleanupIntentRow {
-    fn from(row: PodCleanupIntent) -> Self {
-        Self {
-            node_name: row.node_name,
-            namespace: row.namespace,
-            pod_name: row.pod_name,
-            pod_uid: row.pod_uid,
-            reason: row.reason,
-            resource_version: row.resource_version,
-            created_at_ms: row.created_at_ms,
-            pod_data: row.pod_data,
-        }
-    }
-}
-
-impl From<LogApplyPodCleanupIntentRow> for PodCleanupIntent {
-    fn from(row: LogApplyPodCleanupIntentRow) -> Self {
-        Self {
-            node_name: row.node_name,
-            namespace: row.namespace,
-            pod_name: row.pod_name,
-            pod_uid: row.pod_uid,
-            reason: row.reason,
-            resource_version: row.resource_version,
-            created_at_ms: row.created_at_ms,
-            pod_data: row.pod_data,
-        }
-    }
-}
-
-impl From<AppliedOutboxRecord> for LogApplyAppliedOutboxRow {
-    fn from(record: AppliedOutboxRecord) -> Self {
-        Self {
-            idempotency_key: record.idempotency_key,
-            subject_key: record.subject_key,
-            operation: record.operation,
-            first_seen_ms: record.first_seen_ms,
-            applied_rv: record.applied_rv,
-            result_proto: record.result_proto,
-            status_stamp: record.status_stamp,
-        }
-    }
-}
-
-impl From<LogApplyAppliedOutboxRow> for AppliedOutboxRecord {
-    fn from(row: LogApplyAppliedOutboxRow) -> Self {
-        Self {
-            idempotency_key: row.idempotency_key,
-            subject_key: row.subject_key,
-            operation: row.operation,
-            first_seen_ms: row.first_seen_ms,
-            applied_rv: row.applied_rv,
-            result_proto: row.result_proto,
-            status_stamp: row.status_stamp,
-        }
-    }
-}
-
 pub fn encode_commit_json(commit: &LogApplyCommit) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(commit)?)
 }
@@ -227,7 +117,7 @@ pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
     let start = std::time::Instant::now();
     let commit = serde_json::from_slice::<LogApplyCommit>(bytes)?;
     commit.validate_live_template()?;
-    crate::datastore::diagnostics::log_slow_log_apply_decode(
+    log_slow_log_apply_decode(
         "json",
         start.elapsed(),
         bytes.len(),
@@ -246,7 +136,7 @@ pub fn decode_commit_protobuf(bytes: &[u8]) -> Result<LogApplyCommit> {
     let start = std::time::Instant::now();
     let proto = ProtoLogApplyCommit::decode(bytes)?;
     let commit: LogApplyCommit = proto.try_into_wire()?;
-    crate::datastore::diagnostics::log_slow_log_apply_decode(
+    log_slow_log_apply_decode(
         "protobuf",
         start.elapsed(),
         bytes.len(),
@@ -254,6 +144,28 @@ pub fn decode_commit_protobuf(bytes: &[u8]) -> Result<LogApplyCommit> {
         commit.mutations().len(),
     );
     Ok(commit)
+}
+
+fn log_slow_log_apply_decode(
+    format: &str,
+    elapsed: std::time::Duration,
+    data_len: usize,
+    resource_version: i64,
+    mutation_count: usize,
+) {
+    if elapsed.as_millis() < 25 && data_len < 512 * 1024 {
+        return;
+    }
+    tracing::warn!(
+        target: "klights::replication::slowdown",
+        operation = "log_apply_decode",
+        format,
+        elapsed_ms = elapsed.as_millis(),
+        data_len,
+        resource_version,
+        mutation_count,
+        "slow log_apply decode"
+    );
 }
 
 impl WireFrom<OutboxStreamWatermark> for ProtoOutboxStreamWatermark {
@@ -800,6 +712,8 @@ mod parity_tests {
     //! `LogApplyMutation` without a matching sample below, because the
     //! exhaustive `match` on `variant_name` will not compile.
     use super::*;
+    use crate::datastore::AppliedOutboxRecord;
+    use klights_cluster_core::ClusterMutation;
     use serde_json::json;
 
     fn sample(name: &'static str) -> (String, LogApplyMutation) {

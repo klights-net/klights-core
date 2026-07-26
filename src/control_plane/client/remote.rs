@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use super::Pod;
-use super::informer::{InformerCache, scope_for_request};
+use super::informer::{list as list_cached, replace_scope, scope_for_request};
 use super::{
     LeaderApiClient, ListRequest, ResourceList, focused_watch_event, legacy_list_request,
     legacy_list_response, legacy_watch_event, query_error, query_list_result,
@@ -86,7 +86,7 @@ pub struct RemoteApiClient {
     node_name: String,
     grpc: Option<Arc<ReplicationGrpcClient>>,
     supervisor: Option<Arc<TaskSupervisor>>,
-    cache: InformerCache,
+    cache: klights_watch::WatchCache,
     worker_informers_started: Arc<AtomicBool>,
     /// bug-grpc: per-stream idle timeout; overridable in tests.
     watch_idle_timeout: std::time::Duration,
@@ -98,7 +98,7 @@ impl RemoteApiClient {
             node_name,
             grpc: None,
             supervisor: None,
-            cache: InformerCache::new(),
+            cache: klights_watch::WatchCache::new(),
             worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
@@ -113,7 +113,7 @@ impl RemoteApiClient {
             node_name,
             grpc: Some(grpc),
             supervisor: Some(supervisor),
-            cache: InformerCache::new(),
+            cache: klights_watch::WatchCache::new(),
             worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
@@ -143,21 +143,21 @@ impl RemoteApiClient {
             limit: None,
             continue_token: None,
         };
+        replace_scope(
+            &self.cache,
+            &request,
+            ResourceList {
+                items: Vec::new(),
+                resource_version: 0,
+                watch_replay_position: Some(WatchReplayPosition::from_resource_version(0)),
+                continue_token: None,
+                remaining_item_count: None,
+            },
+        )
+        .await
+        .expect("test cache scope baseline must be valid");
         self.cache
-            .replace_scope(
-                &request,
-                ResourceList {
-                    items: Vec::new(),
-                    resource_version: 0,
-                    watch_replay_position: Some(WatchReplayPosition::from_resource_version(0)),
-                    continue_token: None,
-                    remaining_item_count: None,
-                },
-            )
-            .await
-            .expect("test cache scope baseline must be valid");
-        self.cache
-            .mark_primed(scope)
+            .mark_ready(scope)
             .await
             .expect("test cache scope must have a baseline before readiness");
     }
@@ -165,7 +165,7 @@ impl RemoteApiClient {
     /// Clear a cache scope (simulates watch 410 Gone).
     #[cfg(test)]
     pub async fn cache_clear_scope_for_test(&self, scope: &CacheReadinessRequest) {
-        self.cache.clear_scope_for_test(scope).await;
+        self.cache.clear_ready(scope).await;
     }
 
     pub async fn start_required_worker_informers(
@@ -315,15 +315,7 @@ impl RemoteApiClient {
                                     break;
                                 }
                             };
-                            if let Err(err) = self.cache.apply_event(&event).await {
-                                tracing::warn!(
-                                    api_version = %req.api_version,
-                                    kind = %req.kind,
-                                    error = %err,
-                                    "failed to apply remote informer event; reconnecting from last applied resourceVersion"
-                                );
-                                break;
-                            }
+                            self.cache.apply_event(&event).await;
                             if let Some(mutation) = membership_mutation {
                                 selector_membership.commit(mutation);
                             }
@@ -409,12 +401,11 @@ impl RemoteApiClient {
             klights_leader_api::ResourceQueryConsistency::LeaderFresh,
         )?;
         let list = legacy_list_response(grpc.list_resources_rpc(request).await?);
-        self.cache
-            .replace_scope(&req, list.clone())
+        replace_scope(&self.cache, &req, list.clone())
             .await
             .map_err(query_error)?;
         self.cache
-            .mark_primed(scope_for_request(&req))
+            .mark_ready(scope_for_request(&req))
             .await
             .map_err(query_error)?;
         Ok(list)
@@ -532,8 +523,7 @@ impl LeaderResourceQuery for RemoteApiClient {
             } else {
                 let scope = scope_for_request(&legacy_request);
                 if self.cache.is_ready(&scope).await {
-                    self.cache
-                        .list(&legacy_request)
+                    list_cached(&self.cache, &legacy_request)
                         .await
                         .map_err(query_error)?
                 } else if self.grpc.is_some() {
@@ -541,8 +531,7 @@ impl LeaderResourceQuery for RemoteApiClient {
                         .await
                         .map_err(query_error)?
                 } else {
-                    self.cache
-                        .list(&legacy_request)
+                    list_cached(&self.cache, &legacy_request)
                         .await
                         .map_err(query_error)?
                 }
@@ -611,10 +600,8 @@ impl LeaderCacheReadiness for RemoteApiClient {
                     "cache scope {scope:?} not yet primed"
                 )));
             }
-            self.cache
-                .wait_ready(scope)
-                .await
-                .map_err(|error| CacheReadinessError::unavailable(error.to_string()))
+            self.cache.wait_ready(scope).await;
+            Ok(())
         })
     }
 }
@@ -745,13 +732,13 @@ mod tests {
     use crate::control_plane::client::remote::RemoteApiClient;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
-    use crate::datastore::command::StorageCommand;
     use crate::node_outbox::payload::OutboxPayload;
     use crate::replication::grpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
     };
     use crate::replication::protocol::JoinRole;
     use crate::replication::service::ReplicationService;
+    use klights_cluster_core::command::StorageCommand;
     use klights_leader_api::OutboxDeliveryError as OutboxApplyError;
     use klights_leader_api::{
         CacheReadinessError, CacheReadinessRequest, LeaderCacheReadiness,
@@ -1627,15 +1614,12 @@ mod tests {
     }
 
     /// bug-grpc B2/B3: cursor-advance-only-after-safe-apply. `run_watch_driver`
-    /// now advances its resume `next_resource_version` ONLY after
-    /// `cache.apply_event` succeeds; on apply failure it breaks and reconnects
-    /// from the last applied RV so catch-up replay re-delivers the event. This
-    /// locks the gate that makes that correct: `apply_event` errors on an
-    /// undecodable event (forcing the break / no-advance) and is a no-op success
-    /// on a BOOKMARK (a valid resume point that may advance the cursor).
+    /// advances its resume `next_resource_version` only after applying each
+    /// canonical event. This locks the direct watch-cache behavior: BOOKMARK is
+    /// a no-op while a resource event updates the cache before cursor advance.
     #[tokio::test]
     async fn informer_apply_event_gates_cursor_advance() {
-        let cache = crate::control_plane::client::informer::InformerCache::new();
+        let cache = klights_watch::WatchCache::new();
 
         // BOOKMARK: apply is a no-op success, so its RV is a safe resume point
         // the driver may advance to.
@@ -1650,8 +1634,8 @@ mod tests {
         )
         .expect("valid bookmark");
         assert!(
-            cache.apply_event(&bookmark).await.is_ok(),
-            "a BOOKMARK must apply as a no-op success so its RV is a valid resume point"
+            cache.apply_event(&bookmark).await.is_none(),
+            "a BOOKMARK must apply as a no-op so its RV is a valid resume point"
         );
 
         // A well-formed event applies successfully (cursor may advance).
@@ -1659,7 +1643,7 @@ mod tests {
         let good =
             ResourceEvent::try_new(WatchEventType::Added, pod, None).expect("valid Pod event");
         assert!(
-            cache.apply_event(&good).await.is_ok(),
+            cache.apply_event(&good).await.is_some(),
             "a well-formed event must apply so its RV becomes the resume point"
         );
     }

@@ -71,20 +71,42 @@ fn resource_list_from_leader(result: klights_leader_api::ResourceListResult) -> 
 
 #[cfg(test)]
 struct TestDatastorePodNetworkCache {
-    db: DatastoreHandle,
+    node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
 }
 
 #[cfg(test)]
 pub(crate) fn test_pod_network_cache(
-    db: DatastoreHandle,
+    node_local: crate::datastore::node_local::NodeLocalHandle,
 ) -> Arc<dyn klights_node_store::PodNetworkCache> {
-    Arc::new(TestDatastorePodNetworkCache { db })
+    Arc::new(TestDatastorePodNetworkCache {
+        node_local: Some(node_local),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn empty_test_pod_network_cache() -> Arc<dyn klights_node_store::PodNetworkCache> {
+    Arc::new(TestDatastorePodNetworkCache { node_local: None })
 }
 
 #[cfg(test)]
 pub(crate) fn test_assignment_bus()
 -> Arc<crate::networking::pod_network_events::PodNetworkAssignmentBus> {
     Arc::new(crate::networking::pod_network_events::PodNetworkAssignmentBus::new())
+}
+
+#[cfg(test)]
+pub(crate) async fn test_node_local_store(
+    supervisor: Arc<TaskSupervisor>,
+) -> crate::datastore::node_local::NodeLocalHandle {
+    crate::datastore::node_local::selector::open_node_local(
+        crate::datastore::backend_kind::BackendKind::Sqlite,
+        None,
+        supervisor,
+        None,
+        "sqlite:pod-repository-network-test",
+    )
+    .await
+    .expect("open node-local test store")
 }
 
 #[cfg(test)]
@@ -95,8 +117,11 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
         Box::pin(async move {
-            self.db
-                .get_pod_network_for_pod("", "", pod_uid.as_str())
+            let Some(node_local) = &self.node_local else {
+                return Ok(None);
+            };
+            node_local
+                .get_network_for_uid(pod_uid.as_str())
                 .await
                 .map_err(|error| {
                     klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
@@ -112,12 +137,20 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
         Box::pin(async move {
-            self.db
-                .get_pod_network_for_pod(&pod.namespace, &pod.name, &pod.uid)
+            let Some(node_local) = &self.node_local else {
+                return Ok(None);
+            };
+            node_local
+                .get_network_assignment_for_pod(pod)
                 .await
                 .map_err(|error| {
                     klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
                 })?
+                .map(|row| crate::datastore::PodNetworkEndpoint {
+                    ip_addr: row.ip_addr,
+                    veth_host: row.veth_host,
+                    netns_path: row.netns_path,
+                })
                 .map(test_network_endpoint)
                 .transpose()
         })
@@ -129,8 +162,11 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
         Box::pin(async move {
-            self.db
-                .get_pod_network(sandbox_id.as_str())
+            let Some(node_local) = &self.node_local else {
+                return Ok(None);
+            };
+            node_local
+                .get_network_for_sandbox(sandbox_id.as_str())
                 .await
                 .map_err(|error| {
                     klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
@@ -154,8 +190,11 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         sandbox_id: klights_node_store::SandboxKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
         Box::pin(async move {
-            self.db
-                .delete_pod_network(sandbox_id.as_str())
+            let Some(node_local) = &self.node_local else {
+                return Ok(());
+            };
+            node_local
+                .delete_network_for_sandbox(sandbox_id.as_str())
                 .await
                 .map_err(|error| {
                     klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
@@ -168,13 +207,31 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         request: klights_node_store::PodNetworkAllocationRequest,
     ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
         Box::pin(async move {
-            self.db
-                .delete_pod_network(request.sandbox_id())
+            let Some(node_local) = &self.node_local else {
+                return Ok(false);
+            };
+            let legacy = crate::datastore::PodNetworkAllocationRequest::new(
+                request.sandbox_id(),
+                crate::datastore::PodNetworkAllocationPod::new(
+                    &request.pod().namespace,
+                    &request.pod().name,
+                    &request.pod().uid,
+                ),
+                crate::datastore::PodNetworkAllocationSubnet::new(
+                    request.subnet_base_int(),
+                    request.subnet_size(),
+                ),
+                crate::datastore::PodNetworkAllocationLink::new(
+                    request.veth_host(),
+                    request.netns_path(),
+                ),
+            );
+            node_local
+                .delete_network_assignment_if_matches(legacy)
                 .await
                 .map_err(|error| {
                     klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
-                })?;
-            Ok(true)
+                })
         })
     }
 
@@ -953,7 +1010,7 @@ impl PodRepository {
         scheduling_mode: PodSchedulingMode,
         outbox: Option<Arc<crate::node_outbox::Outbox>>,
     ) -> Self {
-        let network_cache = test_pod_network_cache(db.clone());
+        let network_cache = empty_test_pod_network_cache();
         let assignment_bus = test_assignment_bus();
         Self::new_with_network_events(
             db,
@@ -977,10 +1034,11 @@ impl PodRepository {
         outbox: Option<Arc<crate::node_outbox::Outbox>>,
         cluster_api: Arc<dyn LeaderResourceQuery>,
     ) -> Self {
-        let pod_network_cache = test_pod_network_cache(db.clone());
+        let pod_network_cache = empty_test_pod_network_cache();
         let assignment_waiter = test_assignment_bus();
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
+            node_local: None,
             supervisor,
             side_effects,
             metrics,
@@ -1005,6 +1063,7 @@ impl PodRepository {
     ) -> Self {
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,
+            node_local: None,
             supervisor,
             side_effects,
             metrics,

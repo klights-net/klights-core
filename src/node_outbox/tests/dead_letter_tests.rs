@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::{DeadLetterTestInsert, NodeLocalHandle, OutboxInsert};
 use crate::datastore::node_local::{SqliteNodeLocalDb, selector};
-use crate::datastore::sqlite::{DbExecutor, opener};
 use crate::node_outbox::payload::OutboxPayload;
+use crate::sqlite_boundary::DbExecutor;
+use crate::sqlite_open as opener;
+use klights_cluster_core::command::StorageCommand;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {

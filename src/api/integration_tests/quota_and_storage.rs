@@ -1479,40 +1479,42 @@ async fn test_patch_pvc_status_condition_survives_rejected_stale_controller_comm
         .unwrap()
         .expect("PVC should exist after status patch");
 
-    let committed_status = crate::log_apply::LogApplyCommit::try_new(vec![
-        crate::log_apply::LogApplyMutation::PutResource(crate::log_apply::LogApplyResourceRow {
-            api_version: "v1".to_string(),
-            kind: "PersistentVolumeClaim".to_string(),
-            namespace: Some("pvc-status-race".to_string()),
-            name: "pvc1".to_string(),
-            uid: created.uid.clone(),
-            resource_version: 0,
-            data: json!({
-                "apiVersion": "v1",
-                "kind": "PersistentVolumeClaim",
-                "metadata": {
-                    "name": "pvc1",
-                    "namespace": "pvc-status-race",
-                    "uid": created.uid.clone(),
-                    "resourceVersion": "0"
-                },
-                "spec": {
-                    "accessModes": ["ReadWriteOnce"],
-                    "resources": {"requests": {"storage": "1Gi"}}
-                },
-                "status": {
-                    "phase": "Bound",
-                    "accessModes": ["ReadWriteOnce"],
-                    "capacity": {"storage": "1Gi"},
-                    "volumeName": "pv-pvc-status-race"
-                }
-            }),
-            require_absent: false,
-            require_existing: true,
-            precondition_uid: Some(created.uid.clone()),
-            precondition_resource_version: Some(created.resource_version),
-            status_only: true,
-        }),
+    let committed_status = klights_cluster_core::LogApplyCommit::try_new(vec![
+        klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "PersistentVolumeClaim".to_string(),
+                namespace: Some("pvc-status-race".to_string()),
+                name: "pvc1".to_string(),
+                uid: created.uid.clone(),
+                resource_version: 0,
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "name": "pvc1",
+                        "namespace": "pvc-status-race",
+                        "uid": created.uid.clone(),
+                        "resourceVersion": "0"
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {"requests": {"storage": "1Gi"}}
+                    },
+                    "status": {
+                        "phase": "Bound",
+                        "accessModes": ["ReadWriteOnce"],
+                        "capacity": {"storage": "1Gi"},
+                        "volumeName": "pv-pvc-status-race"
+                    }
+                }),
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some(created.uid.clone()),
+                precondition_resource_version: Some(created.resource_version),
+                status_only: true,
+            },
+        ),
     ])
     .expect("status-only live commit must have resourceVersion zero");
     let result = db

@@ -25,11 +25,9 @@ use crate::datastore::backend::WatchReplayAnchorStore;
 #[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 #[cfg(test)]
-#[cfg(test)]
-#[cfg(test)]
 use crate::replication::grpc::watch_replay_expired_status;
 use crate::replication::grpc::{
-    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, resource_command_request_from_proto,
+    JOIN_TOKEN_METADATA_KEY, entry_to_proto, resource_command_request_from_proto,
     watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 use crate::replication::protocol::{
@@ -78,13 +76,13 @@ where
 }
 
 pub fn validate_join_metadata(
-    join: &generated::JoinRequest,
+    join: &klights_internal_protobuf::JoinRequest,
 ) -> Result<klights_leader_api::NetworkDataplane> {
     validate_join_metadata_with_endpoint(join, None)
 }
 
 fn require_worker_command_codec_v3(
-    join: &generated::JoinRequest,
+    join: &klights_internal_protobuf::JoinRequest,
 ) -> std::result::Result<(), Status> {
     crate::replication::protocol::require_exact_command_codec(join.command_codec_version, "worker")
         .map_err(Status::failed_precondition)
@@ -166,7 +164,7 @@ fn validate_node_lease_renew_time_skew(
 }
 
 fn validate_join_metadata_with_endpoint(
-    join: &generated::JoinRequest,
+    join: &klights_internal_protobuf::JoinRequest,
     endpoint_override: Option<IpAddr>,
 ) -> Result<klights_leader_api::NetworkDataplane> {
     let mode = parse_dataplane_mode(&join.dataplane_mode)?;
@@ -187,7 +185,7 @@ fn validate_join_metadata_with_endpoint(
 }
 
 fn validate_controlplane_join_dataplane_metadata_with_endpoint(
-    join: &generated::JoinAsControlplaneRequest,
+    join: &klights_internal_protobuf::JoinAsControlplaneRequest,
     endpoint_override: Option<IpAddr>,
 ) -> Result<klights_leader_api::NetworkDataplane> {
     let mode = parse_dataplane_mode(&join.dataplane_mode)?;
@@ -208,7 +206,7 @@ fn validate_controlplane_join_dataplane_metadata_with_endpoint(
 }
 
 fn validate_controlplane_node_registration(
-    registration: generated::NodeRegistrationSnapshot,
+    registration: klights_internal_protobuf::NodeRegistrationSnapshot,
 ) -> Result<crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot> {
     let node_mode = match registration.node_mode.as_str() {
         "root" => crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
@@ -948,7 +946,7 @@ fn enforce_node_authority(
 
 fn apply_outbox_error_response(
     error: klights_leader_api::OutboxDeliveryError,
-) -> Response<generated::ApplyOutboxResponse> {
+) -> Response<klights_internal_protobuf::ApplyOutboxResponse> {
     let error = match error {
         klights_leader_api::OutboxDeliveryError::ConflictTerminal(message)
             if message
@@ -975,7 +973,7 @@ fn apply_outbox_error_response(
         klights_leader_api::OutboxDeliveryError::CorruptResponse { .. } => "CorruptResponse",
         _ => "CorruptResponse",
     };
-    Response::new(generated::ApplyOutboxResponse {
+    Response::new(klights_internal_protobuf::ApplyOutboxResponse {
         already_applied: false,
         applied_rv: 0,
         error: Some(error.to_string()),
@@ -1134,12 +1132,12 @@ pub fn mount_service_full_with_policy(
         grpc = grpc.with_controlplane_join_handler(handler);
     }
     let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(crate::replication::grpc::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(klights_internal_protobuf::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build replication gRPC reflection service");
     let max_message_bytes = transport_policy.max_message_bytes;
     let grpc_router = tonic::service::Routes::new(
-        generated::replication_server::ReplicationServer::new(grpc)
+        klights_internal_protobuf::replication_server::ReplicationServer::new(grpc)
             .max_decoding_message_size(max_message_bytes)
             .max_encoding_message_size(max_message_bytes),
     )
@@ -1208,12 +1206,12 @@ pub(crate) fn mount_service_full_production(
         grpc = grpc.with_controlplane_join_handler(handler);
     }
     let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(crate::replication::grpc::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(klights_internal_protobuf::FILE_DESCRIPTOR_SET)
         .build_v1()
         .expect("failed to build replication gRPC reflection service");
     let max_message_bytes = transport_policy.max_message_bytes;
     let grpc_router = tonic::service::Routes::new(
-        generated::replication_server::ReplicationServer::new(grpc)
+        klights_internal_protobuf::replication_server::ReplicationServer::new(grpc)
             .max_decoding_message_size(max_message_bytes)
             .max_encoding_message_size(max_message_bytes),
     )
@@ -1234,14 +1232,15 @@ pub(crate) fn mount_service_full_production(
 }
 
 #[tonic::async_trait]
-impl generated::replication_server::Replication for GrpcReplicationServer {
-    type ConnectStream = BoxStream<'static, std::result::Result<generated::LeaderMessage, Status>>;
+impl klights_internal_protobuf::replication_server::Replication for GrpcReplicationServer {
+    type ConnectStream =
+        BoxStream<'static, std::result::Result<klights_internal_protobuf::LeaderMessage, Status>>;
     type WatchResourcesStream =
-        BoxStream<'static, std::result::Result<generated::WatchEvent, Status>>;
+        BoxStream<'static, std::result::Result<klights_internal_protobuf::WatchEvent, Status>>;
 
     async fn connect(
         &self,
-        request: Request<tonic::Streaming<generated::FollowerMessage>>,
+        request: Request<tonic::Streaming<klights_internal_protobuf::FollowerMessage>>,
     ) -> std::result::Result<Response<Self::ConnectStream>, Status> {
         let remote_addr = request.remote_addr();
         let client_cert_identity = self.node_client_identity(&request).await?;
@@ -1250,7 +1249,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             Status::unauthenticated("first replication message must be JoinRequest")
         })?;
         let join = match first.payload {
-            Some(generated::follower_message::Payload::Join(join)) => join,
+            Some(klights_internal_protobuf::follower_message::Payload::Join(join)) => join,
             _ => {
                 return Err(Status::unauthenticated(
                     "first replication message must be JoinRequest",
@@ -1263,11 +1262,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             validate_join_metadata_with_endpoint(&join, remote_addr.map(|addr| addr.ip()))
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.require_raft_leader()?;
-        let role = match generated::JoinRole::try_from(join.role)
+        let role = match klights_internal_protobuf::JoinRole::try_from(join.role)
             .map_err(|_| Status::invalid_argument("unknown join role"))?
         {
-            generated::JoinRole::Worker => JoinRole::Worker,
-            generated::JoinRole::Unspecified => {
+            klights_internal_protobuf::JoinRole::Worker => JoinRole::Worker,
+            klights_internal_protobuf::JoinRole::Unspecified => {
                 return Err(Status::invalid_argument("join role must be WORKER"));
             }
         };
@@ -1337,8 +1336,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             None
         };
         let stream = async_stream::stream! {
-            yield Ok(generated::LeaderMessage {
-                payload: Some(generated::leader_message::Payload::JoinResponse(first_response)),
+            yield Ok(klights_internal_protobuf::LeaderMessage {
+                payload: Some(klights_internal_protobuf::leader_message::Payload::JoinResponse(first_response)),
             });
             if accepted {
                 if let Some(local_node_name) = local_node_name_for_observed_endpoint.as_deref() {
@@ -1348,10 +1347,10 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     };
                     match node_has_external_ip(query, local_node_name).await {
                         Ok(false) => {
-                            yield Ok(generated::LeaderMessage {
+                            yield Ok(klights_internal_protobuf::LeaderMessage {
                                 payload: Some(
-                                    generated::leader_message::Payload::ObserveLeaderEndpointRequest(
-                                        generated::ObserveLeaderEndpointRequest {},
+                                    klights_internal_protobuf::leader_message::Payload::ObserveLeaderEndpointRequest(
+                                        klights_internal_protobuf::ObserveLeaderEndpointRequest {},
                                     ),
                                 ),
                             });
@@ -1388,10 +1387,10 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                             match message.payload {
                                 // T6: legacy `Forward` payload removed. Workers now
                                 // route writes through outbox -> ApplyOutbox RPC.
-                                Some(generated::follower_message::Payload::Ack(ack)) => {
+                                Some(klights_internal_protobuf::follower_message::Payload::Ack(ack)) => {
                                     service.update_follower_ack(&joined_node_name, ack.applied_rv).await;
                                 }
-                                Some(generated::follower_message::Payload::NodeExecSyncResponse(response)) => {
+                                Some(klights_internal_protobuf::follower_message::Payload::NodeExecSyncResponse(response)) => {
                                     if let Err(err) = service.complete_node_exec_sync(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
@@ -1403,7 +1402,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched node exec response");
                                     }
                                 }
-                                Some(generated::follower_message::Payload::PodLogResponse(response)) => {
+                                Some(klights_internal_protobuf::follower_message::Payload::PodLogResponse(response)) => {
                                     if let Err(err) = service.complete_node_log_event(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
@@ -1415,7 +1414,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched pod log response");
                                     }
                                 }
-                                Some(generated::follower_message::Payload::NodeMetricsResponse(response)) => {
+                                Some(klights_internal_protobuf::follower_message::Payload::NodeMetricsResponse(response)) => {
                                     if let Err(err) = service.complete_node_metrics(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
@@ -1427,7 +1426,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched node metrics response");
                                     }
                                 }
-                                Some(generated::follower_message::Payload::NodeExecStreamFrame(frame)) => {
+                                Some(klights_internal_protobuf::follower_message::Payload::NodeExecStreamFrame(frame)) => {
                                     match node_exec_stream_frame_from_proto(frame) {
                                         Ok(frame) => {
                                             if let Err(err) = service.complete_node_exec_stream_frame(
@@ -1446,7 +1445,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                         }
                                     }
                                 }
-                                Some(generated::follower_message::Payload::ObservedLeaderEndpoint(observed)) => {
+                                Some(klights_internal_protobuf::follower_message::Payload::ObservedLeaderEndpoint(observed)) => {
                                     if let (
                                         Some(local_node_name),
                                         Some(node_query),
@@ -1471,7 +1470,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                         );
                                     }
                                 }
-                                Some(generated::follower_message::Payload::Join(_)) | None => {
+                                Some(klights_internal_protobuf::follower_message::Payload::Join(_)) | None => {
                                     yield Err(Status::invalid_argument("unexpected JoinRequest after stream start"));
                                     break;
                                 }
@@ -1483,36 +1482,36 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                             };
                             match control {
                                 FollowerControlMessage::NodeExecSync(request) => {
-                                    yield Ok(generated::LeaderMessage {
-                                        payload: Some(generated::leader_message::Payload::NodeExecSyncRequest(
+                                    yield Ok(klights_internal_protobuf::LeaderMessage {
+                                        payload: Some(klights_internal_protobuf::leader_message::Payload::NodeExecSyncRequest(
                                             node_exec_sync_request_to_proto(request),
                                         )),
                                     });
                                 }
                                 FollowerControlMessage::NodeExec(request) => {
-                                    yield Ok(generated::LeaderMessage {
-                                        payload: Some(generated::leader_message::Payload::NodeExecRequest(
+                                    yield Ok(klights_internal_protobuf::LeaderMessage {
+                                        payload: Some(klights_internal_protobuf::leader_message::Payload::NodeExecRequest(
                                             node_exec_request_to_proto(request),
                                         )),
                                     });
                                 }
                                 FollowerControlMessage::NodeExecFrame(frame) => {
-                                    yield Ok(generated::LeaderMessage {
-                                        payload: Some(generated::leader_message::Payload::NodeExecStreamFrame(
+                                    yield Ok(klights_internal_protobuf::LeaderMessage {
+                                        payload: Some(klights_internal_protobuf::leader_message::Payload::NodeExecStreamFrame(
                                             node_exec_stream_frame_to_proto(frame),
                                         )),
                                     });
                                 }
                                 FollowerControlMessage::PodLog(request) => {
-                                    yield Ok(generated::LeaderMessage {
-                                        payload: Some(generated::leader_message::Payload::PodLogRequest(
+                                    yield Ok(klights_internal_protobuf::LeaderMessage {
+                                        payload: Some(klights_internal_protobuf::leader_message::Payload::PodLogRequest(
                                             pod_log_request_to_proto(request),
                                         )),
                                     });
                                 }
                                 FollowerControlMessage::NodeMetrics(request) => {
-                                    yield Ok(generated::LeaderMessage {
-                                        payload: Some(generated::leader_message::Payload::NodeMetricsRequest(
+                                    yield Ok(klights_internal_protobuf::LeaderMessage {
+                                        payload: Some(klights_internal_protobuf::leader_message::Payload::NodeMetricsRequest(
                                             node_metrics_request_to_proto(request),
                                         )),
                                     });
@@ -1530,10 +1529,10 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                     break;
                                 }
                             };
-                            yield Ok(generated::LeaderMessage {
-                                payload: Some(generated::leader_message::Payload::StreamItem(
-                                    generated::StreamItem {
-                                        item: Some(generated::stream_item::Item::Entry(entry)),
+                            yield Ok(klights_internal_protobuf::LeaderMessage {
+                                payload: Some(klights_internal_protobuf::leader_message::Payload::StreamItem(
+                                    klights_internal_protobuf::StreamItem {
+                                        item: Some(klights_internal_protobuf::stream_item::Item::Entry(entry)),
                                     }
                                 )),
                             });
@@ -1550,11 +1549,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn get_metadata(
         &self,
-        request: Request<generated::MetadataRequest>,
-    ) -> std::result::Result<Response<generated::MetadataResponse>, Status> {
+        request: Request<klights_internal_protobuf::MetadataRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::MetadataResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
         let metadata = self.service.handle_metadata().await;
-        Ok(Response::new(generated::MetadataResponse {
+        Ok(Response::new(klights_internal_protobuf::MetadataResponse {
             cluster_id: metadata.cluster_id,
             leader_epoch: metadata.leader_epoch,
             current_rv: metadata.current_rv,
@@ -1565,8 +1564,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn get_resource(
         &self,
-        request: Request<generated::GetResourceRequest>,
-    ) -> std::result::Result<Response<generated::GetResourceResponse>, Status> {
+        request: Request<klights_internal_protobuf::GetResourceRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::GetResourceResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
         let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
@@ -1588,11 +1587,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .map_err(|err| Status::unavailable(err.to_string()))?;
         Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         Ok(Response::new(match resource {
-            Some(resource) => generated::GetResourceResponse {
+            Some(resource) => klights_internal_protobuf::GetResourceResponse {
                 found: true,
                 resource: Some(resource_to_proto(&resource)),
             },
-            None => generated::GetResourceResponse {
+            None => klights_internal_protobuf::GetResourceResponse {
                 found: false,
                 resource: None,
             },
@@ -1601,8 +1600,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn list_resources(
         &self,
-        request: Request<generated::ListResourcesRequest>,
-    ) -> std::result::Result<Response<generated::ListResourcesResponse>, Status> {
+        request: Request<klights_internal_protobuf::ListResourcesRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::ListResourcesResponse>, Status>
+    {
         self.require_steady_state_auth(&request).await?;
         let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
@@ -1626,21 +1626,27 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         let (items, resource_version, watch_replay_position, continue_token, remaining_item_count) =
             list.into_parts();
-        let items: Vec<generated::ResourceObject> = items.iter().map(resource_to_proto).collect();
-        Ok(Response::new(generated::ListResourcesResponse {
-            total: items.len() as i64,
-            items,
-            continue_token,
-            resource_version,
-            remaining_item_count,
-            watch_replay_position: watch_replay_position.map(watch_replay_position_to_proto),
-        }))
+        let items: Vec<klights_internal_protobuf::ResourceObject> =
+            items.iter().map(resource_to_proto).collect();
+        Ok(Response::new(
+            klights_internal_protobuf::ListResourcesResponse {
+                total: items.len() as i64,
+                items,
+                continue_token,
+                resource_version,
+                remaining_item_count,
+                watch_replay_position: watch_replay_position.map(watch_replay_position_to_proto),
+            },
+        ))
     }
 
     async fn submit_resource_command(
         &self,
-        request: Request<generated::SubmitResourceCommandRequest>,
-    ) -> std::result::Result<Response<generated::SubmitResourceCommandResponse>, Status> {
+        request: Request<klights_internal_protobuf::SubmitResourceCommandRequest>,
+    ) -> std::result::Result<
+        Response<klights_internal_protobuf::SubmitResourceCommandResponse>,
+        Status,
+    > {
         self.require_controlplane_node_auth(&request, "resource command submissions")
             .await?;
         self.require_raft_leader()?;
@@ -1665,7 +1671,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn watch_resources(
         &self,
-        request: Request<generated::WatchResourcesRequest>,
+        request: Request<klights_internal_protobuf::WatchResourcesRequest>,
     ) -> std::result::Result<Response<Self::WatchResourcesStream>, Status> {
         self.require_steady_state_auth(&request).await?;
         // Issue #4: a worker watch must be served by the current raft leader.
@@ -1746,7 +1752,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                         last_position = position;
                     }
                     last_rv = last_rv.max(event.resource().resource_version);
-                    yield Ok(generated::WatchEvent {
+                    yield Ok(klights_internal_protobuf::WatchEvent {
                         event_type: event.event_type().as_str().to_string(),
                         resource: Some(resource_to_proto(event.resource())),
                         resume_position: event
@@ -1900,7 +1906,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     let resource = resource_from_event(&event);
                     let rv = resource.resource_version;
                     let event_type = watch_event_type(&event).to_string();
-                    yield Ok(generated::WatchEvent {
+                    yield Ok(klights_internal_protobuf::WatchEvent {
                         event_type,
                         resource: Some(resource_to_proto(&resource)),
                         resume_position: Some(watch_replay_position_to_proto(cursor.processed_position())),
@@ -1920,9 +1926,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn projected_service_account_token(
         &self,
-        request: Request<generated::ProjectedServiceAccountTokenRequest>,
-    ) -> std::result::Result<Response<generated::ProjectedServiceAccountTokenResponse>, Status>
-    {
+        request: Request<klights_internal_protobuf::ProjectedServiceAccountTokenRequest>,
+    ) -> std::result::Result<
+        Response<klights_internal_protobuf::ProjectedServiceAccountTokenResponse>,
+        Status,
+    > {
         let authenticated_identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let caller = exact_projected_token_node_authority(&authenticated_identity);
@@ -1946,7 +1954,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .await
             .map_err(projected_token_error_to_status)?;
         Ok(Response::new(
-            generated::ProjectedServiceAccountTokenResponse {
+            klights_internal_protobuf::ProjectedServiceAccountTokenResponse {
                 token: token.into_token(),
             },
         ))
@@ -1954,8 +1962,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn apply_outbox(
         &self,
-        request: Request<generated::ApplyOutboxRequest>,
-    ) -> std::result::Result<Response<generated::ApplyOutboxResponse>, Status> {
+        request: Request<klights_internal_protobuf::ApplyOutboxRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::ApplyOutboxResponse>, Status> {
         let authenticated_identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let caller = node_authority_from_identity(&authenticated_identity);
@@ -1994,30 +2002,31 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .deliver_authenticated_outbox(request)
             .await;
         match result {
-            Ok(OutboxDeliveryResult::Applied { applied_rv }) => {
-                Ok(Response::new(generated::ApplyOutboxResponse {
+            Ok(OutboxDeliveryResult::Applied { applied_rv }) => Ok(Response::new(
+                klights_internal_protobuf::ApplyOutboxResponse {
                     already_applied: false,
                     applied_rv,
                     error: None,
                     error_type: None,
-                }))
-            }
-            Ok(OutboxDeliveryResult::AlreadyApplied { applied_rv }) => {
-                Ok(Response::new(generated::ApplyOutboxResponse {
+                },
+            )),
+            Ok(OutboxDeliveryResult::AlreadyApplied { applied_rv }) => Ok(Response::new(
+                klights_internal_protobuf::ApplyOutboxResponse {
                     already_applied: true,
                     applied_rv: applied_rv.unwrap_or(0),
                     error: None,
                     error_type: None,
-                }))
-            }
+                },
+            )),
             Err(err) => Ok(apply_outbox_error_response(err)),
         }
     }
 
     async fn renew_node_lease(
         &self,
-        request: Request<generated::RenewNodeLeaseRequest>,
-    ) -> std::result::Result<Response<generated::RenewNodeLeaseResponse>, Status> {
+        request: Request<klights_internal_protobuf::RenewNodeLeaseRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::RenewNodeLeaseResponse>, Status>
+    {
         let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let caller = node_authority_from_identity(&identity);
@@ -2041,13 +2050,15 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .renew_node_lease(renewal)
             .await
             .map_err(|err| Status::unavailable(err.to_string()))?;
-        Ok(Response::new(generated::RenewNodeLeaseResponse {}))
+        Ok(Response::new(
+            klights_internal_protobuf::RenewNodeLeaseResponse {},
+        ))
     }
 
     async fn allocate_node_subnet(
         &self,
-        request: Request<generated::AllocateNodeSubnetRequest>,
-    ) -> std::result::Result<Response<generated::NodeSubnetResponse>, Status> {
+        request: Request<klights_internal_protobuf::AllocateNodeSubnetRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::NodeSubnetResponse>, Status> {
         let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let authority = node_authority_from_identity(&identity);
@@ -2066,15 +2077,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .await
             .map_err(node_subnet_allocation_status)?
             .into_subnet();
-        Ok(Response::new(generated::NodeSubnetResponse {
-            subnet: Some(focused_node_subnet_to_proto(subnet)),
-        }))
+        Ok(Response::new(
+            klights_internal_protobuf::NodeSubnetResponse {
+                subnet: Some(focused_node_subnet_to_proto(subnet)),
+            },
+        ))
     }
 
     async fn get_node_subnet(
         &self,
-        request: Request<generated::GetNodeSubnetRequest>,
-    ) -> std::result::Result<Response<generated::GetNodeSubnetResponse>, Status> {
+        request: Request<klights_internal_protobuf::GetNodeSubnetRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::GetNodeSubnetResponse>, Status>
+    {
         self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let req = request.into_inner();
@@ -2088,11 +2102,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .map_err(|err| Status::unavailable(err.to_string()))?
             .into_option();
         Ok(Response::new(match subnet {
-            Some(subnet) => generated::GetNodeSubnetResponse {
+            Some(subnet) => klights_internal_protobuf::GetNodeSubnetResponse {
                 found: true,
                 subnet: Some(focused_node_subnet_to_proto(subnet)),
             },
-            None => generated::GetNodeSubnetResponse {
+            None => klights_internal_protobuf::GetNodeSubnetResponse {
                 found: false,
                 subnet: None,
             },
@@ -2101,8 +2115,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn list_peer_subnets(
         &self,
-        request: Request<generated::ListPeerSubnetsRequest>,
-    ) -> std::result::Result<Response<generated::ListPeerSubnetsResponse>, Status> {
+        request: Request<klights_internal_protobuf::ListPeerSubnetsRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::ListPeerSubnetsResponse>, Status>
+    {
         self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let req = request.into_inner();
@@ -2118,13 +2133,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .into_iter()
             .map(focused_node_subnet_to_proto)
             .collect();
-        Ok(Response::new(generated::ListPeerSubnetsResponse { items }))
+        Ok(Response::new(
+            klights_internal_protobuf::ListPeerSubnetsResponse { items },
+        ))
     }
 
     async fn get_node_dataplane(
         &self,
-        request: Request<generated::GetNodeDataplaneRequest>,
-    ) -> std::result::Result<Response<generated::GetNodeDataplaneResponse>, Status> {
+        request: Request<klights_internal_protobuf::GetNodeDataplaneRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::GetNodeDataplaneResponse>, Status>
+    {
         self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let req = request.into_inner();
@@ -2138,11 +2156,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .map_err(|err| Status::unavailable(err.to_string()))?
             .into_option();
         Ok(Response::new(match metadata {
-            Some(metadata) => generated::GetNodeDataplaneResponse {
+            Some(metadata) => klights_internal_protobuf::GetNodeDataplaneResponse {
                 found: true,
                 metadata: Some(focused_dataplane_to_proto(metadata)),
             },
-            None => generated::GetNodeDataplaneResponse {
+            None => klights_internal_protobuf::GetNodeDataplaneResponse {
                 found: false,
                 metadata: None,
             },
@@ -2151,8 +2169,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn observe_peer_endpoint(
         &self,
-        request: Request<generated::ObservePeerEndpointRequest>,
-    ) -> std::result::Result<Response<generated::ObservePeerEndpointResponse>, Status> {
+        request: Request<klights_internal_protobuf::ObservePeerEndpointRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::ObservePeerEndpointResponse>, Status>
+    {
         let identity = self.require_steady_state_auth(&request).await?;
         let caller = node_authority_from_identity(&identity);
         let observed_endpoint = request.remote_addr().map(|addr| addr.ip().to_string());
@@ -2166,19 +2185,21 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             self.service
                 .record_observed_peer_endpoint(&req.node_name, endpoint.clone())
                 .await;
-            return Ok(Response::new(generated::ObservePeerEndpointResponse {
-                found: true,
-                endpoint,
-            }));
+            return Ok(Response::new(
+                klights_internal_protobuf::ObservePeerEndpointResponse {
+                    found: true,
+                    endpoint,
+                },
+            ));
         }
 
         Ok(Response::new(
             match self.service.observed_peer_endpoint(&req.node_name).await {
-                Some(endpoint) => generated::ObservePeerEndpointResponse {
+                Some(endpoint) => klights_internal_protobuf::ObservePeerEndpointResponse {
                     found: true,
                     endpoint,
                 },
-                None => generated::ObservePeerEndpointResponse {
+                None => klights_internal_protobuf::ObservePeerEndpointResponse {
                     found: false,
                     endpoint: String::new(),
                 },
@@ -2188,9 +2209,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn list_pod_cleanup_intents_for_node(
         &self,
-        request: Request<generated::ListPodCleanupIntentsForNodeRequest>,
-    ) -> std::result::Result<Response<generated::ListPodCleanupIntentsForNodeResponse>, Status>
-    {
+        request: Request<klights_internal_protobuf::ListPodCleanupIntentsForNodeRequest>,
+    ) -> std::result::Result<
+        Response<klights_internal_protobuf::ListPodCleanupIntentsForNodeResponse>,
+        Status,
+    > {
         let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let caller = node_authority_from_identity(&identity);
@@ -2208,14 +2231,17 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .map(pod_cleanup_intent_to_proto)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Response::new(
-            generated::ListPodCleanupIntentsForNodeResponse { items },
+            klights_internal_protobuf::ListPodCleanupIntentsForNodeResponse { items },
         ))
     }
 
     async fn delete_pod_cleanup_intent(
         &self,
-        request: Request<generated::DeletePodCleanupIntentRequest>,
-    ) -> std::result::Result<Response<generated::DeletePodCleanupIntentResponse>, Status> {
+        request: Request<klights_internal_protobuf::DeletePodCleanupIntentRequest>,
+    ) -> std::result::Result<
+        Response<klights_internal_protobuf::DeletePodCleanupIntentResponse>,
+        Status,
+    > {
         let identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
         let caller = node_authority_from_identity(&identity);
@@ -2235,15 +2261,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .acknowledge_pod_cleanup_intent(request)
             .await
             .map_err(pod_cleanup_intent_error_to_status)?;
-        Ok(Response::new(generated::DeletePodCleanupIntentResponse {}))
+        Ok(Response::new(
+            klights_internal_protobuf::DeletePodCleanupIntentResponse {},
+        ))
     }
 
     // ── Phase 3 Raft consensus RPCs (P3-11b) ────────────────────────────
 
     async fn raft_append_entries(
         &self,
-        request: Request<generated::RaftAppendEntriesRequest>,
-    ) -> std::result::Result<Response<generated::RaftAppendEntriesResponse>, Status> {
+        request: Request<klights_internal_protobuf::RaftAppendEntriesRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::RaftAppendEntriesResponse>, Status>
+    {
         self.require_raft_peer_auth(&request).await?;
         let request = request.into_inner();
         crate::replication::protocol::require_exact_command_codec(
@@ -2258,24 +2287,34 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     "invalid exact-v3 Raft receiver admission proof: {error}"
                 ))
             })?;
-        Ok(Response::new(generated::RaftAppendEntriesResponse {
-            result: Some(
-                match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
-                    r.append_entries(receiver.clone(), payload.clone())
-                })
-                .await
-                {
-                    Ok(bytes) => generated::raft_append_entries_response::Result::Ok(bytes),
-                    Err(msg) => generated::raft_append_entries_response::Result::Error(msg),
-                },
-            ),
-        }))
+        Ok(Response::new(
+            klights_internal_protobuf::RaftAppendEntriesResponse {
+                result: Some(
+                    match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
+                        r.append_entries(receiver.clone(), payload.clone())
+                    })
+                    .await
+                    {
+                        Ok(bytes) => {
+                            klights_internal_protobuf::raft_append_entries_response::Result::Ok(
+                                bytes,
+                            )
+                        }
+                        Err(msg) => {
+                            klights_internal_protobuf::raft_append_entries_response::Result::Error(
+                                msg,
+                            )
+                        }
+                    },
+                ),
+            },
+        ))
     }
 
     async fn raft_vote(
         &self,
-        request: Request<generated::RaftVoteRequest>,
-    ) -> std::result::Result<Response<generated::RaftVoteResponse>, Status> {
+        request: Request<klights_internal_protobuf::RaftVoteRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::RaftVoteResponse>, Status> {
         self.require_raft_peer_auth(&request).await?;
         let request = request.into_inner();
         crate::replication::protocol::require_exact_command_codec(
@@ -2290,15 +2329,15 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     "invalid exact-v3 Raft receiver admission proof: {error}"
                 ))
             })?;
-        Ok(Response::new(generated::RaftVoteResponse {
+        Ok(Response::new(klights_internal_protobuf::RaftVoteResponse {
             result: Some(
                 match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
                     r.vote(receiver.clone(), payload.clone())
                 })
                 .await
                 {
-                    Ok(bytes) => generated::raft_vote_response::Result::Ok(bytes),
-                    Err(msg) => generated::raft_vote_response::Result::Error(msg),
+                    Ok(bytes) => klights_internal_protobuf::raft_vote_response::Result::Ok(bytes),
+                    Err(msg) => klights_internal_protobuf::raft_vote_response::Result::Error(msg),
                 },
             ),
         }))
@@ -2306,8 +2345,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
     async fn raft_install_snapshot(
         &self,
-        request: Request<generated::RaftInstallSnapshotRequest>,
-    ) -> std::result::Result<Response<generated::RaftInstallSnapshotResponse>, Status> {
+        request: Request<klights_internal_protobuf::RaftInstallSnapshotRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::RaftInstallSnapshotResponse>, Status>
+    {
         self.require_raft_peer_auth(&request).await?;
         let request = request.into_inner();
         crate::replication::protocol::require_exact_command_codec(
@@ -2322,24 +2362,35 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     "invalid exact-v3 Raft receiver admission proof: {error}"
                 ))
             })?;
-        Ok(Response::new(generated::RaftInstallSnapshotResponse {
-            result: Some(
-                match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
-                    r.install_snapshot(receiver.clone(), payload.clone())
-                })
-                .await
-                {
-                    Ok(bytes) => generated::raft_install_snapshot_response::Result::Ok(bytes),
-                    Err(msg) => generated::raft_install_snapshot_response::Result::Error(msg),
-                },
-            ),
-        }))
+        Ok(Response::new(
+            klights_internal_protobuf::RaftInstallSnapshotResponse {
+                result: Some(
+                    match dispatch_raft_rpc(self.raft_rpc_router.as_ref(), |r| {
+                        r.install_snapshot(receiver.clone(), payload.clone())
+                    })
+                    .await
+                    {
+                        Ok(bytes) => {
+                            klights_internal_protobuf::raft_install_snapshot_response::Result::Ok(
+                                bytes,
+                            )
+                        }
+                        Err(msg) => {
+                            klights_internal_protobuf::raft_install_snapshot_response::Result::Error(
+                                msg,
+                            )
+                        }
+                    },
+                ),
+            },
+        ))
     }
 
     async fn join_as_controlplane(
         &self,
-        request: Request<generated::JoinAsControlplaneRequest>,
-    ) -> std::result::Result<Response<generated::JoinAsControlplaneResponse>, Status> {
+        request: Request<klights_internal_protobuf::JoinAsControlplaneRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::JoinAsControlplaneResponse>, Status>
+    {
         let remote_addr = request.remote_addr();
         // Raft voter/learner admission must be authorized by a valid controlplane
         // bootstrap token on first join. A node client cert alone is insufficient:
@@ -2359,9 +2410,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         };
         validate_node_client_identity(identity, Some(&req.node_name))?;
         let Some(handler) = self.controlplane_join_handler.as_ref() else {
-            return Ok(Response::new(generated::JoinAsControlplaneResponse {
-                result: Some(generated::join_as_controlplane_response::Result::Denied(
-                    generated::JoinAsControlplaneDenied {
+            return Ok(Response::new(klights_internal_protobuf::JoinAsControlplaneResponse {
+                result: Some(klights_internal_protobuf::join_as_controlplane_response::Result::Denied(
+                    klights_internal_protobuf::JoinAsControlplaneDenied {
                         reason:
                             "raft mode not enabled on this server (no controlplane join handler)"
                                 .to_string(),
@@ -2437,7 +2488,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let storage_log_attestation = req.storage_log_attestation.ok_or_else(|| {
             Status::invalid_argument("JoinAsControlplane requires storage_log_attestation")
         })?;
-        let map_log_id = |attestation: generated::RaftStorageLogId| {
+        let map_log_id = |attestation: klights_internal_protobuf::RaftStorageLogId| {
             crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
                 term: attestation.term,
                 leader_node_id: attestation.leader_node_id,
@@ -2481,8 +2532,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     .controlplane_ca_files
                     .join_response_ca_cert_pem()
                     .await?;
-                generated::join_as_controlplane_response::Result::Accepted(
-                    generated::JoinAsControlplaneAccepted {
+                klights_internal_protobuf::join_as_controlplane_response::Result::Accepted(
+                    klights_internal_protobuf::JoinAsControlplaneAccepted {
                         voter_count_after,
                         admitted_as_learner,
                         ca_cert_pem,
@@ -2494,27 +2545,32 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::RedirectToLeader {
                 leader_id,
                 leader_addr,
-            } => generated::join_as_controlplane_response::Result::RedirectToLeader(
-                generated::JoinAsControlplaneRedirect {
-                    leader_id,
-                    leader_addr,
-                },
-            ),
+            } => {
+                klights_internal_protobuf::join_as_controlplane_response::Result::RedirectToLeader(
+                    klights_internal_protobuf::JoinAsControlplaneRedirect {
+                        leader_id,
+                        leader_addr,
+                    },
+                )
+            }
             crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::Denied { reason } => {
-                generated::join_as_controlplane_response::Result::Denied(
-                    generated::JoinAsControlplaneDenied { reason },
+                klights_internal_protobuf::join_as_controlplane_response::Result::Denied(
+                    klights_internal_protobuf::JoinAsControlplaneDenied { reason },
                 )
             }
         };
-        Ok(Response::new(generated::JoinAsControlplaneResponse {
-            result: Some(result),
-        }))
+        Ok(Response::new(
+            klights_internal_protobuf::JoinAsControlplaneResponse {
+                result: Some(result),
+            },
+        ))
     }
 
     async fn sign_controlplane_csr(
         &self,
-        request: Request<generated::SignControlplaneCsrRequest>,
-    ) -> std::result::Result<Response<generated::SignControlplaneCsrResponse>, Status> {
+        request: Request<klights_internal_protobuf::SignControlplaneCsrRequest>,
+    ) -> std::result::Result<Response<klights_internal_protobuf::SignControlplaneCsrResponse>, Status>
+    {
         let join_token = request
             .metadata()
             .get(JOIN_TOKEN_METADATA_KEY)
@@ -2618,14 +2674,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             "SignControlplaneCsr: signed server cert for joining controlplane"
         );
 
-        Ok(Response::new(generated::SignControlplaneCsrResponse {
-            signed_server_cert,
-            ca_cert_pem,
-            encrypted_ca_key,
-            ca_key_nonce,
-            encrypted_service_account_signing_key,
-            service_account_signing_key_nonce,
-        }))
+        Ok(Response::new(
+            klights_internal_protobuf::SignControlplaneCsrResponse {
+                signed_server_cert,
+                ca_cert_pem,
+                encrypted_ca_key,
+                ca_key_nonce,
+                encrypted_service_account_signing_key,
+                service_account_signing_key_nonce,
+            },
+        ))
     }
 }
 
@@ -2653,7 +2711,7 @@ where
     call(router).await.map_err(|err| err.to_string())
 }
 
-pub(crate) fn resource_to_proto(resource: &Resource) -> generated::ResourceObject {
+pub(crate) fn resource_to_proto(resource: &Resource) -> klights_internal_protobuf::ResourceObject {
     let mut data = (*resource.data).clone();
     if let Some(root) = data.as_object_mut() {
         root.insert(
@@ -2693,7 +2751,7 @@ pub(crate) fn resource_to_proto(resource: &Resource) -> generated::ResourceObjec
             );
         }
     }
-    generated::ResourceObject {
+    klights_internal_protobuf::ResourceObject {
         api_version: resource.api_version.clone(),
         kind: resource.kind.clone(),
         namespace: resource.namespace.clone(),
@@ -2706,17 +2764,17 @@ pub(crate) fn resource_to_proto(resource: &Resource) -> generated::ResourceObjec
 
 fn resource_command_result_to_proto(
     result: klights_leader_api::ResourceCommandResult,
-) -> generated::SubmitResourceCommandResponse {
-    use generated::submit_resource_command_response::Result as WireResult;
+) -> klights_internal_protobuf::SubmitResourceCommandResponse {
+    use klights_internal_protobuf::submit_resource_command_response::Result as WireResult;
     let result = match result {
         klights_leader_api::ResourceCommandResult::Resource(resource) => {
             WireResult::Resource(resource_to_proto(&resource))
         }
         klights_leader_api::ResourceCommandResult::Ack { resource_version } => {
-            WireResult::Ack(generated::ResourceCommandAck { resource_version })
+            WireResult::Ack(klights_internal_protobuf::ResourceCommandAck { resource_version })
         }
     };
-    generated::SubmitResourceCommandResponse {
+    klights_internal_protobuf::SubmitResourceCommandResponse {
         result: Some(result),
     }
 }
@@ -2746,8 +2804,8 @@ fn resource_command_status(error: klights_leader_api::ResourceCommandError) -> S
 
 fn focused_node_subnet_to_proto(
     subnet: klights_leader_api::NodeSubnet,
-) -> generated::NodeSubnetObject {
-    generated::NodeSubnetObject {
+) -> klights_internal_protobuf::NodeSubnetObject {
+    klights_internal_protobuf::NodeSubnetObject {
         node_name: subnet.node_name().to_string(),
         subnet: subnet.subnet().to_string(),
         subnet_base_int: subnet.subnet_base_int(),
@@ -2764,8 +2822,8 @@ fn focused_node_subnet_to_proto(
 
 fn focused_dataplane_to_proto(
     metadata: klights_leader_api::NetworkDataplane,
-) -> generated::DataplaneMetadataObject {
-    generated::DataplaneMetadataObject {
+) -> klights_internal_protobuf::DataplaneMetadataObject {
+    klights_internal_protobuf::DataplaneMetadataObject {
         node_name: metadata.node_name().to_string(),
         mode: match metadata.mode() {
             klights_leader_api::NetworkNodeMode::Root => "root",
@@ -2785,7 +2843,7 @@ fn focused_dataplane_to_proto(
 
 fn pod_cleanup_intent_to_proto(
     intent: klights_leader_api::PodCleanupIntent,
-) -> std::result::Result<generated::PodCleanupIntentObject, Status> {
+) -> std::result::Result<klights_internal_protobuf::PodCleanupIntentObject, Status> {
     let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
         intent.into_parts();
     let pod_data_json = serde_json::to_vec(pod.data.as_ref()).map_err(|error| {
@@ -2795,7 +2853,7 @@ fn pod_cleanup_intent_to_proto(
             )),
         )
     })?;
-    Ok(generated::PodCleanupIntentObject {
+    Ok(klights_internal_protobuf::PodCleanupIntentObject {
         node_name,
         namespace,
         pod_name,
@@ -2867,10 +2925,10 @@ fn watch_heartbeat_proto(
     kind: &str,
     last_rv: i64,
     resume_position: WatchReplayPosition,
-) -> generated::WatchEvent {
+) -> klights_internal_protobuf::WatchEvent {
     let hb = crate::watch::WatchEvent::bookmark_typed(last_rv, api_version, kind);
     let resource = resource_from_event(&hb);
-    generated::WatchEvent {
+    klights_internal_protobuf::WatchEvent {
         event_type: watch_event_type(&hb).to_string(),
         resource: Some(resource_to_proto(&resource)),
         resume_position: Some(watch_replay_position_to_proto(resume_position)),
@@ -2896,7 +2954,7 @@ fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv
 #[cfg(test)]
 fn watch_event_should_stream(
     event: &crate::watch::WatchEvent,
-    req: &generated::WatchResourcesRequest,
+    req: &klights_internal_protobuf::WatchResourcesRequest,
 ) -> bool {
     if event.event_type == crate::watch::EventType::Bookmark {
         return true;
@@ -2913,7 +2971,7 @@ fn watch_event_should_stream(
 }
 
 #[cfg(test)]
-fn selector_may_change_membership(req: &generated::WatchResourcesRequest) -> bool {
+fn selector_may_change_membership(req: &klights_internal_protobuf::WatchResourcesRequest) -> bool {
     if req
         .label_selector
         .as_deref()
@@ -2959,7 +3017,7 @@ async fn watch_leadership_lost(leader_rx: &mut tokio::sync::watch::Receiver<bool
 
 #[cfg(test)]
 fn watch_target_for_request(
-    req: &generated::WatchResourcesRequest,
+    req: &klights_internal_protobuf::WatchResourcesRequest,
     resource_scope: klights_watch::WatchResourceScope,
 ) -> WatchTarget {
     if let Some(namespace) = req.namespace.as_ref() {
@@ -2981,7 +3039,7 @@ fn watch_target_for_request(
 
 #[cfg(test)]
 fn watch_delivery_scope_for_request(
-    req: &generated::WatchResourcesRequest,
+    req: &klights_internal_protobuf::WatchResourcesRequest,
     resource_scope: klights_watch::WatchResourceScope,
 ) -> crate::watch::WatchDeliveryScope {
     if let Some(namespace) = req.namespace.as_ref() {
@@ -3123,7 +3181,7 @@ async fn node_has_external_ip(
 async fn join_response_to_proto(
     topology: &dyn klights_leader_api::LeaderNetworkTopologyQuery,
     response: JoinResponse,
-) -> std::result::Result<generated::JoinResponse, Status> {
+) -> std::result::Result<klights_internal_protobuf::JoinResponse, Status> {
     match response {
         JoinResponse::Accepted {
             cluster_id,
@@ -3131,9 +3189,9 @@ async fn join_response_to_proto(
             current_rv,
         } => {
             let peers = dataplane_peers_from_topology(topology).await?;
-            Ok(generated::JoinResponse {
-                result: Some(generated::join_response::Result::Accepted(
-                    generated::JoinAccepted {
+            Ok(klights_internal_protobuf::JoinResponse {
+                result: Some(klights_internal_protobuf::join_response::Result::Accepted(
+                    klights_internal_protobuf::JoinAccepted {
                         cluster_id,
                         leader_epoch,
                         current_rv,
@@ -3142,9 +3200,9 @@ async fn join_response_to_proto(
                 )),
             })
         }
-        JoinResponse::Rejected { reason } => Ok(generated::JoinResponse {
-            result: Some(generated::join_response::Result::Rejected(
-                generated::JoinRejected { reason },
+        JoinResponse::Rejected { reason } => Ok(klights_internal_protobuf::JoinResponse {
+            result: Some(klights_internal_protobuf::join_response::Result::Rejected(
+                klights_internal_protobuf::JoinRejected { reason },
             )),
         }),
     }
@@ -3152,7 +3210,7 @@ async fn join_response_to_proto(
 
 async fn dataplane_peers_from_topology(
     topology: &dyn klights_leader_api::LeaderNetworkTopologyQuery,
-) -> std::result::Result<Vec<generated::DataplanePeer>, Status> {
+) -> std::result::Result<Vec<klights_internal_protobuf::DataplanePeer>, Status> {
     let query = klights_leader_api::PeerSubnetsQuery::try_new("snapshot-peer-list")
         .map_err(|err| Status::internal(err.to_string()))?;
     let mut subnets = topology
@@ -3175,7 +3233,7 @@ async fn dataplane_peers_from_topology(
         else {
             continue;
         };
-        peers.push(generated::DataplanePeer {
+        peers.push(klights_internal_protobuf::DataplanePeer {
             node_name,
             pod_cidr: subnet.subnet().to_string(),
             public_key: dataplane.public_key().unwrap_or_default().to_string(),
@@ -3201,11 +3259,11 @@ async fn dataplane_peers_from_topology(
 
 fn node_exec_sync_request_to_proto(
     request: RoutedNodeExecSyncRequest,
-) -> generated::NodeExecSyncRequest {
+) -> klights_internal_protobuf::NodeExecSyncRequest {
     let request_id = request.request_id;
     let (target, command, timeout_seconds) = request.request.into_parts();
     let (node_name, namespace, pod_name, container_id) = target.into_parts();
-    generated::NodeExecSyncRequest {
+    klights_internal_protobuf::NodeExecSyncRequest {
         request_id,
         node_name,
         namespace,
@@ -3217,7 +3275,7 @@ fn node_exec_sync_request_to_proto(
 }
 
 fn node_exec_sync_response_from_proto(
-    response: generated::NodeExecSyncResponse,
+    response: klights_internal_protobuf::NodeExecSyncResponse,
 ) -> RoutedNodeExecSyncResponse {
     let result = match response.error {
         Some(error) => NodeExecSyncResult::failed(
@@ -3234,11 +3292,13 @@ fn node_exec_sync_response_from_proto(
     }
 }
 
-fn node_exec_request_to_proto(request: RoutedNodeExecRequest) -> generated::NodeExecRequest {
+fn node_exec_request_to_proto(
+    request: RoutedNodeExecRequest,
+) -> klights_internal_protobuf::NodeExecRequest {
     let request_id = request.request_id;
     let (target, command, options, attach) = request.request.into_parts();
     let (node_name, namespace, pod_name, container_id) = target.into_parts();
-    generated::NodeExecRequest {
+    klights_internal_protobuf::NodeExecRequest {
         request_id,
         node_name,
         namespace,
@@ -3253,9 +3313,11 @@ fn node_exec_request_to_proto(request: RoutedNodeExecRequest) -> generated::Node
     }
 }
 
-fn node_exec_stream_frame_to_proto(frame: RoutedNodeExecFrame) -> generated::NodeExecStreamFrame {
+fn node_exec_stream_frame_to_proto(
+    frame: RoutedNodeExecFrame,
+) -> klights_internal_protobuf::NodeExecStreamFrame {
     let (channel, data, fin) = frame.frame.into_parts();
-    generated::NodeExecStreamFrame {
+    klights_internal_protobuf::NodeExecStreamFrame {
         request_id: frame.request_id,
         channel: channel.as_wire_name().to_string(),
         data,
@@ -3264,7 +3326,7 @@ fn node_exec_stream_frame_to_proto(frame: RoutedNodeExecFrame) -> generated::Nod
 }
 
 fn node_exec_stream_frame_from_proto(
-    frame: generated::NodeExecStreamFrame,
+    frame: klights_internal_protobuf::NodeExecStreamFrame,
 ) -> Result<RoutedNodeExecFrame> {
     let channel = ExecStreamChannel::try_from_wire_name(&frame.channel)
         .ok_or_else(|| anyhow!("unknown node exec stream channel '{}'", frame.channel))?;
@@ -3274,12 +3336,14 @@ fn node_exec_stream_frame_from_proto(
     })
 }
 
-fn pod_log_request_to_proto(routed: RoutedNodeLogRequest) -> generated::PodLogRequest {
+fn pod_log_request_to_proto(
+    routed: RoutedNodeLogRequest,
+) -> klights_internal_protobuf::PodLogRequest {
     let (target, options) = routed.request.into_parts();
     let (node_name, namespace, pod_name, pod_uid, container_name) = target.into_parts();
     let (_, tail_lines, timestamps, since_time, since_seconds, limit_bytes, previous) =
         options.into_parts();
-    generated::PodLogRequest {
+    klights_internal_protobuf::PodLogRequest {
         request_id: routed.request_id,
         node_name,
         namespace,
@@ -3296,7 +3360,9 @@ fn pod_log_request_to_proto(routed: RoutedNodeLogRequest) -> generated::PodLogRe
     }
 }
 
-fn pod_log_response_from_proto(response: generated::PodLogResponse) -> RoutedNodeLogEvent {
+fn pod_log_response_from_proto(
+    response: klights_internal_protobuf::PodLogResponse,
+) -> RoutedNodeLogEvent {
     let event = match response.error {
         Some(error) => NodeLogEvent::failed(response.log_content, NodeLogTerminalError::new(error)),
         None if response.fin => NodeLogEvent::complete(response.log_content),
@@ -3310,9 +3376,9 @@ fn pod_log_response_from_proto(response: generated::PodLogResponse) -> RoutedNod
 
 fn node_metrics_request_to_proto(
     request: RoutedNodeMetricsRequest,
-) -> generated::NodeMetricsRequest {
+) -> klights_internal_protobuf::NodeMetricsRequest {
     let (target, pod_uids) = request.request.into_parts();
-    generated::NodeMetricsRequest {
+    klights_internal_protobuf::NodeMetricsRequest {
         request_id: request.request_id,
         node_name: target.into_node_name(),
         pod_uids,
@@ -3320,7 +3386,7 @@ fn node_metrics_request_to_proto(
 }
 
 fn node_metrics_response_from_proto(
-    response: generated::NodeMetricsResponse,
+    response: klights_internal_protobuf::NodeMetricsResponse,
 ) -> RoutedNodeMetricsResponse {
     let request_id = response.request_id;
     let node_name = response.node_name;
@@ -3379,19 +3445,20 @@ mod tests {
     };
 
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
-    use crate::datastore::command::{
-        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
-    };
-    use crate::datastore::types::{ResourcePreconditions, WatchReplayPosition};
-    use crate::replication::grpc::generated::replication_client::ReplicationClient;
-    use crate::replication::grpc::generated::replication_server::Replication;
     use crate::replication::grpc::raft_rpc::{
         ControlplaneJoinHandler, ControlplaneJoinOutcome, RaftRpcRouterError,
     };
-    use crate::replication::grpc::{
-        generated::{self, JoinRequest, JoinRole, MetadataRequest},
-        server::{require_worker_command_codec_v3, validate_join_metadata},
+    use crate::replication::grpc::server::{
+        require_worker_command_codec_v3, validate_join_metadata,
     };
+    use klights_cluster_core::ResourcePreconditions;
+    use klights_cluster_core::WatchReplayPosition;
+    use klights_cluster_core::command::{
+        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
+    };
+    use klights_internal_protobuf::replication_client::ReplicationClient;
+    use klights_internal_protobuf::replication_server::Replication;
+    use klights_internal_protobuf::{JoinRequest, JoinRole, MetadataRequest};
 
     use crate::replication::protocol::ReplicationEntry;
     use crate::replication::service::ReplicationService;
@@ -3495,25 +3562,27 @@ mod tests {
         assert_eq!(request.node_name, "worker-7");
         assert_eq!(request.pod_uids, ["pod-a", "pod-b"]);
 
-        let response = super::node_metrics_response_from_proto(generated::NodeMetricsResponse {
-            request_id: "metrics-request-7".to_string(),
-            node_name: "worker-7".to_string(),
-            node: Some(generated::NodeMetricsNodeSample {
-                cpu_nanos: 17,
-                memory_bytes: 23,
-            }),
-            pods: vec![generated::NodeMetricsPodSample {
-                namespace: "default".to_string(),
-                name: "pod-a".to_string(),
-                uid: "pod-a-uid".to_string(),
-                containers: vec![generated::NodeMetricsContainerSample {
-                    name: "main".to_string(),
-                    cpu_nanos: 29,
-                    memory_bytes: 31,
+        let response = super::node_metrics_response_from_proto(
+            klights_internal_protobuf::NodeMetricsResponse {
+                request_id: "metrics-request-7".to_string(),
+                node_name: "worker-7".to_string(),
+                node: Some(klights_internal_protobuf::NodeMetricsNodeSample {
+                    cpu_nanos: 17,
+                    memory_bytes: 23,
+                }),
+                pods: vec![klights_internal_protobuf::NodeMetricsPodSample {
+                    namespace: "default".to_string(),
+                    name: "pod-a".to_string(),
+                    uid: "pod-a-uid".to_string(),
+                    containers: vec![klights_internal_protobuf::NodeMetricsContainerSample {
+                        name: "main".to_string(),
+                        cpu_nanos: 29,
+                        memory_bytes: 31,
+                    }],
                 }],
-            }],
-            error: None,
-        });
+                error: None,
+            },
+        );
         assert_eq!(response.request_id, "metrics-request-7");
         assert_eq!(response.node_name, "worker-7");
         let result = response.result.unwrap();
@@ -3527,13 +3596,15 @@ mod tests {
         assert_eq!(result.pods()[0].containers()[0].cpu_nanos(), 29);
         assert_eq!(result.pods()[0].containers()[0].memory_bytes(), 31);
 
-        let error = super::node_metrics_response_from_proto(generated::NodeMetricsResponse {
-            request_id: "metrics-request-8".to_string(),
-            node_name: "worker-8".to_string(),
-            node: None,
-            pods: Vec::new(),
-            error: Some("runtime stats unavailable".to_string()),
-        });
+        let error = super::node_metrics_response_from_proto(
+            klights_internal_protobuf::NodeMetricsResponse {
+                request_id: "metrics-request-8".to_string(),
+                node_name: "worker-8".to_string(),
+                node: None,
+                pods: Vec::new(),
+                error: Some("runtime stats unavailable".to_string()),
+            },
+        );
         assert_eq!(error.request_id, "metrics-request-8");
         assert_eq!(error.node_name, "worker-8");
         assert!(matches!(
@@ -3542,16 +3613,18 @@ mod tests {
                 if message == "runtime stats unavailable"
         ));
 
-        let mixed = super::node_metrics_response_from_proto(generated::NodeMetricsResponse {
-            request_id: "metrics-request-9".to_string(),
-            node_name: "worker-9".to_string(),
-            node: Some(generated::NodeMetricsNodeSample {
-                cpu_nanos: 99,
-                memory_bytes: 101,
-            }),
-            pods: Vec::new(),
-            error: Some("runtime failed".to_string()),
-        });
+        let mixed = super::node_metrics_response_from_proto(
+            klights_internal_protobuf::NodeMetricsResponse {
+                request_id: "metrics-request-9".to_string(),
+                node_name: "worker-9".to_string(),
+                node: Some(klights_internal_protobuf::NodeMetricsNodeSample {
+                    cpu_nanos: 99,
+                    memory_bytes: 101,
+                }),
+                pods: Vec::new(),
+                error: Some("runtime failed".to_string()),
+            },
+        );
         assert!(matches!(
             mixed.result,
             Err(klights_node_api::NodeMetricsError::Unavailable { ref message })
@@ -3663,15 +3736,15 @@ mod tests {
             dataplane_port: 51_820,
             dataplane_mode: "root".to_string(),
             dataplane_encryption: "enabled".to_string(),
-            command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+            command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
         }
     }
 
     fn watch_request_for_kind(
         kind: &str,
         namespace: Option<&str>,
-    ) -> generated::WatchResourcesRequest {
-        generated::WatchResourcesRequest {
+    ) -> klights_internal_protobuf::WatchResourcesRequest {
+        klights_internal_protobuf::WatchResourcesRequest {
             api_version: "v1".to_string(),
             kind: kind.to_string(),
             namespace: namespace.map(str::to_string),
@@ -4045,7 +4118,7 @@ mod tests {
         // Default client encoding limit is unbounded, so the oversized request
         // is sent; the server must reject it on decode.
         let mut client = ReplicationClient::new(channel);
-        let oversized = tonic::Request::new(generated::ApplyOutboxRequest {
+        let oversized = tonic::Request::new(klights_internal_protobuf::ApplyOutboxRequest {
             idempotency_key: "k".to_string(),
             operation: "create".to_string(),
             payload_proto: vec![0u8; 8 * 1024],
@@ -4063,7 +4136,7 @@ mod tests {
 
         // A small request is not rejected on size grounds (it fails auth /
         // leadership later, but never with an OutOfRange size error).
-        let small = tonic::Request::new(generated::ApplyOutboxRequest {
+        let small = tonic::Request::new(klights_internal_protobuf::ApplyOutboxRequest {
             idempotency_key: "k".to_string(),
             operation: "create".to_string(),
             payload_proto: vec![0u8; 16],
@@ -4116,7 +4189,7 @@ mod tests {
             .unwrap();
         let mut client = ReplicationClient::new(channel);
         let mut watch = client
-            .watch_resources(generated::WatchResourcesRequest {
+            .watch_resources(klights_internal_protobuf::WatchResourcesRequest {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: None,
@@ -4167,7 +4240,7 @@ mod tests {
             .unwrap();
         let mut client = ReplicationClient::new(channel);
         let mut watch = client
-            .watch_resources(generated::WatchResourcesRequest {
+            .watch_resources(klights_internal_protobuf::WatchResourcesRequest {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: None,
@@ -4309,7 +4382,7 @@ mod tests {
             .unwrap();
         let mut client = ReplicationClient::new(channel);
         let mut watch = client
-            .watch_resources(generated::WatchResourcesRequest {
+            .watch_resources(klights_internal_protobuf::WatchResourcesRequest {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: None,
@@ -4382,8 +4455,8 @@ mod tests {
         (grpc, leader_tx)
     }
 
-    fn watch_pods_request() -> generated::WatchResourcesRequest {
-        generated::WatchResourcesRequest {
+    fn watch_pods_request() -> klights_internal_protobuf::WatchResourcesRequest {
+        klights_internal_protobuf::WatchResourcesRequest {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: None,
@@ -4394,8 +4467,10 @@ mod tests {
         }
     }
 
-    fn watch_configmaps_from_rv(start_resource_version: i64) -> generated::WatchResourcesRequest {
-        generated::WatchResourcesRequest {
+    fn watch_configmaps_from_rv(
+        start_resource_version: i64,
+    ) -> klights_internal_protobuf::WatchResourcesRequest {
+        klights_internal_protobuf::WatchResourcesRequest {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
             namespace: None,
@@ -4487,8 +4562,8 @@ mod tests {
     fn custom_resource_watch_request(
         api_version: &str,
         kind: &str,
-    ) -> generated::WatchResourcesRequest {
-        generated::WatchResourcesRequest {
+    ) -> klights_internal_protobuf::WatchResourcesRequest {
+        klights_internal_protobuf::WatchResourcesRequest {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
             namespace: None,
@@ -4725,13 +4800,13 @@ mod tests {
     #[tokio::test]
     async fn resource_get_and_list_reject_non_leader_and_raw_invalid_requests() {
         let (follower, _leader_tx) = grpc_leader_server(false).await;
-        let get = generated::GetResourceRequest {
+        let get = klights_internal_protobuf::GetResourceRequest {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
             name: "web".to_string(),
         };
-        let list = generated::ListResourcesRequest {
+        let list = klights_internal_protobuf::ListResourcesRequest {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -4786,7 +4861,7 @@ mod tests {
         let (grpc, _leader_tx) = grpc_leader_server(false).await;
         let rejected = grpc
             .get_node_subnet(request_with_node_client_cert(
-                generated::GetNodeSubnetRequest {
+                klights_internal_protobuf::GetNodeSubnetRequest {
                     node_name: "worker-1".to_string(),
                 },
                 "worker-1",
@@ -4801,7 +4876,7 @@ mod tests {
         let (grpc, _leader_tx) = grpc_leader_server(true).await;
         let status = grpc
             .allocate_node_subnet(request_with_node_client_cert(
-                generated::AllocateNodeSubnetRequest {
+                klights_internal_protobuf::AllocateNodeSubnetRequest {
                     node_name: "worker-2".to_string(),
                     cluster_cidr: "10.42.0.0/16".to_string(),
                     node_ip: "192.0.2.22".to_string(),
@@ -4818,7 +4893,7 @@ mod tests {
         let (grpc, _leader_tx) = grpc_leader_server(true).await;
         let response = grpc
             .allocate_node_subnet(request_with_controlplane_client_cert(
-                generated::AllocateNodeSubnetRequest {
+                klights_internal_protobuf::AllocateNodeSubnetRequest {
                     node_name: "worker-2".to_string(),
                     cluster_cidr: "10.42.0.0/16".to_string(),
                     node_ip: "192.0.2.22".to_string(),
@@ -4839,7 +4914,7 @@ mod tests {
         for node_name in ["worker-1", "worker-2"] {
             let result = grpc
                 .allocate_node_subnet(request_with_controlplane_client_cert(
-                    generated::AllocateNodeSubnetRequest {
+                    klights_internal_protobuf::AllocateNodeSubnetRequest {
                         node_name: node_name.to_string(),
                         cluster_cidr: "10.42.0.0/24".to_string(),
                         node_ip: "192.0.2.22".to_string(),
@@ -4894,8 +4969,10 @@ mod tests {
 
     struct AcceptingControlplaneJoinHandler;
 
-    fn test_node_registration_proto(git_commit: &str) -> generated::NodeRegistrationSnapshot {
-        generated::NodeRegistrationSnapshot {
+    fn test_node_registration_proto(
+        git_commit: &str,
+    ) -> klights_internal_protobuf::NodeRegistrationSnapshot {
+        klights_internal_protobuf::NodeRegistrationSnapshot {
             cpu_count: 6,
             memory_ki: 12 * 1024 * 1024,
             architecture: "test-arch".to_string(),
@@ -5055,8 +5132,8 @@ mod tests {
         endpoint: &str,
         join: JoinRequest,
     ) -> (
-        mpsc::Sender<generated::FollowerMessage>,
-        tonic::codec::Streaming<generated::LeaderMessage>,
+        mpsc::Sender<klights_internal_protobuf::FollowerMessage>,
+        tonic::codec::Streaming<klights_internal_protobuf::LeaderMessage>,
     ) {
         let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
             .unwrap()
@@ -5065,8 +5142,10 @@ mod tests {
             .unwrap();
         let mut client = ReplicationClient::new(channel);
         let (tx, mut rx) = mpsc::channel(8);
-        tx.send(generated::FollowerMessage {
-            payload: Some(generated::follower_message::Payload::Join(join)),
+        tx.send(klights_internal_protobuf::FollowerMessage {
+            payload: Some(klights_internal_protobuf::follower_message::Payload::Join(
+                join,
+            )),
         })
         .await
         .unwrap();
@@ -5411,11 +5490,13 @@ mod tests {
         let grpc = raft_test_server().await;
         // No bootstrap token and no client certificate.
         let status = grpc
-            .raft_append_entries(tonic::Request::new(generated::RaftAppendEntriesRequest {
-                payload: vec![],
-                command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
-                receiver_admission: test_raft_receiver_admission(),
-            }))
+            .raft_append_entries(tonic::Request::new(
+                klights_internal_protobuf::RaftAppendEntriesRequest {
+                    payload: vec![],
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
+                    receiver_admission: test_raft_receiver_admission(),
+                },
+            ))
             .await
             .expect_err("unauthenticated raft RPC must be rejected");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
@@ -5426,7 +5507,7 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .submit_resource_command(request_with_node_client_cert(
-                generated::SubmitResourceCommandRequest {
+                klights_internal_protobuf::SubmitResourceCommandRequest {
                     command_protobuf: Vec::new(),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
@@ -5443,7 +5524,7 @@ mod tests {
         let grpc = raft_test_server().await.with_leader_gate(rx);
         let status = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
-                generated::SubmitResourceCommandRequest {
+                klights_internal_protobuf::SubmitResourceCommandRequest {
                     command_protobuf: Vec::new(),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
@@ -5459,7 +5540,7 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
-                generated::SubmitResourceCommandRequest {
+                klights_internal_protobuf::SubmitResourceCommandRequest {
                     command_protobuf: Vec::new(),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION - 1,
                 },
@@ -5473,7 +5554,7 @@ mod tests {
     #[tokio::test]
     async fn submit_resource_command_rejects_generic_pod_hard_delete() {
         let grpc = raft_test_server().await;
-        let command = crate::datastore::command::StorageCommand::DeleteResource {
+        let command = klights_cluster_core::command::StorageCommand::DeleteResource {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -5482,7 +5563,7 @@ mod tests {
         };
         let status = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
-                generated::SubmitResourceCommandRequest {
+                klights_internal_protobuf::SubmitResourceCommandRequest {
                     command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
                         .expect("encode command"),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
@@ -5497,7 +5578,7 @@ mod tests {
     #[tokio::test]
     async fn submit_resource_command_accepts_controlplane_create() {
         let grpc = raft_test_server().await;
-        let command = crate::datastore::command::StorageCommand::CreateResource {
+        let command = klights_cluster_core::command::StorageCommand::CreateResource {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
             namespace: Some("default".to_string()),
@@ -5510,7 +5591,7 @@ mod tests {
         };
         let response = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
-                generated::SubmitResourceCommandRequest {
+                klights_internal_protobuf::SubmitResourceCommandRequest {
                     command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
                         .expect("encode command"),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
@@ -5522,7 +5603,7 @@ mod tests {
             .into_inner();
         assert!(matches!(
             response.result,
-            Some(generated::submit_resource_command_response::Result::Resource(resource))
+            Some(klights_internal_protobuf::submit_resource_command_response::Result::Resource(resource))
                 if resource.kind == "ConfigMap" && resource.name == "settings"
         ));
     }
@@ -5542,9 +5623,9 @@ mod tests {
 
         let status = grpc
             .raft_append_entries(request_with_join_token(
-                generated::RaftAppendEntriesRequest {
+                klights_internal_protobuf::RaftAppendEntriesRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 &token,
@@ -5558,11 +5639,13 @@ mod tests {
     async fn raft_vote_rejects_unauthenticated() {
         let grpc = raft_test_server().await;
         let status = grpc
-            .raft_vote(tonic::Request::new(generated::RaftVoteRequest {
-                payload: vec![],
-                command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
-                receiver_admission: test_raft_receiver_admission(),
-            }))
+            .raft_vote(tonic::Request::new(
+                klights_internal_protobuf::RaftVoteRequest {
+                    payload: vec![],
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
+                    receiver_admission: test_raft_receiver_admission(),
+                },
+            ))
             .await
             .expect_err("unauthenticated raft vote must be rejected");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
@@ -5579,9 +5662,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let resp = grpc
             .raft_append_entries(request_with_controlplane_client_cert(
-                generated::RaftAppendEntriesRequest {
+                klights_internal_protobuf::RaftAppendEntriesRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "controlplane-2",
@@ -5596,9 +5679,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_append_entries(request_with_controlplane_client_cert(
-                generated::RaftAppendEntriesRequest {
+                klights_internal_protobuf::RaftAppendEntriesRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: Vec::new(),
                 },
                 "controlplane-2",
@@ -5613,9 +5696,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_append_entries(request_with_controlplane_client_cert(
-                generated::RaftAppendEntriesRequest {
+                klights_internal_protobuf::RaftAppendEntriesRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION - 1,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION - 1,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "old-controlplane",
@@ -5636,9 +5719,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let resp = grpc
             .raft_install_snapshot(request_with_controlplane_client_cert(
-                generated::RaftInstallSnapshotRequest {
+                klights_internal_protobuf::RaftInstallSnapshotRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "controlplane-3",
@@ -5659,9 +5742,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_vote(request_with_node_client_cert(
-                generated::RaftVoteRequest {
+                klights_internal_protobuf::RaftVoteRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "worker-1",
@@ -5676,9 +5759,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_append_entries(request_with_node_client_cert(
-                generated::RaftAppendEntriesRequest {
+                klights_internal_protobuf::RaftAppendEntriesRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
                 "worker-1",
@@ -5693,9 +5776,9 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .raft_install_snapshot(request_with_admin_cert(
-                generated::RaftInstallSnapshotRequest {
+                klights_internal_protobuf::RaftInstallSnapshotRequest {
                     payload: vec![],
-                    command_codec_version: crate::log_apply::COMMAND_CODEC_VERSION,
+                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                     receiver_admission: test_raft_receiver_admission(),
                 },
             ))
@@ -5724,7 +5807,7 @@ mod tests {
         // worker-1's cert tries to renew worker-2's lease.
         let status = grpc
             .renew_node_lease(request_with_node_client_cert(
-                generated::RenewNodeLeaseRequest {
+                klights_internal_protobuf::RenewNodeLeaseRequest {
                     node_name: "worker-2".to_string(),
                     renew_time: "2026-05-25T00:00:10Z".to_string(),
                     lease_duration_seconds: 50,
@@ -5750,7 +5833,7 @@ mod tests {
         for duration in [0, -1] {
             let status = grpc
                 .renew_node_lease(request_with_node_client_cert(
-                    generated::RenewNodeLeaseRequest {
+                    klights_internal_protobuf::RenewNodeLeaseRequest {
                         node_name: "worker-1".to_string(),
                         renew_time: crate::utils::k8s_time_format(chrono::Utc::now()),
                         lease_duration_seconds: duration,
@@ -5789,7 +5872,7 @@ mod tests {
             kind: "Node".to_string(),
             namespace: None,
             name: "worker-1".to_string(),
-            patch_kind: crate::datastore::types::PatchKind::Merge,
+            patch_kind: klights_cluster_core::PatchKind::Merge,
             patch: serde_json::json!({"metadata": {"labels": {"smuggled": "true"}}}),
             preconditions: ResourcePreconditions::uid("node-uid-1"),
             strict_resource_version: false,
@@ -5800,7 +5883,7 @@ mod tests {
 
         let rejected = grpc
             .apply_outbox(request_with_node_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: "smuggled-node-patch".to_string(),
                     operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
@@ -5849,7 +5932,7 @@ mod tests {
             .expect("encode valid RPC Node status")
         };
         grpc.apply_outbox(request_with_node_client_cert(
-            generated::ApplyOutboxRequest {
+            klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "valid-after-smuggling".to_string(),
                 operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
@@ -5868,7 +5951,7 @@ mod tests {
 
         let malformed = grpc
             .apply_outbox(request_with_node_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: "malformed-rpc-row".to_string(),
                     operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
@@ -5894,7 +5977,7 @@ mod tests {
             "malformed RPC sequence must receive a durable terminal decision"
         );
         grpc.apply_outbox(request_with_node_client_cert(
-            generated::ApplyOutboxRequest {
+            klights_internal_protobuf::ApplyOutboxRequest {
                 idempotency_key: "valid-after-malformed".to_string(),
                 operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                     .as_str()
@@ -5949,7 +6032,7 @@ mod tests {
 
         let response = grpc
             .apply_outbox(request_with_node_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: "wrong-node-uid".to_string(),
                     operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
@@ -6042,7 +6125,7 @@ mod tests {
 
         let response = grpc
             .apply_outbox(request_with_controlplane_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: "controlplane2-node-ready".to_string(),
                     operation: crate::node_outbox::payload::OutboxOperation::NodeStatus
                         .as_str()
@@ -6100,7 +6183,7 @@ mod tests {
 
         let status = grpc
             .apply_outbox(request_with_node_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: String::new(),
                     operation: "NodeDataplane".to_string(),
                     payload_proto: payload,
@@ -6132,7 +6215,7 @@ mod tests {
 
         let status = follower
             .list_pod_cleanup_intents_for_node(request_with_node_client_cert(
-                generated::ListPodCleanupIntentsForNodeRequest {
+                klights_internal_protobuf::ListPodCleanupIntentsForNodeRequest {
                     node_name: "worker-1".to_string(),
                 },
                 "worker-1",
@@ -6145,7 +6228,7 @@ mod tests {
         let leader = super::GrpcReplicationServer::new(service, db);
         let status = leader
             .list_pod_cleanup_intents_for_node(request_with_node_client_cert(
-                generated::ListPodCleanupIntentsForNodeRequest {
+                klights_internal_protobuf::ListPodCleanupIntentsForNodeRequest {
                     node_name: "worker-2".to_string(),
                 },
                 "worker-1",
@@ -6165,7 +6248,7 @@ mod tests {
 
         let status = follower
             .delete_pod_cleanup_intent(request_with_node_client_cert(
-                generated::DeletePodCleanupIntentRequest {
+                klights_internal_protobuf::DeletePodCleanupIntentRequest {
                     node_name: "worker-1".to_string(),
                     namespace: "default".to_string(),
                     pod_name: "web".to_string(),
@@ -6185,7 +6268,7 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .projected_service_account_token(request_with_node_client_cert(
-                generated::ProjectedServiceAccountTokenRequest {
+                klights_internal_protobuf::ProjectedServiceAccountTokenRequest {
                     namespace: "default".to_string(),
                     service_account_name: "default".to_string(),
                     audiences: vec!["api".to_string()],
@@ -6223,7 +6306,7 @@ mod tests {
         grpc.ports.projected_token = Arc::new(MissingAuthoritativeTokenState);
         let status = grpc
             .projected_service_account_token(request_with_node_client_cert(
-                generated::ProjectedServiceAccountTokenRequest {
+                klights_internal_protobuf::ProjectedServiceAccountTokenRequest {
                     namespace: "default".to_string(),
                     service_account_name: "default".to_string(),
                     audiences: vec!["api".to_string()],
@@ -6250,7 +6333,7 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .projected_service_account_token(request_with_node_client_cert(
-                generated::ProjectedServiceAccountTokenRequest {
+                klights_internal_protobuf::ProjectedServiceAccountTokenRequest {
                     namespace: "default".to_string(),
                     service_account_name: "default".to_string(),
                     audiences: vec!["api".to_string()],
@@ -6276,7 +6359,7 @@ mod tests {
         let grpc = raft_test_server().await;
         let status = grpc
             .projected_service_account_token(request_with_controlplane_client_cert(
-                generated::ProjectedServiceAccountTokenRequest {
+                klights_internal_protobuf::ProjectedServiceAccountTokenRequest {
                     namespace: "default".to_string(),
                     service_account_name: "default".to_string(),
                     audiences: vec!["api".to_string()],
@@ -6343,7 +6426,7 @@ mod tests {
             crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::seconds(101));
         let status = grpc
             .renew_node_lease(request_with_node_client_cert(
-                generated::RenewNodeLeaseRequest {
+                klights_internal_protobuf::RenewNodeLeaseRequest {
                     node_name: "worker-1".to_string(),
                     renew_time: skewed,
                     lease_duration_seconds: 50,
@@ -6381,7 +6464,7 @@ mod tests {
 
         let response = grpc
             .apply_outbox(request_with_node_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: "dataplane-worker-2-from-worker-1".to_string(),
                     operation: crate::node_outbox::payload::OutboxOperation::NodeDataplane
                         .as_str()
@@ -6422,7 +6505,7 @@ mod tests {
         require_worker_command_codec_v3(&current).expect("v3 worker is admitted");
 
         let mut old_worker = current;
-        old_worker.command_codec_version = crate::log_apply::COMMAND_CODEC_VERSION - 1;
+        old_worker.command_codec_version = klights_cluster_core::COMMAND_CODEC_VERSION - 1;
         let status = require_worker_command_codec_v3(&old_worker)
             .expect_err("a pre-v3 worker must fail the stream handshake");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -6515,7 +6598,7 @@ mod tests {
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
         let grpc = super::GrpcReplicationServer::new(service.clone(), db);
         let mut request = request_with_node_client_cert(
-            generated::ObservePeerEndpointRequest {
+            klights_internal_protobuf::ObservePeerEndpointRequest {
                 node_name: "leader-a".to_string(),
             },
             "leader-a",
@@ -6813,7 +6896,7 @@ mod tests {
 
         let status = grpc
             .renew_node_lease(request_with_join_token(
-                generated::RenewNodeLeaseRequest {
+                klights_internal_protobuf::RenewNodeLeaseRequest {
                     node_name: "worker-1".to_string(),
                     renew_time: "2026-05-25T00:00:10Z".to_string(),
                     lease_duration_seconds: 50,
@@ -6848,7 +6931,7 @@ mod tests {
 
         let renew_time = crate::utils::k8s_time_format(chrono::Utc::now());
         grpc.renew_node_lease(request_with_node_client_cert(
-            generated::RenewNodeLeaseRequest {
+            klights_internal_protobuf::RenewNodeLeaseRequest {
                 node_name: "worker-1".to_string(),
                 renew_time: renew_time.clone(),
                 lease_duration_seconds: 50,
@@ -6900,7 +6983,7 @@ mod tests {
 
         let status = grpc
             .renew_node_lease(request_with_node_client_cert(
-                generated::RenewNodeLeaseRequest {
+                klights_internal_protobuf::RenewNodeLeaseRequest {
                     node_name: "worker-1".to_string(),
                     renew_time: "2026-05-25T00:00:10Z".to_string(),
                     lease_duration_seconds: 50,
@@ -6939,10 +7022,11 @@ mod tests {
                 time::OffsetDateTime::now_utc(),
             )
             .unwrap();
-            let mut request = tonic::Request::new(generated::SignControlplaneCsrRequest {
-                node_name: node_name.to_string(),
-                server_csr: csr_pem,
-            });
+            let mut request =
+                tonic::Request::new(klights_internal_protobuf::SignControlplaneCsrRequest {
+                    node_name: node_name.to_string(),
+                    server_csr: csr_pem,
+                });
             request.metadata_mut().insert(
                 "x-klights-join-token",
                 "123456.fedcba9876543210".parse().unwrap(),
@@ -7007,7 +7091,7 @@ mod tests {
         )
         .unwrap();
         let mut request = request_with_node_client_cert(
-            generated::SignControlplaneCsrRequest {
+            klights_internal_protobuf::SignControlplaneCsrRequest {
                 node_name: "worker-1".to_string(),
                 server_csr: csr_pem,
             },
@@ -7043,7 +7127,7 @@ mod tests {
             .with_leader_gate(is_leader_rx);
 
         let request = request_with_node_client_cert(
-            generated::JoinAsControlplaneRequest {
+            klights_internal_protobuf::JoinAsControlplaneRequest {
                 node_id: raft_node_id_for_node_name_in_test("worker-1"),
                 addr: "https://192.0.2.50:7679".to_string(),
                 node_name: "worker-1".to_string(),
@@ -7058,7 +7142,9 @@ mod tests {
                 node_registration: Some(test_node_registration_proto("testhash1")),
                 command_codec_version: 0,
                 storage_incarnation: "00000000-0000-4000-8000-000000000001".to_string(),
-                storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
+                storage_log_attestation: Some(
+                    klights_internal_protobuf::RaftStorageAttestation::default(),
+                ),
             },
             "worker-1",
         );
@@ -7091,7 +7177,7 @@ mod tests {
             .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
             .with_leader_gate(is_leader_rx);
 
-        let join_request = generated::JoinAsControlplaneRequest {
+        let join_request = klights_internal_protobuf::JoinAsControlplaneRequest {
             node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
             addr: "https://192.0.2.20:7679".to_string(),
             node_name: "mn-controlplane2".to_string(),
@@ -7106,7 +7192,9 @@ mod tests {
             node_registration: Some(test_node_registration_proto("testhash2")),
             command_codec_version: 0,
             storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
-            storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
+            storage_log_attestation: Some(
+                klights_internal_protobuf::RaftStorageAttestation::default(),
+            ),
         };
 
         let mut mismatched_id = join_request.clone();
@@ -7135,9 +7223,7 @@ mod tests {
             .into_inner();
         assert!(matches!(
             response.result,
-            Some(generated::join_as_controlplane_response::Result::Accepted(
-                _
-            ))
+            Some(klights_internal_protobuf::join_as_controlplane_response::Result::Accepted(_))
         ));
 
         let mut legacy_first_join = join_request;
@@ -7286,10 +7372,12 @@ mod tests {
         let (_tx, mut inbound) = open_connect(&endpoint, join).await;
         let first = inbound.message().await.unwrap().unwrap();
         match first.payload.unwrap() {
-            generated::leader_message::Payload::JoinResponse(response) => {
+            klights_internal_protobuf::leader_message::Payload::JoinResponse(response) => {
                 assert!(matches!(
                     response.result,
-                    Some(generated::join_response::Result::Rejected(_))
+                    Some(klights_internal_protobuf::join_response::Result::Rejected(
+                        _
+                    ))
                 ));
             }
             other => panic!("expected JoinResponse, got {other:?}"),
@@ -7312,9 +7400,13 @@ mod tests {
         let first = inbound.message().await.unwrap().unwrap();
         assert!(matches!(
             first.payload.unwrap(),
-            generated::leader_message::Payload::JoinResponse(generated::JoinResponse {
-                result: Some(generated::join_response::Result::Accepted(_)),
-            })
+            klights_internal_protobuf::leader_message::Payload::JoinResponse(
+                klights_internal_protobuf::JoinResponse {
+                    result: Some(klights_internal_protobuf::join_response::Result::Accepted(
+                        _
+                    )),
+                }
+            )
         ));
 
         let metadata = db
@@ -7405,9 +7497,12 @@ mod tests {
         let (_tx, mut inbound) = open_connect(&endpoint, join).await;
         let first = inbound.message().await.unwrap().unwrap();
         match first.payload.unwrap() {
-            generated::leader_message::Payload::JoinResponse(generated::JoinResponse {
-                result: Some(generated::join_response::Result::Accepted(accepted)),
-            }) => {
+            klights_internal_protobuf::leader_message::Payload::JoinResponse(
+                klights_internal_protobuf::JoinResponse {
+                    result:
+                        Some(klights_internal_protobuf::join_response::Result::Accepted(accepted)),
+                },
+            ) => {
                 assert_eq!(accepted.peers.len(), 1);
                 assert_eq!(accepted.peers[0].node_name, "leader");
                 assert_eq!(accepted.peers[0].pod_cidr, "10.42.0.0/24");
@@ -7419,10 +7514,10 @@ mod tests {
         service.notify_entry(sample_entry(10));
         let streamed = inbound.message().await.unwrap().unwrap();
         match streamed.payload.unwrap() {
-            generated::leader_message::Payload::StreamItem(item) => {
+            klights_internal_protobuf::leader_message::Payload::StreamItem(item) => {
                 assert!(matches!(
                     item.item,
-                    Some(generated::stream_item::Item::Entry(_))
+                    Some(klights_internal_protobuf::stream_item::Item::Entry(_))
                 ));
             }
             other => panic!("expected StreamItem, got {other:?}"),
@@ -7449,7 +7544,7 @@ mod tests {
             .await
             .unwrap();
         let mut client = ReplicationClient::new(channel);
-        let request = tonic::Request::new(generated::JoinAsControlplaneRequest {
+        let request = tonic::Request::new(klights_internal_protobuf::JoinAsControlplaneRequest {
             node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
             addr: "https://192.0.2.20:7679".to_string(),
             node_name: "mn-controlplane2".to_string(),
@@ -7464,7 +7559,9 @@ mod tests {
             node_registration: None,
             command_codec_version: 0,
             storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
-            storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
+            storage_log_attestation: Some(
+                klights_internal_protobuf::RaftStorageAttestation::default(),
+            ),
         });
 
         let response = client
@@ -7474,9 +7571,7 @@ mod tests {
             .into_inner();
         assert!(matches!(
             response.result,
-            Some(generated::join_as_controlplane_response::Result::Accepted(
-                _
-            ))
+            Some(klights_internal_protobuf::join_as_controlplane_response::Result::Accepted(_))
         ));
         let metadata = db
             .get_node_dataplane("mn-controlplane2")
@@ -7508,7 +7603,7 @@ mod tests {
             .await
             .unwrap();
         let mut client = ReplicationClient::new(channel);
-        let request = tonic::Request::new(generated::JoinAsControlplaneRequest {
+        let request = tonic::Request::new(klights_internal_protobuf::JoinAsControlplaneRequest {
             node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
             addr: "https://172.31.14.2:7679".to_string(),
             node_name: "mn-controlplane2".to_string(),
@@ -7523,7 +7618,9 @@ mod tests {
             node_registration: Some(test_node_registration_proto("joinhash1")),
             command_codec_version: 0,
             storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
-            storage_log_attestation: Some(generated::RaftStorageAttestation::default()),
+            storage_log_attestation: Some(
+                klights_internal_protobuf::RaftStorageAttestation::default(),
+            ),
         });
 
         let response = client
@@ -7533,9 +7630,7 @@ mod tests {
             .into_inner();
         assert!(matches!(
             response.result,
-            Some(generated::join_as_controlplane_response::Result::Accepted(
-                _
-            ))
+            Some(klights_internal_protobuf::join_as_controlplane_response::Result::Accepted(_))
         ));
 
         let calls = join_handler.calls();
@@ -7651,7 +7746,7 @@ mod tests {
             .unwrap();
         let response = grpc
             .apply_outbox(request_with_node_client_cert(
-                generated::ApplyOutboxRequest {
+                klights_internal_protobuf::ApplyOutboxRequest {
                     idempotency_key: "pod-status-web-worker".to_string(),
                     operation: crate::node_outbox::payload::OutboxOperation::PodStatus
                         .as_str()

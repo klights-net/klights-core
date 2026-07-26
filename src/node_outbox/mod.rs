@@ -3154,7 +3154,7 @@ mod tests {
         );
         assert_eq!(
             cluster_db.list_outbox_stream_watermarks().await.unwrap(),
-            vec![crate::log_apply::OutboxStreamWatermark {
+            vec![klights_cluster_core::OutboxStreamWatermark {
                 client_id: client_id.clone(),
                 stream_id: first_position.0,
                 stream_seq: 1,
@@ -3188,7 +3188,7 @@ mod tests {
         );
         assert_eq!(
             cluster_db.list_outbox_stream_watermarks().await.unwrap(),
-            vec![crate::log_apply::OutboxStreamWatermark {
+            vec![klights_cluster_core::OutboxStreamWatermark {
                 client_id,
                 stream_id: first_position.0,
                 stream_seq: 2,

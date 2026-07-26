@@ -25,7 +25,6 @@ pub(crate) enum PassiveStoreOpenRequest<'a> {
     SqliteInMemory,
     SqlitePersistent {
         cluster_db_path: &'a Path,
-        node_db_path: &'a Path,
         db_key_file: Option<&'a Path>,
     },
     RedbInMemory,
@@ -45,24 +44,22 @@ pub(crate) async fn open(
     match request {
         PassiveStoreOpenRequest::SqliteInMemory => {
             tracing::info!(backend = "sqlite", mode = "in-memory", "opening datastore");
-            let executor =
-                sqlite::DbExecutor::open_in_memory(supervisor, "sqlite:selector-in-memory").await?;
+            let executor = crate::sqlite_boundary::DbExecutor::open_in_memory(
+                supervisor,
+                "sqlite:selector-in-memory",
+            )
+            .await?;
             let ds = sqlite::Datastore::new_in_memory_with_watch_and_executor(executor).await?;
             Ok(Arc::new(ds))
         }
         PassiveStoreOpenRequest::SqlitePersistent {
             cluster_db_path,
-            node_db_path,
             db_key_file,
         } => {
             tracing::info!(backend = "sqlite", mode = "persistent", "opening datastore");
-            let ds = sqlite::Datastore::new_persistent_paths(
-                cluster_db_path,
-                node_db_path,
-                supervisor,
-                db_key_file,
-            )
-            .await?;
+            let ds =
+                sqlite::Datastore::new_persistent_paths(cluster_db_path, supervisor, db_key_file)
+                    .await?;
             Ok(Arc::new(ds))
         }
         PassiveStoreOpenRequest::RedbInMemory => {
@@ -112,7 +109,6 @@ mod tests {
         let sqlite = open(
             PassiveStoreOpenRequest::SqlitePersistent {
                 cluster_db_path: &sqlite_cluster,
-                node_db_path: &sqlite_node,
                 db_key_file: None,
             },
             supervisor(),
@@ -122,7 +118,10 @@ mod tests {
         assert_eq!(sqlite.get_current_resource_version().await.unwrap(), 0);
         sqlite.close();
         assert!(sqlite_cluster.is_file());
-        assert!(sqlite_node.is_file());
+        assert!(
+            !sqlite_node.exists(),
+            "passive cluster-store open must not create node.db"
+        );
 
         let redb_path = dir.path().join("redb/cluster.redb");
         let redb = open(

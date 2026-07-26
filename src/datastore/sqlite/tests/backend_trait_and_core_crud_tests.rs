@@ -1,16 +1,14 @@
 use super::*;
 #[cfg(test)]
 use crate::datastore::TestWatchStore;
-use crate::datastore::command::StorageCommand;
 use crate::datastore::{
     AppliedOutboxStore, BackendLifecycleStore, ClusterResourceQueryStore,
     CurrentResourceVersionStore, LeaderResourceMutationStore, MetaStore, NamespaceContentStore,
-    NetworkMetadataStore, OwnershipStore, PodCleanupStore, PodWorkqueueStore, RawWatchReplayStore,
-    ReplicationStore, ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore,
-    ResourcePreconditions, StatusStore, WatchHistoryStore, WatchMaintenanceStore,
-    WatchReplayAnchorStore,
+    NetworkMetadataStore, OwnershipStore, PodCleanupStore, RawWatchReplayStore, ReplicationStore,
+    ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore, ResourcePreconditions,
+    StatusStore, WatchHistoryStore, WatchMaintenanceStore, WatchReplayAnchorStore,
 };
-use crate::datastore::{PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState};
+use klights_cluster_core::command::StorageCommand;
 use serde_json::json;
 
 async fn table_column_info(
@@ -60,7 +58,7 @@ async fn schema_namespaces_includes_uid_column() {
 
 #[tokio::test]
 async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
-    use crate::log_apply::{
+    use klights_cluster_core::{
         LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, OutboxStreamWatermark,
     };
 
@@ -103,8 +101,8 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
 
 #[tokio::test]
 async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
-    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
     use klights_cluster_core::BuildOutboxOutcome;
+    use klights_cluster_core::{LogApplyMutation, OutboxStreamWatermark};
 
     let db = Datastore::new_in_memory().await.unwrap();
     let command = StorageCommand::create_namespace(
@@ -124,7 +122,7 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
         .build_log_apply_commit_for_outbox_with_watermark(
             "legacy-key-ignored-for-watermark",
             "PodMetadata",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "client-a".to_string(),
@@ -153,8 +151,8 @@ async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
 #[tokio::test]
 async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit() {
     use crate::datastore::ResourcePreconditions;
-    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
     use klights_cluster_core::BuildOutboxOutcome;
+    use klights_cluster_core::{LogApplyMutation, OutboxStreamWatermark};
 
     let db = Datastore::new_in_memory().await.unwrap();
     let command = StorageCommand::UpdateStatus {
@@ -178,7 +176,7 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
         .build_log_apply_commit_for_outbox_with_watermark(
             "missing-pod-status",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "worker-client".to_string(),
@@ -231,7 +229,7 @@ async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fi
         .build_log_apply_commit_for_outbox(
             "stamped-status",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -263,8 +261,8 @@ async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fi
 
 #[tokio::test]
 async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
-    use crate::datastore::command::StorageCommand;
-    use crate::log_apply::LogApplyMutation;
+    use klights_cluster_core::LogApplyMutation;
+    use klights_cluster_core::command::StorageCommand;
 
     let db = Datastore::new_in_memory().await.unwrap();
     let command = StorageCommand::create_namespace(
@@ -298,7 +296,7 @@ async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
 
 #[tokio::test]
 async fn raft_status_command_materialization_skips_unchanged_merged_status() {
-    use crate::log_apply::LogApplyMutation;
+    use klights_cluster_core::LogApplyMutation;
 
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
@@ -345,8 +343,8 @@ async fn raft_status_command_materialization_skips_unchanged_merged_status() {
 
 #[tokio::test]
 async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
-    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
     use klights_cluster_core::BuildOutboxOutcome;
+    use klights_cluster_core::{LogApplyMutation, OutboxStreamWatermark};
 
     let command = || StorageCommand::CreateResource {
         api_version: "v1".to_string(),
@@ -370,7 +368,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         .build_log_apply_commit_for_outbox(
             "v1-outbox-template",
             "CreateResource",
-            v1_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(v1_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -400,7 +398,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
         .build_log_apply_commit_for_outbox_with_watermark(
             "v1-watermarked-outbox-template",
             "CreateResource",
-            watermarked_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(watermarked_payload.as_ref()),
             "worker-a",
             Some(OutboxStreamWatermark {
                 client_id: "client-a".to_string(),
@@ -428,7 +426,7 @@ async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
 
 #[tokio::test]
 async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
-    use crate::log_apply::{
+    use klights_cluster_core::{
         LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, OutboxStreamWatermark,
     };
 
@@ -529,7 +527,7 @@ async fn apply_resource_batch_command_builds_one_commit_with_two_puts() {
     assert_eq!(commit.mutations().len(), 2);
     assert!(commit.mutations().iter().all(|mutation| matches!(
         mutation,
-        crate::log_apply::LogApplyMutation::PutResource(row)
+        klights_cluster_core::LogApplyMutation::PutResource(row)
             if row.resource_version == 0
     )));
 }
@@ -724,14 +722,14 @@ async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
     let mut delete_mutations = 0usize;
     for mutation in commit.mutations() {
         match mutation {
-            crate::log_apply::LogApplyMutation::PutWatchEvent(row) => {
+            klights_cluster_core::LogApplyMutation::PutWatchEvent(row) => {
                 tombstone_events += 1;
                 assert_eq!(row.event_type, "DELETED");
                 assert_eq!(row.namespace.as_deref(), Some("default"));
                 assert_eq!(row.name, "tombstone-mark");
                 assert_eq!(row.resource_version, 0);
             }
-            crate::log_apply::LogApplyMutation::DeleteResource(_) => delete_mutations += 1,
+            klights_cluster_core::LogApplyMutation::DeleteResource(_) => delete_mutations += 1,
             other => panic!("unexpected mutation in tombstone delete command: {other:?}"),
         }
     }
@@ -982,7 +980,7 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-stale-pvc-update",
             "UpdateResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await;
@@ -1051,10 +1049,10 @@ async fn stale_raft_pv_bind_is_rejected_and_preserves_concurrent_user_labels() {
         "uid": "pvc-label-race-uid"
     });
     stale_bind["status"] = json!({"phase": "Bound"});
-    let committed = crate::log_apply::test_live_commit(
+    let committed = crate::replication::log_apply_wire::test_live_commit(
         created.resource_version + 2,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "PersistentVolume".to_string(),
                 namespace: None,
@@ -1174,7 +1172,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         .build_log_apply_commit_for_outbox(
             "raft-leader-stale-pod-status",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-replica",
         )
         .await
@@ -1187,7 +1185,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         .mutations()
         .iter()
         .find_map(|mutation| match mutation {
-            crate::log_apply::LogApplyMutation::PutResource(row) => Some(row),
+            klights_cluster_core::LogApplyMutation::PutResource(row) => Some(row),
             _ => None,
         })
         .expect("status commit must include a Pod resource row");
@@ -1252,7 +1250,7 @@ async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-deferred-rv",
             "CreateResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -1275,7 +1273,7 @@ async fn raft_commit_builder_defers_resource_version_allocation_until_apply() {
         .mutations()
         .iter()
         .find_map(|mutation| match mutation {
-            crate::log_apply::LogApplyMutation::PutResource(row) => Some(row),
+            klights_cluster_core::LogApplyMutation::PutResource(row) => Some(row),
             _ => None,
         })
         .expect("create must produce a resource row");
@@ -1342,7 +1340,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-create-scheduled-later",
             "CreateResource",
-            create_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(create_payload.as_ref()),
             "leader",
         )
         .await
@@ -1387,7 +1385,7 @@ async fn strict_committed_apply_rejects_divergent_follower_resource_version() {
         .build_log_apply_commit_for_outbox(
             "raft-leader-bind-scheduled-later",
             "UpdateResource",
-            update_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(update_payload.as_ref()),
             "leader",
         )
         .await
@@ -1461,7 +1459,7 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     "CreateResource",
-                    payload.as_ref(),
+                    crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
                     "leader",
                 )
                 .await
@@ -1543,7 +1541,7 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
                 .build_log_apply_commit_for_outbox(
                     idempotency_key,
                     "UpdateResource",
-                    payload.as_ref(),
+                    crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
                     "leader",
                 )
                 .await
@@ -1631,7 +1629,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
         .build_log_apply_commit_for_outbox(
             "raft-status-metadata-race",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -1752,7 +1750,7 @@ async fn stale_status_only_apply_rejects_and_preserves_live_job_status_scalars()
         .build_log_apply_commit_for_outbox(
             "stale-job-status-commit",
             "JobStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -1833,10 +1831,10 @@ async fn stale_status_only_apply_rejects_incoming_nonterminal_job_condition_valu
         .await
         .unwrap();
 
-    let committed_status = crate::log_apply::test_live_commit(
+    let committed_status = crate::replication::log_apply_wire::test_live_commit(
         0,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "batch/v1".to_string(),
                 kind: "Job".to_string(),
                 namespace: Some("default".to_string()),
@@ -1985,7 +1983,7 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
         .build_log_apply_commit_for_outbox(
             "stale-cycle-pod-bind",
             "UpdateResource",
-            bind_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2108,7 +2106,7 @@ async fn stale_committed_pod_bind_preserves_stale_owner_ref_subset() {
         .build_log_apply_commit_for_outbox(
             "stale-bind-pod-stale-owner-subset",
             "UpdateResource",
-            bind_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2241,7 +2239,7 @@ async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
         .build_log_apply_commit_for_outbox(
             "stale-same-node-pod-put",
             "UpdateResource",
-            stale_same_node_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(stale_same_node_payload.as_ref()),
             "leader",
         )
         .await
@@ -2367,7 +2365,7 @@ async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_liv
         .build_log_apply_commit_for_outbox(
             "stale-explicit-owner-clear",
             "UpdateResource",
-            stale_clear_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(stale_clear_payload.as_ref()),
             "leader",
         )
         .await
@@ -2462,7 +2460,7 @@ async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
         .build_log_apply_commit_for_outbox(
             "stale-rebind-pod-bind",
             "UpdateResource",
-            stale_bind_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(stale_bind_payload.as_ref()),
             "leader",
         )
         .await
@@ -2538,10 +2536,10 @@ async fn stale_status_only_committed_pvc_apply_is_rejected_without_losing_live_c
         .await
         .unwrap();
 
-    let committed_status = crate::log_apply::test_live_commit(
+    let committed_status = crate::replication::log_apply_wire::test_live_commit(
         created.resource_version + 2,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "PersistentVolumeClaim".to_string(),
                 namespace: Some("default".to_string()),
@@ -2661,10 +2659,10 @@ async fn stale_status_only_apply_rejects_and_preserves_newer_pv_and_pvc_conditio
             .await
             .unwrap();
 
-        let committed_status = crate::log_apply::test_live_commit(
+        let committed_status = crate::replication::log_apply_wire::test_live_commit(
             0,
-            vec![crate::log_apply::LogApplyMutation::PutResource(
-                crate::log_apply::LogApplyResourceRow {
+            vec![klights_cluster_core::LogApplyMutation::PutResource(
+                klights_cluster_core::LogApplyResourceRow {
                     api_version: "v1".to_string(),
                     kind: kind.to_string(),
                     namespace: namespace.map(str::to_string),
@@ -2840,7 +2838,7 @@ async fn raft_status_apply_built_before_preemption_preserves_disruption_target()
         .build_log_apply_commit_for_outbox(
             "raft-status-preemption-condition-race",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -2954,7 +2952,7 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         .build_log_apply_commit_for_outbox(
             "raft-rc-scale-latest-patch",
             "PatchResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3059,7 +3057,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
         .build_log_apply_commit_for_outbox(
             "raft-pod-delete-mark-latest-patch",
             "PatchResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3188,7 +3186,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
         .build_log_apply_commit_for_outbox(
             "raft-zero-grace-delete-mark-deterministic",
             "PatchResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3342,10 +3340,10 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"},
         {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"}
     ]);
-    let commit = crate::log_apply::test_live_commit(
+    let commit = crate::replication::log_apply_wire::test_live_commit(
         committed_rv,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
@@ -3432,10 +3430,10 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
         },
         "data": {"hello": "derived"},
     });
-    let commit = crate::log_apply::test_live_commit(
+    let commit = crate::replication::log_apply_wire::test_live_commit(
         41,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),
@@ -3546,7 +3544,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         .build_log_apply_commit_for_outbox(
             "raft-stale-deployment-revision-patch",
             "PatchResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3630,7 +3628,7 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
         .build_log_apply_commit_for_outbox(
             "raft-idempotent-apply",
             "CreateResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3692,7 +3690,7 @@ async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_le
     );
     let mutation = &commit.mutations()[0];
     match mutation {
-        crate::log_apply::LogApplyMutation::GcAppliedOutbox {
+        klights_cluster_core::LogApplyMutation::GcAppliedOutbox {
             cutoff_ms,
             operations,
         } => {
@@ -3763,7 +3761,7 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
         .build_log_apply_commit_for_outbox(
             "fresh-raft-placeholder-key",
             "PodMetadata",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await;
@@ -3823,7 +3821,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             "CreateResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await
@@ -3848,7 +3846,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             "CreateResource",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "leader",
         )
         .await;
@@ -3889,10 +3887,10 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
     .unwrap();
     let before_rv = db.get_current_resource_version().await.unwrap();
 
-    let commit = crate::log_apply::test_live_commit(
+    let commit = crate::replication::log_apply_wire::test_live_commit(
         0,
-        vec![crate::log_apply::LogApplyMutation::PutResource(
-            crate::log_apply::LogApplyResourceRow {
+        vec![klights_cluster_core::LogApplyMutation::PutResource(
+            klights_cluster_core::LogApplyResourceRow {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),
@@ -3992,11 +3990,11 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let initial_put = crate::log_apply::test_live_commit(
+    let initial_put = crate::replication::log_apply_wire::test_live_commit(
         1,
         vec![
-            crate::log_apply::LogApplyMutation::PutAppliedOutbox(
-                crate::log_apply::LogApplyAppliedOutboxRow {
+            klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
+                klights_cluster_core::LogApplyAppliedOutboxRow {
                     idempotency_key: "outbox-old".to_string(),
                     subject_key: "v1:Pod:default:old-pod:uid-1".to_string(),
                     operation: "PodMetadata".to_string(),
@@ -4006,8 +4004,8 @@ async fn raft_applied_outbox_replay_is_deterministic() {
                     status_stamp: Some(21_000),
                 },
             ),
-            crate::log_apply::LogApplyMutation::PutAppliedOutbox(
-                crate::log_apply::LogApplyAppliedOutboxRow {
+            klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
+                klights_cluster_core::LogApplyAppliedOutboxRow {
                     idempotency_key: "outbox-new".to_string(),
                     subject_key: "v1:Pod:default:new-pod:uid-2".to_string(),
                     operation: "PodStatus".to_string(),
@@ -4057,11 +4055,13 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         "initial put rows must match expected snapshot"
     );
 
-    let delete = crate::log_apply::test_live_commit(
+    let delete = crate::replication::log_apply_wire::test_live_commit(
         2,
-        vec![crate::log_apply::LogApplyMutation::DeleteAppliedOutbox {
-            idempotency_key: "outbox-old".to_string(),
-        }],
+        vec![
+            klights_cluster_core::LogApplyMutation::DeleteAppliedOutbox {
+                idempotency_key: "outbox-old".to_string(),
+            },
+        ],
     );
     leader.apply_log_apply_commit(delete.clone()).await.unwrap();
     follower.apply_log_apply_commit(delete).await.unwrap();
@@ -4083,10 +4083,10 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     );
     assert_eq!(leader_rows, after_delete_expected);
 
-    let follow_up_put = crate::log_apply::test_live_commit(
+    let follow_up_put = crate::replication::log_apply_wire::test_live_commit(
         3,
-        vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
-            crate::log_apply::LogApplyAppliedOutboxRow {
+        vec![klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
+            klights_cluster_core::LogApplyAppliedOutboxRow {
                 idempotency_key: "outbox-older-again".to_string(),
                 subject_key: "v1:Pod:default:older-pod:uid-3".to_string(),
                 operation: "PodMetadata".to_string(),
@@ -4106,9 +4106,9 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         .await
         .unwrap();
 
-    let gc = crate::log_apply::test_live_commit(
+    let gc = crate::replication::log_apply_wire::test_live_commit(
         4,
-        vec![crate::log_apply::LogApplyMutation::GcAppliedOutbox {
+        vec![klights_cluster_core::LogApplyMutation::GcAppliedOutbox {
             cutoff_ms: 10_000,
             operations: vec!["PodMetadata".to_string(), "PodStatus".to_string()],
         }],
@@ -4183,7 +4183,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         .build_log_apply_commit_for_outbox(
             "raft-leader-node-api-update",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -4195,7 +4195,7 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
         .mutations()
         .iter()
         .find_map(|mutation| match mutation {
-            crate::log_apply::LogApplyMutation::PutResource(row) => Some(row),
+            klights_cluster_core::LogApplyMutation::PutResource(row) => Some(row),
             _ => None,
         })
         .expect("node update must produce a PutResource mutation");
@@ -4203,53 +4203,6 @@ async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refre
     assert!(
         put.data.pointer("/metadata/labels/node").is_none(),
         "API Node label deletion must not be merged back as a kubelet NodeStatus refresh"
-    );
-}
-
-#[tokio::test]
-async fn pod_slot_admissions_schema_exists_with_slot_primary_key() {
-    let db = Datastore::new_in_memory().await.unwrap();
-    let columns: Vec<(String, i64, i64)> = db
-        .node_db_call("test_pod_slot_admissions_schema", |conn| {
-            let mut stmt = conn.prepare("PRAGMA table_info(pod_slot_admissions)")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .unwrap();
-
-    assert!(
-        columns
-            .iter()
-            .any(|(name, not_null, pk)| name == "namespace" && *not_null == 1 && *pk == 1)
-    );
-    assert!(
-        columns
-            .iter()
-            .any(|(name, not_null, pk)| name == "pod_name" && *not_null == 1 && *pk == 2)
-    );
-    assert!(
-        columns
-            .iter()
-            .any(|(name, not_null, _)| name == "pod_uid" && *not_null == 1)
-    );
-    assert!(
-        columns
-            .iter()
-            .any(|(name, not_null, _)| name == "node_name" && *not_null == 1)
-    );
-    assert!(
-        columns
-            .iter()
-            .any(|(name, not_null, _)| name == "state" && *not_null == 1)
     );
 }
 
@@ -4328,10 +4281,10 @@ async fn pod_cleanup_intents_schema_is_cluster_uid_and_reason_bound() {
 #[tokio::test]
 async fn log_apply_replays_pod_cleanup_intents() {
     let db = Datastore::new_in_memory().await.unwrap();
-    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
         7,
-        vec![crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
-            crate::log_apply::LogApplyPodCleanupIntentRow {
+        vec![klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
+            klights_cluster_core::LogApplyPodCleanupIntentRow {
                 node_name: "worker-a".to_string(),
                 namespace: "default".to_string(),
                 pod_name: "lost-pod".to_string(),
@@ -4363,17 +4316,19 @@ async fn log_apply_replays_pod_cleanup_intents() {
     assert_eq!(rows[0].pod_uid, "lost-uid");
     assert_eq!(rows[0].reason, "NodeLost");
 
-    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
         8,
-        vec![crate::log_apply::LogApplyMutation::DeletePodCleanupIntent(
-            crate::log_apply::LogApplyPodCleanupIntentKey {
-                node_name: "worker-a".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "lost-pod".to_string(),
-                pod_uid: "lost-uid".to_string(),
-                reason: "NodeLost".to_string(),
-            },
-        )],
+        vec![
+            klights_cluster_core::LogApplyMutation::DeletePodCleanupIntent(
+                klights_cluster_core::LogApplyPodCleanupIntentKey {
+                    node_name: "worker-a".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "lost-pod".to_string(),
+                    pod_uid: "lost-uid".to_string(),
+                    reason: "NodeLost".to_string(),
+                },
+            ),
+        ],
     ))
     .await
     .unwrap();
@@ -4386,10 +4341,10 @@ async fn log_apply_replays_pod_cleanup_intents() {
     );
 
     for pod_name in ["lost-pod-a", "lost-pod-b"] {
-        db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
             9,
-            vec![crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
-                crate::log_apply::LogApplyPodCleanupIntentRow {
+            vec![klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
+                klights_cluster_core::LogApplyPodCleanupIntentRow {
                     node_name: "worker-a".to_string(),
                     namespace: "default".to_string(),
                     pod_name: pod_name.to_string(),
@@ -4422,10 +4377,10 @@ async fn log_apply_replays_pod_cleanup_intents() {
         2
     );
 
-    db.apply_log_apply_commit(crate::log_apply::test_live_commit(
+    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
         10,
         vec![
-            crate::log_apply::LogApplyMutation::DeletePodCleanupIntentsForNode {
+            klights_cluster_core::LogApplyMutation::DeletePodCleanupIntentsForNode {
                 node_name: "worker-a".to_string(),
             },
         ],
@@ -4547,7 +4502,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-finalizer-race",
             "PodMetadata",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4557,7 +4512,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     };
     assert!(commit.mutations().iter().any(|mutation| matches!(
         mutation,
-        crate::log_apply::LogApplyMutation::FinalizeBoundPod(finalization)
+        klights_cluster_core::LogApplyMutation::FinalizeBoundPod(finalization)
             if finalization.pod_uid == "finalizer-race-uid"
     )));
 
@@ -4652,7 +4607,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-after-finalizer-drain",
             "PodMetadata",
-            fresh_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(fresh_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4662,7 +4617,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     };
     assert!(fresh_commit.mutations().iter().any(|mutation| matches!(
         mutation,
-        crate::log_apply::LogApplyMutation::FinalizeBoundPod(finalization)
+        klights_cluster_core::LogApplyMutation::FinalizeBoundPod(finalization)
             if finalization.pod_uid == "finalizer-race-uid"
     )));
     db.apply_raft_log_apply_commit(fresh_commit).await.unwrap();
@@ -4701,7 +4656,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-already-missing",
             "PodMetadata",
-            missing_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(missing_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4711,7 +4666,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     };
     assert!(missing_commit.mutations().iter().all(|mutation| matches!(
         mutation,
-        crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+        klights_cluster_core::LogApplyMutation::PutAppliedOutbox(_)
     )));
     db.apply_raft_log_apply_commit(missing_commit)
         .await
@@ -4761,7 +4716,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-stale-replacement",
             "PodMetadata",
-            stale_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(stale_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4775,7 +4730,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
             .iter()
             .all(|mutation| matches!(
                 mutation,
-                crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+                klights_cluster_core::LogApplyMutation::PutAppliedOutbox(_)
             ))
     );
     db.apply_raft_log_apply_commit(replacement_commit)
@@ -4812,7 +4767,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
         .build_log_apply_commit_for_outbox(
             "actor-finalize-fixed-contract",
             "PodMetadata",
-            eligible_payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(eligible_payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4824,7 +4779,7 @@ async fn actor_finalize_bound_pod_acks_noop_when_finalizer_is_added_before_apply
     assert!(applied_rv > 0);
     assert!(commit.mutations().iter().any(|mutation| matches!(
         mutation,
-        crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
+        klights_cluster_core::LogApplyMutation::FinalizeBoundPod(_)
     )));
     let placeholder_count = db
         .db_call("test_actor_finalize_fixed_placeholder", |conn| {
@@ -4884,7 +4839,7 @@ async fn actor_finalize_bound_pod_serializes_a_status_write_after_proposal_build
         .build_log_apply_commit_for_outbox(
             "actor-finalize-rv-race",
             "PodMetadata",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -4991,9 +4946,9 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
             .build_log_apply_commit_for_outbox_with_watermark(
                 &idempotency_key,
                 "PodMetadata",
-                payload.as_ref(),
+                crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
                 "worker-a",
-                Some(crate::log_apply::OutboxStreamWatermark {
+                Some(klights_cluster_core::OutboxStreamWatermark {
                     client_id: format!("client-{}", case.name),
                     stream_id: 1,
                     stream_seq: 1,
@@ -5008,12 +4963,12 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
         assert_eq!(commit.resource_version(), 0);
         assert!(commit.mutations().iter().any(|mutation| matches!(
             mutation,
-            crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+            klights_cluster_core::LogApplyMutation::PutAppliedOutbox(_)
         )));
         assert_eq!(
             commit.mutations().iter().any(|mutation| matches!(
                 mutation,
-                crate::log_apply::LogApplyMutation::FinalizeBoundPod(_)
+                klights_cluster_core::LogApplyMutation::FinalizeBoundPod(_)
             )),
             case.eligible,
             "{} delete mutation eligibility mismatch",
@@ -5179,11 +5134,11 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     }))
     .unwrap();
 
-    let initial_put = crate::log_apply::test_live_commit(
+    let initial_put = crate::replication::log_apply_wire::test_live_commit(
         11,
         vec![
-            crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
-                crate::log_apply::LogApplyPodCleanupIntentRow {
+            klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
+                klights_cluster_core::LogApplyPodCleanupIntentRow {
                     node_name: "worker-a".to_string(),
                     namespace: "default".to_string(),
                     pod_name: "lost-pod-a".to_string(),
@@ -5194,8 +5149,8 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
                     pod_data: serde_json::from_slice(&pod_a_data).unwrap(),
                 },
             ),
-            crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
-                crate::log_apply::LogApplyPodCleanupIntentRow {
+            klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
+                klights_cluster_core::LogApplyPodCleanupIntentRow {
                     node_name: "worker-a".to_string(),
                     namespace: "default".to_string(),
                     pod_name: "lost-pod-b".to_string(),
@@ -5206,8 +5161,8 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
                     pod_data: serde_json::from_slice(&pod_b_data).unwrap(),
                 },
             ),
-            crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
-                crate::log_apply::LogApplyPodCleanupIntentRow {
+            klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
+                klights_cluster_core::LogApplyPodCleanupIntentRow {
                     node_name: "worker-b".to_string(),
                     namespace: "default".to_string(),
                     pod_name: "lost-pod-c".to_string(),
@@ -5265,17 +5220,19 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, expected_after_put);
 
-    let delete = crate::log_apply::test_live_commit(
+    let delete = crate::replication::log_apply_wire::test_live_commit(
         12,
-        vec![crate::log_apply::LogApplyMutation::DeletePodCleanupIntent(
-            crate::log_apply::LogApplyPodCleanupIntentKey {
-                node_name: "worker-a".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "lost-pod-a".to_string(),
-                pod_uid: "lost-pod-a-uid".to_string(),
-                reason: "NodeLost".to_string(),
-            },
-        )],
+        vec![
+            klights_cluster_core::LogApplyMutation::DeletePodCleanupIntent(
+                klights_cluster_core::LogApplyPodCleanupIntentKey {
+                    node_name: "worker-a".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "lost-pod-a".to_string(),
+                    pod_uid: "lost-pod-a-uid".to_string(),
+                    reason: "NodeLost".to_string(),
+                },
+            ),
+        ],
     );
 
     leader.apply_log_apply_commit(delete.clone()).await.unwrap();
@@ -5308,10 +5265,10 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, after_delete_expected);
 
-    let delete_node = crate::log_apply::test_live_commit(
+    let delete_node = crate::replication::log_apply_wire::test_live_commit(
         13,
         vec![
-            crate::log_apply::LogApplyMutation::DeletePodCleanupIntentsForNode {
+            klights_cluster_core::LogApplyMutation::DeletePodCleanupIntentsForNode {
                 node_name: "worker-b".to_string(),
             },
         ],
@@ -5344,14 +5301,14 @@ async fn raft_cluster_meta_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let commit = crate::log_apply::test_live_commit(
+    let commit = crate::replication::log_apply_wire::test_live_commit(
         1,
         vec![
-            crate::log_apply::LogApplyMutation::PutKlightsMeta {
+            klights_cluster_core::LogApplyMutation::PutKlightsMeta {
                 key: "raft-test-alpha".to_string(),
                 value: "alpha".to_string(),
             },
-            crate::log_apply::LogApplyMutation::PutKlightsMeta {
+            klights_cluster_core::LogApplyMutation::PutKlightsMeta {
                 key: "raft-test-beta".to_string(),
                 value: "beta".to_string(),
             },
@@ -5375,58 +5332,6 @@ async fn raft_cluster_meta_replay_is_deterministic() {
     assert_eq!(leader_meta, expected);
     assert_eq!(follower_meta, expected);
     assert_eq!(leader_meta, follower_meta);
-}
-
-#[tokio::test]
-async fn pod_slot_events_emit_only_on_state_change() {
-    let db = Datastore::new_in_memory().await.unwrap();
-    let mut rx = db.subscribe_pod_slot_admissions();
-
-    let first = db
-        .pod_slot_try_admit("default", "p", "uid-a", "node-a")
-        .await
-        .unwrap();
-    assert!(matches!(first, PodSlotAdmissionResult::Admitted { .. }));
-    let event = rx.recv().await.unwrap();
-    assert!(matches!(
-        event,
-        PodSlotAdmissionEvent::Changed {
-            namespace,
-            pod_name,
-            pod_uid,
-            state: PodSlotAdmissionState::Admitted,
-            ..
-        } if namespace == "default" && pod_name == "p" && pod_uid == "uid-a"
-    ));
-
-    let same = db
-        .pod_slot_try_admit("default", "p", "uid-a", "node-a")
-        .await
-        .unwrap();
-    assert!(matches!(same, PodSlotAdmissionResult::Admitted { .. }));
-    assert!(rx.try_recv().is_err(), "same-value admit must not emit");
-
-    db.pod_slot_mark_terminating("default", "p", "uid-a", "node-a")
-        .await
-        .unwrap();
-    let event = rx.recv().await.unwrap();
-    assert!(matches!(
-        event,
-        PodSlotAdmissionEvent::Changed {
-            state: PodSlotAdmissionState::Terminating,
-            pod_uid,
-            ..
-        } if pod_uid == "uid-a"
-    ));
-
-    db.pod_slot_clear_if_uid("default", "p", "uid-a", "node-a")
-        .await
-        .unwrap();
-    let event = rx.recv().await.unwrap();
-    assert!(matches!(
-        event,
-        PodSlotAdmissionEvent::Cleared { pod_uid, .. } if pod_uid == "uid-a"
-    ));
 }
 
 #[tokio::test]
@@ -6022,8 +5927,6 @@ async fn focused_store_traits_cover_sqlite_backend() {
             + WatchHistoryStore
             + NamespaceStore
             + NamespaceContentStore
-            + PodWorkqueueStore
-            + NetworkStore
             + NetworkMetadataStore
             + ReplicationStore
             + CurrentResourceVersionStore
@@ -6067,9 +5970,9 @@ async fn test_datastore_backend_advance_rv_via_trait_returns_at_least_min_rv() {
 async fn build_reserved_rv_commit(
     db: &Datastore,
     idempotency_key: &str,
-) -> (crate::log_apply::LogApplyCommit, i64) {
+) -> (klights_cluster_core::LogApplyCommit, i64) {
     let before = db.get_current_resource_version().await.unwrap();
-    let command = crate::datastore::command::StorageCommand::AdvanceResourceVersion {
+    let command = klights_cluster_core::command::StorageCommand::AdvanceResourceVersion {
         min_rv: before,
         new_rv: before + 1,
     };
@@ -6080,7 +5983,7 @@ async fn build_reserved_rv_commit(
         .build_log_apply_commit_for_outbox(
             idempotency_key,
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -6148,7 +6051,7 @@ async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
     .await
     .unwrap();
     let before = db.get_current_resource_version().await.unwrap();
-    let command = crate::datastore::command::StorageCommand::CreateResource {
+    let command = klights_cluster_core::command::StorageCommand::CreateResource {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
         namespace: None,
@@ -6162,7 +6065,7 @@ async fn raft_terminal_conflict_does_not_consume_candidate_resource_version() {
         .build_log_apply_commit_for_outbox(
             "conflicting-node-registration",
             crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane2",
         )
         .await
@@ -6378,69 +6281,6 @@ async fn test_datastore_handle_arc_dyn_clone_shares_state() {
         fetched.is_some(),
         "handle clones must observe shared writes"
     );
-}
-
-#[tokio::test]
-async fn datastore_backend_trait_object_supports_internal_methods() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let handle: DatastoreHandle = std::sync::Arc::new(db);
-
-    assert!(
-        handle
-            .get_pod_network("missing-sandbox")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        handle
-            .get_node_subnet("missing-node")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(handle.list_sandboxes().await.unwrap().is_empty());
-    handle
-        .record_sandbox("default", "pod-a", "uid-a", "sandbox-a")
-        .await
-        .unwrap();
-    let sandboxes = handle.list_sandboxes().await.unwrap();
-    assert_eq!(sandboxes.len(), 1);
-    assert_eq!(sandboxes[0].pod_uid, "uid-a");
-    assert_eq!(handle.gc_watch_events(100_000, 1_000).await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn concurrent_sandbox_insert_different_uids_both_survive_trait_object() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let handle: DatastoreHandle = std::sync::Arc::new(db);
-
-    handle
-        .record_sandbox("default", "pod-a", "uid-a", "sandbox-a")
-        .await
-        .unwrap();
-    handle
-        .record_sandbox("default", "pod-a", "uid-b", "sandbox-b")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        handle
-            .get_sandbox_for_uid("default", "pod-a", "uid-a")
-            .await
-            .unwrap(),
-        Some("sandbox-a".to_string())
-    );
-    assert_eq!(
-        handle
-            .get_sandbox_for_uid("default", "pod-a", "uid-b")
-            .await
-            .unwrap(),
-        Some("sandbox-b".to_string())
-    );
-
-    let sandboxes = handle.list_sandboxes().await.unwrap();
-    assert_eq!(sandboxes.len(), 2);
 }
 
 #[tokio::test]
@@ -7540,7 +7380,6 @@ fn accepts_resource_store(_store: &dyn crate::datastore::ResourceStore) {}
 fn accepts_watch_store(_store: &dyn crate::datastore::WatchStore) {}
 fn accepts_watch_anchor_store(_store: &dyn crate::datastore::WatchReplayAnchorStore) {}
 fn accepts_raw_watch_replay_store(_store: &dyn crate::datastore::RawWatchReplayStore) {}
-fn accepts_network_store(_store: &dyn crate::datastore::NetworkStore) {}
 fn accepts_namespace_store(_store: &dyn crate::datastore::NamespaceStore) {}
 
 #[tokio::test]
@@ -7552,7 +7391,6 @@ async fn datastore_implements_focused_backend_traits() {
     accepts_watch_store(&watch_store);
     accepts_watch_anchor_store(&watch_store);
     accepts_raw_watch_replay_store(&watch_store);
-    accepts_network_store(&db);
     accepts_namespace_store(&db);
 }
 
@@ -7601,7 +7439,7 @@ async fn cluster_same_kind_name_can_exist_in_different_api_versions() {
 
 #[tokio::test]
 async fn from_executor_initializes_watch_and_fingerprint() {
-    use crate::datastore::sqlite::DbExecutor;
+    use crate::sqlite_boundary::DbExecutor;
 
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
@@ -7630,7 +7468,7 @@ async fn from_executor_initializes_watch_and_fingerprint() {
 }
 
 #[tokio::test]
-async fn new_persistent_creates_cluster_and_node_db_files() {
+async fn new_persistent_creates_only_cluster_db_file() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_dir = dir.path();
     // Ensure parent has 0700 for opener
@@ -7647,7 +7485,8 @@ async fn new_persistent_creates_cluster_and_node_db_files() {
         .await
         .unwrap();
 
-    // Verify split DB files exist under {db_dir}/sqlite/
+    // Cluster persistence owns only cluster.db. The node-local selector owns
+    // node.db and its schema.
     let cluster_db_path = db_dir.join("sqlite").join("cluster.db");
     let node_db_path = db_dir.join("sqlite").join("node.db");
     assert!(
@@ -7655,8 +7494,8 @@ async fn new_persistent_creates_cluster_and_node_db_files() {
         "cluster.db must be created under sqlite/"
     );
     assert!(
-        node_db_path.exists(),
-        "node.db must be created under sqlite/"
+        !node_db_path.exists(),
+        "cluster persistence must not create node.db"
     );
 
     // Verify the DB is functional: create a resource

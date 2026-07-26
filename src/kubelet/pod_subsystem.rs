@@ -384,12 +384,11 @@ mod tests {
         let repository_parts =
             PodRepository::build_parts(crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: db.clone(),
+                node_local: None,
                 supervisor: supervisor.clone(),
                 side_effects,
                 metrics,
-                pod_network_cache: crate::kubelet::pod_repository::test_pod_network_cache(
-                    db.clone(),
-                ),
+                pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
                 assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
                 scheduling_mode,
                 outbox: None,

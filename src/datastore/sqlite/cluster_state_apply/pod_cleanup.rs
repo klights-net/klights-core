@@ -1,5 +1,5 @@
 use super::super::queries;
-use crate::log_apply::{LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow};
+use klights_cluster_core::{LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow};
 
 pub(in crate::datastore::sqlite) struct PodCleanupStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,

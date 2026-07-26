@@ -18,27 +18,27 @@
 // DSB-06 will add.
 // ---------------------------------------------------------------------------
 
-pub(super) const PRAGMA_JOURNAL_MODE: &str = "journal_mode";
-pub(super) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
-pub(super) const PRAGMA_AUTO_VACUUM: &str = "auto_vacuum";
-pub(super) const PRAGMA_CACHE_SIZE: &str = "cache_size";
-pub(super) const PRAGMA_TEMP_STORE: &str = "temp_store";
-pub(super) const PRAGMA_MMAP_SIZE: &str = "mmap_size";
-pub(super) const PRAGMA_FOREIGN_KEYS: &str = "foreign_keys";
-pub(super) const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
+pub(crate) const PRAGMA_JOURNAL_MODE: &str = "journal_mode";
+pub(crate) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
+pub(crate) const PRAGMA_AUTO_VACUUM: &str = "auto_vacuum";
+pub(crate) const PRAGMA_CACHE_SIZE: &str = "cache_size";
+pub(crate) const PRAGMA_TEMP_STORE: &str = "temp_store";
+pub(crate) const PRAGMA_MMAP_SIZE: &str = "mmap_size";
+pub(crate) const PRAGMA_FOREIGN_KEYS: &str = "foreign_keys";
+pub(crate) const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
 
-pub(super) const PRAGMA_VALUE_JOURNAL_MODE_WAL: &str = "WAL";
-pub(super) const PRAGMA_VALUE_SYNCHRONOUS_NORMAL: &str = "NORMAL";
-pub(super) const PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL: &str = "INCREMENTAL";
+pub(crate) const PRAGMA_VALUE_JOURNAL_MODE_WAL: &str = "WAL";
+pub(crate) const PRAGMA_VALUE_SYNCHRONOUS_NORMAL: &str = "NORMAL";
+pub(crate) const PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL: &str = "INCREMENTAL";
 /// Negative cache size = KiB cap (≈ 40 MB). Stored as a SQL literal so
 /// `queries.rs` only exposes `pub(super) const NAME: &str` items per
 /// DSB-00b discipline.
-pub(super) const PRAGMA_VALUE_CACHE_SIZE: &str = "-40000";
-pub(super) const PRAGMA_VALUE_TEMP_STORE_MEMORY: &str = "MEMORY";
+pub(crate) const PRAGMA_VALUE_CACHE_SIZE: &str = "-40000";
+pub(crate) const PRAGMA_VALUE_TEMP_STORE_MEMORY: &str = "MEMORY";
 /// 128 MiB mmap window. Disabled (0) under SQLCipher per DSB-06.
-pub(super) const PRAGMA_VALUE_MMAP_SIZE: &str = "134217728";
-pub(super) const PRAGMA_VALUE_FOREIGN_KEYS_ON: &str = "ON";
-pub(super) const PRAGMA_VALUE_BUSY_TIMEOUT_MS: &str = "5000";
+pub(crate) const PRAGMA_VALUE_MMAP_SIZE: &str = "134217728";
+pub(crate) const PRAGMA_VALUE_FOREIGN_KEYS_ON: &str = "ON";
+pub(crate) const PRAGMA_VALUE_BUSY_TIMEOUT_MS: &str = "5000";
 
 // ---------------------------------------------------------------------------
 // metadata / resource_version
@@ -445,144 +445,6 @@ pub(super) const NODE_DATAPLANE_SELECT_BY_NAME: &str = "SELECT node_name, mode, 
        FROM node_dataplane WHERE node_name = ?1";
 
 pub(super) const NODE_DATAPLANE_DELETE: &str = "DELETE FROM node_dataplane WHERE node_name = ?1";
-
-// ---------------------------------------------------------------------------
-// pod_slot_admissions
-// ---------------------------------------------------------------------------
-
-pub(super) const POD_SLOT_ADMISSION_SELECT: &str = "SELECT pod_uid, node_name, state, updated_rv FROM pod_slot_admissions \
-     WHERE namespace = ?1 AND pod_name = ?2";
-
-pub(super) const POD_SLOT_ADMISSION_INSERT: &str = "INSERT INTO pod_slot_admissions \
-     (namespace, pod_name, pod_uid, node_name, state, updated_rv, updated_at_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
-
-pub(super) const POD_SLOT_ADMISSION_UPDATE: &str = "UPDATE pod_slot_admissions \
-     SET pod_uid = ?3, node_name = ?4, state = ?5, updated_rv = ?6, updated_at_ms = ?7 \
-     WHERE namespace = ?1 AND pod_name = ?2";
-
-pub(super) const POD_SLOT_ADMISSION_DELETE_IF_UID: &str = "DELETE FROM pod_slot_admissions \
-     WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3";
-
-pub(super) const NODE_META_POD_SLOT_RV_SELECT: &str =
-    "SELECT value FROM _node_meta WHERE key = 'pod_slot_resource_version'";
-
-pub(super) const NODE_META_POD_SLOT_RV_UPSERT: &str = "INSERT INTO _node_meta (key, value) VALUES ('pod_slot_resource_version', ?1) \
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
-
-// ---------------------------------------------------------------------------
-// pod_sandboxes
-// ---------------------------------------------------------------------------
-
-pub(super) const POD_SANDBOX_INSERT_OR_REPLACE: &str = "INSERT INTO pod_runtime \
-     (namespace, pod_name, pod_uid, node_name, sandbox_id, created_ms) \
-     VALUES (?1, ?2, ?3, '', ?4, ?5) \
-     ON CONFLICT(pod_uid) DO UPDATE SET \
-       namespace = excluded.namespace, \
-       pod_name = excluded.pod_name, \
-       sandbox_id = excluded.sandbox_id";
-
-pub(super) const POD_SANDBOX_GET: &str = "SELECT sandbox_id FROM pod_runtime \
-     WHERE namespace = ?1 AND pod_name = ?2 AND sandbox_id IS NOT NULL \
-     ORDER BY created_ms DESC LIMIT 1";
-
-pub(super) const POD_SANDBOX_GET_FOR_UID: &str = "SELECT sandbox_id FROM pod_runtime \
-     WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3 AND sandbox_id IS NOT NULL";
-
-pub(super) const POD_SANDBOX_LIST: &str =
-    "SELECT namespace, pod_name, pod_uid, sandbox_id FROM pod_runtime WHERE sandbox_id IS NOT NULL";
-
-pub(super) const POD_SANDBOX_DELETE: &str =
-    "DELETE FROM pod_runtime WHERE namespace = ?1 AND pod_name = ?2";
-
-pub(super) const POD_SANDBOX_DELETE_FOR_UID: &str = "DELETE FROM pod_runtime \
-     WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3 AND sandbox_id = ?4";
-
-// ---------------------------------------------------------------------------
-// pod_networks
-// ---------------------------------------------------------------------------
-
-pub(super) const POD_NETWORK_INSERT: &str = "INSERT INTO pod_networks \
-     (sandbox_id, namespace, pod_name, pod_uid, ip_addr, ip_int, veth_host, netns_path, created_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)";
-
-pub(super) const POD_NETWORK_INSERT_ON_CONFLICT_NOTHING: &str = "INSERT INTO pod_networks \
-     (sandbox_id, namespace, pod_name, pod_uid, ip_addr, ip_int, veth_host, netns_path, created_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-     ON CONFLICT(ip_int) DO NOTHING";
-
-pub(super) const POD_NETWORK_GET_BY_SANDBOX: &str =
-    "SELECT ip_addr, ip_int FROM pod_networks WHERE sandbox_id = ?1";
-
-pub(super) const POD_NETWORK_MAX_IP_IN_RANGE: &str = "SELECT MAX(ip_int) FROM pod_networks \
-     WHERE ip_int >= ?1 AND ip_int <= ?2";
-
-pub(super) const POD_NETWORK_GET_ENDPOINT: &str =
-    "SELECT ip_addr, veth_host, netns_path FROM pod_networks WHERE sandbox_id = ?1";
-
-pub(super) const POD_NETWORK_GET_ENDPOINT_FOR_POD: &str = "SELECT ip_addr, veth_host, netns_path FROM pod_networks \
-     WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3 \
-     ORDER BY created_ms DESC LIMIT 1";
-
-pub(super) const POD_NETWORK_DELETE: &str = "DELETE FROM pod_networks WHERE sandbox_id = ?1";
-
-pub(super) const POD_NETWORK_LIST_SANDBOX_IDS: &str = "SELECT sandbox_id FROM pod_networks";
-
-pub(super) const POD_NETWORK_COUNT_BY_IP: &str =
-    "SELECT COUNT(*) FROM pod_networks WHERE ip_int = ?1";
-
-// ---------------------------------------------------------------------------
-// pod_endpoints
-// ---------------------------------------------------------------------------
-
-pub(super) const POD_ENDPOINT_UPSERT: &str = "INSERT OR REPLACE INTO pod_endpoints \
-     (pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, host_port_tcp, host_port_udp, generation, updated_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)";
-
-pub(super) const POD_ENDPOINT_GET_IP_FOR_DELETE: &str =
-    "SELECT pod_ip FROM pod_endpoints WHERE pod_uid = ?1";
-
-pub(super) const POD_ENDPOINT_DELETE: &str = "DELETE FROM pod_endpoints WHERE pod_uid = ?1";
-
-pub(super) const POD_ENDPOINT_LIST_BY_NODE: &str = "SELECT pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-            host_port_tcp, host_port_udp, generation, updated_ms \
-     FROM pod_endpoints WHERE node_name = ?1 ORDER BY pod_uid";
-
-pub(super) const POD_ENDPOINT_LIST_ALL: &str = "SELECT pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-            host_port_tcp, host_port_udp, generation, updated_ms \
-     FROM pod_endpoints ORDER BY pod_uid";
-
-pub(super) const POD_ENDPOINT_GET_BY_POD_IP: &str = "SELECT pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-            host_port_tcp, host_port_udp, generation, updated_ms \
-     FROM pod_endpoints WHERE pod_ip = ?1 LIMIT 1";
-
-// ---------------------------------------------------------------------------
-// pod_workqueue
-// ---------------------------------------------------------------------------
-
-pub(super) const POD_WORKQUEUE_TAIL_OTHER: &str = "SELECT COALESCE(MAX(next_due_ms), 0) \
-     FROM pod_workqueue \
-     WHERE NOT (kind = ?1 AND namespace = ?2 AND pod_name = ?3 AND pod_uid = ?4)";
-
-pub(super) const POD_WORKQUEUE_UPSERT: &str = "INSERT INTO pod_workqueue \
-     (kind, namespace, pod_name, pod_uid, payload, attempt_count, next_due_ms, last_error, enqueued_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-     ON CONFLICT(kind, namespace, pod_name, pod_uid) DO UPDATE SET \
-       payload = excluded.payload, \
-       attempt_count = excluded.attempt_count, \
-       next_due_ms = excluded.next_due_ms, \
-       last_error = excluded.last_error, \
-       enqueued_ms = excluded.enqueued_ms";
-
-pub(super) const POD_WORKQUEUE_PEEK_NEXT_DUE: &str = "SELECT MIN(next_due_ms) FROM pod_workqueue";
-
-pub(super) const POD_WORKQUEUE_CLAIM_DUE: &str = "SELECT id, kind, namespace, pod_name, pod_uid, payload, attempt_count, next_due_ms \
-     FROM pod_workqueue \
-     WHERE next_due_ms <= ?1 \
-     ORDER BY next_due_ms ASC, id ASC \
-     LIMIT 1";
-
-pub(super) const POD_WORKQUEUE_DELETE_BY_ID: &str = "DELETE FROM pod_workqueue WHERE id = ?1";
 
 // ---------------------------------------------------------------------------
 // ownership / owner_uid lookups via resource_owner_refs index

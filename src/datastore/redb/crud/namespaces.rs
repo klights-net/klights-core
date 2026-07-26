@@ -10,8 +10,8 @@ use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::sqlite::{create_pending_watch_event, publish_pending};
-use crate::datastore::types::*;
 use crate::watch::WatchBus;
+use klights_cluster_core::Resource;
 
 pub struct RedbNamespaceStore {
     pub accessor: Arc<RedbAccessor>,

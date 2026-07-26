@@ -530,7 +530,8 @@ mod tests {
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     use super::*;
-    use crate::datastore::sqlite::{DbExecutor, opener};
+    use crate::sqlite_boundary::DbExecutor;
+    use crate::sqlite_open as opener;
 
     async fn fresh() -> SqliteNodeLocalDb {
         let executor = DbExecutor::open_with_opts(

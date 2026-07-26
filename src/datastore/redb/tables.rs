@@ -45,23 +45,11 @@ pub(super) const RESOURCES_BY_OWNER: TableDefinition<&[u8], (u64, &[u8])> =
 // Secondary index: resource_version → resource_key for list-by-RV.
 pub(super) const RV_TO_KEY: TableDefinition<u64, &[u8]> = TableDefinition::new("rv_to_key");
 
-pub(super) const POD_SANDBOXES: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("pod_sandboxes");
-
-pub(super) const POD_NETWORKS: TableDefinition<&str, &[u8]> = TableDefinition::new("pod_networks");
-
 pub(super) const NODE_SUBNETS: TableDefinition<&str, &[u8]> = TableDefinition::new("node_subnets");
-
-pub(super) const POD_SLOT_ADMISSIONS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("pod_slot_admissions");
 
 pub(super) const NODE_DATAPLANE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("node_dataplane");
 
-pub(super) const POD_ENDPOINTS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("pod_endpoints");
-
-pub(super) const POD_WORKQUEUE: TableDefinition<u64, &[u8]> = TableDefinition::new("pod_workqueue");
 pub(super) const POD_CLEANUP_INTENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("pod_cleanup_intents");
 

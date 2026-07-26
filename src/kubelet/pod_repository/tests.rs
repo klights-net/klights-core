@@ -60,6 +60,27 @@ async fn fixture_node_local() -> crate::datastore::node_local::NodeLocalHandle {
     .expect("open node-local test db")
 }
 
+async fn fixture_repository_with_node_local(
+    db: crate::datastore::DatastoreHandle,
+) -> (PodRepository, crate::datastore::node_local::NodeLocalHandle) {
+    let supervisor = fixture_supervisor();
+    let node_local = fixture_node_local().await;
+    let repository = PodRepository::build_parts(PodRepositoryBuildConfig {
+        db,
+        node_local: Some(node_local.clone()),
+        supervisor,
+        side_effects: fixture_side_effects(),
+        metrics: crate::side_effects::SideEffectMetrics::new(),
+        pod_network_cache: super::test_pod_network_cache(node_local.clone()),
+        assignment_waiter: super::test_assignment_bus(),
+        scheduling_mode: super::PodSchedulingMode::InlineSingleNode,
+        outbox: None,
+        cluster_api: None,
+    })
+    .repository;
+    (repository, node_local)
+}
+
 struct RecordingPodDeleteHook {
     db: crate::datastore::DatastoreHandle,
     observed: Arc<tokio::sync::Mutex<Option<(bool, bool)>>>,
@@ -239,27 +260,27 @@ impl klights_leader_api::LeaderOutboxDelivery for TestOutboxDelivery {
                 .map_err(|err| {
                     klights_leader_api::OutboxDeliveryError::Retryable(err.to_string())
                 })?;
-            let meta = crate::datastore::command::CommandMeta {
-                command_id: crate::datastore::command::CommandId(format!(
+            let meta = klights_cluster_core::command::CommandMeta {
+                command_id: klights_cluster_core::command::CommandId(format!(
                     "pod-repository-command-{}",
                     current_rv.saturating_add(1)
                 )),
-                codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
+                codec_version: klights_cluster_core::command::COMMAND_CODEC_VERSION,
                 resource_version: current_rv.saturating_add(1),
                 uid: match &command {
-                    crate::datastore::command::StorageCommand::UpdateResource {
+                    klights_cluster_core::command::StorageCommand::UpdateResource {
                         preconditions,
                         ..
                     } => preconditions.uid.clone(),
-                    crate::datastore::command::StorageCommand::DeleteResource {
+                    klights_cluster_core::command::StorageCommand::DeleteResource {
                         preconditions,
                         ..
                     } => preconditions.uid.clone(),
-                    crate::datastore::command::StorageCommand::PatchResource {
+                    klights_cluster_core::command::StorageCommand::PatchResource {
                         preconditions,
                         ..
                     } => preconditions.uid.clone(),
-                    crate::datastore::command::StorageCommand::UpdateStatus {
+                    klights_cluster_core::command::StorageCommand::UpdateStatus {
                         preconditions,
                         ..
                     } => preconditions.uid.clone(),
@@ -340,11 +361,13 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let pod_network_cache = super::test_pod_network_cache(db.clone());
+    let node_local = fixture_node_local().await;
+    let pod_network_cache = super::test_pod_network_cache(node_local.clone());
     let assignment_waiter = super::test_assignment_bus();
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
+        node_local: Some(node_local),
         supervisor,
         side_effects,
         metrics,
@@ -368,11 +391,13 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let pod_network_cache = super::test_pod_network_cache(db.clone());
+    let node_local = fixture_node_local().await;
+    let pod_network_cache = super::test_pod_network_cache(node_local.clone());
     let assignment_waiter = super::test_assignment_bus();
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
+        node_local: Some(node_local),
         supervisor,
         side_effects,
         metrics,
@@ -406,11 +431,13 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let pod_network_cache = super::test_pod_network_cache(db.clone());
+    let node_local = fixture_node_local().await;
+    let pod_network_cache = super::test_pod_network_cache(node_local.clone());
     let assignment_waiter = super::test_assignment_bus();
 
     let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
         db,
+        node_local: Some(node_local),
         supervisor,
         side_effects,
         metrics,
@@ -1525,7 +1552,7 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
             .expect("decode sandbox metadata payload");
     assert_eq!(
         payload.command,
-        crate::datastore::command::StorageCommand::PatchResource {
+        klights_cluster_core::command::StorageCommand::PatchResource {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),
@@ -1907,7 +1934,7 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
         crate::node_outbox::payload::OutboxPayload::decode_protobuf(row.payload_proto.as_slice())
             .expect("decode delete payload");
     match payload.command {
-        crate::datastore::command::StorageCommand::FinalizeBoundPod {
+        klights_cluster_core::command::StorageCommand::FinalizeBoundPod {
             namespace,
             name,
             pod_uid,
@@ -2503,10 +2530,10 @@ struct StatusRacingRaftProposal {
 impl StatusRacingRaftProposal {
     async fn bump_status_before_delete_mark(
         &self,
-        command: &crate::datastore::command::StorageCommand,
+        command: &klights_cluster_core::command::StorageCommand,
     ) {
         let targets_pod_delete_mark = match command {
-            crate::datastore::command::StorageCommand::UpdateResource {
+            klights_cluster_core::command::StorageCommand::UpdateResource {
                 api_version,
                 kind,
                 namespace,
@@ -2523,7 +2550,7 @@ impl StatusRacingRaftProposal {
                         .and_then(|value| value.as_str())
                         .is_some()
             }
-            crate::datastore::command::StorageCommand::PatchResource {
+            klights_cluster_core::command::StorageCommand::PatchResource {
                 api_version,
                 kind,
                 namespace,
@@ -2574,11 +2601,11 @@ impl StatusRacingRaftProposal {
 
     async fn apply_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         idempotency_key: &str,
         operation: crate::node_outbox::payload::OutboxOperation,
         authoring_node: &str,
-        _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::raft::state_machine::RaftOutboxApply,
         crate::node_outbox::OutboxApplyError,
@@ -2602,7 +2629,7 @@ impl StatusRacingRaftProposal {
 impl crate::datastore::sequenced::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
     ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         let key = format!("status-race-{}", uuid::Uuid::new_v4());
         let outcome = self
@@ -2629,9 +2656,9 @@ impl crate::datastore::sequenced::RaftProposal for StatusRacingRaftProposal {
         &self,
         idempotency_key: &str,
         operation: &str,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
-        _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::node_outbox::OutboxApplyResult,
         crate::node_outbox::OutboxApplyError,
@@ -6666,27 +6693,36 @@ async fn pod_subresource_writes_return_conflict_on_stale_rv() {
 #[tokio::test]
 async fn read_pod_network_assignment_returns_assigned_ip() {
     use super::PodNetworkReader;
-    let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
+    let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
-    let repo = super::PodRepository::new(db, supervisor, side_effects, metrics);
+    let repo = super::PodRepository::new_with_network_events(
+        db,
+        supervisor,
+        side_effects,
+        metrics,
+        super::test_pod_network_cache(node_local.clone()),
+        super::test_assignment_bus(),
+        crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
+        None,
+    );
 
-    ds.record_pod_network(
-        "sandbox-net-1",
-        &PodIdentity::new("default", "p-net", "uid-1"),
-        "10.42.0.42",
-        0x0a2a_002a,
-        "vethXYZ",
-        "/var/run/netns/cni-1",
-    )
-    .await
-    .unwrap();
+    node_local
+        .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
+            "sandbox-net-1",
+            crate::datastore::PodNetworkAllocationPod::new("default", "p-net", "uid-1"),
+            crate::datastore::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
+            crate::datastore::PodNetworkAllocationLink::new("vethXYZ", "/var/run/netns/cni-1"),
+        ))
+        .await
+        .unwrap();
     let assignment = repo
         .read_pod_network_assignment("sandbox-net-1", "default", "p-net", "uid-1", false)
         .await
         .unwrap();
-    assert_eq!(assignment.pod_ip, "10.42.0.42");
+    assert_eq!(assignment.pod_ip, "10.42.0.2");
 }
 
 #[tokio::test]
@@ -6830,8 +6866,9 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     use crate::networking::pod_network_events::PodNetworkAssignmentBus;
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
-    let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
+    let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let events = std::sync::Arc::new(PodNetworkAssignmentBus::new());
@@ -6841,7 +6878,7 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
         supervisor,
         side_effects,
         metrics,
-        super::test_pod_network_cache(db),
+        super::test_pod_network_cache(node_local.clone()),
         events.clone(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
@@ -6864,20 +6901,19 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     });
 
     registered.changed().await.unwrap();
-    ds.record_pod_network(
-        "sandbox-net-late",
-        &PodIdentity::new("default", "p-net-late", "uid-late"),
-        "10.42.0.99",
-        0x0a2a_0063,
-        "vethL",
-        "/var/run/netns/cni-late",
-    )
-    .await
-    .unwrap();
+    node_local
+        .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
+            "sandbox-net-late",
+            crate::datastore::PodNetworkAllocationPod::new("default", "p-net-late", "uid-late"),
+            crate::datastore::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
+            crate::datastore::PodNetworkAllocationLink::new("vethL", "/var/run/netns/cni-late"),
+        ))
+        .await
+        .unwrap();
     events.publish_assignment(&key);
 
     let assignment = read_handle.await.unwrap().unwrap();
-    assert_eq!(assignment.pod_ip, "10.42.0.99");
+    assert_eq!(assignment.pod_ip, "10.42.0.2");
 }
 
 #[tokio::test]
@@ -7016,8 +7052,9 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     use crate::networking::pod_network_events::PodNetworkAssignmentBus;
     use klights_network_api::{PodNetworkAssignmentKey, PodNetworkAssignmentPublisher};
 
-    let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
+    let node_local = super::test_node_local_store(supervisor.clone()).await;
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
     let events = std::sync::Arc::new(PodNetworkAssignmentBus::new());
@@ -7027,7 +7064,7 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
         supervisor,
         side_effects,
         metrics,
-        super::test_pod_network_cache(db),
+        super::test_pod_network_cache(node_local.clone()),
         events.clone(),
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         None,
@@ -7057,20 +7094,26 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     // Full conformance can queue DB work around RunPodSandbox; the reader must
     // stay parked on the event rather than burning retry sleeps.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    ds.record_pod_network(
-        "sandbox-net-backlogged",
-        &PodIdentity::new("default", "p-net-backlogged", "uid-backlogged"),
-        "10.42.0.100",
-        0x0a2a_0064,
-        "vethB",
-        "/var/run/netns/cni-backlogged",
-    )
-    .await
-    .unwrap();
+    node_local
+        .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
+            "sandbox-net-backlogged",
+            crate::datastore::PodNetworkAllocationPod::new(
+                "default",
+                "p-net-backlogged",
+                "uid-backlogged",
+            ),
+            crate::datastore::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
+            crate::datastore::PodNetworkAllocationLink::new(
+                "vethB",
+                "/var/run/netns/cni-backlogged",
+            ),
+        ))
+        .await
+        .unwrap();
     events.publish_assignment(&key);
 
     let assignment = read_handle.await.unwrap().unwrap();
-    assert_eq!(assignment.pod_ip, "10.42.0.100");
+    assert_eq!(assignment.pod_ip, "10.42.0.2");
 }
 
 #[test]
@@ -9422,9 +9465,9 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
 async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_get() {
     use super::{PodApiWriter, PodReader};
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::command::StorageCommand;
     use crate::node_outbox::payload::OutboxPayload;
     use klights_cluster_core::BuildOutboxOutcome;
+    use klights_cluster_core::command::StorageCommand;
 
     let repo = build_repo_with_scheduling_mode(
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
@@ -9570,7 +9613,7 @@ async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_g
         .build_log_apply_commit_for_outbox(
             "stale-worker-status-after-preemption",
             "PodStatus",
-            payload.as_ref(),
+            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await
@@ -12132,7 +12175,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         crate::node_outbox::payload::OutboxPayload::decode_protobuf(row.payload_proto.as_slice())
             .expect("decode delete-mark payload");
     match payload.command {
-        crate::datastore::command::StorageCommand::PatchResource {
+        klights_cluster_core::command::StorageCommand::PatchResource {
             api_version,
             kind,
             namespace,
@@ -12370,10 +12413,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
     use klights_reconcile_api::GcPodDeleteSink;
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = fixture_side_effects();
-    let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
+    let (repo, node_local) = fixture_repository_with_node_local(db.clone()).await;
 
     let ns = "emptydir-diag";
     db.create_namespace(ns, json!({"metadata": {"name": ns}}))
@@ -12474,7 +12514,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
     // Pod-kind row (claim with a far-future clock so grace-delayed rows count).
     let mut enqueued_uids = std::collections::HashSet::new();
     for _ in 0..(CHILDREN * 4) {
-        match db.pod_workqueue_claim_due(i64::MAX).await.unwrap() {
+        match node_local.claim_workqueue_due(i64::MAX).await.unwrap() {
             Some(entry)
                 if entry.kind == crate::datastore::types::PodWorkqueueKind::Pod
                     && entry.namespace == ns =>
@@ -12510,10 +12550,7 @@ async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
     use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = fixture_supervisor();
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects = fixture_side_effects();
-    let repo = PodRepository::new(db.clone(), supervisor, side_effects, metrics);
+    let (repo, node_local) = fixture_repository_with_node_local(db.clone()).await;
 
     let ns = "gc-mark-enqueue";
     db.create_namespace(ns, json!({"metadata": {"name": ns}}))
@@ -12557,8 +12594,8 @@ async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
         "GC delete must mark the Pod terminating"
     );
 
-    let row = db
-        .pod_workqueue_claim_due(i64::MAX)
+    let row = node_local
+        .claim_workqueue_due(i64::MAX)
         .await
         .unwrap()
         .expect("GC mark must create a UID-bound pod_workqueue row");
@@ -12958,10 +12995,13 @@ impl DeleteCasRacingRaftProposal {
         self.raced.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn targets_delete_of_pod(&self, command: &crate::datastore::command::StorageCommand) -> bool {
+    fn targets_delete_of_pod(
+        &self,
+        command: &klights_cluster_core::command::StorageCommand,
+    ) -> bool {
         matches!(
             command,
-            crate::datastore::command::StorageCommand::DeleteResource {
+            klights_cluster_core::command::StorageCommand::DeleteResource {
                 api_version,
                 kind,
                 namespace,
@@ -12977,19 +13017,20 @@ impl DeleteCasRacingRaftProposal {
 
     async fn apply_command_to_inner(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
     ) -> anyhow::Result<()> {
         let current_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
-        let meta = crate::datastore::command::CommandMeta {
-            command_id: crate::datastore::command::CommandId(format!(
+        let meta = klights_cluster_core::command::CommandMeta {
+            command_id: klights_cluster_core::command::CommandId(format!(
                 "failing-pod-repository-command-{}",
                 current_rv.saturating_add(1)
             )),
-            codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
+            codec_version: klights_cluster_core::command::COMMAND_CODEC_VERSION,
             resource_version: current_rv.saturating_add(1),
             uid: match &command {
-                crate::datastore::command::StorageCommand::DeleteResource {
-                    preconditions, ..
+                klights_cluster_core::command::StorageCommand::DeleteResource {
+                    preconditions,
+                    ..
                 } => preconditions.uid.clone(),
                 _ => None,
             },
@@ -13009,7 +13050,7 @@ impl DeleteCasRacingRaftProposal {
 impl crate::datastore::sequenced::RaftProposal for DeleteCasRacingRaftProposal {
     async fn propose_command(
         &self,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
     ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         if self.targets_delete_of_pod(&command) {
             self.race_before_delete().await;
@@ -13022,9 +13063,9 @@ impl crate::datastore::sequenced::RaftProposal for DeleteCasRacingRaftProposal {
         &self,
         _idempotency_key: &str,
         _operation: &str,
-        command: crate::datastore::command::StorageCommand,
+        command: klights_cluster_core::command::StorageCommand,
         _authoring_node: &str,
-        _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::node_outbox::OutboxApplyResult,
         crate::node_outbox::OutboxApplyError,

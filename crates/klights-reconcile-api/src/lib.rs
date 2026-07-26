@@ -219,59 +219,7 @@ pub trait ResourceMutationEffectsPort: Send + Sync {
     ) -> ResourceMutationEffectsFuture<'a>;
 }
 
-/// Borrowed, transport-neutral Pod facts that affect Service endpoint output.
-///
-/// The leaf owns comparison semantics while root adapters retain ownership of
-/// protocol-specific extraction. The borrowed representation keeps mutation
-/// classification allocation-free.
-#[derive(Clone, Copy, Debug)]
-pub struct PodEndpointState<'a, T: ?Sized> {
-    ready: bool,
-    terminal: bool,
-    labels: Option<&'a T>,
-    pod_ip: Option<&'a T>,
-    pod_ips: Option<&'a T>,
-    deletion_timestamp: Option<&'a T>,
-}
-
-impl<'a, T: ?Sized> PodEndpointState<'a, T> {
-    pub const fn new(
-        ready: bool,
-        terminal: bool,
-        labels: Option<&'a T>,
-        pod_ip: Option<&'a T>,
-        pod_ips: Option<&'a T>,
-        deletion_timestamp: Option<&'a T>,
-    ) -> Self {
-        Self {
-            ready,
-            terminal,
-            labels,
-            pod_ip,
-            pod_ips,
-            deletion_timestamp,
-        }
-    }
-
-    pub const fn is_ready(&self) -> bool {
-        self.ready
-    }
-
-    pub const fn is_terminal(&self) -> bool {
-        self.terminal
-    }
-}
-
-impl<T: PartialEq + ?Sized> PodEndpointState<'_, T> {
-    pub fn differs_from(&self, updated: &PodEndpointState<'_, T>) -> bool {
-        self.ready != updated.ready
-            || self.terminal != updated.terminal
-            || self.labels != updated.labels
-            || self.pod_ip != updated.pod_ip
-            || self.pod_ips != updated.pod_ips
-            || self.deletion_timestamp != updated.deletion_timestamp
-    }
-}
+pub use klights_cluster_core::PodEndpointState;
 
 /// Neutral facts used to decide whether a mutation may emit reconciliation work.
 ///
