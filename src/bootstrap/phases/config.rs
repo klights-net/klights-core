@@ -63,11 +63,11 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         task_limits.others
     );
 
-    use crate::paths;
-    let etc_dir = paths::etc_dir_path(&config.containerd_namespace)
-        .to_string_lossy()
-        .into_owned();
-    let containerd_state_dir = paths::containerd_state_dir_path(&config.containerd_namespace)
+    let etc_dir = config.data_root.join("etc").to_string_lossy().into_owned();
+    let containerd_state_dir = config
+        .data_root
+        .join("containerd")
+        .join("state")
         .to_string_lossy()
         .into_owned();
     let runtime_paths =
