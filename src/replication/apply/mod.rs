@@ -20,7 +20,7 @@ use klights_cluster_core::{
 use crate::datastore::AppliedOutboxRecord;
 use crate::datastore::backend::DatastoreBackend;
 use crate::replication::protocol::ReplicationEntry;
-use crate::storage_wire_codec::encode_response_protobuf;
+use crate::replication::storage_wire_codec::encode_response_protobuf;
 use serde_json::Value;
 
 pub mod codec;

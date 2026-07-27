@@ -97,7 +97,6 @@ pub mod spdy;
 pub(crate) mod sqlite_boundary;
 pub(crate) mod sqlite_open;
 mod statefulset_store_adapter;
-pub(crate) mod storage_wire_codec;
 pub mod utils;
 pub mod version;
 pub mod watch;

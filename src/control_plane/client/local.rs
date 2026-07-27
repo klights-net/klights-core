@@ -1234,26 +1234,26 @@ impl LocalApiClient {
         let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
             &client_id, stream_id, stream_seq,
         );
-        let decoded =
-            match crate::node_outbox::payload::OutboxPayload::decode_protobuf(payload.as_ref()) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    let terminal =
-                        OutboxDeliveryError::invalid("delivery.payload", error.to_string());
-                    crate::control_plane::client::apply::consume_terminal_outbox_sequence(
-                        self.db.as_ref(),
-                        &idempotency_key,
-                        operation.into(),
-                        authoring_node,
-                        watermark.clone(),
-                    )
-                    .await?;
-                    return Err(terminal);
-                }
-            };
+        let decoded = match crate::replication::storage_wire_codec::decode_outbox_payload_protobuf(
+            payload.as_ref(),
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let terminal = OutboxDeliveryError::invalid("delivery.payload", error.to_string());
+                crate::control_plane::client::apply::consume_terminal_outbox_sequence(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation.into(),
+                    authoring_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Err(terminal);
+            }
+        };
         if let Err(error) = crate::control_plane::client::apply::authorize_outbox_command(
             operation,
-            &decoded.command,
+            decoded.command(),
             authoring_node,
         ) {
             crate::control_plane::client::apply::consume_terminal_outbox_sequence(

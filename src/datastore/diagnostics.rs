@@ -1,7 +1,10 @@
+#[cfg(test)]
 use serde_json::Value;
 use std::time::Duration;
+#[cfg(test)]
 use tracing::Level;
 
+#[cfg(test)]
 use crate::watch::WatchEvent;
 
 const WATCH_REPLAY_DECODE_WARN_MS: u128 = 10;
@@ -44,6 +47,7 @@ pub fn log_noop_resource_write(entry: NoopResourceWrite<'_>) {
     );
 }
 
+#[cfg(test)]
 pub fn log_watch_event_broadcast(event: &WatchEvent) {
     if !tracing::enabled!(target: "klights::datastore::watch_event", Level::DEBUG) {
         return;
@@ -143,10 +147,12 @@ fn should_log_slow_path(
     elapsed.as_millis() >= slow_ms || data_len >= large_bytes
 }
 
+#[cfg(test)]
 fn value_str(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
+#[cfg(test)]
 fn value_i64(value: Option<&Value>) -> Option<i64> {
     value.and_then(Value::as_i64)
 }

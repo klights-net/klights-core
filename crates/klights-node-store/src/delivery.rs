@@ -788,6 +788,93 @@ pub struct OutboxAttemptFailure {
     error: String,
 }
 
+/// Atomic leased-row failure recording request.
+///
+/// This is distinct from [`OutboxAttemptFailure`]: it preserves the existing
+/// node.db transaction that either schedules the retry or moves the row to
+/// dead letter at the configured threshold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxAttemptFailureRecord {
+    id: i64,
+    lease_token: String,
+    backoff_until_ms: i64,
+    error: String,
+    max_attempts: i64,
+}
+
+impl OutboxAttemptFailureRecord {
+    pub fn try_new(
+        id: i64,
+        lease_token: impl Into<String>,
+        backoff_until_ms: i64,
+        error: impl Into<String>,
+        max_attempts: i64,
+    ) -> Result<Self, DeliveryError> {
+        let lease_token = lease_token.into();
+        require_positive(id, "outbox.id")?;
+        require_nonempty(&lease_token, "lease_token")?;
+        require_nonnegative(backoff_until_ms, "backoff_until_ms")?;
+        require_positive(max_attempts, "max_attempts")?;
+        Ok(Self {
+            id,
+            lease_token,
+            backoff_until_ms,
+            error: error.into(),
+            max_attempts,
+        })
+    }
+
+    pub const fn id(&self) -> i64 {
+        self.id
+    }
+    pub fn lease_token(&self) -> &str {
+        &self.lease_token
+    }
+    pub const fn backoff_until_ms(&self) -> i64 {
+        self.backoff_until_ms
+    }
+    pub fn error(&self) -> &str {
+        &self.error
+    }
+    pub const fn max_attempts(&self) -> i64 {
+        self.max_attempts
+    }
+}
+
+/// Durable result of atomically recording a leased outbox failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboxFailureDisposition {
+    RetryScheduled,
+    DeadLettered,
+    LeaseLost,
+}
+
+/// Monotonic dispatcher counters persisted with node delivery state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxDispatchCounters {
+    dispatch_total: i64,
+    dispatch_errors_total: i64,
+}
+
+impl OutboxDispatchCounters {
+    pub fn try_new(dispatch_total: i64, dispatch_errors_total: i64) -> Result<Self, DeliveryError> {
+        require_nonnegative(dispatch_total, "dispatch_total")?;
+        require_nonnegative(dispatch_errors_total, "dispatch_errors_total")?;
+        Ok(Self {
+            dispatch_total,
+            dispatch_errors_total,
+        })
+    }
+
+    pub const fn dispatch_total(self) -> i64 {
+        self.dispatch_total
+    }
+
+    pub const fn dispatch_errors_total(self) -> i64 {
+        self.dispatch_errors_total
+    }
+}
+
 impl OutboxAttemptFailure {
     pub fn try_new(
         id: i64,
@@ -1357,6 +1444,10 @@ pub trait OutboxDispatcherStore: Send + Sync {
     fn renew_outbox_lease(&self, lease: OutboxLease) -> DeliveryFuture<'_, bool>;
     fn mark_outbox_attempt_failed(&self, failure: OutboxAttemptFailure)
     -> DeliveryFuture<'_, bool>;
+    fn record_outbox_failure(
+        &self,
+        failure: OutboxAttemptFailureRecord,
+    ) -> DeliveryFuture<'_, OutboxFailureDisposition>;
     fn complete_outbox(&self, completion: OutboxCompletion) -> DeliveryFuture<'_, bool>;
     fn requeue_expired_outbox_leases(&self, now: OutboxNow) -> DeliveryFuture<'_, usize>;
     fn next_outbox_wake_ms(&self, now: OutboxNow) -> DeliveryFuture<'_, Option<i64>>;
@@ -1368,6 +1459,17 @@ pub trait OutboxDispatcherStore: Send + Sync {
         &self,
         request: OutboxSupersedeRequest,
     ) -> DeliveryFuture<'_, usize>;
+    fn write_dispatch_counters(&self, counters: OutboxDispatchCounters) -> DeliveryFuture<'_, ()>;
+}
+
+/// Narrow transitional persistence for the Pod status-stamp high-water.
+///
+/// The pure-watermark cutover removes this capability with status stamps. It
+/// remains explicit until then so node outbox never receives arbitrary node
+/// metadata access.
+pub trait OutboxStatusStampStore: Send + Sync {
+    fn read_status_stamp_high_water(&self) -> DeliveryFuture<'_, i64>;
+    fn write_status_stamp_high_water(&self, high_water: i64) -> DeliveryFuture<'_, ()>;
 }
 
 /// Dead-letter administration and outbox diagnostics without queue mutation

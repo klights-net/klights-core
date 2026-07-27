@@ -38,6 +38,13 @@ impl OutboxDispatcherStore for EmptyDeliveryStore {
         Box::pin(async { Ok(false) })
     }
 
+    fn record_outbox_failure(
+        &self,
+        _failure: klights_node_store::OutboxAttemptFailureRecord,
+    ) -> DeliveryFuture<'_, klights_node_store::OutboxFailureDisposition> {
+        Box::pin(async { Ok(klights_node_store::OutboxFailureDisposition::LeaseLost) })
+    }
+
     fn complete_outbox(&self, _completion: OutboxCompletion) -> DeliveryFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }
@@ -62,6 +69,13 @@ impl OutboxDispatcherStore for EmptyDeliveryStore {
         _request: OutboxSupersedeRequest,
     ) -> DeliveryFuture<'_, usize> {
         Box::pin(async { Ok(0) })
+    }
+
+    fn write_dispatch_counters(
+        &self,
+        _counters: klights_node_store::OutboxDispatchCounters,
+    ) -> DeliveryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
 }
 

@@ -904,8 +904,10 @@ mod cases {
             },
             observed_status_stamp: None,
         };
-        let encoded = crate::storage_wire_codec::encode_command_protobuf(&command).unwrap();
-        let decoded = crate::storage_wire_codec::decode_command_protobuf(&encoded).unwrap();
+        let encoded =
+            crate::replication::storage_wire_codec::encode_command_protobuf(&command).unwrap();
+        let decoded =
+            crate::replication::storage_wire_codec::decode_command_protobuf(&encoded).unwrap();
 
         apply_command_to_backend(
             &db,
@@ -2128,7 +2130,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "lease-renew-key",
                 crate::node_outbox::payload::OutboxOperation::LeaseRenew.as_str(),
-                crate::storage_wire_codec::test_outbox_command(&payload),
+                crate::replication::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
@@ -2164,7 +2166,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "create-from-outbox-key",
                 crate::node_outbox::payload::OutboxOperation::NodeRegistration.as_str(),
-                crate::storage_wire_codec::test_outbox_command(&payload),
+                crate::replication::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
@@ -2503,7 +2505,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "outbox-key",
                 crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-                crate::storage_wire_codec::test_outbox_command(&payload),
+                crate::replication::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await
@@ -2908,7 +2910,7 @@ mod cases {
 
     #[test]
     fn ensure_cluster_metadata_protobuf_round_trip() {
-        use crate::storage_wire_codec as codec;
+        use crate::replication::storage_wire_codec as codec;
         use klights_cluster_core::command::StorageCommand;
 
         let cmd = StorageCommand::EnsureClusterMetadata {
@@ -3005,7 +3007,7 @@ mod cases {
             .apply_outbox_transactionally(
                 "key",
                 "PodStatus",
-                crate::storage_wire_codec::test_outbox_command(&payload),
+                crate::replication::storage_wire_codec::test_outbox_command(&payload),
                 "worker-1",
             )
             .await

@@ -88,13 +88,17 @@ pub async fn consume_terminal_outbox_sequence(
     watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<(), OutboxApplyError> {
     let assigned_sequence = watermark.is_some();
-    let payload = crate::node_outbox::payload::terminal_decision_payload(idempotency_key)
-        .map(Bytes::from)
-        .map_err(|error| {
-            OutboxApplyError::Retryable(format!(
-                "failed to encode terminal outbox decision: {error}"
-            ))
-        })?;
+    let payload = crate::replication::storage_wire_codec::encode_outbox_payload_protobuf(
+        &klights_cluster_core::OutboxPayload::new(
+            crate::node_outbox::payload::terminal_decision_command(idempotency_key),
+        ),
+    )
+    .map(Bytes::from)
+    .map_err(|error| {
+        OutboxApplyError::Retryable(format!(
+            "failed to encode terminal outbox decision: {error}"
+        ))
+    })?;
     match apply_outbox_to_local_leader_with_node_operation(
         db,
         idempotency_key,

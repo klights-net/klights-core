@@ -4,7 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::datastore::{
-    CatchUpResource, PositionedWatchReplayRead as StorePositionedWatchReplayRead,
+    PositionedWatchReplayRead as StorePositionedWatchReplayRead,
     WatchReplayRead as StoreWatchReplayRead, WatchStore, WatchTarget,
 };
 use crate::watch::{WatchEvent, WatchReplaySource};
@@ -30,10 +30,7 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
             .watch_store
             .list_watch_events_since(&self.targets, since_rv)
             .await?;
-        Ok(replay
-            .into_iter()
-            .map(CatchUpResource::into_watch_event)
-            .collect())
+        Ok(replay.into_iter().map(WatchEvent::from_catch_up).collect())
     }
 
     async fn replay_since_checked(
@@ -47,10 +44,7 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
             .await?
         {
             StoreWatchReplayRead::Events(events) => Ok(klights_watch::WatchReplayRead::Events(
-                events
-                    .into_iter()
-                    .map(CatchUpResource::into_watch_event)
-                    .collect(),
+                events.into_iter().map(WatchEvent::from_catch_up).collect(),
             )),
             StoreWatchReplayRead::Expired => Ok(klights_watch::WatchReplayRead::Expired),
         }
@@ -74,7 +68,7 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
                             .into_iter()
                             .map(|positioned| klights_watch::PositionedWatchEvent {
                                 position: positioned.position,
-                                event: positioned.event.into_watch_event(),
+                                event: WatchEvent::from_catch_up(positioned.event),
                             })
                             .collect(),
                         replay.next_position,

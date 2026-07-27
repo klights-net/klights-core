@@ -16,11 +16,12 @@ pub use cache_network::{
 pub use delivery::{
     DeadLetterEntry, DeadLetterKey, DeadLetterMoveRequest, DeadLetterReplayRequest,
     DeadLetterStore, DeliveryError, DeliveryFuture, MAX_OUTBOX_BATCH, OUTBOX_DIAGNOSTIC_AGING_MS,
-    OutboxAttemptFailure, OutboxBatchClaimRequest, OutboxClaimRequest, OutboxClassification,
-    OutboxCompletion, OutboxDispatcherStore, OutboxEnqueue, OutboxLease, OutboxNow, OutboxPriority,
+    OutboxAttemptFailure, OutboxAttemptFailureRecord, OutboxBatchClaimRequest, OutboxClaimRequest,
+    OutboxClassification, OutboxCompletion, OutboxDispatchCounters, OutboxDispatcherStore,
+    OutboxEnqueue, OutboxFailureDisposition, OutboxLease, OutboxNow, OutboxPriority,
     OutboxProducerStore, OutboxRecord, OutboxSequence, OutboxSequencePolicy, OutboxStats,
-    OutboxSubject, OutboxSupersedability, OutboxSupersedeRequest, PodCheckpointKey,
-    PodStatusCheckpoint, PodStatusCheckpointApplied, PodStatusCheckpointStore,
+    OutboxStatusStampStore, OutboxSubject, OutboxSupersedability, OutboxSupersedeRequest,
+    PodCheckpointKey, PodStatusCheckpoint, PodStatusCheckpointApplied, PodStatusCheckpointStore,
     PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
     RuntimeObservationGeneration, TerminalDeleteClassification,
 };

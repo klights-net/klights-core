@@ -201,7 +201,7 @@ async fn build_update_node_dataplane_log_apply_does_not_mutate_leader_node() {
         .build_log_apply_commit_for_outbox(
             "dataplane-node-a",
             OutboxOperation::NodeDataplane.as_str(),
-            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "node-a",
         )
         .await
@@ -301,7 +301,7 @@ async fn node_registration_outbox_uses_dataplane_annotation_for_external_ip() {
         .build_log_apply_commit_for_outbox(
             "node-registration-node-a",
             OutboxOperation::NodeRegistration.as_str(),
-            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "node-a",
         )
         .await

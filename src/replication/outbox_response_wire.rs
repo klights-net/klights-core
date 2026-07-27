@@ -1,3 +1,5 @@
+//! Replication-owned internal protobuf codec for outbox responses.
+
 use klights_cluster_core::StorageResponse;
 use klights_internal_protobuf::storage::{
     ProtoAckResp, ProtoErrorResp, ProtoNodeSubnetResp, ProtoResourceResp, ProtoStorageResponse,

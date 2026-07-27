@@ -55,6 +55,43 @@ pub struct WatchEvent {
 }
 
 impl WatchEvent {
+    pub fn from_catch_up(catch_up: crate::datastore::CatchUpResource) -> Self {
+        let (resource, event_type) = catch_up.into_parts();
+        let klights_cluster_core::Resource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            uid,
+            resource_version,
+            data,
+            ..
+        } = resource;
+
+        // Cheap if the replay row owns the only Arc; copy-on-write otherwise.
+        let mut data = Arc::unwrap_or_clone(data);
+        if let Some(object) = data.as_object_mut() {
+            object.insert("apiVersion".to_string(), serde_json::json!(api_version));
+            object.insert("kind".to_string(), serde_json::json!(kind));
+            let metadata = object
+                .entry("metadata")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.insert("name".to_string(), serde_json::json!(name));
+                metadata.insert("uid".to_string(), serde_json::json!(uid));
+                if let Some(namespace) = namespace {
+                    metadata.insert("namespace".to_string(), serde_json::json!(namespace));
+                }
+                metadata.insert(
+                    "resourceVersion".to_string(),
+                    serde_json::json!(resource_version.to_string()),
+                );
+            }
+        }
+
+        Self::from_type(event_type.as_ref(), data)
+    }
+
     pub fn from_type(event_type: &str, object: Value) -> Self {
         match event_type {
             "ADDED" => Self::added(object),
@@ -229,6 +266,12 @@ impl WatchEvent {
             return true;
         }
         value_matches_field_selector(&self.object, field_selector)
+    }
+}
+
+impl klights_cluster_core::ResourceEventObject for WatchEvent {
+    fn resource_object(&self) -> &Arc<Value> {
+        &self.object
     }
 }
 

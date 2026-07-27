@@ -1,4 +1,4 @@
-//! Crate-private domain ↔ internal-wire adapter for storage commands.
+//! Replication-owned domain ↔ internal-wire adapter for storage commands.
 //!
 //! This neutral boundary is shared by persistence and replication. Keeping it
 //! outside both modules prevents either subsystem from depending on the other,

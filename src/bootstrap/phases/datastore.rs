@@ -848,12 +848,26 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
-        let ob = Arc::new(crate::node_outbox::Outbox::with_notify(
-            node_local.clone(),
+        let delivery_store =
+            crate::datastore::node_local::delivery_adapter::NodeLocalDeliveryAdapter::new(
+                node_local.clone(),
+            );
+        let outbox_stores = crate::node_outbox::OutboxStores::new(
+            delivery_store.clone(),
+            delivery_store.clone(),
+            delivery_store.clone(),
+            delivery_store.clone(),
+            delivery_store,
+        );
+        let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
+        let ob = Arc::new(crate::node_outbox::Outbox::compose(
+            outbox_stores.clone(),
+            outbox_codec.clone(),
             notify.clone(),
         ));
         let apply_client = outbox_delivery_client.clone();
-        let node_local_for_retry = node_local.clone();
+        let outbox_stores_for_retry = outbox_stores.clone();
+        let outbox_codec_for_retry = outbox_codec.clone();
         let supervisor_for_retry = supervisor.clone();
         let notify_for_retry = notify.clone();
         let apply_client_for_retry = apply_client.clone();
@@ -867,7 +881,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     let max_delay = std::time::Duration::from_secs(30);
                     loop {
                         let dispatcher = crate::node_outbox::OutboxDispatcher::production(
-                            node_local_for_retry.clone(),
+                            outbox_stores_for_retry.clone(),
+                            outbox_codec_for_retry.clone(),
                             apply_client_for_retry.clone(),
                             notify_for_retry.clone(),
                         );

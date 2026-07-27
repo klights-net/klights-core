@@ -1192,7 +1192,10 @@ async fn list_cr_inner(
                     }
                     let send_initial_snapshot_rv = list.resource_version.max(requested_rv);
                     for resource in merge_custom_resource_watch_baseline(list.items) {
-                        let event = CatchUpResource::added(resource).into_watch_event().into();
+                        let event = crate::watch::WatchEvent::from_catch_up(
+                            CatchUpResource::added(resource),
+                        )
+                        .into();
                         let event = match convert_custom_resource_watch_event_to_requested_version(
                             resource_query.as_ref(),
                             conversion_for_watch.as_ref(),
@@ -1269,7 +1272,10 @@ async fn list_cr_inner(
                         session_bootstrap.set_replay_start_position(position);
                     }
                     for resource in merge_custom_resource_watch_baseline(baseline.items) {
-                            let event = CatchUpResource::added(resource).into_watch_event().into();
+                            let event = crate::watch::WatchEvent::from_catch_up(
+                                CatchUpResource::added(resource),
+                            )
+                            .into();
                             let event = match convert_custom_resource_watch_event_to_requested_version(
                                 resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),
@@ -1368,7 +1374,10 @@ async fn list_cr_inner(
                             }
                         };
                     for resource in merge_custom_resource_watch_baseline(membership.items) {
-                            let event = CatchUpResource::added(resource).into_watch_event().into();
+                            let event = crate::watch::WatchEvent::from_catch_up(
+                                CatchUpResource::added(resource),
+                            )
+                            .into();
                             let event = match convert_custom_resource_watch_event_to_requested_version(
                                 resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),
