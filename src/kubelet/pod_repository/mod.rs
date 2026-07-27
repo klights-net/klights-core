@@ -267,6 +267,7 @@ pub mod watch;
 pub mod workqueue;
 
 #[cfg(test)]
+#[path = "../../pod_repository_integration_tests.rs"]
 mod tests;
 
 #[cfg(test)]
