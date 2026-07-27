@@ -22,7 +22,10 @@ use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_
 #[cfg(test)]
 use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
-use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource};
+use crate::kubelet::pod_watch_source::{
+    PodWatchCheckpoint, PodWatchDisconnect, PodWatchEvent, PodWatchRecoveryPlan, PodWatchSession,
+    PodWatchSource, PodWatchStream,
+};
 #[cfg(test)]
 use crate::watch::{SignalWatchCursor, WatchDeliveryScope, WatchEventFilter, WindowPolicy};
 use anyhow::Result;
@@ -39,6 +42,13 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 type CriEventReceiver = mpsc::Receiver<crate::kubelet::cri_events::KubeletEvent>;
+type PodWatchReconnectFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<PodWatchSession, LeaderWatchError>>
+            + Send
+            + 'static,
+    >,
+>;
 
 pub mod event_handlers;
 mod startup;
@@ -149,6 +159,44 @@ async fn wait_for_cni_readiness(
     readiness.wait_ready(cancel_token).await
 }
 
+fn pod_watch_reconnect_future(
+    source: Arc<dyn PodWatchSource>,
+    node_name: String,
+    recovery: PodWatchRecoveryPlan,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    attempt: u32,
+) -> PodWatchReconnectFuture {
+    Box::pin(async move {
+        if attempt > 0 {
+            let _ = task_supervisor
+                .sleep(
+                    "pod_manager_watch_reconnect",
+                    crate::utils::watch_reconnect_delay(attempt - 1),
+                )
+                .await;
+        }
+        source.open_pod_manager_watch(node_name, recovery).await
+    })
+}
+
+async fn next_pod_watch_event(
+    stream: &mut Option<PodWatchStream>,
+) -> Option<Result<PodWatchEvent, crate::kubelet::pod_watch_source::PodWatchStreamError>> {
+    match stream {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn await_pod_watch_reconnect(
+    reconnect: &mut Option<PodWatchReconnectFuture>,
+) -> Result<PodWatchSession, LeaderWatchError> {
+    match reconnect {
+        Some(reconnect) => reconnect.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Configuration for pod watcher
 #[derive(Clone)]
 pub struct PodWatcherConfig {
@@ -231,18 +279,6 @@ async fn run_pod_watcher_with_runtime(
         .await
         .take()
         .expect("pod lifecycle receiver must be set before run_pod_watcher");
-    let mut pod_events = match state
-        .pod_watch_source
-        .open_pod_manager_watch(config.node_name.clone())
-        .await
-    {
-        Ok(pod_events) => pod_events,
-        Err(error) => {
-            tracing::warn!(%error, "pod watcher failed to open positioned leader watch");
-            return;
-        }
-    };
-
     if let Err(err) =
         wait_for_cni_readiness(runtime_ports.cni_readiness.clone(), cancel_token.clone()).await
     {
@@ -359,6 +395,16 @@ async fn run_pod_watcher_with_runtime(
     // transitions it to Failed/Succeeded cleanly. The CRI event stream is the
     // sole driver of phase reconciliation; the reconnect arm above keeps it
     // live across containerd hiccups.
+    let mut pod_events = None;
+    let mut pod_watch_checkpoint = PodWatchCheckpoint::default();
+    let mut pod_watch_reconnect_attempt = 0_u32;
+    let mut pod_watch_reconnect = Some(pod_watch_reconnect_future(
+        state.pod_watch_source.clone(),
+        config.node_name.clone(),
+        PodWatchRecoveryPlan::initial(),
+        local_execution.task_supervisor.clone(),
+        0,
+    ));
     loop {
         tokio::select! {
             // Handle cancellation signal
@@ -367,23 +413,82 @@ async fn run_pod_watcher_with_runtime(
                 break;
             }
 
-            // Handle watch events with replay retry
-            event_result = pod_events.next() => {
+            reconnect_result = await_pod_watch_reconnect(&mut pod_watch_reconnect) => {
+                pod_watch_reconnect = None;
+                match reconnect_result {
+                    Ok(session) => {
+                        pod_watch_checkpoint = session.checkpoint;
+                        pod_events = Some(session.stream);
+                        pod_watch_reconnect_attempt = 0;
+                        tracing::info!("Pod watcher positioned leader watch established");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "pod watcher failed to open positioned leader watch");
+                        pod_watch_reconnect_attempt = pod_watch_reconnect_attempt.saturating_add(1);
+                        pod_watch_reconnect = Some(pod_watch_reconnect_future(
+                            state.pod_watch_source.clone(),
+                            config.node_name.clone(),
+                            pod_watch_checkpoint.recovery_plan(PodWatchDisconnect::EndOfStream),
+                            local_execution.task_supervisor.clone(),
+                            pod_watch_reconnect_attempt,
+                        ));
+                    }
+                }
+            }
+
+            // Handle watch events with positioned replay recovery. Reconnect
+            // remains one arm of this same loop, so lifecycle and CRI receivers
+            // stay owned and active while the watch transport is unavailable.
+            event_result = next_pod_watch_event(&mut pod_events) => {
                 let event = match event_result {
                     Some(Ok(event)) => event,
-                    Some(Err(LeaderWatchError::ReplayExpired { .. })) => {
-                        tracing::warn!("Pod watcher positioned replay window expired");
-                        break;
+                    Some(Err(error)) if matches!(error.source, LeaderWatchError::ReplayExpired { .. }) => {
+                        tracing::warn!(scope = ?error.scope, "Pod watcher positioned replay window expired; relisting scope");
+                        pod_events = None;
+                        pod_watch_reconnect_attempt = pod_watch_reconnect_attempt.saturating_add(1);
+                        pod_watch_reconnect = Some(pod_watch_reconnect_future(
+                            state.pod_watch_source.clone(),
+                            config.node_name.clone(),
+                            pod_watch_checkpoint.recovery_plan(
+                                PodWatchDisconnect::ReplayExpired(error.scope),
+                            ),
+                            local_execution.task_supervisor.clone(),
+                            pod_watch_reconnect_attempt,
+                        ));
+                        continue;
                     }
                     Some(Err(error)) => {
-                        tracing::warn!(%error, "Pod watcher positioned leader watch failed");
-                        break;
+                        tracing::warn!(scope = ?error.scope, error = %error.source, "Pod watcher positioned leader watch failed");
+                        pod_events = None;
+                        pod_watch_reconnect_attempt = pod_watch_reconnect_attempt.saturating_add(1);
+                        pod_watch_reconnect = Some(pod_watch_reconnect_future(
+                            state.pod_watch_source.clone(),
+                            config.node_name.clone(),
+                            pod_watch_checkpoint.recovery_plan(
+                                PodWatchDisconnect::Failed(error.scope),
+                            ),
+                            local_execution.task_supervisor.clone(),
+                            pod_watch_reconnect_attempt,
+                        ));
+                        continue;
                     }
                     None => {
-                        tracing::warn!("Pod watcher positioned leader watch closed");
-                        break;
+                        tracing::warn!("Pod watcher positioned leader watch closed; reconnecting");
+                        pod_events = None;
+                        pod_watch_reconnect_attempt = pod_watch_reconnect_attempt.saturating_add(1);
+                        pod_watch_reconnect = Some(pod_watch_reconnect_future(
+                            state.pod_watch_source.clone(),
+                            config.node_name.clone(),
+                            pod_watch_checkpoint.recovery_plan(PodWatchDisconnect::EndOfStream),
+                            local_execution.task_supervisor.clone(),
+                            pod_watch_reconnect_attempt,
+                        ));
+                        continue;
                     }
                 };
+                let event_scope = event.scope;
+                let event_resource_version = event.resource_version().unwrap_or_default();
+                let event_resume_position = event.resume_position;
                 // Fire-and-forget lifecycle trace message: spawn through the
                 // supervisor so actor sends never block event processing.
                 // handle_watch_event must always run regardless of actor state.
@@ -408,6 +513,24 @@ async fn run_pod_watcher_with_runtime(
                     },
                     event,
                 ).await;
+                if let Err(error) = pod_watch_checkpoint.advance_after_apply(
+                    event_scope,
+                    event_resource_version,
+                    event_resume_position,
+                ) {
+                    tracing::warn!(scope = ?event_scope, %error, "Pod watcher rejected out-of-order positioned event");
+                    pod_events = None;
+                    pod_watch_reconnect_attempt = pod_watch_reconnect_attempt.saturating_add(1);
+                    pod_watch_reconnect = Some(pod_watch_reconnect_future(
+                        state.pod_watch_source.clone(),
+                        config.node_name.clone(),
+                        pod_watch_checkpoint.recovery_plan(
+                            PodWatchDisconnect::Failed(event_scope),
+                        ),
+                        local_execution.task_supervisor.clone(),
+                        pod_watch_reconnect_attempt,
+                    ));
+                }
             }
 
             Some(ev) = cri_event_rx.recv() => {

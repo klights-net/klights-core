@@ -45,12 +45,14 @@ mod tests {
 
     fn deleted_pod_event() -> PodWatchEvent {
         PodWatchEvent {
+            scope: crate::kubelet::pod_watch_source::PodWatchScope::Pod,
             event_type: WatchEventType::Deleted,
             object: std::sync::Arc::new(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {"namespace": "default", "name": "web", "uid": "uid-web"}
             })),
+            resume_position: None,
         }
     }
 

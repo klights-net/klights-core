@@ -360,67 +360,107 @@ impl PodWatchSource for DatastorePodWatchSource {
     fn open_pod_manager_watch(
         &self,
         node_name: String,
+        recovery: crate::kubelet::pod_watch_source::PodWatchRecoveryPlan,
     ) -> crate::kubelet::pod_watch_source::PodWatchFuture<'_> {
         Box::pin(async move {
+            use crate::kubelet::pod_watch_source::{
+                PodWatchCheckpoint, PodWatchScope, PodWatchSession, scope_watch_stream,
+            };
             let requests = [
-                klights_leader_api::WatchRequest::try_new(
-                    "v1",
-                    "Pod",
-                    None,
-                    None,
-                    Some(format!("spec.nodeName={node_name}")),
-                    None,
-                    None,
-                )?,
-                klights_leader_api::WatchRequest::try_new(
-                    "v1",
-                    "PersistentVolumeClaim",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?,
-                klights_leader_api::WatchRequest::try_new(
-                    "v1",
-                    "PersistentVolume",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?,
-                klights_leader_api::WatchRequest::try_new(
-                    "v1", "Secret", None, None, None, None, None,
-                )?,
-                klights_leader_api::WatchRequest::try_new(
-                    "v1",
-                    "ConfigMap",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?,
-                klights_leader_api::WatchRequest::try_new(
-                    "v1",
-                    "Namespace",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?,
+                (
+                    PodWatchScope::Pod,
+                    klights_leader_api::WatchRequest::try_new(
+                        "v1",
+                        "Pod",
+                        None,
+                        None,
+                        Some(format!("spec.nodeName={node_name}")),
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::PersistentVolumeClaim,
+                    klights_leader_api::WatchRequest::try_new(
+                        "v1",
+                        "PersistentVolumeClaim",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::PersistentVolume,
+                    klights_leader_api::WatchRequest::try_new(
+                        "v1",
+                        "PersistentVolume",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::Secret,
+                    klights_leader_api::WatchRequest::try_new(
+                        "v1", "Secret", None, None, None, None, None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::ConfigMap,
+                    klights_leader_api::WatchRequest::try_new(
+                        "v1",
+                        "ConfigMap",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
+                (
+                    PodWatchScope::Namespace,
+                    klights_leader_api::WatchRequest::try_new(
+                        "v1",
+                        "Namespace",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                ),
             ];
             let mut streams = Vec::with_capacity(requests.len());
-            for request in requests {
-                streams.push(self.leader_watch.watch_resources(request).await?);
+            let mut checkpoint = PodWatchCheckpoint::default();
+            for (scope, request) in requests {
+                // A typed replay expiry deliberately omits only that scope's
+                // cursor. The focused LeaderWatch implementation then invokes
+                // its authoritative fresh establishment/relist kernel; this is
+                // not a lenient reuse of an expired scalar RV.
+                let request = if recovery.must_relist(scope) {
+                    request
+                } else if let Some(cursor) = recovery.cursor_for(scope) {
+                    request.with_resume_cursor(cursor)?
+                } else {
+                    request
+                };
+                let stream = self.leader_watch.watch_resources(request).await?;
+                if let Some(cursor) = stream.accepted_cursor() {
+                    checkpoint.accept_open_cursor(scope, cursor);
+                } else if let Some(cursor) = recovery.cursor_for(scope) {
+                    checkpoint.accept_open_cursor(scope, cursor);
+                }
+                streams.push(scope_watch_stream(scope, stream));
             }
-            use futures::StreamExt as _;
-            let stream = futures::stream::select_all(streams).map(|event| {
-                event.map(crate::kubelet::pod_watch_source::PodWatchEvent::from_resource_event)
-            });
-            Ok(Box::pin(stream) as PodWatchStream)
+            let stream = futures::stream::select_all(streams);
+            Ok(PodWatchSession {
+                stream: Box::pin(stream) as PodWatchStream,
+                checkpoint,
+            })
         })
     }
 }

@@ -1488,7 +1488,7 @@ impl OutboxDispatcher {
                             OutboxDeliveryRequest::try_new(
                                 row.idempotency_key.clone(),
                                 klights_leader_api::OutboxDeliveryOperation::PodStatus,
-                                Arc::<[u8]>::from(payload),
+                                payload,
                                 row.client_id.clone(),
                                 row.stream_id,
                                 row.stream_seq,

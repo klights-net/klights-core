@@ -3,11 +3,11 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 41006,
-      "sha256": "e40e9dc22f93d92f261865f6574d10fb79517a995fed065455f8a414849456eb",
+      "count": 41445,
+      "sha256": "4f4b1f5e9e8bb61fc95f30ca1ee1546bbb84f153a9143606aa5a454ba866e671",
       "source": {
-        "count": 522263,
-        "sha256": "b58e63b7f1fd3c198aec6c612e5a4a9a7c0afbcb88f15d4feb510b3eacef6a46"
+        "count": 523545,
+        "sha256": "7c161ba36cc0708e74408ab2bbb945ee6c0d09b761ccf39d2827e90672a55204"
       }
     },
     "klights-apiserver": {
