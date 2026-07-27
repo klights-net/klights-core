@@ -8,7 +8,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub fn policy_v1_routes() -> Router<Arc<AppState>> {
+pub fn policy_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/poddisruptionbudgets", get(list_all_poddisruptionbudgets))
         .route(
@@ -33,7 +33,7 @@ pub fn policy_v1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn create_poddisruptionbudget(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -58,7 +58,7 @@ async fn create_poddisruptionbudget(
 }
 
 async fn update_poddisruptionbudget(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -83,7 +83,7 @@ async fn update_poddisruptionbudget(
 }
 
 async fn patch_poddisruptionbudget(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,

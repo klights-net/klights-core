@@ -12,8 +12,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use crate::api::AppState;
 use crate::controllers::annotations::{
     HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION, NodePeerMode,
 };
@@ -502,45 +500,6 @@ async fn wait_for_peer_watch_reconnect(
             crate::utils::watch_reconnect_delay(attempt),
         ) => result.is_ok(),
     }
-}
-
-/// Watch Node events and keep peer routes in sync with `node_subnets`.
-///
-/// Event-driven only: no polling loop. Uses WatchCursor replay to survive lag.
-#[cfg(test)]
-pub async fn run_peer_watch(
-    state: std::sync::Arc<AppState>,
-    peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
-    dataplane_health: DataplaneHealth,
-    cancel: CancellationToken,
-) {
-    let db = state.resource_mutation().db.clone();
-    let node_name = state.operational().config.node_name.clone();
-    let query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
-        std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
-            db.clone(),
-            node_name.clone(),
-            crate::control_plane::client::local::always_leader_watch(),
-        ));
-    let node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
-        std::sync::Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
-            node_name.clone(),
-            query.clone(),
-            std::sync::Arc::new(crate::node_outbox::Outbox::test_outbox().await),
-        ));
-    run_peer_watch_with_components_inner(
-        db,
-        node_name,
-        state.operational().config.cluster_cidr.clone(),
-        peering,
-        state.operational().task_supervisor.clone(),
-        state.operational().is_raft_leader_rx.clone(),
-        Some(dataplane_health),
-        query,
-        node_status,
-        cancel,
-    )
-    .await;
 }
 
 #[cfg(test)]

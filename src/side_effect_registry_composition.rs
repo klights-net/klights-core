@@ -221,7 +221,7 @@ pub async fn run_named_hook_logged(
 /// `metrics` is wired into hooks (currently `namespace_termination`) that
 /// need to increment per-failure-mode counters from inside their `apply`
 /// path. Test fixtures pass a fresh `SideEffectMetrics::new()`; production
-/// passes the same `Arc<SideEffectMetrics>` that lives on `AppState`.
+/// passes the same `Arc<SideEffectMetrics>` that lives on `ApiState`.
 pub fn default_registry(
     metrics: std::sync::Arc<SideEffectMetrics>,
     services: Option<std::sync::Arc<dyn klights_network_api::ServiceRouter>>,

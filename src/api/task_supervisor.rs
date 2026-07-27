@@ -1,4 +1,4 @@
-use crate::api::{AppError, AppState};
+use crate::api::{ApiState, AppError};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -15,7 +15,7 @@ struct DbQueryLoggingUpdate {
     enabled: bool,
 }
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/categories", get(get_categories))
         .route("/tasks", get(get_tasks))
@@ -27,7 +27,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn get_categories(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<TaskCategoryStatus>>, AppError> {
     ensure_admin(&headers)?;
@@ -37,7 +37,7 @@ async fn get_categories(
 }
 
 async fn get_tasks(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ActiveTaskStatus>>, AppError> {
     ensure_admin(&headers)?;
@@ -45,7 +45,7 @@ async fn get_tasks(
 }
 
 async fn get_tasks_by_category(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(category): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ActiveTaskStatus>>, AppError> {
@@ -60,7 +60,7 @@ async fn get_tasks_by_category(
 }
 
 async fn get_db_query_logging(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
 ) -> Result<Json<DbQueryLoggingStatus>, AppError> {
     ensure_admin(&headers)?;
@@ -73,7 +73,7 @@ async fn get_db_query_logging(
 }
 
 async fn put_db_query_logging(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Json(payload): Json<DbQueryLoggingUpdate>,
 ) -> Result<Json<DbQueryLoggingStatus>, AppError> {

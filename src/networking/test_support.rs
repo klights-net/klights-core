@@ -421,7 +421,7 @@ impl Default for MockServiceRouter {
 
 /// Convenience: build a `Network` populated with mocks. Matches the
 /// shape every test fixture used to wire `network: Arc<dyn ...>` and
-/// `services: Arc<dyn ...>` separately, so the post-Task-7 AppState
+/// `services: Arc<dyn ...>` separately, so the post-Task-7 ApiState
 /// fixture stays one line.
 pub fn mock_network(
     _db: crate::datastore::DatastoreHandle,

@@ -109,7 +109,7 @@ fn build_subject_identity_from_sar_spec(spec: &Value) -> AuthenticatedIdentity {
 }
 
 pub(crate) async fn create_self_subject_access_review(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     axum::Extension(identity): axum::Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     body: Bytes,
@@ -151,7 +151,7 @@ pub(crate) async fn create_self_subject_access_review(
 }
 
 pub(crate) async fn create_subject_access_review(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     axum::Extension(identity): axum::Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     body: Bytes,
@@ -220,7 +220,7 @@ pub(crate) async fn create_subject_access_review(
 }
 
 pub(crate) async fn create_self_subject_rules_review(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     axum::Extension(identity): axum::Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     body: Bytes,
@@ -281,7 +281,7 @@ pub(crate) async fn create_self_subject_rules_review(
 }
 
 pub(crate) async fn create_local_subject_access_review(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     axum::Extension(identity): axum::Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
@@ -402,7 +402,7 @@ mod tests {
     async fn state_with_sequence_authorizer(
         decisions: Vec<AuthorizationDecision>,
     ) -> (
-        AppState,
+        ApiState,
         Arc<Mutex<Vec<AuthenticatedIdentity>>>,
         Arc<Mutex<Vec<AuthorizationRequest>>>,
     ) {

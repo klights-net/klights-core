@@ -505,8 +505,8 @@ pub fn ready_to_finalize_after_update(data: &Value) -> bool {
         .is_none_or(|arr| arr.is_empty())
 }
 
-pub async fn finalize_after_update_if_ready(
-    state: &Arc<AppState>,
+pub(in crate::api) async fn finalize_after_update_if_ready(
+    state: &Arc<ApiState>,
     api_version: &str,
     kind: &str,
     namespace: Option<&str>,

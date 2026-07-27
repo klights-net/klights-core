@@ -3,7 +3,7 @@
 //! `generated_handlers.rs`.
 //!
 //! These functions take and mutate a `serde_json::Value` body without any
-//! I/O, datastore access, or `AppState` plumbing — making them trivially
+//! I/O, datastore access, or `ApiState` plumbing — making them trivially
 //! unit-testable in isolation. See `defaulting_tests.rs` for the test
 //! coverage.
 //!

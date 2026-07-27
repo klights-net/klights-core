@@ -7,16 +7,16 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::{AppError, AppState, LenientJson};
-use crate::api_status::{
+use crate::api::status::{
     DatastoreScaleMutationWriter, JsonScaleMutationResponder, ScaleMutationPipeline,
     ScaleMutationTarget, ScalePatchOperation, ScalePutOperation, ScaleSelectorStyle,
     build_scale_response,
 };
+use crate::api::{ApiState, AppError, LenientJson};
 use klights_cluster_core::Resource;
 
 #[cfg(test)]
-use crate::api_status::{extract_scale_replicas, extract_scale_resource_version};
+use crate::api::status::{extract_scale_replicas, extract_scale_resource_version};
 #[cfg(test)]
 use klights_cluster_core::ResourcePreconditions;
 
@@ -57,8 +57,8 @@ fn selector_string_from_flat_selector(resource: &Resource) -> String {
         .unwrap_or_default()
 }
 
-pub async fn get_replicaset_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_replicaset_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let rs = state
@@ -90,8 +90,8 @@ pub async fn get_replicaset_scale(
     )))
 }
 
-pub async fn update_replicaset_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_replicaset_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
@@ -100,7 +100,7 @@ pub async fn update_replicaset_scale(
 
 /// Generic scale GET handler for apps/v1 resources (Deployment, StatefulSet, etc.)
 async fn get_apps_v1_scale(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     kind: &str,
     namespace: String,
     name: String,
@@ -136,7 +136,7 @@ async fn get_apps_v1_scale(
 
 /// Generic scale PUT handler for apps/v1 resources
 async fn update_apps_v1_scale(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     kind: &str,
     namespace: String,
     name: String,
@@ -152,30 +152,30 @@ async fn update_apps_v1_scale(
         .await
 }
 
-pub async fn get_deployment_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_deployment_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     get_apps_v1_scale(state, "Deployment", namespace, name).await
 }
 
-pub async fn update_deployment_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_deployment_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
     update_apps_v1_scale(state, "Deployment", namespace, name, body).await
 }
 
-pub async fn get_statefulset_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_statefulset_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     get_apps_v1_scale(state, "StatefulSet", namespace, name).await
 }
 
-pub async fn update_statefulset_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_statefulset_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
@@ -190,7 +190,7 @@ pub async fn update_statefulset_scale(
 /// previously the route only accepted GET/PUT and returned `405 method not
 /// allowed`. apps/v1 path covers Deployment/ReplicaSet/StatefulSet.
 async fn patch_apps_v1_scale(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     kind: &str,
     namespace: String,
     name: String,
@@ -201,7 +201,7 @@ async fn patch_apps_v1_scale(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let patch = crate::api_status::decode_patch_body(&body)?;
+    let patch = crate::api::status::decode_patch_body(&body)?;
     let target = ScaleMutationTarget::namespaced("apps/v1", kind, namespace, name);
     let pipeline = ScaleMutationPipeline::new(
         DatastoreScaleMutationWriter::new(state),
@@ -212,8 +212,8 @@ async fn patch_apps_v1_scale(
         .await
 }
 
-pub async fn patch_deployment_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_deployment_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -221,8 +221,8 @@ pub async fn patch_deployment_scale(
     patch_apps_v1_scale(state, "Deployment", namespace, name, headers, body).await
 }
 
-pub async fn patch_statefulset_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_statefulset_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -234,8 +234,8 @@ pub async fn patch_statefulset_scale(
 /// as Deployment/StatefulSet PATCH /scale. Controller status writes may advance
 /// the parent ReplicaSet resourceVersion between GET and PATCH; PATCH /scale is
 /// UID-bound, not a stale full-object CAS.
-pub async fn patch_replicaset_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_replicaset_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -243,8 +243,8 @@ pub async fn patch_replicaset_scale(
     patch_apps_v1_scale(state, "ReplicaSet", namespace, name, headers, body).await
 }
 
-pub async fn get_replicationcontroller_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_replicationcontroller_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let rc = state
@@ -276,8 +276,8 @@ pub async fn get_replicationcontroller_scale(
     )))
 }
 
-pub async fn update_replicationcontroller_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_replicationcontroller_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
@@ -291,8 +291,8 @@ pub async fn update_replicationcontroller_scale(
         .await
 }
 
-pub async fn patch_replicationcontroller_scale(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_replicationcontroller_scale(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -301,7 +301,7 @@ pub async fn patch_replicationcontroller_scale(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let patch = crate::api_status::decode_patch_body(&body)?;
+    let patch = crate::api::status::decode_patch_body(&body)?;
     let target = ScaleMutationTarget::namespaced("v1", "ReplicationController", namespace, name);
     let pipeline = ScaleMutationPipeline::new(
         DatastoreScaleMutationWriter::new(state),

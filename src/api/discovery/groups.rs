@@ -42,7 +42,10 @@ pub fn wants_aggregated_discovery(headers: &HeaderMap) -> Option<&'static str> {
     }
 }
 
-pub async fn api_groups(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub(in crate::api) async fn api_groups(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> Response {
     let mut groups = vec![
         APIGroup {
             name: "apps".to_string(),
@@ -429,8 +432,8 @@ pub async fn api_groups(State(state): State<Arc<AppState>>, headers: HeaderMap) 
 
 /// Handler for GET /apis/{group} — returns APIGroup for a specific API group.
 /// K8s clients call this to discover available versions for a group.
-pub async fn api_group_by_name(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn api_group_by_name(
+    State(state): State<Arc<ApiState>>,
     Path(group): Path<String>,
 ) -> Result<Json<Value>, crate::api::AppError> {
     // Static groups

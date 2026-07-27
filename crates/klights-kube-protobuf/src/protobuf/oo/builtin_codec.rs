@@ -1303,7 +1303,7 @@ static BARE_LIST_DECODE_CANDIDATES: &[(&str, &str)] = &[
 ];
 
 // Do not grow this table. It is the remaining built-in compatibility bucket
-// and is capped by scripts/check_rbac_task_codecs.sh. New protobuf API group
+// and is capped by tests/source_guard_rbac_task_codecs.py. New protobuf API group
 // coverage should be implemented as dedicated per-group ResourceProtoCodec
 // objects, then this table should shrink as entries migrate out.
 static BUILTIN_ENTRIES: &[BuiltinCodecEntry] = &[

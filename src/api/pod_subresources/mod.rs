@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::{AppError, AppState, build_admission_context, run_admission_for_request};
+use crate::api::{ApiState, AppError, build_admission_context, run_admission_for_request};
 
 // Authorization for all pod subresources is enforced by the global
 // `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs);
@@ -31,16 +31,16 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-pub use self::binding::*;
-pub use self::ephemeral::*;
-pub use self::eviction::*;
-pub use self::exec::*;
+pub(in crate::api) use self::binding::*;
+pub(in crate::api) use self::ephemeral::*;
+pub(in crate::api) use self::eviction::*;
+pub(in crate::api) use self::exec::*;
 pub use self::exec_ws::*;
-pub use self::logs::*;
-pub use self::node_proxy::*;
-pub use self::portforward::*;
+pub(in crate::api) use self::logs::*;
+pub(in crate::api) use self::node_proxy::*;
+pub(in crate::api) use self::portforward::*;
 pub use self::proxy::MAX_APISERVICE_RESPONSE_BODY_BYTES;
 pub use self::proxy::MAX_PROXY_REQUEST_BODY_BYTES;
 pub use self::proxy::MAX_PROXY_RESPONSE_BODY_BYTES;
-pub use self::proxy::*;
-pub use self::status::*;
+pub(in crate::api) use self::proxy::*;
+pub(in crate::api) use self::status::*;

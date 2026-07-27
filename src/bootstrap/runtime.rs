@@ -88,7 +88,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
     client: Option<std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
     cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     config: &std::sync::Arc<crate::KlightsConfig>,
-    pod_watch: std::sync::Arc<dyn crate::api_pod_subresources::logs::PodLogFollowWatchPort>,
+    pod_watch: std::sync::Arc<dyn crate::api::pod_subresources::logs::PodLogFollowWatchPort>,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<Option<klights_supervisor::SupervisedJoinHandle<()>>> {
@@ -122,10 +122,10 @@ async fn start_controlplane_leader_control_stream_if_needed(
     let control_runtimes = crate::replication::grpc::client::NodeControlRuntimes::new(
         exec_runtime,
         crate::replication::grpc::client::NodeLogCapability::Available(std::sync::Arc::new(
-            crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
+            crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
-                crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
+                crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(
                     pod_watch,
                 ),
             ),
@@ -336,7 +336,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                         ),
                     )
                         as std::sync::Arc<
-                            dyn crate::api_pod_subresources::logs::PodLogFollowWatchPort,
+                            dyn crate::api::pod_subresources::logs::PodLogFollowWatchPort,
                         >
                 })
                 .unwrap_or_else(|| {

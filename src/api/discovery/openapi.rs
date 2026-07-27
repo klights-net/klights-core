@@ -698,7 +698,9 @@ pub async fn openapi_v2(query: &dyn klights_leader_api::LeaderResourceQuery) -> 
 }
 
 /// Handler for GET /openapi/v3
-pub async fn get_openapi_v3_discovery(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub(in crate::api) async fn get_openapi_v3_discovery(
+    State(state): State<Arc<ApiState>>,
+) -> Json<Value> {
     Json(openapi_v3_discovery_with_crds(state.resource_mutation().resource_query.as_ref()).await)
 }
 
@@ -923,8 +925,8 @@ pub async fn build_openapi_v3_group_version(
 }
 
 /// Handler for GET /openapi/v3/apis/:group/:version
-pub async fn get_openapi_v3_group_version(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_openapi_v3_group_version(
+    State(state): State<Arc<ApiState>>,
     Path((group, version)): Path<(String, String)>,
 ) -> Json<Value> {
     Json(
@@ -1019,7 +1021,9 @@ pub async fn build_openapi_v3_api_v1(query: &dyn klights_leader_api::LeaderResou
 }
 
 /// Handler for GET /openapi/v3/api/v1
-pub async fn get_openapi_v3_api_v1(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub(in crate::api) async fn get_openapi_v3_api_v1(
+    State(state): State<Arc<ApiState>>,
+) -> Json<Value> {
     Json(build_openapi_v3_api_v1(state.resource_mutation().resource_query.as_ref()).await)
 }
 
@@ -1060,7 +1064,10 @@ pub async fn get_openapi_v3_apis() -> Json<Value> {
 /// kubectl may send protobuf-oriented Accept headers while still being able
 /// to consume JSON OpenAPI from the apiserver for schema validation flows.
 /// Always return JSON Swagger 2.0 here.
-pub async fn get_openapi_v2(State(state): State<Arc<AppState>>, _headers: HeaderMap) -> Response {
+pub(in crate::api) async fn get_openapi_v2(
+    State(state): State<Arc<ApiState>>,
+    _headers: HeaderMap,
+) -> Response {
     let mut spec = openapi_v2(state.resource_mutation().resource_query.as_ref()).await;
     // Strip x-kubernetes-preserve-unknown-fields from definitions: Swagger 2.0 clients
     // do not support this extension. The openapi_v2() function keeps it for v3 callers

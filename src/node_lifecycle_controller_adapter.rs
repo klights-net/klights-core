@@ -6,13 +6,11 @@ use chrono::Utc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::AppState;
 use crate::controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
 };
-use crate::datastore::raft::node::RaftNode;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreBackend, ResourceListQuery, WatchTarget};
+use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery, WatchTarget};
 use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
@@ -92,18 +90,32 @@ impl NodeLostPodLifecycleSink for PodLifecycleRouter {
     }
 }
 
+pub(crate) struct NodeLifecycleControllerDependencies {
+    pub(crate) store: DatastoreHandle,
+    pub(crate) pods: Arc<crate::kubelet::pod_repository::PodRepository>,
+    pub(crate) pod_lifecycle: Arc<PodLifecycleRouter>,
+    pub(crate) lease_observations: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    pub(crate) node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+}
+
 pub(crate) async fn run_node_lifecycle_controller(
-    state: Arc<AppState>,
-    node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+    dependencies: NodeLifecycleControllerDependencies,
     cancel: CancellationToken,
-    _startup_resource_version: i64,
     mut is_leader_rx: watch::Receiver<bool>,
-    _raft_node: Option<Arc<RaftNode>>,
 ) {
+    let NodeLifecycleControllerDependencies {
+        store: db,
+        pods: pod_repository,
+        pod_lifecycle: pod_lifecycle_router,
+        lease_observations: node_lease_tracker,
+        supervisor: task_supervisor,
+        node_status,
+    } = dependencies;
     if let Err(err) =
         crate::controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
-            state.resource_mutation().db.as_ref(),
-            state.controller_reconcile().node_lease_tracker.as_ref(),
+            db.as_ref(),
+            node_lease_tracker.as_ref(),
         )
         .await
     {
@@ -113,16 +125,11 @@ pub(crate) async fn run_node_lifecycle_controller(
     }
 
     if *is_leader_rx.borrow() {
-        state
-            .controller_reconcile()
-            .node_lease_tracker
-            .reset_grace_window(Utc::now())
-            .await;
-    } else if !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await {
+        node_lease_tracker.reset_grace_window(Utc::now()).await;
+    } else if !wait_for_leadership(node_lease_tracker.as_ref(), &cancel, &mut is_leader_rx).await {
         return;
     }
 
-    let db = state.resource_mutation().db.clone();
     let watch_topics = vec![
         WatchTopic::new("v1", "Node"),
         WatchTopic::new("coordination.k8s.io/v1", "Lease"),
@@ -159,7 +166,7 @@ pub(crate) async fn run_node_lifecycle_controller(
         if !*is_leader_rx.borrow() {
             tracing::debug!("node_lifecycle: not leader, waiting before reconcile");
             retry_attempt = 0;
-            if !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await {
+            if !wait_for_leadership(node_lease_tracker.as_ref(), &cancel, &mut is_leader_rx).await {
                 return;
             }
         }
@@ -168,21 +175,11 @@ pub(crate) async fn run_node_lifecycle_controller(
             match crate::controllers::node_lifecycle::reconcile_node_lifecycle_once_with_tracker(
                 db.as_ref(),
                 node_status.as_ref(),
-                state.resource_mutation().pod_repository.as_ref(),
-                state.controller_reconcile().node_lease_tracker.as_ref(),
+                pod_repository.as_ref(),
+                node_lease_tracker.as_ref(),
                 Utc::now(),
-                Some(
-                    state
-                        .resource_mutation()
-                        .pod_repository
-                        .mutation_reconcile_port()
-                        .as_ref(),
-                ),
-                state
-                    .pod_node_subresources()
-                    .pod_lifecycle_router
-                    .as_deref()
-                    .map(|router| router as &dyn NodeLostPodLifecycleSink),
+                Some(pod_repository.mutation_reconcile_port().as_ref()),
+                Some(pod_lifecycle_router.as_ref() as &dyn NodeLostPodLifecycleSink),
             )
             .await
             {
@@ -194,7 +191,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                     tracing::warn!("node_lifecycle reconcile failed: {err:#}");
                     let attempt = retry_attempt;
                     retry_attempt = retry_attempt.saturating_add(1);
-                    if wait_for_retry(&state, &cancel, attempt).await {
+                    if wait_for_retry(task_supervisor.as_ref(), &cancel, attempt).await {
                         continue;
                     }
                     break;
@@ -206,19 +203,23 @@ pub(crate) async fn run_node_lifecycle_controller(
                 _ = cancel.cancelled() => None,
                 _ = is_leader_rx.changed() => {
                     if !*is_leader_rx.borrow()
-                        && !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await
+                        && !wait_for_leadership(
+                            node_lease_tracker.as_ref(),
+                            &cancel,
+                            &mut is_leader_rx,
+                        ).await
                     {
                         return;
                     }
                     None
                 }
-                sleep = state.operational().task_supervisor.sleep("node_lifecycle_lease_deadline", delay) => {
+                sleep = task_supervisor.sleep("node_lifecycle_lease_deadline", delay) => {
                     if let Err(err) = sleep {
                         tracing::warn!("node_lifecycle deadline timer failed: {err:#}");
                     }
                     None
                 }
-                _ = state.controller_reconcile().node_lease_tracker.wait_changed() => None,
+                _ = node_lease_tracker.wait_changed() => None,
                 event = cursor.next_event() => Some(event),
             }
         } else {
@@ -226,13 +227,17 @@ pub(crate) async fn run_node_lifecycle_controller(
                 _ = cancel.cancelled() => None,
                 _ = is_leader_rx.changed() => {
                     if !*is_leader_rx.borrow()
-                        && !wait_for_leadership(&state, &cancel, &mut is_leader_rx).await
+                        && !wait_for_leadership(
+                            node_lease_tracker.as_ref(),
+                            &cancel,
+                            &mut is_leader_rx,
+                        ).await
                     {
                         return;
                     }
                     None
                 }
-                _ = state.controller_reconcile().node_lease_tracker.wait_changed() => None,
+                _ = node_lease_tracker.wait_changed() => None,
                 event = cursor.next_event() => Some(event),
             }
         };
@@ -247,7 +252,7 @@ pub(crate) async fn run_node_lifecycle_controller(
             Ok(event) => {
                 if let Err(err) = crate::controllers::node_lifecycle::track_lease_from_event(
                     &event,
-                    state.controller_reconcile().node_lease_tracker.as_ref(),
+                    node_lease_tracker.as_ref(),
                 )
                 .await
                 {
@@ -261,19 +266,12 @@ pub(crate) async fn run_node_lifecycle_controller(
                     loop {
                         match crate::controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
                             db.as_ref(),
-                            state.resource_mutation().pod_repository.as_ref(),
+                            pod_repository.as_ref(),
+                            Some(pod_repository.mutation_reconcile_port().as_ref()),
                             Some(
-                                state
-                                    .resource_mutation()
-                                    .pod_repository
-                                    .mutation_reconcile_port()
-                                    .as_ref(),
+                                pod_lifecycle_router.as_ref()
+                                    as &dyn NodeLostPodLifecycleSink,
                             ),
-                            state
-                                .pod_node_subresources()
-                                .pod_lifecycle_router
-                                .as_deref()
-                                .map(|router| router as &dyn NodeLostPodLifecycleSink),
                             &event,
                         )
                         .await
@@ -289,7 +287,13 @@ pub(crate) async fn run_node_lifecycle_controller(
                                 );
                                 let attempt = retry_attempt;
                                 retry_attempt = retry_attempt.saturating_add(1);
-                                if !wait_for_retry(&state, &cancel, attempt).await {
+                                if !wait_for_retry(
+                                    task_supervisor.as_ref(),
+                                    &cancel,
+                                    attempt,
+                                )
+                                .await
+                                {
                                     break 'controller;
                                 }
                             }
@@ -305,7 +309,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                 tracing::warn!("node_lifecycle watch error: {err:#?}");
                 let attempt = retry_attempt;
                 retry_attempt = retry_attempt.saturating_add(1);
-                if !wait_for_retry(&state, &cancel, attempt).await {
+                if !wait_for_retry(task_supervisor.as_ref(), &cancel, attempt).await {
                     break;
                 }
             }
@@ -314,17 +318,13 @@ pub(crate) async fn run_node_lifecycle_controller(
 }
 
 async fn wait_for_leadership(
-    state: &AppState,
+    node_lease_tracker: &crate::node_lease_tracker::NodeLeaseTracker,
     cancel: &CancellationToken,
     is_leader_rx: &mut watch::Receiver<bool>,
 ) -> bool {
     loop {
         if *is_leader_rx.borrow() {
-            state
-                .controller_reconcile()
-                .node_lease_tracker
-                .reset_grace_window(Utc::now())
-                .await;
+            node_lease_tracker.reset_grace_window(Utc::now()).await;
             return true;
         }
         tokio::select! {
@@ -338,10 +338,14 @@ async fn wait_for_leadership(
     }
 }
 
-async fn wait_for_retry(state: &AppState, cancel: &CancellationToken, attempt: u32) -> bool {
+async fn wait_for_retry(
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    cancel: &CancellationToken,
+    attempt: u32,
+) -> bool {
     let delay = crate::controllers::node_lifecycle::node_lifecycle_retry_delay(attempt);
     tokio::select! {
         _ = cancel.cancelled() => false,
-        _ = state.operational().task_supervisor.sleep("node_lifecycle_retry", delay) => true,
+        _ = task_supervisor.sleep("node_lifecycle_retry", delay) => true,
     }
 }

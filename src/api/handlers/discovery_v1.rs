@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn discovery_v1_routes() -> Router<Arc<AppState>> {
+pub fn discovery_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/endpointslices", get(list_all_endpointslices))
         .route(

@@ -1,3 +1,15 @@
+//! Kubernetes HTTP API implementation.
+//!
+//! Request state is private to this module tree.
+//!
+//! ```compile_fail
+//! use klights::api::ApiState;
+//! ```
+//!
+//! ```compile_fail
+//! use klights::api::state::ApiState;
+//! ```
+
 // `macros` must be declared with `#[macro_use]` BEFORE any module that
 // invokes its macros (generated_handlers uses cluster_delete_collection_handler!).
 #[macro_use]
@@ -12,6 +24,7 @@ pub(crate) mod custom_resource_ports;
 mod custom_resources;
 mod debug;
 mod defaulting;
+pub mod discovery;
 mod errors;
 mod extractors;
 pub mod finalizer_delete;
@@ -32,6 +45,8 @@ mod patch_tests;
 mod pod_handlers;
 pub(crate) mod pod_repository_ports;
 mod pod_security;
+pub mod pod_subresources;
+pub mod priority_fairness;
 pub(crate) mod query;
 mod quotas;
 pub mod raft_proxy;
@@ -46,6 +61,7 @@ mod routes;
 pub mod server_side_apply;
 mod state;
 pub(crate) mod state_ports;
+pub mod status;
 mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
@@ -59,7 +75,7 @@ mod defaulting_tests;
 
 #[cfg(test)]
 pub use crate::watch::EventType;
-pub(crate) use apiservice_proxy::proxy_apiservice_request;
+pub(in crate::api) use apiservice_proxy::proxy_apiservice_request;
 use crd_conversion::{
     convert_crd_objects_to_requested_version,
     convert_custom_resource_watch_event_to_requested_version,
@@ -74,7 +90,7 @@ use custom_resources::{
     proxy_namespaced_custom_resource_subresource, update_cluster_custom_resource,
     update_custom_resource,
 };
-pub use debug::pod_lifecycle_debug_dump;
+pub(in crate::api) use debug::pod_lifecycle_debug_dump;
 pub use defaulting::{
     apply_pod_create_defaults, apply_pod_service_account_defaults, apply_pod_spec_create_defaults,
     apply_pv_create_defaults, apply_pvc_create_defaults,
@@ -91,7 +107,7 @@ pub use generated_handlers::*;
 pub use handlers::apiextensions_v1::add_crd_established_condition;
 pub use handlers::apiextensions_v1::merge_stored_versions;
 pub use handlers::apiextensions_v1::validate_api_approval;
-pub use handlers::apiregistration_v1::{
+pub(in crate::api) use handlers::apiregistration_v1::{
     delete_apiservice_with_cache_invalidation, delete_collection_apiservices, get_apiservice_status,
 };
 use handlers::authentication_v1::create_token_review;
@@ -99,7 +115,7 @@ use handlers::authorization_v1::{
     create_local_subject_access_review, create_self_subject_access_review,
     create_self_subject_rules_review, create_subject_access_review,
 };
-pub use handlers::flowcontrol_v1::{
+pub(in crate::api) use handlers::flowcontrol_v1::{
     delete_collection_flowschemas, delete_collection_prioritylevelconfigurations,
 };
 #[cfg(test)]
@@ -115,11 +131,11 @@ pub use helpers::{
     reconcile_namespace_termination_for_uid_with_outcome, resource_has_finalizers,
     set_namespace_terminating_status, validate_secret_data,
 };
-pub use namespace::{
-    create_namespace, delete_namespace, finalize_namespace, get_namespace, is_protected_namespace,
-    list_namespaces, patch_namespace, update_namespace,
+pub(in crate::api) use namespace::{
+    create_namespace, delete_namespace, finalize_namespace, get_namespace, list_namespaces,
+    patch_namespace, update_namespace,
 };
-pub use pod_handlers::{
+pub(in crate::api) use pod_handlers::{
     create_pod, delete_collection_pods, delete_pod, get_pod, list_all_pods, list_pods, patch_pod,
     update_pod,
 };
@@ -145,13 +161,21 @@ use response::{
     deployment_list_to_table, node_list_to_table, pod_list_to_table, replicaset_list_to_table,
     statefulset_list_to_table, wants_table_format, watch_event_to_table,
 };
-pub use routes::build_router;
-pub use state::AppState;
+#[cfg(test)]
+pub(crate) use routes::build_router;
+pub(crate) use state::ApiNodeRole;
+#[cfg(not(test))]
+use state::ApiState;
+#[cfg(test)]
+pub(crate) use state::ApiState;
+#[cfg(test)]
 pub(crate) use state::{
     ApiAuthPolicy, ApiAuthenticators, ApiControllerReconcileServices,
-    ApiDiscoveryAggregationServices, ApiNodeRole, ApiOperationalConfig, ApiOperationalServices,
+    ApiDiscoveryAggregationServices, ApiOperationalConfig, ApiOperationalServices,
     ApiPodNodeSubresourceServices, ApiRemoteNodeServices, ApiResourceMutationServices,
 };
+#[cfg(not(test))]
+pub(crate) use state::{RootApiRole, build_router_from_root};
 pub use validation::{
     AdmissionContextRequest, AdmissionExecution, AdmissionExecutionFuture, DeleteOptions,
     apply_crd_defaults, apply_crd_pruning, build_admission_context, check_content_type,
@@ -198,7 +222,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::api_discovery::{
+use crate::api::discovery::{
     admissionregistration_v1_resources, api_group_by_name, api_groups, api_v1_resources,
     api_versions, apiextensions_group, apiextensions_v1_resources, apiregistration_v1_resources,
     apps_v1_resources, authentication_v1_resources, authorization_v1_resources,
@@ -210,13 +234,13 @@ use crate::api_discovery::{
     node_k8s_io_group, node_k8s_io_v1_resources, policy_v1_resources, rbac_v1_resources,
     scheduling_group, scheduling_v1_resources, storage_v1_resources,
 };
-use crate::api_pod_subresources::{
+use crate::api::pod_subresources::{
     get_pod_ephemeral_containers, get_pod_log, get_pod_status, node_proxy, node_proxy_with_path,
     patch_pod_ephemeral_containers, patch_pod_status_subresource, pod_attach, pod_binding,
     pod_eviction, pod_exec, pod_portforward, pod_proxy, pod_proxy_with_path, service_proxy,
     service_proxy_with_path, update_pod_ephemeral_containers, update_pod_status_subresource,
 };
-use crate::api_status::{
+use crate::api::status::{
     get_crd_status, get_csinode_status, get_csr_approval, get_csr_status, get_deployment_scale,
     get_flowschema_status, get_mutatingwebhookconfiguration_status, get_namespace_status,
     get_persistentvolume_status, get_persistentvolumeclaim_status,
@@ -568,7 +592,7 @@ reconcile_create_handler!(replicationcontroller, create_replicationcontroller_ba
 
 #[allow(hidden_glob_reexports)]
 async fn update_replicationcontroller(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -594,7 +618,7 @@ async fn update_replicationcontroller(
 
 #[allow(hidden_glob_reexports)]
 async fn patch_replicationcontroller(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,

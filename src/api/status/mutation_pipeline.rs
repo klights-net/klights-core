@@ -6,7 +6,7 @@ use axum::{Json, body::Bytes};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::Value;
 
-use crate::api::{AppError, AppState, apply_patch, inject_resource_version};
+use crate::api::{ApiState, AppError, apply_patch, inject_resource_version};
 use klights_cluster_core::{
     PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions, StatusApplyFreshness,
     StatusApplyOrigin, merge_status_for_apply,
@@ -247,11 +247,11 @@ pub trait StatusMutationWriter: Send + Sync {
 }
 
 pub struct DatastoreStatusMutationWriter {
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
 }
 
 impl DatastoreStatusMutationWriter {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
         Self { state }
     }
 }
@@ -338,7 +338,7 @@ impl StatusMutationResponder for ResourceStatusResponder {
         final_resource: Resource,
     ) -> Result<Value, AppError> {
         let data = if self.ensure_type_meta {
-            crate::api_status::ensure_type_meta(
+            crate::api::status::ensure_type_meta(
                 final_resource.data.clone(),
                 &target.api_version,
                 &target.kind,
@@ -553,11 +553,11 @@ pub trait ScaleMutationWriter: Send + Sync {
 }
 
 pub struct DatastoreScaleMutationWriter {
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
 }
 
 impl DatastoreScaleMutationWriter {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
         Self { state }
     }
 }
@@ -846,11 +846,11 @@ pub trait NamespaceStatusMutationWriter: Send + Sync {
 }
 
 pub struct DatastoreNamespaceStatusMutationWriter {
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
 }
 
 impl DatastoreNamespaceStatusMutationWriter {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
         Self { state }
     }
 }

@@ -1,7 +1,7 @@
 use super::*;
 
-pub async fn get_pod_status(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_pod_status(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let pod = crate::api::pod_repository_ports::get_pod(
@@ -28,8 +28,8 @@ pub async fn get_pod_status(
 }
 
 // PATCH /api/v1/namespaces/{ns}/pods/{name}/status
-pub async fn patch_pod_status_subresource(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_pod_status_subresource(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -72,8 +72,8 @@ pub async fn patch_pod_status_subresource(
 }
 
 // PUT /api/v1/namespaces/{ns}/pods/{name}/status
-pub async fn update_pod_status_subresource(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_pod_status_subresource(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     crate::api::LenientJson(body): crate::api::LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {

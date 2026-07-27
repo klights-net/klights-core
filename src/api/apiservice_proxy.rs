@@ -49,7 +49,7 @@ pub struct ApiServiceBackend {
 }
 
 async fn find_apiservice_backend_uncached(
-    state: &AppState,
+    state: &ApiState,
     group: &str,
     version: &str,
 ) -> Result<Option<ApiServiceBackend>, AppError> {
@@ -110,8 +110,8 @@ async fn find_apiservice_backend_uncached(
     Ok(None)
 }
 
-pub async fn find_apiservice_backend(
-    state: &AppState,
+pub(in crate::api) async fn find_apiservice_backend(
+    state: &ApiState,
     group: &str,
     version: &str,
 ) -> Result<Option<ApiServiceBackend>, AppError> {
@@ -152,7 +152,7 @@ pub async fn find_apiservice_backend(
 }
 
 pub struct ApiServiceRequestDispatcher {
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
 }
 
 /// Bundled parameters for an APIService proxy dispatch call.
@@ -167,7 +167,7 @@ pub struct ApiServiceDispatchRequest<'a> {
 }
 
 impl ApiServiceRequestDispatcher {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub(in crate::api) fn new(state: Arc<ApiState>) -> Self {
         Self { state }
     }
 
@@ -236,9 +236,9 @@ impl ApiServiceRequestDispatcher {
         let status =
             StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let headers = upstream.headers().clone();
-        let payload = crate::api_pod_subresources::read_reqwest_body_limited(
+        let payload = crate::api::pod_subresources::read_reqwest_body_limited(
             upstream,
-            crate::api_pod_subresources::MAX_APISERVICE_RESPONSE_BODY_BYTES,
+            crate::api::pod_subresources::MAX_APISERVICE_RESPONSE_BODY_BYTES,
             "APIService proxy",
         )
         .await?;
@@ -259,8 +259,8 @@ impl ApiServiceRequestDispatcher {
     }
 }
 
-pub async fn invalidate_apiservice_proxy_cache_for_resource(
-    state: &AppState,
+pub(in crate::api) async fn invalidate_apiservice_proxy_cache_for_resource(
+    state: &ApiState,
     api_version: &str,
     kind: &str,
 ) {
@@ -492,7 +492,7 @@ async fn build_apiservice_proxy_client(
 }
 
 async fn cached_apiservice_proxy_client(
-    state: &AppState,
+    state: &ApiState,
     backend: &ApiServiceBackend,
     service_target: &ServiceProxyTarget,
 ) -> Result<reqwest::Client, AppError> {
@@ -544,8 +544,8 @@ async fn cached_apiservice_proxy_client(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn proxy_apiservice_request(
-    state: &Arc<AppState>,
+pub(in crate::api) async fn proxy_apiservice_request(
+    state: &Arc<ApiState>,
     group: &str,
     version: &str,
     method: Method,

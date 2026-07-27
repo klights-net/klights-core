@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn coordination_v1_routes() -> Router<Arc<AppState>> {
+pub fn coordination_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/leases", get(list_all_leases_coordination))
         .route(

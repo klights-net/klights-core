@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn batch_v1_routes() -> Router<Arc<AppState>> {
+pub fn batch_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/jobs", get(list_all_jobs))
         .route(

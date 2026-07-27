@@ -346,10 +346,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let control_runtimes = crate::replication::grpc::client::NodeControlRuntimes::new(
         exec_runtime,
         crate::replication::grpc::client::NodeLogCapability::Available(std::sync::Arc::new(
-            crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
+            crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime::new_with_pod_event_store(
                 crate::paths::pod_logs_root_path(&config.containerd_namespace),
                 task_supervisor.clone(),
-                crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
+                crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(
                     std::sync::Arc::new(
                         crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(db.clone()),
                     ),

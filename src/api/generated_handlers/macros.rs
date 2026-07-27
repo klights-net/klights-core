@@ -15,8 +15,8 @@ use super::inners::*;
 
 macro_rules! namespaced_resource_handlers {
     ($kind:expr_2021, $list_kind:expr_2021, $api_version:expr_2021, $list_fn:ident, $get_fn:ident, $create_fn:ident, $update_fn:ident, $delete_fn:ident, $patch_fn:ident, $delete_collection_fn:ident) => {
-        pub async fn $list_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $list_fn(
+            State(state): State<Arc<ApiState>>,
             Path(namespace): Path<String>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
@@ -38,8 +38,8 @@ macro_rules! namespaced_resource_handlers {
             .await
         }
 
-        pub async fn $get_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $get_fn(
+            State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             headers: HeaderMap,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -56,8 +56,8 @@ macro_rules! namespaced_resource_handlers {
             .await
         }
 
-        pub async fn $create_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $create_fn(
+            State(state): State<Arc<ApiState>>,
             Path(namespace): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -75,8 +75,8 @@ macro_rules! namespaced_resource_handlers {
             .await
         }
 
-        pub async fn $update_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $update_fn(
+            State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -99,8 +99,8 @@ macro_rules! namespaced_resource_handlers {
             .await
         }
 
-        pub async fn $delete_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $delete_fn(
+            State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -123,8 +123,8 @@ macro_rules! namespaced_resource_handlers {
             .await
         }
 
-        pub async fn $patch_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $patch_fn(
+            State(state): State<Arc<ApiState>>,
             Path((namespace, name)): Path<(String, String)>,
             Query(query): Query<CreateUpdateQuery>,
             headers: HeaderMap,
@@ -149,8 +149,8 @@ macro_rules! namespaced_resource_handlers {
             .await
         }
 
-        pub async fn $delete_collection_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $delete_collection_fn(
+            State(state): State<Arc<ApiState>>,
             Path(namespace): Path<String>,
             Query(query): Query<DeleteCollectionQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -162,8 +162,8 @@ macro_rules! namespaced_resource_handlers {
 
 macro_rules! cluster_resource_handlers {
     ($kind:expr_2021, $list_kind:expr_2021, $api_version:expr_2021, $list_fn:ident, $get_fn:ident, $create_fn:ident, $update_fn:ident, $delete_fn:ident, $patch_fn:ident) => {
-        pub async fn $list_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $list_fn(
+            State(state): State<Arc<ApiState>>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -184,8 +184,8 @@ macro_rules! cluster_resource_handlers {
             .await
         }
 
-        pub async fn $get_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $get_fn(
+            State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             headers: HeaderMap,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -193,8 +193,8 @@ macro_rules! cluster_resource_handlers {
             get_inner(state, &identity, $api_version, $kind, None, &name, headers).await
         }
 
-        pub async fn $create_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $create_fn(
+            State(state): State<Arc<ApiState>>,
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
             LenientJson(body): LenientJson<Value>,
@@ -202,8 +202,8 @@ macro_rules! cluster_resource_handlers {
             create_inner(state, &identity, $api_version, $kind, None, query, body).await
         }
 
-        pub async fn $update_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $update_fn(
+            State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -221,8 +221,8 @@ macro_rules! cluster_resource_handlers {
             .await
         }
 
-        pub async fn $delete_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $delete_fn(
+            State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -240,8 +240,8 @@ macro_rules! cluster_resource_handlers {
             .await
         }
 
-        pub async fn $patch_fn(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $patch_fn(
+            State(state): State<Arc<ApiState>>,
             Path(name): Path<String>,
             Query(query): Query<CreateUpdateQuery>,
             headers: HeaderMap,
@@ -278,7 +278,7 @@ namespaced_resource_handlers!(
     get_service,
     create_service_base,
     update_service_base,
-    delete_service_base,
+    _delete_service_base,
     patch_service_base,
     delete_collection_services
 );
@@ -827,7 +827,7 @@ cluster_resource_handlers!(
     get_apiservice,
     create_apiservice,
     update_apiservice,
-    delete_apiservice,
+    _delete_apiservice,
     patch_apiservice
 );
 
@@ -838,10 +838,10 @@ cluster_resource_handlers!(
     "apiextensions.k8s.io/v1",
     list_customresourcedefinitions,
     get_customresourcedefinition,
-    create_customresourcedefinition,
-    update_customresourcedefinition,
-    delete_customresourcedefinition,
-    patch_customresourcedefinition
+    _create_customresourcedefinition,
+    _update_customresourcedefinition,
+    _delete_customresourcedefinition,
+    _patch_customresourcedefinition
 );
 
 // Helper to add Established condition to CRD status
@@ -1028,8 +1028,8 @@ cluster_delete_collection_handler!(
 // These list resources across ALL namespaces (namespace=None in DB query).
 macro_rules! cluster_wide_list_handler {
     ($kind:expr_2021, $list_kind:expr_2021, $api_version:expr_2021, $fn_name:ident) => {
-        pub async fn $fn_name(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -1195,13 +1195,13 @@ cluster_wide_list_handler!(
     "ServiceCIDR",
     "ServiceCIDRList",
     "networking.k8s.io/v1",
-    list_all_servicecidrs
+    _list_all_servicecidrs
 );
 cluster_wide_list_handler!(
     "IPAddress",
     "IPAddressList",
     "networking.k8s.io/v1",
-    list_all_ipaddresses
+    _list_all_ipaddresses
 );
 cluster_wide_list_handler!(
     "PodDisruptionBudget",

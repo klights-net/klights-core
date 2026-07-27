@@ -1,12 +1,9 @@
 pub mod admission;
 mod allocator;
 pub mod api;
-pub mod api_discovery;
 mod api_helpers_adapter;
-pub mod api_pod_subresources;
-pub mod api_priority_fairness;
+#[cfg(not(test))]
 mod api_state_adapter;
-pub mod api_status;
 mod apiservice_side_effect_adapter;
 pub mod audit;
 pub mod auth;

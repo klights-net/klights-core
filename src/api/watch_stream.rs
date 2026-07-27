@@ -62,6 +62,45 @@ pub trait WatchStreamSource: Send + Sync {
     ) -> klights_leader_api::LeaderWatchFuture<'_>;
 }
 
+impl<T> WatchStreamSource for Arc<T>
+where
+    T: WatchStreamSource + ?Sized,
+{
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> WatchSignalReceiver {
+        self.as_ref().subscribe_watch_signals(topic)
+    }
+
+    fn current_resource_version(&self) -> WatchSourceCurrentResourceVersionFuture<'_> {
+        self.as_ref().current_resource_version()
+    }
+
+    fn list_watch_resources<'a>(
+        &'a self,
+        api_version: &'a str,
+        kind: &'a str,
+        namespace: Option<&'a str>,
+        label_selector: Option<&'a str>,
+        field_selector: Option<&'a str>,
+        limit: Option<i64>,
+    ) -> WatchSourceListFuture<'a> {
+        self.as_ref().list_watch_resources(
+            api_version,
+            kind,
+            namespace,
+            label_selector,
+            field_selector,
+            limit,
+        )
+    }
+
+    fn watch_resources(
+        &self,
+        request: klights_leader_api::WatchRequest,
+    ) -> klights_leader_api::LeaderWatchFuture<'_> {
+        self.as_ref().watch_resources(request)
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WatchCatchUpMode {

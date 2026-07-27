@@ -5,8 +5,8 @@ use klights_node_api::{
     NodePortForwardRequest, NodePortForwardSession, NodePortForwardTarget,
 };
 
-pub async fn pod_portforward(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_portforward(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     req: Request,

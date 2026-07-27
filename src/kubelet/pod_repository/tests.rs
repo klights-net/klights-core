@@ -1,6 +1,6 @@
 //! Repository tests covering trait behavior. Task 1 lands the smoke test
 //! that verifies `PodRepository::new(...)` constructs successfully with
-//! the wiring inputs that `AppState` provides at runtime. Per-trait tests
+//! the wiring inputs that `ApiState` provides at runtime. Per-trait tests
 //! land alongside their implementations in Tasks 2–14.
 
 use std::sync::{

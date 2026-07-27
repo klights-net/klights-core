@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn certificates_v1_routes() -> Router<Arc<AppState>> {
+pub fn certificates_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
             "/certificatesigningrequests",

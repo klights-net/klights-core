@@ -21,8 +21,8 @@ struct EvictionPreconditions {
     resource_version: Option<String>,
 }
 
-pub async fn pod_eviction(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_eviction(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     body: Bytes,

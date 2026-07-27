@@ -1682,7 +1682,7 @@ fn test_format_websocket_error_payload_is_json_for_v4_channel() {
 
 #[tokio::test]
 async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
-    use crate::api_pod_subresources::exec_spdy::{
+    use crate::api::pod_subresources::exec_spdy::{
         SpdyExecStreamRequest, collect_spdy_client_streams, write_spdy_exec_channel_frame,
     };
     use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
@@ -1798,7 +1798,7 @@ async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
 
 #[tokio::test]
 async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() {
-    use crate::api_pod_subresources::exec_spdy::{
+    use crate::api::pod_subresources::exec_spdy::{
         SpdyExecStreamRequest, collect_spdy_client_streams,
     };
     use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
@@ -1844,7 +1844,7 @@ async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() 
 
 #[test]
 fn test_containerd_spdy_bridge_waits_for_container_close_when_stdout_was_requested() {
-    use crate::api_pod_subresources::exec_spdy::{
+    use crate::api::pod_subresources::exec_spdy::{
         ContainerdSpdyBridgeState, SpdyExecStreamRequest,
     };
 
@@ -1873,7 +1873,7 @@ fn test_containerd_spdy_bridge_waits_for_container_close_when_stdout_was_request
 
 #[test]
 fn test_containerd_spdy_bridge_completes_terminal_status_when_no_output_requested() {
-    use crate::api_pod_subresources::exec_spdy::{
+    use crate::api::pod_subresources::exec_spdy::{
         ContainerdSpdyBridgeState, SpdyExecStreamRequest,
     };
 
@@ -2945,7 +2945,7 @@ async fn https_proxy_rejects_oversized_response_without_full_buffering() {
     // Since 32MiB is impractical for a unit test, we verify the function
     // handles the response without panic. The body-limit rejection is
     // covered by the read_reqwest_body_limited unit test.
-    let result = crate::api_pod_subresources::send_proxy_request_https(
+    let result = crate::api::pod_subresources::send_proxy_request_https(
         "localhost",
         port,
         "/test",
@@ -3019,7 +3019,7 @@ async fn https_proxy_preserves_status_headers_body_and_html_rewrite_below_limit(
         }
     });
 
-    let result = crate::api_pod_subresources::send_proxy_request_https(
+    let result = crate::api::pod_subresources::send_proxy_request_https(
         "localhost",
         port,
         "/test",
@@ -3795,7 +3795,7 @@ fn structural_guard_catches_handler_without_identity() {
     // without AuthenticatedIdentity extraction should be detectable.
     let snippet_without = r#"
     pub async fn my_handler(
-        State(state): State<Arc<AppState>>,
+        State(state): State<Arc<ApiState>>,
         Path(name): Path<String>,
     ) -> Result<Json<Value>, AppError> {
         Ok(Json(json!({"ok": true})))

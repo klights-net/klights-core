@@ -88,7 +88,7 @@ fn is_pod_log_follow_request(path: &str, query: &str) -> bool {
             .any(|pair| matches!(pair, "follow=true" | "follow=1"))
 }
 
-pub fn build_router(state: AppState) -> Router {
+pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
     let state = Arc::new(state);
     Router::new()
         .route("/healthz", get(health_check))
@@ -446,7 +446,7 @@ pub fn build_router(state: AppState) -> Router {
             middleware::from_fn(move |request: Request, next: Next| {
                 let apf_state = apf_state.clone();
                 async move {
-                    crate::api_priority_fairness::admit_request(apf_state, request, next).await
+                    crate::api::priority_fairness::admit_request(apf_state, request, next).await
                 }
             })
         })
@@ -469,6 +469,11 @@ pub fn build_router(state: AppState) -> Router {
         // last so it wraps every route, layer, and fallback.
         .layer(middleware::from_fn(negotiate_error_protobuf))
         .with_state(state)
+}
+
+#[cfg(test)]
+pub(crate) fn build_router(state: ApiState) -> Router {
+    build_router_inner(state)
 }
 
 /// Content-negotiate error responses: a JSON `metav1.Status` produced for a
@@ -543,7 +548,7 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
-async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
+async fn metrics_handler(State(state): State<Arc<ApiState>>) -> String {
     state.controller_reconcile().metrics.render_prometheus()
 }
 
@@ -551,7 +556,7 @@ async fn version() -> Json<crate::version::VersionInfo> {
     Json(crate::version::VersionInfo::new())
 }
 
-async fn openid_configuration(State(_state): State<Arc<AppState>>) -> Json<Value> {
+async fn openid_configuration(State(_state): State<Arc<ApiState>>) -> Json<Value> {
     let issuer = "https://kubernetes.default.svc.cluster.local";
     let jwks_uri = format!("{}/openid/v1/jwks", issuer);
     Json(serde_json::json!({
@@ -563,7 +568,7 @@ async fn openid_configuration(State(_state): State<Arc<AppState>>) -> Json<Value
     }))
 }
 
-async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AppError> {
+async fn openid_jwks(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, AppError> {
     let signing_key_path = crate::paths::service_account_signing_key_path(
         &state.operational().config.containerd_namespace,
     );
@@ -647,7 +652,7 @@ fn build_openid_jwks(signing_key_pem: &str) -> Result<Value, AppError> {
 
 /// 2A-12: Role/status surface for manual promotion.
 async fn klights_status_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Value>, AppError> {
     let metadata = state
         .operational()

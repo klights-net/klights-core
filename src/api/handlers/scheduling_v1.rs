@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn scheduling_v1_routes() -> Router<Arc<AppState>> {
+pub fn scheduling_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
             "/priorityclasses",

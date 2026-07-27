@@ -6,7 +6,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub fn node_k8s_io_v1_routes() -> Router<Arc<AppState>> {
+pub fn node_k8s_io_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
             "/runtimeclasses",
@@ -24,7 +24,7 @@ pub fn node_k8s_io_v1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn delete_collection_runtimeclasses(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(

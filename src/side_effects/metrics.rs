@@ -75,6 +75,10 @@ impl SideEffectMetrics {
             .cloned()
             .collect()
     }
+
+    pub fn record_cascade_delete_failure(&self) {
+        klights_reconcile_api::ReconcileFailureMetrics::record_cascade_delete_failure(self);
+    }
 }
 
 impl Default for SideEffectMetrics {

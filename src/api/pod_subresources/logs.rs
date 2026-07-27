@@ -154,8 +154,8 @@ fn validate_requested_container(
 }
 
 // GET /api/v1/namespaces/{ns}/pods/{name}/log
-pub async fn get_pod_log(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_pod_log(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(params): Query<LogQuery>,
     req: Request,
@@ -195,7 +195,7 @@ pub async fn get_pod_log(
     };
 
     // Check if pod is on a remote node — proxy log request via gRPC
-    let remote_node = crate::api_pod_subresources::exec::remote_pod_node_name(
+    let remote_node = crate::api::pod_subresources::exec::remote_pod_node_name(
         &pod_data,
         &state.operational().config.node_name,
     );
@@ -359,7 +359,7 @@ pub async fn get_pod_log(
 }
 
 async fn build_pod_log_follow_termination(
-    state: &AppState,
+    state: &ApiState,
     namespace: &str,
     name: &str,
     pod_uid: &str,

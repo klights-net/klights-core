@@ -14,7 +14,7 @@ use crate::api::*;
 use async_trait::async_trait;
 
 async fn dispatch_pod_handler_mutation_event(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     operation: klights_reconcile_api::MutationOperation,
     resource: &Value,
     context: &'static str,
@@ -33,8 +33,8 @@ async fn dispatch_pod_handler_mutation_event(
     .await;
 }
 
-pub async fn list_pods(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn list_pods(
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
@@ -204,8 +204,8 @@ pub async fn list_pods(
     Ok(K8sResponse::new(response, &headers).into_response())
 }
 
-pub async fn get_pod(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_pod(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
@@ -225,8 +225,8 @@ pub async fn get_pod(
     }
 }
 
-pub async fn create_pod(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn create_pod(
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(body): LenientJson<Value>,
@@ -257,8 +257,8 @@ pub async fn create_pod(
     }
 }
 
-pub async fn update_pod(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_pod(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(body): LenientJson<Value>,
@@ -306,8 +306,8 @@ pub async fn update_pod(
     Ok(Json(data))
 }
 
-pub async fn delete_pod(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_pod(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     body: Bytes,
@@ -348,8 +348,8 @@ pub async fn delete_pod(
     }
 }
 
-pub async fn patch_pod(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_pod(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
@@ -414,8 +414,8 @@ fn content_type_to_patch_type(content_type: Option<&str>) -> klights_pod_api::Po
     }
 }
 
-pub async fn delete_collection_pods(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_collection_pods(
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -454,8 +454,8 @@ pub async fn delete_collection_pods(
     ))
 }
 
-pub async fn list_all_pods(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn list_all_pods(
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
@@ -622,20 +622,20 @@ pub async fn list_all_pods(
 // ---------------------------------------------------------------------------
 
 struct PodCreateStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     namespace: &'a str,
     query: &'a CreateUpdateQuery,
 }
 
 struct PodUpdateStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     namespace: &'a str,
     name: &'a str,
     query: &'a CreateUpdateQuery,
 }
 
 struct PodPatchStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     namespace: &'a str,
     name: &'a str,
     query: &'a CreateUpdateQuery,

@@ -5,6 +5,8 @@ use crate::api::*;
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+#[cfg(test)]
+use klights_pod_api::PodApiMutation;
 use std::sync::Arc;
 
 use super::helpers::*;
@@ -13,7 +15,6 @@ use crate::api::mutation::write::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
-use klights_pod_api::PodApiMutation;
 use klights_reconcile_api::MutationOperation;
 
 #[cfg(test)]
@@ -81,7 +82,7 @@ pub struct GeneratedDeleteCompletionRequest<'a> {
 }
 
 async fn enqueue_generated_controller_after_mutation(
-    state: &AppState,
+    state: &ApiState,
     api_version: &'static str,
     kind: &'static str,
     resource: &Value,
@@ -95,7 +96,7 @@ async fn enqueue_generated_controller_after_mutation(
 }
 
 async fn maybe_reconcile_cluster_role_aggregation(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     api_version: &'static str,
     kind: &'static str,
 ) {
@@ -117,7 +118,7 @@ async fn maybe_reconcile_cluster_role_aggregation(
 }
 
 async fn schedule_foreground_owner_finalization(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     api_version: &'static str,
     kind: &'static str,
     namespace: Option<&str>,
@@ -154,9 +155,7 @@ async fn schedule_foreground_owner_finalization(
                             )
                             .await
                             {
-                                worker_metrics
-                                    .cascade_delete_failures_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                worker_metrics.record_cascade_delete_failure();
                                 tracing::error!(
                                     namespace = ?worker_namespace,
                                     name = %worker_name,
@@ -173,8 +172,7 @@ async fn schedule_foreground_owner_finalization(
                     dispatch_state
                         .controller_reconcile()
                         .metrics
-                        .cascade_delete_failures_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .record_cascade_delete_failure();
                     tracing::warn!(
                         namespace = ?dispatch_namespace,
                         name = %dispatch_name,
@@ -191,8 +189,7 @@ async fn schedule_foreground_owner_finalization(
         state
             .controller_reconcile()
             .metrics
-            .cascade_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .record_cascade_delete_failure();
         tracing::warn!(
             namespace = ?namespace,
             name = %name,
@@ -205,7 +202,7 @@ async fn schedule_foreground_owner_finalization(
 }
 
 async fn dispatch_generated_mutation_event(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     operation: klights_reconcile_api::MutationOperation,
     resource: &Value,
     context: &'static str,
@@ -269,8 +266,9 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
     .await
 }
 
-pub async fn delete_collection_listed_resource_inner(
-    state: Arc<AppState>,
+#[cfg(test)]
+pub(in crate::api) async fn delete_collection_listed_resource_inner(
+    state: Arc<ApiState>,
     api_version: &'static str,
     kind: &'static str,
     namespace: Option<&str>,
@@ -323,7 +321,7 @@ pub async fn delete_collection_listed_resource_inner(
 }
 
 async fn run_post_hard_delete_effects(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     api_version: &'static str,
     kind: &'static str,
     namespace: Option<&str>,
@@ -371,14 +369,13 @@ async fn run_post_hard_delete_effects(
         state
             .controller_reconcile()
             .metrics
-            .cascade_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .record_cascade_delete_failure();
         tracing::error!(namespace = ?namespace, name = %resource.name, error = %e, "cascade delete failed");
     }
 }
 
-pub async fn list_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn list_inner(
+    state: Arc<ApiState>,
     _identity: &crate::auth::AuthenticatedIdentity,
     request: GeneratedListInnerRequest,
 ) -> Result<Response, AppError> {
@@ -566,8 +563,8 @@ pub async fn list_inner(
     Ok(K8sResponse::new(response, &headers).into_response())
 }
 
-pub async fn get_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn get_inner(
+    state: Arc<ApiState>,
     _identity: &crate::auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
@@ -604,7 +601,7 @@ pub async fn get_inner(
 }
 
 async fn inject_node_last_heartbeat_on_leader(
-    state: &AppState,
+    state: &ApiState,
     api_version: &str,
     kind: &str,
     node: &mut Value,
@@ -649,18 +646,18 @@ async fn inject_node_last_heartbeat_on_leader(
         return;
     };
 
-    if let Some(observation) = state
+    if let Some(renew_time) = state
         .controller_reconcile()
         .node_lease_tracker
-        .observed(node_name)
+        .observed_renew_time(node_name)
         .await
     {
-        ready["lastHeartbeatTime"] = serde_json::json!(observation.renew_time_string());
+        ready["lastHeartbeatTime"] = serde_json::json!(renew_time);
     }
 }
 
 struct BuiltinCreateStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     identity: &'a crate::auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
@@ -927,7 +924,7 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
 }
 
 struct BuiltinUpdateStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     identity: &'a crate::auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
@@ -1106,7 +1103,7 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
 }
 
 struct BuiltinPatchStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     identity: &'a crate::auth::AuthenticatedIdentity,
     target: GeneratedNamedResource<'a>,
     query: &'a CreateUpdateQuery,
@@ -1424,8 +1421,8 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
     }
 }
 
-pub async fn create_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn create_inner(
+    state: Arc<ApiState>,
     identity: &crate::auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
@@ -1517,8 +1514,8 @@ pub async fn create_inner(
     }
 }
 
-pub async fn update_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn update_inner(
+    state: Arc<ApiState>,
     identity: &crate::auth::AuthenticatedIdentity,
     request: GeneratedUpdateInnerRequest<'_>,
 ) -> Result<Json<Value>, AppError> {
@@ -1702,8 +1699,8 @@ async fn run_owner_cascade_sweeps(
     }
 }
 
-pub async fn delete_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn delete_inner(
+    state: Arc<ApiState>,
     _identity: &crate::auth::AuthenticatedIdentity,
     request: GeneratedDeleteInnerRequest<'_>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -1885,8 +1882,7 @@ pub async fn delete_inner(
             state
                 .controller_reconcile()
                 .metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .record_cascade_delete_failure();
             tracing::error!(namespace = ?ns, name = %owner_name_gc, error = %e, "cascade delete failed");
         }
 
@@ -1967,8 +1963,8 @@ pub async fn delete_inner(
     Ok((StatusCode::OK, Json(data)))
 }
 
-pub async fn patch_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn patch_inner(
+    state: Arc<ApiState>,
     identity: &crate::auth::AuthenticatedIdentity,
     request: GeneratedPatchInnerRequest<'_>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -2067,8 +2063,8 @@ pub async fn patch_inner(
     Ok((status, Json(data)))
 }
 
-pub async fn delete_collection_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn delete_collection_inner(
+    state: Arc<ApiState>,
     identity: &crate::auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
@@ -2078,8 +2074,8 @@ pub async fn delete_collection_inner(
     delete_collection_shared_inner(state, identity, api_version, kind, Some(namespace), query).await
 }
 
-pub async fn delete_collection_shared_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn delete_collection_shared_inner(
+    state: Arc<ApiState>,
     _identity: &crate::auth::AuthenticatedIdentity,
     api_version: &'static str,
     kind: &'static str,
@@ -2150,8 +2146,7 @@ pub async fn delete_collection_shared_inner(
                     state
                         .controller_reconcile()
                         .metrics
-                        .cascade_delete_failures_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .record_cascade_delete_failure();
                     tracing::error!(namespace = ?namespace, name = %res_name, error = %e, "delete collection: cascade delete failed");
                 }
             }
@@ -2161,8 +2156,7 @@ pub async fn delete_collection_shared_inner(
                 state
                     .controller_reconcile()
                     .metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .record_cascade_delete_failure();
                 tracing::error!(namespace = ?namespace, name = %res_name, error = ?e, "delete collection: resource delete failed");
             }
         }
@@ -2222,7 +2216,7 @@ mod tests {
         })
     }
 
-    async fn seeded_rbac_state() -> Arc<AppState> {
+    async fn seeded_rbac_state() -> Arc<ApiState> {
         let state = Arc::new(crate::api::test_support::build_test_app_state().await);
         crate::controllers::rbac_reconcile::reconcile_default_rbac_objects(
             state.resource_mutation().db.as_ref(),
@@ -2232,7 +2226,7 @@ mod tests {
         state
     }
 
-    async fn create_labeled_aggregate_source(state: &Arc<AppState>, name: &str, rule: Value) {
+    async fn create_labeled_aggregate_source(state: &Arc<ApiState>, name: &str, rule: Value) {
         state
             .resource_mutation()
             .db
@@ -2260,7 +2254,7 @@ mod tests {
         .expect("seed aggregate rules");
     }
 
-    async fn view_has_rule(state: &Arc<AppState>, expected: &Value) -> bool {
+    async fn view_has_rule(state: &Arc<ApiState>, expected: &Value) -> bool {
         let view = state
             .resource_mutation()
             .db

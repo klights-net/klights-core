@@ -6,7 +6,7 @@ mod cases {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::api_pod_subresources::local_node_log_runtime::LocalNodeLogRuntime;
+    use crate::api::pod_subresources::local_node_log_runtime::LocalNodeLogRuntime;
     use crate::datastore::backend::DatastoreHandle;
     use crate::replication::grpc::client::{
         ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, NodeControlRuntimes,
@@ -2784,7 +2784,7 @@ mod cases {
         let handler = LocalNodeLogRuntime::new_with_pod_event_store(
             crate::paths::pod_logs_root_path(&runtime_ns),
             supervisor.clone(),
-            crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
                     crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),
                 )),

@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn events_k8s_io_v1_routes() -> Router<Arc<AppState>> {
+pub fn events_k8s_io_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/events", get(list_all_events_k8s_io))
         .route(

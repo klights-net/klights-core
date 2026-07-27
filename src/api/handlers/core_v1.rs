@@ -11,7 +11,7 @@ use std::sync::Arc;
 // Service and serviceaccount-token authorization is enforced by the global
 // `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs).
 
-pub fn api_v1_routes() -> Router<Arc<AppState>> {
+pub fn api_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         // Cluster-scoped resources
         .route("/namespaces", get(list_namespaces).post(create_namespace))
@@ -400,7 +400,7 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn create_service(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -437,7 +437,7 @@ async fn create_service(
 }
 
 async fn update_service(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -487,7 +487,7 @@ async fn update_service(
 }
 
 async fn patch_service(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
@@ -539,7 +539,7 @@ async fn patch_service(
 }
 
 async fn delete_service(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let resource = crate::api::resource_query_ports::get_resource(
@@ -619,8 +619,7 @@ async fn delete_service(
         state
             .controller_reconcile()
             .metrics
-            .cascade_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .record_cascade_delete_failure();
         tracing::error!(namespace = %namespace, name = %svc_name, error = %e, "service delete: cascade delete failed");
     }
 
@@ -648,7 +647,7 @@ async fn delete_service(
 }
 
 async fn create_serviceaccount_token(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {

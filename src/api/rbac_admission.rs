@@ -14,7 +14,7 @@
 //! could bind themselves to cluster-admin. This runs as a built-in admission
 //! step on RBAC create/update before the object is persisted.
 
-use crate::api::{AppError, AppState};
+use crate::api::{ApiState, AppError};
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::rbac_rule_evaluator::{PolicyRule, rules_cover_all};
 use crate::auth::request_attributes::AuthorizationRequest;
@@ -25,7 +25,7 @@ const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 /// Enforce the RBAC escalation/bind admission rules for a create or update of an
 /// `rbac.authorization.k8s.io` resource. A no-op for every other resource.
 pub async fn enforce_rbac_write_authorization(
-    state: &AppState,
+    state: &ApiState,
     identity: &AuthenticatedIdentity,
     api_version: &str,
     kind: &str,
@@ -53,7 +53,7 @@ pub async fn enforce_rbac_write_authorization(
 }
 
 async fn enforce_role_escalation(
-    state: &AppState,
+    state: &ApiState,
     identity: &AuthenticatedIdentity,
     kind: &str,
     namespace: Option<&str>,
@@ -95,7 +95,7 @@ async fn enforce_role_escalation(
 }
 
 async fn enforce_binding_escalation(
-    state: &AppState,
+    state: &ApiState,
     identity: &AuthenticatedIdentity,
     kind: &str,
     namespace: Option<&str>,
@@ -157,7 +157,7 @@ async fn enforce_binding_escalation(
 
 /// The effective rules the identity holds in the given scope, as `PolicyRule`s.
 async fn holder_rules(
-    state: &AppState,
+    state: &ApiState,
     identity: &AuthenticatedIdentity,
     namespace: Option<&str>,
 ) -> Vec<PolicyRule> {
@@ -191,7 +191,7 @@ async fn holder_rules(
 /// Load the rules of the role referenced by a binding. Returns an empty vec if
 /// the role does not exist (binding to a nonexistent role grants nothing).
 async fn referenced_role_rules(
-    state: &AppState,
+    state: &ApiState,
     ref_kind: &str,
     ref_name: &str,
     binding_namespace: Option<&str>,
@@ -227,7 +227,7 @@ async fn referenced_role_rules(
 
 /// Does the identity hold `verb` on `resource` (optionally name-scoped)?
 async fn has_verb(
-    state: &AppState,
+    state: &ApiState,
     identity: &AuthenticatedIdentity,
     verb: &str,
     resource: &str,

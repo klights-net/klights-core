@@ -90,6 +90,12 @@ impl NodeLeaseTracker {
         self.leases.read().await.get(node_name).cloned()
     }
 
+    pub async fn observed_renew_time(&self, node_name: &str) -> Option<String> {
+        self.observed(node_name)
+            .await
+            .map(|observation| observation.renew_time_string())
+    }
+
     pub async fn deadline_for_node(&self, node_name: &str) -> NodeLeaseDeadline {
         if let Some(observed) = self.observed(node_name).await {
             return NodeLeaseDeadline {

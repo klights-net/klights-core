@@ -143,8 +143,8 @@ async fn read_proxy_client_identity_file(
 /// - `/healthz`, `/livez`, `/readyz` → always pass through
 /// - On leader → pass through to normal handlers
 /// - On follower → reverse-proxy to the leader
-pub async fn leader_proxy_middleware(
-    State(state): State<Arc<crate::api::AppState>>,
+pub(in crate::api) async fn leader_proxy_middleware(
+    State(state): State<Arc<crate::api::ApiState>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -161,7 +161,7 @@ pub async fn leader_proxy_middleware(
         return next.run(request).await;
     }
 
-    // Retrieve the proxy state from AppState
+    // Retrieve the proxy state from ApiState
     let Some(proxy) = state.operational().is_raft_leader_rx.clone() else {
         // No raft proxy configured — single-node or worker; pass through
         return next.run(request).await;

@@ -235,7 +235,7 @@ impl<'a> NftServiceRouterDefaultBoot<'a> {
 /// persistent netlink socket via [`KlightsTable`], the spawned
 /// coalescer worker, and the per-instance hostport state. One instance
 /// per process; instantiated by [`NftServiceRouter::boot`] during
-/// bootstrap and held as `Arc<dyn ServiceRouter>` on AppState.
+/// bootstrap and held as `Arc<dyn ServiceRouter>` on ApiState.
 ///
 /// The coalescer is a `tokio::sync::Notify`-driven loop. Callers signal
 /// "services need re-sync" via `request_services_sync`; the worker

@@ -1,8 +1,8 @@
 use crate::api::*;
 use klights_types::LabelSelector;
 
-pub async fn get_namespace(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_namespace(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let ns = state
@@ -15,8 +15,8 @@ pub async fn get_namespace(
     Ok(Json(data))
 }
 
-pub async fn list_namespaces(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn list_namespaces(
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
@@ -158,8 +158,8 @@ pub async fn list_namespaces(
     Ok(Json(list).into_response())
 }
 
-pub async fn create_namespace(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn create_namespace(
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(mut body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -308,8 +308,8 @@ fn map_namespace_create_error(name: &str, err: anyhow::Error) -> AppError {
     }
 }
 
-pub async fn update_namespace(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_namespace(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(mut body): LenientJson<Value>,
@@ -353,8 +353,8 @@ pub async fn update_namespace(
     Ok(Json(data))
 }
 
-pub async fn finalize_namespace(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn finalize_namespace(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(body): LenientJson<Value>,
@@ -454,8 +454,8 @@ pub async fn finalize_namespace(
     Ok(Json(data))
 }
 
-pub async fn patch_namespace(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_namespace(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     Query(query): Query<CreateUpdateQuery>,
@@ -513,8 +513,8 @@ pub fn is_protected_namespace(name: &str) -> bool {
     crate::namespace_admission::is_protected(name)
 }
 
-pub async fn delete_namespace(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_namespace(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     if is_protected_namespace(&name) {

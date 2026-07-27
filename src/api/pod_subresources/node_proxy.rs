@@ -6,16 +6,16 @@ use super::*;
 /// the `/pods` path is served directly from the DB. The node name may
 /// include a port suffix ({nodeName}:{port}) which is stripped.
 /// Authorization is enforced by the global `authorize_request` middleware.
-pub async fn node_proxy_with_path(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn node_proxy_with_path(
+    State(state): State<Arc<ApiState>>,
     Path((name, proxy_path)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     node_proxy_inner(state, &name, &proxy_path).await
 }
 
 /// GET/POST/PUT/PATCH/DELETE /api/v1/nodes/{name}/proxy (no trailing path)
-pub async fn node_proxy(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn node_proxy(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Response, AppError> {
     node_proxy_inner(state, &name, "").await
@@ -31,7 +31,7 @@ fn node_name_from_param(param: &str) -> &str {
 }
 
 async fn node_proxy_inner(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     name_param: &str,
     proxy_path: &str,
 ) -> Result<Response, AppError> {
@@ -218,7 +218,7 @@ mod node_proxy_tests {
     }
 }
 
-/// Testable inner function that operates on DB directly (no AppState needed).
+/// Testable inner function that operates on DB directly (no ApiState needed).
 #[cfg(test)]
 async fn node_proxy_inner_db(
     db: &dyn crate::datastore::DatastoreBackend,

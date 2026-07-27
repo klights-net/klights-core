@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn autoscaling_v2_routes() -> Router<Arc<AppState>> {
+pub fn autoscaling_v2_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/horizontalpodautoscalers", get(list_all_hpas_v2))
         .route(

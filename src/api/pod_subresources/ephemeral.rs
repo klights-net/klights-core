@@ -49,8 +49,8 @@ where
     ))
 }
 
-pub async fn get_pod_ephemeral_containers(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_pod_ephemeral_containers(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let pod = crate::api::pod_repository_ports::get_pod(
@@ -66,8 +66,8 @@ pub async fn get_pod_ephemeral_containers(
 }
 
 // PUT /api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers
-pub async fn update_pod_ephemeral_containers(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_pod_ephemeral_containers(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     crate::api::LenientJson(body): crate::api::LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
@@ -130,8 +130,8 @@ pub async fn update_pod_ephemeral_containers(
 }
 
 // PATCH /api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers
-pub async fn patch_pod_ephemeral_containers(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_pod_ephemeral_containers(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -257,7 +257,7 @@ fn merge_append_only_ephemeral_containers(
 /// itself bumps `metadata.generation` when the new list grows, so the
 /// handler does not need a second write.
 async fn persist_ephemeral_containers(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     namespace: &str,
     name: &str,
     pod: &klights_cluster_core::Resource,

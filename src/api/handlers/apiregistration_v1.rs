@@ -7,8 +7,8 @@ use axum::{
 };
 use std::sync::Arc;
 
-pub async fn get_apiservice_status(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_apiservice_status(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
@@ -26,8 +26,8 @@ pub async fn get_apiservice_status(
     Ok(K8sResponse::new(data, &headers))
 }
 
-pub async fn delete_collection_apiservices(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_collection_apiservices(
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(
@@ -45,8 +45,8 @@ pub async fn delete_collection_apiservices(
     ))
 }
 
-pub async fn delete_apiservice_with_cache_invalidation(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_apiservice_with_cache_invalidation(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,

@@ -14,7 +14,7 @@ mod tests {
     }
 
     /// Sanity test for the metrics wiring path: the hook holds the same
-    /// Arc<SideEffectMetrics> that callers register on AppState, and any
+    /// Arc<SideEffectMetrics> that callers register on ApiState, and any
     /// future increment inside reconcile_namespace_termination must show
     /// up on the shared counter (not a private clone).
     #[tokio::test]

@@ -41,8 +41,8 @@ fn make_crd_value(group: &str, kind: &str, plural: &str, scope: &str) -> serde_j
     })
 }
 
-/// Helper: build a minimal AppState for HTTP-level tests.
-pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate::api::AppState {
+/// Helper: build a minimal ApiState for HTTP-level tests.
+pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate::api::ApiState {
     let service_ipam = std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
         "10.43.128.0/17",
     ));
@@ -106,11 +106,11 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         ),
     );
     let network = crate::networking::test_support::mock_network(db_handle.clone());
-    crate::api::AppState::new(
+    crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
             crate::audit::default_audit_sink(),
-            std::sync::Arc::new(crate::api_priority_fairness::ApiPriorityFairness::new()),
+            std::sync::Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
             std::sync::Arc::new(
                 crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
                     std::sync::Arc::new(
@@ -175,7 +175,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                     network.services().clone(),
                 ),
             ),
-            crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
+            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(std::sync::Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
                     crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
                 )),

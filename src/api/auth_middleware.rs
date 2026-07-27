@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_types::TlsClientCertificate;
 
-use super::{AppError, AppState};
+use super::{ApiState, AppError};
 use crate::auth::clock::SystemClock;
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::impersonation::ImpersonationRequest;
@@ -27,7 +27,7 @@ const IMPERSONATE_UID: &str = "impersonate-uid";
 const IMPERSONATE_EXTRA_PREFIX: &str = "impersonate-extra-";
 
 struct ApiAuthResources<'a> {
-    state: &'a AppState,
+    state: &'a ApiState,
 }
 
 impl ApiAuthResources<'_> {
@@ -123,7 +123,7 @@ impl BoundTokenSubjectLookup for ApiAuthResources<'_> {
 
 #[cfg(test)]
 async fn validate_sa_token_bindings(
-    state: &AppState,
+    state: &ApiState,
     claims: &crate::auth::SaTokenClaims,
 ) -> Result<(), AppError> {
     crate::auth::validate_sa_token_bindings(&ApiAuthResources { state }, claims)
@@ -131,8 +131,8 @@ async fn validate_sa_token_bindings(
         .map_err(AppError::from)
 }
 
-pub(crate) async fn authenticate_token_for_review(
-    state: &AppState,
+pub(in crate::api) async fn authenticate_token_for_review(
+    state: &ApiState,
     token: &str,
     audiences: &[String],
 ) -> Result<crate::auth::middleware::ReviewedTokenIdentity, AuthenticationError> {
@@ -152,8 +152,8 @@ pub(crate) async fn authenticate_token_for_review(
     crate::auth::middleware::authenticate_token_for_review(&runtime, token, audiences).await
 }
 
-pub async fn authenticate_request(
-    state: Arc<AppState>,
+pub(in crate::api) async fn authenticate_request(
+    state: Arc<ApiState>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -248,7 +248,11 @@ pub async fn authenticate_request(
 }
 
 /// Global authorization chokepoint for every routed and fallback request.
-pub async fn authorize_request(state: Arc<AppState>, request: Request, next: Next) -> Response {
+pub(in crate::api) async fn authorize_request(
+    state: Arc<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
     use crate::api::request_info::{ResolvedAuthz, resolve_request_info};
 
     let ResolvedAuthz::Authorize(authorization) = resolve_request_info(
@@ -559,7 +563,7 @@ mod tests {
     }
 
     async fn seed_service_account(
-        state: &crate::api::AppState,
+        state: &crate::api::ApiState,
         namespace: &str,
         name: &str,
         uid: &str,

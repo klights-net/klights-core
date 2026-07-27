@@ -1,9 +1,9 @@
 // Cluster-scoped (namespace=None) delete_collection handlers.
-// Expands in the caller module where State/Query/AppState/AppError are in scope.
+// Expands in the caller module where State/Query/ApiState/AppError are in scope.
 macro_rules! cluster_delete_collection_handler {
     ($fn_name:ident, $api_version:expr_2021, $kind:expr_2021) => {
-        pub async fn $fn_name(
-            State(state): State<Arc<AppState>>,
+        pub(in crate::api) async fn $fn_name(
+            State(state): State<Arc<ApiState>>,
             Query(query): Query<DeleteCollectionQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
         ) -> Result<Json<Value>, AppError> {
@@ -25,7 +25,7 @@ macro_rules! reconcile_handlers {
     ($resource:ident, $create_base:ident, $update_base:ident, $patch_base:ident) => {
         paste::paste! {
             async fn [<create_ $resource>](
-                State(state): State<Arc<AppState>>,
+                State(state): State<Arc<ApiState>>,
                 Path(namespace): Path<String>,
                 Query(query): Query<CreateUpdateQuery>,
                 axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -49,7 +49,7 @@ macro_rules! reconcile_handlers {
             }
 
             async fn [<update_ $resource>](
-                State(state): State<Arc<AppState>>,
+                State(state): State<Arc<ApiState>>,
                 Path((namespace, name)): Path<(String, String)>,
                 Query(query): Query<CreateUpdateQuery>,
                 axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -70,7 +70,7 @@ macro_rules! reconcile_handlers {
             }
 
             async fn [<patch_ $resource>](
-                State(state): State<Arc<AppState>>,
+                State(state): State<Arc<ApiState>>,
                 Path((namespace, name)): Path<(String, String)>,
                 Query(query): Query<CreateUpdateQuery>,
                 headers: HeaderMap,
@@ -101,7 +101,7 @@ macro_rules! reconcile_create_handler {
     ($resource:ident, $create_base:ident) => {
         paste::paste! {
             async fn [<create_ $resource>](
-                State(state): State<Arc<AppState>>,
+                State(state): State<Arc<ApiState>>,
                 Path(namespace): Path<String>,
                 Query(query): Query<CreateUpdateQuery>,
                 axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,

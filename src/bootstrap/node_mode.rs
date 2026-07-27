@@ -1,7 +1,7 @@
 //! Process-startup node mode detection.
 //!
 //! The operating mode is decided once at process startup and never mutated
-//! thereafter. The detected `NodeMode` is stored on `AppState` and read by
+//! thereafter. The detected `NodeMode` is stored on `ApiState` and read by
 //! reference by every subsystem.
 //!
 //! The root and rootless variants are selected at this boundary without

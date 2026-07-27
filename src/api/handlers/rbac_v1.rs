@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn rbac_v1_routes() -> Router<Arc<AppState>> {
+pub fn rbac_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/roles", get(list_all_roles))
         .route("/rolebindings", get(list_all_rolebindings))

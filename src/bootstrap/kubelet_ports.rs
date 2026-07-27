@@ -328,7 +328,7 @@ impl PodWatchSource for DatastorePodWatchSource {
     }
 }
 
-impl crate::api_pod_subresources::logs::PodLogFollowWatchPort for DatastorePodWatchSource {
+impl crate::api::pod_subresources::logs::PodLogFollowWatchPort for DatastorePodWatchSource {
     fn subscribe_pod_watch_signals(&self) -> klights_watch::WatchSignalReceiver {
         self.watch_store
             .subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "Pod"))
@@ -336,8 +336,8 @@ impl crate::api_pod_subresources::logs::PodLogFollowWatchPort for DatastorePodWa
 
     fn pod_watch_replay_source(
         &self,
-    ) -> crate::api_pod_subresources::logs::PodLogFollowReplaySource {
-        crate::api_pod_subresources::logs::PodLogFollowReplaySource::new(Arc::new(
+    ) -> crate::api::pod_subresources::logs::PodLogFollowReplaySource {
+        crate::api::pod_subresources::logs::PodLogFollowReplaySource::new(Arc::new(
             DatastoreWatchReplaySource::new(
                 self.watch_store.clone(),
                 vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
@@ -347,7 +347,7 @@ impl crate::api_pod_subresources::logs::PodLogFollowWatchPort for DatastorePodWa
 
     fn current_resource_version(
         &self,
-    ) -> crate::api_pod_subresources::logs::PodLogFollowResourceVersionFuture<'_> {
+    ) -> crate::api::pod_subresources::logs::PodLogFollowResourceVersionFuture<'_> {
         Box::pin(async move { self.resource_versions.get_current_resource_version().await })
     }
 }

@@ -195,8 +195,8 @@ fn proxy_retry_policy(method: &axum::http::Method) -> (usize, std::time::Duratio
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/pods/{name}/proxy
-pub async fn pod_proxy(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_proxy(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
@@ -205,8 +205,8 @@ pub async fn pod_proxy(
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path}
-pub async fn pod_proxy_with_path(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_proxy_with_path(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name, proxy_path)): Path<(String, String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
@@ -214,8 +214,8 @@ pub async fn pod_proxy_with_path(
     pod_proxy_inner(state, &namespace, &name, &proxy_path, query.port, req).await
 }
 
-pub async fn pod_proxy_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn pod_proxy_inner(
+    state: Arc<ApiState>,
     namespace: &str,
     name_param: &str,
     proxy_path: &str,
@@ -935,8 +935,8 @@ pub fn rewrite_proxy_response_body(
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/services/{name}/proxy
-pub async fn service_proxy(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn service_proxy(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
@@ -945,8 +945,8 @@ pub async fn service_proxy(
 }
 
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/services/{name}/proxy/{*path}
-pub async fn service_proxy_with_path(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn service_proxy_with_path(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name, proxy_path)): Path<(String, String, String)>,
     Query(query): Query<ProxyQuery>,
     req: Request,
@@ -954,8 +954,8 @@ pub async fn service_proxy_with_path(
     service_proxy_inner(state, &namespace, &name, &proxy_path, query.port, req).await
 }
 
-pub async fn service_proxy_inner(
-    state: Arc<AppState>,
+pub(in crate::api) async fn service_proxy_inner(
+    state: Arc<ApiState>,
     namespace: &str,
     name_param: &str,
     proxy_path: &str,

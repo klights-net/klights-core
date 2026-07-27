@@ -290,9 +290,9 @@ pub async fn convert_crd_objects_to_requested_version(
     let status = resp.status();
     // Bound the conversion-webhook response to avoid unbounded memory growth
     // from a malicious or buggy webhook (DoS).
-    let response_bytes = crate::api_pod_subresources::read_reqwest_body_limited(
+    let response_bytes = crate::api::pod_subresources::read_reqwest_body_limited(
         resp,
-        crate::api_pod_subresources::MAX_APISERVICE_RESPONSE_BODY_BYTES,
+        crate::api::pod_subresources::MAX_APISERVICE_RESPONSE_BODY_BYTES,
         "CRD conversion webhook",
     )
     .await?;

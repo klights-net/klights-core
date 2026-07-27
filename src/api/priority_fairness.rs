@@ -42,8 +42,8 @@ pub enum ApfAdmission {
     Limited(PriorityLevelPermit),
 }
 
-pub async fn admit_request(
-    state: Arc<crate::api::AppState>,
+pub(in crate::api) async fn admit_request(
+    state: Arc<crate::api::ApiState>,
     request: Request,
     next: Next,
 ) -> Response {

@@ -8,11 +8,7 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::api::{
-    AppError, AppState, K8sResponse, LenientJson, ensure_namespace_status_phase_active,
-    inject_resource_version,
-};
-use crate::api_status::{
+use crate::api::status::{
     ApiSubresourceStatusMergePolicy, CurrentNamespaceResourceVersionPrecondition,
     DatastoreNamespaceStatusMutationWriter, DatastoreStatusMutationWriter,
     LenientStatusResourceVersionPrecondition, NamespaceStatusMergePolicy,
@@ -21,12 +17,16 @@ use crate::api_status::{
     StatusPutOperation, decode_patch_body, get_cluster_status_subresource,
     patch_cluster_status_subresource, preserve_node_extended_resources,
 };
+use crate::api::{
+    ApiState, AppError, K8sResponse, LenientJson, ensure_namespace_status_phase_active,
+    inject_resource_version,
+};
 
 // Cluster subresource (status) authorization is enforced by the global
 // `authorize_request` middleware chokepoint (see src/api/auth_middleware.rs).
 
-pub async fn patch_node_status(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_node_status(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -157,8 +157,8 @@ crate::cluster_status_patch_handler!(
 
 // Namespace status subresource handlers (cluster-scoped)
 
-pub async fn get_namespace_status(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_namespace_status(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     // Namespaces are stored in the dedicated `namespaces` table (not `cluster_resources`),
@@ -175,8 +175,8 @@ pub async fn get_namespace_status(
     Ok(Json(result))
 }
 
-pub async fn update_namespace_status(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_namespace_status(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
@@ -194,8 +194,8 @@ pub async fn update_namespace_status(
         .await
 }
 
-pub async fn patch_namespace_status(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_namespace_status(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -234,8 +234,8 @@ crate::cluster_status_patch_handler!(
 
 // CertificateSigningRequest approval subresource GET handler
 // GET /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval
-pub async fn get_csr_approval(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn get_csr_approval(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
@@ -252,13 +252,13 @@ pub async fn get_csr_approval(
 // CertificateSigningRequest approval subresource handler
 // PUT /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval
 // The approval endpoint updates the CSR's status.conditions with Approved/Denied
-pub async fn update_csr_approval(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn update_csr_approval(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<K8sResponse, AppError> {
-    crate::api_status::update_cluster_status_subresource_with_headers(
+    crate::api::status::update_cluster_status_subresource_with_headers(
         state,
         "certificates.k8s.io/v1".to_string(),
         "CertificateSigningRequest".to_string(),
@@ -269,8 +269,8 @@ pub async fn update_csr_approval(
     .await
 }
 
-pub async fn patch_csr_approval(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn patch_csr_approval(
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,

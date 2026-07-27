@@ -6,7 +6,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub fn networking_v1_routes() -> Router<Arc<AppState>> {
+pub fn networking_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/ingresses", get(list_all_ingresses))
         .route(
@@ -90,7 +90,7 @@ pub fn networking_v1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn delete_collection_ingressclasses(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(

@@ -66,7 +66,7 @@ async fn service_patch_enqueues_reconcile_without_route_sync_on_request_path() {
 
     let mut state = crate::api::test_support::build_test_app_state().await;
 
-    // Swap the AppState's service router for an observable double so we can
+    // Swap the ApiState's service router for an observable double so we can
     // assert the handler did not drive an inline nft rebuild. We also wire the
     // SAME double into the controller dispatcher's `services` slot so the
     // ServiceController's coalesced `request_services_sync` (run by the

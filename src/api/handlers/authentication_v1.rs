@@ -151,7 +151,7 @@ fn authenticated_token_review(request: Value, user: Value, audiences: Vec<String
 
 /// TokenReview — create-only resource, no Table support.
 pub async fn create_token_review(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<crate::api::response::K8sResponse, AppError> {

@@ -1,6 +1,6 @@
 use crate::api::*;
 
-pub fn storage_v1_routes() -> Router<Arc<AppState>> {
+pub fn storage_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
             "/storageclasses",

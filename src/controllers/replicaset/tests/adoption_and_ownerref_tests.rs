@@ -88,7 +88,7 @@ async fn test_replicaset_scale_subresource() {
         .await
         .unwrap();
 
-    // Build AppState and router
+    // Build ApiState and router
     let state = crate::crd_tests::build_test_app_state(db, registry).await;
     let app = crate::api::build_router(state);
 

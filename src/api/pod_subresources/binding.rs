@@ -13,8 +13,8 @@ impl BindingQuery {
     }
 }
 
-pub async fn pod_binding(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_binding(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<BindingQuery>,
     body: Bytes,

@@ -127,8 +127,8 @@ pub async fn maybe_hard_delete_pod_after_finalizers_drained(
     );
 }
 
-pub async fn maybe_reconcile_service_after_controller_endpointslice_delete(
-    state: &std::sync::Arc<AppState>,
+pub(in crate::api) async fn maybe_reconcile_service_after_controller_endpointslice_delete(
+    state: &std::sync::Arc<ApiState>,
     namespace: &str,
     deleted: &Value,
 ) -> Result<(), AppError> {
@@ -225,8 +225,8 @@ pub fn initialize_statefulset_revision_status_on_create(name: &str, body: &mut V
     }
 }
 
-pub async fn reconcile_owner_refs_after_mutation(
-    state: &std::sync::Arc<AppState>,
+pub(in crate::api) async fn reconcile_owner_refs_after_mutation(
+    state: &std::sync::Arc<ApiState>,
     resource: &klights_cluster_core::Resource,
     context: &'static str,
 ) {
@@ -248,8 +248,7 @@ pub async fn reconcile_owner_refs_after_mutation(
         state
             .controller_reconcile()
             .metrics
-            .cascade_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .record_cascade_delete_failure();
         tracing::error!(
             context,
             api_version = %resource.api_version,

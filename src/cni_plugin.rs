@@ -898,7 +898,7 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
-    // The "no crate::api::AppState in cni_plugin.rs" invariant is enforced by
+    // The "no crate::api::ApiState in cni_plugin.rs" invariant is enforced by
     // the base-repo source guard run by `./build.sh`.
 
     #[test]

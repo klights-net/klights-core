@@ -11,16 +11,16 @@ pub(crate) fn resource_query_for_test_datastore(
 }
 
 #[cfg(test)]
-pub async fn build_test_app_state() -> crate::api::AppState {
+pub(crate) async fn build_test_app_state() -> crate::api::ApiState {
     // `test_support::in_memory()` already seeds the standard system namespaces.
     let db = crate::datastore::test_support::in_memory().await;
     build_test_app_state_with_db(std::sync::Arc::new(db)).await
 }
 
 #[cfg(test)]
-pub async fn build_test_app_state_with_db(
+pub(crate) async fn build_test_app_state_with_db(
     db_handle: crate::datastore::DatastoreHandle,
-) -> crate::api::AppState {
+) -> crate::api::ApiState {
     use std::sync::Arc;
 
     let crd_registry = crate::controllers::crd::CrdRegistry::new();
@@ -106,11 +106,11 @@ pub async fn build_test_app_state_with_db(
             db_handle.clone(),
         ),
     );
-    crate::api::AppState::new(
+    crate::api::ApiState::new(
         crate::api::ApiAuthPolicy::new(
             std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
             crate::audit::default_audit_sink(),
-            std::sync::Arc::new(crate::api_priority_fairness::ApiPriorityFairness::new()),
+            std::sync::Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
             std::sync::Arc::new(
                 crate::auth::rbac_policy_store::ReaderBackedRbacPolicyStore::new(
                     std::sync::Arc::new(
@@ -175,7 +175,7 @@ pub async fn build_test_app_state_with_db(
                     network.services().clone(),
                 ),
             ),
-            crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
                     crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
                 )),
@@ -219,9 +219,9 @@ pub async fn build_test_router_with_db() -> (axum::Router, crate::datastore::Dat
 }
 
 #[cfg(test)]
-pub async fn build_test_app_state_with_authorizer(
+pub(crate) async fn build_test_app_state_with_authorizer(
     authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer>,
-) -> crate::api::AppState {
+) -> crate::api::ApiState {
     let mut state = build_test_app_state().await;
     state.authorizer = authorizer;
     state

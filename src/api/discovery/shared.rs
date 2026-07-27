@@ -13,7 +13,8 @@ pub use serde::{Serialize, Serializer};
 pub use serde_json::Value;
 pub use std::sync::Arc;
 
-pub use crate::api::{AppError, AppState};
+pub(in crate::api) use crate::api::ApiState;
+pub use crate::api::AppError;
 
 /// Compute the `storageVersionHash` advertised in discovery for a built-in
 /// kind. Upstream emits a base64-encoded hash that clients use only to detect
@@ -28,8 +29,8 @@ pub fn storage_version_hash_for(kind: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(&digest[..8])
 }
 
-pub async fn apiservice_group_versions(
-    state: &AppState,
+pub(in crate::api) async fn apiservice_group_versions(
+    state: &ApiState,
 ) -> Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>, AppError> {
     let mut groups: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
         std::collections::HashMap::new();
@@ -61,8 +62,8 @@ pub async fn apiservice_group_versions(
     Ok(groups)
 }
 
-pub async fn apiservice_discovery_resources(
-    state: &Arc<AppState>,
+pub(in crate::api) async fn apiservice_discovery_resources(
+    state: &Arc<ApiState>,
     group: &str,
     version: &str,
 ) -> Vec<APIResourceDiscovery> {
@@ -120,7 +121,7 @@ pub async fn apiservice_discovery_resources(
 
     let payload = match axum::body::to_bytes(
         response.into_body(),
-        crate::api_pod_subresources::MAX_PROXY_RESPONSE_BODY_BYTES,
+        crate::api::pod_subresources::MAX_PROXY_RESPONSE_BODY_BYTES,
     )
     .await
     {

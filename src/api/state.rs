@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ApiResourceMutationServices {
-    pub(crate) db: crate::api::state_ports::ApiResourceStore,
+    #[cfg(not(test))]
+    pub(crate) db: Arc<dyn crate::api::state_ports::ApiResourceStore>,
+    #[cfg(test)]
+    pub(crate) db: crate::datastore::DatastoreHandle,
     pub(crate) resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub(crate) resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub(crate) finalizer_lifecycle: Arc<dyn klights_reconcile_api::FinalizerLifecyclePort>,
@@ -22,7 +25,10 @@ pub(crate) struct ApiResourceMutationServices {
         Arc<dyn crate::api::generated_handler_ports::GeneratedResourceMutationPort>,
     pub(crate) generated_watch: Arc<dyn crate::api::generated_handler_ports::GeneratedWatchPort>,
     pub(crate) gc_owner_lifecycle: Arc<dyn klights_reconcile_api::GcOwnerLifecyclePort>,
-    pub(crate) pod_repository: crate::api::state_ports::ApiPodRepository,
+    #[cfg(not(test))]
+    pub(crate) pod_repository: Arc<dyn crate::api::state_ports::ApiPodRepository>,
+    #[cfg(test)]
+    pub(crate) pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
 }
 
 #[derive(Clone)]
@@ -47,10 +53,10 @@ impl ApiAuthenticators {
 }
 
 #[derive(Clone)]
-pub struct ApiAuthPolicy {
+pub(crate) struct ApiAuthPolicy {
     pub(crate) authorizer: Arc<dyn crate::auth::authorizer::Authorizer>,
     pub(crate) audit_sink: Arc<dyn crate::audit::AuditSink>,
-    pub(crate) api_priority_fairness: Arc<crate::api_priority_fairness::ApiPriorityFairness>,
+    pub(crate) api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
     pub(crate) rbac_policy_store: Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
     pub(crate) bootstrap_token_authenticator:
         Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
@@ -64,7 +70,7 @@ impl ApiAuthPolicy {
     pub(crate) fn new(
         authorizer: Arc<dyn crate::auth::authorizer::Authorizer>,
         audit_sink: Arc<dyn crate::audit::AuditSink>,
-        api_priority_fairness: Arc<crate::api_priority_fairness::ApiPriorityFairness>,
+        api_priority_fairness: Arc<crate::api::priority_fairness::ApiPriorityFairness>,
         rbac_policy_store: Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
         authenticators: ApiAuthenticators,
         cluster_ca_pem: Option<Arc<String>>,
@@ -119,8 +125,14 @@ pub(crate) struct ApiControllerReconcileServices {
     pub(crate) controller_dispatcher: Arc<dyn klights_reconcile_api::ControllerDispatcherPort>,
     #[cfg(test)]
     pub(crate) controller_dispatcher: Arc<crate::controller_dispatcher::ControllerDispatcher>,
-    pub(crate) metrics: crate::api::state_ports::ApiFailureMetrics,
-    pub(crate) node_lease_tracker: crate::api::state_ports::ApiNodeLeaseObservations,
+    #[cfg(not(test))]
+    pub(crate) metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
+    #[cfg(test)]
+    pub(crate) metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    #[cfg(not(test))]
+    pub(crate) node_lease_tracker: Arc<dyn crate::api::state_ports::ApiNodeLeaseObservations>,
+    #[cfg(test)]
+    pub(crate) node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
 }
 
 impl ApiControllerReconcileServices {
@@ -133,8 +145,12 @@ impl ApiControllerReconcileServices {
             dyn klights_reconcile_api::ControllerDispatcherPort,
         >,
         #[cfg(test)] controller_dispatcher: Arc<crate::controller_dispatcher::ControllerDispatcher>,
-        metrics: crate::api::state_ports::ApiFailureMetrics,
-        node_lease_tracker: crate::api::state_ports::ApiNodeLeaseObservations,
+        #[cfg(not(test))] metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
+        #[cfg(test)] metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        #[cfg(not(test))] node_lease_tracker: Arc<
+            dyn crate::api::state_ports::ApiNodeLeaseObservations,
+        >,
+        #[cfg(test)] node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     ) -> Self {
         Self {
             service_allocations,
@@ -152,11 +168,13 @@ impl ApiControllerReconcileServices {
 #[derive(Clone)]
 pub(crate) struct ApiPodNodeSubresourceServices {
     pub(crate) services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-    pub(crate) pod_log_follow_watch: crate::api_pod_subresources::logs::PodLogFollowWatchSource,
+    pub(crate) pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
     pub(crate) local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
     pub(crate) metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
     pub(crate) node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
-    pub(crate) pod_lifecycle_router: crate::api::state_ports::ApiPodLifecycleRouter,
+    #[cfg(test)]
+    pub(crate) pod_lifecycle_router:
+        Option<Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>>,
     pub(crate) pod_lifecycle_diagnostics:
         Option<Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>>,
     pub(crate) pod_start_retry_state: Option<Arc<dyn klights_pod_api::PodStartRetryDiagnostics>>,
@@ -166,11 +184,13 @@ impl ApiPodNodeSubresourceServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
-        pod_log_follow_watch: crate::api_pod_subresources::logs::PodLogFollowWatchSource,
+        pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
         local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
         metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
         node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
-        pod_lifecycle_router: crate::api::state_ports::ApiPodLifecycleRouter,
+        #[cfg(test)] pod_lifecycle_router: Option<
+            Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+        >,
         pod_lifecycle_diagnostics: Option<Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>>,
         pod_start_retry_state: Option<Arc<dyn klights_pod_api::PodStartRetryDiagnostics>>,
     ) -> Self {
@@ -180,6 +200,7 @@ impl ApiPodNodeSubresourceServices {
             local_node_exec,
             metrics_provider,
             node_port_forward,
+            #[cfg(test)]
             pod_lifecycle_router,
             pod_lifecycle_diagnostics,
             pod_start_retry_state,
@@ -204,7 +225,6 @@ pub(crate) struct ApiOperationalConfig {
     pub(crate) node_name: String,
     pub(crate) containerd_namespace: String,
     pub(crate) anonymous_auth: bool,
-    pub(crate) cluster_cidr: String,
 }
 
 impl ApiOperationalConfig {
@@ -214,11 +234,11 @@ impl ApiOperationalConfig {
         anonymous_auth: bool,
         cluster_cidr: String,
     ) -> Self {
+        let _ = cluster_cidr;
         Self {
             node_name,
             containerd_namespace,
             anonymous_auth,
-            cluster_cidr,
         }
     }
 
@@ -293,8 +313,159 @@ impl ApiOperationalServices {
     }
 }
 
+#[cfg(not(test))]
+pub(crate) enum RootApiRole {
+    Leader,
+    Controlplane {
+        leader_endpoints: Vec<String>,
+        as_learner: bool,
+    },
+    Worker {
+        leader_endpoints: Vec<String>,
+    },
+}
+
+#[cfg(not(test))]
+pub(crate) type RootApiRemoteNodeServices = (
+    Arc<dyn klights_node_api::NodeExec>,
+    Arc<dyn klights_node_api::NodeLog>,
+    Arc<dyn klights_leader_api::LeaderFollowerDiagnostics>,
+);
+
+/// Consumes root-owned capabilities and seals them inside the private HTTP
+/// state. The composition root receives only the completed router back.
+#[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_router_from_root(
+    authorizer: Arc<dyn crate::auth::authorizer::Authorizer>,
+    rbac_policy_store: Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
+    bootstrap_token: Arc<dyn crate::auth::middleware::BootstrapTokenAuthenticator>,
+    oidc: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
+    webhook: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
+    cluster_ca_pem: Option<Arc<String>>,
+    db: Arc<dyn crate::api::state_ports::ApiResourceStore>,
+    resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
+    finalizer_lifecycle: Arc<dyn klights_reconcile_api::FinalizerLifecyclePort>,
+    mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
+    list_resource_versions: Arc<dyn crate::api::query::ListResourceVersionPort>,
+    namespace_lists: Arc<dyn crate::api::query::NamespaceListPort>,
+    quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
+    admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
+    custom_resource_reads: Arc<dyn crate::api::custom_resource_ports::CustomResourceReadPort>,
+    builtin_admission_defaults: Arc<
+        dyn crate::api::generated_handler_ports::BuiltinAdmissionDefaultsPort,
+    >,
+    generated_lifecycle: Arc<dyn crate::api::generated_handler_ports::GeneratedLifecyclePort>,
+    generated_mutations: Arc<
+        dyn crate::api::generated_handler_ports::GeneratedResourceMutationPort,
+    >,
+    generated_watch: Arc<dyn crate::api::generated_handler_ports::GeneratedWatchPort>,
+    gc_owner_lifecycle: Arc<dyn klights_reconcile_api::GcOwnerLifecyclePort>,
+    pod_repository: Arc<dyn crate::api::state_ports::ApiPodRepository>,
+    crd_registry: CrdRegistry,
+    service_allocations: Arc<dyn klights_reconcile_api::ServiceWriteAllocator>,
+    controller_dispatcher: Arc<dyn klights_reconcile_api::ControllerDispatcherPort>,
+    metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
+    node_lease_tracker: Arc<dyn crate::api::state_ports::ApiNodeLeaseObservations>,
+    services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
+    pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
+    local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
+    metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+    node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
+    pod_lifecycle_diagnostics: Option<Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>>,
+    pod_start_retry_state: Option<Arc<dyn klights_pod_api::PodStartRetryDiagnostics>>,
+    role: RootApiRole,
+    replication: Option<RootApiRemoteNodeServices>,
+    node_name: String,
+    containerd_namespace: String,
+    anonymous_auth: bool,
+    cluster_cidr: String,
+    cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    is_raft_leader_rx: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+) -> axum::Router {
+    let role = match role {
+        RootApiRole::Leader => ApiNodeRole::Leader,
+        RootApiRole::Controlplane {
+            leader_endpoints,
+            as_learner,
+        } => ApiNodeRole::Controlplane {
+            leader_endpoints,
+            as_learner,
+        },
+        RootApiRole::Worker { leader_endpoints } => ApiNodeRole::Worker { leader_endpoints },
+    };
+    let replication = replication
+        .map(|(exec, logs, diagnostics)| ApiRemoteNodeServices::new(exec, logs, diagnostics));
+    let state = ApiState::new(
+        ApiAuthPolicy::new(
+            authorizer,
+            crate::audit::default_audit_sink(),
+            Arc::new(crate::api::priority_fairness::ApiPriorityFairness::new()),
+            rbac_policy_store,
+            ApiAuthenticators::new(bootstrap_token, oidc, webhook),
+            cluster_ca_pem,
+        ),
+        ApiResourceMutationServices {
+            db,
+            resource_query,
+            resource_command,
+            finalizer_lifecycle,
+            mutation_effects,
+            list_resource_versions,
+            namespace_lists,
+            quota_runtime,
+            admission,
+            custom_resource_reads,
+            builtin_admission_defaults,
+            generated_lifecycle,
+            generated_mutations,
+            generated_watch,
+            gc_owner_lifecycle,
+            pod_repository,
+        },
+        ApiDiscoveryAggregationServices::new(
+            crd_registry,
+            Arc::new(tokio::sync::OnceCell::new()),
+            Arc::new(crate::api::apiservice_proxy::ApiServiceProxyCache::default()),
+        ),
+        ApiControllerReconcileServices::new(
+            service_allocations,
+            controller_dispatcher,
+            metrics,
+            node_lease_tracker,
+        ),
+        ApiPodNodeSubresourceServices::new(
+            services,
+            pod_log_follow_watch,
+            local_node_exec,
+            metrics_provider,
+            node_port_forward,
+            pod_lifecycle_diagnostics,
+            pod_start_retry_state,
+        ),
+        ApiOperationalServices::new(
+            role,
+            replication,
+            Arc::new(ApiOperationalConfig::new(
+                node_name,
+                containerd_namespace,
+                anonymous_auth,
+                cluster_cidr,
+            )),
+            cluster_status,
+            task_supervisor.clone(),
+            klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            is_raft_leader_rx,
+        ),
+    );
+    crate::api::routes::build_router_inner(state)
+}
+
 #[derive(Clone)]
-pub struct AppState {
+#[cfg(not(test))]
+pub(super) struct ApiState {
     auth_policy: ApiAuthPolicy,
     resource_mutation: ApiResourceMutationServices,
     discovery: ApiDiscoveryAggregationServices,
@@ -303,7 +474,18 @@ pub struct AppState {
     operational: ApiOperationalServices,
 }
 
-impl AppState {
+#[derive(Clone)]
+#[cfg(test)]
+pub(crate) struct ApiState {
+    auth_policy: ApiAuthPolicy,
+    resource_mutation: ApiResourceMutationServices,
+    discovery: ApiDiscoveryAggregationServices,
+    controller_reconcile: ApiControllerReconcileServices,
+    pod_node_subresources: ApiPodNodeSubresourceServices,
+    operational: ApiOperationalServices,
+}
+
+impl ApiState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         auth_policy: ApiAuthPolicy,
@@ -323,6 +505,7 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_local_node_exec(
         mut self,
         local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
@@ -381,7 +564,8 @@ impl AppState {
     }
 }
 
-impl std::ops::Deref for AppState {
+#[cfg(test)]
+impl std::ops::Deref for ApiState {
     type Target = ApiAuthPolicy;
 
     fn deref(&self) -> &Self::Target {
@@ -389,7 +573,8 @@ impl std::ops::Deref for AppState {
     }
 }
 
-impl std::ops::DerefMut for AppState {
+#[cfg(test)]
+impl std::ops::DerefMut for ApiState {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.auth_policy
     }

@@ -1,5 +1,5 @@
 //! Unit tests for the pure helpers in `defaulting.rs`. All sync, no DB,
-//! no `AppState`, no admission webhooks — each helper is exercised in
+//! no `ApiState`, no admission webhooks — each helper is exercised in
 //! isolation against a hand-crafted `serde_json::Value`.
 
 use crate::api::defaulting::*;

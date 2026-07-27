@@ -61,8 +61,8 @@ struct RemotePodExecSyncRequest {
     target: ExecTarget,
 }
 
-pub async fn pod_exec(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_exec(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     req: Request,
@@ -125,7 +125,7 @@ pub async fn pod_exec(
                     "replication service not available for remote pod exec".to_string(),
                 )
             })?;
-        if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
+        if crate::api::pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
             return pod_exec_remote_spdy_stream(
                 state,
                 RemotePodExecStreamRequest {
@@ -186,7 +186,7 @@ pub async fn pod_exec(
         .await;
     }
 
-    let spdy_upgrade = crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers());
+    let spdy_upgrade = crate::api::pod_subresources::exec_spdy::is_spdy_upgrade(req.headers());
     if !spdy_upgrade && !upgrade_header.eq_ignore_ascii_case("websocket") {
         return Err(AppError::BadRequest(
             "Pod exec requires SPDY or WebSocket upgrade".to_string(),
@@ -256,7 +256,7 @@ pub async fn pod_exec(
 }
 
 async fn pod_exec_remote_websocket_stream(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     request: RemotePodExecStreamRequest,
 ) -> Result<Response, AppError> {
     let RemotePodExecStreamRequest {
@@ -372,7 +372,7 @@ async fn pod_exec_remote_websocket_stream(
 }
 
 async fn pod_exec_remote_spdy_stream(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     request: RemotePodExecStreamRequest,
 ) -> Result<Response, AppError> {
     let RemotePodExecStreamRequest {
@@ -393,10 +393,10 @@ async fn pod_exec_remote_spdy_stream(
     }
 
     let selected_subprotocol =
-        crate::api_pod_subresources::exec_spdy::negotiate_spdy_subprotocol(req.headers());
+        crate::api::pod_subresources::exec_spdy::negotiate_spdy_subprotocol(req.headers());
     let task_supervisor = state.operational().task_supervisor.clone();
     let task_supervisor_for_handler = task_supervisor.clone();
-    let request = crate::api_pod_subresources::exec_spdy::SpdyExecStreamRequest {
+    let request = crate::api::pod_subresources::exec_spdy::SpdyExecStreamRequest {
         stdin: stream_options.stdin,
         stdout: stream_options.stdout,
         stderr: stream_options.stderr,
@@ -413,9 +413,9 @@ async fn pod_exec_remote_spdy_stream(
                 match on_upgrade.await {
                     Ok(upgraded) => {
                         let io = hyper_util::rt::TokioIo::new(upgraded);
-                        crate::api_pod_subresources::exec_spdy::handle_remote_exec_spdy(
+                        crate::api::pod_subresources::exec_spdy::handle_remote_exec_spdy(
                             io,
-                            crate::api_pod_subresources::exec_spdy::RemoteExecSpdyRequest {
+                            crate::api::pod_subresources::exec_spdy::RemoteExecSpdyRequest {
                                 node_exec,
                                 task_supervisor: task_supervisor_for_handler,
                                 node_name,
@@ -436,11 +436,11 @@ async fn pod_exec_remote_spdy_stream(
         tracing::warn!("Failed to spawn remote pod exec SPDY task: {}", err);
     }
 
-    crate::api_pod_subresources::exec_spdy::spdy_switching_protocols_response(selected_subprotocol)
+    crate::api::pod_subresources::exec_spdy::spdy_switching_protocols_response(selected_subprotocol)
 }
 
 async fn pod_exec_remote_websocket_sync(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     request: RemotePodExecSyncRequest,
 ) -> Result<Response, AppError> {
     let RemotePodExecSyncRequest {
@@ -521,8 +521,8 @@ async fn pod_exec_remote_websocket_sync(
 
 // POST /api/v1/namespaces/{ns}/pods/{name}/attach
 // Admission-aware attach endpoint. Streaming attach wiring is intentionally deferred.
-pub async fn pod_attach(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_attach(
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     req: Request,
@@ -601,7 +601,7 @@ pub async fn pod_attach(
                     "replication service not available for remote pod attach".to_string(),
                 )
             })?;
-        if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
+        if crate::api::pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
             return pod_exec_remote_spdy_stream(
                 state,
                 RemotePodExecStreamRequest {
@@ -635,7 +635,7 @@ pub async fn pod_attach(
         .await;
     }
 
-    let spdy_upgrade = crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers());
+    let spdy_upgrade = crate::api::pod_subresources::exec_spdy::is_spdy_upgrade(req.headers());
     if !spdy_upgrade && !upgrade_header.eq_ignore_ascii_case("websocket") {
         return Err(AppError::BadRequest(
             "Pod attach requires SPDY or WebSocket upgrade".to_string(),

@@ -1,6 +1,6 @@
 use super::*;
-pub async fn custom_resource_discovery(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn custom_resource_discovery(
+    State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Path((group, version)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,

@@ -8,7 +8,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub fn apps_v1_routes() -> Router<Arc<AppState>> {
+pub fn apps_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         // Cluster-wide list (all namespaces)
         .route("/deployments", get(list_all_deployments))
@@ -127,7 +127,7 @@ pub fn apps_v1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn create_deployment(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -161,7 +161,7 @@ async fn create_deployment(
 }
 
 async fn update_deployment(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
@@ -186,7 +186,7 @@ async fn update_deployment(
 }
 
 async fn patch_deployment(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,

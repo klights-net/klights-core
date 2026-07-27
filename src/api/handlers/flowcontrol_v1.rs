@@ -6,8 +6,8 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub async fn delete_collection_flowschemas(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_collection_flowschemas(
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(
@@ -24,8 +24,8 @@ pub async fn delete_collection_flowschemas(
     ))
 }
 
-pub async fn delete_collection_prioritylevelconfigurations(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn delete_collection_prioritylevelconfigurations(
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(

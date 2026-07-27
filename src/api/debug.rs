@@ -1,5 +1,5 @@
 use crate::api::AppError;
-use crate::api::state::AppState;
+use crate::api::state::ApiState;
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::request_attributes::AuthorizationRequest;
 use axum::{Extension, Json, extract::State};
@@ -7,8 +7,8 @@ use klights_reconcile_api::ReconcileKey;
 use serde_json::json;
 use std::sync::Arc;
 
-pub async fn pod_lifecycle_debug_dump(
-    State(state): State<Arc<AppState>>,
+pub(in crate::api) async fn pod_lifecycle_debug_dump(
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Authorize: non-resource URL /debug/klights/pod-lifecycle

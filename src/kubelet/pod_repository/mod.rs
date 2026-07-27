@@ -782,7 +782,7 @@ pub trait PodApiWriter: Send + Sync {
 }
 
 /// Eight-trait pod persistence repository. Constructed once at process
-/// startup by `AppState`, then shared by every consumer behind narrow
+/// startup by `ApiState`, then shared by every consumer behind narrow
 /// trait references.
 pub struct PodRepository {
     store: Arc<PodStore>,

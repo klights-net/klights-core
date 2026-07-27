@@ -7,7 +7,7 @@ use axum::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub fn metrics_v1beta1_routes() -> Router<Arc<AppState>> {
+pub fn metrics_v1beta1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/nodes", get(list_node_metrics))
         .route("/nodes/{name}", get(get_node_metrics))
@@ -17,7 +17,7 @@ pub fn metrics_v1beta1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn list_node_metrics(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     let list = crate::api::resource_query_ports::list_resources(
@@ -59,7 +59,7 @@ async fn list_node_metrics(
 }
 
 async fn get_node_metrics(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let node = crate::api::resource_query_ports::get_resource(
@@ -86,14 +86,14 @@ async fn get_node_metrics(
 }
 
 async fn list_all_pod_metrics(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     list_pod_metrics_for_namespace(state, None, query).await
 }
 
 async fn list_pod_metrics(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(namespace): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -101,7 +101,7 @@ async fn list_pod_metrics(
 }
 
 async fn list_pod_metrics_for_namespace(
-    state: Arc<AppState>,
+    state: Arc<ApiState>,
     namespace: Option<String>,
     query: ListQuery,
 ) -> Result<Json<Value>, AppError> {
@@ -139,7 +139,7 @@ async fn list_pod_metrics_for_namespace(
 }
 
 async fn get_pod_metrics(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
     let pod = crate::api::pod_repository_ports::get_pod(
@@ -180,7 +180,7 @@ fn list_metadata(
 }
 
 async fn runtime_snapshot_for_nodes<'a>(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     node_names: impl IntoIterator<Item = &'a str>,
 ) -> Result<crate::metrics::RuntimeMetricsSnapshot, AppError> {
     let probes: Vec<klights_cluster_core::Resource> =

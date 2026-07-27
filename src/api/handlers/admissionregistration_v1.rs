@@ -6,7 +6,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub fn admissionregistration_v1_routes() -> Router<Arc<AppState>> {
+pub fn admissionregistration_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
             "/mutatingwebhookconfigurations",
@@ -87,7 +87,7 @@ pub fn admissionregistration_v1_routes() -> Router<Arc<AppState>> {
 }
 
 async fn delete_collection_mutatingwebhookconfigurations(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(
@@ -105,7 +105,7 @@ async fn delete_collection_mutatingwebhookconfigurations(
 }
 
 async fn delete_collection_validatingwebhookconfigurations(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(
@@ -123,7 +123,7 @@ async fn delete_collection_validatingwebhookconfigurations(
 }
 
 async fn delete_collection_validatingadmissionpolicies(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(
@@ -141,7 +141,7 @@ async fn delete_collection_validatingadmissionpolicies(
 }
 
 async fn delete_collection_validatingadmissionpolicybindings(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     crate::api::resource_command_ports::delete_non_pod_collection(

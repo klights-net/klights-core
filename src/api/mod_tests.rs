@@ -1,5 +1,5 @@
 use super::*;
-use crate::api_discovery::{openapi_v2, openapi_v3_discovery_with_crds};
+use crate::api::discovery::{openapi_v2, openapi_v3_discovery_with_crds};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use klights_kube_protobuf as k8s_pb;
@@ -5712,7 +5712,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         ))
     }
 
-    async fn get_response(state: crate::api::AppState, path: &str) -> axum::response::Response {
+    async fn get_response(state: crate::api::ApiState, path: &str) -> axum::response::Response {
         let app = crate::api::build_router(state);
         app.oneshot(
             Request::builder()
@@ -5726,7 +5726,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         .unwrap()
     }
 
-    async fn get_node_body(state: crate::api::AppState, path: &str) -> Value {
+    async fn get_node_body(state: crate::api::ApiState, path: &str) -> Value {
         let response = get_response(state, path).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -5871,7 +5871,7 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
     }
 
     async fn follower_response(
-        state: crate::api::AppState,
+        state: crate::api::ApiState,
         method: &str,
         uri: &str,
         body: Option<serde_json::Value>,

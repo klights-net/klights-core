@@ -147,7 +147,7 @@ struct CustomResourcePatchRequest<'a> {
 }
 
 pub async fn lookup_crd_or_proxy(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     identity: &AuthenticatedIdentity,
     request: CrdLookupRequest<'_>,
     body_for_proxy: impl FnOnce() -> Result<Bytes, AppError>,
@@ -187,7 +187,7 @@ pub async fn lookup_crd_or_proxy(
 }
 
 pub async fn get_existing_custom_resource_for_write(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     group: &str,
     version: &str,
     plural: &str,
@@ -498,7 +498,7 @@ async fn normalize_custom_resource_storage_data(
 }
 
 async fn reconcile_custom_resource_owner_refs(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     resource: &Resource,
     context: &'static str,
 ) {
@@ -520,8 +520,7 @@ async fn reconcile_custom_resource_owner_refs(
         state
             .controller_reconcile()
             .metrics
-            .cascade_delete_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .record_cascade_delete_failure();
         tracing::error!(
             context,
             api_version = %resource.api_version,
@@ -535,7 +534,7 @@ async fn reconcile_custom_resource_owner_refs(
 }
 
 async fn get_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     info: &klights_leader_api::CrdResourceInfo,
     group: &str,
     version: &str,
@@ -608,7 +607,7 @@ async fn get_cr_inner(
 }
 
 pub async fn get_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     Path((group, version, namespace, plural, name)): Path<(String, String, String, String, String)>,
@@ -635,7 +634,7 @@ pub async fn get_custom_resource(
 }
 
 pub async fn proxy_namespaced_custom_resource_subresource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     method: Method,
     Path((group, version, _namespace, plural, name, subresource)): Path<(
@@ -670,7 +669,7 @@ pub async fn proxy_namespaced_custom_resource_subresource(
 }
 
 pub async fn proxy_cluster_custom_resource_subresource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     method: Method,
     Path((group, version, plural, name, subresource)): Path<(
@@ -737,7 +736,7 @@ fn synthetic_cr_resource(
 }
 
 async fn list_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     request: CustomResourceListRequest<'_>,
 ) -> Result<Response, AppError> {
     let CustomResourceListRequest {
@@ -1820,7 +1819,7 @@ async fn list_cr_inner(
 }
 
 pub async fn list_custom_resources(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     Path((group, version, namespace, plural)): Path<(String, String, String, String)>,
@@ -1857,7 +1856,7 @@ pub async fn list_custom_resources(
 }
 
 async fn delete_collection_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     request: CustomResourceCollectionDeleteRequest<'_>,
 ) -> Result<Response, AppError> {
     let CustomResourceCollectionDeleteRequest {
@@ -2020,8 +2019,7 @@ async fn delete_collection_cr_inner(
                     state
                         .controller_reconcile()
                         .metrics
-                        .cascade_delete_failures_total
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        .record_cascade_delete_failure();
                     tracing::error!(name = %deleted.name, kind = %deleted.kind, error = %e, "{log_context}: cascade delete failed");
                 }
             }
@@ -2042,7 +2040,7 @@ async fn delete_collection_cr_inner(
 }
 
 pub async fn delete_collection_custom_resources(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     Path((group, version, namespace, plural)): Path<(String, String, String, String)>,
@@ -2081,7 +2079,7 @@ pub async fn delete_collection_custom_resources(
 }
 
 async fn dispatch_custom_resource_mutation_event(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     operation: klights_reconcile_api::MutationOperation,
     resource: &serde_json::Value,
     context: &'static str,
@@ -2101,7 +2099,7 @@ async fn dispatch_custom_resource_mutation_event(
 }
 
 async fn after_persisted_custom_resource_write(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     resource: &Resource,
     operation: klights_reconcile_api::MutationOperation,
     owner_ref_context: &'static str,
@@ -2112,7 +2110,7 @@ async fn after_persisted_custom_resource_write(
 }
 
 struct CustomResourceCreateStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     scope: CustomResourceScope<'a>,
     query: &'a CreateUpdateQuery,
     log_context: &'static str,
@@ -2276,7 +2274,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
 }
 
 struct CustomResourceUpdateStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     target: CustomResourceName<'a>,
     log_context: &'static str,
 }
@@ -2425,7 +2423,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
 }
 
 struct CustomResourcePatchStrategy<'a> {
-    state: &'a Arc<AppState>,
+    state: &'a Arc<ApiState>,
     target: CustomResourceName<'a>,
     query: &'a CreateUpdateQuery,
     headers: &'a HeaderMap,
@@ -2663,7 +2661,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
 }
 
 async fn create_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     request: CustomResourceCreateRequest<'_>,
 ) -> Result<Response, AppError> {
     let CustomResourceCreateRequest {
@@ -2686,7 +2684,7 @@ async fn create_cr_inner(
 }
 
 pub async fn create_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, namespace, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CreateUpdateQuery>,
@@ -2729,7 +2727,7 @@ pub async fn create_custom_resource(
 }
 
 async fn delete_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     request: CustomResourceDeleteRequest<'_>,
 ) -> Result<Response, AppError> {
     let CustomResourceDeleteRequest {
@@ -2845,8 +2843,7 @@ async fn delete_cr_inner(
                 state
                     .controller_reconcile()
                     .metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .record_cascade_delete_failure();
                 tracing::error!(name = %name, kind = %info.kind, error = %e, "CRD foreground finalize failed");
             }
 
@@ -2899,8 +2896,7 @@ async fn delete_cr_inner(
                 state
                     .controller_reconcile()
                     .metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .record_cascade_delete_failure();
                 tracing::error!(name = %name, kind = %info.kind, error = %e, "CRD cascade delete failed");
             }
         }
@@ -2913,7 +2909,7 @@ async fn delete_cr_inner(
 }
 
 pub async fn delete_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, namespace, plural, name)): Path<(String, String, String, String, String)>,
     Query(query): Query<CreateUpdateQuery>,
@@ -2950,7 +2946,7 @@ pub async fn delete_custom_resource(
 }
 
 async fn update_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     request: CustomResourceUpdateRequest<'_>,
 ) -> Result<Response, AppError> {
     let CustomResourceUpdateRequest {
@@ -2974,7 +2970,7 @@ async fn update_cr_inner(
 }
 
 pub async fn update_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, namespace, plural, name)): Path<(String, String, String, String, String)>,
     OriginalUri(uri): OriginalUri,
@@ -3015,7 +3011,7 @@ pub async fn update_custom_resource(
 }
 
 async fn patch_cr_inner(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     request: CustomResourcePatchRequest<'_>,
 ) -> Result<Response, AppError> {
     let CustomResourcePatchRequest {
@@ -3063,7 +3059,7 @@ async fn patch_cr_inner(
 }
 
 pub async fn patch_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, namespace, plural, name)): Path<(String, String, String, String, String)>,
     Query(query): Query<CreateUpdateQuery>,
@@ -3102,7 +3098,7 @@ pub async fn patch_custom_resource(
 }
 
 pub async fn list_cluster_custom_resources(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     Path((group, version, plural)): Path<(String, String, String)>,
@@ -3133,7 +3129,7 @@ pub async fn list_cluster_custom_resources(
 }
 
 pub async fn delete_collection_cluster_custom_resources(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     Path((group, version, plural)): Path<(String, String, String)>,
@@ -3166,7 +3162,7 @@ pub async fn delete_collection_cluster_custom_resources(
 }
 
 pub async fn create_cluster_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CreateUpdateQuery>,
@@ -3216,7 +3212,7 @@ pub async fn create_cluster_custom_resource(
 }
 
 pub async fn get_cluster_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     headers: HeaderMap,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
@@ -3237,7 +3233,7 @@ pub async fn get_cluster_custom_resource(
 }
 
 pub async fn update_cluster_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     OriginalUri(uri): OriginalUri,
@@ -3272,7 +3268,7 @@ pub async fn update_cluster_custom_resource(
 }
 
 pub async fn patch_cluster_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(query): Query<CreateUpdateQuery>,
@@ -3305,7 +3301,7 @@ pub async fn patch_cluster_custom_resource(
 }
 
 pub async fn delete_cluster_custom_resource(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Extension(identity): Extension<AuthenticatedIdentity>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(query): Query<CreateUpdateQuery>,

@@ -8,7 +8,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-pub fn apiextensions_v1_routes() -> Router<Arc<AppState>> {
+pub fn apiextensions_v1_routes() -> Router<Arc<ApiState>> {
     Router::new()
         .route(
             "/customresourcedefinitions",
@@ -54,7 +54,7 @@ pub fn crd_versions(crd: &Value) -> Vec<String> {
 }
 
 pub async fn delete_custom_resources_for_crd(
-    state: &Arc<AppState>,
+    state: &Arc<ApiState>,
     crd: &Value,
 ) -> Result<(), AppError> {
     let Some(group) = crd.pointer("/spec/group").and_then(|g| g.as_str()) else {
@@ -99,7 +99,7 @@ pub async fn delete_custom_resources_for_crd(
 }
 
 pub async fn delete_crd_with_deregistration(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
 ) -> Result<Json<Value>, AppError> {
@@ -186,7 +186,7 @@ pub async fn delete_crd_with_deregistration(
 }
 
 pub async fn delete_collection_customresourcedefinitions(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
     let resources = crate::api::resource_query_ports::list_resources(
@@ -381,7 +381,7 @@ pub fn add_crd_established_condition(mut body: Value) -> Value {
 
 // Custom CRD create handler that registers the CRD in the registry
 async fn create_crd_with_registration(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -446,7 +446,7 @@ async fn create_crd_with_registration(
 
     // Register the CRD in the registry immediately (so API routes are ready)
     let body_with_status = add_crd_established_condition(body.clone());
-    if let Err(e) = crate::api_discovery::register_crd_from_value(
+    if let Err(e) = crate::api::discovery::register_crd_from_value(
         &state.discovery().crd_registry,
         &body_with_status,
     )
@@ -484,7 +484,7 @@ async fn create_crd_with_registration(
 }
 
 async fn update_crd_with_registration(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(mut body): LenientJson<Value>,
@@ -602,7 +602,7 @@ async fn update_crd_with_registration(
         .await?;
 
     // Re-register with new spec
-    if let Err(e) = crate::api_discovery::register_crd_from_value(
+    if let Err(e) = crate::api::discovery::register_crd_from_value(
         &state.discovery().crd_registry,
         &resource.data,
     )
@@ -616,7 +616,7 @@ async fn update_crd_with_registration(
 }
 
 async fn patch_crd_with_registration(
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
     headers: HeaderMap,
@@ -696,7 +696,7 @@ async fn patch_crd_with_registration(
                 .await?;
 
             let body_with_status = add_crd_established_condition(admitted);
-            if let Err(e) = crate::api_discovery::register_crd_from_value(
+            if let Err(e) = crate::api::discovery::register_crd_from_value(
                 &state.discovery().crd_registry,
                 &body_with_status,
             )
@@ -810,7 +810,7 @@ async fn patch_crd_with_registration(
                     }
                 }
                 // Re-register with new spec
-                if let Err(e) = crate::api_discovery::register_crd_from_value(
+                if let Err(e) = crate::api::discovery::register_crd_from_value(
                     &state.discovery().crd_registry,
                     &resource.data,
                 )

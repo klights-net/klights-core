@@ -67,7 +67,7 @@ pub fn pod_link_mtu_for_encryption(encryption: wireguard::DataplaneEncryption) -
 
 /// App-owned parent struct holding one Arc per narrow networking trait.
 ///
-/// This is the gate Tasks 4–6 of the refactor build toward: AppState
+/// This is the gate Tasks 4–6 of the refactor build toward: ApiState
 /// holds a single `Arc<Network>` rather than four separate Arcs, and
 /// every consumer reaches the surface it needs via the matching capability
 /// accessor.
