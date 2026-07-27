@@ -205,6 +205,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     })
     .await?;
     let db_handle = ds.db_handle;
+    let watch_signals = ds.watch_signals;
     let db: &dyn datastore::DatastoreBackend = &*db_handle;
     let leader_ports = ds.leader_ports;
     let remote_api_client = ds.remote_api_client;
@@ -230,18 +231,14 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     // T2 step 2: construct the runtime leader election. Every
     // leader-class boot has a raft node (T2 step 1) so we always use
     // RaftLeaderLease. Workers have no raft node and get None.
-    let leader_election: Option<std::sync::Arc<dyn crate::leader_election::LeaderElection>> =
-        match (raft_node.as_ref(), is_leader_runtime) {
-            (Some(rn), true) => {
-                let election = crate::leader_election::RaftLeaderLease::new(
-                    rn.clone(),
-                    task_supervisor.root_cancellation_token(),
-                    task_supervisor.clone(),
-                );
-                Some(std::sync::Arc::new(election))
-            }
-            _ => None,
-        };
+    let controller_coordination: Option<
+        std::sync::Arc<dyn klights_leader_api::ControllerCoordination>,
+    > = match (raft_node.as_ref(), is_leader_runtime) {
+        (Some(rn), true) => Some(std::sync::Arc::new(
+            crate::leader_election::RaftLeaderLease::new(rn.clone()),
+        )),
+        _ => None,
+    };
 
     let _ = grpc_ca_cert_path.clone();
     // Reuse the same LocalApiClient instance the outbox dispatcher was
@@ -340,11 +337,15 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                         >
                 })
                 .unwrap_or_else(|| {
+                    let durable_watch = std::sync::Arc::new(
+                        crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+                    );
                     std::sync::Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                                db_handle.clone(),
-                            )),
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
+                            durable_watch.clone(),
+                            watch_signals.clone(),
+                            durable_watch,
+                            leader_ports.watch.clone(),
                         ),
                     )
                 }),
@@ -358,10 +359,11 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         cli: &cli,
         node_mode: &node_mode,
         node_ip: &node_ip,
-        leader_election: leader_election.clone(),
+        leader_coordination: controller_coordination.clone(),
         member_feature_probe,
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
         db_handle: &db_handle,
+        watch_signals: watch_signals.clone(),
         node_local: node_local.clone(),
         worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
@@ -409,8 +411,9 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
 
     phases::leader::start(phases::leader::LeaderStart {
         config: &config,
-        leader_election,
+        leader_coordination: controller_coordination,
         db_handle: &db_handle,
+        watch_signals: watch_signals.clone(),
         node_local: node_local.clone(),
         task_supervisor: &task_supervisor,
         dispatcher_for_worker: &dispatcher_for_worker,
@@ -419,7 +422,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         pod_api_service: &pod_api_service,
         cri_for_shutdown: &cri_for_shutdown,
         datapath: network.datapath(),
-        is_leader_rx: is_leader_rx.clone(),
         shutdown_token: shutdown_token.clone(),
     })
     .await?;

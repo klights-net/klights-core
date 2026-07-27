@@ -371,8 +371,10 @@ mod tests {
             got: ("snapshot-a", 512).into(),
         };
         let outcome = Ok(Err(
-            crate::replication::grpc::raft_rpc::RaftRpcRouterError::snapshot_mismatch(&mismatch)
-                .to_string(),
+            crate::replication::grpc::raft_rpc::RaftRpcRouterError::snapshot_mismatch(
+                serde_json::to_string(&mismatch).unwrap(),
+            )
+            .to_string(),
         ));
         assert!(matches!(
             map_rpc_outcome("https://10.99.0.14:7679", outcome),

@@ -442,7 +442,7 @@ pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
         })
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::api::raft_proxy::leader_proxy_middleware,
+            crate::api::authority_routing::leader_proxy_middleware,
         ))
         .layer({
             let auth_state = state.clone();

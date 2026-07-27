@@ -55,6 +55,7 @@ pub struct OpenLeaderArgs<'a> {
 
 pub struct DatastorePhase {
     pub db_handle: DatastoreHandle,
+    pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     /// The concrete leader-side LocalApiClient that the outbox dispatcher
@@ -132,10 +133,11 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // sufficient because followers must be able to install and advance.
     validate_raft_backend_capability(config.datastore_backend)?;
 
+    let watch_commit_wiring = crate::watch_commit_observation_adapter::new_wiring();
     let passive_backend = crate::datastore::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
-        crate::watch_commit_observation_adapter::new_sink(),
+        watch_commit_wiring.sink,
         crate::outbox_response_codec_adapter::new_codec(),
     )
     .await
@@ -379,7 +381,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             // Raft proposal materialization and committed apply.
             let local_api_client = Arc::new(
                 crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                    db_handle.clone(),
+                    crate::control_plane::client::local::LocalApiPersistencePorts::new(
+                        db_handle.clone(),
+                        watch_commit_wiring.signals.clone(),
+                    ),
                     config.node_name.clone(),
                     config.containerd_namespace.clone(),
                     runtime_paths.service_account_signing_key(),
@@ -957,6 +962,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     Ok(DatastorePhase {
         db_handle,
+        watch_signals: watch_commit_wiring.signals,
         leader_ports,
         remote_api_client: remote_parts.remote_api_client,
         local_api_client,

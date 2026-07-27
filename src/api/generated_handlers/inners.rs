@@ -635,9 +635,9 @@ async fn inject_node_last_heartbeat_on_leader(
 
     let is_raft_leader = state
         .operational()
-        .is_raft_leader_rx
+        .authority_router
         .as_ref()
-        .is_some_and(|proxy| proxy.is_leader());
+        .is_some_and(|router| router.has_local_authority());
     if !is_raft_leader {
         return;
     }

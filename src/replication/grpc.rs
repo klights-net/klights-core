@@ -1,6 +1,7 @@
 pub mod client;
 pub mod fanout;
 pub mod raft_rpc;
+pub(crate) mod runtime_adapter;
 pub mod server;
 pub mod snapshot_cache;
 pub mod transport_policy;

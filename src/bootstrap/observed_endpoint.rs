@@ -45,6 +45,7 @@ impl LeaderPeerEndpointObserverDeps {
 
 pub(crate) async fn start_leader_peer_endpoint_observer(
     db: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     deps: LeaderPeerEndpointObserverDeps,
     supervisor: Arc<TaskSupervisor>,
     grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -64,6 +65,7 @@ pub(crate) async fn start_leader_peer_endpoint_observer(
             async move {
                 run_leader_peer_endpoint_observer(
                     db,
+                    watch_signals,
                     deps,
                     client_identity,
                     supervisor_for_task,
@@ -79,6 +81,7 @@ pub(crate) async fn start_leader_peer_endpoint_observer(
 
 async fn run_leader_peer_endpoint_observer(
     db: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     deps: LeaderPeerEndpointObserverDeps,
     client_identity: ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
@@ -116,7 +119,7 @@ async fn run_leader_peer_endpoint_observer(
     }
 
     let mut signal_rx = crate::watch_commit_observation_adapter::subscribe(
-        &db,
+        watch_signals.as_ref(),
         klights_watch::WatchTopic::new("v1", "Node"),
     );
     loop {

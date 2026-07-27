@@ -3611,14 +3611,13 @@ impl Datastore {
     }
 }
 
-impl crate::datastore::CommitObservationStore for Datastore {
+#[async_trait]
+impl DatastoreBackend for Datastore {
+    #[cfg(test)]
     fn commit_observation_sink(&self) -> std::sync::Arc<dyn CommitObservationSink> {
         self.commit_sink.clone()
     }
-}
 
-#[async_trait]
-impl DatastoreBackend for Datastore {
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
         self.read_db_call("read_durable_allocator_observation", |conn| {
             let raw_rv: String = conn.query_row(

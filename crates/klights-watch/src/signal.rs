@@ -275,6 +275,13 @@ pub trait WatchSignalSubscribe: Send + Sync {
     fn subscribe(&self, topic: WatchTopic) -> WatchSignalReceiver;
 }
 
+/// Backend-neutral post-commit wakeup publisher. An embedded commit hook,
+/// remote notification adapter, or fake external engine may implement this
+/// capability without exposing a datastore or subscriber bus.
+pub trait WatchSignalPublish: Send + Sync {
+    fn publish(&self, signal: WatchSignal);
+}
+
 /// Per-topic bounded signal fan-out. No task, timer, or polling loop is owned
 /// by the hub; publishers synchronously wake only active topic subscribers.
 pub struct WatchSignalHub {
@@ -330,6 +337,12 @@ impl WatchSignalSubscribe for WatchSignalHub {
     }
 }
 
+impl WatchSignalPublish for WatchSignalHub {
+    fn publish(&self, signal: WatchSignal) {
+        Self::publish(self, signal);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +365,32 @@ mod tests {
         let mut subscription = WatchSignalReceiver::new(vec![closed, active]);
 
         assert_eq!(subscription.recv().await, Ok(expected));
+    }
+
+    #[tokio::test]
+    async fn second_engine_publisher_wakes_local_subscription() {
+        struct SimulatedExternalEngine {
+            wakeups: Arc<dyn WatchSignalPublish>,
+        }
+
+        let hub = Arc::new(WatchSignalHub::new(4));
+        let topic = WatchTopic::new("v1", "ConfigMap");
+        let mut local_session = hub.subscribe(topic.clone());
+        let second_engine = SimulatedExternalEngine {
+            wakeups: hub.clone(),
+        };
+        let expected = WatchSignal {
+            topic,
+            advances: vec![WatchAdvance {
+                namespace: Some("default".to_string()),
+                low_rv: 41,
+                high_rv: 41,
+            }],
+        };
+
+        second_engine.wakeups.publish(expected.clone());
+
+        assert_eq!(local_session.recv().await, Ok(expected));
     }
 
     #[test]

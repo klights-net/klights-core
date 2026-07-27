@@ -57,16 +57,15 @@ fn reject_application_committed_apply<T>(operation: &'static str) -> Result<T> {
     ))
 }
 
-impl crate::datastore::CommitObservationStore for SequencedDatastore {
+#[async_trait]
+impl DatastoreBackend for SequencedDatastore {
+    #[cfg(test)]
     fn commit_observation_sink(
         &self,
     ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
         self.passive.commit_observation_sink()
     }
-}
 
-#[async_trait]
-impl DatastoreBackend for SequencedDatastore {
     async fn read_durable_allocator_observation(
         &self,
     ) -> Result<crate::datastore::DurableAllocatorObservation> {

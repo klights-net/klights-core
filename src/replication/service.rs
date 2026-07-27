@@ -26,6 +26,10 @@ use klights_node_api::{
 };
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
+#[cfg(test)]
+pub(crate) use super::protocol::{FollowerCompletionContext, NodeOperationKind};
+#[cfg(not(test))]
+use super::protocol::{FollowerCompletionContext, NodeOperationKind};
 use super::protocol::{
     FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse, ReplicationEntry,
     RoutedNodeExecFrame, RoutedNodeExecRequest, RoutedNodeExecSyncRequest,
@@ -88,35 +92,6 @@ impl FollowerDataplane for crate::networking::wireguard::DataplanePeerMetadata {
             self.endpoint,
             self.port,
         )
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NodeOperationKind {
-    ExecSync,
-    ExecStream,
-    Log,
-    Metrics,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FollowerCompletionContext<'a> {
-    node_name: &'a str,
-    follower_session: u64,
-    kind: NodeOperationKind,
-}
-
-impl<'a> FollowerCompletionContext<'a> {
-    pub(crate) const fn new(
-        node_name: &'a str,
-        follower_session: u64,
-        kind: NodeOperationKind,
-    ) -> Self {
-        Self {
-            node_name,
-            follower_session,
-            kind,
-        }
     }
 }
 

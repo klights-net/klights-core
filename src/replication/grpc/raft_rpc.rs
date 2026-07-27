@@ -45,11 +45,8 @@ pub enum RaftRpcRouterError {
 }
 
 impl RaftRpcRouterError {
-    pub fn snapshot_mismatch(error: &openraft::error::SnapshotMismatch) -> Self {
-        Self::SnapshotMismatch(
-            serde_json::to_string(error)
-                .unwrap_or_else(|encode_error| format!("invalid:{encode_error}")),
-        )
+    pub fn snapshot_mismatch(encoded_error: String) -> Self {
+        Self::SnapshotMismatch(encoded_error)
     }
 }
 

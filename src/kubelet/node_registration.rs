@@ -196,7 +196,7 @@ pub(crate) struct NodeRegistrationSnapshot {
     pub node_role: KubeletNodeRole,
     pub publish_external_ip: bool,
     pub addresses: NodeRegistrationAddresses,
-    pub raft_shape: Option<klights_cluster_core::RaftShape>,
+    pub role_projection: Option<klights_leader_api::NodeRoleProjection>,
     pub grpc_port: Option<u16>,
     pub host: NodeRegistrationHostFacts,
 }
@@ -207,7 +207,7 @@ impl NodeRegistrationSnapshot {
         node_name: &str,
         profile: &NodeRegistrationProfile,
         addresses: NodeRegistrationAddresses,
-        raft_shape: Option<&klights_cluster_core::RaftShape>,
+        role_projection: Option<klights_leader_api::NodeRoleProjection>,
         grpc_port: Option<u16>,
     ) -> Self {
         Self {
@@ -216,7 +216,7 @@ impl NodeRegistrationSnapshot {
             node_role: profile.role(),
             publish_external_ip: profile.publish_external_ip(),
             addresses,
-            raft_shape: raft_shape.cloned(),
+            role_projection,
             grpc_port,
             host: NodeRegistrationHostFacts::capture_local(file_process, profile.kubelet_version())
                 .await,
@@ -581,10 +581,7 @@ pub(crate) async fn register_node_snapshot(
         .pointer_mut("/metadata/labels")
         .and_then(|labels| labels.as_object_mut())
     {
-        // P3-11d: stamp the shape-driven role label set. With no raft_shape
-        // the helper falls back to the static `node_role_label_key`, so
-        // legacy LeaderFollower mode keeps the same wire bytes.
-        for key in node::role_label_keys_for_shape(node_role, snapshot.raft_shape.as_ref()) {
+        for key in node::role_label_keys_for_projection(node_role, snapshot.role_projection) {
             labels.insert(key.to_string(), serde_json::json!(""));
         }
     }

@@ -1007,7 +1007,7 @@ impl ReplicationGrpcClient {
                     self.set_current_leader_endpoint(Some(endpoint));
                     return Ok(response);
                 }
-                Ok(Ok(Err(status))) if is_not_raft_leader_status(&status) => {
+                Ok(Ok(Err(status))) if is_not_current_authority_status(&status) => {
                     last_retryable = Some(anyhow::Error::from(status));
                 }
                 Ok(Ok(Err(status))) if is_transport_status(&status) => {
@@ -1083,7 +1083,7 @@ impl ReplicationGrpcClient {
     ///   so a keepalive-alive but response-wedged connection (the partial-loss
     ///   "stable cluster" stall) aborts instead of blocking forever.
     /// - **Retryable classification**: `not raft leader`
-    ///   ([`is_not_raft_leader_status`]) and transport faults
+    ///   ([`is_not_current_authority_status`]) and transport faults
     ///   ([`is_transport_status`]) are retried on the next candidate; the
     ///   transport case (and an elapsed deadline) **evicts only this lane**
     ///   ([`heal_lane_on_transport`] / [`invalidate_lane`]) so the rebuild is
@@ -1123,7 +1123,7 @@ impl ReplicationGrpcClient {
                 .await
             {
                 Ok(Ok(Ok(value))) => return Ok(value),
-                Ok(Ok(Err(status))) if is_not_raft_leader_status(&status) => {
+                Ok(Ok(Err(status))) if is_not_current_authority_status(&status) => {
                     // Stale leader hint: try the next candidate without
                     // evicting (the connection itself is healthy).
                     last_retryable = Some(status.to_string());
@@ -3314,7 +3314,7 @@ fn outbox_error_from_response(error_type: Option<&str>, message: String) -> Outb
 
 fn outbox_error_from_status(status: tonic::Status) -> OutboxDeliveryError {
     match status.code() {
-        tonic::Code::FailedPrecondition if is_not_raft_leader_status(&status) => {
+        tonic::Code::FailedPrecondition if is_not_current_authority_status(&status) => {
             OutboxDeliveryError::NotLeader
         }
         tonic::Code::DeadlineExceeded => OutboxDeliveryError::Timeout,
@@ -3367,9 +3367,7 @@ fn node_lease_renewal_error_from_unary(
     use klights_leader_api::NodeLeaseRenewalError;
 
     match error {
-        UnaryRpcError::Retryable(message)
-            if message.to_ascii_lowercase().contains("not raft leader") =>
-        {
+        UnaryRpcError::Retryable(message) if is_not_current_authority_message(&message) => {
             NodeLeaseRenewalError::NotLeader
         }
         UnaryRpcError::Retryable(message) => NodeLeaseRenewalError::retryable(message),
@@ -3383,7 +3381,7 @@ fn node_lease_renewal_error_from_unary(
                 tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
                     NodeLeaseRenewalError::unauthorized(message)
                 }
-                tonic::Code::FailedPrecondition if is_not_raft_leader_status(&status) => {
+                tonic::Code::FailedPrecondition if is_not_current_authority_status(&status) => {
                     NodeLeaseRenewalError::NotLeader
                 }
                 tonic::Code::Unavailable => NodeLeaseRenewalError::unavailable(message),
@@ -3397,9 +3395,7 @@ fn node_lease_renewal_error_from_unary(
 
 fn node_subnet_allocation_error_from_unary(error: UnaryRpcError) -> NodeSubnetAllocationError {
     match error {
-        UnaryRpcError::Retryable(message)
-            if message.to_ascii_lowercase().contains("not raft leader") =>
-        {
+        UnaryRpcError::Retryable(message) if is_not_current_authority_message(&message) => {
             NodeSubnetAllocationError::NotLeader
         }
         UnaryRpcError::Retryable(message) => NodeSubnetAllocationError::retryable(message),
@@ -3416,9 +3412,7 @@ fn node_subnet_allocation_error_from_unary(error: UnaryRpcError) -> NodeSubnetAl
                     NodeSubnetAllocationError::conflict(message)
                 }
                 tonic::Code::ResourceExhausted => NodeSubnetAllocationError::exhausted(message),
-                tonic::Code::FailedPrecondition
-                    if message.to_ascii_lowercase().contains("not raft leader") =>
-                {
+                tonic::Code::FailedPrecondition if is_not_current_authority_message(&message) => {
                     NodeSubnetAllocationError::NotLeader
                 }
                 tonic::Code::DeadlineExceeded => NodeSubnetAllocationError::Timeout,
@@ -3431,9 +3425,7 @@ fn node_subnet_allocation_error_from_unary(error: UnaryRpcError) -> NodeSubnetAl
 
 fn network_topology_error_from_unary(error: UnaryRpcError) -> NetworkTopologyError {
     match error {
-        UnaryRpcError::Retryable(message)
-            if message.to_ascii_lowercase().contains("not raft leader") =>
-        {
+        UnaryRpcError::Retryable(message) if is_not_current_authority_message(&message) => {
             NetworkTopologyError::NotLeader
         }
         UnaryRpcError::Retryable(message) => NetworkTopologyError::retryable(message),
@@ -3446,9 +3438,7 @@ fn network_topology_error_from_unary(error: UnaryRpcError) -> NetworkTopologyErr
                 tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
                     NetworkTopologyError::unauthorized(message)
                 }
-                tonic::Code::FailedPrecondition
-                    if message.to_ascii_lowercase().contains("not raft leader") =>
-                {
+                tonic::Code::FailedPrecondition if is_not_current_authority_message(&message) => {
                     NetworkTopologyError::NotLeader
                 }
                 tonic::Code::DeadlineExceeded => NetworkTopologyError::Timeout,
@@ -3461,9 +3451,7 @@ fn network_topology_error_from_unary(error: UnaryRpcError) -> NetworkTopologyErr
 
 fn projected_token_error_from_unary(error: UnaryRpcError) -> ProjectedServiceAccountTokenError {
     match error {
-        UnaryRpcError::Retryable(message)
-            if message.to_ascii_lowercase().contains("not raft leader") =>
-        {
+        UnaryRpcError::Retryable(message) if is_not_current_authority_message(&message) => {
             ProjectedServiceAccountTokenError::NotLeader
         }
         UnaryRpcError::Retryable(message) => {
@@ -3487,9 +3475,7 @@ fn projected_token_error_from_unary(error: UnaryRpcError) -> ProjectedServiceAcc
                     ProjectedServiceAccountTokenError::BoundPodNotFound
                 }
                 tonic::Code::NotFound => ProjectedServiceAccountTokenError::BoundNodeNotFound,
-                tonic::Code::FailedPrecondition
-                    if message.to_ascii_lowercase().contains("not raft leader") =>
-                {
+                tonic::Code::FailedPrecondition if is_not_current_authority_message(&message) => {
                     ProjectedServiceAccountTokenError::NotLeader
                 }
                 tonic::Code::FailedPrecondition => {
@@ -3511,9 +3497,7 @@ fn projected_token_error_from_unary(error: UnaryRpcError) -> ProjectedServiceAcc
 
 fn pod_cleanup_intent_error_from_unary(error: UnaryRpcError) -> PodCleanupIntentError {
     match error {
-        UnaryRpcError::Retryable(message)
-            if message.to_ascii_lowercase().contains("not raft leader") =>
-        {
+        UnaryRpcError::Retryable(message) if is_not_current_authority_message(&message) => {
             PodCleanupIntentError::NotLeader
         }
         UnaryRpcError::Retryable(message) => PodCleanupIntentError::unavailable(message),
@@ -3523,9 +3507,7 @@ fn pod_cleanup_intent_error_from_unary(error: UnaryRpcError) -> PodCleanupIntent
                 tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
                     PodCleanupIntentError::Unauthorized
                 }
-                tonic::Code::FailedPrecondition
-                    if message.to_ascii_lowercase().contains("not raft leader") =>
-                {
+                tonic::Code::FailedPrecondition if is_not_current_authority_message(&message) => {
                     PodCleanupIntentError::NotLeader
                 }
                 tonic::Code::DataLoss | tonic::Code::InvalidArgument => {
@@ -3539,12 +3521,14 @@ fn pod_cleanup_intent_error_from_unary(error: UnaryRpcError) -> PodCleanupIntent
     }
 }
 
-fn is_not_raft_leader_status(status: &tonic::Status) -> bool {
+fn is_not_current_authority_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("not current leader authority") || message.contains("not raft leader")
+}
+
+fn is_not_current_authority_status(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
-        && status
-            .message()
-            .to_ascii_lowercase()
-            .contains("not raft leader")
+        && is_not_current_authority_message(status.message())
 }
 
 /// Whether a gRPC status reflects a transport-level failure (the peer is

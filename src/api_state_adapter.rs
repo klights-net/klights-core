@@ -12,11 +12,21 @@ use crate::datastore::DatastoreHandle;
 
 pub(crate) struct RootApiResourceStore {
     inner: DatastoreHandle,
+    watch: crate::watch_stream_adapter::DatastoreWatchStreamAdapter,
 }
 
 impl RootApiResourceStore {
-    pub(crate) fn new(inner: DatastoreHandle) -> Arc<Self> {
-        Arc::new(Self { inner })
+    pub(crate) fn new(
+        inner: DatastoreHandle,
+        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            watch: crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                inner.clone(),
+                watch_signals,
+            ),
+            inner,
+        })
     }
 }
 
@@ -29,7 +39,7 @@ impl crate::api::watch_stream::WatchStreamSource for RootApiResourceStore {
         task_supervisor: &'a klights_supervisor::TaskSupervisor,
     ) -> crate::api::watch_stream::WatchSourceWaitFuture<'a> {
         crate::api::watch_stream::WatchStreamSource::wait_until_fresh(
-            &self.inner,
+            &self.watch,
             target_rv,
             api_version,
             kind,
@@ -47,7 +57,7 @@ impl crate::api::watch_stream::WatchStreamSource for RootApiResourceStore {
         limit: Option<i64>,
     ) -> crate::api::watch_stream::WatchSourceListFuture<'a> {
         crate::api::watch_stream::WatchStreamSource::list_watch_resources(
-            &self.inner,
+            &self.watch,
             api_version,
             kind,
             namespace,
@@ -61,7 +71,7 @@ impl crate::api::watch_stream::WatchStreamSource for RootApiResourceStore {
         &self,
         request: klights_leader_api::WatchRequest,
     ) -> klights_leader_api::LeaderWatchFuture<'_> {
-        crate::api::watch_stream::WatchStreamSource::watch_resources(&self.inner, request)
+        crate::api::watch_stream::WatchStreamSource::watch_resources(&self.watch, request)
     }
 }
 

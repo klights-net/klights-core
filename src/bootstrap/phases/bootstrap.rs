@@ -42,7 +42,7 @@ pub struct BootstrapRunArgs<'a> {
     /// init steps (namespaces, RBAC, ServiceCIDR, kube-dns) acquire the
     /// lease before running so a joiner that is not yet leader skips them
     /// without error.
-    pub leader_election: Option<Arc<dyn crate::leader_election::LeaderElection>>,
+    pub leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
     /// When true, this node is a joining Raft controlplane that has
     /// already caught up via the Phase A backup stream. Seed-only
     /// bootstrap writes (default namespaces, RBAC, kubernetes
@@ -50,6 +50,7 @@ pub struct BootstrapRunArgs<'a> {
     /// delivered the seed's state into the local cluster.db.
     pub skip_seed_bootstrap: bool,
     pub db_handle: &'a DatastoreHandle,
+    pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub worker_store_adapter:
         Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
@@ -290,9 +291,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         cli,
         node_mode,
         node_ip,
-        leader_election,
+        leader_coordination,
         skip_seed_bootstrap,
         db_handle,
+        watch_signals,
         node_local,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
@@ -335,13 +337,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // acquisition. For a seed boot the raft node is already leader by
     // this point so acquire succeeds immediately. Joiners are not
     // leader and skip init cleanly (the seed already wrote these rows).
-    let has_leader_election = leader_election.is_some();
-    let leader_lease = if has_leader_election && !skip_seed_bootstrap {
-        match leader_election
+    let has_leader_coordination = leader_coordination.is_some();
+    let leader_lease = if has_leader_coordination && !skip_seed_bootstrap {
+        match leader_coordination
             .as_ref()
             .unwrap()
-            .acquire(crate::leader_election::LeaderScope::Cluster)
-            .await
+            .try_acquire(klights_leader_api::ControllerScope::Cluster)
         {
             Ok(lease) => {
                 tracing::info!("bootstrap: acquired leader lease for one-time init");
@@ -463,12 +464,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let controller_coordination = Arc::new(crate::controllers::ControllerCoordination::new());
     local_api_client.set_non_pod_finalization(non_pod_finalization.clone());
 
-    let scheduling_mode = if has_leader_election {
+    let scheduling_mode = if has_leader_coordination {
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
     } else {
         crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode
     };
-    let runtime_node_role = if kubelet_uses_worker_store_adapter || !has_leader_election {
+    let runtime_node_role = if kubelet_uses_worker_store_adapter || !has_leader_coordination {
         RuntimeNodeRole::Worker
     } else {
         RuntimeNodeRole::Leader
@@ -517,7 +518,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
             },
-            Some(is_leader_rx.clone()),
+            leader_coordination.clone(),
         );
         (
             root_parts.repository_parts,
@@ -637,7 +638,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     #[cfg(not(test))]
                     gc_coordination: controller_coordination.clone(),
                 },
-                Some(is_leader_rx.clone()),
+                leader_coordination.clone(),
             );
             let repo = Arc::new(root_parts.repository_parts.repository);
             repo.set_pod_lifecycle_router_for_node(
@@ -714,10 +715,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .context("failed to build webhook authenticator")?;
 
-    // P3-11f: leadership watch channels for API proxy gating.
-    // The shape watcher updates the senders; ApiState holds the
-    // RaftLeaderProxy for the middleware.
-    //
     // T6 step 4: the `(is_leader_tx, is_leader_rx)` pair is created in
     // `runtime.rs` BEFORE `open_leader` so the same receiver flows into
     // `LocalApiClient`'s inner gate (step 1) and the switching
@@ -727,6 +724,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // (which guesses) and now.
     let initial_raft_shape = raft_node.as_ref().map(|node| node.current_shape());
     let initial_is_leader = initial_raft_shape.as_ref().is_none_or(|s| s.is_leader);
+    let initial_declared_role =
+        crate::bootstrap::node_registration_profile::build(node_mode, &cli.role).role();
+    let initial_role_projection = initial_raft_shape
+        .as_ref()
+        .map(|shape| crate::authority_adapter::project_raft_shape(&initial_declared_role, shape));
     let _ = is_leader_tx.send(initial_is_leader);
     let initial_leader_addr = raft_node
         .as_ref()
@@ -738,7 +740,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     ) {
         lease_client.set_current_leader_endpoint(Some(leader_addr.clone()));
     }
-    let (leader_addr_tx, leader_addr_rx) = tokio::sync::watch::channel(initial_leader_addr);
+    let (leader_authority, authority_publisher) =
+        crate::authority_adapter::WatchLeaderAuthority::channel(
+            initial_is_leader,
+            initial_leader_addr.clone(),
+        );
     start_controlplane_remote_informers_if_present(remote_api_client, shutdown_token.clone())
         .await
         .context("control-plane remote API informers")?;
@@ -754,18 +760,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .ok()
         .and_then(|r| r.ok());
-    let raft_leader_proxy = if raft_node.is_some() {
+    let authority_router = if raft_node.is_some() {
         let ca_cert_pem = cluster_ca_pem.clone();
-        let proxy_client_identity = crate::api::raft_proxy::load_proxy_client_identity(
+        let proxy_client_identity = crate::api::authority_routing::load_proxy_client_identity(
             &api_runtime_paths.api_proxy_cert,
             &api_runtime_paths.api_proxy_key,
             supervisor.as_ref(),
         )
         .await;
         Some(std::sync::Arc::new(
-            crate::api::raft_proxy::RaftLeaderProxy::new(
-                is_leader_rx.clone(),
-                leader_addr_rx.clone(),
+            crate::api::authority_routing::HttpAuthorityRouter::from_authority(
+                leader_authority.clone(),
                 ca_cert_pem,
             )
             .with_proxy_client_identity(proxy_client_identity),
@@ -843,6 +848,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         );
     let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
+        watch_signals.clone(),
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         supervisor.clone(),
         api_runtime_paths.ca_cert.clone(),
@@ -872,7 +878,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
         crate::api::ApiResourceMutationServices {
             #[cfg(not(test))]
-            db: crate::api_state_adapter::RootApiResourceStore::new(db_handle.clone()),
+            db: crate::api_state_adapter::RootApiResourceStore::new(
+                db_handle.clone(),
+                watch_signals.clone(),
+            ),
             #[cfg(test)]
             db: db_handle.clone(),
             resource_query: leader_ports.resource_query.clone(),
@@ -893,6 +902,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             custom_resource_reads:
                 crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                     db_handle.clone(),
+                    watch_signals.clone(),
                     supervisor.clone(),
                 ),
             builtin_admission_defaults: generated_handler_adapter.clone(),
@@ -940,11 +950,19 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     services.clone(),
                 ),
             ),
-            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
-                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                    crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
-                )),
-            )),
+            {
+                let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                    db_handle.clone(),
+                ));
+                crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
+                        durable_watch.clone(),
+                        watch_signals.clone(),
+                        durable_watch,
+                        leader_ports.watch.clone(),
+                    ),
+                ))
+            },
             None,
             metrics_provider.clone(),
             node_port_forward,
@@ -966,7 +984,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ),
             supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
-            raft_leader_proxy.clone(),
+            authority_router.clone(),
         ),
     ));
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
@@ -996,7 +1014,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
     ));
 
-    let node_lifecycle_start_resource_version = if has_leader_election {
+    let node_lifecycle_start_resource_version = if has_leader_coordination {
         db.get_current_resource_version().await.unwrap_or(0)
     } else {
         0
@@ -1035,7 +1053,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             &config.node_name,
             &registration_profile,
             registration_addresses,
-            initial_raft_shape.as_ref(),
+            initial_role_projection,
             grpc_port,
         )
         .await;
@@ -1062,6 +1080,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ));
         match crate::bootstrap::observed_endpoint::start_leader_peer_endpoint_observer(
             db_handle.clone(),
+            watch_signals.clone(),
             crate::bootstrap::observed_endpoint::LeaderPeerEndpointObserverDeps::new(
                 endpoint_query,
                 endpoint_status,
@@ -1104,13 +1123,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
         let file_process_task = kubelet_services.local_execution().file_process;
         let is_leader_tx_task = is_leader_tx.clone();
-        let leader_addr_tx_task = leader_addr_tx.clone();
         let grpc_port_task = if cli.role.runs_full_stack() {
             Some(config.tls_port)
         } else {
             None
         };
         let control_plane_lease_client_for_leader_updates = control_plane_lease_client.clone();
+        let authority_publisher_task = authority_publisher;
         let member_feature_probe_task = member_feature_probe.clone();
         let mut last_shape = initial_raft_shape.clone();
         supervisor
@@ -1146,7 +1165,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             );
                             return;
                         }
-                        // Always update the leadership proxy channels on
+                        // Always update the authority capability on
                         // every metrics change — RaftShape only tracks
                         // (voter_count, is_leader, is_learner) and does
                         // NOT capture current_leader identity. When the
@@ -1172,13 +1191,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             .await;
                         }
                         last_was_leader = is_leader;
-                        match raft_task.current_leader_info() {
+                        let leader_endpoint = match raft_task.current_leader_info() {
                             Some((_, addr)) => {
                                 if let Some(lease_client) = control_plane_lease_client_for_leader_updates.as_ref()
                                 {
                                     lease_client.set_current_leader_endpoint(Some(addr.clone()));
                                 }
-                                let _ = leader_addr_tx_task.send(Some(addr.clone()));
+                                Some(addr)
                             }
                             None => {
                                 if let Some(lease_client) = control_plane_lease_client_for_leader_updates
@@ -1186,9 +1205,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 {
                                     lease_client.clear_current_leader_endpoint();
                                 }
-                                let _ = leader_addr_tx_task.send(None);
+                                None
                             }
-                        }
+                        };
+                        authority_publisher_task.publish(is_leader, leader_endpoint);
                         let shape = raft_task.current_shape();
                         if Some(&shape) == last_shape.as_ref() {
                             continue;
@@ -1209,7 +1229,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             &node_name,
                             &registration_profile_task,
                             registration_addresses,
-                            Some(&shape),
+                            Some(crate::authority_adapter::project_raft_shape(
+                                &registration_profile_task.role(),
+                                &shape,
+                            )),
                             grpc_port_task,
                         )
                         .await;
@@ -1303,7 +1326,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let crd_registry_watch_handle = {
         let dbh = db_handle.clone();
         let registry = crd_registry.clone();
-        let crd_runtime = crate::crd_registry_adapter::new_runtime(dbh);
+        let crd_runtime = crate::crd_registry_adapter::new_runtime(dbh, watch_signals.clone());
         let cancel = shutdown_token.clone();
         supervisor
             .spawn_async(
@@ -1333,10 +1356,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     ),
                 )
             } else {
+                let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                    db_handle.clone(),
+                ));
                 Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                        crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
-                    )),
+                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
+                        durable_watch.clone(),
+                        watch_signals.clone(),
+                        durable_watch,
+                        leader_ports.watch.clone(),
+                    ),
                 )
             };
         let volume_events = Arc::new(
@@ -1375,10 +1404,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Heartbeat
     let heartbeat_handle = {
+        let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+            db_handle.clone(),
+        ));
         let watch_source = Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
-            )),
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
+                durable_watch.clone(),
+                watch_signals.clone(),
+                durable_watch,
+                leader_ports.watch.clone(),
+            ),
         );
         let cfg = Arc::clone(config);
         let cancel = shutdown_token.clone();
@@ -1416,7 +1451,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 db_handle.clone(),
                 config.node_name.clone(),
                 config.cluster_cidr.clone(),
-                raft_leader_proxy.clone(),
+                Some(leader_authority.clone()),
             );
         let node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
             Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
@@ -1460,8 +1495,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // P3-11f: in raft mode, every control-plane node can host the node
     // lifecycle watcher, but only the current leader should reconcile
     // changes. Followers wait on leadership before executing writes.
-    let should_run_node_lifecycle = has_leader_election;
-    let is_leader_rx_for_grpc = is_leader_rx.clone();
+    let should_run_node_lifecycle = has_leader_coordination;
     let node_lifecycle_handle = if should_run_node_lifecycle {
         let cancel = shutdown_token.clone();
         let node_lifecycle_status = local_api_client.clone();
@@ -1560,7 +1594,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         oidc_authenticator,
         webhook_authenticator,
         cluster_ca_pem.map(Arc::new),
-        crate::api_state_adapter::RootApiResourceStore::new(db_handle.clone()),
+        crate::api_state_adapter::RootApiResourceStore::new(
+            db_handle.clone(),
+            watch_signals.clone(),
+        ),
         leader_ports.resource_query.clone(),
         local_api_client.clone(),
         finalizer_lifecycle,
@@ -1573,6 +1610,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::resource_admission_adapter::ResourceAdmissionAdapter::new(db_handle.clone()),
         crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
             db_handle.clone(),
+            watch_signals.clone(),
             supervisor.clone(),
         ),
         generated_handler_adapter.clone(),
@@ -1597,11 +1635,19 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::new(
             crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(services.clone()),
         ),
-        crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
-                crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
-            )),
-        )),
+        {
+            let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                db_handle.clone(),
+            ));
+            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
+                    durable_watch.clone(),
+                    watch_signals.clone(),
+                    durable_watch,
+                    leader_ports.watch.clone(),
+                ),
+            ))
+        },
         local_node_exec,
         metrics_provider.clone(),
         node_port_forward,
@@ -1618,7 +1664,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         api_runtime_inputs,
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
-        raft_leader_proxy,
+        authority_router,
     );
     #[cfg(test)]
     let state_with_cri = (*watcher_state)
@@ -1669,7 +1715,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             );
             crate::replication::grpc::server::mount_service_full_production(
                 api_router,
-                rs,
+                crate::replication::grpc::runtime_adapter::GrpcReplicationRuntimeAdapter::new(rs),
                 grpc_ports,
                 Arc::new(
                     crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
@@ -1691,7 +1737,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         &config.containerd_namespace,
                     ),
                 },
-                Some(is_leader_rx_for_grpc),
+                Some(leader_authority.clone()),
                 Some(config.node_name.clone()),
                 Some(grpc_node_query),
                 Some(grpc_node_status),

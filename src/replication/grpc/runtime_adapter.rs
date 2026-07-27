@@ -1,0 +1,124 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+
+use crate::replication::grpc::server::GrpcReplicationRuntime;
+use crate::replication::protocol::{
+    FollowerCompletionContext, FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse,
+    ReplicationEntry, RoutedNodeExecFrame, RoutedNodeExecSyncResponse, RoutedNodeLogEvent,
+    RoutedNodeMetricsResponse,
+};
+use crate::replication::service::ReplicationService;
+
+/// Embedded replication application adapter for the reusable authenticated
+/// gRPC transport contract.
+pub(crate) struct GrpcReplicationRuntimeAdapter {
+    service: Arc<ReplicationService>,
+}
+
+impl GrpcReplicationRuntimeAdapter {
+    pub(crate) fn new(service: Arc<ReplicationService>) -> Arc<Self> {
+        Arc::new(Self { service })
+    }
+}
+
+#[async_trait::async_trait]
+impl GrpcReplicationRuntime for GrpcReplicationRuntimeAdapter {
+    fn task_supervisor(&self) -> Arc<klights_supervisor::TaskSupervisor> {
+        self.service.task_supervisor()
+    }
+
+    async fn validate_controlplane_bootstrap_token(
+        &self,
+        token: &str,
+    ) -> Result<(), klights_leader_api::BootstrapTokenValidationError> {
+        self.service
+            .validate_controlplane_bootstrap_token(token)
+            .await
+    }
+
+    async fn handle_authenticated_join(&self, request: JoinRequest) -> JoinResponse {
+        self.service.handle_authenticated_join(request).await
+    }
+
+    async fn register_follower(
+        &self,
+        dataplane: klights_leader_api::NetworkDataplane,
+    ) -> (tokio::sync::mpsc::Receiver<FollowerControlMessage>, u64) {
+        self.service.register_follower(dataplane).await
+    }
+
+    async fn register_stream_follower(
+        &self,
+        node_name: String,
+        session_id: u64,
+    ) -> Result<tokio::sync::mpsc::Receiver<ReplicationEntry>> {
+        self.service
+            .register_stream_follower(node_name, session_id)
+            .await
+    }
+
+    async fn update_follower_ack(&self, node_name: &str, applied_rv: i64) {
+        self.service
+            .update_follower_ack(node_name, applied_rv)
+            .await;
+    }
+
+    async fn complete_node_exec_sync(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeExecSyncResponse,
+    ) -> Result<()> {
+        self.service
+            .complete_node_exec_sync(context, response)
+            .await
+    }
+
+    async fn complete_node_log_event(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeLogEvent,
+    ) -> Result<()> {
+        self.service
+            .complete_node_log_event(context, response)
+            .await
+    }
+
+    async fn complete_node_metrics(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeMetricsResponse,
+    ) -> Result<()> {
+        self.service.complete_node_metrics(context, response).await
+    }
+
+    async fn complete_node_exec_stream_frame(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeExecFrame,
+    ) -> Result<()> {
+        self.service
+            .complete_node_exec_stream_frame(context, response)
+            .await
+    }
+
+    async fn unregister_follower(&self, node_name: &str, session_id: u64) {
+        self.service
+            .unregister_follower(node_name, session_id)
+            .await;
+    }
+
+    async fn handle_metadata(&self) -> MetadataResponse {
+        self.service.handle_metadata().await
+    }
+
+    async fn record_observed_peer_endpoint(&self, node_name: &str, endpoint: String) {
+        self.service
+            .record_observed_peer_endpoint(node_name, endpoint)
+            .await;
+    }
+
+    async fn observed_peer_endpoint(&self, node_name: &str) -> Option<String> {
+        self.service.observed_peer_endpoint(node_name).await
+    }
+}

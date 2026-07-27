@@ -10,7 +10,7 @@ pub struct DatastorePeerTopologyProjection {
     db: DatastoreHandle,
     my_node_name: String,
     cluster_cidr: String,
-    raft_leader_proxy: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+    authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
 }
 
 impl DatastorePeerTopologyProjection {
@@ -18,13 +18,13 @@ impl DatastorePeerTopologyProjection {
         db: DatastoreHandle,
         my_node_name: String,
         cluster_cidr: String,
-        raft_leader_proxy: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+        authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             my_node_name,
             cluster_cidr,
-            raft_leader_proxy,
+            authority,
         })
     }
 }
@@ -37,10 +37,13 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
         Box::pin(async move {
             let peer_name = event.resource().name.as_str();
             if peer_name == self.my_node_name
-                || self
-                    .raft_leader_proxy
-                    .as_ref()
-                    .is_some_and(|proxy| !proxy.is_leader())
+                || self.authority.as_ref().is_some_and(|authority| {
+                    let klights_leader_api::AuthorityRoute::Local(permit) = authority.route()
+                    else {
+                        return true;
+                    };
+                    authority.validate(&permit).is_err()
+                })
             {
                 return Ok(());
             }

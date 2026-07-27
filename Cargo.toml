@@ -29,6 +29,7 @@ members = [
     "crates/klights-reconcile-api",
     "crates/klights-network-api",
     "crates/klights-leader-api",
+    "crates/klights-leader-rpc",
     "crates/klights-watch",
     "crates/klights-cluster-datastore",
     "crates/klights-node-datastore",
@@ -55,6 +56,7 @@ klights-cluster-core = { path = "crates/klights-cluster-core" }
 klights-cluster-datastore = { path = "crates/klights-cluster-datastore" }
 klights-cluster-store = { path = "crates/klights-cluster-store" }
 klights-leader-api = { path = "crates/klights-leader-api" }
+klights-leader-rpc = { path = "crates/klights-leader-rpc" }
 klights-watch = { path = "crates/klights-watch" }
 klights-node-store = { path = "crates/klights-node-store" }
 klights-node-api = { path = "crates/klights-node-api" }

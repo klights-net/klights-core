@@ -122,7 +122,7 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
 
     let (_leader_addr_tx, leader_addr_rx) =
         tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
-    state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
+    state.operational_mut().authority_router = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx.clone(), leader_addr_rx, None),
     ));
 

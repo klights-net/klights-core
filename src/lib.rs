@@ -7,6 +7,7 @@ mod api_state_adapter;
 mod apiservice_side_effect_adapter;
 pub mod audit;
 pub mod auth;
+mod authority_adapter;
 pub mod cli;
 pub mod cni_plugin;
 pub mod control_plane;

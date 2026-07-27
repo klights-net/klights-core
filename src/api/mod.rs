@@ -18,6 +18,7 @@ pub mod macros;
 pub(crate) mod admission_ports;
 pub mod apiservice_proxy;
 pub(crate) mod auth_middleware;
+pub(crate) mod authority_routing;
 pub(crate) mod backend_proxy_headers;
 mod crd_conversion;
 pub(crate) mod custom_resource_ports;
@@ -49,7 +50,11 @@ pub mod pod_subresources;
 pub mod priority_fairness;
 pub(crate) mod query;
 mod quotas;
-pub mod raft_proxy;
+#[cfg(test)]
+pub mod raft_proxy {
+    pub(crate) use super::authority_routing::*;
+    pub(crate) type RaftLeaderProxy = HttpAuthorityRouter;
+}
 mod rbac_admission;
 pub(crate) mod request_info;
 mod resource_command_ports;

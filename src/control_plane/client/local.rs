@@ -119,6 +119,29 @@ fn projected_token_issue_test_probe(namespace: &str) -> Option<ProjectedTokenIss
 #[cfg(test)]
 use klights_leader_api::{ResourceQueryConsistency, pod_get_request};
 
+#[cfg(test)]
+fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
+    let sink = db.commit_observation_sink();
+    sink.as_any()
+        .downcast_ref::<crate::watch_commit_observation_adapter::WatchCommitObservationSink>()
+        .expect("test datastore watch sink")
+        .signal_source()
+}
+
+pub(crate) struct LocalApiPersistencePorts {
+    db: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+}
+
+impl LocalApiPersistencePorts {
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    ) -> Self {
+        Self { db, watch_signals }
+    }
+}
+
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
 ///
 /// Use cases:
@@ -288,23 +311,6 @@ impl LocalApiClient {
         })
     }
 
-    #[cfg(not(test))]
-    pub fn new(
-        db: DatastoreHandle,
-        authoring_node: String,
-        is_leader_rx: watch::Receiver<bool>,
-        file_process: klights_supervisor::FileProcessExecutor,
-    ) -> Self {
-        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
-            db,
-            authoring_node,
-            std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
-            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
-            is_leader_rx,
-            file_process,
-        )
-    }
-
     #[cfg(test)]
     pub(crate) fn new(
         db: DatastoreHandle,
@@ -319,7 +325,8 @@ impl LocalApiClient {
         )
     }
 
-    pub fn new_with_file_process(
+    #[cfg(test)]
+    pub(crate) fn new_with_file_process(
         db: DatastoreHandle,
         authoring_node: String,
         is_leader_rx: watch::Receiver<bool>,
@@ -330,24 +337,6 @@ impl LocalApiClient {
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
             Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
-            is_leader_rx,
-            file_process,
-        )
-    }
-
-    #[cfg(not(test))]
-    pub fn new_with_node_lease_tracker(
-        db: DatastoreHandle,
-        authoring_node: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
-        file_process: klights_supervisor::FileProcessExecutor,
-    ) -> Self {
-        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
-            db,
-            authoring_node,
-            std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
-            node_lease_tracker,
             is_leader_rx,
             file_process,
         )
@@ -369,7 +358,8 @@ impl LocalApiClient {
         )
     }
 
-    pub fn new_with_node_lease_tracker_and_file_process(
+    #[cfg(test)]
+    pub(crate) fn new_with_node_lease_tracker_and_file_process(
         db: DatastoreHandle,
         authoring_node: String,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
@@ -386,26 +376,8 @@ impl LocalApiClient {
         )
     }
 
-    #[cfg(not(test))]
-    pub fn new_with_node_lease_tracker_and_containerd_namespace(
-        db: DatastoreHandle,
-        authoring_node: String,
-        containerd_namespace: String,
-        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-        is_leader_rx: watch::Receiver<bool>,
-        file_process: klights_supervisor::FileProcessExecutor,
-    ) -> Self {
-        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
-            db,
-            authoring_node,
-            containerd_namespace,
-            node_lease_tracker,
-            is_leader_rx,
-            file_process,
-        )
-    }
-
-    pub fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+    #[cfg(test)]
+    pub(crate) fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
         db: DatastoreHandle,
         authoring_node: String,
         containerd_namespace: String,
@@ -416,7 +388,7 @@ impl LocalApiClient {
         let signing_key_path =
             crate::paths::service_account_signing_key_path(&containerd_namespace);
         Self::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-            db,
+            LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),
             authoring_node,
             containerd_namespace,
             signing_key_path,
@@ -427,7 +399,7 @@ impl LocalApiClient {
     }
 
     pub(crate) fn new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-        db: DatastoreHandle,
+        persistence: LocalApiPersistencePorts,
         authoring_node: String,
         containerd_namespace: String,
         service_account_signing_key_path: std::path::PathBuf,
@@ -435,8 +407,9 @@ impl LocalApiClient {
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
+        let LocalApiPersistencePorts { db, watch_signals } = persistence;
         let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
-        let positioned_watch = datastore_positioned_watch_service(db.clone());
+        let positioned_watch = datastore_positioned_watch_service(db.clone(), watch_signals);
         let crypto = file_process.crypto_executor();
         Self {
             outbox_apply: crate::bootstrap::outbox_apply_adapter::RootOutboxApplyAdapter::new(
@@ -517,24 +490,15 @@ impl LocalApiClient {
 
 pub(crate) fn datastore_positioned_watch_service(
     db: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
 ) -> klights_watch::PositionedWatchService {
     klights_watch::PositionedWatchService::new(
         Arc::new(DatastoreClusterResourceRead::new(db.clone())),
         Arc::new(DatastoreDurableWatchHistory::new(db.clone())),
         Arc::new(DatastoreDurableAllocatorRead::new(db.clone())),
-        Arc::new(DatastoreWatchSignals { db: db.clone() }),
+        watch_signals,
         Arc::new(DatastoreWatchScopes { db }),
     )
-}
-
-struct DatastoreWatchSignals {
-    db: DatastoreHandle,
-}
-
-impl klights_watch::WatchSignalSubscribe for DatastoreWatchSignals {
-    fn subscribe(&self, topic: klights_watch::WatchTopic) -> klights_watch::WatchSignalReceiver {
-        crate::watch_commit_observation_adapter::subscribe(&self.db, topic)
-    }
 }
 
 struct DatastoreWatchScopes {
@@ -2669,7 +2633,7 @@ mod inner_gate_tests {
             let sign_probe = install_projected_token_issue_test_probe(namespace.clone(), reader);
             let client = Arc::new(
                 LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                    db,
+                    LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),
                     "node-a".to_string(),
                     namespace,
                     signing_key_path,
@@ -2781,7 +2745,7 @@ mod inner_gate_tests {
         crate::utils::write_file(&signing_key_path, &signing_key).unwrap();
         let local = Arc::new(
             LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                db,
+                LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),
                 "leader-cp1".to_string(),
                 namespace,
                 signing_key_path,

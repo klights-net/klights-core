@@ -177,6 +177,35 @@ pub(crate) enum FollowerControlMessage {
     NodeMetrics(RoutedNodeMetricsRequest),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeOperationKind {
+    ExecSync,
+    ExecStream,
+    Log,
+    Metrics,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FollowerCompletionContext<'a> {
+    pub(crate) node_name: &'a str,
+    pub(crate) follower_session: u64,
+    pub(crate) kind: NodeOperationKind,
+}
+
+impl<'a> FollowerCompletionContext<'a> {
+    pub(crate) const fn new(
+        node_name: &'a str,
+        follower_session: u64,
+        kind: NodeOperationKind,
+    ) -> Self {
+        Self {
+            node_name,
+            follower_session,
+            kind,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ForwardedResource {
     pub api_version: String,

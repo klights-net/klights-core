@@ -8,29 +8,34 @@ use crate::datastore::DatastoreHandle;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
 
 pub(crate) struct LeaderSchedulerRuntime {
-    db: DatastoreHandle,
     pods: Arc<crate::pod_api_service::PodApiService>,
+    positioned_watch: klights_watch::PositionedWatchService,
 }
 
 impl LeaderSchedulerRuntime {
     pub(crate) fn new(
         db: DatastoreHandle,
+        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
         pods: Arc<crate::pod_api_service::PodApiService>,
     ) -> Self {
-        Self { db, pods }
+        Self {
+            positioned_watch:
+                crate::control_plane::client::local::datastore_positioned_watch_service(
+                    db.clone(),
+                    watch_signals,
+                ),
+            pods,
+        }
     }
 }
 
 #[async_trait]
 impl SchedulerRuntime for LeaderSchedulerRuntime {
     async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError> {
-        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
-            self.db.clone(),
-        );
         let mut sessions = Vec::with_capacity(2);
         for (api_version, kind) in [("v1", "Pod"), ("v1", "Node")] {
             let request = WatchRequest::try_new(api_version, kind, None, None, None, None, None)?;
-            sessions.push(positioned.watch_resources(request).await?);
+            sessions.push(self.positioned_watch.watch_resources(request).await?);
         }
         Ok(sessions)
     }

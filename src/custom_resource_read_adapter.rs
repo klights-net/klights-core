@@ -10,18 +10,27 @@ pub(crate) struct CustomResourceReadAdapter {
     db: crate::datastore::DatastoreHandle,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     positioned_watch: klights_watch::PositionedWatchService,
+    watch_source: crate::watch_stream_adapter::DatastoreWatchStreamAdapter,
     projected_baseline: Arc<dyn klights_watch::ProjectedWatchBaselineRead>,
 }
 
 impl CustomResourceReadAdapter {
     pub(crate) fn new(
         db: crate::datastore::DatastoreHandle,
+        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Arc<Self> {
         let projected_baseline = Arc::new(CrdProjectedWatchBaseline { db: db.clone() });
         Arc::new(Self {
             positioned_watch:
-                crate::control_plane::client::local::datastore_positioned_watch_service(db.clone()),
+                crate::control_plane::client::local::datastore_positioned_watch_service(
+                    db.clone(),
+                    watch_signals.clone(),
+                ),
+            watch_source: crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                db.clone(),
+                watch_signals,
+            ),
             db,
             supervisor,
             projected_baseline,
@@ -157,7 +166,7 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
     ) -> CustomResourceWaitFuture<'_> {
         Box::pin(async move {
             crate::api::watch_stream::wait_until_datastore_fresh(
-                &self.db,
+                &self.watch_source,
                 target_rv,
                 &api_version,
                 &kind,

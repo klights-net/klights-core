@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use klights_leader_api::{ControllerCoordination, ControllerLease, ControllerScope};
 use klights_pod_api::{
     PodLifecycleWakeup, PodLifecycleWakeupRequest, UnscheduledPodDeletion,
     UnscheduledPodDeletionError, UnscheduledPodDeletionFuture, UnscheduledPodDeletionOutcome,
@@ -15,7 +16,7 @@ use klights_reconcile_api::{
     NamespaceTerminationSink,
 };
 use serde_json::{Map, Value, json};
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 #[cfg(test)]
 use crate::datastore::PodWorkqueueEntry as LegacyPodWorkqueueEntry;
@@ -221,7 +222,7 @@ impl UnscheduledPodDeletion for LeaderDeferredUnscheduledPodDeletion {
 pub(crate) struct PodWorkqueue {
     store: Arc<PodStore>,
     unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
-    leadership: Option<watch::Receiver<bool>>,
+    leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     persistence: Arc<dyn PodWorkqueuePersistence>,
     supervisor: Arc<TaskSupervisor>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
@@ -251,7 +252,7 @@ impl PodWorkqueue {
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
-        leadership: watch::Receiver<bool>,
+        leader_coordination: Arc<dyn ControllerCoordination>,
     ) -> Arc<Self> {
         let unscheduled_deletion: Arc<dyn UnscheduledPodDeletion> =
             Arc::new(LeaderDeferredUnscheduledPodDeletion {
@@ -263,7 +264,7 @@ impl PodWorkqueue {
             supervisor,
             metrics,
             Some(unscheduled_deletion),
-            Some(leadership),
+            Some(leader_coordination),
         )
     }
 
@@ -273,12 +274,12 @@ impl PodWorkqueue {
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
         unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
-        leadership: Option<watch::Receiver<bool>>,
+        leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             unscheduled_deletion,
-            leadership,
+            leader_coordination,
             persistence: Arc::new(persistence),
             supervisor,
             metrics,
@@ -298,7 +299,7 @@ impl PodWorkqueue {
 
     pub(super) async fn start(self: &Arc<Self>) -> Result<()> {
         self.start_called.store(true, Ordering::Release);
-        if self.leadership.is_some() {
+        if self.leader_coordination.is_some() {
             self.ensure_reconciler_started().await?;
         }
         Ok(())
@@ -307,6 +308,15 @@ impl PodWorkqueue {
     #[cfg(test)]
     pub(super) fn start_called(&self) -> bool {
         self.start_called.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn current_test_leader_lease(&self) -> Option<ControllerLease> {
+        self.leader_coordination.as_ref().map(|coordination| {
+            coordination
+                .try_acquire(ControllerScope::Cluster)
+                .expect("test leader coordination must be authoritative")
+        })
     }
 
     pub(super) fn set_lifecycle_router_for_node(
@@ -429,49 +439,49 @@ impl PodWorkqueue {
 
     async fn reconciler_loop(self: Arc<Self>) {
         let cancel = self.supervisor.root_cancellation_token();
-        let mut leadership = self.leadership.clone();
-        let mut was_leader = false;
-        let mut scan_on_gain = leadership
-            .as_ref()
-            .is_some_and(|receiver| *receiver.borrow());
+        let mut leader_lease: Option<ControllerLease> = None;
+        let mut scan_on_gain = false;
         loop {
-            if let Some(receiver) = leadership.as_mut() {
-                while !*receiver.borrow() {
+            if let Some(coordination) = self.leader_coordination.as_ref()
+                && leader_lease.is_none()
+            {
+                leader_lease = Some(tokio::select! {
+                    result = coordination.acquire(ControllerScope::Cluster) => {
+                        match result {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                tracing::warn!(%error, "pod_workqueue: leader coordination closed");
+                                return;
+                            }
+                        }
+                    }
+                    _ = cancel.cancelled() => return,
+                });
+                scan_on_gain = true;
+            }
+            if self.leader_coordination.is_some() && scan_on_gain {
+                if let Err(error) = self
+                    .enqueue_terminating_unbound_pods_on_leadership_gain()
+                    .await
+                {
+                    tracing::warn!(%error, "pod_workqueue: leadership handoff discovery failed");
                     tokio::select! {
-                        changed = receiver.changed() => {
-                            if changed.is_err() { return; }
-                            scan_on_gain = observe_leadership(receiver, &mut was_leader);
+                        _ = self.supervisor.sleep(
+                            "pod_workqueue_leadership_handoff_retry",
+                            Duration::from_millis(250),
+                        ) => {}
+                        _ = coordination_revoked(
+                            &self.leader_coordination,
+                            &leader_lease,
+                        ) => {
+                            leader_lease = None;
                         }
                         _ = cancel.cancelled() => return,
                     }
+                    scan_on_gain = leader_lease.is_some();
+                    continue;
                 }
-                if scan_on_gain {
-                    if let Err(error) = self
-                        .enqueue_terminating_unbound_pods_on_leadership_gain()
-                        .await
-                    {
-                        tracing::warn!(%error, "pod_workqueue: leadership handoff discovery failed");
-                        tokio::select! {
-                            _ = self.supervisor.sleep(
-                                "pod_workqueue_leadership_handoff_retry",
-                                Duration::from_millis(250),
-                            ) => {}
-                            changed = receiver.changed() => {
-                                if changed.is_err() { return; }
-                            }
-                            _ = cancel.cancelled() => return,
-                        }
-                        scan_on_gain = if *receiver.borrow() {
-                            true
-                        } else {
-                            observe_leadership(receiver, &mut was_leader)
-                        };
-                        continue;
-                    }
-                    scan_on_gain = false;
-                    was_leader = true;
-                    let _ = receiver.borrow_and_update();
-                }
+                scan_on_gain = false;
             }
             let next_due = match self.persistence.peek_next_due().await {
                 Ok(v) => v,
@@ -492,11 +502,11 @@ impl PodWorkqueue {
                 None => {
                     tokio::select! {
                         _ = self.wake.notified() => {}
-                        changed = leadership_changed(&mut leadership) => {
-                            if changed.is_err() { return; }
-                            scan_on_gain = leadership.as_mut().is_some_and(|receiver| {
-                                observe_leadership(receiver, &mut was_leader)
-                            });
+                        _ = coordination_revoked(
+                            &self.leader_coordination,
+                            &leader_lease,
+                        ) => {
+                            leader_lease = None;
                         }
                         _ = cancel.cancelled() => return,
                     }
@@ -509,11 +519,11 @@ impl PodWorkqueue {
                         tokio::select! {
                             _ = self.supervisor.sleep("pod_workqueue_sleep_until_due", sleep_for) => {}
                             _ = self.wake.notified() => continue,
-                            changed = leadership_changed(&mut leadership) => {
-                                if changed.is_err() { return; }
-                                scan_on_gain = leadership.as_mut().is_some_and(|receiver| {
-                                    observe_leadership(receiver, &mut was_leader)
-                                });
+                            _ = coordination_revoked(
+                                &self.leader_coordination,
+                                &leader_lease,
+                            ) => {
+                                leader_lease = None;
                                 continue;
                             }
                             _ = cancel.cancelled() => return,
@@ -536,11 +546,7 @@ impl PodWorkqueue {
                     continue;
                 }
             };
-            if self
-                .leadership
-                .as_ref()
-                .is_some_and(|receiver| !*receiver.borrow())
-            {
+            if !coordination_is_current(&self.leader_coordination, &leader_lease) {
                 self.park_claimed_row(row, "leadership lost before deferred delete")
                     .await;
                 continue;
@@ -565,16 +571,21 @@ impl PodWorkqueue {
             }
 
             let this = self.clone();
+            let task_lease = leader_lease.clone();
             let _ = self
                 .supervisor
                 .spawn_async(category, "pod_workqueue_retry", async move {
-                    this.run_retry(row).await;
+                    this.run_retry(row, task_lease).await;
                 })
                 .await;
         }
     }
 
-    async fn run_retry(self: Arc<Self>, mut row: PodWorkqueueEntry) {
+    async fn run_retry(
+        self: Arc<Self>,
+        mut row: PodWorkqueueEntry,
+        leader_lease: Option<ControllerLease>,
+    ) {
         let target_node = row
             .payload
             .get(POD_DELETE_TARGET_NODE_PAYLOAD_KEY)
@@ -599,21 +610,17 @@ impl PodWorkqueue {
             }
         };
 
+        if !coordination_is_current(&self.leader_coordination, &leader_lease) {
+            self.park_claimed_row(row, "leadership lost during deferred delete")
+                .await;
+            return;
+        }
         if result.is_ok() {
             let _ = self.persistence.complete(row.id).await;
             return;
         }
 
         let err = result.expect_err("error is present");
-        if self
-            .leadership
-            .as_ref()
-            .is_some_and(|receiver| !*receiver.borrow())
-        {
-            self.park_claimed_row(row, "leadership lost during deferred delete")
-                .await;
-            return;
-        }
         if row.attempt_count >= MAX_ATTEMPTS {
             let _ = self
                 .persistence
@@ -1068,20 +1075,25 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-async fn leadership_changed(
-    leadership: &mut Option<watch::Receiver<bool>>,
-) -> Result<(), watch::error::RecvError> {
-    match leadership {
-        Some(receiver) => receiver.changed().await,
-        None => std::future::pending().await,
+fn coordination_is_current(
+    coordination: &Option<Arc<dyn ControllerCoordination>>,
+    lease: &Option<ControllerLease>,
+) -> bool {
+    match (coordination, lease) {
+        (Some(coordination), Some(lease)) => coordination.validate(lease).is_ok(),
+        (None, None) => true,
+        _ => false,
     }
 }
 
-fn observe_leadership(receiver: &mut watch::Receiver<bool>, was_leader: &mut bool) -> bool {
-    let is_leader = *receiver.borrow_and_update();
-    let gained = is_leader && !*was_leader;
-    *was_leader = is_leader;
-    gained
+async fn coordination_revoked(
+    coordination: &Option<Arc<dyn ControllerCoordination>>,
+    lease: &Option<ControllerLease>,
+) {
+    match (coordination, lease) {
+        (Some(coordination), Some(lease)) => coordination.wait_for_revocation(lease).await,
+        _ => std::future::pending().await,
+    }
 }
 
 fn pod_delete_target_payload(target_node: Option<&str>) -> Value {
@@ -1122,6 +1134,108 @@ mod tests {
     use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
     use crate::kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
     use crate::side_effects::SideEffectMetrics;
+
+    #[derive(Clone, Copy)]
+    struct TestCoordinationState {
+        local: bool,
+        generation: u64,
+    }
+
+    struct TestCoordination {
+        receiver: tokio::sync::watch::Receiver<TestCoordinationState>,
+    }
+
+    struct TestCoordinationFence(u64);
+
+    impl ControllerCoordination for TestCoordination {
+        fn try_acquire(
+            &self,
+            scope: ControllerScope,
+        ) -> Result<ControllerLease, klights_leader_api::ControllerCoordinationError> {
+            let state = *self.receiver.borrow();
+            if state.local {
+                Ok(ControllerLease::issue(
+                    scope,
+                    TestCoordinationFence(state.generation),
+                ))
+            } else {
+                Err(klights_leader_api::ControllerCoordinationError::Unavailable)
+            }
+        }
+
+        fn acquire(
+            &self,
+            scope: ControllerScope,
+        ) -> klights_leader_api::ControllerAcquireFuture<'_> {
+            let mut receiver = self.receiver.clone();
+            Box::pin(async move {
+                loop {
+                    let state = *receiver.borrow_and_update();
+                    if state.local {
+                        return Ok(ControllerLease::issue(
+                            scope,
+                            TestCoordinationFence(state.generation),
+                        ));
+                    }
+                    receiver
+                        .changed()
+                        .await
+                        .map_err(|_| klights_leader_api::ControllerCoordinationError::Closed)?;
+                }
+            })
+        }
+
+        fn validate(
+            &self,
+            lease: &ControllerLease,
+        ) -> Result<(), klights_leader_api::ControllerCoordinationError> {
+            let state = *self.receiver.borrow();
+            if !state.local {
+                Err(klights_leader_api::ControllerCoordinationError::Unavailable)
+            } else if !lease
+                .adapter_fence::<TestCoordinationFence>()
+                .is_some_and(|fence| fence.0 == state.generation)
+            {
+                Err(klights_leader_api::ControllerCoordinationError::StalePermit)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_for_revocation<'a>(
+            &'a self,
+            lease: &'a ControllerLease,
+        ) -> klights_leader_api::ControllerRevocationFuture<'a> {
+            let mut receiver = self.receiver.clone();
+            let generation = lease
+                .adapter_fence::<TestCoordinationFence>()
+                .map_or(0, |fence| fence.0);
+            Box::pin(async move {
+                loop {
+                    let state = *receiver.borrow_and_update();
+                    if !state.local || state.generation != generation {
+                        return;
+                    }
+                    if receiver.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    fn test_coordination(
+        local: bool,
+    ) -> (
+        Arc<dyn ControllerCoordination>,
+        tokio::sync::watch::Sender<TestCoordinationState>,
+    ) {
+        let (sender, receiver) = tokio::sync::watch::channel(TestCoordinationState {
+            local,
+            generation: 1,
+        });
+        (Arc::new(TestCoordination { receiver }), sender)
+    }
 
     #[derive(Default)]
     struct RecordingGcPodDeleteSink {
@@ -1195,13 +1309,9 @@ mod tests {
         ));
         let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let metrics = SideEffectMetrics::new();
-        let workqueue = PodWorkqueue::new_leader(
-            store,
-            node_local.clone(),
-            supervisor,
-            metrics,
-            crate::control_plane::client::local::always_leader_watch(),
-        );
+        let (coordination, _publisher) = test_coordination(true);
+        let workqueue =
+            PodWorkqueue::new_leader(store, node_local.clone(), supervisor, metrics, coordination);
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db, node_local)
     }
@@ -1231,13 +1341,13 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = super::super::test_node_local_store(supervisor.clone()).await;
-        let (leader_tx, leader_rx) = tokio::sync::watch::channel(false);
+        let (coordination, leader_tx) = test_coordination(false);
         let workqueue = PodWorkqueue::new_leader(
             store,
             node_local.clone(),
             supervisor.clone(),
             SideEffectMetrics::new(),
-            leader_rx,
+            coordination,
         );
         db.create_resource(
             "v1",
@@ -1272,7 +1382,10 @@ mod tests {
                 .is_none()
         );
 
-        leader_tx.send(true).unwrap();
+        leader_tx.send_replace(TestCoordinationState {
+            local: true,
+            generation: 2,
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if db
@@ -2149,7 +2262,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
-        workqueue.clone().run_retry(focused_entry(row)).await;
+        let lease = workqueue.current_test_leader_lease();
+        workqueue.clone().run_retry(focused_entry(row), lease).await;
 
         // The local actor must NOT be woken for a remote pod.
         assert!(
@@ -2433,7 +2547,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
-        workqueue.clone().run_retry(focused_entry(row)).await;
+        let lease = workqueue.current_test_leader_lease();
+        workqueue.clone().run_retry(focused_entry(row), lease).await;
 
         // The pod must STILL exist in the datastore — remote leader workqueue
         // retries are actor wakeup/reminder state only.

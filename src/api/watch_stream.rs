@@ -2470,10 +2470,9 @@ mod tests {
                     .unwrap(),
             );
             let topic = WatchTopic::new("v1", "ConfigMap");
-            let signal_rx =
-                WatchSignalReceiver::new(vec![crate::watch_commit_observation_adapter::subscribe(
-                    &db, topic,
-                )]);
+            let signal_rx = WatchSignalReceiver::new(vec![
+                crate::watch_commit_observation_adapter::subscribe_from_db(&db, topic),
+            ]);
             db.close();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let body =

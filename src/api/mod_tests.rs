@@ -5512,7 +5512,7 @@ async fn test_raft_follower_proxy_forwards_authenticated_client_cert_identity_he
     let mut state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
+    state.operational_mut().authority_router = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     let app = crate::api::build_router(state);
@@ -5675,7 +5675,7 @@ async fn raft_follower_health_endpoints_bypass_leader_proxy() {
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
 
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
+    follower_state.operational_mut().authority_router = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     let app = crate::api::build_router(follower_state);
@@ -5737,7 +5737,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     }
 
     let mut leader_state = crate::api::test_support::build_test_app_state().await;
-    leader_state.operational_mut().is_raft_leader_rx = Some(raft_proxy(true));
+    leader_state.operational_mut().authority_router = Some(raft_proxy(true));
     leader_state
         .resource_mutation_mut()
         .db
@@ -5794,7 +5794,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     );
 
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.operational_mut().is_raft_leader_rx = Some(raft_proxy(false));
+    follower_state.operational_mut().authority_router = Some(raft_proxy(false));
     follower_state
         .resource_mutation()
         .db
@@ -5918,7 +5918,7 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
     }
 
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.operational_mut().is_raft_leader_rx = Some(raft_proxy_without_leader());
+    follower_state.operational_mut().authority_router = Some(raft_proxy_without_leader());
 
     for (method, uri, body) in [
         ("GET", "/api/v1/nodes/worker-a", None),
@@ -5953,7 +5953,7 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
     let mut follower_state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    follower_state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
+    follower_state.operational_mut().authority_router = Some(std::sync::Arc::new(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
     follower_state

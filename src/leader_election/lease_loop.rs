@@ -1,424 +1,286 @@
-//! T2 step 2: lease-loop orchestrator.
+//! Event-driven controller lease orchestration.
 //!
-//! Runs `on_leader` each time this node acquires the cluster leader
-//! lease. Re-acquires on every rising edge of `is_leader_rx` (false →
-//! true), and tears `on_leader`'s tasks down via the
-//! `LeaderLease::cancel` token when leadership is lost.
-//!
-//! Event-driven: awaits `is_leader_rx.changed()` and
-//! `lease.cancel.cancelled()`. No polling, no sleeps.
-//!
-//! HR #9: the inputs are ports — `Arc<dyn LeaderElection>` plus a
-//! `watch::Receiver<bool>` for the leader edge. Tests drive both via a
-//! `MockLeaderElection` and a `watch::channel`, so leader→lost→regain
-//! cycles are deterministic without a real raft cluster.
-//!
-//! HR #1, #2: callers spawn this loop via `TaskSupervisor::spawn_async`
-//! and bind `on_leader`'s child tasks to the lease cancel token. No raw
-//! Tokio timers.
+//! The loop depends only on the neutral coordination capability. The embedded
+//! adapter waits for authority changes and validates an opaque generation
+//! fence; controller code never receives a boolean leader signal.
 
 use std::future::Future;
 use std::sync::Arc;
 
+use klights_leader_api::{ControllerCoordination, ControllerScope};
 use tokio_util::sync::CancellationToken;
 
-use super::{LeaderElection, LeaderScope};
-
 pub async fn run_under_lease<F, Fut>(
-    election: Arc<dyn LeaderElection>,
-    scope: LeaderScope,
-    mut is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    coordination: Arc<dyn ControllerCoordination>,
+    scope: ControllerScope,
     shutdown: CancellationToken,
     on_leader: F,
 ) where
-    F: Fn(LeaderScope, CancellationToken) -> Fut + Send + Sync + 'static,
+    F: Fn(ControllerScope, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     loop {
-        // Wait for is_leader == true (or shutdown). `borrow_and_update`
-        // marks the current version as seen so the next `changed()`
-        // waits for an actual transition rather than resolving
-        // immediately on a stale pending value.
-        loop {
-            if *is_leader_rx.borrow_and_update() {
-                break;
-            }
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                changed = is_leader_rx.changed() => {
-                    if changed.is_err() {
-                        // Watch sender dropped; treat as shutdown.
+        let lease = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            result = coordination.acquire(scope.clone()) => {
+                match result {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        tracing::warn!(%error, ?scope, "controller coordination closed");
                         return;
                     }
                 }
             }
+        };
+        if let Err(error) = coordination.validate(&lease) {
+            tracing::debug!(%error, ?scope, "controller lease changed before startup");
+            continue;
         }
 
-        // Try to acquire the lease. If the election backend says we
-        // are not leader (raced with a step-down between the watch
-        // edge and the call), drop back to waiting on the next change.
-        let lease = match election.acquire(scope.clone()).await {
-            Ok(lease) => lease,
-            Err(_err) => {
-                // Wait for the next leader-state change before retrying.
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    changed = is_leader_rx.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let lease_cancel = lease.cancel.clone();
-        // Hand the lease cancel token to the controller starter. It MUST
-        // bind every task it spawns to a child of this token so lease loss
-        // tears them down.
-        on_leader(scope.clone(), lease_cancel.clone()).await;
-
-        // Wait for the lease to be revoked (RaftLeaderLease's internal
-        // metrics watcher cancels on leadership loss) or shutdown.
+        let lease_cancel = shutdown.child_token();
+        let startup = on_leader(scope.clone(), lease_cancel.clone());
+        tokio::pin!(startup);
+        let revocation = coordination.wait_for_revocation(&lease);
+        tokio::pin!(revocation);
         tokio::select! {
-            _ = lease_cancel.cancelled() => {
-                // Drop the lease handle so any per-lease resources release.
-                drop(lease);
-                // A lease token may be cancelled independently from the
-                // leadership watch. Do not reacquire while the last observed
-                // value is still `true`; wait until we observe a non-leader
-                // state, then the outer loop will require the next true edge.
-                loop {
-                    if !*is_leader_rx.borrow_and_update() {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        changed = is_leader_rx.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
             _ = shutdown.cancelled() => {
-                drop(lease);
+                lease_cancel.cancel();
                 return;
             }
+            _ = &mut revocation => {
+                lease_cancel.cancel();
+                continue;
+            }
+            _ = &mut startup => {}
         }
-    }
-}
 
-/// Deterministic [`LeaderElection`] for unit tests.
-///
-/// `acquire` always returns a fresh lease whose `cancel` is a child of
-/// the supplied root cancellation token. Tests can fire the lease's
-/// cancel token to simulate leadership loss, and inspect
-/// `acquire_count` to count re-acquisitions.
-#[cfg(test)]
-pub struct MockLeaderElection {
-    root_cancel: CancellationToken,
-    acquire_count: std::sync::atomic::AtomicUsize,
-    last_lease_cancel: tokio::sync::Mutex<Option<CancellationToken>>,
-    fail_n: std::sync::atomic::AtomicUsize,
-}
-
-#[cfg(test)]
-impl MockLeaderElection {
-    pub fn new(root_cancel: CancellationToken) -> Arc<Self> {
-        Arc::new(Self {
-            root_cancel,
-            acquire_count: std::sync::atomic::AtomicUsize::new(0),
-            last_lease_cancel: tokio::sync::Mutex::new(None),
-            fail_n: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-
-    pub fn acquire_count(&self) -> usize {
-        self.acquire_count.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub async fn cancel_current_lease(&self) {
-        if let Some(c) = self.last_lease_cancel.lock().await.as_ref() {
-            c.cancel();
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                lease_cancel.cancel();
+                return;
+            }
+            _ = coordination.wait_for_revocation(&lease) => {
+                lease_cancel.cancel();
+            }
         }
-    }
-
-    /// Cause the next `n` `acquire` calls to fail (simulating a
-    /// step-down race between leader-edge and acquire).
-    pub fn script_fail_next(&self, n: usize) {
-        self.fail_n.store(n, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl LeaderElection for MockLeaderElection {
-    async fn acquire(&self, scope: LeaderScope) -> Result<super::LeaderLease, super::LeaderError> {
-        if self
-            .fail_n
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |n| if n > 0 { Some(n - 1) } else { None },
-            )
-            .is_ok()
-        {
-            return Err(super::LeaderError::AcquireFailed(scope));
-        }
-        let cancel = self.root_cancel.child_token();
-        *self.last_lease_cancel.lock().await = Some(cancel.clone());
-        self.acquire_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(super::LeaderLease { scope, cancel })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use klights_leader_api::{
+        ControllerAcquireFuture, ControllerCoordinationError, ControllerLease,
+        ControllerRevocationFuture,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
     use tokio::sync::Notify;
 
-    #[tokio::test]
-    async fn acquires_on_leader_edge_and_invokes_on_leader_once() {
-        let root = CancellationToken::new();
-        let election = MockLeaderElection::new(root.clone());
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = calls.clone();
-        let on_leader_done = Arc::new(Notify::new());
-        let on_leader_done_for_closure = on_leader_done.clone();
+    #[derive(Clone, Copy, Debug)]
+    struct CoordinationState {
+        local: bool,
+        generation: u64,
+    }
 
-        let election_dyn: Arc<dyn LeaderElection> = election.clone();
-        let shutdown = CancellationToken::new();
-        let shutdown_for_loop = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            run_under_lease(
-                election_dyn,
-                LeaderScope::Cluster,
-                rx,
-                shutdown_for_loop,
-                move |_scope, _cancel| {
-                    let calls = calls_for_closure.clone();
-                    let notify = on_leader_done_for_closure.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        notify.notify_one();
+    struct FakeCoordination {
+        receiver: tokio::sync::watch::Receiver<CoordinationState>,
+    }
+
+    struct FakeCoordinationFence(u64);
+
+    impl ControllerCoordination for FakeCoordination {
+        fn try_acquire(
+            &self,
+            scope: ControllerScope,
+        ) -> Result<ControllerLease, ControllerCoordinationError> {
+            let state = *self.receiver.borrow();
+            if state.local {
+                Ok(ControllerLease::issue(
+                    scope,
+                    FakeCoordinationFence(state.generation),
+                ))
+            } else {
+                Err(ControllerCoordinationError::Unavailable)
+            }
+        }
+
+        fn acquire(&self, scope: ControllerScope) -> ControllerAcquireFuture<'_> {
+            let mut receiver = self.receiver.clone();
+            Box::pin(async move {
+                loop {
+                    let state = *receiver.borrow_and_update();
+                    if state.local {
+                        return Ok(ControllerLease::issue(
+                            scope,
+                            FakeCoordinationFence(state.generation),
+                        ));
                     }
-                },
-            )
-            .await;
+                    receiver
+                        .changed()
+                        .await
+                        .map_err(|_| ControllerCoordinationError::Closed)?;
+                }
+            })
+        }
+
+        fn validate(&self, lease: &ControllerLease) -> Result<(), ControllerCoordinationError> {
+            let state = *self.receiver.borrow();
+            if !state.local {
+                Err(ControllerCoordinationError::Unavailable)
+            } else if !lease
+                .adapter_fence::<FakeCoordinationFence>()
+                .is_some_and(|fence| fence.0 == state.generation)
+            {
+                Err(ControllerCoordinationError::StalePermit)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_for_revocation<'a>(
+            &'a self,
+            lease: &'a ControllerLease,
+        ) -> ControllerRevocationFuture<'a> {
+            let mut receiver = self.receiver.clone();
+            let generation = lease
+                .adapter_fence::<FakeCoordinationFence>()
+                .map_or(0, |fence| fence.0);
+            Box::pin(async move {
+                loop {
+                    let state = *receiver.borrow_and_update();
+                    if !state.local || state.generation != generation {
+                        return;
+                    }
+                    if receiver.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    fn coordination(
+        local: bool,
+    ) -> (
+        Arc<dyn ControllerCoordination>,
+        tokio::sync::watch::Sender<CoordinationState>,
+    ) {
+        let (sender, receiver) = tokio::sync::watch::channel(CoordinationState {
+            local,
+            generation: 1,
         });
-
-        // Rising edge: false → true.
-        tx.send(true).unwrap();
-        on_leader_done.notified().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(election.acquire_count(), 1);
-
-        // Tear down.
-        shutdown.cancel();
-        handle.await.unwrap();
+        (Arc::new(FakeCoordination { receiver }), sender)
     }
 
     #[tokio::test]
-    async fn reacquires_after_lease_loss_on_next_leader_edge() {
-        let root = CancellationToken::new();
-        let election = MockLeaderElection::new(root.clone());
-        let (tx, rx) = tokio::sync::watch::channel(false);
+    async fn waits_for_authority_then_starts_once() {
+        let (coordination, publisher) = coordination(false);
         let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = calls.clone();
-        let lease_seen = Arc::new(Notify::new());
-        let lease_seen_for_closure = lease_seen.clone();
-
-        let election_dyn: Arc<dyn LeaderElection> = election.clone();
+        let calls_for_task = calls.clone();
+        let started = Arc::new(Notify::new());
+        let started_for_task = started.clone();
         let shutdown = CancellationToken::new();
-        let shutdown_for_loop = shutdown.clone();
-        let handle = tokio::spawn(async move {
+        let shutdown_for_task = shutdown.clone();
+
+        let task = tokio::spawn(async move {
             run_under_lease(
-                election_dyn,
-                LeaderScope::Cluster,
-                rx,
-                shutdown_for_loop,
+                coordination,
+                ControllerScope::Cluster,
+                shutdown_for_task,
                 move |_scope, _cancel| {
-                    let calls = calls_for_closure.clone();
-                    let notify = lease_seen_for_closure.clone();
+                    let calls = calls_for_task.clone();
+                    let started = started_for_task.clone();
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        notify.notify_one();
+                        started.notify_one();
                     }
                 },
             )
             .await;
         });
-
-        // First acquisition.
-        tx.send(true).unwrap();
-        lease_seen.notified().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        // Simulate leadership loss: cancel the lease cancel token AND
-        // drive is_leader_rx false → true to re-arm.
-        election.cancel_current_lease().await;
-        tx.send(false).unwrap();
-        // Yield so the loop observes lease-cancel + waits for edge.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "no re-acquire while not leader"
-        );
-
-        // Re-arm.
-        tx.send(true).unwrap();
-        lease_seen.notified().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(election.acquire_count(), 2);
-
-        shutdown.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_lease_does_not_reacquire_without_new_leader_edge() {
-        let root = CancellationToken::new();
-        let election = MockLeaderElection::new(root.clone());
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = calls.clone();
-        let lease_seen = Arc::new(Notify::new());
-        let lease_seen_for_closure = lease_seen.clone();
-
-        let election_dyn: Arc<dyn LeaderElection> = election.clone();
-        let shutdown = CancellationToken::new();
-        let shutdown_for_loop = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            run_under_lease(
-                election_dyn,
-                LeaderScope::Cluster,
-                rx,
-                shutdown_for_loop,
-                move |_scope, _cancel| {
-                    let calls = calls_for_closure.clone();
-                    let notify = lease_seen_for_closure.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        notify.notify_one();
-                    }
-                },
-            )
-            .await;
-        });
-
-        tx.send(true).unwrap();
-        lease_seen.notified().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        election.cancel_current_lease().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "lease cancellation while the watch still says leader must not spin-reacquire"
-        );
-        assert_eq!(election.acquire_count(), 1);
-
-        tx.send(false).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        tx.send(true).unwrap();
-        lease_seen.notified().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(election.acquire_count(), 2);
-
-        shutdown.cancel();
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_exits_loop_without_acquiring() {
-        let root = CancellationToken::new();
-        let election = MockLeaderElection::new(root.clone());
-        let (_tx, rx) = tokio::sync::watch::channel(false);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = calls.clone();
-
-        let election_dyn: Arc<dyn LeaderElection> = election.clone();
-        let shutdown = CancellationToken::new();
-        let shutdown_for_loop = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            run_under_lease(
-                election_dyn,
-                LeaderScope::Cluster,
-                rx,
-                shutdown_for_loop,
-                move |_scope, _cancel| {
-                    let calls = calls_for_closure.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                    }
-                },
-            )
-            .await;
-        });
-
-        // Immediately shut down before anyone becomes leader.
-        shutdown.cancel();
-        handle.await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(election.acquire_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn acquire_failure_retries_on_next_leader_edge() {
-        let root = CancellationToken::new();
-        let election = MockLeaderElection::new(root.clone());
-        election.script_fail_next(1);
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_closure = calls.clone();
-        let lease_seen = Arc::new(Notify::new());
-        let lease_seen_for_closure = lease_seen.clone();
-
-        let election_dyn: Arc<dyn LeaderElection> = election.clone();
-        let shutdown = CancellationToken::new();
-        let shutdown_for_loop = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            run_under_lease(
-                election_dyn,
-                LeaderScope::Cluster,
-                rx,
-                shutdown_for_loop,
-                move |_scope, _cancel| {
-                    let calls = calls_for_closure.clone();
-                    let notify = lease_seen_for_closure.clone();
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        notify.notify_one();
-                    }
-                },
-            )
-            .await;
-        });
-
-        // First leader edge — acquire fails by script.
-        tx.send(true).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // Flap to retry: false → true; this time acquire succeeds.
-        tx.send(false).unwrap();
-        tx.send(true).unwrap();
-        lease_seen.notified().await;
+        publisher.send_replace(CoordinationState {
+            local: true,
+            generation: 2,
+        });
+        started.notified().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        task.await.expect("join");
+    }
+
+    #[tokio::test]
+    async fn revocation_cancels_tasks_and_reacquires_after_promotion() {
+        let (coordination, publisher) = coordination(true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_task = calls.clone();
+        let (lease_tx, mut lease_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+
+        let task = tokio::spawn(async move {
+            run_under_lease(
+                coordination,
+                ControllerScope::Cluster,
+                shutdown_for_task,
+                move |_scope, cancel| {
+                    let calls = calls_for_task.clone();
+                    let lease_tx = lease_tx.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        lease_tx.send(cancel).expect("lease observer");
+                    }
+                },
+            )
+            .await;
+        });
+
+        let first = lease_rx.recv().await.expect("first lease");
+        publisher.send_replace(CoordinationState {
+            local: false,
+            generation: 2,
+        });
+        first.cancelled().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+        publisher.send_replace(CoordinationState {
+            local: true,
+            generation: 3,
+        });
+        let second = lease_rx.recv().await.expect("second lease");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!second.is_cancelled());
+
         shutdown.cancel();
-        handle.await.unwrap();
+        task.await.expect("join");
+        assert!(second.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn shutdown_while_standby_exits_without_starting() {
+        let (coordination, _publisher) = coordination(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_task = calls.clone();
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let task = tokio::spawn(async move {
+            run_under_lease(
+                coordination,
+                ControllerScope::Cluster,
+                shutdown_for_task,
+                move |_scope, _cancel| {
+                    let calls = calls_for_task.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .await;
+        });
+        shutdown.cancel();
+        task.await.expect("join");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

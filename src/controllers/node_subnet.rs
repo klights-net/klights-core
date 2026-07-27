@@ -563,7 +563,7 @@ async fn run_peer_watch_with_components_inner(
     cluster_cidr: String,
     peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
-    raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+    authority: Option<std::sync::Arc<dyn klights_leader_api::LeaderAuthority>>,
     dataplane_health: Option<DataplaneHealth>,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
     node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
@@ -571,7 +571,7 @@ async fn run_peer_watch_with_components_inner(
 ) {
     let topic = WatchTopic::new("v1", "Node");
     let mut cursor = SignalWatchCursor::new(
-        crate::watch_commit_observation_adapter::subscribe(&db, topic.clone()),
+        crate::watch_commit_observation_adapter::subscribe_from_db(&db, topic.clone()),
         DatastoreWatchReplaySource::new(
             std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
                 db.clone(),
@@ -669,9 +669,14 @@ async fn run_peer_watch_with_components_inner(
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                 {
-                    let can_write_cluster_state = raft_leader_proxy
-                        .as_ref()
-                        .is_none_or(|proxy| proxy.is_leader());
+                    let can_write_cluster_state = authority.as_ref().is_none_or(|authority| {
+                        let klights_leader_api::AuthorityRoute::Local(permit) =
+                            authority.route()
+                        else {
+                            return false;
+                        };
+                        authority.validate(&permit).is_ok()
+                    });
                     if let Err(e) = reconcile_peer_node_event_cluster_state(
                         db.as_ref(),
                         &my_node_name,

@@ -9,6 +9,7 @@ use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 
 struct LeaderCrdRegistryRuntime {
     db: DatastoreHandle,
+    positioned_watch: klights_watch::PositionedWatchService,
 }
 
 #[async_trait]
@@ -65,10 +66,7 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
             Some(listing.resource_version),
             listing.watch_replay_position,
         )?;
-        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
-            self.db.clone(),
-        );
-        let events = positioned.watch_resources(request).await?;
+        let events = self.positioned_watch.watch_resources(request).await?;
         Ok(CrdRegistryWatchSession {
             initial_values: listing
                 .items
@@ -80,6 +78,16 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
     }
 }
 
-pub(crate) fn new_runtime(db: DatastoreHandle) -> Arc<dyn CrdRegistryRuntime> {
-    Arc::new(LeaderCrdRegistryRuntime { db })
+pub(crate) fn new_runtime(
+    db: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+) -> Arc<dyn CrdRegistryRuntime> {
+    let positioned_watch = crate::control_plane::client::local::datastore_positioned_watch_service(
+        db.clone(),
+        watch_signals,
+    );
+    Arc::new(LeaderCrdRegistryRuntime {
+        db,
+        positioned_watch,
+    })
 }

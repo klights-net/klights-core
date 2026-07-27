@@ -14,6 +14,7 @@ use klights_supervisor::TaskSupervisor;
 struct LeaderCronJobSchedulerRuntime {
     db: DatastoreHandle,
     dispatcher: Arc<ControllerDispatcher>,
+    positioned_watch: klights_watch::PositionedWatchService,
 }
 
 #[async_trait]
@@ -60,10 +61,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
             Some(listing.resource_version),
             listing.watch_replay_position,
         )?;
-        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
-            self.db.clone(),
-        );
-        let events = positioned.watch_resources(request).await?;
+        let events = self.positioned_watch.watch_resources(request).await?;
         Ok(CronJobWatchSession {
             initial_resources: listing.items,
             events,
@@ -73,11 +71,20 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
 
 pub(crate) fn new_leader_scheduler(
     db: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     dispatcher: Arc<ControllerDispatcher>,
     supervisor: Arc<TaskSupervisor>,
 ) -> Arc<CronJobScheduler> {
     CronJobScheduler::new(
-        Arc::new(LeaderCronJobSchedulerRuntime { db, dispatcher }),
+        Arc::new(LeaderCronJobSchedulerRuntime {
+            positioned_watch:
+                crate::control_plane::client::local::datastore_positioned_watch_service(
+                    db.clone(),
+                    watch_signals,
+                ),
+            db,
+            dispatcher,
+        }),
         supervisor,
     )
 }
@@ -117,6 +124,11 @@ mod tests {
             ),
         );
         let runtime = LeaderCronJobSchedulerRuntime {
+            positioned_watch:
+                crate::control_plane::client::local::datastore_positioned_watch_service(
+                    db_handle.clone(),
+                    crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
+                ),
             db: db_handle,
             dispatcher,
         };

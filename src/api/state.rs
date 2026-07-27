@@ -343,7 +343,7 @@ pub(crate) struct ApiOperationalServices {
     pub(crate) cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     pub(crate) task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) file_process: klights_supervisor::FileProcessExecutor,
-    pub(crate) is_raft_leader_rx: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+    pub(crate) authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
 }
 
 impl ApiOperationalServices {
@@ -355,7 +355,7 @@ impl ApiOperationalServices {
         cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         file_process: klights_supervisor::FileProcessExecutor,
-        is_raft_leader_rx: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+        authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
     ) -> Self {
         Self {
             role,
@@ -364,7 +364,7 @@ impl ApiOperationalServices {
             cluster_status,
             task_supervisor,
             file_process,
-            is_raft_leader_rx,
+            authority_router,
         }
     }
 }
@@ -438,7 +438,7 @@ pub(crate) fn build_router_from_root(
     runtime_inputs: ApiRuntimeInputs,
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    is_raft_leader_rx: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
+    authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
 ) -> axum::Router {
     let role = match role {
         RootApiRole::Leader => ApiNodeRole::Leader,
@@ -511,7 +511,7 @@ pub(crate) fn build_router_from_root(
             cluster_status,
             task_supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(task_supervisor),
-            is_raft_leader_rx,
+            authority_router,
         ),
     );
     crate::api::routes::build_router_inner(state)

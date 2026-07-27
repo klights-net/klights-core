@@ -2,10 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use klights_cluster_core::{Resource, ResourcePreconditions};
-use klights_reconcile_api::{
-    GcForegroundDeleteCoordination, GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest,
-    GcPodDeleteSink,
-};
+use klights_reconcile_api::{GcForegroundDeleteCoordination, GcPodDeleteRequest, GcPodDeleteSink};
+#[cfg(test)]
+use klights_reconcile_api::{GcPodDeleteError, GcPodDeleteFuture};
 use klights_types::PodIdentity;
 use std::collections::HashSet;
 
@@ -48,8 +47,10 @@ const OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES: usize = 8;
 /// No-op sink for use in tests and contexts where Pod children will not
 /// be encountered. Returns a typed unavailable error if called for a Pod
 /// delete; tests involving Pod children must use a recording sink instead.
+#[cfg(test)]
 pub struct NoOpGcPodDeleteSink;
 
+#[cfg(test)]
 impl GcPodDeleteSink for NoOpGcPodDeleteSink {
     fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
         Box::pin(async {

@@ -22,6 +22,7 @@ pub use session::{
 };
 pub use signal::{
     DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchSignal, WatchSignalEvent,
-    WatchSignalFuture, WatchSignalHub, WatchSignalReceiveError, WatchSignalReceiver,
-    WatchSignalSubscribe, WatchSignalSubscription, WatchSignalTryReceiveError, WatchTopic,
+    WatchSignalFuture, WatchSignalHub, WatchSignalPublish, WatchSignalReceiveError,
+    WatchSignalReceiver, WatchSignalSubscribe, WatchSignalSubscription, WatchSignalTryReceiveError,
+    WatchTopic,
 };

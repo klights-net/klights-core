@@ -12,6 +12,7 @@ use crate::datastore::DatastoreHandle;
 
 pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
+    watch_source: Arc<crate::watch_stream_adapter::DatastoreWatchStreamAdapter>,
     file_process: klights_supervisor::FileProcessExecutor,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ca_cert_path: std::path::PathBuf,
@@ -20,11 +21,18 @@ pub(crate) struct GeneratedHandlerAdapter {
 impl GeneratedHandlerAdapter {
     pub(crate) fn new(
         db: DatastoreHandle,
+        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
         file_process: klights_supervisor::FileProcessExecutor,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         ca_cert_path: std::path::PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
+            watch_source: Arc::new(
+                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                    db.clone(),
+                    watch_signals,
+                ),
+            ),
             db,
             file_process,
             task_supervisor,
@@ -252,7 +260,7 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
         Box::pin(async move {
             crate::api::watch_stream::build_label_selector_watch_stream(
                 crate::api::watch_stream::LabelSelectorWatchStreamRequest {
-                    db: self.db.clone(),
+                    db: self.watch_source.clone(),
                     task_supervisor: self.task_supervisor.clone(),
                     api_version: &request.api_version,
                     kind: request.kind,

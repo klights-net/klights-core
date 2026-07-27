@@ -1,23 +1,51 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::datastore::{CommitObservation, CommitObservationSink, DatastoreHandle};
+use crate::datastore::{CommitObservation, CommitObservationSink};
+#[cfg(test)]
 use crate::watch::WatchBus;
 
-pub(crate) fn new_sink() -> Arc<dyn CommitObservationSink> {
-    Arc::new(WatchCommitObservationSink::new())
+pub(crate) struct WatchCommitWiring {
+    pub(crate) sink: Arc<dyn CommitObservationSink>,
+    pub(crate) signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
 }
 
-pub(crate) fn subscribe(
-    db: &DatastoreHandle,
-    topic: klights_watch::WatchTopic,
-) -> klights_watch::WatchSignalReceiver {
+pub(crate) fn new_wiring() -> WatchCommitWiring {
+    let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
+    let sink = Arc::new(WatchCommitObservationSink::new(hub.clone(), hub.clone()));
+    WatchCommitWiring { sink, signals: hub }
+}
+
+#[cfg(test)]
+pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
+    let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
+    Arc::new(WatchCommitObservationSink::new(hub.clone(), hub))
+}
+
+#[cfg(test)]
+pub(crate) fn test_signal_source(
+    db: &crate::datastore::DatastoreHandle,
+) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
     let sink = db.commit_observation_sink();
     sink.as_any()
         .downcast_ref::<WatchCommitObservationSink>()
-        .expect("cluster datastore was not composed with the root watch observation sink")
-        .bus
-        .subscribe_signals(topic)
+        .expect("test datastore watch sink")
+        .signal_source()
+}
+
+#[cfg(test)]
+pub(crate) fn subscribe_from_db(
+    db: &crate::datastore::DatastoreHandle,
+    topic: klights_watch::WatchTopic,
+) -> klights_watch::WatchSignalReceiver {
+    test_signal_source(db).subscribe(topic)
+}
+
+pub(crate) fn subscribe(
+    source: &dyn klights_watch::WatchSignalSubscribe,
+    topic: klights_watch::WatchTopic,
+) -> klights_watch::WatchSignalReceiver {
+    source.subscribe(topic)
 }
 
 #[cfg(test)]
@@ -28,35 +56,37 @@ pub(crate) fn subscribe_from_sink(
     sink.as_any()
         .downcast_ref::<WatchCommitObservationSink>()
         .expect("cluster datastore was not composed with the root watch observation sink")
-        .bus
-        .subscribe_signals(topic)
-}
-
-pub(crate) trait WatchSignalSource: Send + Sync {
-    fn subscribe_signals(
-        &self,
-        topic: klights_watch::WatchTopic,
-    ) -> klights_watch::WatchSignalReceiver;
-}
-
-impl WatchSignalSource for crate::datastore::DatastoreBackendWatchStore {
-    fn subscribe_signals(
-        &self,
-        topic: klights_watch::WatchTopic,
-    ) -> klights_watch::WatchSignalReceiver {
-        subscribe(&self.db(), topic)
-    }
+        .signals
+        .subscribe(topic)
 }
 
 pub(crate) struct WatchCommitObservationSink {
+    publisher: Arc<dyn klights_watch::WatchSignalPublish>,
+    #[cfg(test)]
+    signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    #[cfg(test)]
     bus: WatchBus,
 }
 
 impl WatchCommitObservationSink {
-    fn new() -> Self {
+    fn new(
+        publisher: Arc<dyn klights_watch::WatchSignalPublish>,
+        signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = signals;
         Self {
+            publisher,
+            #[cfg(test)]
+            signals,
+            #[cfg(test)]
             bus: WatchBus::new(1024),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signal_source(&self) -> Arc<dyn klights_watch::WatchSignalSubscribe> {
+        self.signals.clone()
     }
 }
 
@@ -102,10 +132,11 @@ impl CommitObservationSink for WatchCommitObservationSink {
                 .cmp(&(right.topic.api_version(), right.topic.kind()))
         });
         for signal in signals {
-            self.bus.publish_signal(signal);
+            self.publisher.publish(signal);
         }
     }
 
+    #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

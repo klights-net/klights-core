@@ -25,24 +25,75 @@ use crate::datastore::backend::WatchReplayAnchorStore;
 #[cfg(test)]
 use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 #[cfg(test)]
+use crate::replication::grpc::runtime_adapter::GrpcReplicationRuntimeAdapter;
+#[cfg(test)]
 use crate::replication::grpc::watch_replay_expired_status;
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_to_proto, resource_command_request_from_proto,
     watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 use crate::replication::protocol::{
-    FollowerControlMessage, JoinResponse, JoinRole, RoutedNodeExecFrame, RoutedNodeExecRequest,
-    RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse, RoutedNodeLogEvent,
-    RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
+    FollowerCompletionContext, FollowerControlMessage, JoinRequest, JoinResponse, JoinRole,
+    MetadataResponse, NodeOperationKind, ReplicationEntry, RoutedNodeExecFrame,
+    RoutedNodeExecRequest, RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse,
+    RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
-use crate::replication::service::{
-    FollowerCompletionContext, NodeOperationKind, ReplicationService,
-};
+#[cfg(test)]
+use crate::replication::service::ReplicationService;
 #[cfg(test)]
 use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
 use super::ca_files::ReplicationRuntimeFiles;
+
+/// Focused application handler used by the authenticated gRPC transport.
+///
+/// The transport owns no concrete replication application service. This
+/// contract moves with the transport in Phase 12A; the embedded replication
+/// adapter remains the implementation owner.
+#[async_trait::async_trait]
+pub(crate) trait GrpcReplicationRuntime: Send + Sync {
+    fn task_supervisor(&self) -> Arc<klights_supervisor::TaskSupervisor>;
+    async fn validate_controlplane_bootstrap_token(
+        &self,
+        token: &str,
+    ) -> Result<(), klights_leader_api::BootstrapTokenValidationError>;
+    async fn handle_authenticated_join(&self, request: JoinRequest) -> JoinResponse;
+    async fn register_follower(
+        &self,
+        dataplane: klights_leader_api::NetworkDataplane,
+    ) -> (tokio::sync::mpsc::Receiver<FollowerControlMessage>, u64);
+    async fn register_stream_follower(
+        &self,
+        node_name: String,
+        session_id: u64,
+    ) -> Result<tokio::sync::mpsc::Receiver<ReplicationEntry>>;
+    async fn update_follower_ack(&self, node_name: &str, applied_rv: i64);
+    async fn complete_node_exec_sync(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeExecSyncResponse,
+    ) -> Result<()>;
+    async fn complete_node_log_event(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeLogEvent,
+    ) -> Result<()>;
+    async fn complete_node_metrics(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeMetricsResponse,
+    ) -> Result<()>;
+    async fn complete_node_exec_stream_frame(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeExecFrame,
+    ) -> Result<()>;
+    async fn unregister_follower(&self, node_name: &str, session_id: u64);
+    async fn handle_metadata(&self) -> MetadataResponse;
+    async fn record_observed_peer_endpoint(&self, node_name: &str, endpoint: String);
+    async fn observed_peer_endpoint(&self, node_name: &str) -> Option<String>;
+}
 
 const MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS: i64 = 100;
 
@@ -414,7 +465,7 @@ impl ReplicationServerPorts {
 }
 
 pub struct GrpcReplicationServer {
-    service: Arc<ReplicationService>,
+    runtime: Arc<dyn GrpcReplicationRuntime>,
     ports: ReplicationServerPorts,
     #[cfg(test)]
     db: Option<DatastoreHandle>,
@@ -435,10 +486,8 @@ pub struct GrpcReplicationServer {
         Option<Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>>,
     /// Supervised reader for in-band CA distribution/signing material.
     controlplane_ca_files: ControlplaneCaFiles,
-    /// Raft leadership gate for leader-owned worker RPCs. When present,
-    /// follower controlplanes must reject writes/control streams instead of
-    /// updating follower-local cluster state.
-    is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Fenced authority for leader-owned worker RPCs.
+    authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     local_node_name: Option<String>,
     /// bug-grpc A1/B2: per-stream watch heartbeat cadence, from the shared
     /// `GrpcTransportPolicy`.
@@ -447,15 +496,15 @@ pub struct GrpcReplicationServer {
 
 impl GrpcReplicationServer {
     fn from_parts(
-        service: Arc<ReplicationService>,
+        runtime: Arc<dyn GrpcReplicationRuntime>,
         ports: ReplicationServerPorts,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
         #[cfg(test)] db: Option<DatastoreHandle>,
     ) -> Self {
-        let controlplane_ca_files = ControlplaneCaFiles::new(service.task_supervisor());
+        let controlplane_ca_files = ControlplaneCaFiles::new(runtime.task_supervisor());
         Self {
-            service,
+            runtime,
             ports,
             #[cfg(test)]
             db,
@@ -467,7 +516,7 @@ impl GrpcReplicationServer {
             raft_rpc_router: None,
             controlplane_join_handler: None,
             controlplane_ca_files,
-            is_leader_rx: None,
+            authority: None,
             local_node_name: None,
             watch_heartbeat_interval: Duration::MAX,
         }
@@ -505,13 +554,13 @@ impl GrpcReplicationServer {
     }
 
     pub(crate) fn new_with_ports(
-        service: Arc<ReplicationService>,
+        runtime: Arc<dyn GrpcReplicationRuntime>,
         ports: ReplicationServerPorts,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     ) -> Self {
         Self::from_parts(
-            service,
+            runtime,
             ports,
             peer_authenticator,
             credential_issuer,
@@ -592,7 +641,7 @@ impl GrpcReplicationServer {
         let ports = ReplicationServerPorts::from_shared(local, projected_token);
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         Self::from_parts(
-            service,
+            GrpcReplicationRuntimeAdapter::new(service),
             ports,
             Arc::new(
                 crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
@@ -650,9 +699,19 @@ impl GrpcReplicationServer {
             .await
     }
 
-    pub fn with_leader_gate(mut self, is_leader_rx: tokio::sync::watch::Receiver<bool>) -> Self {
-        self.is_leader_rx = Some(is_leader_rx);
+    pub fn with_authority(
+        mut self,
+        authority: Arc<dyn klights_leader_api::LeaderAuthority>,
+    ) -> Self {
+        self.authority = Some(authority);
         self
+    }
+
+    #[cfg(test)]
+    pub fn with_leader_gate(self, is_leader_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.with_authority(crate::authority_adapter::TestBooleanWatchAuthority::new(
+            is_leader_rx,
+        ))
     }
 
     pub fn with_local_node_name(mut self, node_name: impl Into<String>) -> Self {
@@ -664,31 +723,40 @@ impl GrpcReplicationServer {
     }
 
     fn require_raft_leader(&self) -> std::result::Result<(), Status> {
-        if self.is_leader_rx.as_ref().is_some_and(|rx| !*rx.borrow()) {
-            return Err(Status::failed_precondition("not raft leader"));
+        if let Some(authority) = &self.authority {
+            let klights_leader_api::AuthorityRoute::Local(permit) = authority.route() else {
+                return Err(Status::failed_precondition("not current leader authority"));
+            };
+            authority
+                .validate(&permit)
+                .map_err(|_| Status::failed_precondition("stale leader authority"))?;
         }
         Ok(())
     }
 
     fn sample_raft_leadership(
         &self,
-    ) -> std::result::Result<Option<tokio::sync::watch::Receiver<bool>>, Status> {
-        let Some(mut leadership_rx) = self.is_leader_rx.clone() else {
+    ) -> std::result::Result<Option<klights_leader_api::AuthorityPermit>, Status> {
+        let Some(authority) = &self.authority else {
             return Ok(None);
         };
-        if !*leadership_rx.borrow_and_update() {
-            return Err(Status::failed_precondition("not raft leader"));
-        }
-        Ok(Some(leadership_rx))
+        let klights_leader_api::AuthorityRoute::Local(permit) = authority.route() else {
+            return Err(Status::failed_precondition("not current leader authority"));
+        };
+        authority
+            .validate(&permit)
+            .map_err(|_| Status::failed_precondition("stale leader authority"))?;
+        Ok(Some(permit))
     }
 
     fn require_raft_leadership_unchanged(
-        leadership_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+        &self,
+        permit: Option<&klights_leader_api::AuthorityPermit>,
     ) -> std::result::Result<(), Status> {
-        if leadership_rx.is_some_and(|rx| rx.has_changed().unwrap_or(true)) {
-            return Err(Status::failed_precondition(
-                "raft leadership changed during leader-fresh read",
-            ));
+        if let (Some(authority), Some(permit)) = (&self.authority, permit) {
+            authority.validate(permit).map_err(|_| {
+                Status::failed_precondition("leader authority changed during leader-fresh read")
+            })?;
         }
         Ok(())
     }
@@ -762,7 +830,7 @@ impl GrpcReplicationServer {
             .ok_or_else(|| Status::unauthenticated("missing replication bootstrap token"))?
             .to_str()
             .map_err(|_| Status::unauthenticated("invalid replication bootstrap token metadata"))?;
-        self.service
+        self.runtime
             .validate_controlplane_bootstrap_token(supplied)
             .await
         .map_err(|err| {
@@ -1160,7 +1228,7 @@ pub fn mount_service_full_with_policy(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mount_service_full_production(
     app: axum::Router,
-    service: Arc<ReplicationService>,
+    runtime: Arc<dyn GrpcReplicationRuntime>,
     ports: ReplicationServerPorts,
     peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
     credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
@@ -1169,7 +1237,7 @@ pub(crate) fn mount_service_full_production(
         Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
     >,
     runtime_files: ReplicationRuntimeFiles,
-    is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     local_node_name: Option<String>,
     node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
@@ -1177,15 +1245,15 @@ pub(crate) fn mount_service_full_production(
     transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
     let mut grpc = GrpcReplicationServer::new_with_ports(
-        service,
+        runtime,
         ports,
         peer_authenticator,
         credential_issuer,
     )
     .with_runtime_files(runtime_files)
     .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
-    if let Some(is_leader_rx) = is_leader_rx {
-        grpc = grpc.with_leader_gate(is_leader_rx);
+    if let Some(authority) = authority {
+        grpc = grpc.with_authority(authority);
     }
     if let Some(local_node_name) = local_node_name {
         grpc = grpc.with_local_node_name(local_node_name);
@@ -1277,7 +1345,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             .transpose()
         {
             Ok(Some(())) => {
-                self.service
+                self.runtime
                     .handle_authenticated_join(crate::replication::protocol::JoinRequest {
                         token: String::new(),
                         node_name,
@@ -1311,20 +1379,20 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         }
         let joined_node_name = dataplane.node_name().to_string();
         let (mut control_rx, follower_session) = if accepted {
-            let (rx, session) = self.service.register_follower(dataplane.clone()).await;
+            let (rx, session) = self.runtime.register_follower(dataplane.clone()).await;
             (Some(rx), Some(session))
         } else {
             (None, None)
         };
         let first_response =
             join_response_to_proto(self.ports.topology_query.as_ref(), response).await?;
-        let service = self.service.clone();
+        let runtime = self.runtime.clone();
         let local_node_name_for_observed_endpoint = self.local_node_name.clone();
         let node_self_query_for_observed_endpoint = self.node_self_query.clone();
         let node_self_status_for_observed_endpoint = self.node_self_status.clone();
         let mut entries = if accepted {
             Some(
-                service
+                runtime
                     .register_stream_follower(
                         joined_node_name.clone(),
                         follower_session.expect("session must be set when accepted"),
@@ -1388,10 +1456,10 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                 // T6: legacy `Forward` payload removed. Workers now
                                 // route writes through outbox -> ApplyOutbox RPC.
                                 Some(klights_internal_protobuf::follower_message::Payload::Ack(ack)) => {
-                                    service.update_follower_ack(&joined_node_name, ack.applied_rv).await;
+                                    runtime.update_follower_ack(&joined_node_name, ack.applied_rv).await;
                                 }
                                 Some(klights_internal_protobuf::follower_message::Payload::NodeExecSyncResponse(response)) => {
-                                    if let Err(err) = service.complete_node_exec_sync(
+                                    if let Err(err) = runtime.complete_node_exec_sync(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
                                             follower_session.expect("accepted stream has a follower session"),
@@ -1403,7 +1471,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                     }
                                 }
                                 Some(klights_internal_protobuf::follower_message::Payload::PodLogResponse(response)) => {
-                                    if let Err(err) = service.complete_node_log_event(
+                                    if let Err(err) = runtime.complete_node_log_event(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
                                             follower_session.expect("accepted stream has a follower session"),
@@ -1415,7 +1483,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                     }
                                 }
                                 Some(klights_internal_protobuf::follower_message::Payload::NodeMetricsResponse(response)) => {
-                                    if let Err(err) = service.complete_node_metrics(
+                                    if let Err(err) = runtime.complete_node_metrics(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
                                             follower_session.expect("accepted stream has a follower session"),
@@ -1429,7 +1497,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                 Some(klights_internal_protobuf::follower_message::Payload::NodeExecStreamFrame(frame)) => {
                                     match node_exec_stream_frame_from_proto(frame) {
                                         Ok(frame) => {
-                                            if let Err(err) = service.complete_node_exec_stream_frame(
+                                            if let Err(err) = runtime.complete_node_exec_stream_frame(
                                                 FollowerCompletionContext::new(
                                                     &joined_node_name,
                                                     follower_session.expect("accepted stream has a follower session"),
@@ -1540,7 +1608,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                     }
                 }
                 if let Some(session) = follower_session {
-                    service.unregister_follower(&joined_node_name, session).await;
+                    runtime.unregister_follower(&joined_node_name, session).await;
                 }
             }
         };
@@ -1552,7 +1620,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         request: Request<klights_internal_protobuf::MetadataRequest>,
     ) -> std::result::Result<Response<klights_internal_protobuf::MetadataResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
-        let metadata = self.service.handle_metadata().await;
+        let metadata = self.runtime.handle_metadata().await;
         Ok(Response::new(klights_internal_protobuf::MetadataResponse {
             cluster_id: metadata.cluster_id,
             leader_epoch: metadata.leader_epoch,
@@ -1585,7 +1653,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             .get_resource(query)
             .await
             .map_err(|err| Status::unavailable(err.to_string()))?;
-        Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+        self.require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         Ok(Response::new(match resource {
             Some(resource) => klights_internal_protobuf::GetResourceResponse {
                 found: true,
@@ -1623,7 +1691,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             .list_resources(query)
             .await
             .map_err(|err| Status::unavailable(err.to_string()))?;
-        Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+        self.require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         let (items, resource_version, watch_replay_position, continue_token, remaining_item_count) =
             list.into_parts();
         let items: Vec<klights_internal_protobuf::ResourceObject> =
@@ -1701,10 +1769,11 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             let accepted_cursor = positioned_stream.accepted_cursor().ok_or_else(|| {
                 Status::internal("local positioned watch omitted its accepted session cursor")
             })?;
-            Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
-            let supervisor = self.service.task_supervisor();
+            self.require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+            let supervisor = self.runtime.task_supervisor();
             let heartbeat_interval = self.watch_heartbeat_interval;
-            let mut leader_rx = leadership_rx;
+            let authority = self.authority.clone();
+            let leader_permit = leadership_rx;
             let mut last_rv = accepted_cursor.resource_version().unwrap_or(0);
             let mut last_position = accepted_cursor
                 .replay_position()
@@ -1712,10 +1781,12 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             let stream = async_stream::stream! {
                 let mut positioned_stream = positioned_stream;
                 loop {
-                    let next = if let Some(leader_watch) = leader_rx.as_mut() {
+                    let next = if let (Some(authority), Some(permit)) =
+                        (authority.as_ref(), leader_permit.as_ref())
+                    {
                         tokio::select! {
                             biased;
-                            _ = watch_leadership_lost(leader_watch) => break,
+                            _ = authority.wait_for_revocation(permit) => break,
                             result = supervisor.timeout(
                                 "grpc_positioned_watch_heartbeat",
                                 heartbeat_interval,
@@ -1784,13 +1855,18 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                 // Exact positioned continuations do not need to sample an anchor,
                 // but still install their wakeup edge before any later await.
                 (
-                    crate::watch_commit_observation_adapter::subscribe(&db, topic.clone()),
+                    crate::watch_commit_observation_adapter::subscribe_from_db(&db, topic.clone()),
                     position,
                 )
             } else {
                 subscribe_grpc_watch_handoff(
                     &watch_anchor,
-                    || crate::watch_commit_observation_adapter::subscribe(&db, topic.clone()),
+                    || {
+                        crate::watch_commit_observation_adapter::subscribe_from_db(
+                            &db,
+                            topic.clone(),
+                        )
+                    },
                     req.start_resource_version.unwrap_or(0),
                 )
                 .await?
@@ -1803,7 +1879,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                 )
                 .await
                 .map_err(leader_watch_error_to_status)?;
-            Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+            self.require_raft_leadership_unchanged(leadership_rx.as_ref())?;
             let replay_source = DatastoreWatchReplaySource::new(
                 std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
                     db.clone(),
@@ -1812,14 +1888,15 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             );
             let scope: crate::watch::WatchDeliveryScope =
                 watch_delivery_scope_for_request(&req, resource_scope);
-            let supervisor = self.service.task_supervisor();
+            let supervisor = self.runtime.task_supervisor();
             let heartbeat_interval = self.watch_heartbeat_interval;
             // Clone the leadership signal into the stream so the loop can race it
             // against the broadcast recv and terminate promptly on a leadership
             // change. Without this a deposed leader's broadcast goes silent and the
             // worker waits up to its ~60s idle watchdog before reconnecting, reading
             // stale informer-cached state in the window.
-            let mut leader_rx = leadership_rx;
+            let authority = self.authority.clone();
+            let leader_permit = leadership_rx;
             let stream = async_stream::stream! {
                 let mut last_rv = req
                     .start_resource_version
@@ -1865,10 +1942,12 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                     // signal (issue #4): if this node stops being the raft leader,
                     // end the stream so the worker reconnects to the new leader
                     // instead of idling on a deposed, silent broadcaster.
-                    let recv = if let Some(leader_watch) = leader_rx.as_mut() {
+                    let recv = if let (Some(authority), Some(permit)) =
+                        (authority.as_ref(), leader_permit.as_ref())
+                    {
                         tokio::select! {
                             biased;
-                            _ = watch_leadership_lost(leader_watch) => break,
+                            _ = authority.wait_for_revocation(permit) => break,
                             r = supervisor
                                 .timeout("grpc_watch_heartbeat", wait, cursor.next_event()) => r,
                         }
@@ -2185,7 +2264,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         }
 
         if let Some(endpoint) = observed_endpoint {
-            self.service
+            self.runtime
                 .record_observed_peer_endpoint(&req.node_name, endpoint.clone())
                 .await;
             return Ok(Response::new(
@@ -2197,7 +2276,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         }
 
         Ok(Response::new(
-            match self.service.observed_peer_endpoint(&req.node_name).await {
+            match self.runtime.observed_peer_endpoint(&req.node_name).await {
                 Some(endpoint) => klights_internal_protobuf::ObservePeerEndpointResponse {
                     found: true,
                     endpoint,
@@ -3012,17 +3091,6 @@ fn selector_may_change_membership(req: &klights_internal_protobuf::WatchResource
             _ => true,
         }
     })
-}
-
-/// Complete on any raft leadership-signal version change (or when its sender is
-/// dropped). Even a demote/promote flap invalidates the leader-fresh watch
-/// sample. `watch::Receiver::changed` is cancel-safe, so dropping the pending
-/// future when the broadcast receive wins loses no transition.
-async fn watch_leadership_lost(leader_rx: &mut tokio::sync::watch::Receiver<bool>) {
-    if !*leader_rx.borrow() {
-        return;
-    }
-    let _ = leader_rx.changed().await;
 }
 
 #[cfg(test)]
@@ -6238,7 +6306,7 @@ mod tests {
             .await
             .expect_err("follower must not serve cleanup intents");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(status.message(), "not raft leader");
+        assert_eq!(status.message(), "not current leader authority");
 
         let leader = super::GrpcReplicationServer::new(service, db);
         let status = leader
@@ -6275,7 +6343,7 @@ mod tests {
             .await
             .expect_err("follower must not acknowledge cleanup intents");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(status.message(), "not raft leader");
+        assert_eq!(status.message(), "not current leader authority");
     }
 
     #[tokio::test]
@@ -7009,7 +7077,7 @@ mod tests {
             .expect_err("follower must not accept worker lease renewals");
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(status.message(), "not raft leader");
+        assert_eq!(status.message(), "not current leader authority");
         assert!(
             tracker.observed("worker-1").await.is_none(),
             "follower-local lease tracker must not be updated"

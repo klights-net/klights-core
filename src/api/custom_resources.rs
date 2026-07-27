@@ -812,7 +812,9 @@ async fn list_cr_inner(
                     watch_topics
                         .iter()
                         .cloned()
-                        .map(|topic| crate::watch_commit_observation_adapter::subscribe(&db, topic))
+                        .map(|topic| {
+                            crate::watch_commit_observation_adapter::subscribe_from_db(&db, topic)
+                        })
                         .collect(),
                 )
             },

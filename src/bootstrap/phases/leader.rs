@@ -2,7 +2,7 @@
 //!
 //! T2 step 2: controllers are gated by runtime lease acquisition instead
 //! of a compile-time `leader_scheduler_mode` boolean. The injected
-//! `Arc<dyn LeaderElection>` is `RaftLeaderLease` on every leader-class
+//! `Arc<dyn ControllerCoordination>` is backed by `RaftLeaderLease` on every leader-class
 //! boot (always-on raft, T2 step 1). When the lease is held, controllers
 //! run; when it is lost, the lease cancel token tears them down.
 
@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::KlightsConfig;
 use crate::datastore::DatastoreHandle;
-use crate::leader_election::{LeaderElection, LeaderScope};
 use anyhow::{Context as _, Result};
+use klights_leader_api::{ControllerCoordination, ControllerScope};
 use klights_supervisor::TaskSupervisor;
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +23,9 @@ pub struct LeaderStart<'a> {
     /// `None` for workers (no controllers). When `Some`, the start
     /// function attempts to acquire the lease; if acquisition fails
     /// (not the raft leader), controller startup is skipped cleanly.
-    pub leader_election: Option<Arc<dyn LeaderElection>>,
+    pub leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     pub db_handle: &'a DatastoreHandle,
+    pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub task_supervisor: &'a Arc<TaskSupervisor>,
     pub dispatcher_for_worker: &'a Arc<crate::controllers::ControllerDispatcher>,
@@ -33,7 +34,6 @@ pub struct LeaderStart<'a> {
     pub pod_api_service: &'a Arc<crate::pod_api_service::PodApiService>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
-    pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
     pub shutdown_token: CancellationToken,
 }
 
@@ -41,6 +41,7 @@ pub struct LeaderStart<'a> {
 struct LeaderScopedTaskContext {
     config: Arc<KlightsConfig>,
     db_handle: DatastoreHandle,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     node_local: crate::datastore::node_local::NodeLocalHandle,
     task_supervisor: Arc<TaskSupervisor>,
     dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
@@ -54,8 +55,9 @@ struct LeaderScopedTaskContext {
 pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let LeaderStart {
         config,
-        leader_election,
+        leader_coordination,
         db_handle,
+        watch_signals,
         node_local,
         task_supervisor,
         dispatcher_for_worker,
@@ -64,11 +66,10 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         pod_api_service,
         cri_for_shutdown,
         datapath,
-        is_leader_rx,
         shutdown_token,
     } = args;
 
-    let Some(election) = leader_election else {
+    let Some(coordination) = leader_coordination else {
         tracing::debug!("no leader election injected — skipping controller startup");
         return Ok(());
     };
@@ -76,6 +77,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),
+        watch_signals,
         node_local: node_local.clone(),
         task_supervisor: task_supervisor.clone(),
         dispatcher_for_worker: dispatcher_for_worker.clone(),
@@ -92,9 +94,8 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
             "runtime_leader_controller_lease_loop",
             async move {
                 crate::leader_election::run_under_lease(
-                    election,
-                    LeaderScope::Cluster,
-                    is_leader_rx,
+                    coordination,
+                    ControllerScope::Cluster,
                     shutdown_token,
                     move |_scope, lease_cancel| {
                         let leader_context = leader_context.clone();
@@ -191,6 +192,7 @@ async fn start_leader_scoped_tasks(
     let LeaderScopedTaskContext {
         config,
         db_handle,
+        watch_signals,
         node_local,
         task_supervisor,
         dispatcher_for_worker,
@@ -210,6 +212,7 @@ async fn start_leader_scoped_tasks(
 
     let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
         db_handle.clone(),
+        watch_signals.clone(),
         dispatcher_for_cronjobs,
         task_supervisor.clone(),
     );
@@ -261,6 +264,7 @@ async fn start_leader_scoped_tasks(
     let scheduler_runtime: Arc<dyn crate::controllers::scheduler::SchedulerRuntime> = Arc::new(
         crate::bootstrap::scheduler_adapter::LeaderSchedulerRuntime::new(
             db_handle.clone(),
+            watch_signals,
             pod_api_service,
         ),
     );

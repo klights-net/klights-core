@@ -19,7 +19,7 @@ pub(crate) use crate::kubelet::node_registration::{
 pub(crate) use crate::kubelet::node_registration::{
     register_node_at_addresses, register_node_with_outbox,
 };
-pub(crate) use crate::kubelet::node_role_labels::role_label_keys_for_shape;
+pub(crate) use crate::kubelet::node_role_labels::role_label_keys_for_projection;
 pub(crate) use crate::kubelet::node_status_merge::preserve_existing_network_conditions;
 pub use crate::kubelet::node_status_merge::{
     merge_existing_node_mutable_fields, merge_node_status_for_update, set_node_external_ip,
@@ -1186,11 +1186,7 @@ mod tests {
                 "172.31.50.2".to_string(),
                 Some("192.0.2.50".to_string()),
             ),
-            raft_shape: Some(klights_cluster_core::RaftShape {
-                voter_count: 2,
-                is_leader: false,
-                is_learner: false,
-            }),
+            role_projection: Some(klights_leader_api::NodeRoleProjection::ControlPlaneFollower),
             grpc_port: Some(7679),
             host: NodeRegistrationHostFacts {
                 cpu_count: 37,

@@ -60,6 +60,8 @@ impl RaftNodeJoinHandler {
             is_leader: false,
             is_learner: as_learner,
         };
+        let role_projection =
+            crate::authority_adapter::project_raft_shape(&node_role, &joiner_shape);
         let registration_addresses = NodeRegistrationAddresses::new(
             node_internal_ip.unwrap_or_else(|| joiner_ip.clone()),
             Some(joiner_ip),
@@ -112,7 +114,7 @@ impl RaftNodeJoinHandler {
             node_role,
             publish_external_ip: true,
             addresses: registration_addresses,
-            raft_shape: Some(joiner_shape),
+            role_projection: Some(role_projection),
             grpc_port: joiner_grpc_port,
             host,
         };

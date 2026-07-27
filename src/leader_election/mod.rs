@@ -1,244 +1,139 @@
-//! Leader election abstraction for HA control plane.
+//! Embedded controller-coordination adapter.
 //!
-//! Cluster-wide controllers (Deployment, ReplicaSet, Job, CronJob, GC) must run
-//! on exactly one replica. This module provides an object-safe trait that
-//! abstracts leader election, allowing single-node deployments to run without
-//! coordination while HA deployments can use etcd or Raft-based election.
-//!
-//! ## Cancellation semantics
-//!
-//! The `LeaderLease::cancel` token MUST be a child of
-//! `TaskSupervisor::root_cancellation_token()` so that supervisor shutdown
-//! cancels every leader-held lease, and lease loss (drop or explicit cancel)
-//! cancels every controller task spawned under that lease.
+//! Controller owners consume only the backend-neutral
+//! [`klights_leader_api::ControllerCoordination`] contract. Root constructs
+//! this adapter from the selected cluster engine's authority capability.
 
-use async_trait::async_trait;
 use std::sync::Arc;
-use thiserror::Error;
-use tokio_util::sync::CancellationToken;
+
+use klights_leader_api::{
+    ControllerAcquireFuture, ControllerCoordination, ControllerCoordinationError, ControllerLease,
+    ControllerRevocationFuture, ControllerScope,
+};
 
 pub mod lease_loop;
 pub use lease_loop::run_under_lease;
 
-/// Scope for leader election.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LeaderScope {
-    /// Cluster-wide leadership (controllers like GC, Deployment, etc.)
-    Cluster,
-    /// Namespace-scoped leadership (future: namespace-scoped controllers)
-    Namespace(String),
-}
-
-/// Error type for leader election operations.
-#[derive(Debug, Error)]
-pub enum LeaderError {
-    #[error("failed to acquire lease for scope {0:?}")]
-    AcquireFailed(LeaderScope),
-    #[error("lease lost for scope {0:?}")]
-    LeaseLost(LeaderScope),
-    #[error("leader election backend error: {0}")]
-    Backend(String),
-}
-
-/// A held leader lease.
+/// Embedded-Raft controller lease adapter.
 ///
-/// Dropping the lease or cancelling its token releases leadership.
-#[derive(Debug)]
-pub struct LeaderLease {
-    /// The scope this lease covers.
-    pub scope: LeaderScope,
-    /// Cancellation token that stops every controller task acquired under this lease.
-    ///
-    /// This token MUST be a child of `TaskSupervisor::root_cancellation_token()`.
-    /// Cancelling this token stops every controller task acquired under this lease;
-    /// dropping the lease cancels the token.
-    pub cancel: CancellationToken,
-}
-
-/// Object-safe leader election trait.
-///
-/// Implementations:
-/// - `RaftLeaderLease`: Tracks leadership via Raft metrics watch.
-///   Works for single-node (always leader) and multi-node (election).
-#[async_trait]
-pub trait LeaderElection: Send + Sync {
-    /// Attempt to acquire a leader lease for the given scope.
-    ///
-    /// Returns immediately with a lease or an error. For backends that require
-    /// waiting (etcd, Raft), the implementation should spawn a background task
-    /// that retries acquisition and notifies via the lease's cancellation token
-    /// when leadership is lost.
-    async fn acquire(&self, scope: LeaderScope) -> Result<LeaderLease, LeaderError>;
-}
-
-/// Raft-based leader election.
-///
-/// Tracks the current node's leadership status via
-/// `RaftNode::metrics_watch()`. When the node is the Raft leader the
-/// lease remains active. When leadership is lost the cancellation
-/// token fires, stopping all leader-only controller tasks. On
-/// re-acquisition a new lease with a fresh token is issued.
-///
-/// T2 step 2: replaced `SingleNodeLeader` — a single-voter raft node
-/// is always its own leader, so `acquire` succeeds immediately in
-/// single-node deployments just like the old always-return-lease impl.
+/// The adapter deliberately owns no controller implementation and exports no
+/// Raft value. Its opaque generation fence is validated by the injected
+/// authority provider, including across demotion/promotion ABA transitions.
 pub struct RaftLeaderLease {
     raft_node: Arc<crate::datastore::raft::node::RaftNode>,
-    root_cancel: CancellationToken,
-    supervisor: Arc<klights_supervisor::TaskSupervisor>,
+}
+
+struct RaftControllerFence {
+    term: u64,
 }
 
 impl RaftLeaderLease {
-    pub fn new(
-        raft_node: Arc<crate::datastore::raft::node::RaftNode>,
-        root_cancel: CancellationToken,
-        supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Self {
-        Self {
-            raft_node,
-            root_cancel,
-            supervisor,
-        }
+    pub fn new(raft_node: Arc<crate::datastore::raft::node::RaftNode>) -> Self {
+        Self { raft_node }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.raft_node
+            .server_metrics_watch()
+            .borrow()
+            .vote
+            .leader_id()
+            .get_term()
     }
 }
 
-#[async_trait]
-impl LeaderElection for RaftLeaderLease {
-    async fn acquire(&self, scope: LeaderScope) -> Result<LeaderLease, LeaderError> {
-        let shape = self.raft_node.current_shape();
-        if !shape.is_leader {
-            return Err(LeaderError::AcquireFailed(scope));
-        }
-        let cancel = self.root_cancel.child_token();
-        let raft = self.raft_node.clone();
-        let cancel_clone = cancel.clone();
-        let scope_clone = scope.clone();
-        let supervisor = self.supervisor.clone();
-        // Spawn a supervised background watcher that cancels the lease
-        // token when this node loses Raft leadership.
-        let _ = supervisor
-            .spawn_async(
-                klights_supervisor::TaskCategory::Background,
-                "raft_leader_lease_watcher",
-                async move {
-                    // Deduped server-metrics: only wakes on real
-                    // state/leadership/membership changes, so this watcher
-                    // stays idle-silent (HR #1) instead of firing every tick.
-                    let mut metrics = raft.server_metrics_watch();
-                    loop {
-                        if metrics.changed().await.is_err() {
-                            cancel_clone.cancel();
-                            return;
-                        }
-                        if !raft.current_shape().is_leader {
-                            tracing::info!(?scope_clone, "raft leadership lost, cancelling lease");
-                            cancel_clone.cancel();
-                            return;
-                        }
-                    }
+impl ControllerCoordination for RaftLeaderLease {
+    fn try_acquire(
+        &self,
+        scope: ControllerScope,
+    ) -> Result<ControllerLease, ControllerCoordinationError> {
+        if self.raft_node.current_shape().is_leader {
+            Ok(ControllerLease::issue(
+                scope,
+                RaftControllerFence {
+                    term: self.current_generation(),
                 },
-            )
-            .await;
-        Ok(LeaderLease { scope, cancel })
+            ))
+        } else {
+            Err(ControllerCoordinationError::Unavailable)
+        }
+    }
+
+    fn acquire(&self, scope: ControllerScope) -> ControllerAcquireFuture<'_> {
+        Box::pin(async move {
+            let mut metrics = self.raft_node.server_metrics_watch();
+            loop {
+                let generation = {
+                    let current = metrics.borrow_and_update();
+                    if current.current_leader == Some(self.raft_node.node_id) {
+                        Some(current.vote.leader_id().get_term())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(generation) = generation {
+                    return Ok(ControllerLease::issue(
+                        scope,
+                        RaftControllerFence { term: generation },
+                    ));
+                }
+                metrics
+                    .changed()
+                    .await
+                    .map_err(|_| ControllerCoordinationError::Closed)?;
+            }
+        })
+    }
+
+    fn validate(&self, lease: &ControllerLease) -> Result<(), ControllerCoordinationError> {
+        if !self.raft_node.current_shape().is_leader {
+            Err(ControllerCoordinationError::Unavailable)
+        } else if lease
+            .adapter_fence::<RaftControllerFence>()
+            .is_none_or(|fence| fence.term != self.current_generation())
+        {
+            Err(ControllerCoordinationError::StalePermit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_revocation<'a>(
+        &'a self,
+        lease: &'a ControllerLease,
+    ) -> ControllerRevocationFuture<'a> {
+        let mut metrics = self.raft_node.server_metrics_watch();
+        let Some(generation) = lease
+            .adapter_fence::<RaftControllerFence>()
+            .map(|fence| fence.term)
+        else {
+            return Box::pin(std::future::ready(()));
+        };
+        Box::pin(async move {
+            loop {
+                let revoked = {
+                    let current = metrics.borrow_and_update();
+                    current.current_leader != Some(self.raft_node.node_id)
+                        || current.vote.leader_id().get_term() != generation
+                };
+                if revoked || metrics.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
-    // T2 step 3: SingleNodeLeader deleted. Trait-contract tests now
-    // use MockLeaderElection (from lease_loop) or RaftLeaderLease.
+    fn assert_object_safe(_: &dyn ControllerCoordination) {}
 
     #[test]
-    fn leader_election_trait_is_object_safe() {
-        // Prove the trait is still object-safe by casting a concrete
-        // impl to `Arc<dyn LeaderElection>`.
-        use crate::leader_election::lease_loop::MockLeaderElection;
-        let mock = MockLeaderElection::new(CancellationToken::new());
-        let leader: Arc<dyn LeaderElection> = mock;
-        let _leader: Arc<dyn LeaderElection> = leader;
-    }
-
-    // T2: RaftLeaderLease tests
-    use crate::datastore::node_local::SqliteNodeLocalDb;
-    use crate::datastore::raft::node::RaftNode;
-    use crate::sqlite_boundary::DbExecutor;
-    use crate::sqlite_open as opener;
-    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
-
-    async fn fresh_raft_node(id: u64) -> RaftNode {
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
-            supervisor.clone(),
-            "sqlite:raft-leader-test",
-        )
-        .await
-        .expect("open node-local executor");
-        let node_local =
-            Arc::new(SqliteNodeLocalDb::from_executor(exec).expect("create node-local db"));
-        let backend: Arc<dyn crate::datastore::DatastoreBackend> =
-            Arc::new(crate::datastore::test_support::in_memory().await);
-        RaftNode::start(
-            id,
-            format!("n{id}"),
-            backend,
-            node_local.clone(),
-            node_local,
-            supervisor,
-        )
-        .await
-        .expect("start raft node")
-    }
-
-    #[tokio::test]
-    async fn raft_leader_lease_acquires_when_leader() {
-        let node = Arc::new(fresh_raft_node(80).await);
-        node.bootstrap_single_voter("https://10.99.0.80:7679".into())
-            .await
-            .expect("bootstrap");
-        // Wait for self-election.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if node.current_shape().is_leader {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                panic!("node did not become leader");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        let sup = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let election = RaftLeaderLease::new(node.clone(), CancellationToken::new(), sup);
-        let lease = election
-            .acquire(LeaderScope::Cluster)
-            .await
-            .expect("should acquire lease when leader");
-        assert!(!lease.cancel.is_cancelled());
-        // T3: the lease holds a supervised background task that watches
-        // for leadership loss. Clean up by cancelling the lease, which
-        // drops the background task's Arc reference.
-        drop(lease);
-        drop(election);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    #[tokio::test]
-    async fn raft_leader_lease_fails_when_not_leader() {
-        let node = fresh_raft_node(81).await;
-        // Not bootstrapped, so not leader.
-        let sup = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let election = RaftLeaderLease::new(Arc::new(node), CancellationToken::new(), sup);
-        let err = election
-            .acquire(LeaderScope::Cluster)
-            .await
-            .expect_err("should fail when not leader");
-        assert!(matches!(
-            err,
-            LeaderError::AcquireFailed(LeaderScope::Cluster)
-        ));
-        drop(election);
+    fn raft_adapter_implements_neutral_coordination_contract() {
+        fn assert_impl<T: ControllerCoordination>() {}
+        assert_impl::<RaftLeaderLease>();
+        let _object_safe: fn(&dyn ControllerCoordination) = assert_object_safe;
     }
 }

@@ -1018,7 +1018,7 @@ impl RootPodRepositoryComposition {
 
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
-    leadership: Option<tokio::sync::watch::Receiver<bool>>,
+    leader_coordination: Option<Arc<dyn klights_leader_api::ControllerCoordination>>,
 ) -> RootPodRepositoryParts {
     let PodRepositoryBuildConfig {
         db,
@@ -1058,13 +1058,13 @@ pub(crate) fn build_pod_repository_parts(
         test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
         test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
     };
-    let workqueue = if let Some(leadership) = leadership {
+    let workqueue = if let Some(leader_coordination) = leader_coordination {
         PodWorkqueue::new_leader(
             store.clone(),
             workqueue_persistence,
             supervisor.clone(),
             metrics.clone(),
-            leadership,
+            leader_coordination,
         )
     } else {
         PodWorkqueue::new(

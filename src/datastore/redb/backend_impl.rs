@@ -68,16 +68,15 @@ pub(super) fn decode_outbox_watermark_key(
     })
 }
 
-impl crate::datastore::CommitObservationStore for RedbDatastore {
+#[async_trait]
+impl DatastoreBackend for RedbDatastore {
+    #[cfg(test)]
     fn commit_observation_sink(
         &self,
     ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
         self.commit_sink.clone()
     }
-}
 
-#[async_trait]
-impl DatastoreBackend for RedbDatastore {
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
         self.accessor
             .call("redb_atomic_allocator_observation", |db| {

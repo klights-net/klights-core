@@ -1457,7 +1457,7 @@ async fn test_pod_log_route_empty_container_spec_returns_bad_request() {
 }
 
 #[tokio::test]
-async fn follower_raft_proxy_does_not_fallback_local_for_pod_logs_without_leader() {
+async fn follower_authority_router_does_not_fallback_local_for_pod_logs_without_authority() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -1466,8 +1466,8 @@ async fn follower_raft_proxy_does_not_fallback_local_for_pod_logs_without_leader
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-    state.operational_mut().is_raft_leader_rx = Some(std::sync::Arc::new(
-        crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
+    state.operational_mut().authority_router = Some(std::sync::Arc::new(
+        crate::api::authority_routing::HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None),
     ));
     state
         .resource_mutation()
@@ -1511,8 +1511,8 @@ async fn follower_raft_proxy_does_not_fallback_local_for_pod_logs_without_leader
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(
-        body.contains("no raft leader"),
-        "pod log requests on a follower must fail at the raft proxy instead of falling through to the local remote-log handler: {body}"
+        body.contains("no current cluster authority"),
+        "pod log requests on a follower must fail at the authority router instead of falling through to the local remote-log handler: {body}"
     );
 }
 

@@ -6,7 +6,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+#[cfg(test)]
 use std::any::Any;
+#[cfg(test)]
 use std::sync::Arc;
 
 fn snapshot_replay_floor_cursor_key(
@@ -159,15 +161,10 @@ pub struct SnapshotMutationFence {
 
 /// Synchronous, nonblocking post-commit observation port. Implementations are
 /// injected by root composition and must not perform datastore work.
-pub trait CommitObservationSink: Any + Send + Sync {
+pub trait CommitObservationSink: Send + Sync {
     fn observe(&self, observations: &[CommitObservation]);
+    #[cfg(test)]
     fn as_any(&self) -> &dyn Any;
-}
-
-/// Focused capability for root composition to recover the exact observation
-/// sink injected when the passive cluster store was opened.
-pub trait CommitObservationStore: Send + Sync {
-    fn commit_observation_sink(&self) -> Arc<dyn CommitObservationSink>;
 }
 
 pub trait OutboxResponseCodec: Send + Sync {
@@ -200,7 +197,9 @@ impl SnapshotMutationFence {
 /// (redb, etc.) via MVCC reader. Not on the trait today because no caller
 /// exists.
 #[async_trait]
-pub trait DatastoreBackend: CommitObservationStore + Send + Sync {
+pub trait DatastoreBackend: Send + Sync {
+    #[cfg(test)]
+    fn commit_observation_sink(&self) -> Arc<dyn CommitObservationSink>;
     /// Atomically observe both durable allocators and their persisted mode.
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
         Err(anyhow::anyhow!(
@@ -1583,8 +1582,16 @@ impl DatastoreBackendWatchStore {
         Self { db }
     }
 
+    #[cfg(test)]
     pub(crate) fn db(&self) -> DatastoreHandle {
         self.db.clone()
+    }
+}
+
+#[cfg(test)]
+impl klights_watch::WatchSignalSubscribe for DatastoreBackendWatchStore {
+    fn subscribe(&self, topic: klights_watch::WatchTopic) -> klights_watch::WatchSignalReceiver {
+        crate::watch_commit_observation_adapter::test_signal_source(&self.db).subscribe(topic)
     }
 }
 

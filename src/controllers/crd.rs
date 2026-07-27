@@ -448,7 +448,10 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let watcher = tokio::spawn(run_crd_registry_watch_with_components(
-            crate::crd_registry_adapter::new_runtime(db_handle),
+            crate::crd_registry_adapter::new_runtime(
+                db_handle.clone(),
+                crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
+            ),
             registry.clone(),
             cancel.clone(),
         ));

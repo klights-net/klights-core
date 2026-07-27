@@ -337,7 +337,7 @@ impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter
 
 pub struct DatastorePodWatchSource {
     watch_store: Arc<dyn WatchStore>,
-    watch_signals: Arc<dyn crate::watch_commit_observation_adapter::WatchSignalSource>,
+    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     resource_versions: Arc<dyn CurrentResourceVersionStore>,
     leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
     heartbeat_cursor: tokio::sync::Mutex<Option<SignalWatchCursor<BoxedWatchReplaySource>>>,
@@ -347,13 +347,28 @@ impl DatastorePodWatchSource {
     pub fn new<T>(store: Arc<T>) -> Self
     where
         T: WatchStore + CurrentResourceVersionStore + klights_leader_api::LeaderWatch + 'static,
-        T: crate::watch_commit_observation_adapter::WatchSignalSource,
+        T: klights_watch::WatchSignalSubscribe,
     {
         Self {
             watch_store: store.clone(),
             watch_signals: store.clone(),
             resource_versions: store.clone(),
             leader_watch: store,
+            heartbeat_cursor: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn new_with_ports(
+        watch_store: Arc<dyn WatchStore>,
+        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+        resource_versions: Arc<dyn CurrentResourceVersionStore>,
+        leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
+    ) -> Self {
+        Self {
+            watch_store,
+            watch_signals,
+            resource_versions,
+            leader_watch,
             heartbeat_cursor: tokio::sync::Mutex::new(None),
         }
     }
@@ -490,7 +505,7 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
                         vec![crate::datastore::WatchTarget::cluster("v1", "Node")],
                     )));
                 let mut next = SignalWatchCursor::new(
-                    self.watch_signals.subscribe_signals(topic.clone()),
+                    self.watch_signals.subscribe(topic.clone()),
                     replay,
                     topic,
                     WatchDeliveryScope::Cluster,

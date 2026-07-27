@@ -2261,7 +2261,7 @@ mod cases {
                 "172.31.40.2".to_string(),
                 Some("192.0.2.40".to_string()),
             ),
-            raft_shape: None,
+            role_projection: None,
             grpc_port: Some(7679),
             host: crate::kubelet::node::NodeRegistrationHostFacts {
                 cpu_count: 23,

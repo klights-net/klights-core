@@ -1088,8 +1088,8 @@ impl WatchStore for WorkerStoreAdapter {
     }
 }
 
-impl crate::watch_commit_observation_adapter::WatchSignalSource for WorkerStoreAdapter {
-    fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
+impl klights_watch::WatchSignalSubscribe for WorkerStoreAdapter {
+    fn subscribe(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_events.subscribe_signals(topic)
     }
 }

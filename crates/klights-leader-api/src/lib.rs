@@ -3,6 +3,7 @@
 mod crd_registry;
 pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
@@ -13,6 +14,171 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 use klights_cluster_core::{Resource, StorageCommand, StorageResponse, WatchReplayPosition};
 use klights_types::ResourceKey;
+
+/// Opaque generation fence proving that one operation sampled current
+/// control-plane authority. Consumers must return it to [`LeaderAuthority`]
+/// before performing or completing leader-owned work.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AuthorityPermit {
+    generation: u64,
+}
+
+impl AuthorityPermit {
+    /// Issue a permit for one adapter-owned authority generation.
+    ///
+    /// Production call sites are restricted to root-composed authority
+    /// adapters; feature owners may only receive and validate permits.
+    pub const fn issue(generation: u64) -> Self {
+        Self { generation }
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Backend-neutral routing decision for one API or internal-RPC operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityRoute {
+    Local(AuthorityPermit),
+    Forward { endpoint: String },
+    Unavailable,
+}
+
+/// Failure returned when a leader-owned operation lacks current authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorityError {
+    NotAuthoritative,
+    StalePermit,
+    Closed,
+}
+
+impl fmt::Display for AuthorityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotAuthoritative => "operation requires current leader authority",
+            Self::StalePermit => "leader authority changed during the operation",
+            Self::Closed => "leader authority provider is closed",
+        })
+    }
+}
+
+impl std::error::Error for AuthorityError {}
+
+pub type AuthorityRevocationFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+pub type AuthorityAcquireFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AuthorityPermit, AuthorityError>> + Send + 'a>>;
+
+/// Focused authority/routing capability implemented by the selected cluster
+/// engine adapter. It exposes neither a Raft node nor a process-global boolean.
+pub trait LeaderAuthority: Send + Sync {
+    fn route(&self) -> AuthorityRoute;
+    fn validate(&self, permit: &AuthorityPermit) -> Result<(), AuthorityError>;
+    fn acquire(&self) -> AuthorityAcquireFuture<'_>;
+    fn wait_for_revocation<'a>(
+        &'a self,
+        permit: &'a AuthorityPermit,
+    ) -> AuthorityRevocationFuture<'a>;
+}
+
+/// Scope protected by a controller coordination lease.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum ControllerScope {
+    Cluster,
+    Namespace(String),
+}
+
+/// Opaque, scoped fence returned by [`ControllerCoordination`].
+///
+/// The generation has meaning only to the injected coordination adapter.
+#[derive(Clone)]
+pub struct ControllerLease {
+    scope: ControllerScope,
+    adapter_fence: Arc<dyn Any + Send + Sync>,
+}
+
+impl ControllerLease {
+    /// Issue an adapter-owned lease fence.
+    pub fn issue<T>(scope: ControllerScope, adapter_fence: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            scope,
+            adapter_fence: Arc::new(adapter_fence),
+        }
+    }
+
+    pub const fn scope(&self) -> &ControllerScope {
+        &self.scope
+    }
+
+    /// Recover an issuer-private fence type for adapter validation.
+    #[doc(hidden)]
+    pub fn adapter_fence<T: Any>(&self) -> Option<&T> {
+        self.adapter_fence.downcast_ref()
+    }
+}
+
+impl fmt::Debug for ControllerLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControllerLease")
+            .field("scope", &self.scope)
+            .field("adapter_fence", &"<opaque>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerCoordinationError {
+    Unavailable,
+    StalePermit,
+    Closed,
+}
+
+impl fmt::Display for ControllerCoordinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "controller coordination is unavailable",
+            Self::StalePermit => "controller coordination permit is stale",
+            Self::Closed => "controller coordination provider is closed",
+        })
+    }
+}
+
+impl std::error::Error for ControllerCoordinationError {}
+
+pub type ControllerAcquireFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ControllerLease, ControllerCoordinationError>> + Send + 'a>>;
+pub type ControllerRevocationFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Backend-neutral, fencing-capable controller election/lease contract.
+///
+/// `acquire` waits on backend events rather than polling. `try_acquire` exists
+/// for one-time bootstrap work that must skip cleanly on a standby node.
+pub trait ControllerCoordination: Send + Sync {
+    fn try_acquire(
+        &self,
+        scope: ControllerScope,
+    ) -> Result<ControllerLease, ControllerCoordinationError>;
+    fn acquire(&self, scope: ControllerScope) -> ControllerAcquireFuture<'_>;
+    fn validate(&self, lease: &ControllerLease) -> Result<(), ControllerCoordinationError>;
+    fn wait_for_revocation<'a>(
+        &'a self,
+        lease: &'a ControllerLease,
+    ) -> ControllerRevocationFuture<'a>;
+}
+
+/// Backend-neutral role projection consumed by kubelet Node registration.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NodeRoleProjection {
+    Pending,
+    StandaloneLeader,
+    ControlPlaneLeader,
+    ControlPlaneFollower,
+    Replica,
+}
 
 /// Whether a query may use the worker's coherent informer cache or must read
 /// from the current leader.

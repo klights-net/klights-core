@@ -1677,7 +1677,11 @@ impl crate::replication::grpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
             Ok(response) => response,
             Err(openraft::error::RaftError::APIError(
                 openraft::error::InstallSnapshotError::SnapshotMismatch(mismatch),
-            )) => return Err(RaftRpcRouterError::snapshot_mismatch(&mismatch)),
+            )) => {
+                let encoded = serde_json::to_string(&mismatch)
+                    .unwrap_or_else(|error| format!("invalid:{error}"));
+                return Err(RaftRpcRouterError::snapshot_mismatch(encoded));
+            }
             Err(openraft::error::RaftError::Fatal(error)) => {
                 return Err(RaftRpcRouterError::RemoteFatal(format!(
                     "raft.install_snapshot: {error}"
@@ -1810,7 +1814,10 @@ impl RaftNodeJoinHandler {
             node_role,
             publish_external_ip: true,
             addresses: registration_addresses,
-            raft_shape: Some(joiner_shape),
+            role_projection: Some(crate::authority_adapter::project_raft_shape(
+                &node_role,
+                &joiner_shape,
+            )),
             grpc_port: joiner_grpc_port,
             host,
         };

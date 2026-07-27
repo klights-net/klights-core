@@ -18,9 +18,13 @@ use anyhow::Result;
 /// Maximum number of controlplane voters in the cluster.
 /// Configurable via `KLIGHTS_CONTROLPLANE_LIMIT` env var (default: 3).
 pub fn controlplane_limit() -> usize {
-    std::env::var("KLIGHTS_CONTROLPLANE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    let configured = std::env::var("KLIGHTS_CONTROLPLANE_LIMIT").ok();
+    controlplane_limit_from(configured.as_deref())
+}
+
+fn controlplane_limit_from(configured: Option<&str>) -> usize {
+    configured
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3)
 }
 
@@ -446,22 +450,17 @@ mod tests {
 
     #[test]
     fn controlplane_limit_defaults_to_three() {
-        unsafe { std::env::remove_var("KLIGHTS_CONTROLPLANE_LIMIT") };
-        assert_eq!(controlplane_limit(), 3);
+        assert_eq!(controlplane_limit_from(None), 3);
     }
 
     #[test]
     fn controlplane_limit_reads_env_var() {
-        unsafe { std::env::set_var("KLIGHTS_CONTROLPLANE_LIMIT", "5") };
-        assert_eq!(controlplane_limit(), 5);
-        unsafe { std::env::remove_var("KLIGHTS_CONTROLPLANE_LIMIT") };
+        assert_eq!(controlplane_limit_from(Some("5")), 5);
     }
 
     #[test]
     fn controlplane_limit_ignores_invalid_env() {
-        unsafe { std::env::set_var("KLIGHTS_CONTROLPLANE_LIMIT", "not-a-number") };
-        assert_eq!(controlplane_limit(), 3);
-        unsafe { std::env::remove_var("KLIGHTS_CONTROLPLANE_LIMIT") };
+        assert_eq!(controlplane_limit_from(Some("not-a-number")), 3);
     }
 
     #[test]

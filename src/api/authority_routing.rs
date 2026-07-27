@@ -1,4 +1,4 @@
-//! Raft follower-to-leader API proxy.
+//! Backend-neutral follower-to-authority API routing.
 //!
 //! In the klights HA model, all controlplanes bind TCP 7679 but only
 //! the raft leader serves K8s API requests directly. Follower
@@ -14,13 +14,10 @@ use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use std::{fs as blocking_fs, path::Path};
 
-/// Shared state for the leader-proxy middleware.
+/// HTTP transport state paired with a backend-neutral authority capability.
 #[derive(Clone)]
-pub struct RaftLeaderProxy {
-    /// Watch receiver: `true` when this node is the raft leader.
-    is_leader: tokio::sync::watch::Receiver<bool>,
-    /// Watch receiver: the current leader's `https://<ip>:<port>` address.
-    leader_addr: tokio::sync::watch::Receiver<Option<String>>,
+pub(crate) struct HttpAuthorityRouter {
+    authority: Arc<dyn klights_leader_api::LeaderAuthority>,
     /// Cluster/front-proxy CA certificate PEM for verifying leader serving
     /// certificates. When set, the proxy verifies the leader's TLS certificate
     /// against this CA instead of accepting any certificate.
@@ -31,18 +28,28 @@ pub struct RaftLeaderProxy {
     proxy_client_identity: Option<reqwest::Identity>,
 }
 
-impl RaftLeaderProxy {
-    pub fn new(
+impl HttpAuthorityRouter {
+    pub(crate) fn from_authority(
+        authority: Arc<dyn klights_leader_api::LeaderAuthority>,
+        ca_cert_pem: Option<String>,
+    ) -> Self {
+        Self {
+            authority,
+            ca_cert_pem,
+            proxy_client_identity: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
         is_leader: tokio::sync::watch::Receiver<bool>,
         leader_addr: tokio::sync::watch::Receiver<Option<String>>,
         ca_cert_pem: Option<String>,
     ) -> Self {
-        Self {
-            is_leader,
-            leader_addr,
+        Self::from_authority(
+            Arc::new(TestWatchAuthority::new(is_leader, leader_addr)),
             ca_cert_pem,
-            proxy_client_identity: None,
-        }
+        )
     }
 
     pub fn with_proxy_client_identity(mut self, identity: Option<reqwest::Identity>) -> Self {
@@ -81,14 +88,142 @@ impl RaftLeaderProxy {
         builder.build().unwrap_or_default()
     }
 
-    /// Whether this node is currently the raft leader.
-    pub fn is_leader(&self) -> bool {
-        *self.is_leader.borrow()
+    pub(crate) fn has_local_authority(&self) -> bool {
+        let klights_leader_api::AuthorityRoute::Local(permit) = self.authority.route() else {
+            return false;
+        };
+        self.authority.validate(&permit).is_ok()
     }
 
-    /// The current leader's API address (e.g. `https://10.99.0.10:7679`).
-    pub fn leader_addr(&self) -> Option<String> {
-        self.leader_addr.borrow().clone()
+    #[cfg(test)]
+    fn is_leader(&self) -> bool {
+        self.has_local_authority()
+    }
+
+    #[cfg(test)]
+    fn leader_addr(&self) -> Option<String> {
+        match self.authority.route() {
+            klights_leader_api::AuthorityRoute::Forward { endpoint } => Some(endpoint),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+struct TestWatchAuthority {
+    state: std::sync::Mutex<TestWatchAuthorityState>,
+}
+
+#[cfg(test)]
+struct TestWatchAuthorityState {
+    is_leader: tokio::sync::watch::Receiver<bool>,
+    leader_addr: tokio::sync::watch::Receiver<Option<String>>,
+    generation: u64,
+    last: Option<(bool, Option<String>)>,
+}
+
+#[cfg(test)]
+impl TestWatchAuthority {
+    fn new(
+        is_leader: tokio::sync::watch::Receiver<bool>,
+        leader_addr: tokio::sync::watch::Receiver<Option<String>>,
+    ) -> Self {
+        Self {
+            state: std::sync::Mutex::new(TestWatchAuthorityState {
+                is_leader,
+                leader_addr,
+                generation: 0,
+                last: None,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> (u64, bool, Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        let current = (
+            *state.is_leader.borrow(),
+            state.leader_addr.borrow().clone(),
+        );
+        if state.last.as_ref() != Some(&current) {
+            state.generation = state.generation.checked_add(1).unwrap_or(1);
+            state.last = Some(current.clone());
+        }
+        (state.generation, current.0, current.1)
+    }
+}
+
+#[cfg(test)]
+impl klights_leader_api::LeaderAuthority for TestWatchAuthority {
+    fn route(&self) -> klights_leader_api::AuthorityRoute {
+        let (generation, local, endpoint) = self.snapshot();
+        if local {
+            klights_leader_api::AuthorityRoute::Local(klights_leader_api::AuthorityPermit::issue(
+                generation,
+            ))
+        } else if let Some(endpoint) = endpoint {
+            klights_leader_api::AuthorityRoute::Forward { endpoint }
+        } else {
+            klights_leader_api::AuthorityRoute::Unavailable
+        }
+    }
+
+    fn validate(
+        &self,
+        permit: &klights_leader_api::AuthorityPermit,
+    ) -> Result<(), klights_leader_api::AuthorityError> {
+        let (generation, local, _) = self.snapshot();
+        if !local {
+            Err(klights_leader_api::AuthorityError::NotAuthoritative)
+        } else if generation != permit.generation() {
+            Err(klights_leader_api::AuthorityError::StalePermit)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn acquire(&self) -> klights_leader_api::AuthorityAcquireFuture<'_> {
+        let mut receiver = self.state.lock().unwrap().is_leader.clone();
+        Box::pin(async move {
+            loop {
+                if *receiver.borrow_and_update() {
+                    return match self.route() {
+                        klights_leader_api::AuthorityRoute::Local(permit) => Ok(permit),
+                        _ => Err(klights_leader_api::AuthorityError::NotAuthoritative),
+                    };
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| klights_leader_api::AuthorityError::Closed)?;
+            }
+        })
+    }
+
+    fn wait_for_revocation<'a>(
+        &'a self,
+        permit: &'a klights_leader_api::AuthorityPermit,
+    ) -> klights_leader_api::AuthorityRevocationFuture<'a> {
+        let mut is_leader = self.state.lock().unwrap().is_leader.clone();
+        let mut leader_addr = self.state.lock().unwrap().leader_addr.clone();
+        Box::pin(async move {
+            loop {
+                if self.validate(permit).is_err() {
+                    return;
+                }
+                tokio::select! {
+                    changed = is_leader.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = leader_addr.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -162,37 +297,45 @@ pub(in crate::api) async fn leader_proxy_middleware(
     }
 
     // Retrieve the proxy state from ApiState
-    let Some(proxy) = state.operational().is_raft_leader_rx.clone() else {
-        // No raft proxy configured — single-node or worker; pass through
+    let Some(router) = state.operational().authority_router.clone() else {
+        // No authority router configured — single-node or worker.
         return next.run(request).await;
     };
 
-    if proxy.is_leader() {
-        return next.run(request).await;
+    match router.authority.route() {
+        klights_leader_api::AuthorityRoute::Local(permit)
+            if router.authority.validate(&permit).is_ok() =>
+        {
+            next.run(request).await
+        }
+        klights_leader_api::AuthorityRoute::Forward { endpoint } => {
+            follower_handle(request, &router, &endpoint).await
+        }
+        klights_leader_api::AuthorityRoute::Local(_)
+        | klights_leader_api::AuthorityRoute::Unavailable => {
+            service_unavailable("no current cluster authority; retry when a leader is available")
+        }
     }
-
-    // Follower: proxy to leader or fail closed if no safe leader path exists.
-    follower_handle(request, &proxy).await
 }
 
 /// Follower request handler: proxy to leader when available. If no current
 /// leader endpoint is known or the leader cannot be reached, fail closed with a
 /// retryable Kubernetes 503 rather than serving stale local cluster.db state.
-async fn follower_handle(request: Request, proxy: &RaftLeaderProxy) -> Response {
-    if let Some(leader_addr) = proxy.leader_addr() {
-        let (parts, body) = request.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to read request body");
-                return service_unavailable("failed to read request body");
-            }
-        };
+async fn follower_handle(
+    request: Request,
+    router: &HttpAuthorityRouter,
+    leader_addr: &str,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read request body");
+            return service_unavailable("failed to read request body");
+        }
+    };
 
-        return proxy_raw(&parts, &body_bytes, &leader_addr, &proxy.http_client()).await;
-    }
-
-    service_unavailable("no raft leader elected; retry when a leader is available")
+    proxy_raw(&parts, &body_bytes, leader_addr, &router.http_client()).await
 }
 
 /// Send a pre-buffered request to the leader and return the response.
@@ -358,6 +501,7 @@ fn service_unavailable(msg: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    type RaftLeaderProxy = HttpAuthorityRouter;
 
     #[test]
     fn stamp_forwarded_client_cert_encodes_der_into_header() {
@@ -387,10 +531,7 @@ mod tests {
             tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
         let proxy = RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None);
         assert!(proxy.is_leader());
-        assert_eq!(
-            proxy.leader_addr(),
-            Some("https://10.99.0.10:7679".to_string())
-        );
+        assert_eq!(proxy.leader_addr(), None);
     }
 
     #[test]

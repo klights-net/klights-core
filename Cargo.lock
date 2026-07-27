@@ -2182,6 +2182,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "klights-leader-rpc"
+version = "0.0.0"
+
+[[package]]
 name = "klights-network-api"
 version = "0.0.0"
 dependencies = [
