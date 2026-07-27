@@ -1,9 +1,9 @@
-#[cfg(test)]
-use crate::TestNodeOutboxPayload as OutboxPayload;
 use crate::kubelet::outbox::OutboxOperation;
 use crate::kubelet::outbox::{
     Outbox, OutboxCommand, OutboxSendPlanner, OutboxSendRoute, OutboxSubject,
 };
+#[cfg(test)]
+use crate::node_outbox::payload::OutboxPayload;
 #[cfg(test)]
 use anyhow::Context;
 use anyhow::Result;
@@ -1998,7 +1998,7 @@ mod tests {
         )
         .await
         .expect("open node-local db");
-        let outbox = std::sync::Arc::new(crate::TestNodeOutbox::new(node_local.clone()));
+        let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone()));
         let publisher = OutboxNodeSelfStatusPublisher::new("worker-a", leader_query, outbox);
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
@@ -2068,7 +2068,7 @@ mod tests {
         let publisher = OutboxNodeSelfStatusPublisher::new(
             "worker-a",
             leader_query,
-            std::sync::Arc::new(crate::TestNodeOutbox::new(node_local.clone())),
+            std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
         );
         let request =
             klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {

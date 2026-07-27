@@ -1025,7 +1025,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::TestNodeOutbox>>,
+        outbox: Option<Arc<crate::node_outbox::Outbox>>,
     ) -> Self {
         let network_cache = empty_test_pod_network_cache();
         let assignment_bus = test_assignment_bus();
@@ -1048,7 +1048,7 @@ impl PodRepository {
         side_effects: Arc<SideEffectRegistry>,
         metrics: Arc<SideEffectMetrics>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::TestNodeOutbox>>,
+        outbox: Option<Arc<crate::node_outbox::Outbox>>,
         cluster_api: Arc<dyn LeaderResourceQuery>,
     ) -> Self {
         let pod_network_cache = empty_test_pod_network_cache();
@@ -1076,7 +1076,7 @@ impl PodRepository {
         pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
         assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
         scheduling_mode: PodSchedulingMode,
-        outbox: Option<Arc<crate::TestNodeOutbox>>,
+        outbox: Option<Arc<crate::node_outbox::Outbox>>,
     ) -> Self {
         Self::new_with_network_events_and_cluster_api(PodRepositoryBuildConfig {
             db,

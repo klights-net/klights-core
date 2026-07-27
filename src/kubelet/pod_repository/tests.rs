@@ -63,7 +63,7 @@ async fn fixture_node_local() -> crate::datastore::node_local::KubeletTestStoreH
 fn build_worker_repository_for_test(
     cluster_api: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     node_local: crate::datastore::node_local::KubeletTestStoreHandle,
-    outbox: Arc<crate::TestNodeOutbox>,
+    outbox: Arc<crate::node_outbox::Outbox>,
 ) -> PodRepository {
     crate::pod_repository_composition::build_worker_pod_repository_parts(
         crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
@@ -268,10 +268,10 @@ impl klights_leader_api::LeaderOutboxDelivery for TestOutboxDelivery {
         request: klights_leader_api::OutboxDeliveryRequest,
     ) -> klights_leader_api::OutboxDeliveryFuture<'_> {
         Box::pin(async move {
-            let payload = crate::TestNodeOutboxPayload::decode_protobuf(request.payload().as_ref())
-                .map_err(|err| {
-                    klights_leader_api::OutboxDeliveryError::Retryable(err.to_string())
-                })?;
+            let payload = crate::node_outbox::payload::OutboxPayload::decode_protobuf(
+                request.payload().as_ref(),
+            )
+            .map_err(|err| klights_leader_api::OutboxDeliveryError::Retryable(err.to_string()))?;
             let command = payload.command;
             let current_rv = self
                 .db
@@ -334,7 +334,7 @@ async fn build_repo_with_scheduling_mode_for_outbox(
 ) {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -354,10 +354,10 @@ async fn drain_repo_outbox(
     node_db: &crate::datastore::node_local::KubeletTestStoreHandle,
 ) -> Result<()> {
     let client = std::sync::Arc::new(TestOutboxDelivery::new(db));
-    let dispatcher = crate::TestNodeOutboxDispatcher::for_tests(node_db.clone(), client);
+    let dispatcher = crate::node_outbox::OutboxDispatcher::for_tests(node_db.clone(), client);
     loop {
         let outcome = dispatcher.dispatch_due_once(i64::MAX / 4).await?;
-        if matches!(outcome, crate::TestNodeOutboxDispatchOutcome::Idle { .. }) {
+        if matches!(outcome, crate::node_outbox::DispatchOutcome::Idle { .. }) {
             break;
         }
     }
@@ -1008,7 +1008,7 @@ async fn worker_status_enqueue_does_not_bypass_leader_side_effects() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let supervisor = fixture_supervisor();
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = fixture_side_effects();
@@ -1228,7 +1228,7 @@ async fn runtime_reconcile_reads_pending_status_checkpoint_from_node_db() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let stale_pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1329,7 +1329,7 @@ async fn get_pod_for_uid_overlays_local_status_checkpoint_for_read_your_own_writ
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let stale_pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1426,7 +1426,7 @@ async fn outbox_status_reads_current_pod_through_leader_api() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1505,7 +1505,7 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -1567,8 +1567,9 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
         .expect("metadata row enqueued");
     assert_eq!(row.operation, "PodMetadata");
     assert_eq!(row.pod_uid, "uid-leader-sandbox");
-    let payload = crate::TestNodeOutboxPayload::decode_protobuf(row.payload_proto.as_slice())
-        .expect("decode sandbox metadata payload");
+    let payload =
+        crate::node_outbox::payload::OutboxPayload::decode_protobuf(row.payload_proto.as_slice())
+            .expect("decode sandbox metadata payload");
     assert_eq!(
         payload.command,
         klights_cluster_core::command::StorageCommand::PatchResource {
@@ -1621,7 +1622,7 @@ async fn controller_owner_reference_update_commits_to_leader_store_not_node_outb
         .await
         .expect("create controller-owned Pod");
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let repo = PodRepository::new_with_scheduling_mode_outbox_and_cluster_api(
         db.clone(),
         fixture_supervisor(),
@@ -1879,7 +1880,7 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
     let (_ds, direct_db) = crate::datastore::test_support::in_memory_with_handle().await;
     let (_leader_ds, leader_db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let pod = leader_db
         .create_resource(
             "v1",
@@ -1935,8 +1936,9 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
         .expect("delete row enqueued");
     assert_eq!(row.operation, "PodMetadata");
     assert_eq!(row.pod_uid, "uid-leader-finalize");
-    let payload = crate::TestNodeOutboxPayload::decode_protobuf(row.payload_proto.as_slice())
-        .expect("decode delete payload");
+    let payload =
+        crate::node_outbox::payload::OutboxPayload::decode_protobuf(row.payload_proto.as_slice())
+            .expect("decode delete payload");
     match &payload.command {
         klights_cluster_core::command::StorageCommand::FinalizeBoundPod {
             namespace,
@@ -1994,7 +1996,7 @@ async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal(
         )
         .await
         .expect("seed status checkpoint");
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -2055,7 +2057,7 @@ async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal(
 #[tokio::test]
 async fn worker_actor_finalization_uses_fresh_leader_read_before_emitting_finalize() {
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let stale_pod = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -2139,14 +2141,14 @@ async fn worker_actor_finalization_serializes_same_uid_write_without_actor_retry
         .await
         .expect("create terminating Pod");
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let cluster_api = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
         Arc::new(cluster_db.clone()),
         "worker-1".to_string(),
         crate::control_plane::client::local::always_leader_watch(),
     ));
     let repo = build_worker_repository_for_test(cluster_api.clone(), node_db.clone(), outbox);
-    let dispatcher = crate::TestNodeOutboxDispatcher::for_tests(node_db.clone(), cluster_api);
+    let dispatcher = crate::node_outbox::OutboxDispatcher::for_tests(node_db.clone(), cluster_api);
 
     assert!(
         !repo
@@ -2176,7 +2178,7 @@ async fn worker_actor_finalization_serializes_same_uid_write_without_actor_retry
             .dispatch_due_once(i64::MAX / 4)
             .await
             .expect("dispatch semantic finalization"),
-        crate::TestNodeOutboxDispatchOutcome::Dispatched
+        crate::node_outbox::DispatchOutcome::Dispatched
     );
     assert!(
         cluster_store
@@ -2588,12 +2590,12 @@ impl StatusRacingRaftProposal {
         _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::bootstrap::outbox_apply_adapter::RaftOutboxApply,
-        crate::TestNodeOutboxApplyError,
+        crate::node_outbox::OutboxApplyError,
     > {
         self.bump_status_before_delete_mark(&command).await;
-        let payload = crate::TestNodeOutboxPayload::from_command(command)
+        let payload = crate::node_outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
-            .map_err(|err| crate::TestNodeOutboxApplyError::Retryable(err.to_string()))?;
+            .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
         crate::bootstrap::outbox_apply_adapter::propose_outbox_on_backend(
             self.inner.as_ref(),
             idempotency_key,
@@ -2606,11 +2608,11 @@ impl StatusRacingRaftProposal {
 }
 
 #[async_trait::async_trait]
-impl crate::TestRaftProposal for StatusRacingRaftProposal {
+impl crate::datastore::raft::proposal::RaftProposal for StatusRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<crate::TestStorageCommandResult> {
+    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         let key = format!("status-race-{}", uuid::Uuid::new_v4());
         let outcome = self
             .apply_command(
@@ -2622,7 +2624,7 @@ impl crate::TestRaftProposal for StatusRacingRaftProposal {
             )
             .await
             .map_err(|err| anyhow::anyhow!("status race raft propose: {err}"))?;
-        Ok(crate::TestStorageCommandResult {
+        Ok(crate::datastore::raft::types::StorageCommandResult {
             applied_rv: outcome.applied_resource_version(),
             error_message: None,
             rejection_code: None,
@@ -2639,10 +2641,12 @@ impl crate::TestRaftProposal for StatusRacingRaftProposal {
         command: klights_cluster_core::command::StorageCommand,
         authoring_node: &str,
         _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::TestNodeOutboxApplyResult, crate::TestNodeOutboxApplyError>
-    {
+    ) -> std::result::Result<
+        crate::node_outbox::OutboxApplyResult,
+        crate::node_outbox::OutboxApplyError,
+    > {
         let operation = crate::kubelet::outbox::OutboxOperation::try_from(operation)
-            .map_err(|err| crate::TestNodeOutboxApplyError::Retryable(err.to_string()))?;
+            .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))?;
         let outcome = self
             .apply_command(command, idempotency_key, operation, authoring_node, None)
             .await?;
@@ -9441,8 +9445,8 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
 #[tokio::test]
 async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_get() {
     use super::{PodApiWriter, PodReader};
-    use crate::TestNodeOutboxPayload as OutboxPayload;
     use crate::datastore::ResourcePreconditions;
+    use crate::node_outbox::payload::OutboxPayload;
     use klights_cluster_core::BuildOutboxOutcome;
     use klights_cluster_core::command::StorageCommand;
 
@@ -12089,7 +12093,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
     let node_db = fixture_node_local().await;
-    let outbox = Arc::new(crate::TestNodeOutbox::new(node_db.clone()));
+    let outbox = Arc::new(crate::node_outbox::Outbox::new(node_db.clone()));
     let pod_resource = crate::datastore::Resource {
         id: 1,
         api_version: "v1".to_string(),
@@ -12152,8 +12156,9 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         .expect("delete-mark row enqueued");
     assert_eq!(row.operation, "PodMetadata");
     assert_eq!(row.pod_uid, "uid-missing-delete-mark");
-    let payload = crate::TestNodeOutboxPayload::decode_protobuf(row.payload_proto.as_slice())
-        .expect("decode delete-mark payload");
+    let payload =
+        crate::node_outbox::payload::OutboxPayload::decode_protobuf(row.payload_proto.as_slice())
+            .expect("decode delete-mark payload");
     match payload.command {
         klights_cluster_core::command::StorageCommand::PatchResource {
             api_version,
@@ -13033,16 +13038,16 @@ impl DeleteCasRacingRaftProposal {
 }
 
 #[async_trait::async_trait]
-impl crate::TestRaftProposal for DeleteCasRacingRaftProposal {
+impl crate::datastore::raft::proposal::RaftProposal for DeleteCasRacingRaftProposal {
     async fn propose_command(
         &self,
         command: klights_cluster_core::command::StorageCommand,
-    ) -> anyhow::Result<crate::TestStorageCommandResult> {
+    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         if self.targets_delete_of_pod(&command) {
             self.race_before_delete().await;
         }
         self.apply_command_to_inner(command).await?;
-        Ok(crate::TestStorageCommandResult::default())
+        Ok(crate::datastore::raft::types::StorageCommandResult::default())
     }
 
     async fn propose_outbox_command(
@@ -13052,15 +13057,17 @@ impl crate::TestRaftProposal for DeleteCasRacingRaftProposal {
         command: klights_cluster_core::command::StorageCommand,
         _authoring_node: &str,
         _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
-    ) -> std::result::Result<crate::TestNodeOutboxApplyResult, crate::TestNodeOutboxApplyError>
-    {
+    ) -> std::result::Result<
+        crate::node_outbox::OutboxApplyResult,
+        crate::node_outbox::OutboxApplyError,
+    > {
         if self.targets_delete_of_pod(&command) {
             self.race_before_delete().await;
         }
         self.apply_command_to_inner(command)
             .await
-            .map(|_| crate::TestNodeOutboxApplyResult::Applied { applied_rv: 0 })
-            .map_err(|err| crate::TestNodeOutboxApplyError::Retryable(err.to_string()))
+            .map(|_| crate::node_outbox::OutboxApplyResult::Applied { applied_rv: 0 })
+            .map_err(|err| crate::node_outbox::OutboxApplyError::Retryable(err.to_string()))
     }
 }
 

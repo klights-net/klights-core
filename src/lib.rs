@@ -47,19 +47,6 @@ pub mod node_admin;
 pub mod node_lease_tracker;
 mod node_lifecycle_controller_adapter;
 pub mod node_outbox;
-#[cfg(test)]
-pub(crate) use datastore::raft::{
-    proposal::RaftProposal as TestRaftProposal,
-    types::StorageCommandResult as TestStorageCommandResult,
-};
-#[cfg(test)]
-pub(crate) use node_outbox::payload::OutboxPayload as TestNodeOutboxPayload;
-#[cfg(test)]
-pub(crate) use node_outbox::{
-    DispatchOutcome as TestNodeOutboxDispatchOutcome, Outbox as TestNodeOutbox,
-    OutboxApplyError as TestNodeOutboxApplyError, OutboxApplyResult as TestNodeOutboxApplyResult,
-    OutboxDispatcher as TestNodeOutboxDispatcher,
-};
 pub(crate) mod node_routing_metadata;
 mod node_subnet_controller_adapter;
 mod node_taint_manager_side_effect_adapter;

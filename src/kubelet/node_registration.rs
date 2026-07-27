@@ -381,7 +381,7 @@ pub(crate) async fn register_node(
 pub(crate) async fn register_node_with_outbox(
     file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn crate::datastore::DatastoreBackend,
-    outbox: &crate::TestNodeOutbox,
+    outbox: &crate::node_outbox::Outbox,
     node_name: &str,
     profile: &NodeRegistrationProfile,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
