@@ -93,7 +93,8 @@ impl NodeLostPodLifecycleSink for PodLifecycleRouter {
 
 pub(crate) struct NodeLifecycleControllerDependencies {
     pub(crate) store: DatastoreHandle,
-    pub(crate) pods: Arc<crate::kubelet::pod_repository::PodRepository>,
+    pub(crate) pods: Arc<dyn NodeLifecyclePodStore>,
+    pub(crate) pod_mutations: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     pub(crate) pod_lifecycle: Arc<PodLifecycleRouter>,
     pub(crate) lease_observations: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -109,6 +110,7 @@ pub(crate) async fn run_node_lifecycle_controller(
     let NodeLifecycleControllerDependencies {
         store: db,
         pods: pod_repository,
+        pod_mutations,
         pod_lifecycle: pod_lifecycle_router,
         lease_observations: node_lease_tracker,
         supervisor: task_supervisor,
@@ -157,7 +159,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                 pod_repository.as_ref(),
                 node_lease_tracker.as_ref(),
                 Utc::now(),
-                Some(pod_repository.mutation_reconcile_port().as_ref()),
+                Some(pod_mutations.as_ref()),
                 Some(pod_lifecycle_router.as_ref() as &dyn NodeLostPodLifecycleSink),
             )
             .await
@@ -245,7 +247,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                         match crate::controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
                             db.as_ref(),
                             pod_repository.as_ref(),
-                            Some(pod_repository.mutation_reconcile_port().as_ref()),
+                            Some(pod_mutations.as_ref()),
                             Some(
                                 pod_lifecycle_router.as_ref()
                                     as &dyn NodeLostPodLifecycleSink,

@@ -404,6 +404,8 @@ pub(crate) struct PodRepositoryNetworkDependencies {
 pub(crate) struct PodRepositoryDeliveryDependencies {
     pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    pub bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
+    pub actor_delete_mark: Arc<dyn GcPodDeleteSink>,
 }
 
 pub(crate) struct PodRepositoryAdapters {
@@ -848,6 +850,8 @@ struct PodDeletionFinalizerDependencies {
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
+    actor_delete_mark: Arc<dyn GcPodDeleteSink>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     supervisor: Arc<TaskSupervisor>,
@@ -882,11 +886,13 @@ fn compose_pod_deletion_finalizer(
             crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizerDependencies {
                 store: dependencies.store,
                 gc_pod_delete_sink: dependencies.gc_pod_delete_sink,
+                actor_delete_mark: dependencies.actor_delete_mark,
                 gc_reconcile: dependencies.gc_reconcile,
                 pdb_reconcile: dependencies.pdb_reconcile,
                 namespace_termination: dependencies.namespace_termination,
                 cluster_api: dependencies.cluster_api,
                 outbox: dependencies.outbox,
+                bound_pod_finalization: dependencies.bound_pod_finalization,
                 mutation_reconcile: dependencies.mutation_reconcile,
                 metrics: dependencies.metrics,
                 supervisor: dependencies.supervisor,
@@ -1098,7 +1104,7 @@ impl PodRepository {
     /// must be started after lifecycle wiring is complete (Task 4.2).
     #[cfg(test)]
     pub fn build_parts(config: PodRepositoryBuildConfig) -> facade::PodRepositoryParts {
-        crate::pod_repository_composition::build_pod_repository_parts(config, None)
+        crate::pod_repository_composition::build_pod_repository_parts(config, None).repository_parts
     }
 
     pub(crate) fn prepare(
@@ -1165,6 +1171,8 @@ impl PodRepository {
         let PodRepositoryDeliveryDependencies {
             outbox,
             cluster_api,
+            bound_pod_finalization,
+            actor_delete_mark,
         } = delivery;
         workqueue.set_namespace_termination_sink(adapters.namespace_termination.clone());
         let ordinary_mutation = adapters.ordinary_mutation;
@@ -1204,11 +1212,13 @@ impl PodRepository {
         let deletion_finalizer_dependencies = PodDeletionFinalizerDependencies {
             store: store.clone(),
             gc_pod_delete_sink,
+            actor_delete_mark,
             gc_reconcile,
             pdb_reconcile: pdb_reconcile.clone(),
             namespace_termination: namespace_termination.clone(),
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
+            bound_pod_finalization,
             mutation_reconcile: mutation_reconcile.clone(),
             metrics: runtime_metrics.clone(),
             supervisor: supervisor.clone(),

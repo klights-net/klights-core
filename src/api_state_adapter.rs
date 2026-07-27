@@ -281,11 +281,21 @@ impl ApiResourceStore for RootApiResourceStore {
 
 pub(crate) struct RootApiPodRepository {
     inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+    api: Arc<crate::pod_api_service::PodApiService>,
+    subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
 }
 
 impl RootApiPodRepository {
-    pub(crate) fn new(inner: Arc<crate::kubelet::pod_repository::PodRepository>) -> Arc<Self> {
-        Arc::new(Self { inner })
+    pub(crate) fn new(
+        inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+        api: Arc<crate::pod_api_service::PodApiService>,
+        subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            api,
+            subresource,
+        })
     }
 }
 
@@ -326,35 +336,35 @@ impl klights_pod_api::PodApiMutation for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodApiCreateRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
-        klights_pod_api::PodApiMutation::create_pod(self.inner.as_ref(), request)
+        klights_pod_api::PodApiMutation::create_pod(self.api.as_ref(), request)
     }
 
     fn update_pod(
         &self,
         request: klights_pod_api::PodApiUpdateRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
-        klights_pod_api::PodApiMutation::update_pod(self.inner.as_ref(), request)
+        klights_pod_api::PodApiMutation::update_pod(self.api.as_ref(), request)
     }
 
     fn patch_pod(
         &self,
         request: klights_pod_api::PodApiPatchRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
-        klights_pod_api::PodApiMutation::patch_pod(self.inner.as_ref(), request)
+        klights_pod_api::PodApiMutation::patch_pod(self.api.as_ref(), request)
     }
 
     fn delete_pod(
         &self,
         request: klights_pod_api::PodApiDeleteRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
-        klights_pod_api::PodApiMutation::delete_pod(self.inner.as_ref(), request)
+        klights_pod_api::PodApiMutation::delete_pod(self.api.as_ref(), request)
     }
 
     fn delete_collection_pods(
         &self,
         request: klights_pod_api::PodApiDeleteCollectionRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
-        klights_pod_api::PodApiMutation::delete_collection_pods(self.inner.as_ref(), request)
+        klights_pod_api::PodApiMutation::delete_collection_pods(self.api.as_ref(), request)
     }
 }
 
@@ -363,14 +373,14 @@ impl klights_pod_api::PodSubresourceMutation for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodStatusReplaceRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        klights_pod_api::PodSubresourceMutation::replace_status(self.inner.as_ref(), request)
+        klights_pod_api::PodSubresourceMutation::replace_status(self.subresource.as_ref(), request)
     }
 
     fn patch_status(
         &self,
         request: klights_pod_api::PodStatusPatchRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        klights_pod_api::PodSubresourceMutation::patch_status(self.inner.as_ref(), request)
+        klights_pod_api::PodSubresourceMutation::patch_status(self.subresource.as_ref(), request)
     }
 
     fn update_ephemeral_containers(
@@ -378,7 +388,7 @@ impl klights_pod_api::PodSubresourceMutation for RootApiPodRepository {
         request: klights_pod_api::PodEphemeralContainersRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
         klights_pod_api::PodSubresourceMutation::update_ephemeral_containers(
-            self.inner.as_ref(),
+            self.subresource.as_ref(),
             request,
         )
     }
@@ -389,7 +399,34 @@ impl klights_pod_api::PodEvictionDelete for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodEvictionDeleteRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodEvictionDeleteOutcome> {
-        klights_pod_api::PodEvictionDelete::delete_for_eviction(self.inner.as_ref(), request)
+        Box::pin(async move {
+            let (namespace, name, options, dry_run) = request.into_parts();
+            let outcome = self
+                .api
+                .repository_delete_pod(&namespace, &name, options, dry_run)
+                .await?;
+            match outcome {
+                crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(_) => {
+                    Ok(klights_pod_api::PodEvictionDeleteOutcome::DryRun)
+                }
+                crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(resource) => {
+                    let _ = self
+                        .inner
+                        .mutation_reconcile_port()
+                        .reconcile_pod_mutation(
+                            klights_reconcile_api::PodMutationReconcileRequest::RunHooks {
+                                pod: resource.clone(),
+                                named_hook: None,
+                                context: "pod_eviction_mark_terminating",
+                            },
+                        )
+                        .await;
+                    Ok(klights_pod_api::PodEvictionDeleteOutcome::Persisted(
+                        resource,
+                    ))
+                }
+            }
+        })
     }
 }
 
@@ -426,9 +463,10 @@ impl ApiPodRepository for RootApiPodRepository {
         let namespace = namespace.to_owned();
         let name = name.to_owned();
         Box::pin(async move {
-            self.inner
+            self.api
                 .bind_pod_from_api(&namespace, &name, binding, dry_run)
                 .await
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
         })
     }
 }

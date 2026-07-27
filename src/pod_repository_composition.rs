@@ -82,6 +82,12 @@ pub struct WorkerPodRepositoryBuildConfig {
     pub outbox: Arc<crate::node_outbox::Outbox>,
 }
 
+pub(crate) struct RootPodRepositoryParts {
+    pub repository_parts: crate::kubelet::pod_repository::facade::PodRepositoryParts,
+    pub api: Arc<PodApiService>,
+    pub subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+}
+
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
     node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
@@ -961,7 +967,11 @@ fn root_pod_repository_adapters(
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
     prepared: &crate::kubelet::pod_repository::PodRepositoryPrepared,
-) -> PodRepositoryAdapters {
+) -> (
+    PodRepositoryAdapters,
+    Arc<PodApiService>,
+    Arc<crate::pod_subresource_service::PodSubresourceService>,
+) {
     let pod_reconcile = Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
         db.clone(),
         side_effects.controller_dispatcher_slot(),
@@ -994,10 +1004,10 @@ fn root_pod_repository_adapters(
             ),
         metrics,
     }));
-    PodRepositoryAdapters {
+    let adapters = PodRepositoryAdapters {
         ordinary_mutation: api.clone(),
         controller_create: api.clone(),
-        subresource,
+        subresource: subresource.clone(),
         gc_delete: api.clone(),
         gc_reconcile: pod_reconcile.clone(),
         pdb_reconcile: pod_reconcile.clone(),
@@ -1006,14 +1016,15 @@ fn root_pod_repository_adapters(
         namespace_termination: pod_reconcile.clone(),
         mutation_reconcile: pod_reconcile,
         #[cfg(test)]
-        scheduler_test_control: Some(api),
-    }
+        scheduler_test_control: Some(api.clone()),
+    };
+    (adapters, api, subresource)
 }
 
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leadership: Option<tokio::sync::watch::Receiver<bool>>,
-) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
+) -> RootPodRepositoryParts {
     let PodRepositoryBuildConfig {
         db,
         node_local,
@@ -1052,9 +1063,17 @@ pub(crate) fn build_pod_repository_parts(
         },
         leadership,
     );
-    let adapters =
+    let (adapters, api, subresource) =
         root_pod_repository_adapters(db, resource_query, side_effects, metrics.clone(), &prepared);
-    PodRepository::assemble(
+    let delivery_outbox = outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>);
+    let bound_pod_adapter = crate::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
+        prepared.store.clone(),
+        cluster_api.clone(),
+        delivery_outbox.clone(),
+    );
+    let bound_pod_finalization = bound_pod_adapter.clone();
+    let actor_delete_mark = adapters.gc_delete.clone();
+    let repository_parts = PodRepository::assemble(
         prepared,
         metrics.clone(),
         PodRepositoryNetworkDependencies {
@@ -1062,11 +1081,18 @@ pub(crate) fn build_pod_repository_parts(
             assignment_waiter,
         },
         PodRepositoryDeliveryDependencies {
-            outbox: outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>),
+            outbox: delivery_outbox,
             cluster_api,
+            bound_pod_finalization,
+            actor_delete_mark,
         },
         adapters,
-    )
+    );
+    RootPodRepositoryParts {
+        repository_parts,
+        api,
+        subresource,
+    }
 }
 
 pub(crate) fn build_worker_pod_repository_parts(
@@ -1087,6 +1113,14 @@ pub(crate) fn build_worker_pod_repository_parts(
         },
         None,
     );
+    let delivery_outbox: Arc<dyn klights_leader_api::NodeOutbox> = config.outbox;
+    let bound_pod_adapter = crate::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
+        prepared.store.clone(),
+        Some(config.resource_query.clone()),
+        Some(delivery_outbox.clone()),
+    );
+    let bound_pod_finalization = bound_pod_adapter.clone();
+    let actor_delete_mark = bound_pod_adapter;
     PodRepository::assemble(
         prepared,
         config.metrics,
@@ -1095,8 +1129,10 @@ pub(crate) fn build_worker_pod_repository_parts(
             assignment_waiter: config.assignment_waiter,
         },
         PodRepositoryDeliveryDependencies {
-            outbox: Some(config.outbox as Arc<dyn klights_leader_api::NodeOutbox>),
+            outbox: Some(delivery_outbox),
             cluster_api: Some(config.resource_query),
+            bound_pod_finalization,
+            actor_delete_mark,
         },
         worker_pod_repository_adapters(),
     )

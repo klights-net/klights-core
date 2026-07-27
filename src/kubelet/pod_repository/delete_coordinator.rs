@@ -154,7 +154,7 @@ pub struct PodDeleteCoordinator {
 }
 
 impl PodDeleteCoordinator {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: Arc<PodStore>,
         workqueue: Arc<PodWorkqueue>,
         supervisor: Arc<TaskSupervisor>,

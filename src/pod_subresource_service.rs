@@ -41,7 +41,7 @@ impl PodSubresourceService {
         }
     }
 
-    async fn replace_status_from_api_checked(
+    pub(crate) async fn replace_status_from_api_checked(
         &self,
         ns: &str,
         name: &str,
@@ -96,7 +96,7 @@ impl PodSubresourceService {
 
     /// PATCH `/api/v1/.../pods/{name}/status` — apply the patch and
     /// persist only the resulting `status` subtree.
-    pub(super) async fn patch_status_from_api(
+    pub(crate) async fn patch_status_from_api(
         &self,
         ns: &str,
         name: &str,
@@ -160,7 +160,7 @@ impl PodSubresourceService {
     /// When the new list grows beyond the existing one, `metadata.generation`
     /// is bumped — matches today's handler-side behaviour and the K8s
     /// "spec mutation increments generation" contract.
-    pub(super) async fn update_ephemeral_containers(
+    pub(crate) async fn update_ephemeral_containers(
         &self,
         ns: &str,
         name: &str,
@@ -198,6 +198,66 @@ impl PodSubresourceService {
             bump_metadata_generation(&mut body);
         }
         self.store.update(ns, name, body, expected_rv).await
+    }
+}
+
+impl klights_pod_api::PodSubresourceMutation for PodSubresourceService {
+    fn replace_status(
+        &self,
+        request: klights_pod_api::PodStatusReplaceRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.replace_status_from_api_checked(
+                &request.namespace,
+                &request.name,
+                None,
+                request.status,
+                request.expected_resource_version,
+            )
+            .await
+            .map_err(|error| map_subresource_error(error, &request.namespace, &request.name))
+        })
+    }
+
+    fn patch_status(
+        &self,
+        request: klights_pod_api::PodStatusPatchRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            let patch_type = match request.patch_kind {
+                klights_pod_api::PodStatusPatchKind::JsonPatch => PodStatusPatchType::JsonPatch,
+                klights_pod_api::PodStatusPatchKind::MergePatch => PodStatusPatchType::MergePatch,
+                klights_pod_api::PodStatusPatchKind::StrategicMerge => {
+                    PodStatusPatchType::StrategicMerge
+                }
+                klights_pod_api::PodStatusPatchKind::ApplyPatch => PodStatusPatchType::ApplyPatch,
+            };
+            self.patch_status_from_api(
+                &request.namespace,
+                &request.name,
+                request.patch,
+                patch_type,
+                request.expected_resource_version,
+            )
+            .await
+            .map_err(|error| map_subresource_error(error, &request.namespace, &request.name))
+        })
+    }
+
+    fn update_ephemeral_containers(
+        &self,
+        request: klights_pod_api::PodEphemeralContainersRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.update_ephemeral_containers(
+                &request.namespace,
+                &request.name,
+                request.containers,
+                request.expected_resource_version,
+            )
+            .await
+            .map_err(|error| map_subresource_error(error, &request.namespace, &request.name))
+        })
     }
 }
 
