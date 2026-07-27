@@ -6311,11 +6311,15 @@ async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalizati
         if !removed_immediately {
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
-                    if db
-                        .get_resource("v1", "Pod", Some("gc-cleanup"), name)
+                    if pod_repository
+                        .finalize_pod_deletion_after_actor_cleanup("gc-cleanup", name, uid)
                         .await
                         .unwrap()
-                        .is_none()
+                        || db
+                            .get_resource("v1", "Pod", Some("gc-cleanup"), name)
+                            .await
+                            .unwrap()
+                            .is_none()
                     {
                         break;
                     }
@@ -6324,7 +6328,7 @@ async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalizati
             })
             .await
             .unwrap_or_else(|_| {
-                panic!("queued actor-owned finalization should remove picked-up Pod {name} by UID")
+                panic!("actor-owned finalization retries should remove picked-up Pod {name} by UID")
             });
         }
     }
