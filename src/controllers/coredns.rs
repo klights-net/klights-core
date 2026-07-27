@@ -486,9 +486,12 @@ mod tests {
         containerd_namespace: &str,
         node_name: &str,
     ) -> anyhow::Result<()> {
+        let controller_pods = std::sync::Arc::new(
+            crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(pod_repository),
+        );
         bootstrap_coredns_root(
             db,
-            pod_repository,
+            controller_pods,
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &crate::controllers::ControllerCoordination::new(),
             crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {

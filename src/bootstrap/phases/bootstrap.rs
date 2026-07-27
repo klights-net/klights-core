@@ -1276,7 +1276,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if leader_lease.is_some() {
         crate::coredns_bootstrap_adapter::bootstrap_coredns(
             db,
-            api_pod_repository.clone(),
+            controller_pod_port.clone(),
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
             controller_coordination.as_ref(),
             crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
