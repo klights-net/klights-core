@@ -29,9 +29,8 @@ async fn reconcile_job_test(
         repo.as_ref(),
         repo.as_ref(),
         &non_pod_finalization,
-        coordination(),
         job,
-        node_name,
+        crate::controllers::ControllerReconcileContext::new(coordination(), node_name),
     )
     .await
 }
@@ -251,9 +250,8 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         pod_writer.as_ref(),
         pod_reader.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-        coordination(),
         &job_with_rv,
-        "test-node",
+        crate::controllers::ControllerReconcileContext::new(coordination(), "test-node"),
     )
     .await
     .unwrap();

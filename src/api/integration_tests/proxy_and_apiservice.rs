@@ -4224,6 +4224,7 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
+            data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     let sa_uid = "sa-uid-jwt-test";
@@ -4558,6 +4559,7 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
+            data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
 
@@ -5307,6 +5309,7 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
+            data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
 
@@ -5442,6 +5445,7 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
+            data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     // SA exists, but the bound pod was deleted: TokenReview must not report the

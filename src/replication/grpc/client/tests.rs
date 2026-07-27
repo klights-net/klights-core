@@ -1719,10 +1719,13 @@ mod cases {
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
-        let app = crate::replication::grpc::server::mount_service(
+        let controller_dispatcher = Arc::new(crate::controllers::ControllerDispatcher::default());
+        let app = crate::replication::grpc::server::mount_service_with_controller_dispatcher(
             axum::Router::new(),
             service.clone(),
             db.clone(),
+            Some(controller_dispatcher),
+            None,
             default_transport_policy(),
         );
         let app = mount_test_service_with_node_cert(app, "worker-1");

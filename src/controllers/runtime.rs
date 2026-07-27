@@ -383,9 +383,11 @@ macro_rules! controller_wrapper {
                     ctx.pods().$mutation(),
                     ctx.pods().delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
-                    ctx.coordination(),
                     &resource,
-                    ctx.node_name(),
+                    $crate::controllers::ControllerReconcileContext::new(
+                        ctx.coordination(),
+                        ctx.node_name(),
+                    ),
                 )
                 .await
             }
@@ -508,9 +510,11 @@ macro_rules! controller_wrapper {
                     ctx.pods().$mutation(),
                     ctx.pods().delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
-                    ctx.coordination(),
                     &resource,
-                    ctx.node_name(),
+                    $crate::controllers::ControllerReconcileContext::new(
+                        ctx.coordination(),
+                        ctx.node_name(),
+                    ),
                 )
                 .await
                 .map(|_| ())

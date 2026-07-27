@@ -164,9 +164,7 @@ pub async fn reconcile_node_lifecycle_once(
         pod_repository.as_ref(),
         &tracker,
         now,
-        None,
-        None,
-        Duration::ZERO,
+        NodeLifecyclePodActions::for_test(),
     )
     .await
 }
@@ -200,11 +198,33 @@ pub async fn reconcile_node_lifecycle_once_with_tracker_for_test(
         pod_repository.as_ref(),
         node_lease_tracker,
         now,
-        None,
-        None,
-        Duration::ZERO,
+        NodeLifecyclePodActions::for_test(),
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NodeLifecyclePodActions<'a> {
+    pub(crate) mutation_reconcile: Option<&'a dyn klights_reconcile_api::PodMutationReconcileSink>,
+    pub(crate) lifecycle: Option<&'a dyn NodeLostPodLifecycleSink>,
+    pub(crate) eviction_grace: Duration,
+}
+
+impl NodeLifecyclePodActions<'_> {
+    #[cfg(test)]
+    fn for_test() -> Self {
+        let eviction_grace_seconds = parse_node_not_ready_pod_eviction_grace_seconds(
+            std::env::var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS").ok(),
+        );
+        Self {
+            mutation_reconcile: None,
+            lifecycle: None,
+            eviction_grace: Duration::from_secs(
+                u64::try_from(eviction_grace_seconds)
+                    .expect("validated non-negative Pod eviction grace"),
+            ),
+        }
+    }
 }
 
 pub(crate) async fn reconcile_node_lifecycle_once_with_tracker(
@@ -213,10 +233,13 @@ pub(crate) async fn reconcile_node_lifecycle_once_with_tracker(
     pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
     node_lease_tracker: &NodeLeaseTracker,
     now: DateTime<Utc>,
-    side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
-    pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
-    pod_eviction_grace: Duration,
+    pod_actions: NodeLifecyclePodActions<'_>,
 ) -> Result<Option<Duration>> {
+    let NodeLifecyclePodActions {
+        mutation_reconcile: side_effects,
+        lifecycle: pod_lifecycle_router,
+        eviction_grace: pod_eviction_grace,
+    } = pod_actions;
     let nodes = db.list_nodes().await?;
     let mut next_deadline: Option<Duration> = None;
 
@@ -1973,15 +1996,17 @@ mod tests {
             state.resource_mutation().pod_repository.as_ref(),
             state.controller_reconcile().node_lease_tracker.as_ref(),
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
-            Some(
-                state
-                    .resource_mutation()
-                    .pod_repository
-                    .mutation_reconcile_port()
-                    .as_ref(),
-            ),
-            None,
-            std::time::Duration::ZERO,
+            super::NodeLifecyclePodActions {
+                mutation_reconcile: Some(
+                    state
+                        .resource_mutation()
+                        .pod_repository
+                        .mutation_reconcile_port()
+                        .as_ref(),
+                ),
+                lifecycle: None,
+                eviction_grace: std::time::Duration::ZERO,
+            },
         )
         .await
         .unwrap();
@@ -2003,15 +2028,17 @@ mod tests {
             state.resource_mutation().pod_repository.as_ref(),
             state.controller_reconcile().node_lease_tracker.as_ref(),
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap(),
-            Some(
-                state
-                    .resource_mutation()
-                    .pod_repository
-                    .mutation_reconcile_port()
-                    .as_ref(),
-            ),
-            None,
-            std::time::Duration::ZERO,
+            super::NodeLifecyclePodActions {
+                mutation_reconcile: Some(
+                    state
+                        .resource_mutation()
+                        .pod_repository
+                        .mutation_reconcile_port()
+                        .as_ref(),
+                ),
+                lifecycle: None,
+                eviction_grace: std::time::Duration::ZERO,
+            },
         )
         .await
         .unwrap();

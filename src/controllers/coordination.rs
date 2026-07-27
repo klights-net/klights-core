@@ -12,6 +12,25 @@ pub(crate) enum CoordinatedControllerKind {
     ReplicationController,
 }
 
+/// Root-owned ambient inputs shared by one controller reconcile invocation.
+///
+/// Keeping these values together makes the execution identity explicit without
+/// teaching controller logic about the composition root that owns them.
+#[derive(Clone, Copy)]
+pub(crate) struct ControllerReconcileContext<'a> {
+    pub(crate) coordination: &'a ControllerCoordination,
+    pub(crate) node_name: &'a str,
+}
+
+impl<'a> ControllerReconcileContext<'a> {
+    pub(crate) fn new(coordination: &'a ControllerCoordination, node_name: &'a str) -> Self {
+        Self {
+            coordination,
+            node_name,
+        }
+    }
+}
+
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct ControllerReconcileKey {
     kind: CoordinatedControllerKind,

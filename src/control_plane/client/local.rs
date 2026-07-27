@@ -2396,6 +2396,7 @@ mod inner_gate_tests {
         make_pod(&db).await;
         let (tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+        client.set_controller_dispatcher(Arc::new(ControllerDispatcher::default()));
 
         // Pre-promotion: write refused.
         let pre = client
@@ -2439,6 +2440,7 @@ mod inner_gate_tests {
         make_pod(&db).await;
         let (tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+        client.set_controller_dispatcher(Arc::new(ControllerDispatcher::default()));
 
         // Pre-demotion: write succeeds.
         let pre = client

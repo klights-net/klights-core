@@ -100,10 +100,11 @@ pub(crate) async fn reconcile_replicationcontroller(
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
     rc: &Value,
-    node_name: &str,
+    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
 ) -> Result<()> {
+    let coordination = reconcile_context.coordination;
+    let node_name = reconcile_context.node_name;
     let common = crate::controllers::common::controller_common();
     let rc_name = rc["metadata"]["name"].as_str().context("RC missing name")?;
     let namespace = rc["metadata"]["namespace"]

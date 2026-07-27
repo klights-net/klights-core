@@ -306,9 +306,8 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
             ctx.pod_writer,
             ctx.pod_delete_sink,
             ctx.non_pod_finalization,
-            ctx.coordination,
             &rs_with_metadata,
-            ctx.node_name,
+            crate::controllers::ControllerReconcileContext::new(ctx.coordination, ctx.node_name),
         )
         .await?;
     }
@@ -549,10 +548,11 @@ pub(crate) async fn reconcile_deployment(
      ),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
     deployment: &Value,
-    node_name: &str,
+    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
 ) -> Result<()> {
+    let coordination = reconcile_context.coordination;
+    let node_name = reconcile_context.node_name;
     let common = crate::controllers::common::controller_common();
     let input_metadata = deployment
         .get("metadata")
@@ -963,9 +963,8 @@ pub(crate) async fn reconcile_deployment(
                         pod_writer,
                         pod_delete_sink,
                         non_pod_finalization,
-                        coordination,
                         &rs_with_metadata,
-                        node_name,
+                        reconcile_context,
                     )
                     .await?;
                 }
@@ -1016,9 +1015,8 @@ pub(crate) async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
-                    coordination,
                     &rs_with_metadata,
-                    node_name,
+                    reconcile_context,
                 )
                 .await?;
             }
@@ -1158,9 +1156,8 @@ pub(crate) async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
-                    coordination,
                     &rs_with_metadata,
-                    node_name,
+                    reconcile_context,
                 )
                 .await?;
             }
@@ -1197,9 +1194,8 @@ pub(crate) async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
-                    coordination,
                     &rs_with_metadata,
-                    node_name,
+                    reconcile_context,
                 )
                 .await?;
             }
@@ -1231,9 +1227,8 @@ pub(crate) async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
-                    coordination,
                     &rs_with_metadata,
-                    node_name,
+                    reconcile_context,
                 )
                 .await?;
             }
@@ -1282,9 +1277,8 @@ pub(crate) async fn reconcile_deployment(
                         pod_writer,
                         pod_delete_sink,
                         non_pod_finalization,
-                        coordination,
                         &rs_with_metadata,
-                        node_name,
+                        reconcile_context,
                     )
                     .await?;
                 }
@@ -1392,9 +1386,8 @@ pub(crate) async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
-                    coordination,
                     &rs_with_metadata,
-                    node_name,
+                    reconcile_context,
                 )
                 .await?;
             }
@@ -1557,9 +1550,8 @@ pub(crate) async fn reconcile_deployment(
             pod_writer,
             pod_delete_sink,
             non_pod_finalization,
-            coordination,
             &rs_with_metadata,
-            node_name,
+            reconcile_context,
         )
         .await?;
     }

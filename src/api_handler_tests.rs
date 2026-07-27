@@ -30,9 +30,8 @@ async fn reconcile_deployment(
         pod_writer,
         pod_delete_sink,
         non_pod_finalization,
-        controller_coordination(),
         deployment,
-        node_name,
+        crate::controllers::ControllerReconcileContext::new(controller_coordination(), node_name),
     )
     .await
 }
@@ -52,9 +51,8 @@ async fn reconcile_replicaset(
         pod_writer,
         pod_delete_sink,
         non_pod_finalization,
-        controller_coordination(),
         replicaset,
-        node_name,
+        crate::controllers::ControllerReconcileContext::new(controller_coordination(), node_name),
     )
     .await
 }

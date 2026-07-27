@@ -114,10 +114,11 @@ pub(crate) async fn reconcile_statefulset(
     pod_writer: &(impl StatefulSetPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
     statefulset: &Value,
-    node_name: &str,
+    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
 ) -> Result<()> {
+    let coordination = reconcile_context.coordination;
+    let node_name = reconcile_context.node_name;
     let common = crate::controllers::common::controller_common();
     let input_metadata = statefulset
         .get("metadata")

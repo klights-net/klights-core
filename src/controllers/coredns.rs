@@ -491,10 +491,12 @@ mod tests {
             pod_repository,
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &crate::controllers::ControllerCoordination::new(),
-            tls_port,
-            service_cidr,
-            containerd_namespace,
-            node_name,
+            crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
+                tls_port,
+                service_cidr,
+                containerd_namespace,
+                node_name,
+            },
         )
         .await
     }

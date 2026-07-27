@@ -840,10 +840,11 @@ pub(crate) async fn reconcile_job(
     pod_writer: &(impl JobPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
-    coordination: &crate::controllers::ControllerCoordination,
     job: &Value,
-    node_name: &str,
+    reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
 ) -> Result<Value> {
+    let coordination = reconcile_context.coordination;
+    let node_name = reconcile_context.node_name;
     let initial_metadata = job
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;

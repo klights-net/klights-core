@@ -206,9 +206,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
-                    self.coordination,
                     resource,
-                    node_name,
+                    crate::controllers::ControllerReconcileContext::new(
+                        self.coordination,
+                        node_name,
+                    ),
                 )
                 .await
             }
@@ -219,9 +221,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
-                    self.coordination,
                     resource,
-                    node_name,
+                    crate::controllers::ControllerReconcileContext::new(
+                        self.coordination,
+                        node_name,
+                    ),
                 )
                 .await
             }
@@ -232,9 +236,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
-                    self.coordination,
                     resource,
-                    node_name,
+                    crate::controllers::ControllerReconcileContext::new(
+                        self.coordination,
+                        node_name,
+                    ),
                 )
                 .await
             }
@@ -245,9 +251,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
-                    self.coordination,
                     resource,
-                    node_name,
+                    crate::controllers::ControllerReconcileContext::new(
+                        self.coordination,
+                        node_name,
+                    ),
                 )
                 .await
             }

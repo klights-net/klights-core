@@ -827,6 +827,9 @@ mod tests {
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
+        client.set_controller_dispatcher(Arc::new(
+            crate::controllers::ControllerDispatcher::default(),
+        ));
 
         let first = client
             .deliver_test_outbox(
@@ -944,6 +947,9 @@ mod tests {
             "node-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
+        client.set_controller_dispatcher(Arc::new(
+            crate::controllers::ControllerDispatcher::default(),
+        ));
 
         assert_eq!(client.last_raft_commit_index_for_test().await, 0);
         let applied = client

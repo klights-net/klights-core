@@ -29,9 +29,8 @@ async fn reconcile_replicationcontroller(
         pod_writer,
         pod_delete_sink,
         non_pod_finalization,
-        coordination(),
         rc,
-        node_name,
+        crate::controllers::ControllerReconcileContext::new(coordination(), node_name),
     )
     .await
 }

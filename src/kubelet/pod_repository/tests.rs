@@ -12116,8 +12116,12 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         })),
     };
     let cluster_api = Arc::new(FakeLeaderApiClient::new(pod_resource));
-    let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
-        Arc::new(crate::controllers::gc::NoOpGcPodDeleteSink);
+    let root_deletion = crate::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
+        store.clone(),
+        Some(cluster_api.clone()),
+        Some(outbox.clone()),
+    );
+    let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> = root_deletion;
     let finalizer = RealPodDeletionFinalizer::new(
         store,
         gc_pod_delete_sink,

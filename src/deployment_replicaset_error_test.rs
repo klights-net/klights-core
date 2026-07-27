@@ -53,9 +53,8 @@ mod tests {
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
                 db.clone(),
             )),
-            &coordination,
             &deployment_with_rv,
-            "test-node",
+            crate::controllers::ControllerReconcileContext::new(&coordination, "test-node"),
         )
         .await;
 

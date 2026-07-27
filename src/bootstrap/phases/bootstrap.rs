@@ -1279,10 +1279,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_pod_repository.clone(),
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
             controller_coordination.as_ref(),
-            config.tls_port,
-            &config.service_cidr,
-            &config.containerd_namespace,
-            &config.node_name,
+            crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
+                tls_port: config.tls_port,
+                service_cidr: &config.service_cidr,
+                containerd_namespace: &config.containerd_namespace,
+                node_name: &config.node_name,
+            },
         )
         .await
         .context("Failed to bootstrap CoreDNS")?;

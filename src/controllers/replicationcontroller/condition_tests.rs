@@ -13,9 +13,8 @@ async fn reconcile_rc_test(db: &Datastore, rc: &Value, node_name: &str) -> anyho
         repo.as_ref(),
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-        &coordination,
         rc,
-        node_name,
+        crate::controllers::ControllerReconcileContext::new(&coordination, node_name),
     )
     .await
 }

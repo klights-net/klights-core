@@ -228,9 +228,11 @@ async fn test_statefulset_create_loop_observes_live_scale_down() {
         pod_writer.as_ref(),
         pod_reader.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
-        &crate::controllers::ControllerCoordination::new(),
         &sts_with_rv,
-        "test-node",
+        crate::controllers::ControllerReconcileContext::new(
+            &crate::controllers::ControllerCoordination::new(),
+            "test-node",
+        ),
     )
     .await
     .unwrap();

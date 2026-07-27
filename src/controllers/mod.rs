@@ -46,7 +46,9 @@ pub mod statefulset_controller;
 pub mod test_utils;
 pub mod workqueue;
 
-pub(crate) use coordination::{ControllerCoordination, CoordinatedControllerKind};
+pub(crate) use coordination::{
+    ControllerCoordination, ControllerReconcileContext, CoordinatedControllerKind,
+};
 pub(crate) use dispatcher::ControllerDispatcher;
 pub(crate) use ports::{
     ControllerEffectPort, ControllerLeaderPort, ControllerNetworkPort, ControllerPodPort,

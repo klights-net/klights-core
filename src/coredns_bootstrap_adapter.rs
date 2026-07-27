@@ -105,23 +105,26 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             pod_repository,
             pod_repository,
             self.non_pod_finalization,
-            self.coordination,
             &deployment,
-            node_name,
+            crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
         )
         .await
     }
 }
 
-pub async fn bootstrap_coredns(
+pub(crate) struct CoreDnsBootstrapConfig<'a> {
+    pub(crate) tls_port: u16,
+    pub(crate) service_cidr: &'a str,
+    pub(crate) containerd_namespace: &'a str,
+    pub(crate) node_name: &'a str,
+}
+
+pub(crate) async fn bootstrap_coredns(
     db: &dyn DatastoreBackend,
     pod_repository: Arc<PodRepository>,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &crate::controllers::ControllerCoordination,
-    tls_port: u16,
-    service_cidr: &str,
-    containerd_namespace: &str,
-    node_name: &str,
+    config: CoreDnsBootstrapConfig<'_>,
 ) -> Result<()> {
     bootstrap_coredns_with_store(
         &CoreDnsBootstrapAdapter {
@@ -130,10 +133,10 @@ pub async fn bootstrap_coredns(
             non_pod_finalization,
             coordination,
         },
-        tls_port,
-        service_cidr,
-        containerd_namespace,
-        node_name,
+        config.tls_port,
+        config.service_cidr,
+        config.containerd_namespace,
+        config.node_name,
     )
     .await
 }

@@ -161,9 +161,11 @@ pub(crate) async fn run_node_lifecycle_controller(
                 pod_repository.as_ref(),
                 node_lease_tracker.as_ref(),
                 Utc::now(),
-                Some(pod_mutations.as_ref()),
-                Some(pod_lifecycle_router.as_ref() as &dyn NodeLostPodLifecycleSink),
-                pod_eviction_grace,
+                crate::controllers::node_lifecycle::NodeLifecyclePodActions {
+                    mutation_reconcile: Some(pod_mutations.as_ref()),
+                    lifecycle: Some(pod_lifecycle_router.as_ref() as &dyn NodeLostPodLifecycleSink),
+                    eviction_grace: pod_eviction_grace,
+                },
             )
             .await
             {

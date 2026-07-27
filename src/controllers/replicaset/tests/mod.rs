@@ -25,9 +25,8 @@ where
         pod_writer,
         pod_delete_sink,
         &non_pod_finalization,
-        coordination(),
         replicaset,
-        node_name,
+        crate::controllers::ControllerReconcileContext::new(coordination(), node_name),
     )
     .await
 }

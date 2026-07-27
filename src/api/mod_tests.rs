@@ -5227,6 +5227,7 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
+            data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
 
