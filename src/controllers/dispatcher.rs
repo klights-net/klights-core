@@ -1590,8 +1590,7 @@ mod tests {
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;
 
-        let finish_time = (chrono::Utc::now() - chrono::Duration::milliseconds(500))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let finish_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         db.create_resource(
             "batch/v1",
             "Job",
@@ -1606,7 +1605,7 @@ mod tests {
                     "uid": "uid-ttl-delayed-job"
                 },
                 "spec": {
-                    "ttlSecondsAfterFinished": 1,
+                    "ttlSecondsAfterFinished": 60,
                     "completions": 1,
                     "parallelism": 1,
                     "template": {
@@ -1680,6 +1679,9 @@ mod tests {
             "future ttlSecondsAfterFinished must use the supervised workqueue timer"
         );
 
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
         let requeued = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             dispatcher.take_reconcile_key_for_test(),
