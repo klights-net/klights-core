@@ -86,7 +86,7 @@ impl Context {
                     ),
                 ),
                 pods: Arc::new(
-                    crate::controller_runtime_adapter::RootControllerPodPort::new(
+                    crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
                         repository.clone(),
                     ),
                 ),
@@ -145,7 +145,9 @@ impl Context {
         repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     ) -> Self {
         self.dependencies.pods = Arc::new(
-            crate::controller_runtime_adapter::RootControllerPodPort::new(repository.clone()),
+            crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
+                repository.clone(),
+            ),
         );
         self.pod_repository = Some(repository);
         self

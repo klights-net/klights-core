@@ -1073,10 +1073,10 @@ async fn test_admission_engine_shared_runner_no_webhooks_keeps_resource() {
 }
 
 #[tokio::test]
-async fn test_admission_engine_accepts_datastore_backend_trait_object() {
+async fn test_admission_engine_accepts_focused_lookup_trait_object() {
     let db = crate::datastore::test_support::in_memory().await;
-    let db_backend: &dyn DatastoreBackend = &db;
-    let engine = AdmissionEngine::new(db_backend);
+    let lookup: &dyn AdmissionLookup = &db;
+    let engine = AdmissionEngine::new(lookup);
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",

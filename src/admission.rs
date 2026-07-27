@@ -6,7 +6,6 @@ mod webhook_call;
 mod webhook_response;
 mod webhook_rules;
 
-use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 #[cfg(test)]
 use http_client::webhook_http_client_for;
@@ -41,15 +40,36 @@ use webhook_rules::{
     webhook_side_effects_allow_dry_run,
 };
 
+/// API-server-owned reads for admission policy, webhook, parameter and
+/// namespace-selector evaluation.
+#[async_trait::async_trait]
+pub(crate) trait AdmissionLookup: Send + Sync {
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Option<klights_cluster_core::Resource>>;
+
+    async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>>;
+}
+
 /// Shared OO runner for mutating and validating admission webhooks.
 /// Mutating and validating paths share rule matching, selector checks and callout flow.
 pub struct AdmissionEngine<'a> {
-    db: &'a dyn DatastoreBackend,
+    lookup: &'a dyn AdmissionLookup,
 }
 
 impl<'a> AdmissionEngine<'a> {
-    pub fn new(db: &'a dyn DatastoreBackend) -> Self {
-        Self { db }
+    pub(crate) fn new(lookup: &'a dyn AdmissionLookup) -> Self {
+        Self { lookup }
     }
 
     #[cfg(test)]
@@ -109,15 +129,9 @@ impl<'a> AdmissionEngine<'a> {
         let resource_namespace = context.namespace.clone();
 
         let mut configs = self
-            .db
-            .list_resources(
-                "admissionregistration.k8s.io/v1",
-                webhook_kind,
-                None,
-                crate::datastore::ResourceListQuery::all(),
-            )
-            .await?
-            .items;
+            .lookup
+            .list_resources("admissionregistration.k8s.io/v1", webhook_kind, None, None)
+            .await?;
         configs.sort_by(|a, b| {
             let an = a
                 .data
@@ -143,7 +157,7 @@ impl<'a> AdmissionEngine<'a> {
         let ns_labels: Option<serde_json::Map<String, Value>> =
             if let Some(ref ns) = resource_namespace {
                 Some(
-                    get_namespace_labels_value(self.db, ns)
+                    get_namespace_labels_value(self.lookup, ns)
                         .await
                         .unwrap_or_default(),
                 )
@@ -193,7 +207,7 @@ impl<'a> AdmissionEngine<'a> {
                 let timeout_seconds = webhook_timeout_seconds(webhook);
 
                 match call_webhook(
-                    self.db,
+                    self.lookup,
                     webhook,
                     &mutated_resource,
                     context,
@@ -260,7 +274,7 @@ impl<'a> AdmissionEngine<'a> {
                     .unwrap_or("Fail");
                 let timeout_seconds = webhook_timeout_seconds(webhook);
                 match call_webhook(
-                    self.db,
+                    self.lookup,
                     webhook,
                     &mutated_resource,
                     context,
@@ -283,7 +297,7 @@ impl<'a> AdmissionEngine<'a> {
         }
 
         if !is_mutating {
-            run_validating_admission_policies(self.db, context, &mutated_resource).await?;
+            run_validating_admission_policies(self.lookup, context, &mutated_resource).await?;
         }
 
         Ok(mutated_resource)

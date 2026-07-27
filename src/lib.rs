@@ -68,6 +68,7 @@ pub mod paths;
 mod pdb_side_effect_adapter;
 pub mod pidfile;
 pub(crate) mod pod_api_service;
+mod pod_event_adapter;
 pub(crate) mod pod_events;
 pub(crate) mod pod_readiness;
 pub(crate) mod pod_reconcile_adapter;
@@ -115,7 +116,7 @@ mod cronjob_event_driven_scheduler_tests;
 // as part of `./build.sh`.
 
 mod bootstrap;
-mod bound_pod_finalization_command;
+mod bound_pod_finalization_adapter;
 
 #[cfg(test)]
 mod deployment_replicaset_error_test;

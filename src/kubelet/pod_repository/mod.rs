@@ -282,12 +282,13 @@ use delete_coordinator::PodDeleteCoordinator;
 use klights_reconcile_api::{PodEvictionAdmissionSink, PodGcReconcileSink, PodPdbReconcileSink};
 use network::PodNetworkService;
 use objects::PodObjectService;
-use state_only_writer::{StateOnlyWriter, StatusOnlyWriterService};
+use state_only_writer::StateOnlyWriter;
 use status::PodStatusService;
 use store::PodStore;
 use watch::PodWatchService;
 use workqueue::PodWorkqueue;
 
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait PodApiPort: Send + Sync {
     async fn create(
@@ -343,6 +344,7 @@ pub(crate) trait PodApiPort: Send + Sync {
     async fn schedule_all(self: Arc<Self>) -> std::result::Result<(), PodRepositoryError>;
 }
 
+#[cfg(test)]
 #[async_trait]
 pub(crate) trait PodSubresourcePort: Send + Sync {
     async fn replace_status(
@@ -361,13 +363,6 @@ pub(crate) trait PodSubresourcePort: Send + Sync {
         patch_type: PodStatusPatchType,
         expected_rv: i64,
     ) -> std::result::Result<Resource, PodRepositoryError>;
-    async fn update_ephemeral_containers(
-        &self,
-        ns: &str,
-        name: &str,
-        containers: Vec<Value>,
-        expected_rv: i64,
-    ) -> std::result::Result<Resource, PodRepositoryError>;
 }
 
 pub(crate) struct PodRepositoryAdapterDependencies {
@@ -382,6 +377,12 @@ pub(crate) struct PodRepositoryRuntimeDependencies {
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
 }
 
+pub(crate) struct PodRepositoryCoreDependencies {
+    pub store: Arc<PodStore>,
+    pub status_only: Arc<dyn StateOnlyWriter>,
+    pub workqueue: Arc<PodWorkqueue>,
+}
+
 pub(crate) struct PodRepositoryNetworkDependencies {
     pub pod_network_cache: Arc<dyn klights_node_store::PodNetworkCache>,
     pub assignment_waiter: Arc<dyn klights_network_api::PodNetworkAssignmentWaiter>,
@@ -390,11 +391,10 @@ pub(crate) struct PodRepositoryNetworkDependencies {
 pub(crate) struct PodRepositoryDeliveryDependencies {
     pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    pub bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
 }
 
 pub(crate) struct PodRepositoryAdapters {
-    pub api: Arc<dyn PodApiPort>,
-    pub subresource: Arc<dyn PodSubresourcePort>,
     pub gc_delete: Arc<dyn GcPodDeleteSink>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
     pub pdb_reconcile: Arc<dyn PodPdbReconcileSink>,
@@ -403,11 +403,9 @@ pub(crate) struct PodRepositoryAdapters {
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     #[cfg(test)]
-    pub api_for_test: Option<Arc<crate::pod_api_service::PodApiService>>,
-}
-
-pub(crate) trait PodRepositoryAdapterFactory: Send + Sync {
-    fn build(&self, dependencies: PodRepositoryAdapterDependencies) -> PodRepositoryAdapters;
+    pub test_api: Option<Arc<crate::pod_api_service::PodApiService>>,
+    #[cfg(test)]
+    pub test_subresource: Option<Arc<crate::pod_subresource_service::PodSubresourceService>>,
 }
 
 #[async_trait]
@@ -593,7 +591,7 @@ pub trait PodObjectWriter: Send + Sync {
         &self,
         ns: &str,
         name: &str,
-        node_name: &str,
+        _node_name: &str,
         pod: Value,
     ) -> Result<Resource>;
 
@@ -788,10 +786,12 @@ pub struct PodRepository {
     store: Arc<PodStore>,
     status: PodStatusService,
     objects: PodObjectService,
-    subresource: Arc<dyn PodSubresourcePort>,
+    #[cfg(test)]
+    test_subresource: Option<Arc<crate::pod_subresource_service::PodSubresourceService>>,
     network_svc: PodNetworkService,
     _watch: PodWatchService,
-    api: Arc<dyn PodApiPort>,
+    #[cfg(test)]
+    test_api: Option<Arc<crate::pod_api_service::PodApiService>>,
     gc_delete: Arc<dyn GcPodDeleteSink>,
     eviction_admission: Arc<dyn PodEvictionAdmissionSink>,
     namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
@@ -804,11 +804,26 @@ pub struct PodRepository {
     host_ip: crate::kubelet::context::HostIpState,
     #[cfg(test)]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
-    #[cfg(test)]
-    api_for_test: Option<Arc<crate::pod_api_service::PodApiService>>,
 }
 
 impl PodRepository {
+    #[cfg(test)]
+    pub(crate) fn test_root_api_services(
+        &self,
+    ) -> (
+        Arc<crate::pod_api_service::PodApiService>,
+        Arc<crate::pod_subresource_service::PodSubresourceService>,
+    ) {
+        (
+            self.test_api
+                .clone()
+                .expect("test repository requires a root Pod API adapter"),
+            self.test_subresource
+                .clone()
+                .expect("test repository requires a root Pod subresource adapter"),
+        )
+    }
+
     pub(crate) fn mutation_reconcile_port(
         &self,
     ) -> Arc<dyn klights_reconcile_api::PodMutationReconcileSink> {
@@ -837,6 +852,7 @@ struct PodDeletionFinalizerDependencies {
     namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization>,
     mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
     supervisor: Arc<TaskSupervisor>,
@@ -876,6 +892,7 @@ fn compose_pod_deletion_finalizer(
                 namespace_termination: dependencies.namespace_termination,
                 cluster_api: dependencies.cluster_api,
                 outbox: dependencies.outbox,
+                bound_pod_finalization: dependencies.bound_pod_finalization,
                 mutation_reconcile: dependencies.mutation_reconcile,
                 metrics: dependencies.metrics,
                 supervisor: dependencies.supervisor,
@@ -1087,18 +1104,21 @@ impl PodRepository {
     /// must be started after lifecycle wiring is complete (Task 4.2).
     #[cfg(test)]
     pub fn build_parts(config: PodRepositoryBuildConfig) -> facade::PodRepositoryParts {
-        crate::pod_repository_composition::build_pod_repository_parts(config, None)
+        crate::pod_repository_composition::build_pod_repository_parts(config, None).repository_parts
     }
 
     pub(crate) fn build_parts_with_adapters(
-        pod_persistence: Arc<dyn store::PodPersistence>,
-        workqueue_persistence: impl workqueue::PodWorkqueuePersistence + Clone + 'static,
+        core: PodRepositoryCoreDependencies,
         runtime: PodRepositoryRuntimeDependencies,
         network: PodRepositoryNetworkDependencies,
         delivery: PodRepositoryDeliveryDependencies,
-        leadership: Option<tokio::sync::watch::Receiver<bool>>,
-        adapter_factory: Arc<dyn PodRepositoryAdapterFactory>,
+        adapters: PodRepositoryAdapters,
     ) -> facade::PodRepositoryParts {
+        let PodRepositoryCoreDependencies {
+            store,
+            status_only,
+            workqueue,
+        } = core;
         let PodRepositoryRuntimeDependencies {
             supervisor,
             metrics,
@@ -1110,39 +1130,9 @@ impl PodRepository {
         let PodRepositoryDeliveryDependencies {
             outbox,
             cluster_api,
+            bound_pod_finalization,
         } = delivery;
-        let store = Arc::new(PodStore::from_persistence(pod_persistence));
-        let workqueue = if let Some(leadership) = leadership {
-            PodWorkqueue::new_leader(
-                store.clone(),
-                workqueue_persistence.clone(),
-                supervisor.clone(),
-                metrics.clone(),
-                leadership,
-            )
-        } else {
-            PodWorkqueue::new(
-                store.clone(),
-                workqueue_persistence,
-                supervisor.clone(),
-                metrics.clone(),
-            )
-        };
-        let delete_coordinator = Arc::new(PodDeleteCoordinator::new(
-            store.clone(),
-            workqueue.clone(),
-            supervisor.clone(),
-            metrics.clone(),
-        ));
-        let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
-        let adapters = adapter_factory.build(PodRepositoryAdapterDependencies {
-            store: store.clone(),
-            status_only: status_only.clone(),
-            supervisor: supervisor.clone(),
-            delete_coordinator,
-        });
         workqueue.set_namespace_termination_sink(adapters.namespace_termination.clone());
-        let api = adapters.api;
         let gc_reconcile = adapters.gc_reconcile;
         let pdb_reconcile = adapters.pdb_reconcile;
         let eviction_admission = adapters.eviction_admission;
@@ -1160,12 +1150,10 @@ impl PodRepository {
         );
         let objects = PodObjectService::new(
             store.clone(),
-            api.clone(),
             mutation_reconcile.clone(),
             outbox.clone(),
             cluster_api.clone(),
         );
-        let subresource = adapters.subresource;
         let network_svc = PodNetworkService::new(
             pod_network_cache,
             supervisor.clone(),
@@ -1184,6 +1172,7 @@ impl PodRepository {
             namespace_termination: namespace_termination.clone(),
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
+            bound_pod_finalization,
             mutation_reconcile: mutation_reconcile.clone(),
             metrics: metrics.clone(),
             supervisor: supervisor.clone(),
@@ -1197,10 +1186,12 @@ impl PodRepository {
             store,
             status,
             objects,
-            subresource,
+            #[cfg(test)]
+            test_subresource: adapters.test_subresource,
             network_svc,
             _watch: watch,
-            api,
+            #[cfg(test)]
+            test_api: adapters.test_api,
             gc_delete: adapters.gc_delete,
             eviction_admission,
             namespace_bootstrap,
@@ -1213,8 +1204,6 @@ impl PodRepository {
             host_ip,
             #[cfg(test)]
             deletion_finalizer,
-            #[cfg(test)]
-            api_for_test: adapters.api_for_test,
         };
         let background = PodRepositoryBackground::new(workqueue);
         facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)
@@ -1336,17 +1325,24 @@ impl PodRepository {
         resource
     }
 
+    #[cfg(test)]
     pub async fn schedule_pending_pod(
         &self,
         namespace: &str,
         name: &str,
     ) -> Result<Option<Resource>> {
-        self.api
-            .schedule_pending(namespace, name)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))
+        PodApiPort::schedule_pending(
+            self.test_api
+                .as_deref()
+                .expect("test scheduler requires the root Pod API adapter"),
+            namespace,
+            name,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
+    #[cfg(test)]
     pub async fn bind_pod_from_api(
         &self,
         namespace: &str,
@@ -1354,18 +1350,28 @@ impl PodRepository {
         binding: serde_json::Value,
         dry_run: bool,
     ) -> Result<()> {
-        self.api
-            .bind(namespace, name, binding, dry_run)
-            .await
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
+        PodApiPort::bind(
+            self.test_api
+                .as_deref()
+                .expect("test bind requires the root Pod API adapter"),
+            namespace,
+            name,
+            binding,
+            dry_run,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
+    #[cfg(test)]
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
-        self.api
-            .clone()
-            .schedule_all()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))
+        PodApiPort::schedule_all(
+            self.test_api
+                .clone()
+                .expect("test scheduler requires the root Pod API adapter"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
     #[cfg(test)]
@@ -1373,7 +1379,7 @@ impl PodRepository {
         &self,
         gate: Arc<crate::pod_api_service::SchedulerBindGateForTest>,
     ) {
-        self.api_for_test
+        self.test_api
             .as_ref()
             .expect("scheduler bind gate requires root Pod API adapter")
             .set_scheduler_bind_gate_for_test(gate);
@@ -1787,15 +1793,38 @@ impl PodObjectWriter for PodRepository {
         &self,
         ns: &str,
         name: &str,
-        node_name: &str,
+        _node_name: &str,
         pod: Value,
     ) -> Result<Resource> {
-        let created = self
-            .objects
-            .create_controller_pod(ns, name, node_name, pod)
-            .await?;
-        self.spawn_post_write_maintenance(ns).await;
-        Ok(created)
+        #[cfg(test)]
+        {
+            let result = PodApiPort::create(
+                self.test_api
+                    .as_deref()
+                    .expect("test controller create requires the root Pod API adapter"),
+                PodApiCreateRequest {
+                    namespace: ns.to_string(),
+                    name: name.to_string(),
+                    body: pod,
+                    dry_run: false,
+                    run_admission: true,
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let created = result
+                .resource
+                .ok_or_else(|| anyhow::anyhow!("controller pod create returned dry-run"))?;
+            self.spawn_post_write_maintenance(ns).await;
+            return Ok(created);
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (ns, name, _node_name, pod);
+            Err(anyhow::anyhow!(
+                "controller Pod creation is owned by the root Pod API adapter"
+            ))
+        }
     }
     async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
         let Some(current) = self.store.get(ns, name).await? else {
@@ -1877,6 +1906,7 @@ impl PodObjectWriter for PodRepository {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl PodSubresourceWriter for PodRepository {
     async fn replace_status_from_api(
@@ -1887,7 +1917,9 @@ impl PodSubresourceWriter for PodRepository {
         expected_rv: i64,
     ) -> Result<Resource> {
         let updated = self
-            .subresource
+            .test_subresource
+            .as_deref()
+            .expect("test status replace requires the root subresource adapter")
             .replace_status(ns, name, None, status, expected_rv)
             .await?;
         let _ = self
@@ -1911,7 +1943,9 @@ impl PodSubresourceWriter for PodRepository {
         expected_rv: i64,
     ) -> Result<Resource> {
         let updated = self
-            .subresource
+            .test_subresource
+            .as_deref()
+            .expect("test status replace requires the root subresource adapter")
             .replace_status(ns, name, Some(pod_uid), status, expected_rv)
             .await?;
         let _ = self
@@ -1935,7 +1969,9 @@ impl PodSubresourceWriter for PodRepository {
         expected_rv: i64,
     ) -> Result<Resource> {
         let updated = self
-            .subresource
+            .test_subresource
+            .as_deref()
+            .expect("test status patch requires the root subresource adapter")
             .patch_status(ns, name, patch, patch_type, expected_rv)
             .await?;
         let _ = self
@@ -1957,13 +1993,16 @@ impl PodSubresourceWriter for PodRepository {
         containers: Vec<Value>,
         expected_rv: i64,
     ) -> Result<Resource> {
-        self.subresource
+        self.test_subresource
+            .as_deref()
+            .expect("test ephemeral-container update requires the root subresource adapter")
             .update_ephemeral_containers(ns, name, containers, expected_rv)
             .await
             .map_err(Into::into)
     }
 }
 
+#[cfg(test)]
 impl klights_pod_api::PodSubresourceMutation for PodRepository {
     fn replace_status(
         &self,
@@ -2068,6 +2107,7 @@ impl PodWatchSource for PodRepository {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 #[allow(clippy::todo)]
 impl PodApiWriter for PodRepository {
@@ -2075,7 +2115,13 @@ impl PodApiWriter for PodRepository {
         &self,
         request: PodApiCreateRequest,
     ) -> std::result::Result<PodApiCreateResult, PodRepositoryError> {
-        self.api.create(request).await
+        PodApiPort::create(
+            self.test_api
+                .as_deref()
+                .expect("test create requires the root Pod API adapter"),
+            request,
+        )
+        .await
     }
     async fn api_update_pod(
         &self,
@@ -2085,7 +2131,17 @@ impl PodApiWriter for PodRepository {
         current: Resource,
         dry_run: bool,
     ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
-        self.api.update(ns, name, body, current, dry_run).await
+        PodApiPort::update(
+            self.test_api
+                .as_deref()
+                .expect("test update requires the root Pod API adapter"),
+            ns,
+            name,
+            body,
+            current,
+            dry_run,
+        )
+        .await
     }
     async fn api_patch_pod(
         &self,
@@ -2095,7 +2151,17 @@ impl PodApiWriter for PodRepository {
         patch_type: PodStatusPatchType,
         dry_run: bool,
     ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
-        self.api.patch(ns, name, patch, patch_type, dry_run).await
+        PodApiPort::patch(
+            self.test_api
+                .as_deref()
+                .expect("test patch requires the root Pod API adapter"),
+            ns,
+            name,
+            patch,
+            patch_type,
+            dry_run,
+        )
+        .await
     }
     async fn api_delete_pod<O>(
         &self,
@@ -2107,7 +2173,16 @@ impl PodApiWriter for PodRepository {
     where
         O: Into<PodDeleteOptions> + Send,
     {
-        self.api.delete(ns, name, options.into(), dry_run).await
+        PodApiPort::delete(
+            self.test_api
+                .as_deref()
+                .expect("test delete requires the root Pod API adapter"),
+            ns,
+            name,
+            options.into(),
+            dry_run,
+        )
+        .await
     }
     async fn api_delete_collection_pods(
         &self,
@@ -2116,9 +2191,16 @@ impl PodApiWriter for PodRepository {
         field_selector: Option<&str>,
         dry_run: bool,
     ) -> std::result::Result<(), PodRepositoryError> {
-        self.api
-            .delete_collection(ns, label_selector, field_selector, dry_run)
-            .await
+        PodApiPort::delete_collection(
+            self.test_api
+                .as_deref()
+                .expect("test collection delete requires the root Pod API adapter"),
+            ns,
+            label_selector,
+            field_selector,
+            dry_run,
+        )
+        .await
     }
 }
 

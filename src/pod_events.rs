@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
+#[cfg(test)]
 use crate::datastore::DatastoreBackend;
 #[cfg(test)]
 use crate::datastore::backend_kind::BackendKind;
@@ -33,6 +34,81 @@ pub struct PodEventRecord<'a> {
     pub reporting_instance: &'a str,
 }
 
+/// Focused cluster reads needed by Pod event production.
+#[async_trait::async_trait]
+pub(crate) trait PodEventQuery: Send + Sync {
+    async fn namespace_eligibility(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<crate::namespace_admission::NamespaceCreateEligibility>;
+
+    async fn list_events(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>>;
+}
+
+/// Focused leader-side persistence effect for control-plane-authored Events.
+#[async_trait::async_trait]
+pub(crate) trait PodEventEffect: Send + Sync {
+    async fn create_event(&self, namespace: &str, name: &str, event: Value) -> anyhow::Result<()>;
+}
+
+#[async_trait::async_trait]
+impl PodEventQuery for dyn klights_leader_api::LeaderResourceQuery + '_ {
+    async fn namespace_eligibility(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<crate::namespace_admission::NamespaceCreateEligibility> {
+        let resource = self
+            .get_resource(klights_leader_api::ResourceGetRequest::try_new(
+                klights_types::ResourceKey::new("v1", "Namespace", None, namespace),
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)?;
+        let Some(resource) = resource else {
+            return Ok(if crate::namespace_admission::is_protected(namespace) {
+                crate::namespace_admission::NamespaceCreateEligibility::Allowed
+            } else {
+                crate::namespace_admission::NamespaceCreateEligibility::Missing
+            });
+        };
+        Ok(
+            if resource
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                crate::namespace_admission::NamespaceCreateEligibility::Terminating
+            } else {
+                crate::namespace_admission::NamespaceCreateEligibility::Allowed
+            },
+        )
+    }
+
+    async fn list_events(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
+        let result = self
+            .list_resources(klights_leader_api::ResourceListRequest::try_new(
+                "v1",
+                "Event",
+                Some(namespace.to_string()),
+                None,
+                None,
+                None,
+                None,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )?)
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok(result.into_parts().0)
+    }
+}
+
 /// Create and store a K8s Event object for a pod lifecycle event.
 /// Returns the created Event as a JSON Value.
 #[cfg(test)]
@@ -47,8 +123,8 @@ pub async fn emit_pod_event(
 ) -> Result<Value> {
     let node_db = test_node_db().await?;
     let outbox = Outbox::new(node_db.clone());
-    let event = emit_pod_event_impl(
-        PodEventQuery::Datastore(ds),
+    let event = emit_pod_event_impl::<dyn DatastoreBackend, dyn PodEventEffect>(
+        ds,
         PodEventPersistence::NodeOutbox(Some(&outbox)),
         PodEventRecord {
             pod,
@@ -116,13 +192,16 @@ async fn flush_single_outbox_command(
         .map(|_| ())
 }
 
-pub async fn emit_pod_event_with_outbox(
-    ds: &dyn DatastoreBackend,
+pub async fn emit_pod_event_with_outbox<Q>(
+    query: &Q,
     outbox: Option<&Outbox>,
     record: PodEventRecord<'_>,
-) -> Result<Value> {
-    emit_pod_event_impl(
-        PodEventQuery::Datastore(ds),
+) -> Result<Value>
+where
+    Q: PodEventQuery + ?Sized,
+{
+    emit_pod_event_impl::<Q, dyn PodEventEffect>(
+        query,
         PodEventPersistence::NodeOutbox(outbox),
         record,
     )
@@ -134,8 +213,8 @@ pub(crate) async fn emit_worker_pod_event(
     outbox: &Outbox,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
-    emit_pod_event_impl(
-        PodEventQuery::Leader(resource_query),
+    emit_pod_event_impl::<dyn klights_leader_api::LeaderResourceQuery, dyn PodEventEffect>(
+        resource_query,
         PodEventPersistence::NodeOutbox(Some(outbox)),
         record,
     )
@@ -148,98 +227,21 @@ pub(crate) async fn emit_worker_pod_event(
 /// their reporting instance is the controller rather than a kubelet node, so
 /// worker Event authorization correctly rejects them. The supplied datastore is
 /// the leader-owned cluster port and preserves Raft proposal/apply semantics.
-pub(crate) async fn emit_control_plane_pod_event(
-    ds: &dyn DatastoreBackend,
+pub(crate) async fn emit_control_plane_pod_event<Q, E>(
+    query: &Q,
+    effect: &E,
     record: PodEventRecord<'_>,
-) -> Result<Value> {
-    emit_pod_event_impl(
-        PodEventQuery::Datastore(ds),
-        PodEventPersistence::LeaderStore(ds),
-        record,
-    )
-    .await
+) -> Result<Value>
+where
+    Q: PodEventQuery + ?Sized,
+    E: PodEventEffect + ?Sized,
+{
+    emit_pod_event_impl(query, PodEventPersistence::LeaderEffect(effect), record).await
 }
 
-enum PodEventPersistence<'a> {
+enum PodEventPersistence<'a, E: PodEventEffect + ?Sized> {
     NodeOutbox(Option<&'a Outbox>),
-    LeaderStore(&'a dyn DatastoreBackend),
-}
-
-enum PodEventQuery<'a> {
-    Datastore(&'a dyn DatastoreBackend),
-    Leader(&'a dyn klights_leader_api::LeaderResourceQuery),
-}
-
-impl PodEventQuery<'_> {
-    async fn namespace_eligibility(
-        &self,
-        namespace: &str,
-    ) -> anyhow::Result<crate::namespace_admission::NamespaceCreateEligibility> {
-        let resource = match self {
-            Self::Datastore(ds) => {
-                return crate::namespace_admission::create_eligibility(*ds, namespace).await;
-            }
-            Self::Leader(query) => query
-                .get_resource(klights_leader_api::ResourceGetRequest::try_new(
-                    klights_types::ResourceKey::new("v1", "Namespace", None, namespace),
-                    klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-                )?)
-                .await
-                .map_err(anyhow::Error::new)?,
-        };
-        let Some(resource) = resource else {
-            return Ok(if crate::namespace_admission::is_protected(namespace) {
-                crate::namespace_admission::NamespaceCreateEligibility::Allowed
-            } else {
-                crate::namespace_admission::NamespaceCreateEligibility::Missing
-            });
-        };
-        Ok(
-            if resource
-                .data
-                .pointer("/metadata/deletionTimestamp")
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-            {
-                crate::namespace_admission::NamespaceCreateEligibility::Terminating
-            } else {
-                crate::namespace_admission::NamespaceCreateEligibility::Allowed
-            },
-        )
-    }
-
-    async fn list_events(
-        &self,
-        namespace: &str,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>> {
-        match self {
-            Self::Datastore(ds) => Ok(ds
-                .list_resources(
-                    "v1",
-                    "Event",
-                    Some(namespace),
-                    crate::datastore::ResourceListQuery::all(),
-                )
-                .await?
-                .items),
-            Self::Leader(query) => {
-                let result = query
-                    .list_resources(klights_leader_api::ResourceListRequest::try_new(
-                        "v1",
-                        "Event",
-                        Some(namespace.to_string()),
-                        None,
-                        None,
-                        None,
-                        None,
-                        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
-                    )?)
-                    .await
-                    .map_err(anyhow::Error::new)?;
-                Ok(result.into_parts().0)
-            }
-        }
-    }
+    LeaderEffect(&'a E),
 }
 
 /// Outcome of the namespace preflight before emitting a pod event.
@@ -274,11 +276,15 @@ fn classify_namespace_preflight(
     }
 }
 
-async fn emit_pod_event_impl(
-    query: PodEventQuery<'_>,
-    persistence: PodEventPersistence<'_>,
+async fn emit_pod_event_impl<Q, E>(
+    query: &Q,
+    persistence: PodEventPersistence<'_, E>,
     record: PodEventRecord<'_>,
-) -> Result<Value> {
+) -> Result<Value>
+where
+    Q: PodEventQuery + ?Sized,
+    E: PodEventEffect + ?Sized,
+{
     let PodEventRecord {
         pod,
         reason,
@@ -418,8 +424,9 @@ async fn emit_pod_event_impl(
                 })
                 .await?;
         }
-        PodEventPersistence::LeaderStore(ds) => {
-            ds.create_resource("v1", "Event", Some(namespace), &event_name, event.clone())
+        PodEventPersistence::LeaderEffect(effect) => {
+            effect
+                .create_event(namespace, &event_name, event.clone())
                 .await?;
         }
     }

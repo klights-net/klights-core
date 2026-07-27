@@ -1,7 +1,7 @@
+use super::AdmissionLookup;
 use super::request_context::{AdmissionRequestContext, is_admission_operation};
 use super::webhook_response::build_admission_review;
 use super::webhook_rules::resource_rule_matches;
-use crate::datastore::DatastoreBackend;
 use anyhow::{Result, anyhow};
 use klights_types::LabelSelector;
 use serde_json::{Map, Value};
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(super) async fn run_validating_admission_policies(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     context: &AdmissionRequestContext,
     resource: &Value,
 ) -> Result<()> {
@@ -17,34 +17,32 @@ pub(super) async fn run_validating_admission_policies(
         return Ok(());
     }
 
-    let mut policies = db
+    let mut policies = lookup
         .list_resources(
             "admissionregistration.k8s.io/v1",
             "ValidatingAdmissionPolicy",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            None,
         )
-        .await?
-        .items;
+        .await?;
     policies.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut bindings = db
+    let mut bindings = lookup
         .list_resources(
             "admissionregistration.k8s.io/v1",
             "ValidatingAdmissionPolicyBinding",
             None,
-            crate::datastore::ResourceListQuery::all(),
+            None,
         )
-        .await?
-        .items;
+        .await?;
     bindings.sort_by(|a, b| a.name.cmp(&b.name));
 
     if policies.is_empty() || bindings.is_empty() {
         return Ok(());
     }
 
-    let namespace_labels = namespace_labels_for_request(db, context, resource).await?;
-    let namespace_object = namespace_object_for_request(db, context).await?;
+    let namespace_labels = namespace_labels_for_request(lookup, context, resource).await?;
+    let namespace_object = namespace_object_for_request(lookup, context).await?;
 
     for policy in &policies {
         let policy_name = policy
@@ -95,7 +93,7 @@ pub(super) async fn run_validating_admission_policies(
                 continue;
             }
             let actions = validation_actions(binding_spec);
-            let params = match resolve_params(db, policy_spec, binding_spec, context).await {
+            let params = match resolve_params(lookup, policy_spec, binding_spec, context).await {
                 Ok(params) => params,
                 Err(err) if failure_policy(policy_spec) == "Ignore" => {
                     tracing::warn!(policy = %policy_name, binding = %binding.name, error = %err, "ValidatingAdmissionPolicy params ignored by failurePolicy");
@@ -138,7 +136,7 @@ fn bindings_for_policy<'a>(
 }
 
 async fn namespace_labels_for_request(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     context: &AdmissionRequestContext,
     resource: &Value,
 ) -> Result<Option<Map<String, Value>>> {
@@ -151,23 +149,26 @@ async fn namespace_labels_for_request(
     let Some(namespace) = context.namespace.as_deref() else {
         return Ok(None);
     };
-    Ok(db.get_namespace(namespace).await?.and_then(|ns| {
-        ns.data
-            .pointer("/metadata/labels")
-            .and_then(|v| v.as_object())
-            .cloned()
-    }))
+    Ok(lookup
+        .get_resource("v1", "Namespace", None, namespace)
+        .await?
+        .and_then(|ns| {
+            ns.data
+                .pointer("/metadata/labels")
+                .and_then(|v| v.as_object())
+                .cloned()
+        }))
 }
 
 async fn namespace_object_for_request(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     context: &AdmissionRequestContext,
 ) -> Result<Value> {
     let Some(namespace) = context.namespace.as_deref() else {
         return Ok(Value::Null);
     };
-    Ok(db
-        .get_namespace(namespace)
+    Ok(lookup
+        .get_resource("v1", "Namespace", None, namespace)
         .await?
         .map(|ns| std::sync::Arc::unwrap_or_clone(ns.data))
         .unwrap_or(Value::Null))
@@ -438,7 +439,7 @@ fn evaluate_variables(
 }
 
 async fn resolve_params(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     policy_spec: &Value,
     binding_spec: &Value,
     context: &AdmissionRequestContext,
@@ -476,7 +477,7 @@ async fn resolve_params(
 
     let mut params = Vec::new();
     if let Some(name) = param_ref.get("name").and_then(|v| v.as_str()) {
-        if let Some(resource) = db
+        if let Some(resource) = lookup
             .get_resource(api_version, kind, namespace.as_deref(), name)
             .await?
         {
@@ -484,17 +485,11 @@ async fn resolve_params(
         }
     } else if let Some(selector) = param_ref.get("selector") {
         let selector = LabelSelector::from_k8s_selector(selector)?;
-        let listed = db
-            .list_resources(
-                api_version,
-                kind,
-                namespace.as_deref(),
-                crate::datastore::ResourceListQuery::all(),
-            )
+        let listed = lookup
+            .list_resources(api_version, kind, namespace.as_deref(), None)
             .await?;
         params.extend(
             listed
-                .items
                 .into_iter()
                 .filter(|resource| selector.matches_resource(&resource.data))
                 .map(|resource| std::sync::Arc::unwrap_or_clone(resource.data)),

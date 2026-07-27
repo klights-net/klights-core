@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -32,9 +33,9 @@ use crate::api::{
 use crate::api::{AppError, DeleteOptions};
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
 use crate::side_effects::SideEffectMetrics;
-use klights_pod_api::{
-    PodDeleteOptions, PodDeletePreconditions, PodMutationTarget, PodRepositoryError,
-};
+#[cfg(test)]
+use klights_pod_api::PodMutationTarget;
+use klights_pod_api::{PodDeleteOptions, PodDeletePreconditions, PodRepositoryError};
 use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink, PodGcReconcileSink,
     PodServiceReconcileSink,
@@ -597,6 +598,7 @@ impl PodApiService {
         })
     }
 
+    #[cfg(test)]
     pub async fn schedule_pending_pod(
         &self,
         namespace: &str,
@@ -770,6 +772,7 @@ impl PodApiService {
         if status_changed
             && let Some(message) = decision.unschedulable_message.as_deref()
             && let Err(e) = crate::pod_events::emit_control_plane_pod_event(
+                self.db.as_ref(),
                 self.db.as_ref(),
                 crate::pod_events::PodEventRecord {
                     pod: &final_resource.data,
@@ -1099,7 +1102,8 @@ impl PodApiService {
 
     /// Pod-domain adapter used by ordinary repository consumers. API
     /// DeleteOptions and HTTP errors remain inside this API-facing owner.
-    pub(super) async fn mark_pod_terminating_for_repository(
+    #[cfg(test)]
+    pub(crate) async fn mark_pod_terminating_for_repository(
         &self,
         target: &PodMutationTarget,
     ) -> Result<Resource, PodRepositoryError> {
@@ -2211,6 +2215,134 @@ fn map_pod_store_error_to_api(error: anyhow::Error) -> AppError {
     AppError::from(error)
 }
 
+impl klights_pod_api::PodApiMutation for PodApiService {
+    fn create_pod(
+        &self,
+        request: klights_pod_api::PodApiCreateRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
+        Box::pin(async move {
+            let namespace = request.namespace.clone();
+            let result = self
+                .api_create_pod(PodApiCreateRequest {
+                    namespace: request.namespace,
+                    name: String::new(),
+                    body: request.body,
+                    dry_run: request.dry_run,
+                    run_admission: true,
+                })
+                .await
+                .map_err(|error| map_api_error_to_pod_repository(error, &namespace, ""))?;
+            Ok(klights_pod_api::PodApiCreateResult {
+                resource: result.resource,
+                body: result.body,
+            })
+        })
+    }
+
+    fn update_pod(
+        &self,
+        request: klights_pod_api::PodApiUpdateRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
+        Box::pin(async move {
+            match self
+                .api_update_pod(
+                    &request.namespace,
+                    &request.name,
+                    request.body,
+                    request.current,
+                    request.dry_run,
+                )
+                .await
+                .map_err(|error| {
+                    map_api_error_to_pod_repository(error, &request.namespace, &request.name)
+                })? {
+                PodApiUpdateOutcome::Persisted(resource) => {
+                    Ok(klights_pod_api::PodApiWriteOutcome::Persisted(resource))
+                }
+                PodApiUpdateOutcome::DryRun(value) => {
+                    Ok(klights_pod_api::PodApiWriteOutcome::DryRun(value))
+                }
+            }
+        })
+    }
+
+    fn patch_pod(
+        &self,
+        request: klights_pod_api::PodApiPatchRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
+        Box::pin(async move {
+            let patch_type = match request.patch_kind {
+                klights_pod_api::PodStatusPatchKind::JsonPatch => PodStatusPatchType::JsonPatch,
+                klights_pod_api::PodStatusPatchKind::MergePatch => PodStatusPatchType::MergePatch,
+                klights_pod_api::PodStatusPatchKind::StrategicMerge => {
+                    PodStatusPatchType::StrategicMerge
+                }
+                klights_pod_api::PodStatusPatchKind::ApplyPatch => PodStatusPatchType::ApplyPatch,
+            };
+            match self
+                .api_patch_pod(
+                    &request.namespace,
+                    &request.name,
+                    request.patch,
+                    patch_type,
+                    request.dry_run,
+                )
+                .await
+                .map_err(|error| {
+                    map_api_error_to_pod_repository(error, &request.namespace, &request.name)
+                })? {
+                PodApiUpdateOutcome::Persisted(resource) => {
+                    Ok(klights_pod_api::PodApiWriteOutcome::Persisted(resource))
+                }
+                PodApiUpdateOutcome::DryRun(value) => {
+                    Ok(klights_pod_api::PodApiWriteOutcome::DryRun(value))
+                }
+            }
+        })
+    }
+
+    fn delete_pod(
+        &self,
+        request: klights_pod_api::PodApiDeleteRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
+        Box::pin(async move {
+            match self
+                .repository_delete_pod(
+                    &request.namespace,
+                    &request.name,
+                    request.options,
+                    request.dry_run,
+                )
+                .await?
+            {
+                PodApiDeleteOutcome::GracefulSet(resource) => {
+                    Ok(klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource))
+                }
+                PodApiDeleteOutcome::DryRun(value) => {
+                    Ok(klights_pod_api::PodApiDeleteOutcome::DryRun(value))
+                }
+            }
+        })
+    }
+
+    fn delete_collection_pods(
+        &self,
+        request: klights_pod_api::PodApiDeleteCollectionRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.api_delete_collection_pods(
+                &request.namespace,
+                request.label_selector.as_deref(),
+                request.field_selector.as_deref(),
+                request.dry_run,
+            )
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, &request.namespace, ""))
+        })
+    }
+}
+
+#[cfg(test)]
 #[async_trait]
 impl crate::kubelet::pod_repository::PodApiPort for PodApiService {
     async fn create(

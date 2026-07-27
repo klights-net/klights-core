@@ -1,11 +1,14 @@
 //! Root adapters from focused Pod API contracts to repository and actor internals.
 
+#[cfg(test)]
 use klights_pod_api::{
     PodApiDeleteCollectionRequest, PodApiDeleteRequest, PodApiMutation, PodApiPatchRequest,
     PodApiUpdateRequest, PodApiWriteOutcome, PodEvictionDelete, PodEvictionDeleteOutcome,
-    PodEvictionDeleteRequest, PodGetRequest, PodLifecycleFuture, PodLifecycleWakeup,
-    PodLifecycleWakeupRequest, PodListRequest, PodListResult, PodMarkTerminating,
-    PodMarkTerminatingRequest, PodOwnerListRequest, PodQuery, PodRepositoryError,
+    PodEvictionDeleteRequest, PodMarkTerminating, PodMarkTerminatingRequest,
+};
+use klights_pod_api::{
+    PodGetRequest, PodLifecycleFuture, PodLifecycleWakeup, PodLifecycleWakeupRequest,
+    PodListRequest, PodListResult, PodOwnerListRequest, PodQuery, PodRepositoryError,
     PodRepositoryFuture, PodRoutingError, PodSnapshotListRequest, PodSnapshotQuery, PodUpdate,
     PodUpdateOperation, PodUpdateRequest,
 };
@@ -240,6 +243,7 @@ impl PodUpdate for PodRepository {
     }
 }
 
+#[cfg(test)]
 impl PodMarkTerminating for PodRepository {
     fn mark_pod_terminating(
         &self,
@@ -247,7 +251,13 @@ impl PodMarkTerminating for PodRepository {
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
             let target = request.into_target();
-            let resource = self.api.mark_terminating(&target).await?;
+            let resource = super::PodApiPort::mark_terminating(
+                self.test_api
+                    .as_deref()
+                    .expect("test termination requires the root Pod API adapter"),
+                &target,
+            )
+            .await?;
 
             let _ = self
                 .mutation_reconcile
@@ -264,6 +274,7 @@ impl PodMarkTerminating for PodRepository {
     }
 }
 
+#[cfg(test)]
 impl PodEvictionDelete for PodRepository {
     fn delete_for_eviction(
         &self,
@@ -271,7 +282,16 @@ impl PodEvictionDelete for PodRepository {
     ) -> PodRepositoryFuture<'_, PodEvictionDeleteOutcome> {
         Box::pin(async move {
             let (namespace, name, options, dry_run) = request.into_parts();
-            let outcome = self.api.delete(&namespace, &name, options, dry_run).await?;
+            let outcome = super::PodApiPort::delete(
+                self.test_api
+                    .as_deref()
+                    .expect("test eviction requires the root Pod API adapter"),
+                &namespace,
+                &name,
+                options,
+                dry_run,
+            )
+            .await?;
             match outcome {
                 super::PodApiDeleteOutcome::DryRun(_) => Ok(PodEvictionDeleteOutcome::DryRun),
                 super::PodApiDeleteOutcome::GracefulSet(resource) => {
@@ -292,22 +312,26 @@ impl PodEvictionDelete for PodRepository {
     }
 }
 
+#[cfg(test)]
 impl PodApiMutation for PodRepository {
     fn create_pod(
         &self,
         request: klights_pod_api::PodApiCreateRequest,
     ) -> PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
         Box::pin(async move {
-            let result = self
-                .api
-                .create(super::PodApiCreateRequest {
+            let result = super::PodApiPort::create(
+                self.test_api
+                    .as_deref()
+                    .expect("test create requires the root Pod API adapter"),
+                super::PodApiCreateRequest {
                     namespace: request.namespace,
                     name: String::new(),
                     body: request.body,
                     dry_run: request.dry_run,
                     run_admission: true,
-                })
-                .await?;
+                },
+            )
+            .await?;
             Ok(klights_pod_api::PodApiCreateResult {
                 resource: result.resource,
                 body: result.body,
@@ -320,16 +344,17 @@ impl PodApiMutation for PodRepository {
         request: PodApiUpdateRequest,
     ) -> PodRepositoryFuture<'_, PodApiWriteOutcome> {
         Box::pin(async move {
-            match self
-                .api
-                .update(
-                    &request.namespace,
-                    &request.name,
-                    request.body,
-                    request.current,
-                    request.dry_run,
-                )
-                .await?
+            match super::PodApiPort::update(
+                self.test_api
+                    .as_deref()
+                    .expect("test update requires the root Pod API adapter"),
+                &request.namespace,
+                &request.name,
+                request.body,
+                request.current,
+                request.dry_run,
+            )
+            .await?
             {
                 super::PodApiUpdateOutcome::Persisted(resource) => {
                     Ok(PodApiWriteOutcome::Persisted(resource))
@@ -358,16 +383,17 @@ impl PodApiMutation for PodRepository {
                     super::PodStatusPatchType::ApplyPatch
                 }
             };
-            match self
-                .api
-                .patch(
-                    &request.namespace,
-                    &request.name,
-                    request.patch,
-                    patch_type,
-                    request.dry_run,
-                )
-                .await?
+            match super::PodApiPort::patch(
+                self.test_api
+                    .as_deref()
+                    .expect("test patch requires the root Pod API adapter"),
+                &request.namespace,
+                &request.name,
+                request.patch,
+                patch_type,
+                request.dry_run,
+            )
+            .await?
             {
                 super::PodApiUpdateOutcome::Persisted(resource) => {
                     Ok(PodApiWriteOutcome::Persisted(resource))
@@ -382,15 +408,16 @@ impl PodApiMutation for PodRepository {
         request: PodApiDeleteRequest,
     ) -> PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
         Box::pin(async move {
-            match self
-                .api
-                .delete(
-                    &request.namespace,
-                    &request.name,
-                    request.options,
-                    request.dry_run,
-                )
-                .await?
+            match super::PodApiPort::delete(
+                self.test_api
+                    .as_deref()
+                    .expect("test delete requires the root Pod API adapter"),
+                &request.namespace,
+                &request.name,
+                request.options,
+                request.dry_run,
+            )
+            .await?
             {
                 super::PodApiDeleteOutcome::GracefulSet(resource) => {
                     Ok(klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource))
@@ -407,14 +434,16 @@ impl PodApiMutation for PodRepository {
         request: PodApiDeleteCollectionRequest,
     ) -> PodRepositoryFuture<'_, ()> {
         Box::pin(async move {
-            self.api
-                .delete_collection(
-                    &request.namespace,
-                    request.label_selector.as_deref(),
-                    request.field_selector.as_deref(),
-                    request.dry_run,
-                )
-                .await
+            super::PodApiPort::delete_collection(
+                self.test_api
+                    .as_deref()
+                    .expect("test collection delete requires the root Pod API adapter"),
+                &request.namespace,
+                request.label_selector.as_deref(),
+                request.field_selector.as_deref(),
+                request.dry_run,
+            )
+            .await
         })
     }
 }

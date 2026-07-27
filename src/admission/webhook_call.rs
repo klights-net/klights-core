@@ -1,6 +1,6 @@
+use crate::admission::AdmissionLookup;
 use crate::admission::http_client::webhook_http_client_for;
 use crate::admission::request_context::AdmissionRequestContext;
-use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use crate::networking::service_routing::{Protocol, ServiceSpec};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -18,7 +18,7 @@ pub(super) struct ResolvedWebhookTarget {
 /// to the Service ClusterIP so TLS/SNI stays spec-compatible and Service targetPort
 /// translation remains in the dataplane.
 pub(super) async fn resolve_webhook_target(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     client_config: &Value,
 ) -> Result<ResolvedWebhookTarget> {
     if let Some(url) = client_config.get("url").and_then(|u| u.as_str()) {
@@ -44,7 +44,7 @@ pub(super) async fn resolve_webhook_target(
             .map(|p| u16::try_from(p).context("Service reference port out of range"))
             .transpose()?
             .unwrap_or(443);
-        let service_spec = resolve_webhook_service_spec(db, namespace, name).await?;
+        let service_spec = resolve_webhook_service_spec(lookup, namespace, name).await?;
         let selected_service_port = service_spec
             .ports
             .iter()
@@ -88,26 +88,25 @@ pub(super) async fn resolve_webhook_target(
 }
 
 async fn resolve_webhook_service_spec(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     namespace: &str,
     name: &str,
 ) -> Result<ServiceSpec> {
-    let service = db
+    let service = lookup
         .get_resource("v1", "Service", Some(namespace), name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Service not found: {}/{}", namespace, name))?;
 
     let label_selector = format!("kubernetes.io/service-name={name}");
-    let endpoint_slices = db
+    let endpoint_slices = lookup
         .list_resources(
             "discovery.k8s.io/v1",
             "EndpointSlice",
             Some(namespace),
-            ResourceListQuery::new(Some(&label_selector), None, None, None),
+            Some(&label_selector),
         )
         .await?;
     let slice_refs: Vec<&Value> = endpoint_slices
-        .items
         .iter()
         .map(|slice| slice.data.as_ref())
         .collect();
@@ -117,7 +116,7 @@ async fn resolve_webhook_service_spec(
         return Ok(spec);
     }
 
-    let endpoints = db
+    let endpoints = lookup
         .get_resource("v1", "Endpoints", Some(namespace), name)
         .await?;
     if let Some(endpoints) = endpoints
@@ -131,7 +130,7 @@ async fn resolve_webhook_service_spec(
 }
 
 pub(super) async fn call_webhook(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     webhook: &Value,
     resource: &Value,
     context: &AdmissionRequestContext,
@@ -141,7 +140,7 @@ pub(super) async fn call_webhook(
         .get("clientConfig")
         .ok_or_else(|| anyhow::anyhow!("Webhook missing clientConfig"))?;
 
-    let target = resolve_webhook_target(db, client_config).await?;
+    let target = resolve_webhook_target(lookup, client_config).await?;
     let url = add_timeout_query(&target.base_url, timeout_seconds)?;
 
     let admission_review = super::build_admission_review(context, resource);

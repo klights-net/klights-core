@@ -15,10 +15,14 @@ impl From<crate::api::pod_repository_ports::ApiPodList> for crate::datastore::Re
 }
 
 use crate::datastore::DatastoreHandle;
+use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
+use crate::kubelet::pod_repository::state_only_writer::{StateOnlyWriter, StatusOnlyWriterService};
+use crate::kubelet::pod_repository::store::PodStore;
+use crate::kubelet::pod_repository::workqueue::PodWorkqueue;
 use crate::kubelet::pod_repository::{
-    PodRepository, PodRepositoryAdapterDependencies, PodRepositoryAdapterFactory,
-    PodRepositoryAdapters, PodRepositoryDeliveryDependencies, PodRepositoryNetworkDependencies,
-    PodRepositoryRuntimeDependencies,
+    PodRepository, PodRepositoryAdapterDependencies, PodRepositoryAdapters,
+    PodRepositoryCoreDependencies, PodRepositoryDeliveryDependencies,
+    PodRepositoryNetworkDependencies, PodRepositoryRuntimeDependencies,
 };
 
 impl klights_cluster_store::PodUidPreconditionRead for dyn crate::datastore::DatastoreBackend + '_ {
@@ -83,11 +87,17 @@ pub struct WorkerPodRepositoryBuildConfig {
     pub outbox: Arc<crate::node_outbox::Outbox>,
 }
 
-struct RootPodRepositoryAdapterFactory {
+struct RootPodRepositoryComposition {
     db: DatastoreHandle,
     resource_query: Arc<dyn LeaderResourceQuery>,
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
+}
+
+pub(crate) struct RootPodRepositoryParts {
+    pub repository_parts: crate::kubelet::pod_repository::facade::PodRepositoryParts,
+    pub api: Arc<PodApiService>,
+    pub subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
 }
 
 #[derive(Clone)]
@@ -105,16 +115,16 @@ struct WorkerPodPersistence {
     resource_query: Arc<dyn LeaderResourceQuery>,
 }
 
-struct WorkerPodRepositoryAdapterFactory;
-
 struct WorkerPodAdapters;
 
+#[cfg(test)]
 fn worker_pod_api_unavailable() -> klights_pod_api::PodRepositoryError {
     klights_pod_api::PodRepositoryError::unavailable(
         "worker kubelet does not own the Kubernetes Pod API",
     )
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::kubelet::pod_repository::PodApiPort for WorkerPodAdapters {
     async fn create(
@@ -208,6 +218,7 @@ impl crate::kubelet::pod_repository::PodApiPort for WorkerPodAdapters {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl crate::kubelet::pod_repository::PodSubresourcePort for WorkerPodAdapters {
     async fn replace_status(
@@ -231,16 +242,6 @@ impl crate::kubelet::pod_repository::PodSubresourcePort for WorkerPodAdapters {
     ) -> Result<klights_cluster_core::Resource, klights_pod_api::PodRepositoryError> {
         Err(worker_pod_api_unavailable())
     }
-
-    async fn update_ephemeral_containers(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _containers: Vec<serde_json::Value>,
-        _expected_rv: i64,
-    ) -> Result<klights_cluster_core::Resource, klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
 }
 
 fn worker_reconcile_ok() -> klights_reconcile_api::ReconcileSinkFuture<'static> {
@@ -253,15 +254,6 @@ impl klights_reconcile_api::PodMutationReconcileSink for WorkerPodAdapters {
         _request: klights_reconcile_api::PodMutationReconcileRequest,
     ) -> klights_reconcile_api::ReconcileSinkFuture<'_> {
         worker_reconcile_ok()
-    }
-}
-
-impl klights_reconcile_api::GcPodDeleteSink for WorkerPodAdapters {
-    fn request_gc_pod_delete(
-        &self,
-        _request: klights_reconcile_api::GcPodDeleteRequest,
-    ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
-        Box::pin(async { Ok(()) })
     }
 }
 
@@ -335,19 +327,15 @@ impl klights_reconcile_api::NamespaceBootstrapSink for WorkerPodAdapters {
     }
 }
 
-impl crate::kubelet::pod_repository::PodRepositoryAdapterFactory
-    for WorkerPodRepositoryAdapterFactory
-{
+impl WorkerPodAdapters {
     fn build(
-        &self,
         dependencies: crate::kubelet::pod_repository::PodRepositoryAdapterDependencies,
+        gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     ) -> crate::kubelet::pod_repository::PodRepositoryAdapters {
         let adapter = Arc::new(WorkerPodAdapters);
         let _ = dependencies;
         crate::kubelet::pod_repository::PodRepositoryAdapters {
-            api: adapter.clone(),
-            subresource: adapter.clone(),
-            gc_delete: adapter.clone(),
+            gc_delete,
             gc_reconcile: adapter.clone(),
             pdb_reconcile: adapter.clone(),
             eviction_admission: adapter.clone(),
@@ -355,7 +343,9 @@ impl crate::kubelet::pod_repository::PodRepositoryAdapterFactory
             namespace_termination: adapter.clone(),
             mutation_reconcile: adapter,
             #[cfg(test)]
-            api_for_test: None,
+            test_api: None,
+            #[cfg(test)]
+            test_subresource: None,
         }
     }
 }
@@ -959,8 +949,15 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
     }
 }
 
-impl PodRepositoryAdapterFactory for RootPodRepositoryAdapterFactory {
-    fn build(&self, dependencies: PodRepositoryAdapterDependencies) -> PodRepositoryAdapters {
+impl RootPodRepositoryComposition {
+    fn build(
+        &self,
+        dependencies: PodRepositoryAdapterDependencies,
+    ) -> (
+        PodRepositoryAdapters,
+        Arc<PodApiService>,
+        Arc<crate::pod_subresource_service::PodSubresourceService>,
+    ) {
         let pod_reconcile = Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
             self.db.clone(),
             self.side_effects.controller_dispatcher_slot(),
@@ -994,9 +991,7 @@ impl PodRepositoryAdapterFactory for RootPodRepositoryAdapterFactory {
                 ),
             metrics: self.metrics.clone(),
         }));
-        PodRepositoryAdapters {
-            api: api.clone(),
-            subresource,
+        let adapters = PodRepositoryAdapters {
             gc_delete: api.clone(),
             gc_reconcile: pod_reconcile.clone(),
             pdb_reconcile: pod_reconcile.clone(),
@@ -1005,15 +1000,18 @@ impl PodRepositoryAdapterFactory for RootPodRepositoryAdapterFactory {
             namespace_termination: pod_reconcile.clone(),
             mutation_reconcile: pod_reconcile,
             #[cfg(test)]
-            api_for_test: Some(api),
-        }
+            test_api: Some(api.clone()),
+            #[cfg(test)]
+            test_subresource: Some(subresource.clone()),
+        };
+        (adapters, api, subresource)
     }
 }
 
 pub(crate) fn build_pod_repository_parts(
     config: PodRepositoryBuildConfig,
     leadership: Option<tokio::sync::watch::Receiver<bool>>,
-) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
+) -> RootPodRepositoryParts {
     let PodRepositoryBuildConfig {
         db,
         node_local,
@@ -1039,12 +1037,61 @@ pub(crate) fn build_pod_repository_parts(
             crate::control_plane::client::local::always_leader_watch(),
         ))
     });
-    PodRepository::build_parts_with_adapters(
-        Arc::new(RootPodPersistence { db: db.clone() }),
-        RootPodWorkqueuePersistence {
-            node_local,
-            test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
-            test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+    let store = Arc::new(PodStore::from_persistence(Arc::new(RootPodPersistence {
+        db: db.clone(),
+    })));
+    let workqueue_persistence = RootPodWorkqueuePersistence {
+        node_local,
+        test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
+        test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+    };
+    let workqueue = if let Some(leadership) = leadership {
+        PodWorkqueue::new_leader(
+            store.clone(),
+            workqueue_persistence,
+            supervisor.clone(),
+            metrics.clone(),
+            leadership,
+        )
+    } else {
+        PodWorkqueue::new(
+            store.clone(),
+            workqueue_persistence,
+            supervisor.clone(),
+            metrics.clone(),
+        )
+    };
+    let status_only: Arc<dyn StateOnlyWriter> =
+        Arc::new(StatusOnlyWriterService::new(store.clone()));
+    let delete_coordinator = Arc::new(PodDeleteCoordinator::new(
+        store.clone(),
+        workqueue.clone(),
+        supervisor.clone(),
+        metrics.clone(),
+    ));
+    let (adapters, api, subresource) = RootPodRepositoryComposition {
+        db: db.clone(),
+        resource_query,
+        side_effects: side_effects.clone(),
+        metrics: metrics.clone(),
+    }
+    .build(PodRepositoryAdapterDependencies {
+        store: store.clone(),
+        status_only: status_only.clone(),
+        supervisor: supervisor.clone(),
+        delete_coordinator,
+    });
+    let delivery_outbox = outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>);
+    let bound_pod_finalization = crate::bound_pod_finalization_adapter::new_for_root(
+        store.clone(),
+        cluster_api.clone(),
+        delivery_outbox.clone(),
+    );
+    let repository_parts = PodRepository::build_parts_with_adapters(
+        PodRepositoryCoreDependencies {
+            store,
+            status_only,
+            workqueue,
         },
         PodRepositoryRuntimeDependencies {
             supervisor,
@@ -1055,30 +1102,63 @@ pub(crate) fn build_pod_repository_parts(
             assignment_waiter,
         },
         PodRepositoryDeliveryDependencies {
-            outbox: outbox.map(|outbox| outbox as Arc<dyn klights_leader_api::NodeOutbox>),
+            outbox: delivery_outbox,
             cluster_api,
+            bound_pod_finalization,
         },
-        leadership,
-        Arc::new(RootPodRepositoryAdapterFactory {
-            db,
-            resource_query,
-            side_effects: side_effects.clone(),
-            metrics: metrics.clone(),
-        }),
-    )
+        adapters,
+    );
+    RootPodRepositoryParts {
+        repository_parts,
+        api,
+        subresource,
+    }
 }
 
 pub(crate) fn build_worker_pod_repository_parts(
     config: WorkerPodRepositoryBuildConfig,
 ) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
-    PodRepository::build_parts_with_adapters(
-        Arc::new(WorkerPodPersistence {
-            resource_query: config.resource_query.clone(),
-        }),
+    let store = Arc::new(PodStore::from_persistence(Arc::new(WorkerPodPersistence {
+        resource_query: config.resource_query.clone(),
+    })));
+    let workqueue = PodWorkqueue::new(
+        store.clone(),
         RootPodWorkqueuePersistence {
             node_local: Some(config.node_local),
             test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
             test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+        },
+        config.supervisor.clone(),
+        config.metrics.clone(),
+    );
+    let status_only: Arc<dyn StateOnlyWriter> =
+        Arc::new(StatusOnlyWriterService::new(store.clone()));
+    let outbox: Arc<dyn klights_leader_api::NodeOutbox> = config.outbox;
+    let root_deletion = crate::bound_pod_finalization_adapter::RootBoundPodFinalization::new(
+        store.clone(),
+        Some(config.resource_query.clone()),
+        Some(outbox.clone()),
+    );
+    let adapters = WorkerPodAdapters::build(
+        PodRepositoryAdapterDependencies {
+            store: store.clone(),
+            status_only: status_only.clone(),
+            supervisor: config.supervisor.clone(),
+            delete_coordinator: Arc::new(PodDeleteCoordinator::new(
+                store.clone(),
+                workqueue.clone(),
+                config.supervisor.clone(),
+                config.metrics.clone(),
+            )),
+        },
+        root_deletion.clone(),
+    );
+    let bound_pod_finalization: Arc<dyn klights_pod_api::BoundPodFinalization> = root_deletion;
+    PodRepository::build_parts_with_adapters(
+        PodRepositoryCoreDependencies {
+            store,
+            status_only,
+            workqueue,
         },
         PodRepositoryRuntimeDependencies {
             supervisor: config.supervisor,
@@ -1089,10 +1169,10 @@ pub(crate) fn build_worker_pod_repository_parts(
             assignment_waiter: config.assignment_waiter,
         },
         PodRepositoryDeliveryDependencies {
-            outbox: Some(config.outbox as Arc<dyn klights_leader_api::NodeOutbox>),
+            outbox: Some(outbox),
             cluster_api: Some(config.resource_query),
+            bound_pod_finalization,
         },
-        None,
-        Arc::new(WorkerPodRepositoryAdapterFactory),
+        adapters,
     )
 }

@@ -1,4 +1,4 @@
-use crate::datastore::DatastoreBackend;
+use super::AdmissionLookup;
 use serde_json::Value;
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -6,10 +6,11 @@ use std::collections::BTreeMap;
 /// Fetch namespace labels from DB for namespaceSelector matching.
 #[cfg(test)]
 pub(super) async fn get_namespace_labels(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     namespace: &str,
 ) -> BTreeMap<String, String> {
-    db.get_namespace(namespace)
+    lookup
+        .get_resource("v1", "Namespace", None, namespace)
         .await
         .ok()
         .flatten()
@@ -31,10 +32,11 @@ pub(super) async fn get_namespace_labels(
 /// shape so the cached `LabelSelector` can match against them without an
 /// intermediate BTreeMap rebuild on every webhook evaluation.
 pub(super) async fn get_namespace_labels_value(
-    db: &dyn DatastoreBackend,
+    lookup: &dyn AdmissionLookup,
     namespace: &str,
 ) -> Option<serde_json::Map<String, Value>> {
-    db.get_namespace(namespace)
+    lookup
+        .get_resource("v1", "Namespace", None, namespace)
         .await
         .ok()
         .flatten()

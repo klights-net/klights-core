@@ -785,11 +785,27 @@ impl crate::controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort
 
 pub(crate) struct RootControllerPodPort {
     repository: Arc<PodRepository>,
+    api: Arc<crate::pod_api_service::PodApiService>,
+    subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
 }
 
 impl RootControllerPodPort {
-    pub(crate) fn new(repository: Arc<PodRepository>) -> Self {
-        Self { repository }
+    pub(crate) fn new(
+        repository: Arc<PodRepository>,
+        api: Arc<crate::pod_api_service::PodApiService>,
+        subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+    ) -> Self {
+        Self {
+            repository,
+            api,
+            subresource,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(repository: Arc<PodRepository>) -> Self {
+        let (api, subresource) = repository.test_root_api_services();
+        Self::new(repository, api, subresource)
     }
 }
 
@@ -807,33 +823,235 @@ impl ControllerPodPort for RootControllerPodPort {
     }
 
     fn deployment_mutation(&self) -> &dyn crate::controllers::DeploymentControllerPodMutation {
-        self.repository.as_ref()
+        self
     }
 
     fn replicaset_mutation(&self) -> &dyn crate::controllers::replicaset::ReplicaSetPodMutation {
-        self.repository.as_ref()
+        self
     }
 
     fn statefulset_mutation(&self) -> &dyn crate::controllers::statefulset::StatefulSetPodMutation {
-        self.repository.as_ref()
+        self
     }
 
     fn daemonset_mutation(&self) -> &dyn crate::controllers::daemonset::DaemonSetPodMutation {
-        self.repository.as_ref()
+        self
     }
 
     fn job_mutation(&self) -> &dyn crate::controllers::job::JobPodMutation {
-        self.repository.as_ref()
+        self
     }
 
     fn replicationcontroller_mutation(
         &self,
     ) -> &dyn crate::controllers::replicationcontroller::ReplicationControllerPodMutation {
-        self.repository.as_ref()
+        self
     }
 
     fn delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
         self.repository.as_ref()
+    }
+}
+
+#[async_trait]
+impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
+    async fn create_controller_pod(
+        &self,
+        namespace: &str,
+        name: &str,
+        _node_name: &str,
+        pod: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        let result = klights_pod_api::PodApiMutation::create_pod(
+            self.api.as_ref(),
+            klights_pod_api::PodApiCreateRequest {
+                namespace: namespace.to_string(),
+                body: pod,
+                dry_run: false,
+            },
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+        result.resource.ok_or_else(|| {
+            anyhow::anyhow!("controller Pod {namespace}/{name} create returned dry-run")
+        })
+    }
+
+    async fn delete_pod(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        crate::kubelet::pod_repository::PodObjectWriter::delete_pod(
+            self.repository.as_ref(),
+            namespace,
+            name,
+        )
+        .await
+    }
+
+    async fn update_pod_owner_references(
+        &self,
+        namespace: &str,
+        name: &str,
+        owner_refs: Vec<serde_json::Value>,
+    ) -> anyhow::Result<Resource> {
+        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references(
+            self.repository.as_ref(),
+            namespace,
+            name,
+            owner_refs,
+        )
+        .await
+    }
+
+    async fn update_pod_owner_references_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected_uid: &str,
+        owner_refs: Vec<serde_json::Value>,
+    ) -> anyhow::Result<Resource> {
+        crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references_for_uid(
+            self.repository.as_ref(),
+            namespace,
+            name,
+            expected_uid,
+            owner_refs,
+        )
+        .await
+    }
+
+    async fn merge_pod_labels(
+        &self,
+        namespace: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> anyhow::Result<Resource> {
+        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels(
+            self.repository.as_ref(),
+            namespace,
+            name,
+            labels,
+        )
+        .await
+    }
+
+    async fn merge_pod_labels_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected_uid: &str,
+        labels: Vec<(String, String)>,
+    ) -> anyhow::Result<Resource> {
+        crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels_for_uid(
+            self.repository.as_ref(),
+            namespace,
+            name,
+            expected_uid,
+            labels,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodPort {
+    async fn replace_status_from_api(
+        &self,
+        namespace: &str,
+        name: &str,
+        status: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        self.subresource
+            .replace_status_from_api_checked(
+                namespace,
+                name,
+                None,
+                status,
+                expected_resource_version,
+            )
+            .await
+    }
+
+    async fn replace_status_from_api_for_uid(
+        &self,
+        namespace: &str,
+        name: &str,
+        pod_uid: &str,
+        status: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        self.subresource
+            .replace_status_from_api_checked(
+                namespace,
+                name,
+                Some(pod_uid),
+                status,
+                expected_resource_version,
+            )
+            .await
+    }
+
+    async fn patch_status_from_api(
+        &self,
+        namespace: &str,
+        name: &str,
+        patch: serde_json::Value,
+        patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        self.subresource
+            .patch_status_from_api(
+                namespace,
+                name,
+                patch,
+                patch_type,
+                expected_resource_version,
+            )
+            .await
+    }
+
+    async fn update_ephemeral_containers(
+        &self,
+        namespace: &str,
+        name: &str,
+        containers: Vec<serde_json::Value>,
+        expected_resource_version: i64,
+    ) -> anyhow::Result<Resource> {
+        self.subresource
+            .update_ephemeral_containers(namespace, name, containers, expected_resource_version)
+            .await
+    }
+}
+
+#[async_trait]
+impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControllerPodPort {
+    async fn list_pods_bound_to_node(&self, node_name: &str) -> anyhow::Result<Vec<Resource>> {
+        let field_selector = format!("spec.nodeName={node_name}");
+        Ok(crate::kubelet::pod_repository::PodReader::list_pods(
+            self.repository.as_ref(),
+            None,
+            None,
+            Some(&field_selector),
+            None,
+            None,
+        )
+        .await?
+        .items)
+    }
+
+    async fn replace_pod_status_for_uid(
+        &self,
+        pod: &Resource,
+        status: serde_json::Value,
+    ) -> anyhow::Result<Resource> {
+        self.subresource
+            .replace_status_from_api_checked(
+                pod.namespace.as_deref().unwrap_or("default"),
+                &pod.name,
+                Some(&pod.uid),
+                status,
+                pod.resource_version,
+            )
+            .await
     }
 }
 

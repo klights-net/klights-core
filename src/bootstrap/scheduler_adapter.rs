@@ -5,16 +5,18 @@ use async_trait::async_trait;
 
 use crate::controllers::scheduler::SchedulerRuntime;
 use crate::datastore::DatastoreHandle;
-use crate::kubelet::pod_repository::PodRepository;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
 
 pub(crate) struct LeaderSchedulerRuntime {
     db: DatastoreHandle,
-    pods: Arc<PodRepository>,
+    pods: Arc<crate::pod_api_service::PodApiService>,
 }
 
 impl LeaderSchedulerRuntime {
-    pub(crate) fn new(db: DatastoreHandle, pods: Arc<PodRepository>) -> Self {
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        pods: Arc<crate::pod_api_service::PodApiService>,
+    ) -> Self {
         Self { db, pods }
     }
 }
@@ -34,6 +36,9 @@ impl SchedulerRuntime for LeaderSchedulerRuntime {
     }
 
     async fn schedule_all_unbound_pods(&self) -> Result<()> {
-        self.pods.schedule_all_unbound_pods().await
+        self.pods
+            .schedule_all_unbound_pods()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 }

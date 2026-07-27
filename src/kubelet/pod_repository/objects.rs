@@ -2,9 +2,8 @@
 //! (`create_controller_pod`, `delete_pod`, `update_pod_owner_references`,
 //! `record_sandbox_id`).
 //!
-//! Holds `Arc<PodStore>` and a sibling Pod API capability (so that
-//! `create_controller_pod` can delegate to the full admission pipeline).
-//! Implementations land in Tasks 6 and 14.
+//! Holds `Arc<PodStore>` plus focused mutation delivery ports. API/controller
+//! Pod creation is composed above kubelet by the root Pod adapter.
 
 use std::sync::Arc;
 
@@ -18,14 +17,12 @@ use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
-use super::PodApiPort;
 use super::store::PodStore;
 
 const SANDBOX_ID_ANNOTATION: &str = "klights.dev/sandbox-id";
 
 pub(super) struct PodObjectService {
     store: Arc<PodStore>,
-    api: Arc<dyn PodApiPort>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
@@ -34,14 +31,12 @@ pub(super) struct PodObjectService {
 impl PodObjectService {
     pub(super) fn new(
         store: Arc<PodStore>,
-        api: Arc<dyn PodApiPort>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     ) -> Self {
         Self {
             store,
-            api,
             mutation_reconcile,
             outbox,
             cluster_api,
@@ -85,33 +80,6 @@ impl PodObjectService {
             super::ensure_pod_uid_matches(&pod.data, uid, ns, name)?;
         }
         Ok(pod)
-    }
-
-    /// Workload-controller-driven Pod create. Delegates to
-    /// `PodApiService::api_create_pod` so Deployment/ReplicaSet/StatefulSet/
-    /// DaemonSet/Job/RC and other controllers go through the same admission
-    /// + quota + defaulting pipeline as the API path. Returns the persisted Resource.
-    pub(super) async fn create_controller_pod(
-        &self,
-        ns: &str,
-        name: &str,
-        _node_name: &str,
-        pod: serde_json::Value,
-    ) -> Result<Resource> {
-        let result = self
-            .api
-            .create(super::types::PodApiCreateRequest {
-                namespace: ns.to_string(),
-                name: name.to_string(),
-                body: pod,
-                dry_run: false,
-                run_admission: true,
-            })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))?;
-        result
-            .resource
-            .ok_or_else(|| anyhow!("controller pod create returned dry-run"))
     }
 
     /// Replace `metadata.ownerReferences` with `owner_refs`, preserving

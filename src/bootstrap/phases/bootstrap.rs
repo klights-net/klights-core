@@ -20,6 +20,7 @@ pub struct BootstrapPhase {
     pub _watcher_state: Arc<crate::api::ApiState>,
     pub _node_lifecycle_start_resource_version: i64,
     pub pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    pub pod_api_service: Arc<crate::pod_api_service::PodApiService>,
     pub crd_registry_watch_handle: SupervisedJoinHandle<()>,
     pub leader_peer_endpoint_observer_handle: Option<SupervisedJoinHandle<()>>,
     pub pod_watcher_handle: Option<SupervisedJoinHandle<()>>,
@@ -478,20 +479,23 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_parts = if kubelet_uses_worker_store_adapter {
-        crate::pod_repository_composition::build_worker_pod_repository_parts(
-            crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
-                resource_query: leader_ports.resource_query.clone(),
-                node_local: node_local.clone(),
-                supervisor: supervisor.clone(),
-                metrics: metrics.clone(),
-                pod_network_cache: pod_network_cache.clone(),
-                assignment_waiter: assignment_waiter.clone(),
-                outbox: outbox_runtime.clone(),
-            },
+    let (pod_repository_parts, root_pod_api_services) = if kubelet_uses_worker_store_adapter {
+        (
+            crate::pod_repository_composition::build_worker_pod_repository_parts(
+                crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+                    resource_query: leader_ports.resource_query.clone(),
+                    node_local: node_local.clone(),
+                    supervisor: supervisor.clone(),
+                    metrics: metrics.clone(),
+                    pod_network_cache: pod_network_cache.clone(),
+                    assignment_waiter: assignment_waiter.clone(),
+                    outbox: outbox_runtime.clone(),
+                },
+            ),
+            None,
         )
     } else {
-        crate::pod_repository_composition::build_pod_repository_parts(
+        let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
             crate::pod_repository_composition::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 node_local: Some(node_local.clone()),
@@ -505,6 +509,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 cluster_api: Some(leader_ports.resource_query.clone()),
             },
             Some(is_leader_rx.clone()),
+        );
+        (
+            root_parts.repository_parts,
+            Some((root_parts.api, root_parts.subresource)),
         )
     };
     let pod_slot_adapter =
@@ -603,45 +611,52 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if let Some(worker_store_adapter) = worker_store_adapter.as_ref() {
         worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
     }
-    let api_pod_repository = if kubelet_uses_worker_store_adapter {
-        let parts = crate::pod_repository_composition::build_pod_repository_parts(
-            crate::pod_repository_composition::PodRepositoryBuildConfig {
-                db: db_handle.clone(),
-                node_local: Some(node_local.clone()),
-                supervisor: supervisor.clone(),
-                side_effects: side_effects.clone(),
-                metrics: metrics.clone(),
-                pod_network_cache: pod_network_cache.clone(),
-                assignment_waiter: assignment_waiter.clone(),
-                scheduling_mode,
-                outbox: Some(outbox_runtime.clone()),
-                cluster_api: Some(leader_ports.resource_query.clone()),
-            },
-            Some(is_leader_rx.clone()),
-        );
-        let repo = Arc::new(parts.repository);
-        repo.set_pod_lifecycle_router_for_node(
-            pod_lifecycle_router.clone(),
-            config.node_name.clone(),
-        );
-        parts
-            .background
-            .start()
-            .await
-            .context("API Pod repository background startup")?;
-        repo
-    } else {
-        pod_repository.clone()
-    };
+    let (api_pod_repository, pod_api_service, pod_subresource_service) =
+        if kubelet_uses_worker_store_adapter {
+            let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
+                crate::pod_repository_composition::PodRepositoryBuildConfig {
+                    db: db_handle.clone(),
+                    node_local: Some(node_local.clone()),
+                    supervisor: supervisor.clone(),
+                    side_effects: side_effects.clone(),
+                    metrics: metrics.clone(),
+                    pod_network_cache: pod_network_cache.clone(),
+                    assignment_waiter: assignment_waiter.clone(),
+                    scheduling_mode,
+                    outbox: Some(outbox_runtime.clone()),
+                    cluster_api: Some(leader_ports.resource_query.clone()),
+                },
+                Some(is_leader_rx.clone()),
+            );
+            let repo = Arc::new(root_parts.repository_parts.repository);
+            repo.set_pod_lifecycle_router_for_node(
+                pod_lifecycle_router.clone(),
+                config.node_name.clone(),
+            );
+            root_parts
+                .repository_parts
+                .background
+                .start()
+                .await
+                .context("API Pod repository background startup")?;
+            (repo, root_parts.api, root_parts.subresource)
+        } else {
+            let (api, subresource) = root_pod_api_services
+                .expect("root Pod API services must accompany the root repository");
+            (pod_repository.clone(), api, subresource)
+        };
+    let controller_pod_port = Arc::new(
+        crate::controller_runtime_adapter::RootControllerPodPort::new(
+            api_pod_repository.clone(),
+            pod_api_service.clone(),
+            pod_subresource_service.clone(),
+        ),
+    );
     let controller_dependencies = crate::controllers::ControllerRuntimeDependencies {
         leader: Arc::new(
             crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
         ),
-        pods: Arc::new(
-            crate::controller_runtime_adapter::RootControllerPodPort::new(
-                api_pod_repository.clone(),
-            ),
-        ),
+        pods: controller_pod_port.clone(),
         reconcile: Arc::new(
             crate::controller_runtime_adapter::RootControllerReconcilePort::new(
                 non_pod_finalization.clone(),
@@ -871,6 +886,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             #[cfg(not(test))]
             pod_repository: crate::api_state_adapter::RootApiPodRepository::new(
                 api_pod_repository.clone(),
+                pod_api_service.clone(),
+                pod_subresource_service.clone(),
             ),
             #[cfg(test)]
             pod_repository: api_pod_repository.clone(),
@@ -1428,7 +1445,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let cancel = shutdown_token.clone();
         let node_lifecycle_status = local_api_client.clone();
         let node_lifecycle_db = db_handle.clone();
-        let node_lifecycle_pod_repository = api_pod_repository.clone();
+        let node_lifecycle_pod_repository = controller_pod_port.clone();
+        let node_lifecycle_pod_mutations = api_pod_repository.mutation_reconcile_port();
         let node_lifecycle_pod_router = pod_lifecycle_router.clone();
         let node_lifecycle_lease_tracker = node_lease_tracker.clone();
         let node_lifecycle_supervisor = supervisor.clone();
@@ -1442,6 +1460,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             crate::node_lifecycle_controller_adapter::NodeLifecycleControllerDependencies {
                                 store: node_lifecycle_db,
                                 pods: node_lifecycle_pod_repository,
+                                pod_mutations: node_lifecycle_pod_mutations,
                                 pod_lifecycle: node_lifecycle_pod_router,
                                 lease_observations: node_lifecycle_lease_tracker,
                                 supervisor: node_lifecycle_supervisor,
@@ -1538,7 +1557,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         generated_handler_adapter.clone(),
         generated_handler_adapter,
         Arc::new(gc_owner_lifecycle),
-        crate::api_state_adapter::RootApiPodRepository::new(api_pod_repository.clone()),
+        crate::api_state_adapter::RootApiPodRepository::new(
+            api_pod_repository.clone(),
+            pod_api_service.clone(),
+            pod_subresource_service.clone(),
+        ),
         crd_registry.clone(),
         crate::bootstrap::service_adapters::ApiServiceWriteAllocator::new(
             db_handle.clone(),
@@ -1662,6 +1685,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         #[cfg(test)]
         _watcher_state: watcher_state,
         pod_repository: api_pod_repository,
+        pod_api_service,
         crd_registry_watch_handle,
         leader_peer_endpoint_observer_handle,
         _node_lifecycle_start_resource_version: node_lifecycle_start_resource_version,

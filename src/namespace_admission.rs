@@ -1,7 +1,5 @@
 //! Framework-neutral Namespace lifecycle admission facts.
 
-use crate::datastore::DatastoreBackend;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NamespaceCreateEligibility {
     Allowed,
@@ -14,10 +12,13 @@ pub(crate) fn is_protected(name: &str) -> bool {
 }
 
 pub(crate) async fn create_eligibility(
-    db: &dyn DatastoreBackend,
+    lookup: &(impl crate::admission::AdmissionLookup + ?Sized),
     namespace: &str,
 ) -> anyhow::Result<NamespaceCreateEligibility> {
-    let Some(resource) = db.get_namespace(namespace).await? else {
+    let Some(resource) = lookup
+        .get_resource("v1", "Namespace", None, namespace)
+        .await?
+    else {
         return Ok(if is_protected(namespace) {
             NamespaceCreateEligibility::Allowed
         } else {

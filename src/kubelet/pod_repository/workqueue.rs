@@ -218,7 +218,7 @@ impl UnscheduledPodDeletion for LeaderDeferredUnscheduledPodDeletion {
     }
 }
 
-pub(super) struct PodWorkqueue {
+pub(crate) struct PodWorkqueue {
     store: Arc<PodStore>,
     unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
     leadership: Option<watch::Receiver<bool>>,
@@ -237,7 +237,7 @@ pub(super) struct PodWorkqueue {
 }
 
 impl PodWorkqueue {
-    pub(super) fn new(
+    pub(crate) fn new(
         store: Arc<PodStore>,
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
@@ -246,7 +246,7 @@ impl PodWorkqueue {
         Self::new_with_unscheduled_deletion(store, persistence, supervisor, metrics, None, None)
     }
 
-    pub(super) fn new_leader(
+    pub(crate) fn new_leader(
         store: Arc<PodStore>,
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
