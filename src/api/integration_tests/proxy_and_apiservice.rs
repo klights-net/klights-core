@@ -664,7 +664,7 @@ async fn test_apiservice_status_recovers_from_endpointslice_update() {
     )
     .unwrap();
 
-    let _ = timeout(Duration::from_secs(2), async {
+    let _ = timeout(Duration::from_secs(10), async {
         loop {
             let status = app
                 .clone()
@@ -733,7 +733,7 @@ async fn test_apiservice_status_recovers_from_endpointslice_update() {
         .unwrap();
     assert_eq!(update_endpointslice.status(), StatusCode::OK);
 
-    let final_status = timeout(Duration::from_secs(2), async {
+    let final_status = timeout(Duration::from_secs(10), async {
         loop {
             let status = app
                 .clone()

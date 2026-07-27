@@ -127,7 +127,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn scheduler_runs_each_registered_task_per_tick() {
         let count_a = Arc::new(AtomicUsize::new(0));
         let count_b = Arc::new(AtomicUsize::new(0));
@@ -149,7 +149,11 @@ mod tests {
         let handle =
             tokio::spawn(async move { scheduler.run(task_supervisor, cancel_for_run).await });
 
-        tokio::time::sleep(Duration::from_millis(180)).await;
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
         cancel.cancel();
         handle.await.unwrap();
 

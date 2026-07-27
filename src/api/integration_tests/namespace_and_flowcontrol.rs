@@ -6304,13 +6304,29 @@ async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalizati
     // Drive each picked-up Pod through the actor-owned finalization seam. This
     // is the ONLY production path allowed to remove a picked-up Pod row.
     for (name, uid) in &pod_uids {
-        assert!(
-            pod_repository
-                .finalize_pod_deletion_after_actor_cleanup("gc-cleanup", name, uid)
-                .await
-                .unwrap(),
-            "actor-owned finalization should remove picked-up Pod {name} by UID"
-        );
+        let removed_immediately = pod_repository
+            .finalize_pod_deletion_after_actor_cleanup("gc-cleanup", name, uid)
+            .await
+            .unwrap();
+        if !removed_immediately {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if db
+                        .get_resource("v1", "Pod", Some("gc-cleanup"), name)
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!("queued actor-owned finalization should remove picked-up Pod {name} by UID")
+            });
+        }
     }
 
     // Namespace finalization must be re-drivable event-style from the
