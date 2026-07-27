@@ -2212,7 +2212,7 @@ fn map_pod_store_error_to_api(error: anyhow::Error) -> AppError {
 }
 
 #[async_trait]
-impl crate::kubelet::pod_repository::PodApiPort for PodApiService {
+impl crate::kubelet::pod_repository::PodOrdinaryMutation for PodApiService {
     async fn create(
         &self,
         request: PodApiCreateRequest,
@@ -2305,6 +2305,27 @@ impl crate::kubelet::pod_repository::PodApiPort for PodApiService {
         self.schedule_all_unbound_pods()
             .await
             .map_err(|error| map_api_error_to_pod_repository(error, "", ""))
+    }
+}
+
+#[async_trait]
+impl crate::kubelet::pod_repository::ControllerPodCreate for PodApiService {
+    async fn create_controller_pod(
+        &self,
+        request: PodApiCreateRequest,
+    ) -> Result<PodApiCreateResult, PodRepositoryError> {
+        let namespace = request.namespace.clone();
+        let name = request.name.clone();
+        self.api_create_pod(request)
+            .await
+            .map_err(|error| map_api_error_to_pod_repository(error, &namespace, &name))
+    }
+}
+
+#[cfg(test)]
+impl crate::kubelet::pod_repository::SchedulerBindTestControl for PodApiService {
+    fn set_scheduler_bind_gate(&self, gate: Arc<SchedulerBindGateForTest>) {
+        self.set_scheduler_bind_gate_for_test(gate);
     }
 }
 

@@ -247,7 +247,7 @@ impl PodMarkTerminating for PodRepository {
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
             let target = request.into_target();
-            let resource = self.api.mark_terminating(&target).await?;
+            let resource = self.ordinary_mutation.mark_terminating(&target).await?;
 
             let _ = self
                 .mutation_reconcile
@@ -271,7 +271,10 @@ impl PodEvictionDelete for PodRepository {
     ) -> PodRepositoryFuture<'_, PodEvictionDeleteOutcome> {
         Box::pin(async move {
             let (namespace, name, options, dry_run) = request.into_parts();
-            let outcome = self.api.delete(&namespace, &name, options, dry_run).await?;
+            let outcome = self
+                .ordinary_mutation
+                .delete(&namespace, &name, options, dry_run)
+                .await?;
             match outcome {
                 super::PodApiDeleteOutcome::DryRun(_) => Ok(PodEvictionDeleteOutcome::DryRun),
                 super::PodApiDeleteOutcome::GracefulSet(resource) => {
@@ -299,7 +302,7 @@ impl PodApiMutation for PodRepository {
     ) -> PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
         Box::pin(async move {
             let result = self
-                .api
+                .ordinary_mutation
                 .create(super::PodApiCreateRequest {
                     namespace: request.namespace,
                     name: String::new(),
@@ -321,7 +324,7 @@ impl PodApiMutation for PodRepository {
     ) -> PodRepositoryFuture<'_, PodApiWriteOutcome> {
         Box::pin(async move {
             match self
-                .api
+                .ordinary_mutation
                 .update(
                     &request.namespace,
                     &request.name,
@@ -359,7 +362,7 @@ impl PodApiMutation for PodRepository {
                 }
             };
             match self
-                .api
+                .ordinary_mutation
                 .patch(
                     &request.namespace,
                     &request.name,
@@ -383,7 +386,7 @@ impl PodApiMutation for PodRepository {
     ) -> PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
         Box::pin(async move {
             match self
-                .api
+                .ordinary_mutation
                 .delete(
                     &request.namespace,
                     &request.name,
@@ -407,7 +410,7 @@ impl PodApiMutation for PodRepository {
         request: PodApiDeleteCollectionRequest,
     ) -> PodRepositoryFuture<'_, ()> {
         Box::pin(async move {
-            self.api
+            self.ordinary_mutation
                 .delete_collection(
                     &request.namespace,
                     request.label_selector.as_deref(),

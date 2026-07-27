@@ -18,14 +18,14 @@ use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_leader_api::LeaderResourceQuery;
 use klights_reconcile_api::{PodMutationReconcileRequest, PodMutationReconcileSink};
 
-use super::PodApiPort;
+use super::ControllerPodCreate;
 use super::store::PodStore;
 
 const SANDBOX_ID_ANNOTATION: &str = "klights.dev/sandbox-id";
 
 pub(super) struct PodObjectService {
     store: Arc<PodStore>,
-    api: Arc<dyn PodApiPort>,
+    controller_create: Arc<dyn ControllerPodCreate>,
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
@@ -34,14 +34,14 @@ pub(super) struct PodObjectService {
 impl PodObjectService {
     pub(super) fn new(
         store: Arc<PodStore>,
-        api: Arc<dyn PodApiPort>,
+        controller_create: Arc<dyn ControllerPodCreate>,
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     ) -> Self {
         Self {
             store,
-            api,
+            controller_create,
             mutation_reconcile,
             outbox,
             cluster_api,
@@ -99,8 +99,8 @@ impl PodObjectService {
         pod: serde_json::Value,
     ) -> Result<Resource> {
         let result = self
-            .api
-            .create(super::types::PodApiCreateRequest {
+            .controller_create
+            .create_controller_pod(super::types::PodApiCreateRequest {
                 namespace: ns.to_string(),
                 name: name.to_string(),
                 body: pod,

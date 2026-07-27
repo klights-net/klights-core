@@ -289,7 +289,7 @@ use watch::PodWatchService;
 use workqueue::PodWorkqueue;
 
 #[async_trait]
-pub(crate) trait PodApiPort: Send + Sync {
+pub(crate) trait PodOrdinaryMutation: Send + Sync {
     async fn create(
         &self,
         request: PodApiCreateRequest,
@@ -344,6 +344,19 @@ pub(crate) trait PodApiPort: Send + Sync {
 }
 
 #[async_trait]
+pub(crate) trait ControllerPodCreate: Send + Sync {
+    async fn create_controller_pod(
+        &self,
+        request: PodApiCreateRequest,
+    ) -> std::result::Result<PodApiCreateResult, PodRepositoryError>;
+}
+
+#[cfg(test)]
+pub(crate) trait SchedulerBindTestControl: Send + Sync {
+    fn set_scheduler_bind_gate(&self, gate: Arc<crate::pod_api_service::SchedulerBindGateForTest>);
+}
+
+#[async_trait]
 pub(crate) trait PodSubresourcePort: Send + Sync {
     async fn replace_status(
         &self,
@@ -370,11 +383,12 @@ pub(crate) trait PodSubresourcePort: Send + Sync {
     ) -> std::result::Result<Resource, PodRepositoryError>;
 }
 
-pub(crate) struct PodRepositoryAdapterDependencies {
+pub(crate) struct PodRepositoryPrepared {
     pub store: Arc<PodStore>,
     pub status_only: Arc<dyn StateOnlyWriter>,
     pub supervisor: Arc<TaskSupervisor>,
     pub delete_coordinator: Arc<PodDeleteCoordinator>,
+    workqueue: Arc<PodWorkqueue>,
 }
 
 pub(crate) struct PodRepositoryRuntimeDependencies {
@@ -393,7 +407,8 @@ pub(crate) struct PodRepositoryDeliveryDependencies {
 }
 
 pub(crate) struct PodRepositoryAdapters {
-    pub api: Arc<dyn PodApiPort>,
+    pub ordinary_mutation: Arc<dyn PodOrdinaryMutation>,
+    pub controller_create: Arc<dyn ControllerPodCreate>,
     pub subresource: Arc<dyn PodSubresourcePort>,
     pub gc_delete: Arc<dyn GcPodDeleteSink>,
     pub gc_reconcile: Arc<dyn PodGcReconcileSink>,
@@ -403,11 +418,7 @@ pub(crate) struct PodRepositoryAdapters {
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     #[cfg(test)]
-    pub api_for_test: Option<Arc<crate::pod_api_service::PodApiService>>,
-}
-
-pub(crate) trait PodRepositoryAdapterFactory: Send + Sync {
-    fn build(&self, dependencies: PodRepositoryAdapterDependencies) -> PodRepositoryAdapters;
+    pub scheduler_test_control: Option<Arc<dyn SchedulerBindTestControl>>,
 }
 
 #[async_trait]
@@ -791,7 +802,7 @@ pub struct PodRepository {
     subresource: Arc<dyn PodSubresourcePort>,
     network_svc: PodNetworkService,
     _watch: PodWatchService,
-    api: Arc<dyn PodApiPort>,
+    ordinary_mutation: Arc<dyn PodOrdinaryMutation>,
     gc_delete: Arc<dyn GcPodDeleteSink>,
     eviction_admission: Arc<dyn PodEvictionAdmissionSink>,
     namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
@@ -805,7 +816,7 @@ pub struct PodRepository {
     #[cfg(test)]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
     #[cfg(test)]
-    api_for_test: Option<Arc<crate::pod_api_service::PodApiService>>,
+    scheduler_test_control: Option<Arc<dyn SchedulerBindTestControl>>,
 }
 
 impl PodRepository {
@@ -1090,27 +1101,16 @@ impl PodRepository {
         crate::pod_repository_composition::build_pod_repository_parts(config, None)
     }
 
-    pub(crate) fn build_parts_with_adapters(
+    pub(crate) fn prepare(
         pod_persistence: Arc<dyn store::PodPersistence>,
         workqueue_persistence: impl workqueue::PodWorkqueuePersistence + Clone + 'static,
         runtime: PodRepositoryRuntimeDependencies,
-        network: PodRepositoryNetworkDependencies,
-        delivery: PodRepositoryDeliveryDependencies,
         leadership: Option<tokio::sync::watch::Receiver<bool>>,
-        adapter_factory: Arc<dyn PodRepositoryAdapterFactory>,
-    ) -> facade::PodRepositoryParts {
+    ) -> PodRepositoryPrepared {
         let PodRepositoryRuntimeDependencies {
             supervisor,
             metrics,
         } = runtime;
-        let PodRepositoryNetworkDependencies {
-            pod_network_cache,
-            assignment_waiter,
-        } = network;
-        let PodRepositoryDeliveryDependencies {
-            outbox,
-            cluster_api,
-        } = delivery;
         let store = Arc::new(PodStore::from_persistence(pod_persistence));
         let workqueue = if let Some(leadership) = leadership {
             PodWorkqueue::new_leader(
@@ -1135,14 +1135,39 @@ impl PodRepository {
             metrics.clone(),
         ));
         let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
-        let adapters = adapter_factory.build(PodRepositoryAdapterDependencies {
-            store: store.clone(),
-            status_only: status_only.clone(),
-            supervisor: supervisor.clone(),
+        PodRepositoryPrepared {
+            store,
+            status_only,
+            supervisor,
             delete_coordinator,
-        });
+            workqueue,
+        }
+    }
+
+    pub(crate) fn assemble(
+        prepared: PodRepositoryPrepared,
+        runtime_metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
+        network: PodRepositoryNetworkDependencies,
+        delivery: PodRepositoryDeliveryDependencies,
+        adapters: PodRepositoryAdapters,
+    ) -> facade::PodRepositoryParts {
+        let PodRepositoryPrepared {
+            store,
+            status_only,
+            supervisor,
+            delete_coordinator: _,
+            workqueue,
+        } = prepared;
+        let PodRepositoryNetworkDependencies {
+            pod_network_cache,
+            assignment_waiter,
+        } = network;
+        let PodRepositoryDeliveryDependencies {
+            outbox,
+            cluster_api,
+        } = delivery;
         workqueue.set_namespace_termination_sink(adapters.namespace_termination.clone());
-        let api = adapters.api;
+        let ordinary_mutation = adapters.ordinary_mutation;
         let gc_reconcile = adapters.gc_reconcile;
         let pdb_reconcile = adapters.pdb_reconcile;
         let eviction_admission = adapters.eviction_admission;
@@ -1160,7 +1185,7 @@ impl PodRepository {
         );
         let objects = PodObjectService::new(
             store.clone(),
-            api.clone(),
+            adapters.controller_create,
             mutation_reconcile.clone(),
             outbox.clone(),
             cluster_api.clone(),
@@ -1185,7 +1210,7 @@ impl PodRepository {
             cluster_api: cluster_api.clone(),
             outbox: outbox.clone(),
             mutation_reconcile: mutation_reconcile.clone(),
-            metrics: metrics.clone(),
+            metrics: runtime_metrics.clone(),
             supervisor: supervisor.clone(),
             deferred_runtime: status.deferred_runtime_handle(),
         };
@@ -1200,7 +1225,7 @@ impl PodRepository {
             subresource,
             network_svc,
             _watch: watch,
-            api,
+            ordinary_mutation,
             gc_delete: adapters.gc_delete,
             eviction_admission,
             namespace_bootstrap,
@@ -1214,7 +1239,7 @@ impl PodRepository {
             #[cfg(test)]
             deletion_finalizer,
             #[cfg(test)]
-            api_for_test: adapters.api_for_test,
+            scheduler_test_control: adapters.scheduler_test_control,
         };
         let background = PodRepositoryBackground::new(workqueue);
         facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)
@@ -1341,7 +1366,7 @@ impl PodRepository {
         namespace: &str,
         name: &str,
     ) -> Result<Option<Resource>> {
-        self.api
+        self.ordinary_mutation
             .schedule_pending(namespace, name)
             .await
             .map_err(|e| anyhow::anyhow!("{e:?}"))
@@ -1354,14 +1379,14 @@ impl PodRepository {
         binding: serde_json::Value,
         dry_run: bool,
     ) -> Result<()> {
-        self.api
+        self.ordinary_mutation
             .bind(namespace, name, binding, dry_run)
             .await
             .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
-        self.api
+        self.ordinary_mutation
             .clone()
             .schedule_all()
             .await
@@ -1373,10 +1398,10 @@ impl PodRepository {
         &self,
         gate: Arc<crate::pod_api_service::SchedulerBindGateForTest>,
     ) {
-        self.api_for_test
+        self.scheduler_test_control
             .as_ref()
             .expect("scheduler bind gate requires root Pod API adapter")
-            .set_scheduler_bind_gate_for_test(gate);
+            .set_scheduler_bind_gate(gate);
     }
 
     /// Enqueue the owning Job for asynchronous reconciliation after a pod
@@ -2075,7 +2100,7 @@ impl PodApiWriter for PodRepository {
         &self,
         request: PodApiCreateRequest,
     ) -> std::result::Result<PodApiCreateResult, PodRepositoryError> {
-        self.api.create(request).await
+        self.ordinary_mutation.create(request).await
     }
     async fn api_update_pod(
         &self,
@@ -2085,7 +2110,9 @@ impl PodApiWriter for PodRepository {
         current: Resource,
         dry_run: bool,
     ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
-        self.api.update(ns, name, body, current, dry_run).await
+        self.ordinary_mutation
+            .update(ns, name, body, current, dry_run)
+            .await
     }
     async fn api_patch_pod(
         &self,
@@ -2095,7 +2122,9 @@ impl PodApiWriter for PodRepository {
         patch_type: PodStatusPatchType,
         dry_run: bool,
     ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
-        self.api.patch(ns, name, patch, patch_type, dry_run).await
+        self.ordinary_mutation
+            .patch(ns, name, patch, patch_type, dry_run)
+            .await
     }
     async fn api_delete_pod<O>(
         &self,
@@ -2107,7 +2136,9 @@ impl PodApiWriter for PodRepository {
     where
         O: Into<PodDeleteOptions> + Send,
     {
-        self.api.delete(ns, name, options.into(), dry_run).await
+        self.ordinary_mutation
+            .delete(ns, name, options.into(), dry_run)
+            .await
     }
     async fn api_delete_collection_pods(
         &self,
@@ -2116,7 +2147,7 @@ impl PodApiWriter for PodRepository {
         field_selector: Option<&str>,
         dry_run: bool,
     ) -> std::result::Result<(), PodRepositoryError> {
-        self.api
+        self.ordinary_mutation
             .delete_collection(ns, label_selector, field_selector, dry_run)
             .await
     }
