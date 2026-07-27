@@ -1,14 +1,8 @@
 use super::*;
-use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchReplaySource, WindowPolicy,
-};
+use crate::api::watch_event::{EventType, WatchEvent};
 use klights_node_api::{NodeLog, NodeLogOptions, NodeLogRequest, NodeLogTarget};
-use klights_watch::{WatchSignalReceiver, WatchTopic};
 use std::collections::VecDeque;
-use std::future::Future;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::{fs as blocking_fs, path::PathBuf};
 #[cfg(test)]
@@ -70,50 +64,8 @@ impl PodLogFollowWatchSource {
     }
 }
 
-pub(crate) type PodLogFollowResourceVersionFuture<'a> =
-    Pin<Box<dyn Future<Output = anyhow::Result<i64>> + Send + 'a>>;
-
 pub(crate) trait PodLogFollowWatchPort: Send + Sync {
-    fn subscribe_pod_watch_signals(&self) -> WatchSignalReceiver;
-    fn pod_watch_replay_source(&self) -> PodLogFollowReplaySource;
-    fn current_resource_version(&self) -> PodLogFollowResourceVersionFuture<'_>;
-}
-
-pub(crate) struct PodLogFollowReplaySource {
-    inner: Arc<dyn WatchReplaySource>,
-}
-
-impl PodLogFollowReplaySource {
-    pub(crate) fn new(inner: Arc<dyn WatchReplaySource>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait::async_trait]
-impl WatchReplaySource for PodLogFollowReplaySource {
-    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
-        self.inner.replay_since(since_rv).await
-    }
-
-    async fn replay_since_checked(
-        &self,
-        since_rv: i64,
-        limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<klights_watch::WatchReplayRead<WatchEvent>> {
-        self.inner.replay_since_checked(since_rv, limit).await
-    }
-
-    async fn replay_after_checked(
-        &self,
-        position: klights_watch::WatchReplayPosition,
-        limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
-        self.inner.replay_after_checked(position, limit).await
-    }
-
-    async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
-        self.inner.earliest_retained_rv().await
-    }
+    fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_>;
 }
 
 /// All container names declared in a Pod spec (regular, init, ephemeral).
@@ -367,7 +319,10 @@ async fn build_pod_log_follow_termination(
 ) -> Result<PodLogFollowTermination, AppError> {
     let pod_events =
         build_pod_log_follow_event_cursor(&state.pod_node_subresources().pod_log_follow_watch)
-            .await;
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("failed to open Pod log follow watch: {error}"))
+            })?;
     let current = crate::api::pod_repository_ports::get_pod(
         state.resource_mutation().pod_repository.as_ref(),
         namespace,
@@ -432,22 +387,8 @@ async fn build_pod_log_follow_termination(
 
 pub(crate) async fn build_pod_log_follow_event_cursor(
     pod_event_store: &PodLogFollowWatchSource,
-) -> SignalWatchCursor<PodLogFollowReplaySource> {
-    let topic = WatchTopic::new("v1", "Pod");
-    let signal_rx = pod_event_store.inner.subscribe_pod_watch_signals();
-    let start_rv = pod_event_store
-        .inner
-        .current_resource_version()
-        .await
-        .unwrap_or(0);
-    SignalWatchCursor::new(
-        signal_rx,
-        pod_event_store.inner.pod_watch_replay_source(),
-        topic,
-        WatchDeliveryScope::NamespacedAll,
-        start_rv,
-        WindowPolicy::default_watch_delivery(),
-    )
+) -> Result<klights_leader_api::WatchStream, klights_leader_api::LeaderWatchError> {
+    pod_event_store.inner.open_pod_watch().await
 }
 
 fn build_text_log_response(body: axum::body::Body) -> Result<Response, AppError> {
@@ -818,7 +759,7 @@ pub struct PodLogFollowTermination {
 
 impl PodLogFollowTermination {
     pub(crate) fn new(
-        pod_events: SignalWatchCursor<PodLogFollowReplaySource>,
+        pod_events: klights_leader_api::WatchStream,
         namespace: String,
         name: String,
         uid: String,
@@ -826,7 +767,7 @@ impl PodLogFollowTermination {
         terminate_after_initial: bool,
     ) -> Self {
         Self {
-            pod_events: PodLogEventSource::Signal(Box::new(pod_events)),
+            pod_events: PodLogEventSource::Leader(pod_events),
             namespace,
             name,
             uid,
@@ -860,7 +801,7 @@ impl PodLogFollowTermination {
 }
 
 enum PodLogEventSource {
-    Signal(Box<SignalWatchCursor<PodLogFollowReplaySource>>),
+    Leader(klights_leader_api::WatchStream),
     #[cfg(test)]
     Broadcast(broadcast::Receiver<WatchEvent>),
 }
@@ -876,11 +817,18 @@ enum PodLogEventError {
 impl PodLogEventSource {
     async fn next_event(&mut self) -> Result<WatchEvent, PodLogEventError> {
         match self {
-            Self::Signal(cursor) => cursor.next_event().await.map_err(|err| match err {
-                WatchCursorError::Closed => PodLogEventError::Closed,
-                WatchCursorError::Expired => PodLogEventError::Expired,
-                WatchCursorError::Replay(err) => PodLogEventError::Replay(err),
-            }),
+            Self::Leader(stream) => match stream.next().await {
+                Some(Ok(event)) => {
+                    Ok(crate::api::custom_resource_ports::resource_event_to_watch_event(&event))
+                }
+                Some(Err(klights_leader_api::LeaderWatchError::ReplayExpired { .. })) => {
+                    Err(PodLogEventError::Expired)
+                }
+                Some(Err(error)) => Err(PodLogEventError::Replay(anyhow::Error::msg(
+                    error.to_string(),
+                ))),
+                None => Err(PodLogEventError::Closed),
+            },
             #[cfg(test)]
             Self::Broadcast(rx) => rx.recv().await.map_err(|err| match err {
                 broadcast::error::RecvError::Lagged(skipped) => PodLogEventError::Lagged(skipped),
@@ -2118,73 +2066,45 @@ mod watch_port_tests {
     use super::*;
     use std::sync::Mutex;
 
-    struct RecordingReplaySource {
-        positions: Arc<Mutex<Vec<klights_watch::WatchReplayPosition>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl WatchReplaySource for RecordingReplaySource {
-        async fn replay_since(&self, _since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
-            Ok(Vec::new())
-        }
-
-        async fn replay_after_checked(
-            &self,
-            position: klights_watch::WatchReplayPosition,
-            _limit: std::num::NonZeroUsize,
-        ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<WatchEvent>> {
-            self.positions.lock().unwrap().push(position);
-            Ok(klights_watch::PositionedWatchReplayRead::Events(
-                klights_watch::PositionedWatchReplay::new(Vec::new(), position),
-            ))
-        }
-    }
-
     struct RecordingWatchPort {
-        receiver: Mutex<Option<WatchSignalReceiver>>,
-        replay: Arc<RecordingReplaySource>,
-        current_rv: i64,
+        requests: Arc<Mutex<Vec<klights_leader_api::WatchRequest>>>,
     }
 
     impl PodLogFollowWatchPort for RecordingWatchPort {
-        fn subscribe_pod_watch_signals(&self) -> WatchSignalReceiver {
-            self.receiver
-                .lock()
-                .unwrap()
-                .take()
-                .expect("cursor is constructed once")
-        }
-
-        fn pod_watch_replay_source(&self) -> PodLogFollowReplaySource {
-            PodLogFollowReplaySource::new(self.replay.clone())
-        }
-
-        fn current_resource_version(&self) -> PodLogFollowResourceVersionFuture<'_> {
-            Box::pin(async move { Ok(self.current_rv) })
+        fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
+            Box::pin(async move {
+                let request = klights_leader_api::WatchRequest::try_new(
+                    "v1", "Pod", None, None, None, None, None,
+                )?;
+                self.requests.lock().unwrap().push(request);
+                Ok(klights_leader_api::WatchStream::positioned(
+                    Box::pin(futures::stream::empty()),
+                    klights_leader_api::WatchResumeCursor::try_new(Some(41), None)?,
+                ))
+            })
         }
     }
 
     #[tokio::test]
-    async fn follow_cursor_uses_current_rv_as_positioned_replay_handoff() {
-        let (_hub, receiver) = crate::watch::test_signal_channel(4, [WatchTopic::new("v1", "Pod")]);
-        let positions = Arc::new(Mutex::new(Vec::new()));
+    async fn follow_cursor_uses_positioned_leader_watch_handoff() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let source = PodLogFollowWatchSource::new(Arc::new(RecordingWatchPort {
-            receiver: Mutex::new(Some(receiver)),
-            replay: Arc::new(RecordingReplaySource {
-                positions: positions.clone(),
-            }),
-            current_rv: 41,
+            requests: requests.clone(),
         }));
 
-        let mut cursor = build_pod_log_follow_event_cursor(&source).await;
-        assert_eq!(cursor.accepted_rv(), 41);
-        assert_eq!(cursor.prime_replay_or_expired().await.unwrap(), 0);
+        let cursor = build_pod_log_follow_event_cursor(&source).await.unwrap();
         assert_eq!(
-            positions.lock().unwrap().as_slice(),
-            [klights_watch::WatchReplayPosition::from_resource_version(
-                41
-            )]
+            cursor
+                .accepted_cursor()
+                .and_then(|cursor| cursor.resource_version()),
+            Some(41)
         );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].api_version(), "v1");
+        assert_eq!(requests[0].kind(), "Pod");
+        assert_eq!(requests[0].start_resource_version(), None);
+        assert_eq!(requests[0].start_watch_replay_position(), None);
     }
 
     #[test]

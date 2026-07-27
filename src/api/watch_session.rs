@@ -1,6 +1,7 @@
+use crate::api::watch_event::{EventType, WatchEvent};
 use crate::watch::{
-    SelectorMembership, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchReplaySource, WindowPolicy,
+    SelectorMembership, SignalWatchCursor, WatchCursorError, WatchDeliveryScope,
+    WatchEvent as LegacyWatchEvent, WatchReplaySource, WindowPolicy,
 };
 use klights_watch::{WatchReplayPosition, WatchSignalReceiver, WatchTopic};
 
@@ -73,7 +74,9 @@ impl WatchSessionBootstrap {
     }
 
     pub(crate) fn record_baseline_event(&mut self, event: &WatchEvent) {
-        if self.membership.record_event(event)
+        if self
+            .membership
+            .record_event(&to_legacy_watch_event(event.clone()))
             && let Some(rv) = event.resource_version()
         {
             self.observe_delivered_rv(rv);
@@ -152,7 +155,7 @@ impl<S: WatchReplaySource> WatchSession<S> {
     }
 
     pub(crate) async fn next_event(&mut self) -> Result<WatchEvent, WatchCursorError> {
-        self.cursor.next_event().await
+        self.cursor.next_event().await.map(from_legacy_watch_event)
     }
 
     pub(crate) fn classify_event(
@@ -198,7 +201,9 @@ fn classify_event(
     membership: &mut SelectorMembership,
 ) -> WatchSessionEvent {
     let event = if has_selector {
-        membership.transition(event, matches_selector)
+        membership
+            .transition(to_legacy_watch_event(event), matches_selector)
+            .map(from_legacy_watch_event)
     } else if matches_selector {
         Some(event)
     } else {
@@ -207,6 +212,36 @@ fn classify_event(
     match event {
         Some(event) => WatchSessionEvent::Deliver(event),
         None => WatchSessionEvent::Filtered,
+    }
+}
+
+fn to_legacy_watch_event(event: WatchEvent) -> LegacyWatchEvent {
+    let event_type = match event.event_type {
+        EventType::Added => crate::watch::EventType::Added,
+        EventType::Modified => crate::watch::EventType::Modified,
+        EventType::Deleted => crate::watch::EventType::Deleted,
+        EventType::Bookmark => crate::watch::EventType::Bookmark,
+        EventType::Error => crate::watch::EventType::Error,
+    };
+    LegacyWatchEvent {
+        event_type,
+        object: event.object,
+        encoded_payload: None,
+    }
+}
+
+fn from_legacy_watch_event(event: LegacyWatchEvent) -> WatchEvent {
+    let event_type = match event.event_type {
+        crate::watch::EventType::Added => EventType::Added,
+        crate::watch::EventType::Modified => EventType::Modified,
+        crate::watch::EventType::Deleted => EventType::Deleted,
+        crate::watch::EventType::Bookmark => EventType::Bookmark,
+        crate::watch::EventType::Error => EventType::Error,
+    };
+    WatchEvent {
+        event_type,
+        object: event.object,
+        encoded_payload: None,
     }
 }
 

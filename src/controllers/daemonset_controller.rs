@@ -1,6 +1,6 @@
 //! `Controller` impl for `DaemonSet`. Registered in `ControllerDispatcher`.
 
-use crate::controller::controller_wrapper;
+use crate::controllers::controller_wrapper;
 use crate::controllers::daemonset as daemonset_core;
 
 controller_wrapper!(
@@ -8,13 +8,15 @@ controller_wrapper!(
     "daemonset",
     daemonset_core::reconcile_daemonset,
     no_node,
-    with_pod_repository
+    with_pod_repository,
+    store = daemonset_store,
+    mutation = daemonset_mutation
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::Controller;
+    use crate::controllers::Controller;
     use crate::controllers::test_utils::store_and_prepare;
     use serde_json::json;
 

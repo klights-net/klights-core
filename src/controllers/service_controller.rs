@@ -1,7 +1,7 @@
 //! `Controller` impl for `Service`.
 
-use crate::controller::{Context, Controller};
 use crate::controllers::service as service_core;
+use crate::controllers::{Context, Controller};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -24,23 +24,15 @@ impl Controller for ServiceController {
     }
 
     async fn reconcile(&self, resource: Value, ctx: Context) -> Result<()> {
-        let pod_repository = ctx.pod_repository().ok_or_else(|| {
-            anyhow::anyhow!(
-                "service controller requires pod_repository in Context — wire it via \
-                 ControllerDispatcher::set_pod_repository or Context::with_pod_repository"
-            )
-        })?;
         service_core::reconcile_service_with_nodeport(
-            ctx.db_handle().as_ref(),
-            pod_repository.as_ref(),
+            ctx.leader().service_store(),
+            ctx.pods().query(),
             &resource,
             &self.service_ipam,
             &self.nodeport_alloc,
         )
         .await?;
-        if let Some(services) = ctx.services() {
-            services.request_services_sync()?;
-        }
+        ctx.network().service_router().request_services_sync()?;
         Ok(())
     }
 }

@@ -8,7 +8,7 @@
 //! controller fully unit-testable with a mock signer and in-memory
 //! datastore.
 
-use crate::controller::{Context, Controller};
+use crate::controllers::{Context, Controller};
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use serde_json::Value;
@@ -98,11 +98,7 @@ impl Controller for CsrSignerController {
 
     async fn reconcile(&self, resource: Value, ctx: Context) -> anyhow::Result<()> {
         let csr_name = extract_name(&resource);
-        let live_resource = match ctx
-            .db_handle()
-            .get_resource(API_VERSION, KIND, None, &csr_name)
-            .await?
-        {
+        let live_resource = match ctx.leader().csr_status_store().get_csr(&csr_name).await? {
             Some(resource) => resource,
             None => return Ok(()),
         };
@@ -154,7 +150,7 @@ impl Controller for CsrSignerController {
 
         // Update CSR status with certificate and approval
         update_csr_with_certificate(
-            ctx.db_handle().as_ref(),
+            ctx.leader().csr_status_store(),
             &csr_name,
             &uid,
             resource_version,
@@ -170,7 +166,9 @@ impl Controller for CsrSignerController {
 
 // --- Helper functions (private to this module) ---
 
+#[cfg(test)]
 const API_VERSION: &str = "certificates.k8s.io/v1";
+#[cfg(test)]
 const KIND: &str = "CertificateSigningRequest";
 
 fn is_csr_pending(csr: &Value) -> bool {

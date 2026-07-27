@@ -1,6 +1,6 @@
 //! `Controller` impl for `PersistentVolumeClaim`. Registered in `ControllerDispatcher`.
 
-use crate::controller::controller_wrapper;
+use crate::controllers::controller_wrapper;
 use crate::controllers::pvc as pvc_core;
 
 controller_wrapper!(
@@ -9,14 +9,15 @@ controller_wrapper!(
     pvc_core::reconcile_pvc,
     no_node,
     discard,
-    with_file_process
+    with_file_process,
+    store = pvc_store
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{Context, Controller};
     use crate::controllers::test_utils::store_and_prepare;
+    use crate::controllers::{Context, Controller};
     use serde_json::json;
 
     #[test]

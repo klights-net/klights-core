@@ -32,17 +32,20 @@ impl AdmissionExecution for RootApiResourceStore {
 }
 
 impl crate::api::watch_stream::WatchStreamSource for RootApiResourceStore {
-    fn subscribe_watch_signals(
-        &self,
-        topic: klights_watch::WatchTopic,
-    ) -> klights_watch::WatchSignalReceiver {
-        crate::api::watch_stream::WatchStreamSource::subscribe_watch_signals(&self.inner, topic)
-    }
-
-    fn current_resource_version(
-        &self,
-    ) -> crate::api::watch_stream::WatchSourceCurrentResourceVersionFuture<'_> {
-        crate::api::watch_stream::WatchStreamSource::current_resource_version(&self.inner)
+    fn wait_until_fresh<'a>(
+        &'a self,
+        target_rv: i64,
+        api_version: &'a str,
+        kind: &'a str,
+        task_supervisor: &'a klights_supervisor::TaskSupervisor,
+    ) -> crate::api::watch_stream::WatchSourceWaitFuture<'a> {
+        crate::api::watch_stream::WatchStreamSource::wait_until_fresh(
+            &self.inner,
+            target_rv,
+            api_version,
+            kind,
+            task_supervisor,
+        )
     }
 
     fn list_watch_resources<'a>(

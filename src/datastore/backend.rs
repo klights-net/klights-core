@@ -6,6 +6,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::any::Any;
+use std::sync::Arc;
 
 fn snapshot_replay_floor_cursor_key(
     cursor: &klights_cluster_store::SnapshotReplayFloorCursor,
@@ -117,6 +119,7 @@ use tokio::sync::broadcast;
 #[cfg(test)]
 use crate::watch::{WatchEvent, WatchReceiver};
 use klights_cluster_core::command::StorageCommand;
+#[cfg(test)]
 use klights_watch::WatchTopic;
 
 #[cfg(test)]
@@ -124,10 +127,10 @@ use super::types::PendingWatchEvent;
 #[cfg(test)]
 use super::types::ReplicatedCreateOptions;
 use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, NodeSubnet, PodCleanupIntent, PositionedWatchReplayRead, RawWatchEvent,
-    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor,
-    WatchReplayRead, WatchTarget,
+    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, CommitObservation,
+    DurableAllocatorObservation, ListPageRequest, NodeSubnet, PodCleanupIntent,
+    PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata, ResourceList,
+    ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 #[cfg(test)]
 use klights_cluster_core::command::CommandMeta;
@@ -154,6 +157,30 @@ pub struct SnapshotMutationFence {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
+/// Synchronous, nonblocking post-commit observation port. Implementations are
+/// injected by root composition and must not perform datastore work.
+pub trait CommitObservationSink: Any + Send + Sync {
+    fn observe(&self, observations: &[CommitObservation]);
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// Focused capability for root composition to recover the exact observation
+/// sink injected when the passive cluster store was opened.
+pub trait CommitObservationStore: Send + Sync {
+    fn commit_observation_sink(&self) -> Arc<dyn CommitObservationSink>;
+}
+
+pub trait OutboxResponseCodec: Send + Sync {
+    fn encode(
+        &self,
+        response: &klights_cluster_core::StorageResponse,
+    ) -> std::result::Result<Vec<u8>, String>;
+    fn decode(
+        &self,
+        bytes: &[u8],
+    ) -> std::result::Result<klights_cluster_core::StorageResponse, String>;
+}
+
 #[async_trait]
 pub trait SnapshotCaptureAnchor: Send + Sync {
     async fn pin_under_snapshot_fence(&self) -> Result<()>;
@@ -173,7 +200,7 @@ impl SnapshotMutationFence {
 /// (redb, etc.) via MVCC reader. Not on the trait today because no caller
 /// exists.
 #[async_trait]
-pub trait DatastoreBackend: Send + Sync {
+pub trait DatastoreBackend: CommitObservationStore + Send + Sync {
     /// Atomically observe both durable allocators and their persisted mode.
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
         Err(anyhow::anyhow!(
@@ -216,8 +243,6 @@ pub trait DatastoreBackend: Send + Sync {
     /// Release backend-specific resources (file locks, connections, etc.)
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
-
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
 
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
@@ -1488,7 +1513,6 @@ pub trait RawWatchReplayStore: Send + Sync {
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     async fn list_watch_events_since(
@@ -1558,6 +1582,10 @@ impl DatastoreBackendWatchStore {
     pub fn new(db: DatastoreHandle) -> Self {
         Self { db }
     }
+
+    pub(crate) fn db(&self) -> DatastoreHandle {
+        self.db.clone()
+    }
 }
 
 #[async_trait]
@@ -1602,10 +1630,6 @@ impl RawWatchReplayStore for DatastoreBackendWatchStore {
 
 #[async_trait]
 impl WatchStore for DatastoreBackendWatchStore {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.db.subscribe_watch_signals(topic)
-    }
-
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         self.db.subscribe_watch(topic)

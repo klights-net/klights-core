@@ -1,7 +1,8 @@
-use crate::watch::{EventType, WatchCursorError, WatchEvent};
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt as _;
 pub use klights_leader_api::{CrdRegistry, CrdResourceInfo};
+use klights_leader_api::{LeaderWatchError, ResourceEvent, WatchEventType, WatchStream};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -10,15 +11,16 @@ pub trait CrdRegistryReader: Send + Sync {
     async fn list_crd_values(&self) -> Result<Vec<serde_json::Value>>;
 }
 
-#[async_trait]
-pub trait CrdRegistryEventStream: Send {
-    async fn prime_replay(&mut self) -> std::result::Result<(), WatchCursorError>;
-    async fn next_event(&mut self) -> std::result::Result<WatchEvent, WatchCursorError>;
+pub struct CrdRegistryWatchSession {
+    pub initial_values: Vec<serde_json::Value>,
+    pub events: WatchStream,
 }
 
 #[async_trait]
 pub trait CrdRegistryRuntime: CrdRegistryReader {
-    async fn subscribe_crd_events(&self) -> Result<Box<dyn CrdRegistryEventStream>>;
+    async fn open_crd_watch(
+        &self,
+    ) -> std::result::Result<CrdRegistryWatchSession, LeaderWatchError>;
 }
 
 pub async fn load_existing_crds<S: CrdRegistryReader + ?Sized>(
@@ -46,27 +48,23 @@ pub async fn run_crd_registry_watch_with_components(
     registry: CrdRegistry,
     cancel: CancellationToken,
 ) {
-    if let Err(err) = sync_registry_from_datastore(runtime.as_ref(), &registry).await {
-        tracing::warn!("crd_registry: initial sync failed: {err:#}");
-    }
-
-    let mut events = match runtime.subscribe_crd_events().await {
-        Ok(events) => events,
+    let mut session = match runtime.open_crd_watch().await {
+        Ok(session) => session,
         Err(err) => {
             tracing::warn!("crd_registry: watch subscribe failed: {err:#}");
             return;
         }
     };
-    if let Err(err) = events.prime_replay().await {
-        tracing::warn!(?err, "crd_registry: initial replay failed");
+    if let Err(err) = replace_registry_from_values(&registry, &session.initial_values).await {
+        tracing::warn!("crd_registry: initial snapshot failed: {err:#}");
     }
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            result = events.next_event() => {
+            result = session.events.next() => {
                 match result {
-                    Ok(event) => {
+                    Some(Ok(event)) => {
                         if !is_crd_event(&event) {
                             continue;
                         }
@@ -74,17 +72,29 @@ pub async fn run_crd_registry_watch_with_components(
                             tracing::warn!("crd_registry: sync after watch event failed: {err:#}");
                         }
                     }
-                    Err(WatchCursorError::Closed) => {
+                    None => {
                         tracing::warn!("crd_registry: watch signal channel closed");
                         break;
                     }
-                    Err(WatchCursorError::Expired) => {
+                    Some(Err(LeaderWatchError::ReplayExpired { .. })) => {
                         tracing::warn!("crd_registry: replay window expired; running full resync");
-                        if let Err(err) = sync_registry_from_datastore(runtime.as_ref(), &registry).await {
-                            tracing::warn!("crd_registry: sync after expired replay failed: {err:#}");
+                        match runtime.open_crd_watch().await {
+                            Ok(reopened) => {
+                                if let Err(err) = replace_registry_from_values(
+                                    &registry,
+                                    &reopened.initial_values,
+                                ).await {
+                                    tracing::warn!("crd_registry: resync after expired replay failed: {err:#}");
+                                }
+                                session = reopened;
+                            }
+                            Err(err) => {
+                                tracing::warn!("crd_registry: reopen after expired replay failed: {err:#}");
+                                break;
+                            }
                         }
                     }
-                    Err(WatchCursorError::Replay(err)) => {
+                    Some(Err(err)) => {
                         tracing::warn!("crd_registry: watch replay failed: {err:#}");
                     }
                 }
@@ -93,12 +103,24 @@ pub async fn run_crd_registry_watch_with_components(
     }
 }
 
-fn is_crd_event(event: &WatchEvent) -> bool {
+async fn replace_registry_from_values(
+    registry: &CrdRegistry,
+    values: &[serde_json::Value],
+) -> Result<()> {
+    let mut infos = Vec::new();
+    for value in values {
+        infos.extend(crd_resource_infos_from_value(value)?);
+    }
+    registry.replace_all(infos).await;
+    Ok(())
+}
+
+fn is_crd_event(event: &ResourceEvent) -> bool {
     matches!(
-        event.event_type,
-        EventType::Added | EventType::Modified | EventType::Deleted
-    ) && event.object.get("apiVersion").and_then(|v| v.as_str()) == Some("apiextensions.k8s.io/v1")
-        && event.object.get("kind").and_then(|v| v.as_str()) == Some("CustomResourceDefinition")
+        event.event_type(),
+        WatchEventType::Added | WatchEventType::Modified | WatchEventType::Deleted
+    ) && event.resource().api_version == "apiextensions.k8s.io/v1"
+        && event.resource().kind == "CustomResourceDefinition"
 }
 
 pub async fn register_crd_from_value(

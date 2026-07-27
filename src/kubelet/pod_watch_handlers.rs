@@ -1,15 +1,15 @@
 #[cfg(test)]
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
+use crate::kubelet::pod_watch_source::PodWatchEvent;
 #[cfg(test)]
-use crate::watch::EventType;
-use crate::watch::WatchEvent;
+use klights_leader_api::WatchEventType;
 #[cfg(test)]
 use klights_reconcile_api::PvcReconcileSink;
 
 #[async_trait::async_trait]
 pub trait PersistentVolumeEventHandler: Send + Sync {
-    async fn handle_pvc_event(&self, event: &WatchEvent, event_name: &str);
-    async fn handle_pv_event(&self, event: &WatchEvent, event_name: &str);
+    async fn handle_pvc_event(&self, event: &PodWatchEvent, event_name: &str);
+    async fn handle_pv_event(&self, event: &PodWatchEvent, event_name: &str);
 }
 
 /// Leader-scoped handler that reconciles PersistentVolumeClaim binding against
@@ -44,7 +44,7 @@ impl DatastorePersistentVolumeEventHandler {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
-    async fn handle_pvc_event(&self, event: &WatchEvent, event_name: &str) {
+    async fn handle_pvc_event(&self, event: &PodWatchEvent, event_name: &str) {
         // Re-check the live leadership authority for this event. Never cache
         // the result: a leadership transition between two events must be
         // honored without restart.
@@ -57,7 +57,7 @@ impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
         handle_pvc_event(&self.file_process, self.db.as_ref(), event, event_name).await;
     }
 
-    async fn handle_pv_event(&self, event: &WatchEvent, event_name: &str) {
+    async fn handle_pv_event(&self, event: &PodWatchEvent, event_name: &str) {
         // Re-check the live leadership authority for this event. Never cache
         // the result: a leadership transition between two events must be
         // honored without restart.
@@ -91,8 +91,8 @@ impl Default for NoopPersistentVolumeEventHandler {
 
 #[async_trait::async_trait]
 impl PersistentVolumeEventHandler for NoopPersistentVolumeEventHandler {
-    async fn handle_pvc_event(&self, _event: &WatchEvent, _event_name: &str) {}
-    async fn handle_pv_event(&self, _event: &WatchEvent, _event_name: &str) {}
+    async fn handle_pvc_event(&self, _event: &PodWatchEvent, _event_name: &str) {}
+    async fn handle_pv_event(&self, _event: &PodWatchEvent, _event_name: &str) {}
 }
 
 /// Handle PersistentVolumeClaim ADDED/MODIFIED events
@@ -100,16 +100,16 @@ impl PersistentVolumeEventHandler for NoopPersistentVolumeEventHandler {
 pub async fn handle_pvc_event(
     file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
-    event: &WatchEvent,
+    event: &PodWatchEvent,
     event_name: &str,
 ) {
-    if event.event_type != EventType::Added && event.event_type != EventType::Modified {
+    if event.event_type != WatchEventType::Added && event.event_type != WatchEventType::Modified {
         return;
     }
 
     tracing::info!(
         "Resource watcher received {} event for PVC {}",
-        event.event_type,
+        event.event_type.as_str(),
         event_name
     );
 
@@ -152,10 +152,10 @@ pub async fn handle_pvc_event(
 pub async fn handle_pv_event(
     file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
-    event: &WatchEvent,
+    event: &PodWatchEvent,
     event_name: &str,
 ) {
-    if event.event_type != EventType::Added {
+    if event.event_type != WatchEventType::Added {
         return;
     }
 
@@ -272,7 +272,7 @@ mod tests {
 
         // While not leader, a PVC event must not originate a binding write.
         handler
-            .handle_pvc_event(&WatchEvent::added((*pvc.data).clone()), "test-pvc")
+            .handle_pvc_event(&PodWatchEvent::added((*pvc.data).clone()), "test-pvc")
             .await;
         let pvc_after = db
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")
@@ -290,7 +290,7 @@ mod tests {
         // After a live leadership transition, the same handler reconciles.
         leader_tx.send(true).unwrap();
         handler
-            .handle_pvc_event(&WatchEvent::added((*pvc.data).clone()), "test-pvc")
+            .handle_pvc_event(&PodWatchEvent::added((*pvc.data).clone()), "test-pvc")
             .await;
         let pvc_bound = db
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")
@@ -317,7 +317,7 @@ mod tests {
         );
 
         handler
-            .handle_pv_event(&WatchEvent::added((*pv.data).clone()), "test-pv")
+            .handle_pv_event(&PodWatchEvent::added((*pv.data).clone()), "test-pv")
             .await;
 
         let pvc_after = db
@@ -410,7 +410,7 @@ mod tests {
             crate::kubelet::file_blocking::test_file_process_executor(),
         );
         handler
-            .handle_pv_event(&WatchEvent::added((*small_pv.data).clone()), "small-pv")
+            .handle_pv_event(&PodWatchEvent::added((*small_pv.data).clone()), "small-pv")
             .await;
 
         let pvc_after = db
@@ -433,10 +433,10 @@ mod tests {
         let (db, pv, pvc) = seed_matching_pv_and_pvc().await;
         let handler = NoopPersistentVolumeEventHandler::new();
         handler
-            .handle_pv_event(&WatchEvent::added((*pv.data).clone()), "test-pv")
+            .handle_pv_event(&PodWatchEvent::added((*pv.data).clone()), "test-pv")
             .await;
         handler
-            .handle_pvc_event(&WatchEvent::added((*pvc.data).clone()), "test-pvc")
+            .handle_pvc_event(&PodWatchEvent::added((*pvc.data).clone()), "test-pvc")
             .await;
         let pvc_after = db
             .get_resource("v1", "PersistentVolumeClaim", Some("default"), "test-pvc")

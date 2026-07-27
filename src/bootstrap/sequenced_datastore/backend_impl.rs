@@ -13,6 +13,8 @@ use serde_json::Value;
 #[cfg(test)]
 use tokio::sync::broadcast;
 
+#[cfg(test)]
+use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::errors::DatastoreError;
 use crate::datastore::types::{
@@ -22,7 +24,6 @@ use crate::datastore::types::{
 };
 #[cfg(test)]
 use crate::datastore::types::{PendingWatchEvent, ReplicatedCreateOptions};
-use crate::datastore::{WatchSignalReceiver, WatchTopic};
 
 use super::SequencedDatastore;
 #[cfg(test)]
@@ -56,6 +57,14 @@ fn reject_application_committed_apply<T>(operation: &'static str) -> Result<T> {
     ))
 }
 
+impl crate::datastore::CommitObservationStore for SequencedDatastore {
+    fn commit_observation_sink(
+        &self,
+    ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
+        self.passive.commit_observation_sink()
+    }
+}
+
 #[async_trait]
 impl DatastoreBackend for SequencedDatastore {
     async fn read_durable_allocator_observation(
@@ -79,14 +88,6 @@ impl DatastoreBackend for SequencedDatastore {
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
         self.passive.acquire_snapshot_mutation_fence().await
-    }
-
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> WatchSignalReceiver {
-        if true {
-            self.passive.subscribe_watch_signals(topic)
-        } else {
-            WatchSignalReceiver::closed()
-        }
     }
 
     #[cfg(test)]

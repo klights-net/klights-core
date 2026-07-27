@@ -26,7 +26,7 @@ use crate::bootstrap::sequenced_datastore::WriteRejection;
 use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
-use crate::controller_dispatcher::ControllerDispatcher;
+use crate::controllers::ControllerDispatcher;
 use crate::datastore::cluster_store_adapter::{
     DatastoreClusterResourceRead, DatastoreDurableAllocatorRead, DatastoreDurableWatchHistory,
 };
@@ -533,7 +533,7 @@ struct DatastoreWatchSignals {
 
 impl klights_watch::WatchSignalSubscribe for DatastoreWatchSignals {
     fn subscribe(&self, topic: klights_watch::WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.db.subscribe_watch_signals(topic)
+        crate::watch_commit_observation_adapter::subscribe(&self.db, topic)
     }
 }
 
@@ -1322,6 +1322,19 @@ impl LocalApiClient {
             .await?;
         if let Some(command) = outcome.command.as_ref() {
             let controller_dispatcher = self.controller_dispatcher.get();
+            #[cfg(not(test))]
+            let gc_pod_delete_sink =
+                if matches!(
+                    command,
+                    StorageCommand::DeleteResource { api_version, kind, .. }
+                        if api_version == "v1" && kind == "Pod"
+                ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
+                {
+                    controller_dispatcher.map(|dispatcher| dispatcher.pod_delete_sink())
+                } else {
+                    None
+                };
+            #[cfg(test)]
             let gc_pod_delete_sink =
                 if matches!(
                     command,
@@ -1330,7 +1343,11 @@ impl LocalApiClient {
                 ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
                 {
                     match controller_dispatcher {
-                        Some(dispatcher) => dispatcher.current_pod_repository().await,
+                        Some(dispatcher) => {
+                            dispatcher.current_pod_repository().await.map(|repository| {
+                                repository as Arc<dyn klights_reconcile_api::GcPodDeleteSink>
+                            })
+                        }
                         None => None,
                     }
                 } else {
@@ -1344,9 +1361,10 @@ impl LocalApiClient {
                     service: controller_dispatcher.map(|dispatcher| {
                         dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
                     }),
-                    pod_delete: gc_pod_delete_sink
-                        .as_deref()
-                        .map(|sink| sink as &dyn klights_reconcile_api::GcPodDeleteSink),
+                    #[cfg(not(test))]
+                    pod_delete: gc_pod_delete_sink,
+                    #[cfg(test)]
+                    pod_delete: gc_pod_delete_sink.as_deref(),
                     non_pod_finalization: self.non_pod_finalization.get().map(Arc::as_ref),
                 },
                 command,
@@ -1472,7 +1490,7 @@ mod inner_gate_tests {
             "worker-1".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
-        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::default());
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::default());
         client.set_controller_dispatcher(dispatcher.clone());
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),

@@ -32,15 +32,16 @@ use tokio::sync::Mutex;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
+use klights_leader_api::{LeaderWatchError, ResourceEvent, WatchEventType, WatchStream};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::watch::{EventType, WatchCursorError, WatchEvent};
 use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
-#[async_trait::async_trait]
-pub trait CronJobWatch: Send {
-    async fn next_event(&mut self) -> std::result::Result<WatchEvent, WatchCursorError>;
+pub struct CronJobWatchSession {
+    pub initial_resources: Vec<klights_cluster_core::Resource>,
+    pub events: WatchStream,
 }
 
 #[async_trait::async_trait]
@@ -49,7 +50,7 @@ pub trait CronJobSchedulerRuntime: Send + Sync {
 
     async fn reconcile_cronjob(&self, resource: &klights_cluster_core::Resource) -> Result<()>;
 
-    async fn subscribe_watch(&self) -> Result<Box<dyn CronJobWatch>>;
+    async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError>;
 }
 
 /// Maximum delay we ever pass to `spawn_delay` for a single arm. Long
@@ -286,82 +287,79 @@ impl CronJobScheduler {
     /// `batch/v1`/`CronJob`, and arms / cancels timers in response.
     /// Runs until `cancel` fires.
     pub async fn run_watch_loop(self: Arc<Self>, cancel: CancellationToken) {
-        let mut watch = match self.runtime.subscribe_watch().await {
-            Ok(watch) => watch,
+        let mut session = match self.runtime.open_watch().await {
+            Ok(session) => session,
             Err(error) => {
                 tracing::warn!("cronjob_scheduler: watch subscribe failed: {error:#}");
                 return;
             }
         };
-        if let Err(e) = self.startup_walk().await {
-            tracing::warn!("cronjob_scheduler: startup walk after watch subscribe failed: {e:#}");
+        for resource in &session.initial_resources {
+            Arc::clone(&self).arm(&resource.data).await;
         }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                msg = watch.next_event() => {
+                msg = session.events.next() => {
                     match msg {
-                        Ok(event) => {
+                        Some(Ok(event)) => {
                             if !is_cronjob_event(&event) {
                                 continue;
                             }
                             self.handle_watch_event(event).await;
                         }
-                        Err(WatchCursorError::Expired) => {
+                        Some(Err(LeaderWatchError::ReplayExpired { .. })) => {
                             tracing::warn!(
                                 "cronjob_scheduler: replay window expired; \
                                  reconciling all CronJobs to recover state"
                             );
-                            if let Err(e) = self.startup_walk().await {
-                                tracing::warn!(
-                                    "cronjob_scheduler: re-walk after expired replay failed: {:#}",
-                                    e
-                                );
+                            match self.runtime.open_watch().await {
+                                Ok(reopened) => {
+                                    for resource in &reopened.initial_resources {
+                                        Arc::clone(&self).arm(&resource.data).await;
+                                    }
+                                    session = reopened;
+                                }
+                                Err(error) => {
+                                    tracing::warn!("cronjob_scheduler: reopen failed: {error:#}");
+                                    break;
+                                }
                             }
                         }
-                        Err(WatchCursorError::Replay(err)) => {
+                        Some(Err(err)) => {
                             tracing::warn!("cronjob_scheduler: watch replay failed: {err:#}");
                         }
-                        Err(WatchCursorError::Closed) => break,
+                        None => break,
                     }
                 }
             }
         }
     }
 
-    async fn handle_watch_event(self: &Arc<Self>, event: WatchEvent) {
+    async fn handle_watch_event(self: &Arc<Self>, event: ResourceEvent) {
         let uid_opt = event
-            .object
+            .resource()
+            .data
             .pointer("/metadata/uid")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        match event.event_type {
-            EventType::Deleted => {
+        match event.event_type() {
+            WatchEventType::Deleted => {
                 if let Some(uid) = uid_opt {
                     self.cancel(&uid).await;
                 }
             }
-            EventType::Added | EventType::Modified => {
+            WatchEventType::Added | WatchEventType::Modified => {
                 // arm() handles uid extraction + suspension + deletionTimestamp.
-                Arc::clone(self).arm(&event.object).await;
+                Arc::clone(self).arm(&event.resource().data).await;
             }
-            EventType::Bookmark | EventType::Error => {}
+            WatchEventType::Bookmark | WatchEventType::Error => {}
         }
     }
 }
 
-fn is_cronjob_event(event: &WatchEvent) -> bool {
-    let api = event
-        .object
-        .get("apiVersion")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let kind = event
-        .object
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    api == "batch/v1" && kind == "CronJob"
+fn is_cronjob_event(event: &ResourceEvent) -> bool {
+    event.resource().api_version == "batch/v1" && event.resource().kind == "CronJob"
 }
 
 /// Compute the next fire time for a CronJob given `now`.
@@ -403,6 +401,7 @@ pub fn compute_next_fire(cj: &Value, now: DateTime<Utc>) -> Result<Option<DateTi
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn cj(uid: &str, schedule: &str) -> Value {
         json!({
@@ -423,6 +422,63 @@ mod tests {
                 }
             }
         })
+    }
+
+    struct ReplayExpiryRuntime {
+        opens: AtomicUsize,
+        reopened: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl CronJobSchedulerRuntime for ReplayExpiryRuntime {
+        async fn list_cronjobs(&self) -> Result<Vec<klights_cluster_core::Resource>> {
+            Ok(Vec::new())
+        }
+
+        async fn reconcile_cronjob(
+            &self,
+            _resource: &klights_cluster_core::Resource,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError> {
+            let open = self.opens.fetch_add(1, Ordering::SeqCst);
+            let events = if open == 0 {
+                WatchStream::unpositioned_test_stream(futures::stream::once(async {
+                    Err(LeaderWatchError::ReplayExpired {
+                        accepted_resource_version: 7,
+                    })
+                }))
+            } else {
+                self.reopened.notify_one();
+                WatchStream::unpositioned_test_stream(futures::stream::pending())
+            };
+            Ok(CronJobWatchSession {
+                initial_resources: Vec::new(),
+                events,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn positioned_watch_replay_expiry_reopens_from_fresh_snapshot() {
+        let runtime = Arc::new(ReplayExpiryRuntime {
+            opens: AtomicUsize::new(0),
+            reopened: tokio::sync::Notify::new(),
+        });
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let scheduler = CronJobScheduler::new(runtime.clone(), supervisor);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(scheduler.run_watch_loop(cancel.clone()));
+
+        runtime.reopened.notified().await;
+        cancel.cancel();
+        task.await.unwrap();
+
+        assert_eq!(runtime.opens.load(Ordering::SeqCst), 2);
     }
 
     #[test]

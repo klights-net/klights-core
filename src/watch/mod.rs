@@ -8,6 +8,7 @@ mod raw_signal_cursor;
 mod replay;
 mod scope;
 mod selection;
+#[cfg(test)]
 mod selector_membership;
 mod signal_cursor;
 mod signal_replay_cursor_core;
@@ -28,9 +29,8 @@ pub use raw_signal_cursor::RawSignalWatchCursor;
 pub use replay::{WatchCursorError, WatchReplaySource};
 pub use scope::WatchDeliveryScope;
 pub use selection::WatchEventSelection;
-pub(crate) use selector_membership::SelectorMembership;
 #[cfg(test)]
-pub(crate) use selector_membership::{event_key, resource_key};
+pub(crate) use selector_membership::{SelectorMembership, event_key, resource_key};
 pub use signal_cursor::SignalWatchCursor;
 pub use window::WindowPolicy;
 

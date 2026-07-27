@@ -344,6 +344,39 @@ impl DbExecutor {
             }
         }
     }
+
+    /// Run a DB closure and then synchronously publish its post-commit payload
+    /// from a separately supervised async owner. Once admitted, cancellation
+    /// of the request future cannot strand a committed mutation before its
+    /// notification is published.
+    pub async fn call_raw_with_post_commit<T, P, F, C>(
+        &self,
+        query_name: &'static str,
+        f: F,
+        post_commit: C,
+    ) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        P: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<(T, P)> + Send + 'static,
+        C: FnOnce(P) + Send + 'static,
+    {
+        let executor = self.clone();
+        let supervisor = self.inner.task_supervisor.clone();
+        let handle = supervisor
+            .spawn_async(TaskCategory::Others, query_name, async move {
+                let (result, payload) = executor.call_raw(query_name, f).await?;
+                post_commit(payload);
+                Ok(result)
+            })
+            .await
+            .map_err(|error| {
+                tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(error.to_string())))
+            })?;
+        handle.join().await.map_err(|error| {
+            tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(error.to_string())))
+        })?
+    }
 }
 
 #[cfg(test)]

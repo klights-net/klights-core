@@ -391,12 +391,30 @@ pub struct RawWatchEvent {
 }
 
 impl RawWatchEvent {
-    pub fn topic(&self) -> klights_watch::WatchTopic {
-        klights_watch::WatchTopic::new(&self.api_version, &self.kind)
-    }
-
     pub fn key(&self) -> (Option<String>, String) {
         (self.namespace.clone(), self.name.clone())
+    }
+}
+
+/// Neutral post-commit notification emitted by persistence after a resource
+/// mutation is durable. Root composition owns delivery channels and watch
+/// signal projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitObservation {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: Option<String>,
+    pub resource_version: i64,
+}
+
+impl From<&PendingWatchEvent> for CommitObservation {
+    fn from(pending: &PendingWatchEvent) -> Self {
+        Self {
+            api_version: pending.api_version.clone(),
+            kind: pending.kind.clone(),
+            namespace: pending.namespace.clone(),
+            resource_version: pending.resource_version,
+        }
     }
 }
 

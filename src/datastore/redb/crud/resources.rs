@@ -9,25 +9,25 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+use crate::datastore::CommitObservationSink;
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::key_codec::{lex_next, resource_key, resource_prefix};
 use crate::datastore::redb::tables;
 use crate::datastore::sqlite::{create_pending_watch_event, publish_pending};
 use crate::datastore::types::*;
-use crate::watch::WatchBus;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
-    watch_bus: Arc<WatchBus>,
+    commit_sink: Arc<dyn CommitObservationSink>,
 }
 
 impl RedbResourceStore {
-    pub fn new(accessor: Arc<RedbAccessor>, watch_bus: Arc<WatchBus>) -> Self {
+    pub fn new(accessor: Arc<RedbAccessor>, commit_sink: Arc<dyn CommitObservationSink>) -> Self {
         Self {
             accessor,
-            watch_bus,
+            commit_sink,
         }
     }
 
@@ -38,6 +38,20 @@ impl RedbResourceStore {
         F: FnOnce(&::redb::Database) -> Result<T> + Send + 'static,
     {
         self.accessor.call(label, f).await
+    }
+
+    async fn db_call_with_observation<T, F>(&self, label: &str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&::redb::Database) -> Result<(T, Option<crate::datastore::PendingWatchEvent>)>
+            + Send
+            + 'static,
+    {
+        let (result, pending) = self.accessor.call(label, f).await?;
+        if let Some(pending) = pending {
+            publish_pending(pending, self.commit_sink.as_ref());
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -64,9 +78,8 @@ impl RedbResourceStore {
         let kind_res = kind_owned.clone();
         let ns_res = ns_owned.clone();
         let name_res = name_owned.clone();
-        let watch_bus = self.watch_bus.clone();
         let rv = self
-            .db_call("create_res", move |db| {
+            .db_call_with_observation("create_res", move |db| {
                 let res_tbl = if ns_owned.is_some() {
                     tables::RES_NS
                 } else {
@@ -100,8 +113,7 @@ impl RedbResourceStore {
                     Some(&body),
                 )?;
                 w.commit()?;
-                publish_pending(
-                    create_pending_watch_event(
+                let pending = create_pending_watch_event(
                         &av_owned,
                         &kind_owned,
                         ns_owned.as_deref(),
@@ -109,10 +121,8 @@ impl RedbResourceStore {
                         rv,
                         "ADDED",
                         data,
-                    ),
-                    &watch_bus,
-                );
-                Ok(rv)
+                    );
+                Ok((rv, Some(pending)))
             })
             .await?;
         Ok(Resource {
@@ -167,7 +177,7 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|value| value.to_string());
         let name_owned = name.to_string();
-        let watch_bus = self.watch_bus.clone();
+        let watch_bus = self.commit_sink.clone();
         let incoming_uid_for_db = incoming_uid.clone();
         let av_for_db = av_owned.clone();
         let kind_for_db = kind_owned.clone();
@@ -382,7 +392,7 @@ impl RedbResourceStore {
                         "ADDED",
                         (*data_for_return).clone(),
                     ),
-                    &watch_bus,
+                    watch_bus.as_ref(),
                 );
                 Ok(Resource {
                     id: 0,
@@ -406,7 +416,7 @@ impl RedbResourceStore {
                         "MODIFIED",
                         (*data_for_return).clone(),
                     ),
-                    &watch_bus,
+                    watch_bus.as_ref(),
                 );
                 Ok(Resource {
                     id: 0,
@@ -434,7 +444,7 @@ impl RedbResourceStore {
                         "DELETED",
                         old_object,
                     ),
-                    &watch_bus,
+                    watch_bus.as_ref(),
                 );
                 publish_pending(
                     create_pending_watch_event(
@@ -446,7 +456,7 @@ impl RedbResourceStore {
                         "ADDED",
                         (*data_for_return).clone(),
                     ),
-                    &watch_bus,
+                    watch_bus.as_ref(),
                 );
                 Ok(Resource {
                     id: 0,
@@ -534,15 +544,13 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|s| s.to_string());
         let name_owned = name.to_string();
-        let watch_bus = self.watch_bus.clone();
-        self.db_call("update_res", move |db: &::redb::Database| {
+        self.db_call_with_observation("update_res", move |db: &::redb::Database| {
             let mut data = data.clone();
             let key = key.clone();
             let av_o = av_owned.clone();
             let kind_o = kind_owned.clone();
             let ns_o = ns_owned.clone();
             let name_o = name_owned.clone();
-            let wbus = watch_bus.clone();
             let preconditions = preconditions.clone();
             let res_tbl = if ns_o.is_some() {
                 tables::RES_NS
@@ -596,7 +604,7 @@ impl RedbResourceStore {
                     },
                 );
                 w.commit()?;
-                return Ok(Resource {
+                return Ok((Resource {
                     id: 0,
                     api_version: av_o,
                     kind: kind_o,
@@ -605,7 +613,7 @@ impl RedbResourceStore {
                     uid,
                     resource_version: cur_rv,
                     data: Arc::new(current),
-                });
+                }, None));
             }
 
             let rv = helpers::incr_rv(&w)?;
@@ -629,8 +637,7 @@ impl RedbResourceStore {
                 Some(&body),
             )?;
             w.commit()?;
-            publish_pending(
-                create_pending_watch_event(
+            let pending = create_pending_watch_event(
                     &av_o,
                     &kind_o,
                     ns_o.as_deref(),
@@ -638,10 +645,8 @@ impl RedbResourceStore {
                     rv,
                     "MODIFIED",
                     data.clone(),
-                ),
-                &wbus,
-            );
-            Ok(Resource {
+                );
+            Ok((Resource {
                 id: 0,
                 api_version: av_o,
                 kind: kind_o,
@@ -650,7 +655,7 @@ impl RedbResourceStore {
                 uid: Resource::uid_from_data(&data),
                 resource_version: rv,
                 data: Arc::new(data),
-            })
+            }, Some(pending)))
         })
         .await
     }
@@ -667,8 +672,7 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|s| s.to_string());
         let name_owned = name.to_string();
-        let watch_bus = self.watch_bus.clone();
-        self.db_call("delete_res", move |db| {
+        self.db_call_with_observation("delete_res", move |db| {
             let res_tbl = if ns_owned.is_some() {
                 tables::RES_NS
             } else {
@@ -679,7 +683,7 @@ impl RedbResourceStore {
                 let table = w.open_table(res_tbl)?;
                 let guard = table.get(key.as_slice())?;
                 match guard {
-                    None => return Ok(()),
+                    None => return Ok(((), None)),
                     Some(g) => g.value().1.to_vec(),
                 }
             };
@@ -705,8 +709,7 @@ impl RedbResourceStore {
                 None,
             )?;
             w.commit()?;
-            publish_pending(
-                create_pending_watch_event(
+            let pending = create_pending_watch_event(
                     &av_owned,
                     &kind_owned,
                     ns_owned.as_deref(),
@@ -714,10 +717,8 @@ impl RedbResourceStore {
                     rv,
                     "DELETED",
                     data,
-                ),
-                &watch_bus,
-            );
-            Ok(())
+                );
+            Ok(((), Some(pending)))
         })
         .await
     }
@@ -736,7 +737,6 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|s| s.to_string());
         let name_owned = name.to_string();
-        let watch_bus = self.watch_bus.clone();
         let av_error = av_owned.clone();
         let kind_error = kind_owned.clone();
         let ns_error = ns_owned.clone();
@@ -747,7 +747,7 @@ impl RedbResourceStore {
         let name_event = name_owned.clone();
 
         let (resource_version, data, uid) = self
-            .db_call("delete_res_with_tombstone", move |db| {
+            .db_call_with_observation("delete_res_with_tombstone", move |db| {
                 let res_tbl = if ns_error.is_some() {
                     tables::RES_NS
                 } else {
@@ -819,8 +819,7 @@ impl RedbResourceStore {
                     None,
                 )?;
                 w.commit()?;
-                publish_pending(
-                    create_pending_watch_event(
+                let pending = create_pending_watch_event(
                         &av_event,
                         &kind_event,
                         ns_event.as_deref(),
@@ -828,10 +827,8 @@ impl RedbResourceStore {
                         rv,
                         "DELETED",
                         watch_data,
-                    ),
-                    &watch_bus,
-                );
-                Ok::<_, anyhow::Error>((rv, Arc::new(data), resource_uid))
+                    );
+                Ok::<_, anyhow::Error>(((rv, Arc::new(data), resource_uid), Some(pending)))
             })
             .await?;
 
@@ -1211,13 +1208,11 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let name_owned = name.to_string();
         let ns_owned = ns.map(|s| s.to_string());
-        let watch_bus = self.watch_bus.clone();
-        self.db_call("update_status_only", move |db: &::redb::Database| {
+        self.db_call_with_observation("update_status_only", move |db: &::redb::Database| {
             let av_o = av_owned.clone();
             let kind_o = kind_owned.clone();
             let name_o = name_owned.clone();
             let ns_o = ns_owned.clone();
-            let wbus = watch_bus.clone();
             let status_c = status.clone();
             let er = expected_rv;
             let av: &str = &av_o;
@@ -1262,7 +1257,7 @@ impl RedbResourceStore {
                     },
                 );
                 w.commit()?;
-                return Ok(Resource {
+                return Ok((Resource {
                     id: 0,
                     api_version: av.into(),
                     kind: kind.into(),
@@ -1271,7 +1266,7 @@ impl RedbResourceStore {
                     uid,
                     resource_version: cur_rv,
                     data: Arc::new(current),
-                });
+                }, None));
             }
             if let Some(obj) = current.as_object_mut() {
                 obj.insert("status".to_string(), status_c);
@@ -1289,8 +1284,7 @@ impl RedbResourceStore {
             let ev = serde_json::json!({"apiVersion":av,"kind":kind,"namespace":ns,"name":name,"eventType":"MODIFIED","data":current});
             helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            publish_pending(
-                create_pending_watch_event(
+            let pending = create_pending_watch_event(
                     av,
                     kind,
                     ns,
@@ -1298,10 +1292,8 @@ impl RedbResourceStore {
                     rv,
                     "MODIFIED",
                     current.clone(),
-                ),
-                &wbus,
-            );
-            Ok(Resource {
+                );
+            Ok((Resource {
                 id: 0,
                 api_version: av.into(),
                 kind: kind.into(),
@@ -1310,7 +1302,7 @@ impl RedbResourceStore {
                 uid: Resource::uid_from_data(&current),
                 resource_version: rv,
                 data: Arc::new(current),
-            })
+            }, Some(pending)))
         })
         .await
     }
@@ -1331,8 +1323,7 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let name_owned = name.to_string();
         let ns_owned = ns.map(|s| s.to_string());
-        let watch_bus = self.watch_bus.clone();
-        self.db_call("patch", move |db| {
+        self.db_call_with_observation("patch", move |db| {
             let av: &str = &av_owned;
             let kind: &str = &kind_owned;
             let name: &str = &name_owned;
@@ -1347,7 +1338,7 @@ impl RedbResourceStore {
             let (old_body, current) = {
                 let tbl = w.open_table(res_tbl)?;
                 match tbl.get(key.as_slice())? {
-                    None => return Ok(None),
+                    None => return Ok((None, None)),
                     Some(g) => {
                         let (rv, body) = g.value();
                         (Some(body.to_vec()), (rv, body.to_vec()))
@@ -1378,7 +1369,7 @@ impl RedbResourceStore {
                     },
                 );
                 w.commit()?;
-                return Ok(Some(Resource {
+                return Ok((Some(Resource {
                     id: 0,
                     api_version: av.into(),
                     kind: kind.into(),
@@ -1387,7 +1378,7 @@ impl RedbResourceStore {
                     uid,
                     resource_version: current.0 as i64,
                     data: Arc::new(before_patch),
-                }));
+                }), None));
             }
             let new_body = serde_json::to_vec(&current_data)?;
             helpers::update_owner_table(
@@ -1411,8 +1402,7 @@ impl RedbResourceStore {
             let ev = serde_json::json!({"apiVersion":av,"kind":kind,"namespace":ns,"name":name,"eventType":"MODIFIED","data":current_data});
             helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            publish_pending(
-                create_pending_watch_event(
+            let pending = create_pending_watch_event(
                     av,
                     kind,
                     ns,
@@ -1420,10 +1410,8 @@ impl RedbResourceStore {
                     rv,
                     "MODIFIED",
                     current_data.clone(),
-                ),
-                &watch_bus,
-            );
-            Ok(Some(Resource {
+                );
+            Ok((Some(Resource {
                 id: 0,
                 api_version: av.into(),
                 kind: kind.into(),
@@ -1432,7 +1420,7 @@ impl RedbResourceStore {
                 uid: Resource::uid_from_data(&current_data),
                 resource_version: rv,
                 data: Arc::new(current_data),
-            }))
+            }), Some(pending)))
         })
         .await
     }
@@ -1521,7 +1509,10 @@ mod tests {
         let db = open_boundary::open_in_memory_blocking().unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        RedbResourceStore::new(accessor, Arc::new(WatchBus::new(256)))
+        RedbResourceStore::new(
+            accessor,
+            crate::watch_commit_observation_adapter::new_sink(),
+        )
     }
 
     // ── tests of code paths NOT covered by cross_backend_tests.rs ──
@@ -1648,9 +1639,12 @@ mod tests {
         let db = open_boundary::open_in_memory_blocking().unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        let watch_bus = Arc::new(WatchBus::new(256));
-        let mut watch_rx = watch_bus.subscribe(klights_watch::WatchTopic::new("v1", "Pod"));
-        let s = RedbResourceStore::new(accessor, watch_bus);
+        let watch_sink = crate::watch_commit_observation_adapter::new_sink();
+        let mut watch_rx = crate::watch_commit_observation_adapter::subscribe_test_events(
+            watch_sink.as_ref(),
+            klights_watch::WatchTopic::new("v1", "Pod"),
+        );
+        let s = RedbResourceStore::new(accessor, watch_sink);
 
         let pod =
             json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"we","namespace":"default"}});

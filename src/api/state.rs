@@ -124,7 +124,7 @@ pub(crate) struct ApiControllerReconcileServices {
     #[cfg(not(test))]
     pub(crate) controller_dispatcher: Arc<dyn klights_reconcile_api::ControllerDispatcherPort>,
     #[cfg(test)]
-    pub(crate) controller_dispatcher: Arc<crate::controller_dispatcher::ControllerDispatcher>,
+    pub(crate) controller_dispatcher: Arc<crate::controllers::ControllerDispatcher>,
     #[cfg(not(test))]
     pub(crate) metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
     #[cfg(test)]
@@ -144,7 +144,7 @@ impl ApiControllerReconcileServices {
         #[cfg(not(test))] controller_dispatcher: Arc<
             dyn klights_reconcile_api::ControllerDispatcherPort,
         >,
-        #[cfg(test)] controller_dispatcher: Arc<crate::controller_dispatcher::ControllerDispatcher>,
+        #[cfg(test)] controller_dispatcher: Arc<crate::controllers::ControllerDispatcher>,
         #[cfg(not(test))] metrics: Arc<dyn crate::api::state_ports::ApiFailureMetrics>,
         #[cfg(test)] metrics: Arc<crate::side_effects::SideEffectMetrics>,
         #[cfg(not(test))] node_lease_tracker: Arc<

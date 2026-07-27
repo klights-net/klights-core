@@ -1,6 +1,6 @@
 //! `Controller` impl for `ReplicationController`. Registered in `ControllerDispatcher`.
 
-use crate::controller::controller_wrapper;
+use crate::controllers::controller_wrapper;
 use crate::controllers::replicationcontroller as rc_core;
 
 controller_wrapper!(
@@ -8,13 +8,16 @@ controller_wrapper!(
     "replicationcontroller",
     rc_core::reconcile_replicationcontroller,
     with_node,
-    with_pod_repository
+    with_pod_repository,
+    store = replicationcontroller_store,
+    reader = query,
+    mutation = replicationcontroller_mutation
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::Controller;
+    use crate::controllers::Controller;
     use serde_json::json;
 
     #[test]

@@ -12,6 +12,7 @@ pub mod daemonset_controller;
 pub mod default_rbac_policy;
 pub mod deployment;
 pub mod deployment_controller;
+mod dispatcher;
 pub mod endpoints;
 pub mod endpoints_controller;
 pub mod gc;
@@ -24,6 +25,7 @@ pub mod node_lifecycle;
 pub mod node_subnet;
 pub mod pdb;
 pub mod pdb_controller;
+mod ports;
 pub mod pvc;
 pub mod pvc_controller;
 pub mod rbac_reconcile;
@@ -33,6 +35,7 @@ pub mod replication_controller_runner;
 pub mod replicationcontroller;
 pub(crate) mod resource_projection;
 pub mod resource_quota;
+mod runtime;
 pub mod scheduler;
 pub mod service;
 pub mod service_controller;
@@ -41,6 +44,14 @@ pub mod statefulset_controller;
 #[cfg(test)]
 pub mod test_utils;
 pub mod workqueue;
+
+pub(crate) use dispatcher::ControllerDispatcher;
+pub(crate) use ports::{
+    ControllerEffectPort, ControllerLeaderPort, ControllerNetworkPort, ControllerPodPort,
+    ControllerReconcilePort, ControllerRuntimeDependencies, DeploymentControllerPodMutation,
+    DeploymentControllerPodReader,
+};
+pub(crate) use runtime::{Context, Controller, controller_wrapper};
 
 #[cfg(test)]
 use crate::datastore::DatastoreBackend;

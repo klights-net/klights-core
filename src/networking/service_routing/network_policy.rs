@@ -51,16 +51,17 @@ pub struct NetworkPolicyPortMatch {
 }
 
 impl NetworkPolicyPlan {
-    pub fn from_resources(
-        policies: &[Value],
-        pods: &[Value],
-        namespaces: &[Value],
+    pub fn from_resources<T: std::borrow::Borrow<Value>>(
+        policies: &[T],
+        pods: &[T],
+        namespaces: &[T],
     ) -> Result<Self> {
         let pod_infos = pod_infos_from_resources(pods);
         let namespace_labels = namespace_labels_from_resources(namespaces);
         let mut plan = Self::default();
 
         for policy in policies {
+            let policy = policy.borrow();
             let Some(spec) = policy.get("spec") else {
                 continue;
             };
@@ -154,9 +155,10 @@ fn policy_types_for(spec: &Value) -> PolicyTypes {
     }
 }
 
-fn pod_infos_from_resources(pods: &[Value]) -> Vec<PodInfo> {
+fn pod_infos_from_resources<T: std::borrow::Borrow<Value>>(pods: &[T]) -> Vec<PodInfo> {
     pods.iter()
         .filter_map(|pod| {
+            let pod = pod.borrow();
             let namespace = pod.pointer("/metadata/namespace")?.as_str()?.to_string();
             let ip = pod.pointer("/status/podIP")?.as_str()?.parse().ok()?;
             Some(PodInfo {
@@ -206,12 +208,13 @@ fn named_ports_from_pod(pod: &Value) -> BTreeMap<(String, Protocol), u16> {
     out
 }
 
-fn namespace_labels_from_resources(
-    namespaces: &[Value],
+fn namespace_labels_from_resources<T: std::borrow::Borrow<Value>>(
+    namespaces: &[T],
 ) -> BTreeMap<String, Option<serde_json::Map<String, Value>>> {
     namespaces
         .iter()
         .filter_map(|namespace| {
+            let namespace = namespace.borrow();
             let name = namespace.pointer("/metadata/name")?.as_str()?.to_string();
             let labels = namespace
                 .pointer("/metadata/labels")

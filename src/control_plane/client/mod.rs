@@ -12,7 +12,7 @@ use klights_leader_api::{
     LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
     LeaderProjectedServiceAccountToken, LeaderResourceQuery, LeaderWatch, LeaderWatchError,
     NetworkDataplane, NetworkNodeMode, NetworkTopologyError, ResourceEvent, ResourceListRequest,
-    ResourceListResult, ResourceQueryError, WatchEventType, WatchRequest,
+    ResourceListResult, ResourceQueryError, WatchEventType,
 };
 use std::sync::Arc;
 
@@ -201,23 +201,6 @@ pub(crate) fn legacy_list_response(result: ResourceListResult) -> ResourceList {
         continue_token,
         remaining_item_count,
     }
-}
-
-pub(crate) fn watch_request_matches_event(req: &WatchRequest, event: &WatchEvent) -> bool {
-    crate::watch::WatchEventSelection::new(req.api_version(), req.kind())
-        .namespace(req.namespace())
-        .label_selector(req.label_selector())
-        .field_selector(req.field_selector())
-        .matches(event)
-}
-
-pub(crate) fn watch_request_has_selector(req: &WatchRequest) -> bool {
-    selectors_present(req.label_selector(), req.field_selector())
-}
-
-pub(crate) fn selectors_present(label: Option<&str>, field: Option<&str>) -> bool {
-    label.is_some_and(|selector| !selector.trim().is_empty())
-        || field.is_some_and(|selector| !selector.trim().is_empty())
 }
 
 pub(crate) fn legacy_watch_event(event: &ResourceEvent) -> WatchEvent {
@@ -1064,11 +1047,9 @@ mod tests {
         client.set_non_pod_finalization(Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
-        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
-            Arc::new(crate::controllers::service::ServiceIpam::new(
-                "10.43.128.0/17",
-            )),
-        ));
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
+            crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+        )));
         dispatcher
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;
@@ -1169,11 +1150,9 @@ mod tests {
         client.set_non_pod_finalization(Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));
-        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
-            Arc::new(crate::controllers::service::ServiceIpam::new(
-                "10.43.128.0/17",
-            )),
-        ));
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
+            crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+        )));
         dispatcher
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;

@@ -66,6 +66,7 @@ mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
 mod validation;
+mod watch_event;
 #[cfg(test)]
 mod watch_session;
 pub(crate) mod watch_stream;
@@ -74,7 +75,7 @@ pub(crate) mod watch_stream;
 mod defaulting_tests;
 
 #[cfg(test)]
-pub use crate::watch::EventType;
+pub(crate) use crate::api::watch_event::EventType;
 pub(in crate::api) use apiservice_proxy::proxy_apiservice_request;
 use crd_conversion::{
     convert_crd_objects_to_requested_version,
@@ -271,15 +272,16 @@ use crate::api::status::{
     update_validatingadmissionpolicybinding_status, update_validatingwebhookconfiguration_status,
     update_volumeattachment_status,
 };
+use crate::api::watch_event::WatchEvent;
 #[cfg(test)]
 use crate::controllers;
 #[cfg(test)]
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-#[cfg(test)]
 use crate::datastore::{CatchUpResource, WatchTarget};
 #[cfg(test)]
+use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
+#[cfg(test)]
+#[cfg(test)]
 use crate::watch::WatchCursorError;
-use crate::watch::WatchEvent;
 use klights_cluster_core::Resource;
 use klights_types::LabelSelector;
 

@@ -46,9 +46,9 @@ pub async fn ensure_namespace(db: &dyn DatastoreBackend, name: &str) {
 
 /// Construct a controller `Context` over an in-memory `Datastore`.
 /// `node_name` defaults to `"test-node"`.
-pub fn test_context(db: &Datastore) -> crate::controller::Context {
+pub(crate) fn test_context(db: &Datastore) -> crate::controllers::Context {
     let db_handle = Arc::new(db.clone()) as DatastoreHandle;
-    crate::controller::Context::new(db_handle.clone(), "test-node".to_string())
+    crate::controllers::Context::new(db_handle.clone(), "test-node".to_string())
         .with_non_pod_finalization(Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle),
         ))

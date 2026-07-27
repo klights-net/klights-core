@@ -35,7 +35,7 @@ pub(crate) async fn build_test_app_state_with_db(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
     let controller_dispatcher = Arc::new(
-        crate::controller_dispatcher::ControllerDispatcher::with_task_supervisor(
+        crate::controllers::ControllerDispatcher::with_task_supervisor(
             service_ipam.clone(),
             task_supervisor.clone(),
         ),

@@ -27,7 +27,7 @@ pub struct BootstrapPhase {
     pub node_subnet_watch_handle: SupervisedJoinHandle<()>,
     pub node_lifecycle_handle: Option<SupervisedJoinHandle<()>>,
     pub scheduler_controller_handle: Option<SupervisedJoinHandle<()>>,
-    pub dispatcher_for_worker: Arc<crate::controller_dispatcher::ControllerDispatcher>,
+    pub dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
     pub app: axum::Router,
 }
 
@@ -323,7 +323,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         is_leader_tx,
         is_leader_rx,
     } = args;
-    use crate::{api, controller_dispatcher, controllers, kubelet};
+    use crate::{api, controllers, kubelet};
 
     // T2 step 2: leader-capable nodes gate one-time init on lease
     // acquisition. For a seed boot the raft node is already leader by
@@ -433,15 +433,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         }
     };
 
-    let controller_dispatcher = Arc::new(
-        controller_dispatcher::ControllerDispatcher::new_with_nodeport(
-            service_ipam.clone(),
-            nodeport_alloc.clone(),
-            supervisor.clone(),
-            csr_issuer,
-        ),
-    );
-    controller_dispatcher.set_services(services.clone()).await;
     let metrics_provider: Arc<dyn crate::metrics::MetricsProvider> =
         Arc::new(crate::metrics::OnDemandMetricsProvider::new(
             config.node_name.clone(),
@@ -451,9 +442,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 .map(|service| service as Arc<dyn klights_node_api::NodeMetrics>),
             supervisor.clone(),
         ));
-    controller_dispatcher
-        .set_metrics_provider(metrics_provider.clone())
-        .await;
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
@@ -462,11 +450,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Some(supervisor.clone()),
         Some(db_handle.clone()),
     ));
-    side_effects.set_controller_dispatcher(controller_dispatcher.clone());
-    local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
-    local_api_client.set_non_pod_finalization(Arc::new(
+    let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
-    ));
+    );
+    local_api_client.set_non_pod_finalization(non_pod_finalization.clone());
 
     let scheduling_mode = if has_leader_election {
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader
@@ -646,6 +633,47 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     } else {
         pod_repository.clone()
     };
+    let controller_dependencies = crate::controllers::ControllerRuntimeDependencies {
+        leader: Arc::new(
+            crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
+        ),
+        pods: Arc::new(
+            crate::controller_runtime_adapter::RootControllerPodPort::new(
+                api_pod_repository.clone(),
+            ),
+        ),
+        reconcile: Arc::new(
+            crate::controller_runtime_adapter::RootControllerReconcilePort::new(
+                non_pod_finalization.clone(),
+            ),
+        ),
+        network: Arc::new(
+            crate::controller_runtime_adapter::RootControllerNetworkPort::new(services.clone()),
+        ),
+        effects: Arc::new(
+            crate::controller_runtime_adapter::RootControllerEffectPort::new(
+                klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+            ),
+        ),
+        node_name: Arc::from(config.node_name.as_str()),
+    };
+    let hpa_controller = Arc::new(crate::hpa_controller_adapter::HpaController::new(
+        db_handle.clone(),
+        api_pod_repository.clone(),
+        non_pod_finalization,
+        Arc::from(config.node_name.as_str()),
+        metrics_provider.clone(),
+    ));
+    let controller_dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new_complete(
+        service_ipam.clone(),
+        nodeport_alloc.clone(),
+        supervisor.clone(),
+        csr_issuer,
+        hpa_controller,
+        controller_dependencies,
+    ));
+    side_effects.set_controller_dispatcher(controller_dispatcher.clone());
+    local_api_client.set_controller_dispatcher(controller_dispatcher.clone());
     let pod_start_retry_state: crate::kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
         tokio::sync::Mutex::new(crate::kubelet::pod_creation_state::PodStartRetryState::new()),
     );
@@ -907,9 +935,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             raft_leader_proxy.clone(),
         ),
     ));
-    controller_dispatcher
-        .set_pod_repository(api_pod_repository.clone())
-        .await;
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
         config.node_name.clone(),
@@ -1420,7 +1445,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 pod_lifecycle: node_lifecycle_pod_router,
                                 lease_observations: node_lifecycle_lease_tracker,
                                 supervisor: node_lifecycle_supervisor,
-                                node_status: node_lifecycle_status,
+                                node_status: node_lifecycle_status.clone(),
+                                watch: node_lifecycle_status,
                             },
                             cancel,
                             is_leader_rx,
@@ -1764,6 +1790,7 @@ mod tests {
             grpc,
             supervisor,
             "cp1".to_string(),
+            Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
         ))
     }
 

@@ -3,20 +3,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::controllers::crd::{CrdRegistryEventStream, CrdRegistryReader, CrdRegistryRuntime};
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreBackend, DatastoreHandle, WatchTarget};
-use crate::watch::{
-    SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
-};
-use klights_watch::WatchTopic;
+use crate::controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
+use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 
 struct LeaderCrdRegistryRuntime {
     db: DatastoreHandle,
-}
-
-struct LeaderCrdRegistryEventStream {
-    cursor: SignalWatchCursor<DatastoreWatchReplaySource>,
 }
 
 #[async_trait]
@@ -51,37 +43,40 @@ impl CrdRegistryReader for LeaderCrdRegistryRuntime {
 
 #[async_trait]
 impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
-    async fn subscribe_crd_events(&self) -> Result<Box<dyn CrdRegistryEventStream>> {
-        let topic = WatchTopic::new("apiextensions.k8s.io/v1", "CustomResourceDefinition");
-        let start_rv = self.db.get_current_resource_version().await?;
-        let cursor = SignalWatchCursor::new(
-            self.db.subscribe_watch_signals(topic.clone()),
-            DatastoreWatchReplaySource::new(
-                Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    self.db.clone(),
-                )),
-                vec![WatchTarget::cluster(
-                    "apiextensions.k8s.io/v1",
-                    "CustomResourceDefinition",
-                )],
-            ),
-            topic,
-            WatchDeliveryScope::Cluster,
-            start_rv,
-            WindowPolicy::default_watch_delivery(),
+    async fn open_crd_watch(
+        &self,
+    ) -> std::result::Result<CrdRegistryWatchSession, LeaderWatchError> {
+        let listing = self
+            .db
+            .list_resources(
+                "apiextensions.k8s.io/v1",
+                "CustomResourceDefinition",
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await
+            .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?;
+        let request = WatchRequest::try_new(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            None,
+            None,
+            Some(listing.resource_version),
+            listing.watch_replay_position,
+        )?;
+        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
+            self.db.clone(),
         );
-        Ok(Box::new(LeaderCrdRegistryEventStream { cursor }))
-    }
-}
-
-#[async_trait]
-impl CrdRegistryEventStream for LeaderCrdRegistryEventStream {
-    async fn prime_replay(&mut self) -> std::result::Result<(), WatchCursorError> {
-        self.cursor.prime_replay_or_expired().await.map(|_| ())
-    }
-
-    async fn next_event(&mut self) -> std::result::Result<WatchEvent, WatchCursorError> {
-        self.cursor.next_event().await
+        let events = positioned.watch_resources(request).await?;
+        Ok(CrdRegistryWatchSession {
+            initial_values: listing
+                .items
+                .into_iter()
+                .map(|resource| Arc::unwrap_or_clone(resource.data))
+                .collect(),
+            events,
+        })
     }
 }
 

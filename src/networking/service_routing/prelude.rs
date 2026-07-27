@@ -15,5 +15,5 @@ pub use tokio_util::sync::CancellationToken;
 
 pub use crate::networking::netfilter::JhashExpr;
 pub use crate::networking::netfilter::{Batch, Netfilter};
-pub use klights_leader_api::{LeaderResourceQuery, LeaderWatch};
+pub use klights_leader_api::LeaderWatch;
 pub(crate) use klights_types::{ClusterCidr, PodSubnet};

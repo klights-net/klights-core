@@ -298,6 +298,7 @@ fn merge_custom_resource_watch_baseline(
     resources
 }
 
+#[cfg(test)]
 fn crd_watch_topics(
     group: &str,
     kind: &str,
@@ -337,7 +338,7 @@ struct CrdWatchProjection {
     requested_api_version: String,
 }
 
-impl klights_watch::WatchResourceProjection for CrdWatchProjection {
+impl crate::api::custom_resource_ports::CustomResourceProjection for CrdWatchProjection {
     fn project_resources(
         &self,
         resources: Vec<klights_cluster_core::Resource>,
@@ -361,7 +362,9 @@ impl klights_watch::WatchResourceProjection for CrdWatchProjection {
                 .map_err(|error| {
                     klights_leader_api::LeaderWatchError::unavailable(format!("{error:?}"))
                 })?;
-                projected.push(klights_cluster_core::Resource::from_watch_event_ref(&event));
+                projected.push(klights_cluster_core::Resource::from_data_lossy(
+                    event.object.clone(),
+                ));
             }
             Ok(projected)
         })
@@ -793,6 +796,7 @@ async fn list_cr_inner(
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty());
 
+        #[cfg(test)]
         let watch_topics = crd_watch_topics(group, &kind, conversion.as_ref(), version);
         #[cfg(test)]
         let db = state.resource_mutation().db.clone();
@@ -808,7 +812,7 @@ async fn list_cr_inner(
                     watch_topics
                         .iter()
                         .cloned()
-                        .map(|topic| db.subscribe_watch_signals(topic))
+                        .map(|topic| crate::watch_commit_observation_adapter::subscribe(&db, topic))
                         .collect(),
                 )
             },
@@ -903,10 +907,6 @@ async fn list_cr_inner(
             .collect::<Vec<_>>();
 
         if canonical_crd_positioned_watch_enabled() {
-            let positioned_watch = state
-                .resource_mutation()
-                .custom_resource_reads
-                .positioned_watch_service();
             let projection = Arc::new(CrdWatchProjection {
                 resource_query: state.resource_mutation().resource_query.clone(),
                 conversion: conversion_for_watch.clone(),
@@ -917,7 +917,7 @@ async fn list_cr_inner(
             state
                 .resource_mutation()
                 .custom_resource_reads
-                .wait_until_fresh(requested_rv, klights_watch::WatchTopic::new(&av, &kind))
+                .wait_until_fresh(requested_rv, av.clone(), kind.clone())
                 .await;
             let emit_baseline = send_initial_events
                 || requested_rv <= 0
@@ -960,7 +960,7 @@ async fn list_cr_inner(
                 };
                 start_position = Some(position);
                 last_rv = last_rv.max(list.resource_version());
-                let projected = match klights_watch::WatchResourceProjection::project_resources(
+                let projected = match crate::api::custom_resource_ports::CustomResourceProjection::project_resources(
                     projection.as_ref(),
                     list.into_items(),
                 )
@@ -1034,33 +1034,11 @@ async fn list_cr_inner(
                     ));
                 }
             };
-            let plan = match state
+            let mut positioned_stream = match state
                 .resource_mutation()
                 .custom_resource_reads
-                .projected_watch_plan(
-                    request,
-                    custom_watch_targets,
-                    watch_topics,
-                    if is_cluster_scope {
-                        klights_watch::WatchResourceScope::Cluster
-                    } else {
-                        klights_watch::WatchResourceScope::Namespaced
-                    },
-                    projection,
-                ) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    return Ok(crd_watch_frame_response(
-                        stream_format,
-                        crate::api::watch_stream::serialize_watch_status_line(
-                            500,
-                            "InternalError",
-                            &error.to_string(),
-                        ),
-                    ));
-                }
-            };
-            let mut positioned_stream = match positioned_watch.watch_projected_resources(plan).await
+                .watch_projected_resources(request, custom_watch_targets, projection)
+                .await
             {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -1183,7 +1161,8 @@ async fn list_cr_inner(
                 crate::api::watch_stream::wait_until_datastore_fresh(
                     &db,
                     requested_rv,
-                    klights_watch::WatchTopic::new(&av, &kind),
+                    &av,
+                    &kind,
                     &task_supervisor,
                 )
                 .await;
@@ -1213,7 +1192,7 @@ async fn list_cr_inner(
                     }
                     let send_initial_snapshot_rv = list.resource_version.max(requested_rv);
                     for resource in merge_custom_resource_watch_baseline(list.items) {
-                        let event = CatchUpResource::added(resource).into_watch_event();
+                        let event = CatchUpResource::added(resource).into_watch_event().into();
                         let event = match convert_custom_resource_watch_event_to_requested_version(
                             resource_query.as_ref(),
                             conversion_for_watch.as_ref(),
@@ -1290,7 +1269,7 @@ async fn list_cr_inner(
                         session_bootstrap.set_replay_start_position(position);
                     }
                     for resource in merge_custom_resource_watch_baseline(baseline.items) {
-                            let event = CatchUpResource::added(resource).into_watch_event();
+                            let event = CatchUpResource::added(resource).into_watch_event().into();
                             let event = match convert_custom_resource_watch_event_to_requested_version(
                                 resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),
@@ -1389,7 +1368,7 @@ async fn list_cr_inner(
                             }
                         };
                     for resource in merge_custom_resource_watch_baseline(membership.items) {
-                            let event = CatchUpResource::added(resource).into_watch_event();
+                            let event = CatchUpResource::added(resource).into_watch_event().into();
                             let event = match convert_custom_resource_watch_event_to_requested_version(
                                 resource_query.as_ref(),
                                 conversion_for_watch.as_ref(),

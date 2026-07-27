@@ -1,13 +1,13 @@
-use anyhow::Result;
-
-use async_trait::async_trait;
-
-use crate::watch::{WatchEvent, WatchReplaySource};
-
 use std::sync::Arc;
 
-use super::{CatchUpResource, WatchReplayRead as StoreWatchReplayRead, WatchTarget};
-use crate::datastore::{PositionedWatchReplayRead as StorePositionedWatchReplayRead, WatchStore};
+use anyhow::Result;
+use async_trait::async_trait;
+
+use crate::datastore::{
+    CatchUpResource, PositionedWatchReplayRead as StorePositionedWatchReplayRead,
+    WatchReplayRead as StoreWatchReplayRead, WatchStore, WatchTarget,
+};
+use crate::watch::{WatchEvent, WatchReplaySource};
 
 pub struct DatastoreWatchReplaySource {
     watch_store: Arc<dyn WatchStore>,

@@ -15,7 +15,7 @@ use std::time::Instant;
 use tonic::{Request, Response, Status, metadata::MetadataMap};
 
 #[cfg(test)]
-use crate::controller_dispatcher::ControllerDispatcher;
+use crate::controllers::ControllerDispatcher;
 #[cfg(test)]
 use crate::datastore::WatchTarget;
 #[cfg(test)]
@@ -23,7 +23,7 @@ use crate::datastore::backend::DatastoreHandle;
 #[cfg(test)]
 use crate::datastore::backend::WatchReplayAnchorStore;
 #[cfg(test)]
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
+use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 #[cfg(test)]
 use crate::replication::grpc::watch_replay_expired_status;
 use crate::replication::grpc::{
@@ -1783,11 +1783,14 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             let (signal_rx, replay_position) = if let Some(position) = requested_position {
                 // Exact positioned continuations do not need to sample an anchor,
                 // but still install their wakeup edge before any later await.
-                (db.subscribe_watch_signals(topic.clone()), position)
+                (
+                    crate::watch_commit_observation_adapter::subscribe(&db, topic.clone()),
+                    position,
+                )
             } else {
                 subscribe_grpc_watch_handoff(
                     &watch_anchor,
-                    || db.subscribe_watch_signals(topic.clone()),
+                    || crate::watch_commit_observation_adapter::subscribe(&db, topic.clone()),
                     req.start_resource_version.unwrap_or(0),
                 )
                 .await?
@@ -2902,10 +2905,12 @@ fn pod_cleanup_intent_error_to_status(error: klights_leader_api::PodCleanupInten
     }
 }
 
+#[cfg(test)]
 fn resource_from_event(event: &crate::watch::WatchEvent) -> Resource {
     Resource::from_watch_event_ref(event)
 }
 
+#[cfg(test)]
 fn watch_event_type(event: &crate::watch::WatchEvent) -> &'static str {
     match event.event_type {
         crate::watch::EventType::Added => "ADDED",
@@ -2926,10 +2931,15 @@ fn watch_heartbeat_proto(
     last_rv: i64,
     resume_position: WatchReplayPosition,
 ) -> klights_internal_protobuf::WatchEvent {
-    let hb = crate::watch::WatchEvent::bookmark_typed(last_rv, api_version, kind);
-    let resource = resource_from_event(&hb);
+    let resource = Resource::from_data_lossy(Arc::new(serde_json::json!({
+        "apiVersion": api_version,
+        "kind": kind,
+        "metadata": {"resourceVersion": last_rv.to_string()}
+    })));
     klights_internal_protobuf::WatchEvent {
-        event_type: watch_event_type(&hb).to_string(),
+        event_type: klights_leader_api::WatchEventType::Bookmark
+            .as_str()
+            .to_string(),
         resource: Some(resource_to_proto(&resource)),
         resume_position: Some(watch_replay_position_to_proto(resume_position)),
     }
@@ -3649,7 +3659,8 @@ mod tests {
                     "namespace": "stale",
                     "name": "stale",
                     "uid": "uid-stale"
-                }
+                },
+                "status": {"phase": "Ready", "observedGeneration": 9}
             })),
         };
 
@@ -3662,6 +3673,8 @@ mod tests {
         assert_eq!(body["metadata"]["name"], "canonical");
         assert_eq!(body["metadata"]["uid"], "uid-canonical");
         assert_eq!(body["metadata"]["resourceVersion"], "42");
+        assert_eq!(body["status"]["phase"], "Ready");
+        assert_eq!(body["status"]["observedGeneration"], 9);
     }
 
     #[derive(Default)]
@@ -3924,14 +3937,14 @@ mod tests {
 
     async fn grpc_test_server_with_dispatcher(
         db: DatastoreHandle,
-        controller_dispatcher: Option<Arc<crate::controller_dispatcher::ControllerDispatcher>>,
+        controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
     ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
         grpc_test_server_full(db, controller_dispatcher, None).await
     }
 
     async fn grpc_test_server_full(
         db: DatastoreHandle,
-        controller_dispatcher: Option<Arc<crate::controller_dispatcher::ControllerDispatcher>>,
+        controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
         controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
     ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
         grpc_test_server_full_with_node_cert(
@@ -3952,7 +3965,7 @@ mod tests {
 
     async fn grpc_test_server_full_with_node_cert(
         db: DatastoreHandle,
-        controller_dispatcher: Option<Arc<crate::controller_dispatcher::ControllerDispatcher>>,
+        controller_dispatcher: Option<Arc<crate::controllers::ControllerDispatcher>>,
         controlplane_join_handler: Option<Arc<dyn ControlplaneJoinHandler>>,
         injected_node_cert: Option<String>,
     ) -> (String, Arc<ReplicationService>, tokio::task::JoinHandle<()>) {
@@ -7710,11 +7723,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
-            Arc::new(crate::controllers::service::ServiceIpam::new(
-                "10.43.128.0/17",
-            )),
-        ));
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(Arc::new(
+            crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+        )));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
         let grpc = super::GrpcReplicationServer::new_with_controller_dispatcher(

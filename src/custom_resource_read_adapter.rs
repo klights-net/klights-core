@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::api::custom_resource_ports::{
-    CustomResourceListSnapshot, CustomResourceReadFuture, CustomResourceReadPort,
-    CustomResourceSnapshotRequest, CustomResourceWaitFuture, CustomResourceWatchTarget,
+    CustomResourceListSnapshot, CustomResourceProjection, CustomResourceReadFuture,
+    CustomResourceReadPort, CustomResourceSnapshotRequest, CustomResourceWaitFuture,
+    CustomResourceWatchTarget,
 };
 
 pub(crate) struct CustomResourceReadAdapter {
@@ -106,42 +107,60 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
         })
     }
 
-    fn positioned_watch_service(&self) -> klights_watch::PositionedWatchService {
-        self.positioned_watch.clone()
-    }
-
-    fn projected_watch_plan(
+    fn watch_projected_resources(
         &self,
         request: klights_leader_api::WatchRequest,
         targets: Vec<CustomResourceWatchTarget>,
-        topics: Vec<klights_watch::WatchTopic>,
-        resource_scope: klights_watch::WatchResourceScope,
-        projection: Arc<dyn klights_watch::WatchResourceProjection>,
-    ) -> Result<klights_watch::ProjectedWatchPlan, klights_leader_api::LeaderWatchError> {
-        let targets = targets
+        projection: Arc<dyn CustomResourceProjection>,
+    ) -> klights_leader_api::LeaderWatchFuture<'_> {
+        let topics = targets
+            .iter()
+            .map(|target| match target {
+                CustomResourceWatchTarget::Cluster { api_version, kind }
+                | CustomResourceWatchTarget::Namespaced {
+                    api_version, kind, ..
+                } => klights_watch::WatchTopic::new(api_version, kind),
+            })
+            .collect();
+        let resource_scope = if targets
+            .iter()
+            .all(|target| matches!(target, CustomResourceWatchTarget::Cluster { .. }))
+        {
+            klights_watch::WatchResourceScope::Cluster
+        } else {
+            klights_watch::WatchResourceScope::Namespaced
+        };
+        let durable_targets = targets
             .iter()
             .map(custom_target_to_durable_target)
             .collect();
-        klights_watch::ProjectedWatchPlan::try_new(
+        let plan = match klights_watch::ProjectedWatchPlan::try_new(
             request,
-            targets,
+            durable_targets,
             topics,
             resource_scope,
             self.projected_baseline.clone(),
-            projection,
-        )
+            Arc::new(CustomResourceProjectionAdapter(projection)),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        let positioned_watch = self.positioned_watch.clone();
+        Box::pin(async move { positioned_watch.watch_projected_resources(plan).await })
     }
 
     fn wait_until_fresh(
         &self,
         target_rv: i64,
-        topic: klights_watch::WatchTopic,
+        api_version: String,
+        kind: String,
     ) -> CustomResourceWaitFuture<'_> {
         Box::pin(async move {
             crate::api::watch_stream::wait_until_datastore_fresh(
                 &self.db,
                 target_rv,
-                topic,
+                &api_version,
+                &kind,
                 &self.supervisor,
             )
             .await;
@@ -166,6 +185,20 @@ impl CustomResourceReadPort for CustomResourceReadAdapter {
                 .map(|list| list.resource_version)
                 .map_err(crate::api::AppError::from)
         })
+    }
+}
+
+struct CustomResourceProjectionAdapter(Arc<dyn CustomResourceProjection>);
+
+impl klights_watch::WatchResourceProjection for CustomResourceProjectionAdapter {
+    fn project_resources(
+        &self,
+        resources: Vec<klights_cluster_core::Resource>,
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<Vec<klights_cluster_core::Resource>, klights_leader_api::LeaderWatchError>,
+    > {
+        self.0.project_resources(resources)
     }
 }
 

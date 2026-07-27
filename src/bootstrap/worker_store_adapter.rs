@@ -18,12 +18,19 @@ pub(crate) async fn start_worker_store_adapter(
 
     let worker_store = std::sync::Arc::new(
         crate::control_plane::client::worker_store::WorkerStoreAdapter::from_ports(
-            remote_api_client.clone(),
-            remote_api_client.clone(),
-            remote_api_client.clone(),
-            remote_api_client.clone(),
-            remote_api_client,
-            std::sync::Arc::new(crate::control_plane::client::worker_store::WorkerWatchBus::new()),
+            crate::control_plane::client::worker_store::WorkerStorePorts {
+                resource_query: remote_api_client.clone(),
+                leader_watch: remote_api_client.clone(),
+                subnet_allocation: remote_api_client.clone(),
+                network_topology: remote_api_client.clone(),
+                cleanup_intents: remote_api_client,
+                transition_projectors: std::sync::Arc::new(
+                    crate::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+                ),
+                watch_events: std::sync::Arc::new(
+                    crate::control_plane::client::worker_store::WorkerWatchBus::new(),
+                ),
+            },
             node_name,
         ),
     );

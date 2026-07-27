@@ -18,9 +18,9 @@ use crate::controllers::annotations::{
 #[cfg(test)]
 use crate::datastore::WatchTarget;
 #[cfg(test)]
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-#[cfg(test)]
 use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet};
+#[cfg(test)]
+use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 #[cfg(test)]
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 #[cfg(test)]
@@ -571,7 +571,7 @@ async fn run_peer_watch_with_components_inner(
 ) {
     let topic = WatchTopic::new("v1", "Node");
     let mut cursor = SignalWatchCursor::new(
-        db.subscribe_watch_signals(topic.clone()),
+        crate::watch_commit_observation_adapter::subscribe(&db, topic.clone()),
         DatastoreWatchReplaySource::new(
             std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
                 db.clone(),

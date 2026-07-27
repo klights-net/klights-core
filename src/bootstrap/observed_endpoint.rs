@@ -115,7 +115,10 @@ async fn run_leader_peer_endpoint_observer(
         );
     }
 
-    let mut signal_rx = db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "Node"));
+    let mut signal_rx = crate::watch_commit_observation_adapter::subscribe(
+        &db,
+        klights_watch::WatchTopic::new("v1", "Node"),
+    );
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => return,

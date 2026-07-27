@@ -1,6 +1,6 @@
 //! `Controller` impl for `StatefulSet`. Registered in `ControllerDispatcher`.
 
-use crate::controller::controller_wrapper;
+use crate::controllers::controller_wrapper;
 use crate::controllers::statefulset as statefulset_core;
 
 controller_wrapper!(
@@ -8,14 +8,17 @@ controller_wrapper!(
     "statefulset",
     statefulset_core::reconcile_statefulset,
     with_node,
-    with_pod_repository
+    with_pod_repository,
+    store = statefulset_store,
+    reader = query,
+    mutation = statefulset_mutation
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{Context, Controller};
     use crate::controllers::test_utils::store_and_prepare;
+    use crate::controllers::{Context, Controller};
     use serde_json::json;
 
     #[test]

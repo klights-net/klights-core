@@ -149,7 +149,21 @@ impl NodeLogRuntime for LocalNodeLogRuntime {
         let task_cancel = producer_cancel.clone();
         let log_task = async move {
             let mut inbound = if let Some(pod_log_follow_watch) = pod_log_follow_watch {
-                let pod_events = build_pod_log_follow_event_cursor(&pod_log_follow_watch).await;
+                let pod_events =
+                    match build_pod_log_follow_event_cursor(&pod_log_follow_watch).await {
+                        Ok(pod_events) => pod_events,
+                        Err(error) => {
+                            let _ = log_tx
+                                .send(NodeLogEvent::failed(
+                                    Vec::new(),
+                                    NodeLogTerminalError::new(format!(
+                                        "failed to open Pod log follow watch: {error}"
+                                    )),
+                                ))
+                                .await;
+                            return;
+                        }
+                    };
                 let termination = PodLogFollowTermination::new(
                     pod_events,
                     namespace,

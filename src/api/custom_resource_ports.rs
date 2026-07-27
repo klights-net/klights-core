@@ -71,6 +71,13 @@ pub(crate) type CustomResourceReadFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, AppError>> + Send + 'a>>;
 pub(crate) type CustomResourceWaitFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
+pub(crate) trait CustomResourceProjection: Send + Sync {
+    fn project_resources(
+        &self,
+        resources: Vec<Resource>,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<Resource>, klights_leader_api::LeaderWatchError>>;
+}
+
 /// Focused custom-resource snapshot/watch capability.
 ///
 /// Ordinary live reads and writes use the existing leader query/command
@@ -88,21 +95,18 @@ pub(crate) trait CustomResourceReadPort: Send + Sync {
         label_selector: Option<String>,
     ) -> CustomResourceReadFuture<'_, ResourceListResult>;
 
-    fn positioned_watch_service(&self) -> klights_watch::PositionedWatchService;
-
-    fn projected_watch_plan(
+    fn watch_projected_resources(
         &self,
         request: klights_leader_api::WatchRequest,
         targets: Vec<CustomResourceWatchTarget>,
-        topics: Vec<klights_watch::WatchTopic>,
-        resource_scope: klights_watch::WatchResourceScope,
-        projection: Arc<dyn klights_watch::WatchResourceProjection>,
-    ) -> Result<klights_watch::ProjectedWatchPlan, klights_leader_api::LeaderWatchError>;
+        projection: Arc<dyn CustomResourceProjection>,
+    ) -> klights_leader_api::LeaderWatchFuture<'_>;
 
     fn wait_until_fresh(
         &self,
         target_rv: i64,
-        topic: klights_watch::WatchTopic,
+        api_version: String,
+        kind: String,
     ) -> CustomResourceWaitFuture<'_>;
 
     fn current_collection_resource_version(
@@ -115,22 +119,26 @@ pub(crate) trait CustomResourceReadPort: Send + Sync {
 
 pub(crate) fn resource_event_to_watch_event(
     event: &klights_leader_api::ResourceEvent,
-) -> crate::watch::WatchEvent {
+) -> crate::api::watch_event::WatchEvent {
     let event_type = match event.event_type() {
-        klights_leader_api::WatchEventType::Added => crate::watch::EventType::Added,
-        klights_leader_api::WatchEventType::Modified => crate::watch::EventType::Modified,
-        klights_leader_api::WatchEventType::Deleted => crate::watch::EventType::Deleted,
-        klights_leader_api::WatchEventType::Bookmark => crate::watch::EventType::Bookmark,
-        klights_leader_api::WatchEventType::Error => crate::watch::EventType::Error,
+        klights_leader_api::WatchEventType::Added => crate::api::watch_event::EventType::Added,
+        klights_leader_api::WatchEventType::Modified => {
+            crate::api::watch_event::EventType::Modified
+        }
+        klights_leader_api::WatchEventType::Deleted => crate::api::watch_event::EventType::Deleted,
+        klights_leader_api::WatchEventType::Bookmark => {
+            crate::api::watch_event::EventType::Bookmark
+        }
+        klights_leader_api::WatchEventType::Error => crate::api::watch_event::EventType::Error,
     };
-    crate::watch::WatchEvent {
+    crate::api::watch_event::WatchEvent {
         event_type,
         object: event.resource().data.clone(),
         encoded_payload: None,
     }
 }
 
-pub(crate) fn added_watch_event(mut resource: Resource) -> crate::watch::WatchEvent {
+pub(crate) fn added_watch_event(mut resource: Resource) -> crate::api::watch_event::WatchEvent {
     if resource.resource_version > 0
         && let Some(metadata) = Arc::make_mut(&mut resource.data)
             .get_mut("metadata")
@@ -141,8 +149,8 @@ pub(crate) fn added_watch_event(mut resource: Resource) -> crate::watch::WatchEv
             serde_json::json!(resource.resource_version.to_string()),
         );
     }
-    crate::watch::WatchEvent {
-        event_type: crate::watch::EventType::Added,
+    crate::api::watch_event::WatchEvent {
+        event_type: crate::api::watch_event::EventType::Added,
         object: resource.data,
         encoded_payload: None,
     }

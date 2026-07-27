@@ -261,7 +261,7 @@ impl ReplayCursorEvent for RawWatchEvent {
     }
 
     fn topic(&self) -> Option<WatchTopic> {
-        Some(RawWatchEvent::topic(self))
+        Some(WatchTopic::new(&self.api_version, &self.kind))
     }
 
     fn namespace(&self) -> Option<&str> {

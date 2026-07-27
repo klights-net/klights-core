@@ -1,6 +1,6 @@
 //! `Controller` impl for `Job`. Registered in `ControllerDispatcher`.
 
-use crate::controller::controller_wrapper;
+use crate::controllers::controller_wrapper;
 use crate::controllers::job as job_core;
 
 controller_wrapper!(
@@ -9,14 +9,16 @@ controller_wrapper!(
     job_core::reconcile_job,
     with_node,
     discard,
-    with_pod_repository
+    with_pod_repository,
+    store = job_store,
+    mutation = job_mutation
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{Context, Controller};
     use crate::controllers::test_utils::store_and_prepare;
+    use crate::controllers::{Context, Controller};
     use serde_json::json;
 
     #[test]
@@ -72,13 +74,24 @@ mod tests {
     #[tokio::test]
     async fn test_job_controller_reconcile_missing_template_returns_error() {
         let db = crate::datastore::test_support::in_memory().await;
-        let ctx = Context::new(std::sync::Arc::new(db), "test-node".to_string());
+        let ctx = Context::new(std::sync::Arc::new(db.clone()), "test-node".to_string())
+            .with_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db));
         let controller = JobController;
 
-        let bad = json!({
-            "metadata": {"name": "x", "namespace": "default", "uid": "u"},
-            "spec": {"completions": 1}
-        });
+        let bad = store_and_prepare(
+            &db,
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "x",
+            json!({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "x", "namespace": "default", "uid": "u"},
+                "spec": {"completions": 1}
+            }),
+        )
+        .await;
         assert!(controller.reconcile(bad, ctx).await.is_err());
     }
 }

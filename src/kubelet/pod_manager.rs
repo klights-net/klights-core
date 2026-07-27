@@ -22,16 +22,16 @@ use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_
 #[cfg(test)]
 use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
-use crate::kubelet::pod_watch_source::PodWatchSource;
-use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchEventFilter, WindowPolicy,
-};
+use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource};
+#[cfg(test)]
+use crate::watch::{SignalWatchCursor, WatchDeliveryScope, WatchEventFilter, WindowPolicy};
 use anyhow::Result;
 #[cfg(test)]
 use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
-use klights_watch::WatchTarget;
-use klights_watch::{WatchSignalReceiver, WatchTopic};
+use futures::StreamExt as _;
+use klights_leader_api::{LeaderWatchError, WatchEventType};
+#[cfg(test)]
+use klights_watch::WatchTopic;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -102,6 +102,7 @@ fn pod_watcher_node_field_selector(node_name: &str) -> String {
     format!("spec.nodeName={node_name}")
 }
 
+#[cfg(test)]
 fn pod_watcher_node_event_filter(node_name: &str) -> WatchEventFilter {
     WatchEventFilter::new().with_field_selector(
         "v1",
@@ -110,42 +111,15 @@ fn pod_watcher_node_event_filter(node_name: &str) -> WatchEventFilter {
     )
 }
 
-fn pod_watcher_watch_topics() -> Vec<WatchTopic> {
-    vec![
-        WatchTopic::new("v1", "Pod"),
-        WatchTopic::new("v1", "PersistentVolumeClaim"),
-        WatchTopic::new("v1", "PersistentVolume"),
-        WatchTopic::new("v1", "Secret"),
-        WatchTopic::new("v1", "ConfigMap"),
-        WatchTopic::new("v1", "Namespace"),
-    ]
-}
-
-fn pod_watcher_replay_targets() -> Vec<WatchTarget> {
-    vec![
-        WatchTarget::namespaced("v1", "Pod"),
-        WatchTarget::namespaced("v1", "PersistentVolumeClaim"),
-        WatchTarget::cluster("v1", "PersistentVolume"),
-        WatchTarget::namespaced("v1", "Secret"),
-        WatchTarget::namespaced("v1", "ConfigMap"),
-        WatchTarget::cluster("v1", "Namespace"),
-    ]
-}
-
 #[cfg(test)]
 mod watch_topic_tests {
     use super::*;
 
     #[test]
-    fn pod_watcher_live_topics_cover_secret_configmap_refresh_sources() {
-        let topics = pod_watcher_watch_topics();
-        assert!(
-            topics.contains(&klights_watch::WatchTopic::new("v1", "ConfigMap")),
-            "ConfigMap watch events must reach the pod watcher so mounted ConfigMap volumes refresh"
-        );
-        assert!(
-            topics.contains(&klights_watch::WatchTopic::new("v1", "Secret")),
-            "Secret watch events must reach the pod watcher so mounted Secret volumes refresh"
+    fn pod_watcher_node_selector_is_exact() {
+        assert_eq!(
+            pod_watcher_node_field_selector("worker-a"),
+            "spec.nodeName=worker-a"
         );
     }
 }
@@ -257,14 +231,17 @@ async fn run_pod_watcher_with_runtime(
         .await
         .take()
         .expect("pod lifecycle receiver must be set before run_pod_watcher");
-    let watch_topics = pod_watcher_watch_topics();
-    let signal_rx = WatchSignalReceiver::new(
-        watch_topics
-            .iter()
-            .cloned()
-            .map(|topic| state.pod_watch_source.subscribe_watch_signals(topic))
-            .collect(),
-    );
+    let mut pod_events = match state
+        .pod_watch_source
+        .open_pod_manager_watch(config.node_name.clone())
+        .await
+    {
+        Ok(pod_events) => pod_events,
+        Err(error) => {
+            tracing::warn!(%error, "pod watcher failed to open positioned leader watch");
+            return;
+        }
+    };
 
     if let Err(err) =
         wait_for_cni_readiness(runtime_ports.cni_readiness.clone(), cancel_token.clone()).await
@@ -328,23 +305,6 @@ async fn run_pod_watcher_with_runtime(
         Some(tx)
     };
 
-    let event_filter = pod_watcher_node_event_filter(&config.node_name);
-    let mut cursor = SignalWatchCursor::new_many(
-        signal_rx,
-        state
-            .pod_watch_source
-            .replay_source(pod_watcher_replay_targets()),
-        watch_topics,
-        WatchDeliveryScope::All,
-        state
-            .pod_watch_source
-            .current_resource_version()
-            .await
-            .unwrap_or(0),
-        WindowPolicy::default_watch_delivery(),
-    )
-    .with_event_filter(event_filter);
-
     {
         let mut pod_recovery = PodRecovery::new(
             &lifecycle.pod_repository,
@@ -399,18 +359,6 @@ async fn run_pod_watcher_with_runtime(
     // transitions it to Failed/Succeeded cleanly. The CRI event stream is the
     // sole driver of phase reconciliation; the reconnect arm above keeps it
     // live across containerd hiccups.
-    match cursor.prime_replay_or_expired().await {
-        Ok(replayed) => {
-            tracing::debug!(
-                "Pod watcher primed {} replay events before entering live watch",
-                replayed
-            );
-        }
-        Err(err) => {
-            tracing::warn!(?err, "Pod watcher initial replay failed");
-        }
-    }
-
     loop {
         tokio::select! {
             // Handle cancellation signal
@@ -420,23 +368,22 @@ async fn run_pod_watcher_with_runtime(
             }
 
             // Handle watch events with replay retry
-            event_result = cursor.next_event() => {
+            event_result = pod_events.next() => {
                 let event = match event_result {
-                    Ok(event) => event,
-                    Err(WatchCursorError::Closed) => {
-                        tracing::warn!("Pod watcher signal channel closed");
+                    Some(Ok(event)) => event,
+                    Some(Err(LeaderWatchError::ReplayExpired { .. })) => {
+                        tracing::warn!("Pod watcher positioned replay window expired");
                         break;
                     }
-                    Err(WatchCursorError::Expired) => {
-                        tracing::warn!("Pod watcher replay window expired");
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "Pod watcher positioned leader watch failed");
                         break;
                     }
-                    Err(WatchCursorError::Replay(err)) => {
-                        tracing::warn!("Pod watcher replay failed: {err:#}");
+                    None => {
+                        tracing::warn!("Pod watcher positioned leader watch closed");
                         break;
                     }
                 };
-                let event_rv = event.resource_version().unwrap_or(0);
                 // Fire-and-forget lifecycle trace message: spawn through the
                 // supervisor so actor sends never block event processing.
                 // handle_watch_event must always run regardless of actor state.
@@ -461,7 +408,6 @@ async fn run_pod_watcher_with_runtime(
                     },
                     event,
                 ).await;
-                cursor.accept_event(event_rv);
             }
 
             Some(ev) = cri_event_rx.recv() => {
@@ -530,7 +476,7 @@ fn pod_resource_version(pod: &Value) -> Option<i64> {
     })
 }
 
-fn lifecycle_message_from_watch_event(event: &WatchEvent) -> Option<LifecycleMessage> {
+fn lifecycle_message_from_watch_event(event: &PodWatchEvent) -> Option<LifecycleMessage> {
     if event.object.pointer("/kind").and_then(|kind| kind.as_str()) != Some("Pod") {
         return None;
     }
@@ -540,22 +486,22 @@ fn lifecycle_message_from_watch_event(event: &WatchEvent) -> Option<LifecycleMes
     let resource_version = pod_resource_version(pod);
     let pod = pod.clone();
     match event.event_type {
-        EventType::Added => Some(LifecycleMessage::WatchAdded {
+        WatchEventType::Added => Some(LifecycleMessage::WatchAdded {
             key,
             resource_version,
             pod,
         }),
-        EventType::Modified => Some(LifecycleMessage::WatchModified {
+        WatchEventType::Modified => Some(LifecycleMessage::WatchModified {
             key,
             resource_version,
             pod,
         }),
-        EventType::Deleted => Some(LifecycleMessage::WatchDeleted {
+        WatchEventType::Deleted => Some(LifecycleMessage::WatchDeleted {
             key,
             resource_version,
             pod,
         }),
-        EventType::Bookmark | EventType::Error => None,
+        WatchEventType::Bookmark | WatchEventType::Error => None,
     }
 }
 

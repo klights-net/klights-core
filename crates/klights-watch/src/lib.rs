@@ -16,8 +16,9 @@ pub use replay::{
     WatchTargetScope,
 };
 pub use session::{
-    PositionedWatchService, ProjectedWatchBaselineRead, ProjectedWatchBaselineRequest,
-    ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope, WatchScopeResolver,
+    PendingWatchSelectorTransition, PositionedWatchService, ProjectedWatchBaselineRead,
+    ProjectedWatchBaselineRequest, ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope,
+    WatchScopeResolver, WatchSelectorMembership,
 };
 pub use signal::{
     DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchSignal, WatchSignalEvent,

@@ -3,11 +3,11 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 40826,
-      "sha256": "a3719a77dd139a6c5b1f8ecabcf1957dd5a6b928f542120952f831fbafdd7476",
+      "count": 41012,
+      "sha256": "b98a1ab961ff0710f06cf62779b2bfa9588255b2c64920e5f299ea8127af146c",
       "source": {
-        "count": 518464,
-        "sha256": "576ed19bef2d7fbe61f1a3a5a8ada735fb0c97d6ca1dd5f53042e9d89e7644ee"
+        "count": 521349,
+        "sha256": "47a3cfa15935714b3d04b5df9c5c1c06449caa11771910ebf109f3250656441b"
       }
     },
     "klights-apiserver": {
@@ -171,11 +171,11 @@
       }
     },
     "klights-watch": {
-      "count": 711,
-      "sha256": "dd8514e9327728889f152c84a822ccf1a2b28e91220aa3af504caec445dcedcf",
+      "count": 768,
+      "sha256": "f19dee8ede23649f1324b6655efec00707955bc9db254dca326628146ba14d84",
       "source": {
-        "count": 10959,
-        "sha256": "51625cc07680292bba9f3293eddaa7be295c1bba0b65ed5da4a619febcf7567b"
+        "count": 11049,
+        "sha256": "3998f913c56c1ac850b41ffec8300a745c62e73e9507a773d148646eb0cf9691"
       }
     }
   }

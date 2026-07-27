@@ -106,9 +106,7 @@ mod tests {
         let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
             "10.43.128.0/17",
         ));
-        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
-            service_ipam,
-        ));
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new(service_ipam));
         let slot = ControllerDispatcherSlot::new();
         slot.set(dispatcher.clone());
 

@@ -88,19 +88,19 @@ const INITIAL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct NftServiceRouterStores {
-    pub resource_query: std::sync::Arc<dyn LeaderResourceQuery>,
+    pub routing_state: std::sync::Arc<dyn RoutingStateSource>,
     pub watch: std::sync::Arc<dyn LeaderWatch>,
     pub endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource>,
 }
 
 impl NftServiceRouterStores {
     pub fn new(
-        resource_query: std::sync::Arc<dyn LeaderResourceQuery>,
+        routing_state: std::sync::Arc<dyn RoutingStateSource>,
         watch: std::sync::Arc<dyn LeaderWatch>,
         endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource>,
     ) -> Self {
         Self {
-            resource_query,
+            routing_state,
             watch,
             endpoint_source,
         }
@@ -250,7 +250,7 @@ impl<'a> NftServiceRouterDefaultBoot<'a> {
 /// lock).
 pub struct NftServiceRouter {
     table: std::sync::Arc<KlightsTable>,
-    resource_query: std::sync::Arc<dyn LeaderResourceQuery>,
+    routing_state: std::sync::Arc<dyn RoutingStateSource>,
     notify: std::sync::Arc<tokio::sync::Notify>,
     force_full_sync: std::sync::Arc<AtomicBool>,
     /// Cancellation token observed by the coalescer worker. Cancelled
@@ -284,7 +284,7 @@ impl NftServiceRouter {
             runtime,
         } = request;
         let NftServiceRouterStores {
-            resource_query,
+            routing_state,
             watch,
             endpoint_source,
         } = stores;
@@ -326,7 +326,7 @@ impl NftServiceRouter {
         let worker_notify = notify.clone();
         let worker_cancel = cancel.clone();
         let worker_task_supervisor = task_supervisor.clone();
-        let worker_resource_query = resource_query.clone();
+        let worker_routing_state = routing_state.clone();
         let worker_force_full_sync = force_full_sync.clone();
         let worker = task_supervisor
             .spawn_async(
@@ -357,7 +357,7 @@ impl NftServiceRouter {
                         }
                         let full_sync = worker_force_full_sync.swap(false, Ordering::AcqRel);
                         let service_sync_result = if full_sync {
-                            worker_table.sync_services_from_api(worker_resource_query.as_ref()).await
+                            worker_table.sync_services_from_api(worker_routing_state.as_ref()).await
                         } else {
                             match worker_table.sync_services_from_cached_inventory().await {
                                 Ok(count) => Ok(count),
@@ -366,13 +366,13 @@ impl NftServiceRouter {
                                         error = %err,
                                         "service routing cached inventory unavailable; falling back to full sync"
                                     );
-                                    worker_table.sync_services_from_api(worker_resource_query.as_ref()).await
+                                    worker_table.sync_services_from_api(worker_routing_state.as_ref()).await
                                 }
                             }
                         };
                         let sync_result = match service_sync_result {
                             Ok(service_count) => worker_table
-                                .sync_network_policies_from_api(worker_resource_query.as_ref())
+                                .sync_network_policies_from_api(worker_routing_state.as_ref())
                                 .await
                                 .context("rebuild network-policy chain")
                                 .map(|_| service_count),
@@ -460,7 +460,7 @@ impl NftServiceRouter {
 
         Ok(std::sync::Arc::new(Self {
             table,
-            resource_query,
+            routing_state,
             notify,
             force_full_sync,
             cancel,
@@ -501,7 +501,7 @@ impl ServiceRouter for NftServiceRouter {
 
     fn sync_services_now(&self) -> ServiceRouterFuture<'_> {
         Box::pin(async move {
-            sync_routing_from_api(self.table.as_ref(), self.resource_query.as_ref())
+            sync_routing_from_api(self.table.as_ref(), self.routing_state.as_ref())
                 .await
                 .context("sync_services_now: rebuild routing chains")
                 .map_err(|error| ServiceRouterError::sync(error.to_string()))?;
@@ -994,14 +994,14 @@ async fn run_service_routing_watch_worker(
 
 async fn sync_routing_from_api(
     table: &KlightsTable,
-    resource_query: &dyn LeaderResourceQuery,
+    routing_state: &dyn RoutingStateSource,
 ) -> Result<usize> {
     let service_count = table
-        .sync_services_from_api(resource_query)
+        .sync_services_from_api(routing_state)
         .await
         .context("rebuild services chain")?;
     table
-        .sync_network_policies_from_api(resource_query)
+        .sync_network_policies_from_api(routing_state)
         .await
         .context("rebuild network-policy chain")?;
     Ok(service_count)
@@ -1616,7 +1616,11 @@ mod tests {
         let force_full_sync = Arc::new(AtomicBool::new(false));
         let router = NftServiceRouter {
             table: test_service_table(supervisor.clone()),
-            resource_query: Arc::new(WatchOnlyLeaderApiClient::default()),
+            routing_state: Arc::new(
+                crate::networking_state_adapter::LeaderRoutingStateAdapter::new(Arc::new(
+                    WatchOnlyLeaderApiClient::default(),
+                )),
+            ),
             notify: Arc::new(Notify::new()),
             force_full_sync: force_full_sync.clone(),
             cancel: CancellationToken::new(),

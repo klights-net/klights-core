@@ -400,7 +400,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use crate::controller_dispatcher::ControllerDispatcher;
+    use crate::controllers::ControllerDispatcher;
     use crate::datastore::ResourcePreconditions;
     use crate::replication::protocol::ForwardedResource;
     use klights_cluster_core::command::StorageCommand;

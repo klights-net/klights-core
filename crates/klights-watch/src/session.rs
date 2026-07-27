@@ -616,9 +616,68 @@ fn validate_event_scope(
     Ok(())
 }
 
+/// Selector membership state for a remote LIST-to-WATCH consumer.
+///
+/// The two-phase transition keeps membership unchanged until the consumer has
+/// durably applied the synthesized event.
+pub struct WatchSelectorMembership {
+    filter: ResourceFilter,
+    membership: SelectorMembership,
+}
+
+impl WatchSelectorMembership {
+    pub fn try_new(request: &WatchRequest) -> Result<Self, LeaderWatchError> {
+        Ok(Self {
+            filter: ResourceFilter::for_watch(request)?,
+            membership: SelectorMembership::default(),
+        })
+    }
+
+    pub fn replace(&mut self, resources: &[Resource]) {
+        self.membership.replace(resources);
+    }
+
+    pub fn len(&self) -> usize {
+        self.membership.matched.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.membership.matched.is_empty()
+    }
+
+    pub fn prepare(
+        &self,
+        event: ResourceEvent,
+    ) -> Result<PendingWatchSelectorTransition, LeaderWatchError> {
+        let matches = self.filter.matches(event.resource());
+        self.membership.prepare(event, matches)
+    }
+
+    pub fn commit(&mut self, pending: PendingWatchSelectorTransition) {
+        self.membership.commit(pending.mutation);
+    }
+}
+
+pub struct PendingWatchSelectorTransition {
+    event: Option<ResourceEvent>,
+    mutation: SelectorMembershipMutation,
+}
+
+impl PendingWatchSelectorTransition {
+    pub fn event(&self) -> Option<&ResourceEvent> {
+        self.event.as_ref()
+    }
+}
+
 #[derive(Default)]
 struct SelectorMembership {
     matched: HashMap<SelectorKey, Resource>,
+}
+
+enum SelectorMembershipMutation {
+    None,
+    Upsert(SelectorKey, Resource),
+    Remove(SelectorKey),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -652,8 +711,22 @@ impl SelectorMembership {
         event: ResourceEvent,
         matches: bool,
     ) -> Result<Option<ResourceEvent>, LeaderWatchError> {
+        let pending = self.prepare(event, matches)?;
+        let event = pending.event.clone();
+        self.commit(pending.mutation);
+        Ok(event)
+    }
+
+    fn prepare(
+        &self,
+        event: ResourceEvent,
+        matches: bool,
+    ) -> Result<PendingWatchSelectorTransition, LeaderWatchError> {
         if ResourceFilter::event_always_deliver(event.event_type()) {
-            return Ok(Some(event));
+            return Ok(PendingWatchSelectorTransition {
+                event: Some(event),
+                mutation: SelectorMembershipMutation::None,
+            });
         }
         let key = SelectorKey::from_resource(event.resource());
         let prior = self.matched.get(&key).cloned();
@@ -661,32 +734,52 @@ impl SelectorMembership {
         let position = event.resume_position();
         let event_type = event.event_type();
         let current = event.resource().clone();
-        match event_type {
+        let (event, mutation) = match event_type {
             WatchEventType::Deleted => {
-                if was_member {
-                    self.matched.remove(&key);
-                }
-                Ok((was_member || matches).then_some(event))
+                let mutation = if was_member {
+                    SelectorMembershipMutation::Remove(key)
+                } else {
+                    SelectorMembershipMutation::None
+                };
+                ((was_member || matches).then_some(event), mutation)
             }
             WatchEventType::Added | WatchEventType::Modified if matches => {
-                self.matched.insert(key, current.clone());
-                if was_member || event_type == WatchEventType::Added {
-                    Ok(Some(event))
+                let event = if was_member || event_type == WatchEventType::Added {
+                    Some(event)
                 } else {
-                    ResourceEvent::try_new(WatchEventType::Added, current, position).map(Some)
-                }
+                    Some(ResourceEvent::try_new(
+                        WatchEventType::Added,
+                        current.clone(),
+                        position,
+                    )?)
+                };
+                (event, SelectorMembershipMutation::Upsert(key, current))
             }
             WatchEventType::Added | WatchEventType::Modified if was_member => {
-                self.matched.remove(&key);
-                ResourceEvent::try_new(
+                let event = ResourceEvent::try_new(
                     WatchEventType::Deleted,
                     prior.expect("membership was checked"),
                     position,
-                )
-                .map(Some)
+                )?;
+                (Some(event), SelectorMembershipMutation::Remove(key))
             }
-            WatchEventType::Added | WatchEventType::Modified => Ok(None),
+            WatchEventType::Added | WatchEventType::Modified => {
+                (None, SelectorMembershipMutation::None)
+            }
             WatchEventType::Bookmark | WatchEventType::Error => unreachable!(),
+        };
+        Ok(PendingWatchSelectorTransition { event, mutation })
+    }
+
+    fn commit(&mut self, mutation: SelectorMembershipMutation) {
+        match mutation {
+            SelectorMembershipMutation::None => {}
+            SelectorMembershipMutation::Upsert(key, resource) => {
+                self.matched.insert(key, resource);
+            }
+            SelectorMembershipMutation::Remove(key) => {
+                self.matched.remove(&key);
+            }
         }
     }
 }

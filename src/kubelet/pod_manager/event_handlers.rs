@@ -1,6 +1,8 @@
 use super::*;
 #[cfg(test)]
 use crate::kubelet::pod_status_logic::ContainerInfo;
+use crate::kubelet::pod_watch_source::PodWatchEvent as WatchEvent;
+use klights_leader_api::WatchEventType as EventType;
 
 pub(super) async fn enqueue_job_reconcile_for_terminal_watch_pod(
     pod_repo: &Arc<crate::kubelet::pod_repository::PodRepository>,
@@ -133,7 +135,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
 
     tracing::info!(
         "Pod watcher received {} event for pod {}",
-        event.event_type,
+        event.event_type.as_str(),
         event_name
     );
 

@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt as _;
+use klights_leader_api::{LeaderWatchError, ResourceEvent, WatchEventType, WatchStream};
 use tokio_util::sync::CancellationToken;
 
 /// Focused runtime port used by the event-driven scheduler.
@@ -22,9 +24,7 @@ use tokio_util::sync::CancellationToken;
 /// leader datastore and Pod repository to this narrow contract.
 #[async_trait]
 pub trait SchedulerRuntime: Send + Sync {
-    fn subscribe_signals(&self) -> klights_watch::WatchSignalReceiver;
-
-    async fn current_resource_version(&self) -> Result<i64>;
+    async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError>;
 
     async fn schedule_all_unbound_pods(&self) -> Result<()>;
 }
@@ -53,17 +53,11 @@ impl SchedulerControllerConfig {
 /// Wakes on:
 /// - unbound Pod add/modify/delete
 /// - Node add/modify/delete
-pub fn should_wake_scheduler(event: &crate::watch::WatchEvent) -> bool {
-    let kind = event
-        .object
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    match kind {
+pub fn should_wake_scheduler(event: &ResourceEvent) -> bool {
+    match event.resource().kind.as_str() {
         "Pod" => {
             // Wake only for unbound Pods (no spec.nodeName)
-            event.object.pointer("/spec/nodeName").is_none()
+            event.resource().data.pointer("/spec/nodeName").is_none()
         }
         "Node" => true,
         _ => false,
@@ -74,8 +68,14 @@ pub fn should_wake_scheduler(event: &crate::watch::WatchEvent) -> bool {
 ///
 /// Disabled by default — call this only when config.enabled = true.
 pub async fn run_scheduler_watch(runtime: Arc<dyn SchedulerRuntime>, cancel: CancellationToken) {
-    let mut signal_rx = runtime.subscribe_signals();
-    let mut last_seen_rv = runtime.current_resource_version().await.unwrap_or(0);
+    let sessions = match runtime.open_watch_sessions().await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!("scheduler watch open failed: {error:#}");
+            return;
+        }
+    };
+    let mut events = futures::stream::select_all(sessions);
 
     // Initial sweep: the watch replay only catches events with RV > floor_rv.
     // Pods created before the scheduler starts (e.g. during CoreDNS bootstrap)
@@ -88,36 +88,35 @@ pub async fn run_scheduler_watch(runtime: Arc<dyn SchedulerRuntime>, cancel: Can
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            signal = signal_rx.recv() => match signal {
-                Ok(signal) => {
-                    let high_rv = signal
-                        .advances
-                        .iter()
-                        .map(|advance| advance.high_rv)
-                        .max()
-                        .unwrap_or(last_seen_rv);
-                    if high_rv <= last_seen_rv {
+            event = events.next() => match event {
+                Some(Ok(event)) => {
+                    if matches!(event.event_type(), WatchEventType::Bookmark | WatchEventType::Error)
+                        || !should_wake_scheduler(&event)
+                    {
                         continue;
                     }
-                    last_seen_rv = high_rv;
                     tracing::debug!("scheduler controller woke on watch signal");
                     if let Err(e) = runtime.schedule_all_unbound_pods().await {
                         tracing::warn!("scheduler reconcile failed: {e:#}");
                     }
                 }
-                Err(klights_watch::WatchSignalReceiveError::Lagged(n)) => {
+                Some(Err(LeaderWatchError::ReplayExpired { .. })) => {
                     tracing::warn!(
-                        "scheduler watch signals lagged by {n}; running full unbound-pod sweep"
+                        "scheduler watch replay expired; running full unbound-pod sweep"
                     );
                     if let Err(e) = runtime.schedule_all_unbound_pods().await {
-                        tracing::warn!("scheduler reconcile after signal lag failed: {e:#}");
+                        tracing::warn!("scheduler reconcile after replay expiry failed: {e:#}");
                     }
-                    last_seen_rv = runtime
-                        .current_resource_version()
-                        .await
-                        .unwrap_or(last_seen_rv);
+                    match runtime.open_watch_sessions().await {
+                        Ok(reopened) => events = futures::stream::select_all(reopened),
+                        Err(error) => {
+                            tracing::warn!("scheduler watch reopen failed: {error:#}");
+                            break;
+                        }
+                    }
                 }
-                Err(klights_watch::WatchSignalReceiveError::Closed) => break,
+                Some(Err(error)) => tracing::warn!("scheduler watch failed: {error:#}"),
+                None => break,
             }
         }
     }
@@ -128,8 +127,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn pod_event(node_name: Option<&str>) -> crate::watch::WatchEvent {
-        crate::watch::WatchEvent::modified(json!({
+    fn event(value: serde_json::Value) -> ResourceEvent {
+        let resource =
+            klights_cluster_core::Resource::try_from_data(std::sync::Arc::new(value)).unwrap();
+        ResourceEvent::try_new(WatchEventType::Modified, resource, None).unwrap()
+    }
+
+    fn pod_event(node_name: Option<&str>) -> ResourceEvent {
+        event(json!({
             "kind": "Pod",
             "apiVersion": "v1",
             "metadata": {"name": "pod-1", "namespace": "default", "resourceVersion": "1"},
@@ -140,16 +145,16 @@ mod tests {
         }))
     }
 
-    fn node_event() -> crate::watch::WatchEvent {
-        crate::watch::WatchEvent::modified(json!({
+    fn node_event() -> ResourceEvent {
+        event(json!({
             "kind": "Node",
             "apiVersion": "v1",
             "metadata": {"name": "node-1", "resourceVersion": "1"},
         }))
     }
 
-    fn configmap_event() -> crate::watch::WatchEvent {
-        crate::watch::WatchEvent::modified(json!({
+    fn configmap_event() -> ResourceEvent {
+        event(json!({
             "kind": "ConfigMap",
             "apiVersion": "v1",
             "metadata": {"name": "cm-1", "namespace": "default", "resourceVersion": "1"},

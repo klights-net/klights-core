@@ -37,9 +37,11 @@ pub(crate) enum PassiveStoreOpenRequest<'a> {
 ///
 /// Every variant returns the concrete backend behind a `DatastoreHandle`; this
 /// dispatch never reads ambient configuration or installs replication behavior.
-pub(crate) async fn open(
+pub(crate) async fn open_with_sink(
     request: PassiveStoreOpenRequest<'_>,
     supervisor: Arc<TaskSupervisor>,
+    commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
+    outbox_codec: Arc<dyn crate::datastore::OutboxResponseCodec>,
 ) -> Result<DatastoreHandle> {
     match request {
         PassiveStoreOpenRequest::SqliteInMemory => {
@@ -49,7 +51,12 @@ pub(crate) async fn open(
                 "sqlite:selector-in-memory",
             )
             .await?;
-            let ds = sqlite::Datastore::new_in_memory_with_watch_and_executor(executor).await?;
+            let ds = sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
+                executor,
+                commit_sink,
+                outbox_codec,
+            )
+            .await?;
             Ok(Arc::new(ds))
         }
         PassiveStoreOpenRequest::SqlitePersistent {
@@ -57,26 +64,50 @@ pub(crate) async fn open(
             db_key_file,
         } => {
             tracing::info!(backend = "sqlite", mode = "persistent", "opening datastore");
-            let ds =
-                sqlite::Datastore::new_persistent_paths(cluster_db_path, supervisor, db_key_file)
-                    .await?;
+            let ds = sqlite::Datastore::new_persistent_paths_with_sink(
+                cluster_db_path,
+                supervisor,
+                db_key_file,
+                commit_sink,
+                outbox_codec,
+            )
+            .await?;
             Ok(Arc::new(ds))
         }
         PassiveStoreOpenRequest::RedbInMemory => {
             tracing::info!(backend = "redb", mode = "in-memory", "opening datastore");
-            let ds =
-                crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor(supervisor)
-                    .await?;
+            let ds = crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor_and_sink(
+                supervisor,
+                commit_sink,
+            )
+            .await?;
             Ok(Arc::new(ds))
         }
         PassiveStoreOpenRequest::RedbPersistent { cluster_db_path } => {
             tracing::info!(backend = "redb", mode = "persistent", "opening datastore");
-            let ds =
-                crate::datastore::redb::RedbDatastore::new_persistent(cluster_db_path, supervisor)
-                    .await?;
+            let ds = crate::datastore::redb::RedbDatastore::new_persistent_with_sink(
+                cluster_db_path,
+                supervisor,
+                commit_sink,
+            )
+            .await?;
             Ok(Arc::new(ds))
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn open(
+    request: PassiveStoreOpenRequest<'_>,
+    supervisor: Arc<TaskSupervisor>,
+) -> Result<DatastoreHandle> {
+    open_with_sink(
+        request,
+        supervisor,
+        crate::watch_commit_observation_adapter::new_sink(),
+        crate::outbox_response_codec_adapter::new_codec(),
+    )
+    .await
 }
 
 #[cfg(test)]

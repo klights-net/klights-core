@@ -14,10 +14,10 @@ pub(crate) mod fingerprint;
 mod focused_ports;
 mod gc;
 mod merge_patch;
+mod outbox_codec;
 pub(super) mod owner_ref_index;
 mod position_membership;
 pub(crate) mod queries;
-mod replay;
 mod replay_floor;
 mod resource_shape;
 mod rv_helpers;
@@ -43,9 +43,9 @@ use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 
 use crate::datastore::WatchReplayRead;
-use crate::watch::WatchBus;
 use klights_supervisor::TaskSupervisor;
 use klights_types::{NodeName, PodSubnet};
+#[cfg(test)]
 use klights_watch::WatchTopic;
 
 impl std::fmt::Debug for Datastore {
@@ -57,12 +57,13 @@ impl std::fmt::Debug for Datastore {
 // Re-export types and trait surface so `use super::*;` in submodules picks
 // them up the same way the legacy `db/mod.rs` exposed them.
 pub use super::backend::{
-    DatastoreBackend, DatastoreHandle, NamespaceStore, ResourceStore, WatchStore,
+    CommitObservationSink, DatastoreBackend, DatastoreHandle, NamespaceStore, OutboxResponseCodec,
+    ResourceStore, WatchStore,
 };
 pub use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent, PodEndpointEvent,
-    PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
+    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, CommitObservation,
+    DurableAllocatorObservation, ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent,
+    PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
     PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult,
     PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplay, PositionedWatchReplayRead,
     RawWatchEvent, ReplicatedCreateOptions, ReplicatedMembershipState, ReplicatedSnapshotMetadata,
@@ -73,9 +74,17 @@ use klights_cluster_core::{
     WatchReplayPosition,
 };
 
+struct AppliedOutboxLedgerInput<'a> {
+    idempotency_key: String,
+    subject_key: String,
+    operation: String,
+    first_seen_ms: i64,
+    status_stamp: Option<i64>,
+    terminal_error: Option<&'a klights_cluster_core::OutboxApplyError>,
+}
+
 use crate::sqlite_boundary::DbExecutor;
 use crate::sqlite_open as opener;
-pub use replay::DatastoreWatchReplaySource;
 pub use watch::create_pending_watch_event;
 pub use watch::publish_pending;
 
@@ -110,7 +119,8 @@ const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 pub struct Datastore {
     executor: DbExecutor,
     read_executor: DbExecutor,
-    watch_bus: std::sync::Arc<WatchBus>,
+    commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+    outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
@@ -119,6 +129,9 @@ pub struct Datastore {
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    post_commit_publish_pause:
+        std::sync::Arc<std::sync::Mutex<Option<cluster_replace::PostCommitPublishPause>>>,
 }
 
 struct AtomicOutboxMutation {
@@ -234,20 +247,15 @@ impl Datastore {
 
     fn append_applied_outbox_ledger_mutation(
         commit: &mut klights_cluster_core::LogApplyCommit,
-        idempotency_key: String,
-        subject_key: String,
-        operation: String,
-        first_seen_ms: i64,
-        status_stamp: Option<i64>,
-        terminal_error: Option<&klights_cluster_core::OutboxApplyError>,
+        input: AppliedOutboxLedgerInput<'_>,
+        context: &outbox_codec::TransactionContext<'_>,
     ) {
         use klights_cluster_core::StorageResponse;
         use klights_cluster_core::{
             ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation,
         };
-        use klights_cluster_datastore::encode_outbox_response;
 
-        let response = terminal_error.map_or_else(
+        let response = input.terminal_error.map_or_else(
             || StorageResponse::Ack {
                 resource_version: 0,
             },
@@ -263,13 +271,13 @@ impl Datastore {
         mutations.push(
             ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(
                 LogApplyAppliedOutboxRow {
-                    idempotency_key,
-                    subject_key,
-                    operation,
-                    first_seen_ms,
+                    idempotency_key: input.idempotency_key,
+                    subject_key: input.subject_key,
+                    operation: input.operation,
+                    first_seen_ms: input.first_seen_ms,
                     applied_rv: None,
-                    result_proto: encode_outbox_response(&response).unwrap_or_default(),
-                    status_stamp: status_stamp.filter(|stamp| *stamp > 0),
+                    result_proto: context.encode(&response).unwrap_or_default(),
+                    status_stamp: input.status_stamp.filter(|stamp| *stamp > 0),
                 },
             ))
             .into_log_apply_mutation(),
@@ -1504,6 +1512,23 @@ impl Datastore {
         self.executor.call_raw(query_name, f).await
     }
 
+    pub async fn db_call_with_post_commit<T, P, F, C>(
+        &self,
+        query_name: &'static str,
+        f: F,
+        post_commit: C,
+    ) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        P: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<(T, P)> + Send + 'static,
+        C: FnOnce(P) + Send + 'static,
+    {
+        self.executor
+            .call_raw_with_post_commit(query_name, f, post_commit)
+            .await
+    }
+
     pub async fn read_db_call<T, F>(
         &self,
         query_name: &'static str,
@@ -1689,11 +1714,13 @@ impl Datastore {
         }
         let command =
             klights_cluster_core::command::StorageCommand::ApplyResourceBatch { operations };
+        let outbox_codec = self.outbox_codec.clone();
         // Build + apply in one IMMEDIATE transaction. The builder authors only
         // an RV-zero template; committed apply allocates the public RV in the
         // same transaction that writes the rows.
         let pending = self
             .db_call("db_apply_resource_batch", move |conn| {
+                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -1703,7 +1730,9 @@ impl Datastore {
                     None,
                 )?;
                 let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
+                        &tx, commit, &context,
+                    )?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -1729,8 +1758,10 @@ impl Datastore {
             reason: reason.to_string(),
         };
         let authoring_node = node_name.to_string();
+        let outbox_codec = self.outbox_codec.clone();
         let pending = self
             .db_call("db_move_pod_to_cleanup_intent", move |conn| {
+                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -1740,7 +1771,9 @@ impl Datastore {
                     None,
                 )?;
                 let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
+                        &tx, commit, &context,
+                    )?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -1819,8 +1852,10 @@ impl Datastore {
         authoring_node: &str,
     ) -> Result<()> {
         let authoring_node = authoring_node.to_string();
+        let outbox_codec = self.outbox_codec.clone();
         let pending = self
             .db_call("db_apply_cluster_maintenance_command", move |conn| {
+                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -1830,7 +1865,9 @@ impl Datastore {
                     None,
                 )?;
                 let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
+                        &tx, commit, &context,
+                    )?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -1902,9 +1939,11 @@ impl Datastore {
         let claim_key = idempotency_key.to_string();
         let claim_operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
+        let outbox_codec = self.outbox_codec.clone();
 
         let outcome = self
             .db_call("db_build_log_apply_commit_for_outbox", move |conn| {
+                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if let Some(existing) = Self::completed_outbox_record_in_tx(&tx, &claim_key)? {
                     tx.commit()?;
@@ -1930,12 +1969,15 @@ impl Datastore {
                 // duplicate proposals converge at apply time.
                 Self::append_applied_outbox_ledger_mutation(
                     &mut commit,
-                    claim_key.clone(),
-                    subject_key.clone(),
-                    claim_operation.clone(),
-                    now,
-                    status_stamp,
-                    None,
+                    AppliedOutboxLedgerInput {
+                        idempotency_key: claim_key.clone(),
+                        subject_key: subject_key.clone(),
+                        operation: claim_operation.clone(),
+                        first_seen_ms: now,
+                        status_stamp,
+                        terminal_error: None,
+                    },
+                    &context,
                 );
                 tx.commit()?;
                 Ok(BuildOutboxTxnOutcome::Built {
@@ -1958,12 +2000,16 @@ impl Datastore {
                 terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
-                if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
+                let context = outbox_codec::TransactionContext::new(self.outbox_codec.as_ref());
+                if let Some(message) =
+                    Self::cached_outbox_terminal_error(record.as_ref(), &context)?
+                {
                     return Err(klights_cluster_core::OutboxApplyError::ConflictTerminal(
                         message,
                     ));
                 }
-                let committed_resource = Self::cached_outbox_committed_resource(record.as_ref())?;
+                let committed_resource =
+                    Self::cached_outbox_committed_resource(record.as_ref(), &context)?;
                 Ok(BuildOutboxOutcome::AlreadyApplied {
                     applied_rv: record.as_ref().and_then(|r| r.applied_rv),
                     committed_resource,
@@ -2007,9 +2053,11 @@ impl Datastore {
         let claim_operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
         let watermark_for_tx = watermark.clone();
+        let outbox_codec = self.outbox_codec.clone();
 
         let outcome = self
             .db_call("db_build_log_apply_commit_for_outbox_watermark", move |conn| {
+                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if let Some(existing) =
                     Self::completed_outbox_record_in_tx(&tx, &claim_key)?
@@ -2071,12 +2119,15 @@ impl Datastore {
                     Self::set_live_commit_watermark(&mut commit, watermark_for_tx);
                     Self::append_applied_outbox_ledger_mutation(
                         &mut commit,
-                        claim_key.clone(),
-                        subject_key.clone(),
-                        claim_operation.clone(),
-                        now,
-                        status_stamp,
-                        Some(&terminal_error),
+                        AppliedOutboxLedgerInput {
+                            idempotency_key: claim_key.clone(),
+                            subject_key: subject_key.clone(),
+                            operation: claim_operation.clone(),
+                            first_seen_ms: now,
+                            status_stamp,
+                            terminal_error: Some(&terminal_error),
+                        },
+                        &context,
                     );
                     tx.commit()?;
                     return Ok(BuildOutboxTxnOutcome::Built {
@@ -2095,12 +2146,15 @@ impl Datastore {
                     Self::set_live_commit_watermark(&mut commit, watermark_for_tx);
                     Self::append_applied_outbox_ledger_mutation(
                         &mut commit,
-                        claim_key.clone(),
-                        subject_key.clone(),
-                        claim_operation.clone(),
-                        now,
-                        status_stamp,
-                        None,
+                        AppliedOutboxLedgerInput {
+                            idempotency_key: claim_key.clone(),
+                            subject_key: subject_key.clone(),
+                            operation: claim_operation.clone(),
+                            first_seen_ms: now,
+                            status_stamp,
+                            terminal_error: None,
+                        },
+                        &context,
                     );
                     tx.commit()?;
                     return Ok(BuildOutboxTxnOutcome::Built {
@@ -2124,12 +2178,15 @@ impl Datastore {
                         Self::set_live_commit_watermark(&mut commit, watermark_for_tx);
                         Self::append_applied_outbox_ledger_mutation(
                             &mut commit,
-                            claim_key.clone(),
-                            subject_key.clone(),
-                            claim_operation.clone(),
-                            now,
-                            status_stamp,
-                            Some(&terminal_error),
+                            AppliedOutboxLedgerInput {
+                                idempotency_key: claim_key.clone(),
+                                subject_key: subject_key.clone(),
+                                operation: claim_operation.clone(),
+                                first_seen_ms: now,
+                                status_stamp,
+                                terminal_error: Some(&terminal_error),
+                            },
+                            &context,
                         );
                         tx.commit()?;
                         return Ok(BuildOutboxTxnOutcome::Built {
@@ -2145,12 +2202,15 @@ impl Datastore {
                 Self::set_live_commit_watermark(&mut commit, watermark_for_tx);
                 Self::append_applied_outbox_ledger_mutation(
                     &mut commit,
-                    claim_key.clone(),
-                    subject_key.clone(),
-                    claim_operation.clone(),
-                    now,
-                    status_stamp,
-                    None,
+                    AppliedOutboxLedgerInput {
+                        idempotency_key: claim_key.clone(),
+                        subject_key: subject_key.clone(),
+                        operation: claim_operation.clone(),
+                        first_seen_ms: now,
+                        status_stamp,
+                        terminal_error: None,
+                    },
+                    &context,
                 );
                 tx.commit()?;
                 Ok(BuildOutboxTxnOutcome::Built {
@@ -2173,7 +2233,9 @@ impl Datastore {
                 terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
-                let committed_resource = Self::cached_outbox_committed_resource(record.as_ref())?;
+                let context = outbox_codec::TransactionContext::new(self.outbox_codec.as_ref());
+                let committed_resource =
+                    Self::cached_outbox_committed_resource(record.as_ref(), &context)?;
                 Ok(BuildOutboxOutcome::AlreadyApplied {
                     applied_rv: record.as_ref().and_then(|r| r.applied_rv),
                     committed_resource,
@@ -2245,8 +2307,10 @@ impl Datastore {
         let claim_key = idempotency_key.to_string();
         let claim_operation = operation.to_string();
         let authoring_node = authoring_node.to_string();
+        let outbox_codec = self.outbox_codec.clone();
         let outcome = self
             .db_call("db_apply_outbox_atomic", move |conn| {
+                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let pod_state = |tx: &rusqlite::Transaction<'_>| {
                     let Some((namespace, name)) = pod_target.as_ref() else {
@@ -2309,11 +2373,12 @@ impl Datastore {
                         Option::<i64>::None
                     ],
                 )?;
-                let mutation = Self::apply_outbox_command_in_tx(
+                let mutation = Self::apply_outbox_command_in_tx_with_context(
                     &tx,
                     command,
                     &claim_operation,
                     &authoring_node,
+                    &context,
                 )?;
                 let pod_after = pod_state(&tx)?;
                 let pod_endpoint_effect = if pod_target.is_none() {
@@ -2390,10 +2455,14 @@ impl Datastore {
                 .with_committed_resource(committed_resource))
             }
             OutboxTxnOutcome::AlreadyApplied(record) => {
-                if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
+                let context = outbox_codec::TransactionContext::new(self.outbox_codec.as_ref());
+                if let Some(message) =
+                    Self::cached_outbox_terminal_error(record.as_ref(), &context)?
+                {
                     return Err(OutboxApplyError::ConflictTerminal(message));
                 }
-                let committed_resource = Self::cached_outbox_committed_resource(record.as_ref())?;
+                let committed_resource =
+                    Self::cached_outbox_committed_resource(record.as_ref(), &context)?;
                 let applied_rv = record.as_ref().and_then(|record| record.applied_rv);
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     klights_cluster_core::OutboxApplyOutcome::AlreadyApplied { applied_rv },
@@ -2414,14 +2483,14 @@ impl Datastore {
     ///   - All StorageCommand variants are supported (no "unsupported" gap)
     ///   - Leader-local outbox apply and raft state-machine replay share row semantics
     ///   - The applied outbox result is derived from the same committed mutation data
-    fn apply_outbox_command_in_tx(
+    fn apply_outbox_command_in_tx_with_context(
         tx: &rusqlite::Transaction<'_>,
         command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
+        context: &outbox_codec::TransactionContext<'_>,
     ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
         use klights_cluster_core::StorageResponse;
-        use klights_cluster_datastore::encode_outbox_response;
 
         let durable_actor_cascade = Self::is_bound_pod_finalization_delivery(&command, operation);
         let candidate_rv = Self::current_resource_version_in_tx(tx)?.saturating_add(1);
@@ -2434,9 +2503,10 @@ impl Datastore {
         )?;
 
         let (applied_rv, pending, applied_mutation) =
-            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv_and_mutation(
+            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv_and_mutation_with_context(
                 tx,
                 commit,
+                context,
             )?;
 
         let pending_event = pending.into_iter().next();
@@ -2458,13 +2528,31 @@ impl Datastore {
                 resource_version: applied_rv,
             }
         };
-        let result_proto = encode_outbox_response(&response).unwrap_or_default();
+        let result_proto = context.encode(&response).unwrap_or_default();
         Ok(AtomicOutboxMutation {
             applied_rv: Some(applied_rv),
             result_proto,
             pending: pending_event,
             committed_resource,
         })
+    }
+
+    #[cfg(test)]
+    fn apply_outbox_command_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        command: klights_cluster_core::command::StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
+        let codec = crate::outbox_response_codec_adapter::new_codec();
+        let context = outbox_codec::TransactionContext::new(codec.as_ref());
+        Self::apply_outbox_command_in_tx_with_context(
+            tx,
+            command,
+            operation,
+            authoring_node,
+            &context,
+        )
     }
 
     fn resource_snapshot_for_key_at_rv_in_tx(
@@ -2989,6 +3077,7 @@ impl Datastore {
 
     fn cached_outbox_terminal_error(
         record: Option<&AppliedOutboxRecord>,
+        context: &outbox_codec::TransactionContext<'_>,
     ) -> std::result::Result<Option<String>, klights_cluster_core::OutboxApplyError> {
         let Some(record) = record else {
             return Ok(None);
@@ -2996,7 +3085,7 @@ impl Datastore {
         if record.result_proto.is_empty() {
             return Ok(None);
         }
-        match klights_cluster_datastore::decode_outbox_response(&record.result_proto) {
+        match context.decode(&record.result_proto) {
             Ok(klights_cluster_core::command::StorageResponse::Error { message }) => {
                 Ok(Some(message))
             }
@@ -3009,6 +3098,7 @@ impl Datastore {
 
     fn cached_outbox_committed_resource(
         record: Option<&AppliedOutboxRecord>,
+        context: &outbox_codec::TransactionContext<'_>,
     ) -> std::result::Result<
         Option<crate::datastore::Resource>,
         klights_cluster_core::OutboxApplyError,
@@ -3016,7 +3106,7 @@ impl Datastore {
         let Some(record) = record else {
             return Ok(None);
         };
-        match klights_cluster_datastore::decode_outbox_response(&record.result_proto) {
+        match context.decode(&record.result_proto) {
             Ok(klights_cluster_core::command::StorageResponse::Resource {
                 resource_version,
                 data,
@@ -3233,6 +3323,8 @@ impl Datastore {
         executor: DbExecutor,
         read_executor: DbExecutor,
         snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
+        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
         let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
@@ -3240,7 +3332,8 @@ impl Datastore {
         Ok(Self {
             executor,
             read_executor,
-            watch_bus: std::sync::Arc::new(WatchBus::new(1024)),
+            commit_sink,
+            outbox_codec,
             pod_endpoint_tx,
             pod_slot_admission_tx,
             snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
@@ -3251,15 +3344,28 @@ impl Datastore {
             ),
             #[cfg(test)]
             resource_get_call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            post_commit_publish_pause: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
-    async fn from_executor(executor: DbExecutor) -> Result<Self> {
+    async fn from_executor(
+        executor: DbExecutor,
+        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+    ) -> Result<Self> {
         let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
             snapshot_capture::SqliteSnapshotFactory::new(opts, executor.task_supervisor())
         });
         let read_executor = executor.read_lane_clone();
-        Self::from_executors(executor, read_executor, snapshot_factory).await
+        Self::from_executors(
+            executor,
+            read_executor,
+            snapshot_factory,
+            commit_sink,
+            outbox_codec,
+        )
+        .await
     }
 
     /// Production constructor — open a persistent on-disk database.
@@ -3268,10 +3374,12 @@ impl Datastore {
     ///
     /// If `key_file` is `Some`, the DB is opened with SQLCipher encryption
     /// (requires the `sqlcipher` cargo feature).
-    pub async fn new_persistent_paths(
+    pub async fn new_persistent_paths_with_sink(
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
         key_file: Option<&std::path::Path>,
+        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
         let db_path = cluster_db_path.to_path_buf();
         let opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
@@ -3307,7 +3415,14 @@ impl Datastore {
         })?;
         let snapshot_factory =
             snapshot_capture::SqliteSnapshotFactory::new(read_opts, supervisor.clone());
-        let ds = Self::from_executors(executor, read_executor, Some(snapshot_factory)).await?;
+        let ds = Self::from_executors(
+            executor,
+            read_executor,
+            Some(snapshot_factory),
+            commit_sink,
+            outbox_codec,
+        )
+        .await?;
 
         // Log DB size at startup for operator triage (DSB-05).
         let (db_size, wal_size) = opener::persistent_datastore_sizes(&supervisor, &db_path).await?;
@@ -3320,6 +3435,22 @@ impl Datastore {
         );
 
         Ok(ds)
+    }
+
+    #[cfg(test)]
+    pub async fn new_persistent_paths(
+        cluster_db_path: &std::path::Path,
+        supervisor: std::sync::Arc<TaskSupervisor>,
+        key_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        Self::new_persistent_paths_with_sink(
+            cluster_db_path,
+            supervisor,
+            key_file,
+            crate::watch_commit_observation_adapter::new_sink(),
+            crate::outbox_response_codec_adapter::new_codec(),
+        )
+        .await
     }
 
     /// Compatibility constructor for tests and helper call sites that still pass
@@ -3350,13 +3481,40 @@ impl Datastore {
             .snapshot_open_opts()
             .map(|opts| snapshot_capture::SqliteSnapshotFactory::new(opts, supervisor.clone()));
         let read_executor = executor.read_lane_clone();
-        Self::from_executors(executor, read_executor, snapshot_factory).await
+        Self::from_executors(
+            executor,
+            read_executor,
+            snapshot_factory,
+            crate::watch_commit_observation_adapter::new_sink(),
+            crate::outbox_response_codec_adapter::new_codec(),
+        )
+        .await
     }
 
     /// Shared production + test constructor when an externally-created
     /// `DbExecutor` is already available (in-memory or persistent).
+    pub async fn new_in_memory_with_watch_and_executor_with_sink(
+        executor: DbExecutor,
+        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+    ) -> Result<Self> {
+        Self::from_executor(executor, commit_sink, outbox_codec).await
+    }
+
+    #[cfg(test)]
     pub async fn new_in_memory_with_watch_and_executor(executor: DbExecutor) -> Result<Self> {
-        Self::from_executor(executor).await
+        Self::new_in_memory_with_watch_and_executor_with_sink(
+            executor,
+            crate::watch_commit_observation_adapter::new_sink(),
+            crate::outbox_response_codec_adapter::new_codec(),
+        )
+        .await
+    }
+}
+
+impl crate::datastore::CommitObservationStore for Datastore {
+    fn commit_observation_sink(&self) -> std::sync::Arc<dyn CommitObservationSink> {
+        self.commit_sink.clone()
     }
 }
 
@@ -3539,10 +3697,6 @@ impl DatastoreBackend for Datastore {
         Datastore::seed_namespace_no_rv(self, name)
             .await
             .expect("seed namespace for test");
-    }
-
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        Datastore::subscribe_watch_signals(self, topic)
     }
 
     #[cfg(test)]

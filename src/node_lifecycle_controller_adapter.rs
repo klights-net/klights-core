@@ -3,22 +3,23 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::StreamExt as _;
+use klights_leader_api::{
+    LeaderWatch, LeaderWatchError, WatchEventType, WatchRequest, WatchStream,
+};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
 };
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery, WatchTarget};
+use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
 use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
 };
 use crate::kubelet::pod_repository::{PodReader, PodSubresourceWriter};
-use crate::watch::{SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WindowPolicy};
 use klights_cluster_core::Resource;
-use klights_watch::{WatchSignalReceiver, WatchTopic};
 
 #[async_trait]
 impl<T> NodeLifecycleStore for T
@@ -97,6 +98,7 @@ pub(crate) struct NodeLifecycleControllerDependencies {
     pub(crate) lease_observations: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+    pub(crate) watch: Arc<dyn LeaderWatch>,
 }
 
 pub(crate) async fn run_node_lifecycle_controller(
@@ -111,7 +113,15 @@ pub(crate) async fn run_node_lifecycle_controller(
         lease_observations: node_lease_tracker,
         supervisor: task_supervisor,
         node_status,
+        watch,
     } = dependencies;
+    let mut events = match open_node_lifecycle_watches(watch.as_ref()).await {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!("node_lifecycle: failed to open positioned watches: {error:#}");
+            return;
+        }
+    };
     if let Err(err) =
         crate::controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
             db.as_ref(),
@@ -128,37 +138,6 @@ pub(crate) async fn run_node_lifecycle_controller(
         node_lease_tracker.reset_grace_window(Utc::now()).await;
     } else if !wait_for_leadership(node_lease_tracker.as_ref(), &cancel, &mut is_leader_rx).await {
         return;
-    }
-
-    let watch_topics = vec![
-        WatchTopic::new("v1", "Node"),
-        WatchTopic::new("coordination.k8s.io/v1", "Lease"),
-    ];
-    let signal_rx = WatchSignalReceiver::new(
-        watch_topics
-            .iter()
-            .cloned()
-            .map(|topic| db.subscribe_watch_signals(topic))
-            .collect(),
-    );
-    let mut cursor = SignalWatchCursor::new_many(
-        signal_rx,
-        DatastoreWatchReplaySource::new(
-            Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                db.clone(),
-            )),
-            vec![
-                WatchTarget::cluster("v1", "Node"),
-                WatchTarget::cluster("coordination.k8s.io/v1", "Lease"),
-            ],
-        ),
-        watch_topics,
-        WatchDeliveryScope::Cluster,
-        db.get_current_resource_version().await.unwrap_or(0),
-        WindowPolicy::default_watch_delivery(),
-    );
-    if let Err(err) = cursor.prime_replay_or_expired().await {
-        tracing::warn!(?err, "node_lifecycle: initial replay failed");
     }
 
     let mut retry_attempt = 0u32;
@@ -220,7 +199,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                     None
                 }
                 _ = node_lease_tracker.wait_changed() => None,
-                event = cursor.next_event() => Some(event),
+                event = events.next() => event,
             }
         } else {
             tokio::select! {
@@ -238,7 +217,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                     None
                 }
                 _ = node_lease_tracker.wait_changed() => None,
-                event = cursor.next_event() => Some(event),
+                event = events.next() => event,
             }
         };
         let Some(watch_result) = maybe_event else {
@@ -260,8 +239,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                         "node_lifecycle: failed to refresh lease from watch event: {err:#}"
                     );
                 }
-                if event.event_type == crate::watch::EventType::Deleted
-                    && event.object.get("kind").and_then(|value| value.as_str()) == Some("Node")
+                if event.event_type() == WatchEventType::Deleted && event.resource().kind == "Node"
                 {
                     loop {
                         match crate::controllers::node_lifecycle::cleanup_pods_bound_to_deleted_node_event(
@@ -304,7 +282,29 @@ pub(crate) async fn run_node_lifecycle_controller(
                     continue;
                 }
             }
-            Err(WatchCursorError::Closed) => break,
+            Err(LeaderWatchError::ReplayExpired { .. }) => {
+                tracing::warn!(
+                    "node_lifecycle watch replay expired; refreshing lease state and reopening"
+                );
+                if let Err(error) =
+                    crate::controllers::node_lifecycle::refresh_node_lease_tracker_from_cluster_leases(
+                        db.as_ref(),
+                        node_lease_tracker.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::warn!("node_lifecycle lease refresh failed: {error:#}");
+                }
+                match open_node_lifecycle_watches(watch.as_ref()).await {
+                    Ok(reopened) => {
+                        events = reopened;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!("node_lifecycle positioned watch reopen failed: {error:#}");
+                    }
+                }
+            }
             Err(err) => {
                 tracing::warn!("node_lifecycle watch error: {err:#?}");
                 let attempt = retry_attempt;
@@ -315,6 +315,24 @@ pub(crate) async fn run_node_lifecycle_controller(
             }
         }
     }
+}
+
+async fn open_node_lifecycle_watches(
+    watch: &dyn LeaderWatch,
+) -> std::result::Result<futures::stream::SelectAll<WatchStream>, LeaderWatchError> {
+    let mut sessions = Vec::with_capacity(2);
+    for (api_version, kind, namespace) in [
+        ("v1", "Node", None),
+        (
+            "coordination.k8s.io/v1",
+            "Lease",
+            Some("kube-node-lease".to_string()),
+        ),
+    ] {
+        let request = WatchRequest::try_new(api_version, kind, namespace, None, None, None, None)?;
+        sessions.push(watch.watch_resources(request).await?);
+    }
+    Ok(futures::stream::select_all(sessions))
 }
 
 async fn wait_for_leadership(

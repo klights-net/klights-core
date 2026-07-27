@@ -985,11 +985,13 @@ crate::control_plane::client::impl_unavailable_leader_pod_effects!(FreshServiceI
 
 #[tokio::test]
 async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {
-    let api = FreshServiceInventoryClient::default();
+    let api = std::sync::Arc::new(FreshServiceInventoryClient::default());
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build");
 
     assert_eq!(
         api.cached_list_calls
@@ -1030,14 +1032,16 @@ async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {
 
 #[tokio::test]
 async fn service_specs_from_api_uses_bounded_bulk_fresh_inventory() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_partial: true,
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build from bulk inventory");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build from bulk inventory");
 
     assert_eq!(specs.len(), 1);
     assert_eq!(
@@ -1074,16 +1078,18 @@ async fn service_specs_from_api_uses_bounded_bulk_fresh_inventory() {
 
 #[tokio::test]
 async fn service_specs_from_api_prefers_observed_endpointslice_state_over_larger_legacy_snapshot() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_partial: true,
         legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string(), "10.50.0.3".to_string()]),
         endpointslice_endpoint_ips: Some(vec!["10.50.0.20".to_string()]),
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build from the authoritative EndpointSlice source");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build from the authoritative EndpointSlice source");
 
     assert_eq!(specs.len(), 1);
     let mut tuples: Vec<_> = specs[0]
@@ -1111,16 +1117,18 @@ async fn service_specs_from_api_prefers_observed_endpointslice_state_over_larger
 
 #[tokio::test]
 async fn service_specs_from_api_observed_empty_endpointslice_does_not_revive_stale_legacy() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_partial: true,
         legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string()]),
         endpointslice_endpoint_ips: Some(Vec::new()),
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("observed empty EndpointSlice state should still build deterministically");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("observed empty EndpointSlice state should still build deterministically");
 
     assert_eq!(specs.len(), 1);
     assert!(
@@ -1132,14 +1140,16 @@ async fn service_specs_from_api_observed_empty_endpointslice_does_not_revive_sta
 
 #[tokio::test]
 async fn service_specs_from_api_falls_back_to_ready_endpointslices_when_legacy_endpoints_empty() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_empty: true,
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build from EndpointSlices");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build from EndpointSlices");
 
     assert_eq!(specs.len(), 1);
     let mut tuples: Vec<_> = specs[0]
@@ -1167,14 +1177,16 @@ async fn service_specs_from_api_falls_back_to_ready_endpointslices_when_legacy_e
 
 #[tokio::test]
 async fn service_specs_from_api_prefers_complete_endpointslices_over_partial_legacy_endpoints() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_partial: true,
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build from EndpointSlices");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build from EndpointSlices");
 
     assert_eq!(specs.len(), 1);
     let mut tuples: Vec<_> = specs[0]
@@ -1202,7 +1214,7 @@ async fn service_specs_from_api_prefers_complete_endpointslices_over_partial_leg
 
 #[tokio::test]
 async fn service_specs_from_api_merges_protocol_ports_from_partial_endpoint_sources() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_partial: true,
         legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string()]),
         endpointslice_endpoint_ips: Some(vec!["10.50.0.20".to_string()]),
@@ -1217,11 +1229,13 @@ async fn service_specs_from_api_merges_protocol_ports_from_partial_endpoint_sour
             json!({"name": "tcp-port", "port": 80, "protocol": "TCP"}),
         ]),
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build from both endpoint sources");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build from both endpoint sources");
 
     assert_eq!(specs.len(), 1);
     let mut tuples: Vec<_> = specs[0]
@@ -1249,7 +1263,7 @@ async fn service_specs_from_api_merges_protocol_ports_from_partial_endpoint_sour
 
 #[tokio::test]
 async fn service_specs_from_api_preserves_sctp_endpointslice_ports() {
-    let api = FreshServiceInventoryClient {
+    let api = std::sync::Arc::new(FreshServiceInventoryClient {
         legacy_endpoints_empty: true,
         service_ports: Some(vec![
             json!({"name": "sctp", "port": 5000, "protocol": "SCTP"}),
@@ -1258,11 +1272,13 @@ async fn service_specs_from_api_preserves_sctp_endpointslice_ports() {
             json!({"name": "sctp", "port": 5000, "protocol": "SCTP"}),
         ]),
         ..Default::default()
-    };
+    });
 
-    let specs = service_specs_from_api(&api)
-        .await
-        .expect("service specs should build from EndpointSlice SCTP ports");
+    let specs = service_specs_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("service specs should build from EndpointSlice SCTP ports");
 
     assert_eq!(specs.len(), 1);
     let tuples: Vec<_> = specs[0]
@@ -1281,11 +1297,13 @@ async fn service_specs_from_api_preserves_sctp_endpointslice_ports() {
 
 #[tokio::test]
 async fn coalesced_sync_uses_cached_inventory_after_initial_snapshot() {
-    let api = FreshServiceInventoryClient::default();
+    let api = std::sync::Arc::new(FreshServiceInventoryClient::default());
     // Initial snapshot: builds inventory from the API.
-    let inventory = bootstrap_inventory_from_api(&api)
-        .await
-        .expect("bootstrap inventory");
+    let inventory = bootstrap_inventory_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("bootstrap inventory");
     assert!(
         !inventory.is_empty()
             || api
@@ -1326,10 +1344,12 @@ async fn coalesced_sync_uses_cached_inventory_after_initial_snapshot() {
 #[tokio::test]
 async fn service_route_sync_does_not_query_api_per_service() {
     // Set up several services so the count is meaningful.
-    let api = FreshServiceInventoryClient::default();
-    let inventory = bootstrap_inventory_from_api(&api)
-        .await
-        .expect("bootstrap inventory");
+    let api = std::sync::Arc::new(FreshServiceInventoryClient::default());
+    let inventory = bootstrap_inventory_from_api(
+        &crate::networking_state_adapter::LeaderRoutingStateAdapter::new(api.clone()),
+    )
+    .await
+    .expect("bootstrap inventory");
     let svc_count = inventory.to_specs().len();
 
     // Whatever the number of Services discovered, the bootstrap must use

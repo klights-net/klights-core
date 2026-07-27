@@ -1004,11 +1004,11 @@ mod tests {
         .await
         .unwrap();
 
-        let dispatcher = std::sync::Arc::new(
-            crate::controller_dispatcher::ControllerDispatcher::new(std::sync::Arc::new(
-                crate::controllers::service::ServiceIpam::new("10.43.128.0/17"),
+        let dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
+            std::sync::Arc::new(crate::controllers::service::ServiceIpam::new(
+                "10.43.128.0/17",
             )),
-        );
+        ));
         dispatcher
             .set_sync_context(std::sync::Arc::new(db.clone()), "test-node".to_string())
             .await;

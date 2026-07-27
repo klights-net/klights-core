@@ -2,13 +2,14 @@ use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::{
     OrphanReason, PodLifecycleRouteError, PodLifecycleRouter, enqueue_orphan_finalize,
 };
-use crate::watch::{EventType, WatchEvent};
+use crate::kubelet::pod_watch_source::PodWatchEvent;
+use klights_leader_api::WatchEventType;
 
 pub struct OrphanScanner;
 
 impl OrphanScanner {
-    pub fn key_for_deleted_pod(event: &WatchEvent) -> Option<PodLifecycleKey> {
-        if event.event_type != EventType::Deleted {
+    pub fn key_for_deleted_pod(event: &PodWatchEvent) -> Option<PodLifecycleKey> {
+        if event.event_type != WatchEventType::Deleted {
             return None;
         }
         let namespace = event
@@ -28,7 +29,7 @@ impl OrphanScanner {
 
     pub async fn scan_deleted_event(
         router: &PodLifecycleRouter,
-        event: &WatchEvent,
+        event: &PodWatchEvent,
     ) -> Result<bool, PodLifecycleRouteError> {
         let Some(key) = Self::key_for_deleted_pod(event) else {
             return Ok(false);
@@ -42,15 +43,14 @@ impl OrphanScanner {
 mod tests {
     use super::*;
 
-    fn deleted_pod_event() -> WatchEvent {
-        WatchEvent {
-            event_type: EventType::Deleted,
+    fn deleted_pod_event() -> PodWatchEvent {
+        PodWatchEvent {
+            event_type: WatchEventType::Deleted,
             object: std::sync::Arc::new(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {"namespace": "default", "name": "web", "uid": "uid-web"}
             })),
-            encoded_payload: None,
         }
     }
 
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn non_deleted_event_is_ignored() {
         let mut event = deleted_pod_event();
-        event.event_type = EventType::Modified;
+        event.event_type = WatchEventType::Modified;
         assert!(OrphanScanner::key_for_deleted_pod(&event).is_none());
     }
 }

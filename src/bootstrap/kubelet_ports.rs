@@ -1,15 +1,52 @@
 use std::sync::Arc;
 
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CurrentResourceVersionStore, WatchStore};
+use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 use crate::kubelet::node_heartbeat::{
     NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
 };
-use crate::kubelet::pod_watch_source::{BoxedWatchReplaySource, PodWatchSource};
+use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WindowPolicy,
 };
 use klights_watch::WatchTopic;
+
+struct BoxedWatchReplaySource {
+    inner: Arc<dyn crate::watch::WatchReplaySource>,
+}
+
+impl BoxedWatchReplaySource {
+    fn new(inner: Arc<dyn crate::watch::WatchReplaySource>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::watch::WatchReplaySource for BoxedWatchReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<crate::watch::WatchEvent>> {
+        self.inner.replay_since(since_rv).await
+    }
+
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<klights_watch::WatchReplayRead<crate::watch::WatchEvent>> {
+        self.inner.replay_since_checked(since_rv, limit).await
+    }
+
+    async fn replay_after_checked(
+        &self,
+        position: klights_watch::WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<crate::watch::WatchEvent>> {
+        self.inner.replay_after_checked(position, limit).await
+    }
+
+    async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
+        self.inner.earliest_retained_rv().await
+    }
+}
 
 pub struct SystemNodeHeartbeatClock;
 
@@ -55,11 +92,12 @@ impl LeaderPersistentVolumeEventHandler {
 impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
     for LeaderPersistentVolumeEventHandler
 {
-    async fn handle_pvc_event(&self, event: &crate::watch::WatchEvent, event_name: &str) {
+    async fn handle_pvc_event(&self, event: &PodWatchEvent, event_name: &str) {
         if !*self.is_leader_rx.borrow()
             || !matches!(
                 event.event_type,
-                crate::watch::EventType::Added | crate::watch::EventType::Modified
+                klights_leader_api::WatchEventType::Added
+                    | klights_leader_api::WatchEventType::Modified
             )
         {
             return;
@@ -77,8 +115,10 @@ impl crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler
         }
     }
 
-    async fn handle_pv_event(&self, event: &crate::watch::WatchEvent, _event_name: &str) {
-        if !*self.is_leader_rx.borrow() || event.event_type != crate::watch::EventType::Added {
+    async fn handle_pv_event(&self, event: &PodWatchEvent, _event_name: &str) {
+        if !*self.is_leader_rx.borrow()
+            || event.event_type != klights_leader_api::WatchEventType::Added
+        {
             return;
         }
         let Ok(pvcs) = self
@@ -293,18 +333,23 @@ impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter
 
 pub struct DatastorePodWatchSource {
     watch_store: Arc<dyn WatchStore>,
+    watch_signals: Arc<dyn crate::watch_commit_observation_adapter::WatchSignalSource>,
     resource_versions: Arc<dyn CurrentResourceVersionStore>,
+    leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
     heartbeat_cursor: tokio::sync::Mutex<Option<SignalWatchCursor<BoxedWatchReplaySource>>>,
 }
 
 impl DatastorePodWatchSource {
     pub fn new<T>(store: Arc<T>) -> Self
     where
-        T: WatchStore + CurrentResourceVersionStore + 'static,
+        T: WatchStore + CurrentResourceVersionStore + klights_leader_api::LeaderWatch + 'static,
+        T: crate::watch_commit_observation_adapter::WatchSignalSource,
     {
         Self {
             watch_store: store.clone(),
-            resource_versions: store,
+            watch_signals: store.clone(),
+            resource_versions: store.clone(),
+            leader_watch: store,
             heartbeat_cursor: tokio::sync::Mutex::new(None),
         }
     }
@@ -312,61 +357,80 @@ impl DatastorePodWatchSource {
 
 #[async_trait::async_trait]
 impl PodWatchSource for DatastorePodWatchSource {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_store.subscribe_watch_signals(topic)
-    }
-
-    fn replay_source(&self, targets: Vec<klights_watch::WatchTarget>) -> BoxedWatchReplaySource {
-        BoxedWatchReplaySource::new(Arc::new(DatastoreWatchReplaySource::new(
-            self.watch_store.clone(),
-            targets.into_iter().map(datastore_watch_target).collect(),
-        )))
-    }
-
-    async fn current_resource_version(&self) -> anyhow::Result<i64> {
-        self.resource_versions.get_current_resource_version().await
+    fn open_pod_manager_watch(
+        &self,
+        node_name: String,
+    ) -> crate::kubelet::pod_watch_source::PodWatchFuture<'_> {
+        Box::pin(async move {
+            let requests = [
+                klights_leader_api::WatchRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    Some(format!("spec.nodeName={node_name}")),
+                    None,
+                    None,
+                )?,
+                klights_leader_api::WatchRequest::try_new(
+                    "v1",
+                    "PersistentVolumeClaim",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+                klights_leader_api::WatchRequest::try_new(
+                    "v1",
+                    "PersistentVolume",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+                klights_leader_api::WatchRequest::try_new(
+                    "v1", "Secret", None, None, None, None, None,
+                )?,
+                klights_leader_api::WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+                klights_leader_api::WatchRequest::try_new(
+                    "v1",
+                    "Namespace",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+            ];
+            let mut streams = Vec::with_capacity(requests.len());
+            for request in requests {
+                streams.push(self.leader_watch.watch_resources(request).await?);
+            }
+            use futures::StreamExt as _;
+            let stream = futures::stream::select_all(streams).map(|event| {
+                event.map(crate::kubelet::pod_watch_source::PodWatchEvent::from_resource_event)
+            });
+            Ok(Box::pin(stream) as PodWatchStream)
+        })
     }
 }
 
 impl crate::api::pod_subresources::logs::PodLogFollowWatchPort for DatastorePodWatchSource {
-    fn subscribe_pod_watch_signals(&self) -> klights_watch::WatchSignalReceiver {
-        self.watch_store
-            .subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "Pod"))
-    }
-
-    fn pod_watch_replay_source(
-        &self,
-    ) -> crate::api::pod_subresources::logs::PodLogFollowReplaySource {
-        crate::api::pod_subresources::logs::PodLogFollowReplaySource::new(Arc::new(
-            DatastoreWatchReplaySource::new(
-                self.watch_store.clone(),
-                vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
-            ),
-        ))
-    }
-
-    fn current_resource_version(
-        &self,
-    ) -> crate::api::pod_subresources::logs::PodLogFollowResourceVersionFuture<'_> {
-        Box::pin(async move { self.resource_versions.get_current_resource_version().await })
-    }
-}
-
-fn datastore_watch_target(target: klights_watch::WatchTarget) -> crate::datastore::WatchTarget {
-    match target.scope() {
-        klights_watch::WatchTargetScope::Cluster => {
-            crate::datastore::WatchTarget::cluster(target.api_version(), target.kind())
-        }
-        klights_watch::WatchTargetScope::Namespaced(None) => {
-            crate::datastore::WatchTarget::namespaced(target.api_version(), target.kind())
-        }
-        klights_watch::WatchTargetScope::Namespaced(Some(namespace)) => {
-            crate::datastore::WatchTarget::namespaced_in_namespace(
-                target.api_version(),
-                target.kind(),
-                namespace,
-            )
-        }
+    fn open_pod_watch(&self) -> klights_leader_api::LeaderWatchFuture<'_> {
+        let request =
+            klights_leader_api::WatchRequest::try_new("v1", "Pod", None, None, None, None, None)
+                .expect("Pod log follow watch identity is valid");
+        self.leader_watch.watch_resources(request)
     }
 }
 
@@ -382,7 +446,7 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
                         vec![crate::datastore::WatchTarget::cluster("v1", "Node")],
                     )));
                 let mut next = SignalWatchCursor::new(
-                    self.watch_store.subscribe_watch_signals(topic.clone()),
+                    self.watch_signals.subscribe_signals(topic.clone()),
                     replay,
                     topic,
                     WatchDeliveryScope::Cluster,

@@ -13,7 +13,7 @@
 //! across its public surface — never a concrete `Datastore` — so the
 //! datastore backend stays pluggable behind the trait boundary.
 
-use crate::controller::{Context, Controller};
+use crate::controllers::{Context, Controller, ControllerRuntimeDependencies};
 use crate::controllers::{
     apiservice_controller::APIServiceController,
     daemonset_controller::DaemonSetController,
@@ -28,9 +28,10 @@ use crate::controllers::{
     statefulset_controller::StatefulSetController,
     workqueue::{Key, MAX_RETRY_ATTEMPTS, WorkQueue, backoff_for, controller_kind_static},
 };
+#[cfg(test)]
 use crate::datastore::DatastoreHandle;
+#[cfg(test)]
 use crate::hpa_controller_adapter::HpaController;
-use crate::kubelet::pod_repository::PodRepository;
 use anyhow::{Context as _, Result};
 use klights_reconcile_api::{
     ControllerReconcileSink, ReconcileKey, ReconcileSinkFuture, ServiceReconcileKey,
@@ -62,18 +63,25 @@ pub struct ControllerDispatcher {
     /// Datastore handle + node_name captured by the running worker, used by
     /// [`enqueue`] when no worker is registered (test mode) so the call still
     /// has somewhere to dispatch synchronously.
-    sync_ctx: Arc<Mutex<Option<(DatastoreHandle, String)>>>,
+    #[cfg(test)]
+    sync_ctx: Arc<Mutex<Option<(crate::datastore::DatastoreHandle, String)>>>,
     /// Service router shared across all dispatched controllers via
     /// [`Context::services`]. Set by bootstrap before the worker starts;
     /// `None` in tests that exercise non-Service controllers without a
     /// live router.
+    #[cfg(test)]
     services: Arc<Mutex<Option<Arc<dyn klights_network_api::ServiceRouter>>>>,
     /// Pod repository shared across all dispatched controllers via
     /// [`Context::pod_repository`]. Set by bootstrap before the worker
     /// starts; required by the Deployment and ReplicaSet controllers
     /// (they fail-fast at reconcile time if it is missing).
-    pod_repository: Arc<Mutex<Option<Arc<PodRepository>>>>,
+    #[cfg(test)]
+    pod_repository: Arc<Mutex<Option<Arc<crate::kubelet::pod_repository::PodRepository>>>>,
+    #[cfg(test)]
     metrics_provider: Arc<Mutex<Option<Arc<dyn crate::metrics::MetricsProvider>>>>,
+    #[cfg(not(test))]
+    dependencies: ControllerRuntimeDependencies,
+    #[cfg(test)]
     file_process: klights_supervisor::FileProcessExecutor,
     active_reconciles: Arc<Mutex<ActiveReconciles>>,
     active_reconciles_changed: Arc<Notify>,
@@ -86,6 +94,11 @@ struct ActiveReconciles {
 }
 
 impl ControllerDispatcher {
+    #[cfg(not(test))]
+    pub(crate) fn pod_delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
+        self.dependencies.pods.delete_sink()
+    }
+
     /// Create a new controller dispatcher with all available controllers
     #[cfg(test)]
     pub fn new(service_ipam: Arc<ServiceIpam>) -> Self {
@@ -97,6 +110,7 @@ impl ControllerDispatcher {
         )
     }
 
+    #[cfg(test)]
     pub fn with_task_supervisor(
         service_ipam: Arc<ServiceIpam>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -109,6 +123,7 @@ impl ControllerDispatcher {
         )
     }
 
+    #[cfg(test)]
     pub fn new_with_nodeport(
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
@@ -197,13 +212,119 @@ impl ControllerDispatcher {
         }
     }
 
+    fn controller_registry(
+        service_ipam: Arc<ServiceIpam>,
+        nodeport_alloc: Arc<NodePortAllocator>,
+        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        hpa_controller: Arc<dyn Controller>,
+    ) -> HashMap<(&'static str, &'static str), Arc<dyn Controller>> {
+        let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
+            HashMap::new();
+        controllers.insert(("apps/v1", "Deployment"), Arc::new(DeploymentController));
+        controllers.insert(("apps/v1", "ReplicaSet"), Arc::new(ReplicaSetController));
+        controllers.insert(("apps/v1", "StatefulSet"), Arc::new(StatefulSetController));
+        controllers.insert(("apps/v1", "DaemonSet"), Arc::new(DaemonSetController));
+        controllers.insert(("batch/v1", "Job"), Arc::new(JobController));
+        controllers.insert(
+            ("v1", "Service"),
+            Arc::new(ServiceController {
+                service_ipam,
+                nodeport_alloc,
+            }),
+        );
+        controllers.insert(("v1", "PersistentVolumeClaim"), Arc::new(PVCController));
+        controllers.insert(
+            ("v1", "ReplicationController"),
+            Arc::new(ReplicationControllerController),
+        );
+        controllers.insert(
+            ("policy/v1", "PodDisruptionBudget"),
+            Arc::new(PDBController),
+        );
+        controllers.insert(
+            ("autoscaling/v1", "HorizontalPodAutoscaler"),
+            hpa_controller.clone(),
+        );
+        controllers.insert(
+            ("autoscaling/v2", "HorizontalPodAutoscaler"),
+            hpa_controller,
+        );
+        controllers.insert(
+            ("apiregistration.k8s.io/v1", "APIService"),
+            Arc::new(APIServiceController),
+        );
+        if let Some(issuer) = csr_issuer {
+            controllers.insert(
+                ("certificates.k8s.io/v1", "CertificateSigningRequest"),
+                Arc::new(crate::controllers::csr_signer::CsrSignerController::new(
+                    issuer,
+                )),
+            );
+        }
+        controllers
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn new_complete(
+        service_ipam: Arc<ServiceIpam>,
+        nodeport_alloc: Arc<NodePortAllocator>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        hpa_controller: Arc<dyn Controller>,
+        dependencies: ControllerRuntimeDependencies,
+    ) -> Self {
+        let mut controllers =
+            Self::controller_registry(service_ipam, nodeport_alloc, csr_issuer, hpa_controller);
+        let queue = WorkQueue::with_task_supervisor(task_supervisor);
+        Self {
+            controllers: std::mem::take(&mut controllers),
+            queue,
+            retry_count: Arc::new(Mutex::new(HashMap::new())),
+            worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dependencies,
+            active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
+            active_reconciles_changed: Arc::new(Notify::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_complete(
+        service_ipam: Arc<ServiceIpam>,
+        nodeport_alloc: Arc<NodePortAllocator>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
+        hpa_controller: Arc<dyn Controller>,
+        _dependencies: ControllerRuntimeDependencies,
+    ) -> Self {
+        Self {
+            controllers: Self::controller_registry(
+                service_ipam,
+                nodeport_alloc,
+                csr_issuer,
+                hpa_controller,
+            ),
+            queue: WorkQueue::with_task_supervisor(task_supervisor.clone()),
+            retry_count: Arc::new(Mutex::new(HashMap::new())),
+            worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync_ctx: Arc::new(Mutex::new(None)),
+            services: Arc::new(Mutex::new(None)),
+            pod_repository: Arc::new(Mutex::new(None)),
+            metrics_provider: Arc::new(Mutex::new(None)),
+            file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
+            active_reconciles_changed: Arc::new(Notify::new()),
+        }
+    }
+
     /// Attach a live ServiceRouter so controllers (notably ServiceController)
     /// can request immediate nft sync via `Context::services`. Must be
     /// called by bootstrap before [`run_worker`] starts.
+    #[cfg(test)]
     pub async fn set_services(&self, services: Arc<dyn klights_network_api::ServiceRouter>) {
         *self.services.lock().await = Some(services);
     }
 
+    #[cfg(test)]
     async fn current_services(&self) -> Option<Arc<dyn klights_network_api::ServiceRouter>> {
         self.services.lock().await.clone()
     }
@@ -213,14 +334,22 @@ impl ControllerDispatcher {
     /// repository. Bootstrap must call this before [`run_worker`] starts;
     /// test fixtures that drive these controllers must call it before
     /// invoking [`reconcile`].
-    pub async fn set_pod_repository(&self, pod_repository: Arc<PodRepository>) {
+    #[cfg(test)]
+    pub async fn set_pod_repository(
+        &self,
+        pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
+    ) {
         *self.pod_repository.lock().await = Some(pod_repository);
     }
 
-    pub async fn current_pod_repository(&self) -> Option<Arc<PodRepository>> {
+    #[cfg(test)]
+    pub async fn current_pod_repository(
+        &self,
+    ) -> Option<Arc<crate::kubelet::pod_repository::PodRepository>> {
         self.pod_repository.lock().await.clone()
     }
 
+    #[cfg(test)]
     pub async fn set_metrics_provider(
         &self,
         metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
@@ -228,6 +357,7 @@ impl ControllerDispatcher {
         *self.metrics_provider.lock().await = Some(metrics_provider);
     }
 
+    #[cfg(test)]
     async fn current_metrics_provider(&self) -> Option<Arc<dyn crate::metrics::MetricsProvider>> {
         self.metrics_provider.lock().await.clone()
     }
@@ -241,6 +371,7 @@ impl ControllerDispatcher {
     /// to a synchronous `reconcile` so test fixtures that don't spawn the
     /// worker still observe the post-mutation reconcile side effects.
     pub async fn enqueue(&self, resource: &Value) {
+        #[cfg(test)]
         if !self
             .worker_running
             .load(std::sync::atomic::Ordering::Acquire)
@@ -310,19 +441,21 @@ impl ControllerDispatcher {
     /// re-enqueued with exponential backoff up to [`MAX_RETRY_ATTEMPTS`];
     /// persistent failures surface via `tracing::error!` and the key is
     /// dropped (the next mutation/watch event will re-enqueue it).
+    #[cfg(test)]
     pub async fn run_worker(
         self: Arc<Self>,
-        db_handle: DatastoreHandle,
+        db_handle: crate::datastore::DatastoreHandle,
         node_name: String,
         cancel: tokio_util::sync::CancellationToken,
     ) {
         self.run_worker_pool(1, db_handle, node_name, cancel).await;
     }
 
+    #[cfg(test)]
     pub async fn run_worker_pool(
         self: Arc<Self>,
         worker_count: usize,
-        db_handle: DatastoreHandle,
+        db_handle: crate::datastore::DatastoreHandle,
         node_name: String,
         cancel: tokio_util::sync::CancellationToken,
     ) {
@@ -351,10 +484,11 @@ impl ControllerDispatcher {
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(test)]
     async fn run_worker_loop(
         self: Arc<Self>,
         worker_id: usize,
-        db_handle: DatastoreHandle,
+        db_handle: crate::datastore::DatastoreHandle,
         node_name: String,
         cancel: tokio_util::sync::CancellationToken,
     ) {
@@ -375,6 +509,47 @@ impl ControllerDispatcher {
         }
     }
 
+    #[cfg(not(test))]
+    pub(crate) async fn run_worker_pool(
+        self: Arc<Self>,
+        worker_count: usize,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        self.worker_running
+            .store(true, std::sync::atomic::Ordering::Release);
+        let workers = (0..worker_count.max(1)).map(|worker_id| {
+            let dispatcher = self.clone();
+            let cancel = cancel.clone();
+            async move { dispatcher.run_worker_loop(worker_id, cancel).await }
+        });
+        futures::future::join_all(workers).await;
+        self.worker_running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(not(test))]
+    async fn run_worker_loop(
+        self: Arc<Self>,
+        worker_id: usize,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(worker_id, "Controller workqueue worker shutting down");
+                    return;
+                }
+                key = self.queue.take() => {
+                    if !self.begin_key_dispatch(&key).await {
+                        continue;
+                    }
+                    self.dispatch_key(&key).await;
+                    self.finish_key_dispatch(key).await;
+                }
+            }
+        }
+    }
+
     async fn begin_key_dispatch(&self, key: &Key) -> bool {
         let mut active = self.active_reconciles.lock().await;
         if active.in_flight.contains(key) {
@@ -385,6 +560,7 @@ impl ControllerDispatcher {
         true
     }
 
+    #[cfg(test)]
     async fn wait_for_key_dispatch_slot(&self, key: &Key) {
         loop {
             let notified = self.active_reconciles_changed.notified();
@@ -411,7 +587,13 @@ impl ControllerDispatcher {
         }
     }
 
-    async fn dispatch_key(&self, key: &Key, db_handle: &DatastoreHandle, node_name: &str) {
+    #[cfg(test)]
+    async fn dispatch_key(
+        &self,
+        key: &Key,
+        db_handle: &crate::datastore::DatastoreHandle,
+        node_name: &str,
+    ) {
         // Fetch the freshest version of the resource. If it's gone (deleted
         // between enqueue and dispatch), there is nothing to reconcile and we
         // also clear any retry counter for the key.
@@ -467,10 +649,48 @@ impl ControllerDispatcher {
         }
     }
 
+    #[cfg(not(test))]
+    async fn dispatch_key(&self, key: &Key) {
+        let resource = match self
+            .dependencies
+            .leader
+            .get_reconcile_resource(key.api_version(), key.kind(), key.namespace(), key.name())
+            .await
+        {
+            Ok(Some(resource)) => resource,
+            Ok(None) => {
+                self.retry_count.lock().await.remove(key);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(workqueue_key = %key, %error, "workqueue resource read failed");
+                self.requeue_with_backoff(key.clone()).await;
+                return;
+            }
+        };
+        let value = super::ports::inject_resource_version(
+            Arc::unwrap_or_clone(resource.data),
+            resource.resource_version,
+        );
+        match self.reconcile_unlocked(&value).await {
+            Ok(()) => {
+                self.retry_count.lock().await.remove(key);
+                if let Err(error) = self.schedule_finished_job_ttl_requeue_if_needed(key).await {
+                    tracing::warn!(workqueue_key = %key, %error, "job TTL requeue failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(workqueue_key = %key, %error, "controller reconcile failed");
+                self.requeue_with_backoff(key.clone()).await;
+            }
+        }
+    }
+
+    #[cfg(test)]
     async fn schedule_finished_job_ttl_requeue_if_needed(
         &self,
         key: &Key,
-        db_handle: &DatastoreHandle,
+        db_handle: &crate::datastore::DatastoreHandle,
     ) -> Result<()> {
         if key.api_version() != "batch/v1" || key.kind() != "Job" {
             return Ok(());
@@ -495,6 +715,37 @@ impl ControllerDispatcher {
             return Ok(());
         };
 
+        if delay.is_zero() {
+            self.queue.add(key.clone()).await;
+        } else {
+            self.queue.add_after(key.clone(), delay).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    async fn schedule_finished_job_ttl_requeue_if_needed(&self, key: &Key) -> Result<()> {
+        if key.api_version() != "batch/v1" || key.kind() != "Job" {
+            return Ok(());
+        }
+        let Some(resource) = self
+            .dependencies
+            .leader
+            .get_reconcile_resource(key.api_version(), key.kind(), key.namespace(), key.name())
+            .await?
+        else {
+            return Ok(());
+        };
+        if resource
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(delay) = crate::controllers::job::job_ttl_cleanup_delay(&resource.data)? else {
+            return Ok(());
+        };
         if delay.is_zero() {
             self.queue.add(key.clone()).await;
         } else {
@@ -534,10 +785,11 @@ impl ControllerDispatcher {
     ///
     /// Returns `Ok(())` if reconciliation succeeded or no controller is registered
     /// for this resource type. Returns `Err` if reconciliation failed.
+    #[cfg(test)]
     pub async fn reconcile(
         &self,
         resource: &Value,
-        db_handle: &DatastoreHandle,
+        db_handle: &crate::datastore::DatastoreHandle,
         node_name: &str,
     ) -> Result<()> {
         let Some(key) = key_for_value(resource) else {
@@ -553,10 +805,11 @@ impl ControllerDispatcher {
         result
     }
 
+    #[cfg(test)]
     async fn reconcile_unlocked(
         &self,
         resource: &Value,
-        db_handle: &DatastoreHandle,
+        db_handle: &crate::datastore::DatastoreHandle,
         node_name: &str,
     ) -> Result<()> {
         let api_version = resource
@@ -619,6 +872,36 @@ impl ControllerDispatcher {
 
         Ok(())
     }
+
+    #[cfg(not(test))]
+    async fn reconcile_unlocked(&self, resource: &Value) -> Result<()> {
+        let api_version = resource
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .context("Missing apiVersion in resource")?;
+        let kind = resource
+            .get("kind")
+            .and_then(Value::as_str)
+            .context("Missing kind in resource")?;
+        if let Some(namespace) = resource
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+            && self
+                .dependencies
+                .leader
+                .namespace_is_terminating(namespace)
+                .await?
+        {
+            return Ok(());
+        }
+        if let Some(controller) = self.controllers.get(&(api_version, kind)) {
+            controller
+                .reconcile(resource.clone(), Context::new(self.dependencies.clone()))
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 impl klights_reconcile_api::ControllerDispatcherPort for ControllerDispatcher {
@@ -644,7 +927,11 @@ impl klights_reconcile_api::ControllerDispatcherPort for ControllerDispatcher {
     }
 }
 
-async fn namespace_is_terminating(db_handle: &DatastoreHandle, namespace: &str) -> Result<bool> {
+#[cfg(test)]
+async fn namespace_is_terminating(
+    db_handle: &crate::datastore::DatastoreHandle,
+    namespace: &str,
+) -> Result<bool> {
     let Some(ns) = db_handle.get_namespace(namespace).await? else {
         return Ok(false);
     };

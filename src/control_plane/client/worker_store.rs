@@ -335,12 +335,31 @@ pub struct WorkerStoreAdapter {
     subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
     network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
     cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    transition_projectors:
+        Arc<dyn crate::control_plane::client::informer::WatchTransitionProjectorFactory>,
     watch_events: Arc<dyn WorkerWatchEvents>,
     node_name: String,
     current_rv: AtomicI64,
     event_history: Mutex<WorkerWatchHistory>,
     next_event_id: AtomicI64,
     pod_lifecycle_router: Mutex<Option<Arc<PodLifecycleRouter>>>,
+}
+
+pub(crate) struct WorkerStorePorts {
+    pub(crate) resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    pub(crate) leader_watch: Arc<dyn LeaderWatch>,
+    pub(crate) subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
+    pub(crate) network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
+    pub(crate) cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
+    pub(crate) transition_projectors:
+        Arc<dyn crate::control_plane::client::informer::WatchTransitionProjectorFactory>,
+    pub(crate) watch_events: Arc<dyn WorkerWatchEvents>,
+}
+
+impl LeaderWatch for WorkerStoreAdapter {
+    fn watch_resources(&self, request: WatchRequest) -> klights_leader_api::LeaderWatchFuture<'_> {
+        self.leader_watch.watch_resources(request)
+    }
 }
 
 impl WorkerStoreAdapter {
@@ -357,32 +376,30 @@ impl WorkerStoreAdapter {
             + 'static,
     {
         Self::from_ports(
-            cluster_api.clone(),
-            cluster_api.clone(),
-            cluster_api.clone(),
-            cluster_api.clone(),
-            cluster_api,
-            Arc::new(WorkerWatchBus::new()),
+            WorkerStorePorts {
+                resource_query: cluster_api.clone(),
+                leader_watch: cluster_api.clone(),
+                subnet_allocation: cluster_api.clone(),
+                network_topology: cluster_api.clone(),
+                cleanup_intents: cluster_api,
+                transition_projectors: Arc::new(
+                    crate::remote_informer_cache_adapter::WatchCacheAdapter::new(),
+                ),
+                watch_events: Arc::new(WorkerWatchBus::new()),
+            },
             node_name,
         )
     }
 
-    pub fn from_ports(
-        resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
-        leader_watch: Arc<dyn LeaderWatch>,
-        subnet_allocation: Arc<dyn klights_leader_api::LeaderNodeSubnetAllocation>,
-        network_topology: Arc<dyn klights_leader_api::LeaderNetworkTopologyQuery>,
-        cleanup_intents: Arc<dyn klights_leader_api::LeaderPodCleanupIntents>,
-        watch_events: Arc<dyn WorkerWatchEvents>,
-        node_name: String,
-    ) -> Self {
+    pub(crate) fn from_ports(ports: WorkerStorePorts, node_name: String) -> Self {
         Self {
-            resource_query,
-            leader_watch,
-            subnet_allocation,
-            network_topology,
-            cleanup_intents,
-            watch_events,
+            resource_query: ports.resource_query,
+            leader_watch: ports.leader_watch,
+            subnet_allocation: ports.subnet_allocation,
+            network_topology: ports.network_topology,
+            cleanup_intents: ports.cleanup_intents,
+            transition_projectors: ports.transition_projectors,
+            watch_events: ports.watch_events,
             node_name,
             current_rv: AtomicI64::new(0),
             event_history: Mutex::new(WorkerWatchHistory::default()),
@@ -480,8 +497,10 @@ impl WorkerStoreAdapter {
         let mut next_resource_version = req.start_resource_version();
         let mut next_watch_replay_position = req.start_watch_replay_position();
         let mut state = ReflectorState::default();
-        let mut selector_membership = crate::watch::SelectorMembership::default();
-        let has_selector = super::watch_request_has_selector(&req);
+        let mut selector_membership = self
+            .transition_projectors
+            .projector(&req)
+            .expect("worker mirror selector was validated by WatchRequest");
         // Consecutive failed reconnects; reset to 0 once the stream delivers an
         // event (progress). Drives the shared exponential reconnect backoff so
         // a sustained leader/WAN outage cannot become a fixed-interval
@@ -494,11 +513,7 @@ impl WorkerStoreAdapter {
             }
             if next_resource_version.is_none() {
                 match self
-                    .reconcile_watch_snapshot(
-                        &req,
-                        &mut state,
-                        has_selector.then_some(&mut selector_membership),
-                    )
+                    .reconcile_watch_snapshot(&req, &mut state, selector_membership.as_mut())
                     .await
                 {
                     Ok((resource_version, watch_replay_position)) => {
@@ -529,7 +544,6 @@ impl WorkerStoreAdapter {
                         .expect("worker mirror cursor remains valid"),
                 )
                 .expect("worker mirror request remains valid");
-            let selector_req = watch_req.clone();
             match self.leader_watch.watch_resources(watch_req).await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
@@ -553,33 +567,33 @@ impl WorkerStoreAdapter {
                                             tracing::warn!(error = %err, "worker mirror cursor rejected event before apply");
                                             break;
                                         }
-                                        let legacy_event = legacy_watch_event(&event);
-                                        let matches = super::watch_request_matches_event(
-                                            &selector_req,
-                                            &legacy_event,
-                                        );
-                                        let (transitioned, membership_mutation) = if has_selector {
-                                            let (event, mutation) = selector_membership
-                                                .prepare_transition(legacy_event, matches)
-                                                .into_parts();
-                                            (event, Some(mutation))
-                                        } else {
-                                            (matches.then_some(legacy_event), None)
+                                        let pending_transition =
+                                            match selector_membership.prepare(event) {
+                                                Ok(pending) => pending,
+                                                Err(err) => {
+                                                    tracing::warn!(error = %err, "worker mirror selector rejected event before apply");
+                                                    break;
+                                                }
                                         };
-                                        let Some(transitioned) = transitioned
-                                        else {
-                                            if let Some(mutation) = membership_mutation {
-                                                selector_membership.commit(mutation);
+                                        let Some(transitioned) = pending_transition.event() else {
+                                            if let Err(err) =
+                                                selector_membership.commit(pending_transition)
+                                            {
+                                                tracing::warn!(error = %err, "worker mirror selector could not commit filtered event");
+                                                break;
                                             }
                                             if event_rv > 0 {
                                                 self.observe_rv(event_rv);
                                             }
-                                            next_resource_version = applied_cursor.resource_version();
-                                            next_watch_replay_position = applied_cursor.replay_position();
+                                            next_resource_version =
+                                                applied_cursor.resource_version();
+                                            next_watch_replay_position =
+                                                applied_cursor.replay_position();
                                             reconnect_attempt = 0;
                                             immediate_expiry_relist_available = true;
                                             continue;
                                         };
+                                        let transitioned = legacy_watch_event(transitioned);
                                         let transitioned = match self
                                             .publish_watch_from_mirror(transitioned)
                                             .await
@@ -594,8 +608,11 @@ impl WorkerStoreAdapter {
                                             }
                                         };
                                         state.observe(&transitioned);
-                                        if let Some(mutation) = membership_mutation {
-                                            selector_membership.commit(mutation);
+                                        if let Err(err) =
+                                            selector_membership.commit(pending_transition)
+                                        {
+                                            tracing::warn!(error = %err, "worker mirror selector could not commit applied event");
+                                            break;
                                         }
                                         if event_rv > 0 {
                                             self.observe_rv(event_rv);
@@ -673,7 +690,7 @@ impl WorkerStoreAdapter {
         &self,
         req: &WatchRequest,
         state: &mut ReflectorState,
-        selector_membership: Option<&mut crate::watch::SelectorMembership>,
+        selector_membership: &mut dyn crate::control_plane::client::informer::WatchTransitionProjector,
     ) -> Result<(i64, Option<WatchReplayPosition>)> {
         let list = self
             .resource_query
@@ -690,24 +707,15 @@ impl WorkerStoreAdapter {
             .await?;
         let list = legacy_list_response(list);
         let resource_version = list.resource_version;
-        let pending_membership = selector_membership.as_ref().map(|_| {
-            let mut membership = crate::watch::SelectorMembership::default();
-            membership.replace_from_resources(&list.items);
-            membership
-        });
         let PendingReflectorSnapshot {
             replacement,
             events,
-        } = state.prepare_snapshot(list.items, resource_version);
+        } = state.prepare_snapshot(list.items.clone(), resource_version);
         for event in events {
             self.publish_watch_from_mirror(event).await?;
         }
         state.commit_snapshot(replacement);
-        if let (Some(selector_membership), Some(pending_membership)) =
-            (selector_membership, pending_membership)
-        {
-            *selector_membership = pending_membership;
-        }
+        selector_membership.replace(&list.items);
         self.observe_rv(resource_version);
         Ok((resource_version, list.watch_replay_position))
     }
@@ -1019,10 +1027,6 @@ impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
 
 #[async_trait]
 impl WatchStore for WorkerStoreAdapter {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_events.subscribe_signals(topic)
-    }
-
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
         self.watch_events.subscribe(topic)
@@ -1081,6 +1085,12 @@ impl WatchStore for WorkerStoreAdapter {
             events,
             next_position,
         }))
+    }
+}
+
+impl crate::watch_commit_observation_adapter::WatchSignalSource for WorkerStoreAdapter {
+    fn subscribe_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
+        self.watch_events.subscribe_signals(topic)
     }
 }
 
@@ -1931,11 +1941,11 @@ mod tests {
         )));
         let req = worker_pod_watch_request();
         let mut state = ReflectorState::default();
-        let mut membership = crate::watch::SelectorMembership::default();
+        let mut membership = adapter.transition_projectors.projector(&req).unwrap();
         let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
 
         let first = adapter
-            .reconcile_watch_snapshot(&req, &mut state, Some(&mut membership))
+            .reconcile_watch_snapshot(&req, &mut state, membership.as_mut())
             .await;
         assert!(
             first.is_err(),
@@ -1945,11 +1955,6 @@ mod tests {
             state.resources.is_empty(),
             "reflector state must remain uncommitted"
         );
-        assert_eq!(
-            membership.len(),
-            0,
-            "selector membership must remain uncommitted"
-        );
         assert_eq!(adapter.current_rv.load(Ordering::Acquire), 0);
         assert!(
             watch.try_recv().is_err(),
@@ -1957,7 +1962,7 @@ mod tests {
         );
 
         adapter
-            .reconcile_watch_snapshot(&req, &mut state, Some(&mut membership))
+            .reconcile_watch_snapshot(&req, &mut state, membership.as_mut())
             .await
             .expect("the same snapshot must replay after the route recovers");
         let replayed = watch.try_recv().expect("replayed snapshot event");
@@ -1970,7 +1975,6 @@ mod tests {
             Some("snapshot-replay")
         );
         assert_eq!(state.resources.len(), 1);
-        assert_eq!(membership.len(), 1);
         assert_eq!(
             backend.route_attempts(),
             2,

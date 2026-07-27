@@ -47,9 +47,9 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         "10.43.128.0/17",
     ));
     let nodeport_alloc = std::sync::Arc::new(crate::controllers::service::NodePortAllocator::new());
-    let controller_dispatcher = std::sync::Arc::new(
-        crate::controller_dispatcher::ControllerDispatcher::new(service_ipam.clone()),
-    );
+    let controller_dispatcher = std::sync::Arc::new(crate::controllers::ControllerDispatcher::new(
+        service_ipam.clone(),
+    ));
     let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));

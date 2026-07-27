@@ -3,8 +3,8 @@
 //! This module provides a trait-based implementation of the Endpoints controller,
 //! wrapping the existing free-function reconcile logic.
 
-use crate::controller::{Context, Controller};
 use crate::controllers::endpoints as endpoints_core;
+use crate::controllers::{Context, Controller};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -54,16 +54,9 @@ impl Controller for EndpointsController {
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
-        let pod_repository = ctx.pod_repository().ok_or_else(|| {
-            anyhow::anyhow!(
-                "endpoints controller requires pod_repository in Context — wire it via \
-                 ControllerDispatcher::set_pod_repository or Context::with_pod_repository"
-            )
-        })?;
-
         endpoints_core::reconcile_endpoints(
-            ctx.db_handle().as_ref(),
-            pod_repository.as_ref(),
+            ctx.leader().service_store(),
+            ctx.pods().query(),
             name,
             namespace,
             selector,

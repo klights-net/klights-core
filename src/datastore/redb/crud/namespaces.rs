@@ -6,23 +6,23 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+use crate::datastore::CommitObservationSink;
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::sqlite::{create_pending_watch_event, publish_pending};
-use crate::watch::WatchBus;
 use klights_cluster_core::Resource;
 
 pub struct RedbNamespaceStore {
     pub accessor: Arc<RedbAccessor>,
-    pub watch_bus: Arc<WatchBus>,
+    pub commit_sink: Arc<dyn CommitObservationSink>,
 }
 
 impl RedbNamespaceStore {
-    pub fn new(accessor: Arc<RedbAccessor>, watch_bus: Arc<WatchBus>) -> Self {
+    pub fn new(accessor: Arc<RedbAccessor>, commit_sink: Arc<dyn CommitObservationSink>) -> Self {
         Self {
             accessor,
-            watch_bus,
+            commit_sink,
         }
     }
 
@@ -34,14 +34,27 @@ impl RedbNamespaceStore {
         self.accessor.call(label, f).await
     }
 
+    async fn db_call_with_observation<T, F>(&self, label: &str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&::redb::Database) -> Result<(T, Option<crate::datastore::PendingWatchEvent>)>
+            + Send
+            + 'static,
+    {
+        let (result, pending) = self.accessor.call(label, f).await?;
+        if let Some(pending) = pending {
+            publish_pending(pending, self.commit_sink.as_ref());
+        }
+        Ok(result)
+    }
+
     // -----------------------------------------------------------------------
     // Namespace CRUD
     // -----------------------------------------------------------------------
 
     pub async fn create_ns(&self, name: &str, data: Value) -> Result<Resource> {
         let name_owned = name.to_string();
-        let watch_bus = self.watch_bus.clone();
-        self.db_call("create_ns", move |db| {
+        self.db_call_with_observation("create_ns", move |db| {
             let name: &str = &name_owned;
             let body = serde_json::to_vec(&data)?;
             let w = db.begin_write()?;
@@ -56,8 +69,7 @@ impl RedbNamespaceStore {
             let ev = serde_json::json!({"apiVersion":"v1","kind":"Namespace","namespace":null,"name":name,"eventType":"ADDED","data":data});
             helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            publish_pending(
-                create_pending_watch_event(
+            let pending = create_pending_watch_event(
                     "v1",
                     "Namespace",
                     None,
@@ -65,10 +77,8 @@ impl RedbNamespaceStore {
                     rv,
                     "ADDED",
                     data.clone(),
-                ),
-                &watch_bus,
-            );
-            Ok(Resource {
+                );
+            Ok((Resource {
                 id: 0,
                 api_version: "v1".into(),
                 kind: "Namespace".into(),
@@ -77,7 +87,7 @@ impl RedbNamespaceStore {
                 uid: Resource::uid_from_data(&data),
                 resource_version: rv,
                 data: Arc::new(data),
-            })
+            }, Some(pending)))
         })
         .await
     }
@@ -358,7 +368,10 @@ mod tests {
         let db = open_boundary::open_in_memory_blocking().unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        RedbNamespaceStore::new(accessor, Arc::new(WatchBus::new(256)))
+        RedbNamespaceStore::new(
+            accessor,
+            crate::watch_commit_observation_adapter::new_sink(),
+        )
     }
 
     #[tokio::test]
@@ -391,7 +404,7 @@ mod tests {
             .await
             .unwrap();
         // Insert a resource into this namespace via the resource store.
-        let resources = RedbResourceStore::new(s.accessor.clone(), s.watch_bus.clone());
+        let resources = RedbResourceStore::new(s.accessor.clone(), s.commit_sink.clone());
         resources.create_res("v1", "ConfigMap", Some("hascontent"), "cm",
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"hascontent"}})).await.unwrap();
         let err = s.delete_ns_impl("hascontent").await.unwrap_err();
@@ -404,7 +417,7 @@ mod tests {
         s.create_ns("cnt", json!({"metadata":{"name":"cnt"}}))
             .await
             .unwrap();
-        let resources = RedbResourceStore::new(s.accessor.clone(), s.watch_bus.clone());
+        let resources = RedbResourceStore::new(s.accessor.clone(), s.commit_sink.clone());
         resources
             .create_res(
                 "v1",
@@ -434,7 +447,7 @@ mod tests {
         s.create_ns("excl", json!({"metadata":{"name":"excl"}}))
             .await
             .unwrap();
-        let resources = RedbResourceStore::new(s.accessor.clone(), s.watch_bus.clone());
+        let resources = RedbResourceStore::new(s.accessor.clone(), s.commit_sink.clone());
         resources
             .create_res(
                 "v1",

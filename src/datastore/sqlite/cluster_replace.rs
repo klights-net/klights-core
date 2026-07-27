@@ -22,7 +22,7 @@ use rusqlite::OptionalExtension;
 
 #[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct PostCommitPublishPause {
+pub(super) struct PostCommitPublishPause {
     pub(crate) reached: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) published: std::sync::Arc<tokio::sync::Notify>,
     gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -38,26 +38,10 @@ impl PostCommitPublishPause {
 }
 
 #[cfg(test)]
-static POST_COMMIT_PUBLISH_PAUSE: std::sync::Mutex<Option<PostCommitPublishPause>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-static POST_COMMIT_PUBLISH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[cfg(test)]
-pub(crate) fn install_post_commit_publish_pause() -> PostCommitPublishPause {
-    let pause = PostCommitPublishPause {
-        reached: std::sync::Arc::new(tokio::sync::Notify::new()),
-        published: std::sync::Arc::new(tokio::sync::Notify::new()),
-        gate: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
-    };
-    *POST_COMMIT_PUBLISH_PAUSE.lock().unwrap() = Some(pause.clone());
-    pause
-}
-
-#[cfg(test)]
-fn pause_after_commit_before_publish() -> Option<std::sync::Arc<tokio::sync::Notify>> {
-    let pause = POST_COMMIT_PUBLISH_PAUSE.lock().unwrap().take()?;
+fn pause_after_commit_before_publish(
+    slot: &std::sync::Mutex<Option<PostCommitPublishPause>>,
+) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    let pause = slot.lock().unwrap().take()?;
     pause.reached.notify_one();
     let (lock, condition) = &*pause.gate;
     let mut resumed = lock.lock().unwrap();
@@ -68,6 +52,17 @@ fn pause_after_commit_before_publish() -> Option<std::sync::Arc<tokio::sync::Not
 }
 
 impl Datastore {
+    #[cfg(test)]
+    fn install_post_commit_publish_pause(&self) -> PostCommitPublishPause {
+        let pause = PostCommitPublishPause {
+            reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+            published: std::sync::Arc::new(tokio::sync::Notify::new()),
+            gate: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        };
+        *self.post_commit_publish_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
     /// Replace cluster-replicated Kubernetes resources from a full leader snapshot.
     ///
     /// This deliberately bypasses normal CRUD helpers because bootstrap restore
@@ -81,25 +76,36 @@ impl Datastore {
         watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        let watch_bus = self.watch_bus.clone();
-        self.db_call("replace_replicated_resource_state", move |conn| {
-            let pending = replace_resource_state_in_conn(
-                conn,
-                entries,
-                current_rv,
-                watch_event_high_water,
-                watch_replay_floors,
-                metadata,
-            )?;
-            #[cfg(test)]
-            let published = pause_after_commit_before_publish();
-            super::watch::publish_pending_batch(pending, &watch_bus);
-            #[cfg(test)]
-            if let Some(published) = published {
-                published.notify_one();
-            }
-            Ok(())
-        })
+        let watch_bus = self.commit_sink.clone();
+        let outbox_codec = self.outbox_codec.clone();
+        #[cfg(test)]
+        let post_commit_publish_pause = self.post_commit_publish_pause.clone();
+        self.db_call_with_post_commit(
+            "replace_replicated_resource_state",
+            move |conn| {
+                let context = super::outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let pending = replace_resource_state_in_conn(
+                    conn,
+                    entries,
+                    current_rv,
+                    watch_event_high_water,
+                    watch_replay_floors,
+                    metadata,
+                    &context,
+                )?;
+                Ok(((), pending))
+            },
+            move |pending| {
+                #[cfg(test)]
+                let published =
+                    pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
+                super::watch::publish_pending_batch(pending, watch_bus.as_ref());
+                #[cfg(test)]
+                if let Some(published) = published {
+                    published.notify_one();
+                }
+            },
+        )
         .await
         .map_err(|err| anyhow!("failed to replace replicated resource state: {err}"))?;
         Ok(())
@@ -113,6 +119,7 @@ fn replace_resource_state_in_conn(
     watch_event_high_water: Option<i64>,
     watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
     metadata: Option<ReplicatedSnapshotMetadata>,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
     if current_rv < 0 {
         return Err(other_error("snapshot current_rv must be non-negative"));
@@ -193,6 +200,7 @@ fn replace_resource_state_in_conn(
                 &tx,
                 ApplyCommit::from(operation),
                 emit_synthetic_watch_events,
+                context,
             )?;
         pending.extend(commit_pending);
     }
@@ -386,10 +394,12 @@ fn restore_created_rv_from_watch_history(
 
 impl Datastore {
     pub async fn apply_log_apply_commit(&self, commit: LogApplyCommit) -> Result<()> {
+        let outbox_codec = self.outbox_codec.clone();
         let pending = self
             .db_call("apply_log_apply_commit", move |conn| {
+                let context = super::outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction()?;
-                let pending = apply_commit_in_tx(&tx, commit)?;
+                let pending = apply_commit_in_tx_with_context(&tx, commit, &context)?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -424,24 +434,38 @@ impl Datastore {
         &self,
         commit: LogApplyCommit,
     ) -> Result<RaftLogApplyCommitted> {
-        let watch_bus = self.watch_bus.clone();
+        let watch_bus = self.commit_sink.clone();
+        let outbox_codec = self.outbox_codec.clone();
+        #[cfg(test)]
+        let post_commit_publish_pause = self.post_commit_publish_pause.clone();
         let result = self
-            .db_call("apply_raft_log_apply_commit", move |conn| {
-                let tx = conn.transaction()?;
-                let outcome = apply_commit_in_tx_for_raft(&tx, commit)?;
-                tx.commit()?;
-                #[cfg(test)]
-                let published = pause_after_commit_before_publish();
-                super::watch::publish_pending_batch(outcome.pending, &watch_bus);
-                #[cfg(test)]
-                if let Some(published) = published {
-                    published.notify_one();
-                }
-                Ok(RaftLogApplyCommitted {
-                    result: outcome.result,
-                    committed_outcome: outcome.committed_outcome,
-                })
-            })
+            .db_call_with_post_commit(
+                "apply_raft_log_apply_commit",
+                move |conn| {
+                    let context =
+                        super::outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                    let tx = conn.transaction()?;
+                    let outcome = apply_commit_in_tx_for_raft_with_context(&tx, commit, &context)?;
+                    tx.commit()?;
+                    Ok((
+                        RaftLogApplyCommitted {
+                            result: outcome.result,
+                            committed_outcome: outcome.committed_outcome,
+                        },
+                        outcome.pending,
+                    ))
+                },
+                move |pending| {
+                    #[cfg(test)]
+                    let published =
+                        pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
+                    super::watch::publish_pending_batch(pending, watch_bus.as_ref());
+                    #[cfg(test)]
+                    if let Some(published) = published {
+                        published.notify_one();
+                    }
+                },
+            )
             .await
             .map_err(|err| anyhow!("failed to apply raft log_apply commit: {err}"))?;
 
@@ -629,9 +653,10 @@ fn pod_endpoint_effect(
     }
 }
 
-pub(crate) fn apply_commit_in_tx_for_raft(
+pub(crate) fn apply_commit_in_tx_for_raft_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
     let pod_target = pod_status_target(&commit);
     let pod_before = pod_state_in_tx(tx, pod_target.as_ref())?;
@@ -654,7 +679,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     if let Some(template) = outbox_template.as_ref()
         && let Some(existing) = applied_outbox_record_in_tx(tx, &template.idempotency_key)?
     {
-        let result = storage_result_from_applied_outbox(&existing)?;
+        let result = storage_result_from_applied_outbox(&existing, context)?;
         if result.error_message.is_some() {
             let outcome = committed_outcome_from_storage_result(
                 result,
@@ -726,6 +751,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                     outbox_commit
                 },
                 true,
+                context,
             )?;
             let reason = match last_applied_stamp.cmp(&Some(incoming_stamp)) {
                 std::cmp::Ordering::Greater => {
@@ -756,7 +782,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     }
 
     tx.execute("SAVEPOINT raft_apply_attempt", [])?;
-    match apply_commit_in_tx_returning_rv_and_mutation(tx, commit) {
+    match apply_commit_in_tx_returning_rv_and_mutation_with_context(tx, commit, context) {
         Ok((rv, pending, applied_mutation)) => {
             if let (
                 Some(template),
@@ -766,17 +792,16 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                 && resource.api_version == "v1"
                 && resource.kind == "Pod"
             {
-                let result_proto = klights_cluster_datastore::encode_outbox_response(
-                    &klights_cluster_core::command::StorageResponse::Resource {
+                let result_proto = context
+                    .encode(&klights_cluster_core::command::StorageResponse::Resource {
                         resource_version: resource.resource_version,
                         data: (*resource.data).clone(),
-                    },
-                )
-                .map_err(|error| {
-                    other_error(format!(
-                        "failed to encode durable actor-finalization receipt: {error}"
-                    ))
-                })?;
+                    })
+                    .map_err(|error| {
+                        other_error(format!(
+                            "failed to encode durable actor-finalization receipt: {error}"
+                        ))
+                    })?;
                 tx.execute(
                     queries::APPLIED_OUTBOX_UPDATE_RESULT,
                     rusqlite::params![
@@ -832,12 +857,11 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             }
             if let Some(mut row) = outbox_template {
                 row.applied_rv = None;
-                row.result_proto = klights_cluster_datastore::encode_outbox_response(
-                    &klights_cluster_core::command::StorageResponse::Error {
+                row.result_proto = context
+                    .encode(&klights_cluster_core::command::StorageResponse::Error {
                         message: message.clone(),
-                    },
-                )
-                .unwrap_or_default();
+                    })
+                    .unwrap_or_default();
                 RaftClusterStateApplier::new(tx)
                     .outbox_mut()
                     .put_applied_outbox(row)?;
@@ -858,6 +882,16 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             Err(err)
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn apply_commit_in_tx_for_raft(
+    tx: &rusqlite::Transaction<'_>,
+    commit: LogApplyCommit,
+) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
+    let codec = crate::outbox_response_codec_adapter::new_codec();
+    let context = super::outbox_codec::TransactionContext::new(codec.as_ref());
+    apply_commit_in_tx_for_raft_with_context(tx, commit, &context)
 }
 
 fn committed_outcome_from_storage_result(
@@ -935,26 +969,29 @@ fn committed_rejection_from_message(
     }
 }
 
-pub(crate) fn apply_commit_in_tx(
+pub(crate) fn apply_commit_in_tx_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
-    let (_applied_rv, pending) = apply_commit_in_tx_returning_rv(tx, commit)?;
+    let (_applied_rv, pending) = apply_commit_in_tx_returning_rv_with_context(tx, commit, context)?;
     Ok(pending)
 }
 
-pub(crate) fn apply_commit_in_tx_returning_rv(
+pub(crate) fn apply_commit_in_tx_returning_rv_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
     let (applied_rv, pending, _applied_mutation) =
-        apply_commit_in_tx_returning_rv_and_mutation(tx, commit)?;
+        apply_commit_in_tx_returning_rv_and_mutation_with_context(tx, commit, context)?;
     Ok((applied_rv, pending))
 }
 
-pub(crate) fn apply_commit_in_tx_returning_rv_and_mutation(
+pub(crate) fn apply_commit_in_tx_returning_rv_and_mutation_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<(
     i64,
     Vec<PendingWatchEvent>,
@@ -968,6 +1005,7 @@ pub(crate) fn apply_commit_in_tx_returning_rv_and_mutation(
         tx,
         ApplyCommit::from_live(commit)?,
         !has_explicit_watch_history,
+        context,
     )
 }
 
@@ -975,6 +1013,7 @@ fn apply_commit_in_tx_with_watch_events(
     tx: &rusqlite::Transaction<'_>,
     commit: ApplyCommit,
     emit_watch_events: bool,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<(
     i64,
     Vec<PendingWatchEvent>,
@@ -991,7 +1030,7 @@ fn apply_commit_in_tx_with_watch_events(
             .mutations
             .iter()
             .any(|mutation| matches!(mutation, LogApplyMutation::PutWatchEvent(_)));
-    let commit = stamp_provisional_resource_version_in_tx(tx, commit)?;
+    let commit = stamp_provisional_resource_version_in_tx(tx, commit, context)?;
     let applied_rv = commit.resource_version;
     let watermark = commit.outbox_watermark.clone();
     let watermark_only_snapshot_restore = watermark.is_some() && commit.mutations.is_empty();
@@ -1220,6 +1259,7 @@ fn upsert_outbox_watermark_in_tx(
 fn stamp_provisional_resource_version_in_tx(
     tx: &rusqlite::Transaction<'_>,
     mut commit: ApplyCommit,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<ApplyCommit> {
     let is_outbox_ledger_only = !commit.mutations.is_empty()
         && commit
@@ -1291,29 +1331,26 @@ fn stamp_provisional_resource_version_in_tx(
                     row.applied_rv = Some(rv);
                 }
                 if row.result_proto.is_empty()
-                    || klights_cluster_datastore::decode_outbox_response(&row.result_proto)
-                        .is_ok_and(|response| {
-                            matches!(
-                                response,
-                                klights_cluster_core::command::StorageResponse::Ack { .. }
-                            )
-                        })
-                    || klights_cluster_datastore::decode_outbox_response(&row.result_proto)
-                        .is_ok_and(|response| {
-                            matches!(
-                                response,
-                                klights_cluster_core::command::StorageResponse::Ack {
-                                    resource_version: 0
-                                }
-                            )
-                        })
+                    || context.decode(&row.result_proto).is_ok_and(|response| {
+                        matches!(
+                            response,
+                            klights_cluster_core::command::StorageResponse::Ack { .. }
+                        )
+                    })
+                    || context.decode(&row.result_proto).is_ok_and(|response| {
+                        matches!(
+                            response,
+                            klights_cluster_core::command::StorageResponse::Ack {
+                                resource_version: 0
+                            }
+                        )
+                    })
                 {
-                    row.result_proto = klights_cluster_datastore::encode_outbox_response(
-                        &klights_cluster_core::command::StorageResponse::Ack {
+                    row.result_proto = context
+                        .encode(&klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: rv,
-                        },
-                    )
-                    .unwrap_or_default();
+                        })
+                        .unwrap_or_default();
                 }
             }
             LogApplyMutation::AdvanceResourceVersion { resource_version } => {
@@ -1346,8 +1383,9 @@ fn applied_outbox_record_in_tx(
 
 fn storage_result_from_applied_outbox(
     row: &AppliedOutboxRecord,
+    context: &super::outbox_codec::TransactionContext<'_>,
 ) -> tokio_rusqlite::Result<crate::datastore::raft::types::StorageCommandResult> {
-    match klights_cluster_datastore::decode_outbox_response(&row.result_proto) {
+    match context.decode(&row.result_proto) {
         Ok(klights_cluster_core::command::StorageResponse::Error { message }) => {
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
@@ -1555,7 +1593,7 @@ mod tests {
                     operation: "PodStatus".to_string(),
                     first_seen_ms: status_stamp,
                     applied_rv: None,
-                    result_proto: klights_cluster_datastore::encode_outbox_response(
+                    result_proto: crate::datastore::sqlite::outbox_codec::encode(
                         &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
@@ -1641,7 +1679,7 @@ mod tests {
     }
 
     fn applied_outbox_ack_rv(row: &AppliedOutboxRecord) -> i64 {
-        match klights_cluster_datastore::decode_outbox_response(&row.result_proto)
+        match crate::datastore::sqlite::outbox_codec::decode(&row.result_proto)
             .expect("decode applied-outbox response")
         {
             klights_cluster_core::command::StorageResponse::Ack { resource_version } => {
@@ -2543,7 +2581,7 @@ mod tests {
             operation: "PodStatus".to_string(),
             first_seen_ms: 1,
             applied_rv: None,
-            result_proto: klights_cluster_datastore::encode_outbox_response(
+            result_proto: crate::datastore::sqlite::outbox_codec::encode(
                 &klights_cluster_core::command::StorageResponse::Ack {
                     resource_version: 0,
                 },
@@ -2601,7 +2639,7 @@ mod tests {
                 operation: "PodStatus".to_string(),
                 first_seen_ms: 1,
                 applied_rv: None,
-                result_proto: klights_cluster_datastore::encode_outbox_response(
+                result_proto: crate::datastore::sqlite::outbox_codec::encode(
                     &klights_cluster_core::command::StorageResponse::Ack {
                         resource_version: 0,
                     },
@@ -2658,7 +2696,7 @@ mod tests {
             .unwrap()
             .expect("terminal decision ledger row");
         assert!(matches!(
-            klights_cluster_datastore::decode_outbox_response(&terminal_row.result_proto),
+            crate::datastore::sqlite::outbox_codec::decode(&terminal_row.result_proto),
             Ok(klights_cluster_core::command::StorageResponse::Error { .. })
         ));
 
@@ -5203,9 +5241,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_caller_after_commit_still_publishes_and_retry_recovers_receipt() {
-        let _serial = POST_COMMIT_PUBLISH_TEST_LOCK.lock().await;
         let db = crate::datastore::test_support::in_memory().await;
         enable_committed_apply_v1(&db).await;
         let mut watch =
@@ -5221,7 +5258,7 @@ mod tests {
                     operation: "Create".to_string(),
                     first_seen_ms: 1,
                     applied_rv: None,
-                    result_proto: klights_cluster_datastore::encode_outbox_response(
+                    result_proto: crate::datastore::sqlite::outbox_codec::encode(
                         &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
@@ -5231,7 +5268,7 @@ mod tests {
                 }),
             ],
         ));
-        let pause = install_post_commit_publish_pause();
+        let pause = db.install_post_commit_publish_pause();
         let task_db = db.clone();
         let task_commit = commit.clone();
         let task =
@@ -5266,9 +5303,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_snapshot_restore_after_commit_still_publishes_and_is_retryable() {
-        let _serial = POST_COMMIT_PUBLISH_TEST_LOCK.lock().await;
         let db = crate::datastore::test_support::in_memory().await;
         let mut watch =
             db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "ConfigMap"));
@@ -5310,7 +5346,7 @@ mod tests {
                 }),
             ],
         );
-        let pause = install_post_commit_publish_pause();
+        let pause = db.install_post_commit_publish_pause();
         let task_db = db.clone();
         let task_commit = commit.clone();
         let task = tokio::spawn(async move {
@@ -5341,5 +5377,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.get_current_resource_version().await.unwrap(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_commit_pause_is_scoped_to_its_datastore_instance() {
+        let paused_db = crate::datastore::test_support::in_memory().await;
+        let independent_db = crate::datastore::test_support::in_memory().await;
+        let pause = paused_db.install_post_commit_publish_pause();
+
+        let independent_commit =
+            snapshot_operation(1, None, vec![v1_resource("independent", "independent-uid")]);
+        let independent_task = tokio::spawn(async move {
+            independent_db
+                .replace_replicated_resource_state(vec![independent_commit], 1, None, None, None)
+                .await
+        });
+        tokio::pin!(independent_task);
+        tokio::select! {
+            result = &mut independent_task => {
+                result.unwrap().unwrap();
+            }
+            () = pause.reached.notified() => {
+                pause.resume();
+                independent_task.await.unwrap().unwrap();
+                panic!("another datastore instance intercepted the post-commit pause");
+            }
+        }
+
+        let paused_commit = snapshot_operation(1, None, vec![v1_resource("paused", "paused-uid")]);
+        let task_db = paused_db.clone();
+        let paused_task = tokio::spawn(async move {
+            task_db
+                .replace_replicated_resource_state(vec![paused_commit], 1, None, None, None)
+                .await
+        });
+        pause.reached.notified().await;
+        paused_task.abort();
+        pause.resume();
+        pause.published.notified().await;
+        assert!(
+            paused_db
+                .get_resource("v1", "ConfigMap", Some("default"), "paused")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

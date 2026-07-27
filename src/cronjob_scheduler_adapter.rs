@@ -3,32 +3,17 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::controller_dispatcher::ControllerDispatcher;
+use crate::controllers::ControllerDispatcher;
 use crate::controllers::cronjob_scheduler::{
-    CronJobScheduler, CronJobSchedulerRuntime, CronJobWatch,
+    CronJobScheduler, CronJobSchedulerRuntime, CronJobWatchSession,
 };
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreHandle, WatchTarget};
-use crate::watch::{
-    SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
-};
+use crate::datastore::DatastoreHandle;
+use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
 use klights_supervisor::TaskSupervisor;
-use klights_watch::WatchTopic;
 
 struct LeaderCronJobSchedulerRuntime {
     db: DatastoreHandle,
     dispatcher: Arc<ControllerDispatcher>,
-}
-
-struct LeaderCronJobWatch {
-    cursor: SignalWatchCursor<DatastoreWatchReplaySource>,
-}
-
-#[async_trait]
-impl CronJobWatch for LeaderCronJobWatch {
-    async fn next_event(&mut self) -> std::result::Result<WatchEvent, WatchCursorError> {
-        self.cursor.next_event().await
-    }
 }
 
 #[async_trait]
@@ -55,23 +40,34 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
         .await
     }
 
-    async fn subscribe_watch(&self) -> Result<Box<dyn CronJobWatch>> {
-        let topic = WatchTopic::new("batch/v1", "CronJob");
-        let accepted_rv = self.db.get_current_resource_version().await?;
-        let cursor = SignalWatchCursor::new(
-            self.db.subscribe_watch_signals(topic.clone()),
-            DatastoreWatchReplaySource::new(
-                Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    self.db.clone(),
-                )),
-                vec![WatchTarget::namespaced("batch/v1", "CronJob")],
-            ),
-            topic,
-            WatchDeliveryScope::NamespacedAll,
-            accepted_rv,
-            WindowPolicy::default_watch_delivery(),
+    async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError> {
+        let listing = self
+            .db
+            .list_resources(
+                "batch/v1",
+                "CronJob",
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await
+            .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?;
+        let request = WatchRequest::try_new(
+            "batch/v1",
+            "CronJob",
+            None,
+            None,
+            None,
+            Some(listing.resource_version),
+            listing.watch_replay_position,
+        )?;
+        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
+            self.db.clone(),
         );
-        Ok(Box::new(LeaderCronJobWatch { cursor }))
+        let events = positioned.watch_resources(request).await?;
+        Ok(CronJobWatchSession {
+            initial_resources: listing.items,
+            events,
+        })
     }
 }
 
@@ -84,4 +80,75 @@ pub(crate) fn new_leader_scheduler(
         Arc::new(LeaderCronJobSchedulerRuntime { db, dispatcher }),
         supervisor,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt as _;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn positioned_watch_uses_exact_initial_snapshot_handoff() {
+        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        db.create_resource(
+            "batch/v1",
+            "CronJob",
+            Some("default"),
+            "first",
+            json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": {"name": "first", "namespace": "default"},
+                "spec": {"schedule": "0 * * * *", "suspend": true}
+            }),
+        )
+        .await
+        .unwrap();
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let dispatcher = Arc::new(
+            crate::controllers::ControllerDispatcher::with_task_supervisor(
+                Arc::new(crate::controllers::service::ServiceIpam::new(
+                    "10.43.128.0/17",
+                )),
+                supervisor,
+            ),
+        );
+        let runtime = LeaderCronJobSchedulerRuntime {
+            db: db_handle,
+            dispatcher,
+        };
+
+        let mut session = runtime.open_watch().await.unwrap();
+        let accepted = session
+            .events
+            .accepted_cursor()
+            .and_then(|cursor| cursor.replay_position())
+            .expect("local positioned watch exposes the exact accepted event cursor");
+        assert_eq!(session.initial_resources.len(), 1);
+        assert_eq!(session.initial_resources[0].name, "first");
+
+        db.create_resource(
+            "batch/v1",
+            "CronJob",
+            Some("default"),
+            "second",
+            json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": {"name": "second", "namespace": "default"},
+                "spec": {"schedule": "0 * * * *", "suspend": true}
+            }),
+        )
+        .await
+        .unwrap();
+        let delivered = session.events.next().await.unwrap().unwrap();
+        let delivered_position = delivered
+            .resume_position()
+            .expect("delivered watch event carries the durable event cursor");
+        assert!(accepted.permits_successor(delivered_position));
+        assert_eq!(delivered.resource().name, "second");
+    }
 }

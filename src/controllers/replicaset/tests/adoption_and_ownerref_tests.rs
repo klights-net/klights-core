@@ -60,7 +60,7 @@ async fn test_replicaset_scale_subresource() {
         "10.43.128.0/17",
     ));
     let _controller_dispatcher = std::sync::Arc::new(
-        crate::controller_dispatcher::ControllerDispatcher::new(service_ipam.clone()),
+        crate::controllers::ControllerDispatcher::new(service_ipam.clone()),
     );
 
     // Create namespace

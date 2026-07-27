@@ -2300,14 +2300,12 @@ mod tests {
             Arc::new(crate::auth::clock::SystemClock),
             state.operational().task_supervisor.clone(),
         ));
-        let dispatcher = Arc::new(
-            crate::controller_dispatcher::ControllerDispatcher::new_with_nodeport(
-                state.controller_reconcile().service_ipam.clone(),
-                state.controller_reconcile().nodeport_alloc.clone(),
-                state.operational().task_supervisor.clone(),
-                Some(issuer),
-            ),
-        );
+        let dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new_with_nodeport(
+            state.controller_reconcile().service_ipam.clone(),
+            state.controller_reconcile().nodeport_alloc.clone(),
+            state.operational().task_supervisor.clone(),
+            Some(issuer),
+        ));
         dispatcher
             .set_sync_context(
                 state.resource_mutation().db.clone(),

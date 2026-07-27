@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use super::Pod;
-use super::informer::{list as list_cached, replace_scope, scope_for_request};
+use super::informer::{RemoteInformerCache, list as list_cached, replace_scope, scope_for_request};
 use super::{
     ListRequest, ResourceList, focused_watch_event, legacy_list_request, legacy_list_response,
     legacy_watch_event, query_error, query_list_result,
@@ -86,19 +86,20 @@ pub struct RemoteApiClient {
     node_name: String,
     grpc: Option<Arc<ReplicationGrpcClient>>,
     supervisor: Option<Arc<TaskSupervisor>>,
-    cache: klights_watch::WatchCache,
+    cache: Arc<dyn RemoteInformerCache>,
     worker_informers_started: Arc<AtomicBool>,
     /// bug-grpc: per-stream idle timeout; overridable in tests.
     watch_idle_timeout: std::time::Duration,
 }
 
 impl RemoteApiClient {
+    #[cfg(test)]
     pub fn new(node_name: String) -> Self {
         Self {
             node_name,
             grpc: None,
             supervisor: None,
-            cache: klights_watch::WatchCache::new(),
+            cache: Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
             worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
@@ -108,12 +109,13 @@ impl RemoteApiClient {
         grpc: Arc<ReplicationGrpcClient>,
         supervisor: Arc<TaskSupervisor>,
         node_name: String,
+        cache: Arc<dyn RemoteInformerCache>,
     ) -> Self {
         Self {
             node_name,
             grpc: Some(grpc),
             supervisor: Some(supervisor),
-            cache: klights_watch::WatchCache::new(),
+            cache,
             worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
@@ -144,7 +146,7 @@ impl RemoteApiClient {
             continue_token: None,
         };
         replace_scope(
-            &self.cache,
+            self.cache.as_ref(),
             &request,
             ResourceList {
                 items: Vec::new(),
@@ -212,9 +214,6 @@ impl RemoteApiClient {
     async fn run_watch_driver(self: Arc<Self>, req: ListRequest, cancel: CancellationToken) {
         let mut next_resource_version = None;
         let mut next_watch_replay_position = None;
-        let mut selector_membership = crate::watch::SelectorMembership::default();
-        let has_selector =
-            super::selectors_present(req.label_selector.as_deref(), req.field_selector.as_deref());
         // Consecutive failed reconnects; reset to 0 once the stream delivers an
         // event. Drives the shared exponential reconnect backoff so a sustained
         // leader/WAN outage cannot become a fixed-interval reconnect storm.
@@ -226,9 +225,6 @@ impl RemoteApiClient {
             if next_resource_version.is_none() {
                 match self.prime_list_scope(req.clone()).await {
                     Ok(list) => {
-                        if has_selector {
-                            selector_membership.replace_from_resources(&list.items);
-                        }
                         next_resource_version = Some(list.resource_version);
                         next_watch_replay_position = list.watch_replay_position;
                     }
@@ -255,7 +251,6 @@ impl RemoteApiClient {
                 next_watch_replay_position,
             )
             .expect("worker informer LIST identity and cursor are validated");
-            let selector_req = watch_req.clone();
             match self.watch_resources(watch_req).await {
                 Ok(mut stream) => loop {
                     let next = tokio::select! {
@@ -286,27 +281,8 @@ impl RemoteApiClient {
                                 break;
                             }
                             let legacy_event = legacy_watch_event(&event);
-                            let matches =
-                                super::watch_request_matches_event(&selector_req, &legacy_event);
-                            let (transitioned, membership_mutation) = if has_selector {
-                                let (event, mutation) = selector_membership
-                                    .prepare_transition(legacy_event, matches)
-                                    .into_parts();
-                                (event, Some(mutation))
-                            } else {
-                                (matches.then_some(legacy_event), None)
-                            };
-                            let Some(transitioned) = transitioned else {
-                                if let Some(mutation) = membership_mutation {
-                                    selector_membership.commit(mutation);
-                                }
-                                next_resource_version = applied_cursor.resource_version();
-                                next_watch_replay_position = applied_cursor.replay_position();
-                                reconnect_attempt = 0;
-                                continue;
-                            };
                             let event = match focused_watch_event(
-                                transitioned,
+                                legacy_event,
                                 event.resume_position(),
                             ) {
                                 Ok(event) => event,
@@ -316,9 +292,6 @@ impl RemoteApiClient {
                                 }
                             };
                             self.cache.apply_event(&event).await;
-                            if let Some(mutation) = membership_mutation {
-                                selector_membership.commit(mutation);
-                            }
                             next_resource_version = applied_cursor.resource_version();
                             next_watch_replay_position = applied_cursor.replay_position();
                             reconnect_attempt = 0;
@@ -401,7 +374,7 @@ impl RemoteApiClient {
             klights_leader_api::ResourceQueryConsistency::LeaderFresh,
         )?;
         let list = legacy_list_response(grpc.list_resources_rpc(request).await?);
-        replace_scope(&self.cache, &req, list.clone())
+        replace_scope(self.cache.as_ref(), &req, list.clone())
             .await
             .map_err(query_error)?;
         self.cache
@@ -523,7 +496,7 @@ impl LeaderResourceQuery for RemoteApiClient {
             } else {
                 let scope = scope_for_request(&legacy_request);
                 if self.cache.is_ready(&scope).await {
-                    list_cached(&self.cache, &legacy_request)
+                    list_cached(self.cache.as_ref(), &legacy_request)
                         .await
                         .map_err(query_error)?
                 } else if self.grpc.is_some() {
@@ -531,7 +504,7 @@ impl LeaderResourceQuery for RemoteApiClient {
                         .await
                         .map_err(query_error)?
                 } else {
-                    list_cached(&self.cache, &legacy_request)
+                    list_cached(self.cache.as_ref(), &legacy_request)
                         .await
                         .map_err(query_error)?
                 }
@@ -860,7 +833,12 @@ mod tests {
             .unwrap(),
         );
         (
-            RemoteApiClient::from_grpc(grpc, supervisor, remote_node_name),
+            RemoteApiClient::from_grpc(
+                grpc,
+                supervisor,
+                remote_node_name,
+                Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
+            ),
             db,
             handle,
         )

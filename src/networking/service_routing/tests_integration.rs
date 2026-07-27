@@ -1050,7 +1050,13 @@ mod integration_tests {
             cluster_api.clone();
         let watch: std::sync::Arc<dyn klights_leader_api::LeaderWatch> = cluster_api;
         let rt = NftServiceRouter::boot(NftServiceRouterBoot::new(
-            NftServiceRouterStores::new(resource_query, watch, endpoint_source),
+            NftServiceRouterStores::new(
+                std::sync::Arc::new(
+                    crate::networking_state_adapter::LeaderRoutingStateAdapter::new(resource_query),
+                ),
+                watch,
+                endpoint_source,
+            ),
             NftServiceRouterTableConfig::new("node-a", "klights-test-shutdown", "klights-test"),
             NftServiceRouterNetworkConfig::new(
                 PodSubnet::parse("10.42.0.0/24").unwrap(),

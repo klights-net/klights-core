@@ -1,16 +1,16 @@
 use serde_json::Value;
-use std::collections::HashMap;
 use tokio::sync::broadcast;
 
 #[cfg(test)]
 use super::hydrate_watch_event_data;
 #[cfg(test)]
 use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_payload};
-use klights_watch::{WatchSignal, WatchTopic};
+#[cfg(test)]
+use klights_watch::WatchTopic;
 
 use super::{
-    CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
-    RawWatchEvent,
+    CatchUpResource, CommitObservation, CommitObservationSink, Datastore, PendingWatchEvent,
+    PodEndpointEvent, PodSlotAdmissionEvent, RawWatchEvent,
 };
 use klights_cluster_core::Resource;
 
@@ -25,84 +25,32 @@ use klights_cluster_core::Resource;
 /// Per HA contract bullet #4, request handlers must never call the
 /// watch bus directly — they hand a `PendingWatchEvent` back
 /// and this function publishes it. tests/source_guard_tests.py enforces this.
-pub fn publish_pending(pending: PendingWatchEvent, bus: &crate::watch::WatchBus) {
-    publish_pending_batch(std::iter::once(pending), bus);
+pub fn publish_pending(pending: PendingWatchEvent, sink: &dyn CommitObservationSink) {
+    publish_pending_batch(std::iter::once(pending), sink);
 }
 
 pub fn publish_pending_batch(
     pending: impl IntoIterator<Item = PendingWatchEvent>,
-    bus: &crate::watch::WatchBus,
+    sink: &dyn CommitObservationSink,
 ) {
     let pending = pending.into_iter().collect::<Vec<_>>();
 
     #[cfg(test)]
-    let events = pending
-        .iter()
-        .map(|pending| pending.event.clone())
-        .collect::<Vec<_>>();
-
-    #[cfg(test)]
-    for event in &events {
-        crate::datastore::diagnostics::log_watch_event_broadcast(event);
-    }
-
-    for signal in pending_watch_signals(&pending) {
-        bus.publish_signal(signal);
-    }
-
-    #[cfg(test)]
-    for event in events {
-        bus.publish(event);
-    }
-}
-
-fn pending_watch_signals<I, P>(pending: I) -> Vec<WatchSignal>
-where
-    I: IntoIterator<Item = P>,
-    P: std::borrow::Borrow<PendingWatchEvent>,
-{
-    let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, (i64, i64)>> = HashMap::new();
-
-    for pending in pending {
-        let pending = pending.borrow();
-        if pending.resource_version <= 0 {
-            continue;
-        }
-        let topic = WatchTopic::new(&pending.api_version, &pending.kind);
-        let topic_advances = grouped.entry(topic).or_default();
-        let entry = topic_advances
-            .entry(pending.namespace.clone())
-            .or_insert((pending.resource_version, pending.resource_version));
-        entry.0 = entry.0.min(pending.resource_version);
-        entry.1 = entry.1.max(pending.resource_version);
-    }
-
-    let mut signals = Vec::new();
-    for (topic, namespace_rvs) in grouped {
-        let mut advances = namespace_rvs
-            .into_iter()
-            .map(
-                |(namespace, (low_rv, high_rv))| klights_watch::WatchAdvance {
-                    namespace,
-                    low_rv,
-                    high_rv,
-                },
-            )
+    {
+        let events = pending
+            .iter()
+            .map(|pending| pending.event.clone())
             .collect::<Vec<_>>();
-        advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-
-        for chunk in advances.chunks(klights_watch::DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
-            signals.push(WatchSignal {
-                topic: topic.clone(),
-                advances: chunk.to_vec(),
-            });
+        for event in &events {
+            crate::datastore::diagnostics::log_watch_event_broadcast(event);
         }
+        crate::watch_commit_observation_adapter::publish_test_events(sink, events);
     }
-    signals.sort_by(|left, right| {
-        (left.topic.api_version(), left.topic.kind())
-            .cmp(&(right.topic.api_version(), right.topic.kind()))
-    });
-    signals
+    let observations = pending
+        .iter()
+        .map(CommitObservation::from)
+        .collect::<Vec<_>>();
+    sink.observe(&observations);
 }
 
 /// Map a DB-stored event_type string back to a `Cow<'static, str>` reusing
@@ -221,17 +169,30 @@ impl Datastore {
     }
 
     #[cfg(test)]
-    pub fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        self.watch_bus.subscribe(topic)
+    pub fn subscribe_watch(
+        &self,
+        topic: klights_watch::WatchTopic,
+    ) -> broadcast::Receiver<WatchEvent> {
+        crate::watch_commit_observation_adapter::subscribe_test_events(
+            self.commit_sink.as_ref(),
+            topic,
+        )
     }
 
     #[cfg(test)]
-    pub fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
-        self.watch_bus.subscribe_many(topics)
+    pub fn subscribe_watch_many(&self, topics: Vec<klights_watch::WatchTopic>) -> WatchReceiver {
+        crate::watch_commit_observation_adapter::subscribe_test_events_many(
+            self.commit_sink.as_ref(),
+            topics,
+        )
     }
 
+    #[cfg(test)]
     pub fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_bus.subscribe_signals(topic)
+        crate::watch_commit_observation_adapter::subscribe_from_sink(
+            self.commit_sink.as_ref(),
+            topic,
+        )
     }
 
     /// Broadcast a watch event after the DB transaction has committed.
@@ -239,7 +200,7 @@ impl Datastore {
     /// path is identical whether called from CRUD methods or a future
     /// Raft FSM apply hook.
     pub fn publish_watch_event(&self, pending: PendingWatchEvent) {
-        publish_pending(pending, &self.watch_bus);
+        publish_pending(pending, self.commit_sink.as_ref());
     }
 
     /// Broadcast a batch of watch events after the DB transaction has
@@ -247,7 +208,7 @@ impl Datastore {
     /// the post-commit signals are grouped per `(topic, namespace)` through
     /// `publish_pending_batch` instead of emitting one signal per event.
     pub fn publish_watch_events(&self, pending: impl IntoIterator<Item = PendingWatchEvent>) {
-        publish_pending_batch(pending, &self.watch_bus);
+        publish_pending_batch(pending, self.commit_sink.as_ref());
     }
 
     #[cfg(test)]
@@ -620,7 +581,7 @@ mod tests {
                     serde_json::json!({"metadata": {"labels": {"app": "c"}}}),
                 ),
             ],
-            &ds.watch_bus,
+            ds.commit_sink.as_ref(),
         );
 
         let signal = signals.try_recv().expect("grouped signal");
@@ -631,31 +592,6 @@ mod tests {
             high_rv: 12,
         }));
         assert!(signal.advances.contains(&WatchAdvance {
-            namespace: Some("kube-system".to_string()),
-            low_rv: 11,
-            high_rv: 11,
-        }));
-    }
-
-    #[test]
-    fn pending_watch_signals_are_grouped_from_pending_metadata() {
-        use klights_watch::WatchAdvance;
-
-        let signals = pending_watch_signals(vec![
-            PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("default"), 10),
-            PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("default"), 12),
-            PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("kube-system"), 11),
-        ]);
-
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].topic, WatchTopic::new("v1", "Pod"));
-        assert_eq!(signals[0].advances.len(), 2);
-        assert!(signals[0].advances.contains(&WatchAdvance {
-            namespace: Some("default".to_string()),
-            low_rv: 10,
-            high_rv: 12,
-        }));
-        assert!(signals[0].advances.contains(&WatchAdvance {
             namespace: Some("kube-system".to_string()),
             low_rv: 11,
             high_rv: 11,

@@ -162,7 +162,11 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         networking::service_routing::NftServiceRouter::boot_with_defaults(
             networking::service_routing::NftServiceRouterDefaultBoot::new(
                 networking::service_routing::NftServiceRouterStores::new(
-                    resource_query,
+                    Arc::new(
+                        crate::networking_state_adapter::LeaderRoutingStateAdapter::new(
+                            resource_query,
+                        ),
+                    ),
                     watch,
                     endpoint_source,
                 ),

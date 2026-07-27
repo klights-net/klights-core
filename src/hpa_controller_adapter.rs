@@ -3,15 +3,57 @@ use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::{Value, json};
 
-use crate::controller::{Context, Controller};
 use crate::controllers::hpa::{
     HpaRuntime, ScaleTarget, ScaleTargetKind, reconcile_hpa_with_runtime,
 };
+use crate::controllers::{Context, Controller};
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
 use crate::metrics::MetricsProvider;
 
+#[cfg(test)]
 pub struct HpaController;
+
+#[cfg(test)]
+impl HpaController {
+    pub(crate) fn new(
+        _db: crate::datastore::DatastoreHandle,
+        _pod_repository: std::sync::Arc<PodRepository>,
+        _non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+        _node_name: std::sync::Arc<str>,
+        _metrics_provider: std::sync::Arc<dyn MetricsProvider>,
+    ) -> Self {
+        Self
+    }
+}
+
+#[cfg(not(test))]
+pub struct HpaController {
+    db: crate::datastore::DatastoreHandle,
+    pod_repository: std::sync::Arc<PodRepository>,
+    non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    node_name: std::sync::Arc<str>,
+    metrics_provider: std::sync::Arc<dyn MetricsProvider>,
+}
+
+#[cfg(not(test))]
+impl HpaController {
+    pub(crate) fn new(
+        db: crate::datastore::DatastoreHandle,
+        pod_repository: std::sync::Arc<PodRepository>,
+        non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+        node_name: std::sync::Arc<str>,
+        metrics_provider: std::sync::Arc<dyn MetricsProvider>,
+    ) -> Self {
+        Self {
+            db,
+            pod_repository,
+            non_pod_finalization,
+            node_name,
+            metrics_provider,
+        }
+    }
+}
 
 #[async_trait]
 impl Controller for HpaController {
@@ -20,32 +62,50 @@ impl Controller for HpaController {
     }
 
     async fn reconcile(&self, resource: Value, ctx: Context) -> Result<()> {
-        let pod_repository = ctx.pod_repository().ok_or_else(|| {
-            anyhow::anyhow!(
-                "horizontalpodautoscaler requires pod_repository in Context — wire it via \
-                 ControllerDispatcher::set_pod_repository or Context::with_pod_repository"
+        #[cfg(not(test))]
+        {
+            let _ = &ctx;
+            return reconcile_hpa_with_metrics(
+                self.db.as_ref(),
+                self.pod_repository.as_ref(),
+                self.non_pod_finalization.as_ref(),
+                &resource,
+                &self.node_name,
+                self.metrics_provider.as_ref(),
             )
-        })?;
-        let fallback_metrics;
-        let metrics_provider = match ctx.metrics_provider() {
-            Some(provider) => provider.as_ref(),
-            None => {
-                fallback_metrics = crate::metrics::FallbackOnlyMetricsProvider;
-                &fallback_metrics as &dyn MetricsProvider
-            }
-        };
-        let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
-            anyhow::anyhow!("horizontalpodautoscaler requires non-Pod GC finalization in Context")
-        })?;
-        reconcile_hpa_with_metrics(
-            ctx.db_handle().as_ref(),
-            pod_repository.as_ref(),
-            non_pod_finalization,
-            &resource,
-            ctx.node_name(),
-            metrics_provider,
-        )
-        .await
+            .await;
+        }
+        #[cfg(test)]
+        {
+            let pod_repository = ctx.pod_repository().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "horizontalpodautoscaler requires pod_repository in Context — wire it via \
+                 ControllerDispatcher::set_pod_repository or Context::with_pod_repository"
+                )
+            })?;
+            let fallback_metrics;
+            let metrics_provider = match ctx.metrics_provider() {
+                Some(provider) => provider.as_ref(),
+                None => {
+                    fallback_metrics = crate::metrics::FallbackOnlyMetricsProvider;
+                    &fallback_metrics as &dyn MetricsProvider
+                }
+            };
+            let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "horizontalpodautoscaler requires non-Pod GC finalization in Context"
+                )
+            })?;
+            reconcile_hpa_with_metrics(
+                ctx.db_handle().as_ref(),
+                pod_repository.as_ref(),
+                non_pod_finalization.as_ref(),
+                &resource,
+                ctx.node_name(),
+                metrics_provider,
+            )
+            .await
+        }
     }
 }
 

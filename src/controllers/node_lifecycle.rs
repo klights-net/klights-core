@@ -6,11 +6,11 @@ use crate::node_lease_tracker::{
     DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseObservation, NodeLeaseTracker,
 };
 use crate::utils::k8s_time_format;
-use crate::watch::{EventType, WatchEvent};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
+use klights_leader_api::{ResourceEvent, WatchEventType};
 use serde_json::{Value, json};
 
 #[cfg(test)]
@@ -275,7 +275,7 @@ pub(crate) async fn cleanup_pods_bound_to_deleted_node_event(
     pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
     side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
     pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
-    event: &WatchEvent,
+    event: &ResourceEvent,
 ) -> Result<bool> {
     let Some(node_name) = deleted_node_name(event) else {
         return Ok(false);
@@ -292,17 +292,16 @@ pub(crate) async fn cleanup_pods_bound_to_deleted_node_event(
     Ok(true)
 }
 
-fn deleted_node_name(event: &WatchEvent) -> Option<&str> {
-    if event.event_type != EventType::Deleted {
+fn deleted_node_name(event: &ResourceEvent) -> Option<&str> {
+    if event.event_type() != WatchEventType::Deleted {
         return None;
     }
-    if event.object.get("apiVersion").and_then(|v| v.as_str()) != Some("v1")
-        || event.object.get("kind").and_then(|v| v.as_str()) != Some("Node")
-    {
+    if event.resource().api_version != "v1" || event.resource().kind != "Node" {
         return None;
     }
     event
-        .object
+        .resource()
+        .data
         .pointer("/metadata/name")
         .and_then(|v| v.as_str())
         .filter(|name| !name.trim().is_empty())
@@ -376,18 +375,21 @@ pub(crate) async fn refresh_node_lease_tracker_from_cluster_leases(
 }
 
 pub(crate) async fn track_lease_from_event(
-    event: &WatchEvent,
+    event: &ResourceEvent,
     tracker: &NodeLeaseTracker,
 ) -> Result<()> {
-    if event.event_type == EventType::Bookmark || event.event_type == EventType::Deleted {
+    if event.event_type() == WatchEventType::Bookmark
+        || event.event_type() == WatchEventType::Deleted
+    {
         return Ok(());
     }
 
-    if event.object.get("kind").and_then(|k| k.as_str()) != Some("Lease") {
+    if event.resource().kind != "Lease" {
         return Ok(());
     }
     if event
-        .object
+        .resource()
+        .data
         .pointer("/metadata/namespace")
         .and_then(|v| v.as_str())
         != Some("kube-node-lease")
@@ -396,7 +398,8 @@ pub(crate) async fn track_lease_from_event(
     }
 
     let node_name = event
-        .object
+        .resource()
+        .data
         .pointer("/metadata/name")
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -405,7 +408,7 @@ pub(crate) async fn track_lease_from_event(
     }
 
     tracker
-        .record_from_lease_object(node_name, event.object.as_ref())
+        .record_from_lease_object(node_name, event.resource().data.as_ref())
         .await
         .map(|_| ())
 }
@@ -596,17 +599,19 @@ async fn reconcile_unknown_pods_after_node_ready(
     Ok(())
 }
 
-pub(crate) fn node_lifecycle_event(event: &WatchEvent) -> bool {
-    if event.event_type == EventType::Bookmark {
+pub(crate) fn node_lifecycle_event(event: &ResourceEvent) -> bool {
+    if event.event_type() == WatchEventType::Bookmark {
         return false;
     }
-    let kind = event.object.get("kind").and_then(|v| v.as_str());
-    let api_version = event.object.get("apiVersion").and_then(|v| v.as_str());
-    match (api_version, kind) {
-        (Some("v1"), Some("Node")) => true,
-        (Some("coordination.k8s.io/v1"), Some("Lease")) => {
+    match (
+        event.resource().api_version.as_str(),
+        event.resource().kind.as_str(),
+    ) {
+        ("v1", "Node") => true,
+        ("coordination.k8s.io/v1", "Lease") => {
             event
-                .object
+                .resource()
+                .data
                 .pointer("/metadata/namespace")
                 .and_then(|v| v.as_str())
                 == Some("kube-node-lease")
@@ -1188,9 +1193,15 @@ mod tests {
     // serializes env-var mutation for the whole test body, so dropping it
     // before the awaited reconcile would reintroduce the cross-test env race.
     #![allow(clippy::await_holding_lock)]
-    use crate::watch::{EventType, WatchEvent};
     use chrono::{TimeZone, Utc};
+    use klights_leader_api::{ResourceEvent, WatchEventType};
     use serde_json::json;
+
+    fn resource_event(event_type: WatchEventType, value: serde_json::Value) -> ResourceEvent {
+        let resource =
+            klights_cluster_core::Resource::try_from_data(std::sync::Arc::new(value)).unwrap();
+        ResourceEvent::try_new(event_type, resource, None).unwrap()
+    }
 
     /// Test-only env var guard: sets a var for the test's duration and
     /// restores the prior value on drop. Use under `crate::TEST_ENV_LOCK`.
@@ -1253,20 +1264,23 @@ mod tests {
         let tracker = crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 30, 0).unwrap(),
         );
-        let event = WatchEvent::added(json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": {
-                "name": "worker-a",
-                "namespace": "kube-node-lease",
-                "resourceVersion": "1"
-            },
-            "spec": {
-                "holderIdentity": "worker-a",
-                "leaseDurationSeconds": 40,
-                "renewTime": "2026-05-13T06:34:15.000000Z"
-            }
-        }));
+        let event = resource_event(
+            WatchEventType::Added,
+            json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": "worker-a",
+                    "namespace": "kube-node-lease",
+                    "resourceVersion": "1"
+                },
+                "spec": {
+                    "holderIdentity": "worker-a",
+                    "leaseDurationSeconds": 40,
+                    "renewTime": "2026-05-13T06:34:15.000000Z"
+                }
+            }),
+        );
 
         super::track_lease_from_event(&event, &tracker)
             .await
@@ -1285,9 +1299,9 @@ mod tests {
         let tracker = crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 30, 0).unwrap(),
         );
-        let event = WatchEvent {
-            event_type: EventType::Deleted,
-            object: std::sync::Arc::new(json!({
+        let event = resource_event(
+            WatchEventType::Deleted,
+            json!({
                 "apiVersion": "coordination.k8s.io/v1",
                 "kind": "Lease",
                 "metadata": {
@@ -1299,9 +1313,8 @@ mod tests {
                     "leaseDurationSeconds": 40,
                     "renewTime": "2026-05-13T06:34:15.000000Z"
                 }
-            })),
-            encoded_payload: None,
-        };
+            }),
+        );
 
         super::track_lease_from_event(&event, &tracker)
             .await
@@ -1757,11 +1770,14 @@ mod tests {
         seed_running_pod_on_node(&db, "fake-node-pod", "fake-node-pod-uid", "e2e-fake-node").await;
         seed_running_pod_on_node(&db, "real-node-pod", "real-node-pod-uid", "real-node").await;
 
-        let event = WatchEvent::deleted(json!({
-            "apiVersion": "v1",
-            "kind": "Node",
-            "metadata": {"name": "e2e-fake-node"}
-        }));
+        let event = resource_event(
+            WatchEventType::Deleted,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "e2e-fake-node"}
+            }),
+        );
 
         let cleaned = super::cleanup_pods_bound_to_deleted_node_event(
             &db,

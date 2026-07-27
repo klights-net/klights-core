@@ -14,7 +14,7 @@ use crate::controllers::cronjob_scheduler::{CronJobScheduler, compute_next_fire}
 async fn make_scheduler() -> (
     crate::datastore::sqlite::Datastore,
     crate::datastore::DatastoreHandle,
-    Arc<crate::controller_dispatcher::ControllerDispatcher>,
+    Arc<crate::controllers::ControllerDispatcher>,
     Arc<klights_supervisor::TaskSupervisor>,
     Arc<CronJobScheduler>,
 ) {
@@ -26,7 +26,7 @@ async fn make_scheduler() -> (
         "10.43.128.0/17",
     ));
     let dispatcher = Arc::new(
-        crate::controller_dispatcher::ControllerDispatcher::with_task_supervisor(
+        crate::controllers::ControllerDispatcher::with_task_supervisor(
             service_ipam,
             supervisor.clone(),
         ),

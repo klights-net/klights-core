@@ -1,6 +1,6 @@
 //! `Controller` impl for `ReplicaSet`. Registered in `ControllerDispatcher`.
 
-use crate::controller::controller_wrapper;
+use crate::controllers::controller_wrapper;
 use crate::controllers::replicaset as replicaset_core;
 
 controller_wrapper!(
@@ -8,14 +8,17 @@ controller_wrapper!(
     "replicaset",
     replicaset_core::reconcile_replicaset,
     with_node,
-    with_pod_repository
+    with_pod_repository,
+    store = replicaset_store,
+    reader = query,
+    mutation = replicaset_mutation
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{Context, Controller};
     use crate::controllers::test_utils::store_and_prepare;
+    use crate::controllers::{Context, Controller};
     use serde_json::json;
 
     #[test]

@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use crate::controllers::scheduler::SchedulerRuntime;
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::PodRepository;
+use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
 
 pub(crate) struct LeaderSchedulerRuntime {
     db: DatastoreHandle,
@@ -20,20 +21,16 @@ impl LeaderSchedulerRuntime {
 
 #[async_trait]
 impl SchedulerRuntime for LeaderSchedulerRuntime {
-    fn subscribe_signals(&self) -> klights_watch::WatchSignalReceiver {
-        klights_watch::WatchSignalReceiver::new(
-            [
-                klights_watch::WatchTopic::new("v1", "Pod"),
-                klights_watch::WatchTopic::new("v1", "Node"),
-            ]
-            .into_iter()
-            .map(|topic| self.db.subscribe_watch_signals(topic))
-            .collect(),
-        )
-    }
-
-    async fn current_resource_version(&self) -> Result<i64> {
-        self.db.get_current_resource_version().await
+    async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError> {
+        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
+            self.db.clone(),
+        );
+        let mut sessions = Vec::with_capacity(2);
+        for (api_version, kind) in [("v1", "Pod"), ("v1", "Node")] {
+            let request = WatchRequest::try_new(api_version, kind, None, None, None, None, None)?;
+            sessions.push(positioned.watch_resources(request).await?);
+        }
+        Ok(sessions)
     }
 
     async fn schedule_all_unbound_pods(&self) -> Result<()> {

@@ -1,7 +1,7 @@
 use super::cursor::INITIAL_REPLAY_BACKOFF;
 use super::*;
 use crate::datastore::WatchTarget;
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
+use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;

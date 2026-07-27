@@ -132,10 +132,14 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // sufficient because followers must be able to install and advance.
     validate_raft_backend_capability(config.datastore_backend)?;
 
-    let passive_backend =
-        crate::datastore::selector::open(passive_store_open_request(config), supervisor.clone())
-            .await
-            .context("Failed to open datastore")?;
+    let passive_backend = crate::datastore::selector::open_with_sink(
+        passive_store_open_request(config),
+        supervisor.clone(),
+        crate::watch_commit_observation_adapter::new_sink(),
+        crate::outbox_response_codec_adapter::new_codec(),
+    )
+    .await
+    .context("Failed to open datastore")?;
 
     // T1.6: joining controlplanes get their initial cluster.db
     // contents from raft (install_snapshot or AppendEntries from index 0
@@ -1046,6 +1050,7 @@ fn build_remote_forwarder(
         grpc.clone(),
         supervisor,
         config.node_name.clone(),
+        Arc::new(crate::remote_informer_cache_adapter::WatchCacheAdapter::new()),
     ));
     RemoteForwarderParts {
         leader_ports: crate::control_plane::client::LeaderClientPorts::from_client(remote.clone()),

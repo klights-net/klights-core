@@ -27,8 +27,8 @@ pub struct LeaderStart<'a> {
     pub db_handle: &'a DatastoreHandle,
     pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub task_supervisor: &'a Arc<TaskSupervisor>,
-    pub dispatcher_for_worker: &'a Arc<crate::controller_dispatcher::ControllerDispatcher>,
-    pub dispatcher_for_cronjobs: &'a Arc<crate::controller_dispatcher::ControllerDispatcher>,
+    pub dispatcher_for_worker: &'a Arc<crate::controllers::ControllerDispatcher>,
+    pub dispatcher_for_cronjobs: &'a Arc<crate::controllers::ControllerDispatcher>,
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
@@ -42,8 +42,8 @@ struct LeaderScopedTaskContext {
     db_handle: DatastoreHandle,
     node_local: crate::datastore::node_local::NodeLocalHandle,
     task_supervisor: Arc<TaskSupervisor>,
-    dispatcher_for_worker: Arc<crate::controller_dispatcher::ControllerDispatcher>,
-    dispatcher_for_cronjobs: Arc<crate::controller_dispatcher::ControllerDispatcher>,
+    dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
+    dispatcher_for_cronjobs: Arc<crate::controllers::ControllerDispatcher>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     datapath: Arc<dyn klights_network_api::Datapath>,
@@ -227,7 +227,9 @@ async fn start_leader_scoped_tasks(
     }
 
     let d = dispatcher_for_worker;
+    #[cfg(test)]
     let dhw = db_handle.clone();
+    #[cfg(test)]
     let nn = config.node_name.clone();
     let c = lease_cancel.child_token();
     if let Err(e) = task_supervisor
@@ -235,8 +237,11 @@ async fn start_leader_scoped_tasks(
             klights_supervisor::TaskCategory::Background,
             "runtime_controller_workqueue_worker",
             async move {
+                #[cfg(test)]
                 d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, dhw, nn, c)
                     .await;
+                #[cfg(not(test))]
+                d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, c).await;
             },
         )
         .await

@@ -1,18 +1,20 @@
-use crate::api::watch_stream::{
-    WatchSourceCurrentResourceVersionFuture, WatchSourceListFuture, WatchStreamSource,
-};
-use crate::datastore::{DatastoreBackend, DatastoreHandle, ResourceListQuery};
+use crate::api::watch_stream::{WatchSourceListFuture, WatchSourceWaitFuture, WatchStreamSource};
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
 
 impl WatchStreamSource for DatastoreHandle {
-    fn subscribe_watch_signals(
-        &self,
-        topic: klights_watch::WatchTopic,
-    ) -> klights_watch::WatchSignalReceiver {
-        DatastoreBackend::subscribe_watch_signals(self.as_ref(), topic)
-    }
-
-    fn current_resource_version(&self) -> WatchSourceCurrentResourceVersionFuture<'_> {
-        Box::pin(async move { self.get_current_resource_version().await })
+    fn wait_until_fresh<'a>(
+        &'a self,
+        target_rv: i64,
+        api_version: &'a str,
+        kind: &'a str,
+        task_supervisor: &'a klights_supervisor::TaskSupervisor,
+    ) -> WatchSourceWaitFuture<'a> {
+        Box::pin(wait_until_fresh(
+            self,
+            target_rv,
+            klights_watch::WatchTopic::new(api_version, kind),
+            task_supervisor,
+        ))
     }
 
     fn list_watch_resources<'a>(
@@ -53,5 +55,49 @@ impl WatchStreamSource for DatastoreHandle {
         Box::pin(async move {
             klights_leader_api::LeaderWatch::watch_resources(&positioned_watch, request).await
         })
+    }
+}
+
+async fn wait_until_fresh(
+    db: &DatastoreHandle,
+    target_rv: i64,
+    topic: klights_watch::WatchTopic,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+) {
+    if target_rv <= 0 {
+        return;
+    }
+    let mut fresh_rx = crate::watch_commit_observation_adapter::subscribe(db, topic);
+    if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
+        return;
+    }
+    let sleep = task_supervisor.sleep(
+        "watch_read_freshness_wait",
+        crate::api::watch_stream::READ_FRESHNESS_TIMEOUT,
+    );
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => {
+                tracing::warn!(
+                    target_rv,
+                    "watch read-freshness wait timed out; serving best-effort from local state"
+                );
+                return;
+            }
+            recv = fresh_rx.recv() => match recv {
+                Ok(signal) => {
+                    if signal.advances.iter().any(|advance| advance.high_rv >= target_rv) {
+                        return;
+                    }
+                }
+                Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
+                    if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
+                        return;
+                    }
+                }
+                Err(klights_watch::WatchSignalReceiveError::Closed) => return,
+            },
+        }
     }
 }

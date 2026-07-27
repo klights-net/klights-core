@@ -23,8 +23,8 @@ use klights_cluster_core::{
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 #[cfg(test)]
-use klights_watch::WatchSignal;
-use klights_watch::WatchTopic;
+#[cfg(test)]
+use klights_watch::{WatchSignal, WatchTopic};
 
 use super::RedbDatastore;
 
@@ -66,6 +66,14 @@ pub(super) fn decode_outbox_watermark_key(
         stream_id,
         stream_seq,
     })
+}
+
+impl crate::datastore::CommitObservationStore for RedbDatastore {
+    fn commit_observation_sink(
+        &self,
+    ) -> std::sync::Arc<dyn crate::datastore::CommitObservationSink> {
+        self.commit_sink.clone()
+    }
 }
 
 #[async_trait]
@@ -216,27 +224,30 @@ impl DatastoreBackend for RedbDatastore {
         self.accessor.close();
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
-        self.watch_bus.subscribe_signals(topic)
-    }
-
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
-        self.watch_bus.subscribe(topic)
+        crate::watch_commit_observation_adapter::subscribe_test_events(
+            self.commit_sink.as_ref(),
+            topic,
+        )
     }
 
     #[cfg(test)]
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
-        self.watch_bus.subscribe_many(topics)
+        crate::watch_commit_observation_adapter::subscribe_test_events_many(
+            self.commit_sink.as_ref(),
+            topics,
+        )
     }
 
     #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
         let event = pending.event;
-        if let Some(signal) = WatchSignal::from_event(&event) {
-            self.watch_bus.publish_signal(signal);
-        }
-        self.watch_bus.publish(event);
+        let _ = WatchSignal::from_event(&event);
+        crate::watch_commit_observation_adapter::publish_test_events(
+            self.commit_sink.as_ref(),
+            vec![event],
+        );
     }
 
     async fn apply_raft_log_apply_commit(

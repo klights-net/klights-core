@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::watch::WatchBus;
+use crate::datastore::CommitObservationSink;
 use anyhow::{Result, anyhow};
 use klights_supervisor::TaskSupervisor;
 
@@ -54,7 +54,7 @@ use watch::RedbWatchStore;
 /// The `DatastoreBackend` impl delegates to these stores.
 pub struct RedbDatastore {
     pub accessor: Arc<RedbAccessor>,
-    watch_bus: Arc<WatchBus>,
+    commit_sink: Arc<dyn CommitObservationSink>,
     resources: RedbResourceStore,
     namespaces: RedbNamespaceStore,
     watch_store: RedbWatchStore,
@@ -67,7 +67,7 @@ impl Clone for RedbDatastore {
     fn clone(&self) -> Self {
         Self::from_accessor(
             self.accessor.clone(),
-            self.watch_bus.clone(),
+            self.commit_sink.clone(),
             self.snapshot_sessions.clone(),
         )
     }
@@ -76,24 +76,25 @@ impl Clone for RedbDatastore {
 impl RedbDatastore {
     fn from_accessor(
         accessor: Arc<RedbAccessor>,
-        watch_bus: Arc<WatchBus>,
+        commit_sink: Arc<dyn CommitObservationSink>,
         snapshot_sessions: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self {
-            resources: RedbResourceStore::new(accessor.clone(), watch_bus.clone()),
-            namespaces: RedbNamespaceStore::new(accessor.clone(), watch_bus.clone()),
+            resources: RedbResourceStore::new(accessor.clone(), commit_sink.clone()),
+            namespaces: RedbNamespaceStore::new(accessor.clone(), commit_sink.clone()),
             watch_store: RedbWatchStore::new(accessor.clone()),
             network: RedbNetworkStore::new(accessor.clone()),
             rv_store: RedbRvStore::new(accessor.clone()),
             accessor,
-            watch_bus,
+            commit_sink,
             snapshot_sessions,
         }
     }
 
-    pub async fn new_persistent(
+    pub async fn new_persistent_with_sink(
         path: &std::path::Path,
         supervisor: Arc<TaskSupervisor>,
+        commit_sink: Arc<dyn CommitObservationSink>,
     ) -> Result<Self> {
         let path = if path.extension().is_none() {
             path.join("redb").join("cluster.redb")
@@ -112,20 +113,45 @@ impl RedbDatastore {
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         Ok(Self::from_accessor(
             accessor,
-            Arc::new(WatchBus::new(1024)),
+            commit_sink,
             Arc::new(tokio::sync::Semaphore::new(1)),
         ))
     }
 
     /// Production in-memory constructor with an explicit task supervisor.
-    pub async fn new_in_memory_with_supervisor(supervisor: Arc<TaskSupervisor>) -> Result<Self> {
+    pub async fn new_in_memory_with_supervisor_and_sink(
+        supervisor: Arc<TaskSupervisor>,
+        commit_sink: Arc<dyn CommitObservationSink>,
+    ) -> Result<Self> {
         let db = open_boundary::open_in_memory(supervisor.as_ref()).await?;
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         Ok(Self::from_accessor(
             accessor,
-            Arc::new(WatchBus::new(1024)),
+            commit_sink,
             Arc::new(tokio::sync::Semaphore::new(1)),
         ))
+    }
+
+    #[cfg(test)]
+    pub async fn new_persistent(
+        path: &std::path::Path,
+        supervisor: Arc<TaskSupervisor>,
+    ) -> Result<Self> {
+        Self::new_persistent_with_sink(
+            path,
+            supervisor,
+            crate::watch_commit_observation_adapter::new_sink(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn new_in_memory_with_supervisor(supervisor: Arc<TaskSupervisor>) -> Result<Self> {
+        Self::new_in_memory_with_supervisor_and_sink(
+            supervisor,
+            crate::watch_commit_observation_adapter::new_sink(),
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -135,7 +161,7 @@ impl RedbDatastore {
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         Ok(Self::from_accessor(
             accessor,
-            Arc::new(WatchBus::new(1024)),
+            crate::watch_commit_observation_adapter::new_sink(),
             Arc::new(tokio::sync::Semaphore::new(1)),
         ))
     }

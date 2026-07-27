@@ -1,10 +1,9 @@
+use crate::api::watch_event::{EventType, WatchContentType, WatchEvent};
 #[cfg(test)]
 use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
 use crate::api::{AppError, watch_event_to_table};
 #[cfg(test)]
 use crate::datastore::RawWatchEvent;
-#[cfg(test)]
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
 #[cfg(test)]
 use crate::datastore::{CatchUpResource, DatastoreHandle};
 #[cfg(test)]
@@ -12,7 +11,8 @@ use crate::datastore::{
     DatastoreBackendWatchStore, RawWatchReplayStore, SnapshotAtRv, WatchReplayAnchorStore,
     WatchReplayPosition, WatchTarget,
 };
-use crate::watch::{EventType, WatchContentType, WatchEvent};
+#[cfg(test)]
+use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 #[cfg(test)]
 use crate::watch::{RawSignalWatchCursor, WatchCursorError, WatchDeliveryScope};
 #[cfg(test)]
@@ -25,17 +25,14 @@ use klights_kube_protobuf::{AcceptValue, ResponseFormat};
 #[cfg(test)]
 use klights_types::LabelSelector;
 #[cfg(test)]
-use klights_watch::WatchSignalReceiver;
-#[cfg(not(test))]
-use klights_watch::WatchSignalReceiver;
-use klights_watch::WatchTopic;
+use klights_watch::{WatchSignalReceiver, WatchTopic};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-pub type WatchSourceCurrentResourceVersionFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>;
+pub type WatchSourceWaitFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 pub type WatchSourceListFuture<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<Output = Result<klights_leader_api::ResourceListResult, AppError>>
@@ -45,8 +42,13 @@ pub type WatchSourceListFuture<'a> = std::pin::Pin<
 >;
 
 pub trait WatchStreamSource: Send + Sync {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> WatchSignalReceiver;
-    fn current_resource_version(&self) -> WatchSourceCurrentResourceVersionFuture<'_>;
+    fn wait_until_fresh<'a>(
+        &'a self,
+        target_rv: i64,
+        api_version: &'a str,
+        kind: &'a str,
+        task_supervisor: &'a klights_supervisor::TaskSupervisor,
+    ) -> WatchSourceWaitFuture<'a>;
     fn list_watch_resources<'a>(
         &'a self,
         api_version: &'a str,
@@ -66,12 +68,15 @@ impl<T> WatchStreamSource for Arc<T>
 where
     T: WatchStreamSource + ?Sized,
 {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> WatchSignalReceiver {
-        self.as_ref().subscribe_watch_signals(topic)
-    }
-
-    fn current_resource_version(&self) -> WatchSourceCurrentResourceVersionFuture<'_> {
-        self.as_ref().current_resource_version()
+    fn wait_until_fresh<'a>(
+        &'a self,
+        target_rv: i64,
+        api_version: &'a str,
+        kind: &'a str,
+        task_supervisor: &'a klights_supervisor::TaskSupervisor,
+    ) -> WatchSourceWaitFuture<'a> {
+        self.as_ref()
+            .wait_until_fresh(target_rv, api_version, kind, task_supervisor)
     }
 
     fn list_watch_resources<'a>(
@@ -186,57 +191,16 @@ pub const READ_FRESHNESS_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn wait_until_datastore_fresh(
     db: &(impl WatchStreamSource + ?Sized),
     target_rv: i64,
-    topic: WatchTopic,
+    api_version: &str,
+    kind: &str,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) {
-    if target_rv <= 0 {
-        return;
-    }
-    // Subscribe BEFORE the first freshness check so an advance landing
-    // between the check and the wait is still observed (no lost wakeup).
-    let mut fresh_rx = db.subscribe_watch_signals(topic);
-    if db.current_resource_version().await.unwrap_or(0) >= target_rv {
-        return;
-    }
-    let sleep = task_supervisor.sleep("watch_read_freshness_wait", READ_FRESHNESS_TIMEOUT);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            _ = &mut sleep => {
-                tracing::warn!(
-                    target_rv,
-                    "watch read-freshness wait timed out; serving best-effort from local state"
-                );
-                return;
-            }
-            recv = fresh_rx.recv() => match recv {
-                Ok(signal) => {
-                    // Any applied write with rv >= target proves the
-                    // monotonic resource-version counter has reached the
-                    // target — no DB round-trip needed on the hot path.
-                    if signal
-                        .advances
-                        .iter()
-                        .any(|advance| advance.high_rv >= target_rv)
-                    {
-                        return;
-                    }
-                }
-                Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
-                    // A burst of writes overflowed our buffer; re-check the
-                    // authoritative counter directly.
-                    if db.current_resource_version().await.unwrap_or(0) >= target_rv {
-                        return;
-                    }
-                }
-                Err(klights_watch::WatchSignalReceiveError::Closed) => return,
-            },
-        }
-    }
+    db.wait_until_fresh(target_rv, api_version, kind, task_supervisor)
+        .await;
 }
 
 pub fn object_matches_field_selector(object: &Value, field_selector: Option<&str>) -> bool {
-    crate::watch::value_matches_field_selector(object, field_selector)
+    crate::api::watch_event::value_matches_field_selector(object, field_selector)
 }
 
 #[cfg(test)]
@@ -835,13 +799,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         emit_initial_state_for_resource_version_zero,
     } = request;
     let api_version = api_version.to_string();
-    wait_until_datastore_fresh(
-        &db,
-        requested_rv,
-        WatchTopic::new(&api_version, &kind),
-        &task_supervisor,
-    )
-    .await;
+    wait_until_datastore_fresh(&db, requested_rv, &api_version, &kind, &task_supervisor).await;
 
     let has_selector = label_selector
         .as_deref()
@@ -1119,7 +1077,8 @@ pub fn legacy_build_label_selector_watch_stream(
         wait_until_datastore_fresh(
             &db,
             requested_rv,
-            WatchTopic::new(&api_version, &kind),
+            &api_version,
+            &kind,
             &task_supervisor,
         )
         .await;
@@ -2511,7 +2470,10 @@ mod tests {
                     .unwrap(),
             );
             let topic = WatchTopic::new("v1", "ConfigMap");
-            let signal_rx = WatchSignalReceiver::new(vec![db.subscribe_watch_signals(topic)]);
+            let signal_rx =
+                WatchSignalReceiver::new(vec![crate::watch_commit_observation_adapter::subscribe(
+                    &db, topic,
+                )]);
             db.close();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let body =
@@ -2858,7 +2820,7 @@ mod tests {
         // resourceVersion 0 / unset: nothing to wait for.
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            wait_until_datastore_fresh(&handle, 0, WatchTopic::new("v1", "Pod"), &supervisor),
+            wait_until_datastore_fresh(&handle, 0, "v1", "Pod", &supervisor),
         )
         .await
         .expect("zero target must return immediately");
@@ -2867,7 +2829,7 @@ mod tests {
         let cur = handle.get_current_resource_version().await.unwrap();
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            wait_until_datastore_fresh(&handle, cur, WatchTopic::new("v1", "Pod"), &supervisor),
+            wait_until_datastore_fresh(&handle, cur, "v1", "Pod", &supervisor),
         )
         .await
         .expect("already-fresh target must return immediately");
@@ -2881,12 +2843,7 @@ mod tests {
         let base = handle.get_current_resource_version().await.unwrap();
         let target = base + 1;
 
-        let waiter = wait_until_datastore_fresh(
-            &handle,
-            target,
-            WatchTopic::new("v1", "ConfigMap"),
-            &supervisor,
-        );
+        let waiter = wait_until_datastore_fresh(&handle, target, "v1", "ConfigMap", &supervisor);
         let writer = async {
             // Let the waiter subscribe and run its initial check first so
             // we exercise the event-driven wakeup, not the fast path.

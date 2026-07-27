@@ -2693,7 +2693,7 @@ async fn build_repo_with_scheduling_mode(
 async fn build_repo_with_dispatcher() -> (
     super::PodRepository,
     crate::datastore::DatastoreHandle,
-    Arc<crate::controller_dispatcher::ControllerDispatcher>,
+    Arc<crate::controllers::ControllerDispatcher>,
 ) {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -2705,7 +2705,7 @@ async fn build_repo_with_dispatcher() -> (
         Some(db.clone()),
     ));
     let dispatcher = Arc::new(
-        crate::controller_dispatcher::ControllerDispatcher::with_task_supervisor(
+        crate::controllers::ControllerDispatcher::with_task_supervisor(
             Arc::new(crate::controllers::service::ServiceIpam::new(
                 "10.43.128.0/17",
             )),

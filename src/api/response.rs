@@ -1,5 +1,5 @@
 use crate::api::AppError;
-use crate::watch::{EventType, WatchEvent};
+use crate::api::watch_event::{EventType, WatchEvent};
 use axum::{
     Json,
     body::Body,

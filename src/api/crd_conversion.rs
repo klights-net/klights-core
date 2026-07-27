@@ -1,6 +1,6 @@
 use crate::api::AppError;
 use crate::api::apiservice_proxy::resolve_service_proxy_target;
-use crate::watch::{EventType, WatchEvent};
+use crate::api::watch_event::{EventType, WatchEvent};
 use klights_cluster_core::Resource;
 use serde_json::Value;
 use std::net::SocketAddr;

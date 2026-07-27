@@ -8,6 +8,7 @@ mod planner;
 mod prelude;
 mod service_rules;
 mod session_affinity;
+mod state_source;
 
 pub use inventory::{InventoryApply, ServiceRouteInventory};
 pub use planner::RoutePlan;
@@ -52,6 +53,10 @@ pub(crate) use service_rules::{
     parse_port, parse_session_affinity, prefix_len_from_mask, probability_for_ladder_step,
 };
 pub use session_affinity::SessionAffinity;
+pub use state_source::{
+    NetworkPolicySnapshot, RoutingStateFuture, RoutingStateSource, ServiceRoutingResource,
+    ServiceRoutingSnapshot,
+};
 
 #[cfg(test)]
 mod tests;
