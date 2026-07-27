@@ -1091,16 +1091,27 @@ impl ControllerNetworkPort for RootControllerNetworkPort {
 
 pub(crate) struct RootControllerEffectPort {
     file_process: klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: std::path::PathBuf,
 }
 
 impl RootControllerEffectPort {
-    pub(crate) fn new(file_process: klights_supervisor::FileProcessExecutor) -> Self {
-        Self { file_process }
+    pub(crate) fn new(
+        file_process: klights_supervisor::FileProcessExecutor,
+        local_path_provisioner_root: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            file_process,
+            local_path_provisioner_root,
+        }
     }
 }
 
 impl ControllerEffectPort for RootControllerEffectPort {
     fn file_process(&self) -> &klights_supervisor::FileProcessExecutor {
         &self.file_process
+    }
+
+    fn local_path_provisioner_root(&self) -> &std::path::Path {
+        &self.local_path_provisioner_root
     }
 }

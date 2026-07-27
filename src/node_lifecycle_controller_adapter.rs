@@ -100,6 +100,7 @@ pub(crate) struct NodeLifecycleControllerDependencies {
     pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
     pub(crate) watch: Arc<dyn LeaderWatch>,
+    pub(crate) pod_eviction_grace: std::time::Duration,
 }
 
 pub(crate) async fn run_node_lifecycle_controller(
@@ -116,6 +117,7 @@ pub(crate) async fn run_node_lifecycle_controller(
         supervisor: task_supervisor,
         node_status,
         watch,
+        pod_eviction_grace,
     } = dependencies;
     let mut events = match open_node_lifecycle_watches(watch.as_ref()).await {
         Ok(events) => events,
@@ -161,6 +163,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                 Utc::now(),
                 Some(pod_mutations.as_ref()),
                 Some(pod_lifecycle_router.as_ref() as &dyn NodeLostPodLifecycleSink),
+                pod_eviction_grace,
             )
             .await
             {

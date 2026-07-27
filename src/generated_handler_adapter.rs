@@ -14,7 +14,7 @@ pub(crate) struct GeneratedHandlerAdapter {
     db: DatastoreHandle,
     file_process: klights_supervisor::FileProcessExecutor,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    containerd_namespace: String,
+    ca_cert_path: std::path::PathBuf,
 }
 
 impl GeneratedHandlerAdapter {
@@ -22,13 +22,13 @@ impl GeneratedHandlerAdapter {
         db: DatastoreHandle,
         file_process: klights_supervisor::FileProcessExecutor,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-        containerd_namespace: String,
+        ca_cert_path: std::path::PathBuf,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             file_process,
             task_supervisor,
-            containerd_namespace,
+            ca_cert_path,
         })
     }
 }
@@ -138,10 +138,10 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn create_root_ca_config_map(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            let ca_cert_path = crate::paths::ca_cert_path(&self.containerd_namespace);
-            let ca_cert_pem = crate::utils::read_utf8_file_async(&self.file_process, &ca_cert_path)
-                .await
-                .map_err(|error| AppError::Internal(error.to_string()))?;
+            let ca_cert_pem =
+                crate::utils::read_utf8_file_async(&self.file_process, &self.ca_cert_path)
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
             crate::controllers::namespace::create_kube_root_ca_configmap(
                 self.db.as_ref(),
                 &namespace,
@@ -154,10 +154,11 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn reconcile_root_ca_data(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::namespace::reconcile_kube_root_ca_data(
+            crate::controllers::namespace::reconcile_kube_root_ca_data_with_path(
                 &self.file_process,
                 self.db.as_ref(),
                 &namespace,
+                &self.ca_cert_path,
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -166,10 +167,11 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn reconcile_root_ca(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::namespace::reconcile_kube_root_ca(
+            crate::controllers::namespace::reconcile_kube_root_ca_with_path(
                 &self.file_process,
                 self.db.as_ref(),
                 &namespace,
+                &self.ca_cert_path,
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))

@@ -60,6 +60,7 @@ pub struct LeaderPersistentVolumeEventHandler {
     db: crate::datastore::DatastoreHandle,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
     file_process: klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: std::path::PathBuf,
 }
 
 impl LeaderPersistentVolumeEventHandler {
@@ -67,11 +68,13 @@ impl LeaderPersistentVolumeEventHandler {
         db: crate::datastore::DatastoreHandle,
         is_leader_rx: tokio::sync::watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
+        local_path_provisioner_root: std::path::PathBuf,
     ) -> Self {
         Self {
             db,
             is_leader_rx,
             file_process,
+            local_path_provisioner_root,
         }
     }
 
@@ -81,6 +84,7 @@ impl LeaderPersistentVolumeEventHandler {
         let reconcile = crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
             self.db.as_ref(),
             &self.file_process,
+            &self.local_path_provisioner_root,
         );
         if let Err(error) = reconcile.reconcile_pvc(resource).await {
             tracing::error!(pvc = event_name, error = %error, "failed to reconcile PVC");

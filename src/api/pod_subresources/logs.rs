@@ -200,16 +200,16 @@ pub(in crate::api) async fn get_pod_log(
         .and_then(|u| u.as_str())
         .ok_or_else(|| AppError::Internal("Pod has no UID".to_string()))?;
 
-    let log_path = crate::paths::pod_log_dir_path(
-        &state.operational().config.containerd_namespace,
-        &namespace,
-        &name,
-        pod_uid,
-    )
-    .join(&container_name)
-    .join("0.log")
-    .to_string_lossy()
-    .into_owned();
+    let log_path = state
+        .operational()
+        .config
+        .runtime
+        .paths
+        .pod_log_dir(&namespace, &name, pod_uid)
+        .join(&container_name)
+        .join("0.log")
+        .to_string_lossy()
+        .into_owned();
 
     tracing::debug!("Reading container logs from: {}", log_path);
 

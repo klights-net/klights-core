@@ -98,7 +98,10 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         db_handle.clone(),
         klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor.clone(),
-        crate::KlightsConfig::test_default().containerd_namespace,
+        crate::KlightsConfig::test_default()
+            .data_root
+            .join("etc")
+            .join("ca.crt"),
     );
     let bootstrap_token_authenticator = std::sync::Arc::new(
         crate::bootstrap::auth_adapters::DatastoreBootstrapTokenAuthenticator::new(
@@ -192,12 +195,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             None,
             {
                 let config = crate::KlightsConfig::test_default();
-                std::sync::Arc::new(crate::api::ApiOperationalConfig::new(
-                    config.node_name,
-                    config.containerd_namespace,
-                    config.anonymous_auth,
-                    config.cluster_cidr,
-                ))
+                crate::api::ApiOperationalConfig::from_test(config)
             },
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),

@@ -386,14 +386,15 @@ pub async fn resolve_service_proxy_target(
 }
 
 pub async fn load_apiservice_proxy_identity(
-    namespace: &str,
+    cert_path: &Path,
+    key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
     cache: &tokio::sync::OnceCell<reqwest::Identity>,
 ) -> Option<reqwest::Identity> {
-    let etc = crate::paths::etc_dir_path(namespace);
-    load_apiservice_proxy_identity_from_etc(&etc, task_supervisor, cache).await
+    load_apiservice_proxy_identity_from_paths(cert_path, key_path, task_supervisor, cache).await
 }
 
+#[cfg(test)]
 async fn load_apiservice_proxy_identity_from_etc(
     etc: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
@@ -401,7 +402,32 @@ async fn load_apiservice_proxy_identity_from_etc(
 ) -> Option<reqwest::Identity> {
     match cache
         .get_or_try_init(|| async {
-            load_apiservice_proxy_identity_uncached(etc, task_supervisor).await
+            load_apiservice_proxy_identity_uncached(
+                &etc.join("apiservice-proxy.crt"),
+                &etc.join("apiservice-proxy.key"),
+                task_supervisor,
+            )
+            .await
+        })
+        .await
+    {
+        Ok(identity) => Some(identity.clone()),
+        Err(err) => {
+            tracing::warn!("Failed to load APIService proxy client identity: {err}");
+            None
+        }
+    }
+}
+
+async fn load_apiservice_proxy_identity_from_paths(
+    cert_path: &Path,
+    key_path: &Path,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    cache: &tokio::sync::OnceCell<reqwest::Identity>,
+) -> Option<reqwest::Identity> {
+    match cache
+        .get_or_try_init(|| async {
+            load_apiservice_proxy_identity_uncached(cert_path, key_path, task_supervisor).await
         })
         .await
     {
@@ -414,20 +440,19 @@ async fn load_apiservice_proxy_identity_from_etc(
 }
 
 async fn load_apiservice_proxy_identity_uncached(
-    etc: &Path,
+    cert_path: &Path,
+    key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<reqwest::Identity> {
-    let cert_path = etc.join("apiservice-proxy.crt");
-    let key_path = etc.join("apiservice-proxy.key");
     let cert = read_apiservice_proxy_identity_file(
         task_supervisor,
-        &cert_path,
+        cert_path,
         "apiservice_proxy_identity_read_cert",
     )
     .await?;
     let key = read_apiservice_proxy_identity_file(
         task_supervisor,
-        &key_path,
+        key_path,
         "apiservice_proxy_identity_read_key",
     )
     .await?;
@@ -498,7 +523,18 @@ async fn cached_apiservice_proxy_client(
 ) -> Result<reqwest::Client, AppError> {
     let identity = {
         load_apiservice_proxy_identity(
-            &state.operational().config.containerd_namespace,
+            &state
+                .operational()
+                .config
+                .runtime
+                .paths
+                .apiservice_proxy_cert,
+            &state
+                .operational()
+                .config
+                .runtime
+                .paths
+                .apiservice_proxy_key,
             state.operational().task_supervisor.as_ref(),
             state.discovery().apiservice_proxy_identity_cache.as_ref(),
         )

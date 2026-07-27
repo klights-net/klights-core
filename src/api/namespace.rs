@@ -267,8 +267,8 @@ pub(in crate::api) async fn create_namespace(
             e
         );
     }
-    let ca_cert_path = crate::paths::ca_cert_path(&state.operational().config.containerd_namespace);
-    match crate::utils::read_utf8_file_async(&state.operational().file_process, &ca_cert_path).await
+    let ca_cert_path = &state.operational().config.runtime.paths.ca_cert;
+    match crate::utils::read_utf8_file_async(&state.operational().file_process, ca_cert_path).await
     {
         Ok(ca_cert_pem) => {
             if let Err(e) = namespace_bootstrap

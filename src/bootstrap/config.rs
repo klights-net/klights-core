@@ -1,8 +1,12 @@
 pub const DEFAULT_TLS_PORT: u16 = 7679;
+pub const DEFAULT_API_SLOW_LOG_MS: u64 = 250;
+pub const DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS: i64 = 0;
+pub const DEFAULT_MAX_WATCH_EVENTS: i64 = 100_000;
+pub const DEFAULT_GC_INTERVAL_SECONDS: u64 = 30;
 
 use crate::datastore::backend_kind::BackendKind;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KlightsConfig {
     pub bridge_name: String,
     pub pod_subnet: String,
@@ -44,6 +48,21 @@ pub struct KlightsConfig {
 
     /// Persistent node-local durability datastore path.
     pub node_db_path: std::path::PathBuf,
+
+    /// Absolute process data root, resolved exactly once during bootstrap.
+    pub data_root: std::path::PathBuf,
+
+    /// Immutable API slow-request threshold captured at the root.
+    pub api_slow_log_threshold: std::time::Duration,
+
+    /// Nonnegative delay after a Node becomes Unknown before Pod eviction.
+    pub node_not_ready_pod_eviction_grace: std::time::Duration,
+
+    /// Positive global watch-history retention window.
+    pub max_watch_events: i64,
+
+    /// GC scheduler cadence captured once with the rest of root configuration.
+    pub gc_interval: std::time::Duration,
 
     /// When true, use an in-memory datastore instead of persistent disk.
     pub in_memory: bool,
@@ -178,6 +197,7 @@ impl KlightsConfig {
 
         let datastore_backend = parse_datastore_backend_env()?;
         let node_local_backend = parse_node_local_backend_env()?;
+        let data_root = crate::paths::data_root_path(&containerd_namespace);
         let cluster_db_path =
             crate::paths::cluster_db_path(&containerd_namespace, datastore_backend.as_str());
         let node_db_path =
@@ -216,6 +236,27 @@ impl KlightsConfig {
             )?,
             cluster_db_path,
             node_db_path,
+            data_root,
+            api_slow_log_threshold: std::time::Duration::from_millis(
+                parse_positive_u64_env_or_default(
+                    "KLIGHTS_API_SLOW_LOG_MS",
+                    DEFAULT_API_SLOW_LOG_MS,
+                ),
+            ),
+            node_not_ready_pod_eviction_grace: std::time::Duration::from_secs(
+                parse_nonnegative_i64_env_or_default(
+                    "KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS",
+                    DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS,
+                ) as u64,
+            ),
+            max_watch_events: parse_positive_i64_env_or_default(
+                "KLIGHTS_MAX_WATCH_EVENTS",
+                DEFAULT_MAX_WATCH_EVENTS,
+            ),
+            gc_interval: std::time::Duration::from_secs(parse_u64_env_or_default(
+                "KLIGHTS_GC_INTERVAL_SECS",
+                DEFAULT_GC_INTERVAL_SECONDS,
+            )),
             in_memory,
             db_encryption,
             db_key_file,
@@ -264,10 +305,14 @@ impl KlightsConfig {
         self.log_file
             .as_deref()
             .map(|value| {
-                crate::bootstrap::logging::resolve_log_file_path(value, &self.containerd_namespace)
+                if value.trim().eq_ignore_ascii_case("true") {
+                    self.data_root.join("logs").join("klights.log")
+                } else {
+                    std::path::PathBuf::from(value)
+                }
             })
             .unwrap_or_else(|| {
-                crate::paths::data_root_path(&self.containerd_namespace)
+                self.data_root
                     .join("logs")
                     .join(format!("{}.log", self.bridge_name))
             })
@@ -305,6 +350,13 @@ impl KlightsConfig {
                 .join("db")
                 .join("sqlite")
                 .join("node.db"),
+            data_root: crate::paths::test_data_root_path(ns),
+            api_slow_log_threshold: std::time::Duration::from_millis(DEFAULT_API_SLOW_LOG_MS),
+            node_not_ready_pod_eviction_grace: std::time::Duration::from_secs(
+                DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS as u64,
+            ),
+            max_watch_events: DEFAULT_MAX_WATCH_EVENTS,
+            gc_interval: std::time::Duration::from_secs(DEFAULT_GC_INTERVAL_SECONDS),
             in_memory: true,
             db_encryption: DbEncryption::Disabled,
             db_key_file: None,
@@ -376,6 +428,37 @@ fn parse_u16_env(var: &str, default: u16) -> anyhow::Result<u16> {
             .map_err(|e| anyhow::anyhow!("{} must be a u16: {}", var, e)),
         Err(_) => Ok(default),
     }
+}
+
+fn parse_u64_env_or_default(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_positive_u64_env_or_default(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_nonnegative_i64_env_or_default(var: &str, default: i64) -> i64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(default)
+}
+
+fn parse_positive_i64_env_or_default(var: &str, default: i64) -> i64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn parse_optional_trimmed_env(var: &str) -> Option<String> {
@@ -463,6 +546,11 @@ mod tests {
         unsafe { std::env::remove_var("KLIGHTS_DATASTORE_BACKEND") };
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_NODE_LOCAL_BACKEND") };
+        unsafe { std::env::remove_var("KLIGHTS_DATA_ROOT") };
+        unsafe { std::env::remove_var("KLIGHTS_API_SLOW_LOG_MS") };
+        unsafe { std::env::remove_var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS") };
+        unsafe { std::env::remove_var("KLIGHTS_MAX_WATCH_EVENTS") };
+        unsafe { std::env::remove_var("KLIGHTS_GC_INTERVAL_SECS") };
     }
 
     #[test]
@@ -512,11 +600,62 @@ mod tests {
         );
         assert_eq!(config.datastore_backend, BackendKind::Sqlite);
         assert_eq!(config.node_local_backend, BackendKind::Sqlite);
+        assert_eq!(
+            config.api_slow_log_threshold,
+            std::time::Duration::from_millis(DEFAULT_API_SLOW_LOG_MS)
+        );
+        assert_eq!(
+            config.node_not_ready_pod_eviction_grace,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(config.max_watch_events, DEFAULT_MAX_WATCH_EVENTS);
         let log_path = config.log_file_path();
         assert!(
             log_path.ends_with("/logs/klights.log"),
             "default log path must live under {{data_root}}/logs/, got: {log_path}"
         );
+    }
+
+    #[test]
+    fn ambient_runtime_inputs_preserve_defaults_invalid_fallbacks_and_valid_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_klights_env();
+        unsafe { std::env::set_var("KLIGHTS_API_SLOW_LOG_MS", "0") };
+        unsafe { std::env::set_var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "-1") };
+        unsafe { std::env::set_var("KLIGHTS_MAX_WATCH_EVENTS", "invalid") };
+        let fallback = KlightsConfig::from_env().expect("invalid optional inputs use defaults");
+        assert_eq!(
+            fallback.api_slow_log_threshold,
+            std::time::Duration::from_millis(DEFAULT_API_SLOW_LOG_MS)
+        );
+        assert_eq!(
+            fallback.node_not_ready_pod_eviction_grace,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(fallback.max_watch_events, DEFAULT_MAX_WATCH_EVENTS);
+
+        unsafe { std::env::set_var("KLIGHTS_API_SLOW_LOG_MS", "700") };
+        unsafe { std::env::set_var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS", "45") };
+        unsafe { std::env::set_var("KLIGHTS_MAX_WATCH_EVENTS", "12345") };
+        let captured = KlightsConfig::from_env().expect("valid optional inputs");
+        assert_eq!(
+            captured.api_slow_log_threshold,
+            std::time::Duration::from_millis(700)
+        );
+        assert_eq!(
+            captured.node_not_ready_pod_eviction_grace,
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(captured.max_watch_events, 12_345);
+
+        unsafe { std::env::set_var("KLIGHTS_API_SLOW_LOG_MS", "900") };
+        unsafe { std::env::set_var("KLIGHTS_DATA_ROOT", "/tmp/changed-after-capture") };
+        assert_eq!(
+            captured.api_slow_log_threshold,
+            std::time::Duration::from_millis(700)
+        );
+        assert!(!captured.data_root.starts_with("/tmp/changed-after-capture"));
+        clear_klights_env();
     }
 
     #[test]

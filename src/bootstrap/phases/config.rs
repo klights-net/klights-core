@@ -70,10 +70,9 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
     let containerd_state_dir = paths::containerd_state_dir_path(&config.containerd_namespace)
         .to_string_lossy()
         .into_owned();
-    let runtime_paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-        paths::data_root_path(&config.containerd_namespace),
-    )
-    .context("invalid kubelet runtime path layout")?;
+    let runtime_paths =
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(config.data_root.clone())
+            .context("invalid kubelet runtime path layout")?;
 
     Ok(ConfigPhase {
         config,

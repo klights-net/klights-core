@@ -175,6 +175,7 @@ pub(crate) use state::{
     ApiDiscoveryAggregationServices, ApiOperationalConfig, ApiOperationalServices,
     ApiPodNodeSubresourceServices, ApiRemoteNodeServices, ApiResourceMutationServices,
 };
+pub(crate) use state::{ApiRuntimeInputs, ApiRuntimePaths};
 #[cfg(not(test))]
 pub(crate) use state::{RootApiRole, build_router_from_root};
 pub use validation::{

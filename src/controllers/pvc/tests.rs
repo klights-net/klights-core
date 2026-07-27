@@ -5,7 +5,9 @@ use serde_json::json;
 
 async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Value> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-    super::reconcile_pvc(&file_process, db, pvc).await
+    let local_path_provisioner_root =
+        crate::paths::test_data_root_path("pvc-controller-tests").join("local-path-provisioner");
+    super::reconcile_pvc(&file_process, &local_path_provisioner_root, db, pvc).await
 }
 
 /// Helper to fetch latest PVC from DB with resourceVersion injected

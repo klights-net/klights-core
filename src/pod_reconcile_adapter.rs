@@ -380,24 +380,34 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
 pub(crate) struct PersistentVolumeReconcileAdapter<'a> {
     db: &'a dyn crate::datastore::DatastoreBackend,
     file_process: &'a klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: &'a std::path::Path,
 }
 
 impl<'a> PersistentVolumeReconcileAdapter<'a> {
     pub(crate) fn new(
         db: &'a dyn crate::datastore::DatastoreBackend,
         file_process: &'a klights_supervisor::FileProcessExecutor,
+        local_path_provisioner_root: &'a std::path::Path,
     ) -> Self {
-        Self { db, file_process }
+        Self {
+            db,
+            file_process,
+            local_path_provisioner_root,
+        }
     }
 }
 
 impl PvcReconcileSink for PersistentVolumeReconcileAdapter<'_> {
     fn reconcile_pvc(&self, pvc: Resource) -> PvcReconcileFuture<'_> {
         Box::pin(async move {
-            let updated =
-                crate::controllers::pvc::reconcile_pvc(self.file_process, self.db, &pvc.data)
-                    .await
-                    .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
+            let updated = crate::controllers::pvc::reconcile_pvc(
+                self.file_process,
+                self.local_path_provisioner_root,
+                self.db,
+                &pvc.data,
+            )
+            .await
+            .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
             Ok(PvcReconcileOutcome {
                 phase: updated
                     .pointer("/status/phase")

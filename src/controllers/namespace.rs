@@ -34,15 +34,13 @@ pub trait NamespaceBootstrapStore: Send + Sync {
     ) -> Result<Resource>;
 }
 
-pub async fn init_default_namespaces<S: NamespaceBootstrapStore + ?Sized>(
+pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
     store: &S,
+    ca_cert_path: &std::path::Path,
 ) -> Result<()> {
     // Read CA cert once (will be used for all namespaces)
-    let containerd_ns =
-        std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or("klights".to_string());
-    let ca_cert_path = crate::paths::ca_cert_path(&containerd_ns);
-    let ca_cert_pem = crate::utils::read_utf8_file_async(file_process, &ca_cert_path)
+    let ca_cert_pem = crate::utils::read_utf8_file_async(file_process, ca_cert_path)
         .await
         .ok();
 
@@ -115,6 +113,16 @@ pub async fn init_default_namespaces<S: NamespaceBootstrapStore + ?Sized>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub async fn init_default_namespaces<S: NamespaceBootstrapStore + ?Sized>(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    store: &S,
+) -> Result<()> {
+    let namespace = crate::paths::runtime_namespace();
+    let ca_cert_path = crate::paths::ca_cert_path(&namespace);
+    init_default_namespaces_with_ca_path(file_process, store, &ca_cert_path).await
 }
 
 pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
@@ -209,10 +217,11 @@ async fn namespace_absent_or_terminating<S: NamespaceBootstrapStore + ?Sized>(
 /// Reconcile `kube-root-ca.crt` in a namespace: read the CA from the
 /// bootstrap file and create the ConfigMap if it does not exist.
 /// Skips if the namespace is terminating.
-pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
+pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
     store: &S,
     namespace: &str,
+    ca_cert_path: &std::path::Path,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
@@ -228,10 +237,7 @@ pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
     }
 
     // Read the CA cert from the bootstrap file
-    let containerd_ns =
-        std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or("klights".to_string());
-    let ca_cert_path = crate::paths::ca_cert_path(&containerd_ns);
-    let ca_pem = match crate::utils::read_utf8_file_async(file_process, &ca_cert_path).await {
+    let ca_pem = match crate::utils::read_utf8_file_async(file_process, ca_cert_path).await {
         Ok(pem) => pem,
         Err(e) => {
             tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
@@ -242,24 +248,33 @@ pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
     create_kube_root_ca_configmap(store, namespace, &ca_pem).await
 }
 
+#[cfg(test)]
+pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    store: &S,
+    namespace: &str,
+) -> Result<()> {
+    let runtime_namespace = crate::paths::runtime_namespace();
+    let ca_cert_path = crate::paths::ca_cert_path(&runtime_namespace);
+    reconcile_kube_root_ca_with_path(file_process, store, namespace, &ca_cert_path).await
+}
+
 /// Reconcile `kube-root-ca.crt` data in a namespace: read the CA from
 /// the bootstrap file and update the existing ConfigMap's `ca.crt` key.
 /// Used when the data is cleared or modified by a user.
 /// Skips if the namespace is terminating.
-pub async fn reconcile_kube_root_ca_data<S: NamespaceBootstrapStore + ?Sized>(
+pub async fn reconcile_kube_root_ca_data_with_path<S: NamespaceBootstrapStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
     store: &S,
     namespace: &str,
+    ca_cert_path: &std::path::Path,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
     }
 
     // Read the CA cert from the bootstrap file
-    let containerd_ns =
-        std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or("klights".to_string());
-    let ca_cert_path = crate::paths::ca_cert_path(&containerd_ns);
-    let ca_pem = match crate::utils::read_utf8_file_async(file_process, &ca_cert_path).await {
+    let ca_pem = match crate::utils::read_utf8_file_async(file_process, ca_cert_path).await {
         Ok(pem) => pem,
         Err(e) => {
             tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
@@ -297,6 +312,17 @@ pub async fn reconcile_kube_root_ca_data<S: NamespaceBootstrapStore + ?Sized>(
         namespace
     );
     Ok(())
+}
+
+#[cfg(test)]
+pub async fn reconcile_kube_root_ca_data<S: NamespaceBootstrapStore + ?Sized>(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    store: &S,
+    namespace: &str,
+) -> Result<()> {
+    let runtime_namespace = crate::paths::runtime_namespace();
+    let ca_cert_path = crate::paths::ca_cert_path(&runtime_namespace);
+    reconcile_kube_root_ca_data_with_path(file_process, store, namespace, &ca_cert_path).await
 }
 
 pub async fn create_extension_apiserver_authentication_configmap<

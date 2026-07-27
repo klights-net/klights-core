@@ -89,6 +89,7 @@ pub(crate) trait ControllerNetworkPort: Send + Sync {
 
 pub(crate) trait ControllerEffectPort: Send + Sync {
     fn file_process(&self) -> &klights_supervisor::FileProcessExecutor;
+    fn local_path_provisioner_root(&self) -> &std::path::Path;
 }
 
 #[derive(Clone)]

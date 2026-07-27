@@ -42,8 +42,6 @@ const NODE_STATUS_UNKNOWN_REASON: &str = "NodeStatusUnknown";
 const NODE_STATUS_UNKNOWN_MESSAGE: &str = "Kubelet stopped posting node status.";
 const NODE_READY_REASON: &str = "KubeletReady";
 const NODE_READY_MESSAGE: &str = "klights is ready";
-const NODE_NOT_READY_POD_EVICTION_GRACE_ENV: &str =
-    "KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS";
 // Default 0: once a node is confirmed Unknown (after ~24s of confirmed lease
 // silence, T3), its pods are marked Unknown and cleaned up immediately — no
 // extra wait. Cleanup still flows through the UID-bound actor finalization
@@ -54,6 +52,7 @@ const NODE_NOT_READY_POD_EVICTION_GRACE_ENV: &str =
 // after confirmed silence, not on a transient blip); (b) a partitioned-but-
 // alive node could have its pods rescheduled while it still runs them until it
 // sheds leadership/membership — mitigated by the 24s detection, not eliminated.
+#[cfg(test)]
 const DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS: i64 = 0;
 
 #[cfg(test)]
@@ -109,8 +108,16 @@ pub async fn mark_all_nodes_unknown_at(
 ) -> Result<()> {
     let pod_repository = crate::controllers::test_utils::pod_repository_for_test(db);
     let node_status = TestNodeLifecycleStatus(db);
-    mark_all_nodes_unknown_at_with_pods(db, &node_status, pod_repository.as_ref(), None, None, now)
-        .await
+    mark_all_nodes_unknown_at_with_pods(
+        db,
+        &node_status,
+        pod_repository.as_ref(),
+        None,
+        None,
+        Duration::ZERO,
+        now,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -120,6 +127,7 @@ async fn mark_all_nodes_unknown_at_with_pods(
     pod_repository: &(impl NodeLifecyclePodStore + ?Sized),
     side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
     pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
+    pod_eviction_grace: Duration,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let nodes = db.list_nodes().await?;
@@ -134,6 +142,7 @@ async fn mark_all_nodes_unknown_at_with_pods(
             side_effects,
             pod_lifecycle_router,
             &node.name,
+            pod_eviction_grace,
             now,
         )
         .await?;
@@ -157,6 +166,7 @@ pub async fn reconcile_node_lifecycle_once(
         now,
         None,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -192,6 +202,7 @@ pub async fn reconcile_node_lifecycle_once_with_tracker_for_test(
         now,
         None,
         None,
+        Duration::ZERO,
     )
     .await
 }
@@ -204,6 +215,7 @@ pub(crate) async fn reconcile_node_lifecycle_once_with_tracker(
     now: DateTime<Utc>,
     side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
     pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
+    pod_eviction_grace: Duration,
 ) -> Result<Option<Duration>> {
     let nodes = db.list_nodes().await?;
     let mut next_deadline: Option<Duration> = None;
@@ -258,6 +270,7 @@ pub(crate) async fn reconcile_node_lifecycle_once_with_tracker(
                     side_effects,
                     pod_lifecycle_router,
                     &node.name,
+                    pod_eviction_grace,
                     now,
                 )
                 .await?,
@@ -448,6 +461,7 @@ async fn mark_pods_unknown_on_node(
     side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
     pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     node_name: &str,
+    pod_eviction_grace: Duration,
     now: DateTime<Utc>,
 ) -> Result<Option<Duration>> {
     let pods = pod_repository.list_pods_bound_to_node(node_name).await?;
@@ -456,7 +470,7 @@ async fn mark_pods_unknown_on_node(
         let mut data = Arc::unwrap_or_clone(pod.data.clone());
         let status_changed = mark_pod_status_unknown(&mut data, now);
         if pod.data.pointer("/metadata/deletionTimestamp").is_none() {
-            match stale_node_pod_terminal_deadline(&data) {
+            match stale_node_pod_terminal_deadline(&data, pod_eviction_grace) {
                 Some(deadline) if deadline <= now => {
                     mark_pod_node_lost_and_enqueue_actor_cleanup(
                         db,
@@ -846,18 +860,16 @@ fn pod_status_has_node_unknown_projection(pod: &Value) -> bool {
         })
 }
 
-fn stale_node_pod_terminal_deadline(pod: &Value) -> Option<DateTime<Utc>> {
-    node_unknown_transition_time(pod).map(|transition_time| {
-        transition_time + chrono::Duration::seconds(node_not_ready_pod_eviction_grace_seconds())
-    })
+fn stale_node_pod_terminal_deadline(
+    pod: &Value,
+    pod_eviction_grace: Duration,
+) -> Option<DateTime<Utc>> {
+    let seconds = i64::try_from(pod_eviction_grace.as_secs()).unwrap_or(i64::MAX);
+    node_unknown_transition_time(pod)
+        .map(|transition_time| transition_time + chrono::Duration::seconds(seconds))
 }
 
-fn node_not_ready_pod_eviction_grace_seconds() -> i64 {
-    parse_node_not_ready_pod_eviction_grace_seconds(
-        std::env::var(NODE_NOT_READY_POD_EVICTION_GRACE_ENV).ok(),
-    )
-}
-
+#[cfg(test)]
 fn parse_node_not_ready_pod_eviction_grace_seconds(raw: Option<String>) -> i64 {
     raw.as_deref()
         .and_then(|value| value.trim().parse::<i64>().ok())
@@ -1969,6 +1981,7 @@ mod tests {
                     .as_ref(),
             ),
             None,
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();
@@ -1998,6 +2011,7 @@ mod tests {
                     .as_ref(),
             ),
             None,
+            std::time::Duration::ZERO,
         )
         .await
         .unwrap();

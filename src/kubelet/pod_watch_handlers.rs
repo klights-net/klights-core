@@ -24,6 +24,7 @@ pub struct DatastorePersistentVolumeEventHandler {
     db: DatastoreHandle,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
     file_process: klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: std::path::PathBuf,
 }
 
 #[cfg(test)]
@@ -37,6 +38,9 @@ impl DatastorePersistentVolumeEventHandler {
             db,
             is_leader_rx,
             file_process,
+            local_path_provisioner_root: crate::KlightsConfig::test_default()
+                .data_root
+                .join("local-path-provisioner"),
         }
     }
 }
@@ -54,7 +58,14 @@ impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
             );
             return;
         }
-        handle_pvc_event(&self.file_process, self.db.as_ref(), event, event_name).await;
+        handle_pvc_event(
+            &self.file_process,
+            &self.local_path_provisioner_root,
+            self.db.as_ref(),
+            event,
+            event_name,
+        )
+        .await;
     }
 
     async fn handle_pv_event(&self, event: &PodWatchEvent, event_name: &str) {
@@ -67,7 +78,14 @@ impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
             );
             return;
         }
-        handle_pv_event(&self.file_process, self.db.as_ref(), event, event_name).await;
+        handle_pv_event(
+            &self.file_process,
+            &self.local_path_provisioner_root,
+            self.db.as_ref(),
+            event,
+            event_name,
+        )
+        .await;
     }
 }
 
@@ -99,6 +117,7 @@ impl PersistentVolumeEventHandler for NoopPersistentVolumeEventHandler {
 #[cfg(test)]
 pub async fn handle_pvc_event(
     file_process: &klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: &std::path::Path,
     db: &dyn DatastoreBackend,
     event: &PodWatchEvent,
     event_name: &str,
@@ -127,8 +146,11 @@ pub async fn handle_pvc_event(
         )
         .await
     {
-        let reconcile =
-            crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(db, file_process);
+        let reconcile = crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
+            db,
+            file_process,
+            local_path_provisioner_root,
+        );
         match reconcile.reconcile_pvc(pvc_resource).await {
             Ok(outcome) => {
                 if let Some(phase) = outcome.phase.as_deref() {
@@ -151,6 +173,7 @@ pub async fn handle_pvc_event(
 #[cfg(test)]
 pub async fn handle_pv_event(
     file_process: &klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: &std::path::Path,
     db: &dyn DatastoreBackend,
     event: &PodWatchEvent,
     event_name: &str,
@@ -190,6 +213,7 @@ pub async fn handle_pv_event(
                         crate::pod_reconcile_adapter::PersistentVolumeReconcileAdapter::new(
                             db,
                             file_process,
+                            local_path_provisioner_root,
                         );
                     if let Err(e) = reconcile.reconcile_pvc(pvc_resource.clone()).await {
                         let pvc_name = pvc_resource.name.as_str();

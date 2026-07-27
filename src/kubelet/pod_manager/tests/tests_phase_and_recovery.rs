@@ -330,6 +330,7 @@ async fn test_pvc_added_event_triggers_reconciliation() {
     // Call reconcile_pvc (what handle_watch_event will do)
     crate::controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
+        &crate::paths::test_data_root_path("pod-manager-pvc-tests").join("local-path-provisioner"),
         &db,
         &pvc_with_rv,
     )
@@ -415,6 +416,7 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
 
     crate::controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
+        &crate::paths::test_data_root_path("pod-manager-pvc-tests").join("local-path-provisioner"),
         &db,
         &pvc_with_rv,
     )
@@ -489,6 +491,8 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
             }
             crate::controllers::pvc::reconcile_pvc(
                 &crate::kubelet::file_blocking::test_file_process_executor(),
+                &crate::paths::test_data_root_path("pod-manager-pvc-tests")
+                    .join("local-path-provisioner"),
                 &db,
                 &pvc_with_rv,
             )

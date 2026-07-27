@@ -98,7 +98,7 @@ pub(crate) async fn build_test_app_state_with_db(
         db_handle.clone(),
         klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor.clone(),
-        config.containerd_namespace.clone(),
+        config.data_root.join("etc").join("ca.crt"),
     );
     let network = crate::networking::test_support::mock_network(db_handle.clone());
     let bootstrap_token_authenticator = Arc::new(
@@ -190,12 +190,7 @@ pub(crate) async fn build_test_app_state_with_db(
         crate::api::ApiOperationalServices::new(
             crate::api::ApiNodeRole::Leader,
             None,
-            Arc::new(crate::api::ApiOperationalConfig::new(
-                config.node_name.clone(),
-                config.containerd_namespace.clone(),
-                config.anonymous_auth,
-                config.cluster_cidr.clone(),
-            )),
+            crate::api::ApiOperationalConfig::from_test(config.as_ref().clone()),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),
             ),

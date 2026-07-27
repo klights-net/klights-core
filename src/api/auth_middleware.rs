@@ -63,11 +63,15 @@ impl ApiAuthResources<'_> {
 #[async_trait::async_trait]
 impl ServiceAccountSigningKeyProvider for ApiAuthResources<'_> {
     async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
-        let signing_key_path = crate::paths::service_account_signing_key_path(
-            &self.state.operational().config.containerd_namespace,
-        );
+        let signing_key_path = &self
+            .state
+            .operational()
+            .config
+            .runtime
+            .paths
+            .service_account_signing_key;
         crate::auth::read_service_account_signing_key_supervised(
-            &signing_key_path,
+            signing_key_path,
             self.state.operational().task_supervisor.as_ref(),
         )
         .await

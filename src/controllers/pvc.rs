@@ -53,6 +53,7 @@ async fn write_pvc_status<S: PvcStore + ?Sized>(
 /// Returns the created PV name, or None if storageClassName is not provisioned.
 async fn provision_pv_for_pvc<S: PvcStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: &std::path::Path,
     store: &S,
     pvc: &Value,
 ) -> Result<Option<String>> {
@@ -102,8 +103,7 @@ async fn provision_pv_for_pvc<S: PvcStore + ?Sized>(
         .ok_or_else(|| anyhow::anyhow!("PVC missing accessModes"))?;
 
     // Create host directory under the klights data root.
-    let runtime_ns = crate::paths::runtime_namespace();
-    let host_path = crate::paths::local_path_provisioner_root_path(&runtime_ns)
+    let host_path = local_path_provisioner_root
         .join(namespace)
         .join(pvc_name)
         .to_string_lossy()
@@ -151,6 +151,7 @@ async fn provision_pv_for_pvc<S: PvcStore + ?Sized>(
 /// Returns the updated PVC resource
 pub(crate) async fn reconcile_pvc<S: PvcStore + ?Sized>(
     file_process: &klights_supervisor::FileProcessExecutor,
+    local_path_provisioner_root: &std::path::Path,
     store: &S,
     pvc: &Value,
 ) -> Result<Value> {
@@ -418,7 +419,9 @@ pub(crate) async fn reconcile_pvc<S: PvcStore + ?Sized>(
     }
 
     // No matching PV found - try to provision a PV
-    if let Some(provisioned_pv_name) = provision_pv_for_pvc(file_process, store, &pvc).await? {
+    if let Some(provisioned_pv_name) =
+        provision_pv_for_pvc(file_process, local_path_provisioner_root, store, &pvc).await?
+    {
         // PV was provisioned, now bind PVC to it
         let provisioned_pv = store
             .get_persistent_volume(&provisioned_pv_name)

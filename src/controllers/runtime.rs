@@ -101,6 +101,9 @@ impl Context {
                 effects: Arc::new(
                     crate::controller_runtime_adapter::RootControllerEffectPort::new(
                         crate::kubelet::file_blocking::test_file_process_executor(),
+                        crate::KlightsConfig::test_default()
+                            .data_root
+                            .join("local-path-provisioner"),
                     ),
                 ),
                 node_name: Arc::from(node_name),
@@ -134,7 +137,12 @@ impl Context {
     #[cfg(test)]
     fn with_file_process(mut self, file_process: klights_supervisor::FileProcessExecutor) -> Self {
         self.dependencies.effects = Arc::new(
-            crate::controller_runtime_adapter::RootControllerEffectPort::new(file_process),
+            crate::controller_runtime_adapter::RootControllerEffectPort::new(
+                file_process,
+                crate::KlightsConfig::test_default()
+                    .data_root
+                    .join("local-path-provisioner"),
+            ),
         );
         self
     }
@@ -402,6 +410,7 @@ macro_rules! controller_wrapper {
             ) -> ::anyhow::Result<()> {
                 $core_fn(
                     ctx.effects().file_process(),
+                    ctx.effects().local_path_provisioner_root(),
                     ctx.leader().$store(),
                     &resource,
                 )

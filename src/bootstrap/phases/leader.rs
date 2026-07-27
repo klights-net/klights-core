@@ -283,11 +283,7 @@ async fn start_leader_scoped_tasks(
     }
     tracing::info!("Scheduler controller started");
 
-    let gc_interval = std::env::var("KLIGHTS_GC_INTERVAL_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(30);
-    let mut sched = gc::GcScheduler::new(std::time::Duration::from_secs(gc_interval));
+    let mut sched = gc::GcScheduler::new(config.gc_interval);
     if let Some(cri_arc) = cri_for_shutdown {
         sched.register(Arc::new(gc::sandbox_gc::SandboxGc::new(
             node_local.clone(),
@@ -300,7 +296,8 @@ async fn start_leader_scoped_tasks(
     }
     sched.register(Arc::new(gc::watch_events_gc::WatchEventsGc::new(
         db_handle.clone(),
-    )));
+        config.max_watch_events,
+    )?));
 
     let cancel = lease_cancel.child_token();
     let ts = task_supervisor.clone();

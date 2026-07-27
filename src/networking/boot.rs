@@ -138,6 +138,15 @@ mod tests {
                 .join("db")
                 .join("sqlite")
                 .join("node.db"),
+            data_root: crate::paths::test_data_root_path(ns),
+            api_slow_log_threshold: std::time::Duration::from_millis(
+                crate::bootstrap::config::DEFAULT_API_SLOW_LOG_MS,
+            ),
+            node_not_ready_pod_eviction_grace: std::time::Duration::ZERO,
+            max_watch_events: crate::bootstrap::config::DEFAULT_MAX_WATCH_EVENTS,
+            gc_interval: std::time::Duration::from_secs(
+                crate::bootstrap::config::DEFAULT_GC_INTERVAL_SECONDS,
+            ),
             in_memory: true,
             db_encryption: crate::DbEncryption::Disabled,
             db_key_file: None,

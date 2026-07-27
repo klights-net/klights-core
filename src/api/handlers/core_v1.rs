@@ -778,11 +778,14 @@ async fn create_serviceaccount_token(
         }
     }
 
-    let signing_key_path = crate::paths::service_account_signing_key_path(
-        &state.operational().config.containerd_namespace,
-    );
+    let signing_key_path = &state
+        .operational()
+        .config
+        .runtime
+        .paths
+        .service_account_signing_key;
     let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-        &signing_key_path,
+        signing_key_path,
         &state.operational().file_process,
     )
     .await

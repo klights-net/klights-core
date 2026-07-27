@@ -1545,13 +1545,13 @@ async fn test_pod_log_route_success_returns_text_plain_body() {
         .await
         .unwrap();
 
-    let log_dir = crate::paths::pod_log_dir_path(
-        &state.operational().config.containerd_namespace,
-        "default",
-        "log-success",
-        "log-success-uid",
-    )
-    .join("main");
+    let log_dir = state
+        .operational()
+        .config
+        .runtime
+        .paths
+        .pod_log_dir("default", "log-success", "log-success-uid")
+        .join("main");
     tokio::fs::create_dir_all(&log_dir).await.unwrap();
     tokio::fs::write(
         log_dir.join("0.log"),

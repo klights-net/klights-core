@@ -93,10 +93,11 @@ impl RaftLeaderProxy {
 }
 
 pub(crate) async fn load_proxy_client_identity(
-    containerd_namespace: &str,
+    cert_path: &Path,
+    key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Option<reqwest::Identity> {
-    match load_proxy_client_identity_from_namespace(containerd_namespace, task_supervisor).await {
+    match load_proxy_client_identity_from_paths(cert_path, key_path, task_supervisor).await {
         Ok(identity) => Some(identity),
         Err(err) => {
             tracing::warn!("Failed to load raft leader proxy client identity: {err}");
@@ -105,20 +106,19 @@ pub(crate) async fn load_proxy_client_identity(
     }
 }
 
-async fn load_proxy_client_identity_from_namespace(
-    containerd_namespace: &str,
+async fn load_proxy_client_identity_from_paths(
+    cert_path: &Path,
+    key_path: &Path,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<reqwest::Identity> {
-    let cert_path = crate::paths::api_proxy_cert_path(containerd_namespace);
-    let key_path = crate::paths::api_proxy_key_path(containerd_namespace);
     let cert = read_proxy_client_identity_file(
         task_supervisor,
-        &cert_path,
+        cert_path,
         "raft_proxy_identity_read_cert",
     )
     .await?;
     let key =
-        read_proxy_client_identity_file(task_supervisor, &key_path, "raft_proxy_identity_read_key")
+        read_proxy_client_identity_file(task_supervisor, key_path, "raft_proxy_identity_read_key")
             .await?;
 
     reqwest::Identity::from_pkcs8_pem(&cert, &key)

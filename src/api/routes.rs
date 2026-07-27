@@ -15,7 +15,7 @@ use std::{
 
 /// Middleware that gates K8s API requests on raft leadership.
 /// On non-leader controlplanes:
-async fn log_request(request: Request, next: Next) -> Response {
+async fn log_request(slow_threshold: Duration, request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path();
@@ -36,7 +36,6 @@ async fn log_request(request: Request, next: Next) -> Response {
     let elapsed = started.elapsed();
     let status = response.status();
     let elapsed_ms = elapsed.as_millis() as u64;
-    let slow_threshold = api_slow_log_threshold();
     if api_request_is_slow(elapsed, slow_threshold) {
         tracing::warn!(
             target: "klights::api",
@@ -67,16 +66,6 @@ async fn log_request(request: Request, next: Next) -> Response {
     response
 }
 
-fn api_slow_log_threshold() -> Duration {
-    const DEFAULT_API_SLOW_LOG_MS: u64 = 250;
-    let millis = std::env::var("KLIGHTS_API_SLOW_LOG_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .unwrap_or(DEFAULT_API_SLOW_LOG_MS);
-    Duration::from_millis(millis)
-}
-
 fn api_request_is_slow(elapsed: Duration, threshold: Duration) -> bool {
     elapsed >= threshold
 }
@@ -90,6 +79,7 @@ fn is_pod_log_follow_request(path: &str, query: &str) -> bool {
 
 pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
     let state = Arc::new(state);
+    let slow_log_threshold = state.operational().config.runtime.slow_log_threshold;
     Router::new()
         .route("/healthz", get(health_check))
         .route("/livez", get(health_check))
@@ -464,7 +454,9 @@ pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
                 }
             })
         })
-        .layer(middleware::from_fn(log_request))
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            log_request(slow_log_threshold, request, next)
+        }))
         // Outermost: content-negotiate error Status bodies to protobuf. Added
         // last so it wraps every route, layer, and fallback.
         .layer(middleware::from_fn(negotiate_error_protobuf))
@@ -569,11 +561,14 @@ async fn openid_configuration(State(_state): State<Arc<ApiState>>) -> Json<Value
 }
 
 async fn openid_jwks(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, AppError> {
-    let signing_key_path = crate::paths::service_account_signing_key_path(
-        &state.operational().config.containerd_namespace,
-    );
+    let signing_key_path = &state
+        .operational()
+        .config
+        .runtime
+        .paths
+        .service_account_signing_key;
     let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-        &signing_key_path,
+        signing_key_path,
         &state.operational().file_process,
     )
     .await

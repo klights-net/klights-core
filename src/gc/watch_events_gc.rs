@@ -5,13 +5,13 @@
 //! The SQLite GC also preserves a small per resource-scope floor so unrelated
 //! write bursts cannot erase rare-kind history needed by lagged watches.
 //!
-//! The 100k-row cap is configurable via `KLIGHTS_MAX_WATCH_EVENTS`.
+//! The root captures and validates the configurable row cap once at startup.
 
 use crate::datastore::DatastoreHandle;
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Default sliding-window size. Override with `KLIGHTS_MAX_WATCH_EVENTS`.
+/// Default sliding-window size used by root configuration.
 pub const DEFAULT_MAX_WATCH_EVENTS: i64 = 100_000;
 
 /// Maximum rows deleted per tick. Bounds the SQLite write so the GC stays
@@ -25,17 +25,13 @@ pub struct WatchEventsGc {
 }
 
 impl WatchEventsGc {
-    pub fn new(db: DatastoreHandle) -> Self {
-        let max_rows = std::env::var("KLIGHTS_MAX_WATCH_EVENTS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_MAX_WATCH_EVENTS);
-        Self {
+    pub fn new(db: DatastoreHandle, max_rows: i64) -> anyhow::Result<Self> {
+        anyhow::ensure!(max_rows > 0, "watch event retention limit must be positive");
+        Ok(Self {
             db,
             max_rows,
             batch_cap: BATCH_CAP_PER_TICK,
-        }
+        })
     }
 }
 
@@ -226,11 +222,18 @@ mod tests {
     #[tokio::test]
     async fn watch_events_gc_task_name() {
         let db = crate::datastore::test_support::in_memory().await;
-        let task = WatchEventsGc::new(std::sync::Arc::new(db));
+        let task = WatchEventsGc::new(std::sync::Arc::new(db), DEFAULT_MAX_WATCH_EVENTS).unwrap();
         assert_eq!(
             <WatchEventsGc as super::super::GcTask>::name(&task),
             "watch_events_gc"
         );
+    }
+
+    #[tokio::test]
+    async fn watch_events_gc_rejects_nonpositive_retention_limit() {
+        let db = crate::datastore::test_support::in_memory().await;
+        assert!(WatchEventsGc::new(std::sync::Arc::new(db.clone()), 0).is_err());
+        assert!(WatchEventsGc::new(std::sync::Arc::new(db), -1).is_err());
     }
 
     #[tokio::test]

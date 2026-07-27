@@ -325,6 +325,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         is_leader_rx,
     } = args;
     use crate::{api, controllers, kubelet};
+    let api_runtime_paths = crate::api::ApiRuntimePaths::from_data_root(config.data_root.clone())
+        .context("invalid API runtime path layout")?;
+    let api_runtime_inputs =
+        crate::api::ApiRuntimeInputs::new(api_runtime_paths.clone(), config.api_slow_log_threshold)
+            .context("invalid API runtime inputs")?;
 
     // T2 step 2: leader-capable nodes gate one-time init on lease
     // acquisition. For a seed boot the raft node is already leader by
@@ -356,9 +361,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Initialize default namespaces (only on the seed leader).
     if leader_lease.is_some() {
-        controllers::namespace::init_default_namespaces(
+        controllers::namespace::init_default_namespaces_with_ca_path(
             &klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             db,
+            &api_runtime_paths.ca_cert,
         )
         .await
         .context("Failed to initialize default namespaces")?;
@@ -668,6 +674,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         effects: Arc::new(
             crate::controller_runtime_adapter::RootControllerEffectPort::new(
                 klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+                config.data_root.join("local-path-provisioner"),
             ),
         ),
         node_name: Arc::from(config.node_name.as_str()),
@@ -731,7 +738,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     // Load the cluster CA cert once: the follower proxy uses it to verify the
     // leader's serving cert, and the leader uses it to cryptographically
     // re-authenticate client certificates forwarded by follower proxies.
-    let ca_cert_path = crate::paths::ca_cert_path(&config.containerd_namespace);
+    let ca_cert_path = api_runtime_paths.ca_cert.clone();
     let cluster_ca_pem = supervisor
         .run_blocking_file_keyed("proxy_read_ca_cert", ca_cert_path.display().to_string(), {
             let p = ca_cert_path.clone();
@@ -743,7 +750,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let raft_leader_proxy = if raft_node.is_some() {
         let ca_cert_pem = cluster_ca_pem.clone();
         let proxy_client_identity = crate::api::raft_proxy::load_proxy_client_identity(
-            &config.containerd_namespace,
+            &api_runtime_paths.api_proxy_cert,
+            &api_runtime_paths.api_proxy_key,
             supervisor.as_ref(),
         )
         .await;
@@ -802,9 +810,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     #[cfg(test)]
     let api_config = Arc::new(crate::api::ApiOperationalConfig::new(
         config.node_name.clone(),
-        config.containerd_namespace.clone(),
         config.anonymous_auth,
-        config.cluster_cidr.clone(),
+        api_runtime_inputs.clone(),
     ));
     let finalizer_lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new(
@@ -828,7 +835,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         db_handle.clone(),
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         supervisor.clone(),
-        config.containerd_namespace.clone(),
+        api_runtime_paths.ca_cert.clone(),
     );
     #[cfg(test)]
     let watcher_state = Arc::new(api::ApiState::new(
@@ -1324,6 +1331,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 db_handle.clone(),
                 is_leader_rx.clone(),
                 ctx.local_execution().file_process,
+                config.data_root.join("local-path-provisioner"),
             ),
         );
         let cancel = shutdown_token.clone();
@@ -1450,6 +1458,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let node_lifecycle_pod_router = pod_lifecycle_router.clone();
         let node_lifecycle_lease_tracker = node_lease_tracker.clone();
         let node_lifecycle_supervisor = supervisor.clone();
+        let node_lifecycle_pod_eviction_grace = config.node_not_ready_pod_eviction_grace;
         Some(
             supervisor
                 .spawn_async(
@@ -1466,6 +1475,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 supervisor: node_lifecycle_supervisor,
                                 node_status: node_lifecycle_status.clone(),
                                 watch: node_lifecycle_status,
+                                pod_eviction_grace: node_lifecycle_pod_eviction_grace,
                             },
                             cancel,
                             is_leader_rx,
@@ -1591,9 +1601,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         root_api_role,
         root_api_replication,
         config.node_name.clone(),
-        config.containerd_namespace.clone(),
         config.anonymous_auth,
-        config.cluster_cidr.clone(),
+        api_runtime_inputs,
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
         raft_leader_proxy,

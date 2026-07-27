@@ -223,33 +223,89 @@ pub(crate) enum ApiNodeRole {
 #[derive(Clone)]
 pub(crate) struct ApiOperationalConfig {
     pub(crate) node_name: String,
-    pub(crate) containerd_namespace: String,
     pub(crate) anonymous_auth: bool,
+    pub(crate) runtime: ApiRuntimeInputs,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApiRuntimePaths {
+    pub(crate) ca_cert: std::path::PathBuf,
+    pub(crate) service_account_signing_key: std::path::PathBuf,
+    pub(crate) api_proxy_cert: std::path::PathBuf,
+    pub(crate) api_proxy_key: std::path::PathBuf,
+    pub(crate) apiservice_proxy_cert: std::path::PathBuf,
+    pub(crate) apiservice_proxy_key: std::path::PathBuf,
+    pub(crate) pod_logs_root: std::path::PathBuf,
+}
+
+impl ApiRuntimePaths {
+    pub(crate) fn from_data_root(data_root: std::path::PathBuf) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            data_root.is_absolute(),
+            "API runtime data root must be absolute: {}",
+            data_root.display()
+        );
+        let etc = data_root.join("etc");
+        Ok(Self {
+            ca_cert: etc.join("ca.crt"),
+            service_account_signing_key: etc.join("service-account-signing.key"),
+            api_proxy_cert: etc.join("api-proxy.crt"),
+            api_proxy_key: etc.join("api-proxy.key"),
+            apiservice_proxy_cert: etc.join("apiservice-proxy.crt"),
+            apiservice_proxy_key: etc.join("apiservice-proxy.key"),
+            pod_logs_root: data_root.join("logs").join("pods"),
+        })
+    }
+
+    pub(crate) fn pod_log_dir(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> std::path::PathBuf {
+        self.pod_logs_root
+            .join(format!("{namespace}_{pod_name}_{pod_uid}"))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ApiRuntimeInputs {
+    pub(crate) paths: ApiRuntimePaths,
+    pub(crate) slow_log_threshold: std::time::Duration,
+}
+
+impl ApiRuntimeInputs {
+    pub(crate) fn new(
+        paths: ApiRuntimePaths,
+        slow_log_threshold: std::time::Duration,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !slow_log_threshold.is_zero(),
+            "API slow-log threshold must be positive"
+        );
+        Ok(Self {
+            paths,
+            slow_log_threshold,
+        })
+    }
 }
 
 impl ApiOperationalConfig {
-    pub(crate) fn new(
-        node_name: String,
-        containerd_namespace: String,
-        anonymous_auth: bool,
-        cluster_cidr: String,
-    ) -> Self {
-        let _ = cluster_cidr;
+    pub(crate) fn new(node_name: String, anonymous_auth: bool, runtime: ApiRuntimeInputs) -> Self {
         Self {
             node_name,
-            containerd_namespace,
             anonymous_auth,
+            runtime,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn from_test(config: crate::KlightsConfig) -> Arc<Self> {
-        Arc::new(Self::new(
-            config.node_name,
-            config.containerd_namespace,
-            config.anonymous_auth,
-            config.cluster_cidr,
-        ))
+        let paths = ApiRuntimePaths::from_data_root(config.data_root.clone())
+            .expect("test API data root must be absolute");
+        let runtime = ApiRuntimeInputs::new(paths, config.api_slow_log_threshold)
+            .expect("test API slow-log threshold must be positive");
+        Arc::new(Self::new(config.node_name, config.anonymous_auth, runtime))
     }
 }
 
@@ -378,9 +434,8 @@ pub(crate) fn build_router_from_root(
     role: RootApiRole,
     replication: Option<RootApiRemoteNodeServices>,
     node_name: String,
-    containerd_namespace: String,
     anonymous_auth: bool,
-    cluster_cidr: String,
+    runtime_inputs: ApiRuntimeInputs,
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     is_raft_leader_rx: Option<Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
@@ -450,9 +505,8 @@ pub(crate) fn build_router_from_root(
             replication,
             Arc::new(ApiOperationalConfig::new(
                 node_name,
-                containerd_namespace,
                 anonymous_auth,
-                cluster_cidr,
+                runtime_inputs,
             )),
             cluster_status,
             task_supervisor.clone(),
@@ -577,5 +631,46 @@ impl std::ops::Deref for ApiState {
 impl std::ops::DerefMut for ApiState {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.auth_policy
+    }
+}
+
+#[cfg(test)]
+mod runtime_input_tests {
+    use super::*;
+
+    #[test]
+    fn api_runtime_paths_are_derived_from_one_absolute_root() {
+        let paths = ApiRuntimePaths::from_data_root(std::path::PathBuf::from("/srv/klights"))
+            .expect("absolute root");
+        assert_eq!(
+            paths.ca_cert,
+            std::path::PathBuf::from("/srv/klights/etc/ca.crt")
+        );
+        assert_eq!(
+            paths.service_account_signing_key,
+            std::path::PathBuf::from("/srv/klights/etc/service-account-signing.key")
+        );
+        assert_eq!(
+            paths.api_proxy_cert,
+            std::path::PathBuf::from("/srv/klights/etc/api-proxy.crt")
+        );
+        assert_eq!(
+            paths.apiservice_proxy_key,
+            std::path::PathBuf::from("/srv/klights/etc/apiservice-proxy.key")
+        );
+        assert_eq!(
+            paths.pod_log_dir("default", "pod", "uid"),
+            std::path::PathBuf::from("/srv/klights/logs/pods/default_pod_uid")
+        );
+    }
+
+    #[test]
+    fn api_runtime_paths_reject_relative_root_and_inputs_reject_zero_threshold() {
+        assert!(
+            ApiRuntimePaths::from_data_root(std::path::PathBuf::from("relative/root")).is_err()
+        );
+        let paths = ApiRuntimePaths::from_data_root(std::path::PathBuf::from("/srv/klights"))
+            .expect("absolute root");
+        assert!(ApiRuntimeInputs::new(paths, std::time::Duration::ZERO).is_err());
     }
 }
