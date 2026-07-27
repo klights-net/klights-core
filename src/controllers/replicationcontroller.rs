@@ -11,10 +11,8 @@ use futures::future::{poll_fn, select_all};
 use klights_pod_api::{PodListRequest, PodQuery};
 use klights_types::LabelSelector;
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
 use std::task::Poll;
 
 #[async_trait]
@@ -54,7 +52,6 @@ pub trait ReplicationControllerPodMutation: Send + Sync {
     ) -> Result<klights_cluster_core::Resource>;
 }
 
-type ReplicationControllerReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
 type PodCreateFuture<'a> =
     Pin<Box<dyn Future<Output = Result<klights_cluster_core::Resource>> + Send + 'a>>;
 
@@ -72,21 +69,6 @@ struct ScaleUpProgress<'state, 'future> {
 
 const RC_SCALE_UP_PROGRESS_INTERVAL: usize = 10;
 const RC_SCALE_UP_MAX_IN_FLIGHT: usize = 4;
-
-static REPLICATIONCONTROLLER_RECONCILE_LOCKS: LazyLock<
-    tokio::sync::Mutex<ReplicationControllerReconcileLocks>,
-> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
-
-async fn replicationcontroller_reconcile_lock(
-    namespace: &str,
-    name: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = REPLICATIONCONTROLLER_RECONCILE_LOCKS.lock().await;
-    locks
-        .entry(format!("{namespace}/{name}"))
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
 fn is_controller_owner_ref(owner_ref: &Value) -> bool {
     owner_ref
@@ -112,12 +94,13 @@ async fn list_replication_controller_pods(
 }
 
 /// Reconcile a ReplicationController to match desired state
-pub async fn reconcile_replicationcontroller(
+pub(crate) async fn reconcile_replicationcontroller(
     db: &(impl ReplicationControllerStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -126,7 +109,11 @@ pub async fn reconcile_replicationcontroller(
     let namespace = rc["metadata"]["namespace"]
         .as_str()
         .context("RC missing namespace")?;
-    let reconcile_lock = replicationcontroller_reconcile_lock(namespace, rc_name).await;
+    let reconcile_lock = coordination.reconcile_lock(
+        crate::controllers::CoordinatedControllerKind::ReplicationController,
+        namespace,
+        rc_name,
+    );
     let _reconcile_guard = reconcile_lock.lock().await;
 
     let live_resource = match db.get_replication_controller(namespace, rc_name).await? {
@@ -139,6 +126,7 @@ pub async fn reconcile_replicationcontroller(
         live_resource.clone(),
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await?
     {

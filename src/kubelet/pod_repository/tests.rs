@@ -12448,6 +12448,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
 
     // Drive the real RC background-delete cascade (one-shot inline call, the
     // path inners.rs runs after hard-deleting the RC row).
+    let coordination = crate::controllers::ControllerCoordination::new();
     cascade_delete_with_uid(
         db.as_ref(),
         rc_uid,
@@ -12459,6 +12460,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
         &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
             db.clone() as crate::datastore::DatastoreHandle
         ),
+        &coordination,
     )
     .await
     .expect("cascade must not error");

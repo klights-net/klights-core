@@ -99,6 +99,7 @@ pub(crate) struct ControllerRuntimeDependencies {
     pub(crate) reconcile: Arc<dyn ControllerReconcilePort>,
     pub(crate) network: Arc<dyn ControllerNetworkPort>,
     pub(crate) effects: Arc<dyn ControllerEffectPort>,
+    pub(crate) coordination: Arc<super::ControllerCoordination>,
     pub(crate) node_name: Arc<str>,
 }
 
@@ -123,6 +124,7 @@ mod tests {
         reconcile: Arc<dyn ControllerReconcilePort>,
         network: Arc<dyn ControllerNetworkPort>,
         effects: Arc<dyn ControllerEffectPort>,
+        coordination: Arc<crate::controllers::ControllerCoordination>,
     ) -> ControllerRuntimeDependencies {
         ControllerRuntimeDependencies {
             leader,
@@ -130,6 +132,7 @@ mod tests {
             reconcile,
             network,
             effects,
+            coordination,
             node_name: Arc::from("fake-node"),
         }
     }

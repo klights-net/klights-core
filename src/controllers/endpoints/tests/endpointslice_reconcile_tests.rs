@@ -738,6 +738,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
     );
 
     // Now simulate cascade delete (what happens when Service is deleted)
+    let coordination = crate::controllers::ControllerCoordination::new();
     crate::controllers::gc::cascade_delete_with_uid(
         &db,
         "test-service-uid-123",
@@ -749,6 +750,7 @@ async fn test_endpointslice_deleted_when_service_deleted_via_cascade() {
         &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
             db.clone(),
         )),
+        &coordination,
     )
     .await
     .unwrap();

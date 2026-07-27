@@ -571,12 +571,13 @@ async fn live_daemonset_active(
 
 /// Reconcile a DaemonSet by ensuring one pod exists per node.
 /// Phase 1 (single-node): creates exactly one pod for the local node.
-pub async fn reconcile_daemonset(
+pub(crate) async fn reconcile_daemonset(
     db: &(impl DaemonSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl DaemonSetPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     daemonset: &Value,
 ) -> Result<()> {
     let common = crate::controllers::common::controller_common();
@@ -604,6 +605,7 @@ pub async fn reconcile_daemonset(
         live_resource.clone(),
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await?
     {

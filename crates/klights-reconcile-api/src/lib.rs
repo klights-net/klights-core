@@ -599,6 +599,32 @@ pub trait GcNonPodFinalizationPort: Send + Sync {
     ) -> GcNonPodFinalizationFuture<'_>;
 }
 
+/// Instance-owned duplicate suppression for foreground Pod deletion.
+///
+/// The capability is deliberately storage- and transport-neutral. A root
+/// composition graph owns one implementation and shares it across controller,
+/// finalizer, Pod lifecycle, and committed side-effect entrypoints. Separate
+/// graphs therefore never coordinate through ambient process state.
+pub trait GcForegroundDeleteCoordination: Send + Sync {
+    /// Reserve one owner/child UID pair.
+    ///
+    /// Returns `true` only to the caller that created the reservation.
+    fn reserve(&self, owner_uid: &str, child_uid: &str) -> bool;
+
+    /// Release a reservation after a failed or terminal delete request.
+    fn release(&self, owner_uid: &str, child_uid: &str);
+
+    /// Retain only reservations for children still observed for this owner.
+    fn retain_owner_children(
+        &self,
+        owner_uid: &str,
+        seen_child_uids: &std::collections::HashSet<String>,
+    );
+
+    /// Clear every reservation after owner completion.
+    fn clear_owner(&self, owner_uid: &str);
+}
+
 /// Complete UID-bound identity of a garbage-collection owner.
 ///
 /// Empty UIDs remain representable for Kubernetes' legacy circular-owner

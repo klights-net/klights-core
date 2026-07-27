@@ -2,6 +2,7 @@ pub mod annotations;
 pub mod apiservice;
 pub mod apiservice_controller;
 pub mod common;
+mod coordination;
 pub mod coredns;
 pub mod crd;
 pub mod cronjob;
@@ -45,6 +46,7 @@ pub mod statefulset_controller;
 pub mod test_utils;
 pub mod workqueue;
 
+pub(crate) use coordination::{ControllerCoordination, CoordinatedControllerKind};
 pub(crate) use dispatcher::ControllerDispatcher;
 pub(crate) use ports::{
     ControllerEffectPort, ControllerLeaderPort, ControllerNetworkPort, ControllerPodPort,

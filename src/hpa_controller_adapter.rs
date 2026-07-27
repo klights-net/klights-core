@@ -20,6 +20,7 @@ impl HpaController {
         _db: crate::datastore::DatastoreHandle,
         _pod_repository: std::sync::Arc<PodRepository>,
         _non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+        _coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
         _node_name: std::sync::Arc<str>,
         _metrics_provider: std::sync::Arc<dyn MetricsProvider>,
     ) -> Self {
@@ -32,6 +33,7 @@ pub struct HpaController {
     db: crate::datastore::DatastoreHandle,
     pod_repository: std::sync::Arc<PodRepository>,
     non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+    coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
     node_name: std::sync::Arc<str>,
     metrics_provider: std::sync::Arc<dyn MetricsProvider>,
 }
@@ -42,6 +44,7 @@ impl HpaController {
         db: crate::datastore::DatastoreHandle,
         pod_repository: std::sync::Arc<PodRepository>,
         non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
+        coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
         node_name: std::sync::Arc<str>,
         metrics_provider: std::sync::Arc<dyn MetricsProvider>,
     ) -> Self {
@@ -49,6 +52,7 @@ impl HpaController {
             db,
             pod_repository,
             non_pod_finalization,
+            coordination,
             node_name,
             metrics_provider,
         }
@@ -69,6 +73,7 @@ impl Controller for HpaController {
                 self.db.as_ref(),
                 self.pod_repository.as_ref(),
                 self.non_pod_finalization.as_ref(),
+                self.coordination.as_ref(),
                 &resource,
                 &self.node_name,
                 self.metrics_provider.as_ref(),
@@ -100,6 +105,7 @@ impl Controller for HpaController {
                 ctx.db_handle().as_ref(),
                 pod_repository.as_ref(),
                 non_pod_finalization.as_ref(),
+                ctx.coordination(),
                 &resource,
                 ctx.node_name(),
                 metrics_provider,
@@ -123,6 +129,7 @@ struct HpaControllerAdapter<'a> {
     db: &'a dyn DatastoreBackend,
     pod_repository: &'a PodRepository,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &'a crate::controllers::ControllerCoordination,
 }
 
 #[async_trait]
@@ -199,6 +206,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
+                    self.coordination,
                     resource,
                     node_name,
                 )
@@ -211,6 +219,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
+                    self.coordination,
                     resource,
                     node_name,
                 )
@@ -223,6 +232,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
+                    self.coordination,
                     resource,
                     node_name,
                 )
@@ -235,6 +245,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     pods,
                     self.non_pod_finalization,
+                    self.coordination,
                     resource,
                     node_name,
                 )
@@ -274,6 +285,7 @@ pub async fn reconcile_hpa(
         db,
         pod_repository,
         non_pod_finalization,
+        &crate::controllers::ControllerCoordination::new(),
         hpa,
         node_name,
         &crate::metrics::FallbackOnlyMetricsProvider,
@@ -285,6 +297,7 @@ pub async fn reconcile_hpa_with_metrics(
     db: &dyn DatastoreBackend,
     pod_repository: &PodRepository,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     hpa: &Value,
     node_name: &str,
     metrics_provider: &dyn MetricsProvider,
@@ -294,6 +307,7 @@ pub async fn reconcile_hpa_with_metrics(
             db,
             pod_repository,
             non_pod_finalization,
+            coordination,
         },
         hpa,
         node_name,

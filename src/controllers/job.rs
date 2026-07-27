@@ -3,14 +3,7 @@ use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-
-type JobReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
-
-static JOB_RECONCILE_LOCKS: LazyLock<tokio::sync::Mutex<JobReconcileLocks>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 #[async_trait]
 pub trait JobStore: crate::controllers::gc::GcResourceStore + Send + Sync {
@@ -33,15 +26,6 @@ pub trait JobPodMutation: Send + Sync {
         name: &str,
         owner_references: Vec<Value>,
     ) -> Result<Resource>;
-}
-
-async fn job_reconcile_lock(namespace: &str, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{namespace}/{name}");
-    let mut locks = JOB_RECONCILE_LOCKS.lock().await;
-    locks
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 
 /// Parse a succeededIndexes string like "0,2,4-6" into a set of individual indexes.
@@ -256,6 +240,7 @@ async fn delete_finished_job_for_ttl(
     resource: &Resource,
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    gc_coordination: &dyn klights_reconcile_api::GcForegroundDeleteCoordination,
 ) -> Result<()> {
     if resource
         .data
@@ -271,6 +256,7 @@ async fn delete_finished_job_for_ttl(
         &marked,
         pod_delete_sink,
         non_pod_finalization,
+        gc_coordination,
     )
     .await?;
     Ok(())
@@ -848,12 +834,13 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
 
 /// Reconcile a Job: manage pod creation/deletion against `completions`,
 /// `parallelism`, and `backoffLimit`. Returns the updated Job resource.
-pub async fn reconcile_job(
+pub(crate) async fn reconcile_job(
     db: &(impl JobStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl JobPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     job: &Value,
     node_name: &str,
 ) -> Result<Value> {
@@ -869,7 +856,11 @@ pub async fn reconcile_job(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
 
-    let reconcile_lock = job_reconcile_lock(initial_namespace, initial_name).await;
+    let reconcile_lock = coordination.reconcile_lock(
+        crate::controllers::CoordinatedControllerKind::Job,
+        initial_namespace,
+        initial_name,
+    );
     let _reconcile_guard = reconcile_lock.lock().await;
 
     let latest_job = db.get_job(initial_namespace, initial_name).await?;
@@ -890,7 +881,14 @@ pub async fn reconcile_job(
     }
 
     if job_ttl_cleanup_delay(&latest_job.data)?.is_some_and(|delay| delay.is_zero()) {
-        delete_finished_job_for_ttl(db, &latest_job, pod_delete_sink, non_pod_finalization).await?;
+        delete_finished_job_for_ttl(
+            db,
+            &latest_job,
+            pod_delete_sink,
+            non_pod_finalization,
+            coordination,
+        )
+        .await?;
         return Ok(std::sync::Arc::unwrap_or_clone(latest_job.data.clone()));
     }
 
@@ -1409,8 +1407,14 @@ pub async fn reconcile_job(
     let updated_resource = db.update_job_status(&status_job_resource, status).await?;
 
     if job_ttl_cleanup_delay(&updated_resource.data)?.is_some_and(|delay| delay.is_zero()) {
-        delete_finished_job_for_ttl(db, &updated_resource, pod_delete_sink, non_pod_finalization)
-            .await?;
+        delete_finished_job_for_ttl(
+            db,
+            &updated_resource,
+            pod_delete_sink,
+            non_pod_finalization,
+            coordination,
+        )
+        .await?;
     }
 
     Ok(std::sync::Arc::unwrap_or_clone(updated_resource.data))

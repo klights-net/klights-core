@@ -6,12 +6,14 @@ use serde_json::json;
 /// repository-backed argument list, mirroring the pre-Task-18 signature.
 async fn reconcile_rc_test(db: &Datastore, rc: &Value, node_name: &str) -> anyhow::Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
+    let coordination = crate::controllers::ControllerCoordination::new();
     super::reconcile_replicationcontroller(
         db,
         repo.as_ref(),
         repo.as_ref(),
         repo.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+        &coordination,
         rc,
         node_name,
     )

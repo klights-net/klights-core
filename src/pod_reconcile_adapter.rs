@@ -25,15 +25,35 @@ pub(crate) struct PodReconcileAdapter {
     side_effects: std::sync::Arc<crate::side_effects::SideEffectRegistry>,
     pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
     non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter,
+    coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
 
 impl PodReconcileAdapter {
+    #[cfg(test)]
     pub(crate) fn new(
         db: DatastoreHandle,
         dispatcher: ControllerDispatcherSlot,
         metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics>,
         side_effects: std::sync::Arc<crate::side_effects::SideEffectRegistry>,
         pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+    ) -> Self {
+        Self::new_with_coordination(
+            db,
+            dispatcher,
+            metrics,
+            side_effects,
+            pod_reader,
+            std::sync::Arc::new(crate::controllers::ControllerCoordination::new()),
+        )
+    }
+
+    pub(crate) fn new_with_coordination(
+        db: DatastoreHandle,
+        dispatcher: ControllerDispatcherSlot,
+        metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics>,
+        side_effects: std::sync::Arc<crate::side_effects::SideEffectRegistry>,
+        pod_reader: std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader>,
+        coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Self {
         Self {
             non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
@@ -44,6 +64,7 @@ impl PodReconcileAdapter {
             metrics,
             side_effects,
             pod_reader,
+            coordination,
         }
     }
 }
@@ -290,6 +311,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
                 pod,
                 pod_delete_sink,
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map(|_| ())
@@ -312,6 +334,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
                 Some(owner.namespace),
                 pod_delete_sink,
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
@@ -329,6 +352,7 @@ impl PodGcReconcileSink for PodReconcileAdapter {
                 &deleted_dependent,
                 pod_delete_sink,
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))

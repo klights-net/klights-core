@@ -460,6 +460,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let non_pod_finalization: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort> = Arc::new(
         crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
     );
+    let controller_coordination = Arc::new(crate::controllers::ControllerCoordination::new());
     local_api_client.set_non_pod_finalization(non_pod_finalization.clone());
 
     let scheduling_mode = if has_leader_election {
@@ -513,6 +514,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(leader_ports.resource_query.clone()),
+                #[cfg(not(test))]
+                gc_coordination: controller_coordination.clone(),
             },
             Some(is_leader_rx.clone()),
         );
@@ -631,6 +634,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     scheduling_mode,
                     outbox: Some(outbox_runtime.clone()),
                     cluster_api: Some(leader_ports.resource_query.clone()),
+                    #[cfg(not(test))]
+                    gc_coordination: controller_coordination.clone(),
                 },
                 Some(is_leader_rx.clone()),
             );
@@ -677,12 +682,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.data_root.join("local-path-provisioner"),
             ),
         ),
+        coordination: controller_coordination.clone(),
         node_name: Arc::from(config.node_name.as_str()),
     };
     let hpa_controller = Arc::new(crate::hpa_controller_adapter::HpaController::new(
         db_handle.clone(),
         api_pod_repository.clone(),
         non_pod_finalization,
+        controller_coordination.clone(),
         Arc::from(config.node_name.as_str()),
         metrics_provider.clone(),
     ));
@@ -814,11 +821,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         api_runtime_inputs.clone(),
     ));
     let finalizer_lifecycle =
-        crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new(
+        crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new_with_coordination(
             db_handle.clone(),
             api_pod_repository.clone(),
             side_effects.clone(),
             metrics.clone(),
+            controller_coordination.clone(),
         );
     let mutation_effects =
         crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
@@ -827,10 +835,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         );
     let list_resource_versions =
         crate::list_query_adapter::DatastoreListResourceVersionPort::new(db_handle.clone());
-    let gc_owner_lifecycle = crate::gc_delete_adapter::GcOwnerLifecycleAdapter::new(
-        db_handle.clone(),
-        api_pod_repository.clone(),
-    );
+    let gc_owner_lifecycle =
+        crate::gc_delete_adapter::GcOwnerLifecycleAdapter::new_with_coordination(
+            db_handle.clone(),
+            api_pod_repository.clone(),
+            controller_coordination.clone(),
+        );
     let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
@@ -1268,6 +1278,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             db,
             api_pod_repository.clone(),
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
+            controller_coordination.as_ref(),
             config.tls_port,
             &config.service_cidr,
             &config.containerd_namespace,

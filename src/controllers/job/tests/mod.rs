@@ -7,6 +7,12 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+fn coordination() -> &'static crate::controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+    &COORDINATION
+}
+
 /// Test-only shim wrapping `reconcile_job` with the repository-backed
 /// argument list, mirroring the pre-Task-18 signature.
 async fn reconcile_job_test(
@@ -23,6 +29,7 @@ async fn reconcile_job_test(
         repo.as_ref(),
         repo.as_ref(),
         &non_pod_finalization,
+        coordination(),
         job,
         node_name,
     )
@@ -244,6 +251,7 @@ async fn test_job_create_loop_observes_live_parallelism_scale_down() {
         pod_writer.as_ref(),
         pod_reader.as_ref(),
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+        coordination(),
         &job_with_rv,
         "test-node",
     )

@@ -74,6 +74,8 @@ pub struct PodRepositoryBuildConfig {
     pub scheduling_mode: PodSchedulingMode,
     pub outbox: Option<Arc<crate::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    #[cfg(not(test))]
+    pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
 
 #[derive(Clone)]
@@ -92,6 +94,7 @@ struct RootPodRepositoryComposition {
     resource_query: Arc<dyn LeaderResourceQuery>,
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
+    gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
 
 pub(crate) struct RootPodRepositoryParts {
@@ -958,13 +961,16 @@ impl RootPodRepositoryComposition {
         Arc<PodApiService>,
         Arc<crate::pod_subresource_service::PodSubresourceService>,
     ) {
-        let pod_reconcile = Arc::new(crate::pod_reconcile_adapter::PodReconcileAdapter::new(
-            self.db.clone(),
-            self.side_effects.controller_dispatcher_slot(),
-            self.metrics.clone(),
-            self.side_effects.clone(),
-            dependencies.store.clone(),
-        ));
+        let pod_reconcile = Arc::new(
+            crate::pod_reconcile_adapter::PodReconcileAdapter::new_with_coordination(
+                self.db.clone(),
+                self.side_effects.controller_dispatcher_slot(),
+                self.metrics.clone(),
+                self.side_effects.clone(),
+                dependencies.store.clone(),
+                self.gc_coordination.clone(),
+            ),
+        );
         let subresource = Arc::new(crate::pod_subresource_service::PodSubresourceService::new(
             dependencies.store.clone(),
             dependencies.status_only.clone(),
@@ -1023,7 +1029,12 @@ pub(crate) fn build_pod_repository_parts(
         scheduling_mode,
         outbox,
         cluster_api,
+        #[cfg(not(test))]
+        gc_coordination,
     } = config;
+    #[cfg(test)]
+    let gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination> =
+        Arc::new(crate::controllers::ControllerCoordination::new());
     let _ = scheduling_mode;
     #[cfg(not(test))]
     let resource_query = cluster_api
@@ -1074,6 +1085,7 @@ pub(crate) fn build_pod_repository_parts(
         resource_query,
         side_effects: side_effects.clone(),
         metrics: metrics.clone(),
+        gc_coordination,
     }
     .build(PodRepositoryAdapterDependencies {
         store: store.clone(),

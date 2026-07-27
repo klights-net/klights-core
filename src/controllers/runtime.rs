@@ -106,6 +106,7 @@ impl Context {
                             .join("local-path-provisioner"),
                     ),
                 ),
+                coordination: Arc::new(super::ControllerCoordination::new()),
                 node_name: Arc::from(node_name),
             },
             db_handle,
@@ -136,12 +137,15 @@ impl Context {
 
     #[cfg(test)]
     fn with_file_process(mut self, file_process: klights_supervisor::FileProcessExecutor) -> Self {
+        let local_path_provisioner_root = self
+            .dependencies
+            .effects
+            .local_path_provisioner_root()
+            .to_path_buf();
         self.dependencies.effects = Arc::new(
             crate::controller_runtime_adapter::RootControllerEffectPort::new(
                 file_process,
-                crate::KlightsConfig::test_default()
-                    .data_root
-                    .join("local-path-provisioner"),
+                local_path_provisioner_root,
             ),
         );
         self
@@ -228,6 +232,10 @@ impl Context {
         self.dependencies.effects.as_ref()
     }
 
+    pub(crate) fn coordination(&self) -> &super::ControllerCoordination {
+        self.dependencies.coordination.as_ref()
+    }
+
     pub(crate) fn node_name(&self) -> &str {
         &self.dependencies.node_name
     }
@@ -239,7 +247,14 @@ impl Debug for Context {
             .field("node_name", &self.dependencies.node_name)
             .field(
                 "focused_dependencies",
-                &["leader", "pods", "reconcile", "network", "effects"],
+                &[
+                    "leader",
+                    "pods",
+                    "reconcile",
+                    "network",
+                    "effects",
+                    "coordination",
+                ],
             )
             .finish()
     }
@@ -368,6 +383,7 @@ macro_rules! controller_wrapper {
                     ctx.pods().$mutation(),
                     ctx.pods().delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
+                    ctx.coordination(),
                     &resource,
                     ctx.node_name(),
                 )
@@ -442,6 +458,7 @@ macro_rules! controller_wrapper {
                     ctx.pods().$mutation(),
                     ctx.pods().delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
+                    ctx.coordination(),
                     &resource,
                 )
                 .await
@@ -491,6 +508,7 @@ macro_rules! controller_wrapper {
                     ctx.pods().$mutation(),
                     ctx.pods().delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
+                    ctx.coordination(),
                     &resource,
                     ctx.node_name(),
                 )

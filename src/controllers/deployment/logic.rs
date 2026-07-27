@@ -248,6 +248,7 @@ struct ZeroReplicaOldReplicaSetRedrive<'a, S: ?Sized, R: ?Sized, W: ?Sized> {
     pod_writer: &'a W,
     pod_delete_sink: &'a dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &'a crate::controllers::ControllerCoordination,
     namespace: &'a str,
     deployment_uid: &'a str,
     current_template: &'a Value,
@@ -305,6 +306,7 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
             ctx.pod_writer,
             ctx.pod_delete_sink,
             ctx.non_pod_finalization,
+            ctx.coordination,
             &rs_with_metadata,
             ctx.node_name,
         )
@@ -539,7 +541,7 @@ async fn scale_replicaset_resource(
         .ok_or_else(|| anyhow::anyhow!("ReplicaSet {} disappeared during scale", rs.name))
 }
 
-pub async fn reconcile_deployment(
+pub(crate) async fn reconcile_deployment(
     db: &(impl DeploymentStore + ?Sized),
     pod_reader: &(impl super::DeploymentPodReader + PodQuery + ?Sized),
     pod_writer: &(
@@ -547,6 +549,7 @@ pub async fn reconcile_deployment(
      ),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     deployment: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -960,6 +963,7 @@ pub async fn reconcile_deployment(
                         pod_writer,
                         pod_delete_sink,
                         non_pod_finalization,
+                        coordination,
                         &rs_with_metadata,
                         node_name,
                     )
@@ -1012,6 +1016,7 @@ pub async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
+                    coordination,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1153,6 +1158,7 @@ pub async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
+                    coordination,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1191,6 +1197,7 @@ pub async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
+                    coordination,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1224,6 +1231,7 @@ pub async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
+                    coordination,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1274,6 +1282,7 @@ pub async fn reconcile_deployment(
                         pod_writer,
                         pod_delete_sink,
                         non_pod_finalization,
+                        coordination,
                         &rs_with_metadata,
                         node_name,
                     )
@@ -1383,6 +1392,7 @@ pub async fn reconcile_deployment(
                     pod_writer,
                     pod_delete_sink,
                     non_pod_finalization,
+                    coordination,
                     &rs_with_metadata,
                     node_name,
                 )
@@ -1528,6 +1538,7 @@ pub async fn reconcile_deployment(
             created_rs.clone(),
             pod_delete_sink,
             non_pod_finalization,
+            coordination,
         )
         .await?
             == crate::controllers::gc::OwnerReferenceReconcile::Deleted
@@ -1546,6 +1557,7 @@ pub async fn reconcile_deployment(
             pod_writer,
             pod_delete_sink,
             non_pod_finalization,
+            coordination,
             &rs_with_metadata,
             node_name,
         )
@@ -1566,6 +1578,7 @@ pub async fn reconcile_deployment(
             pod_writer,
             pod_delete_sink,
             non_pod_finalization,
+            coordination,
             namespace,
             deployment_uid: uid,
             current_template: template,

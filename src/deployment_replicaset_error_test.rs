@@ -5,8 +5,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::controllers::deployment::reconcile_deployment;
-
     use serde_json::json;
 
     #[tokio::test]
@@ -46,7 +44,8 @@ mod tests {
             crate::api::inject_resource_version(created.data, created.resource_version);
 
         // Reconcile should succeed (not return error) and set failure condition
-        let result = reconcile_deployment(
+        let coordination = crate::controllers::ControllerCoordination::new();
+        let result = crate::controllers::deployment::reconcile_deployment(
             &db,
             __pod_repo.as_ref(),
             __pod_repo.as_ref(),
@@ -54,6 +53,7 @@ mod tests {
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(
                 db.clone(),
             )),
+            &coordination,
             &deployment_with_rv,
             "test-node",
         )

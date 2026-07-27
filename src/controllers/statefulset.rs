@@ -108,12 +108,13 @@ async fn live_statefulset_replicas(
     ))
 }
 
-pub async fn reconcile_statefulset(
+pub(crate) async fn reconcile_statefulset(
     db: &(impl StatefulSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl StatefulSetPodMutation + ?Sized),
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     statefulset: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -139,6 +140,7 @@ pub async fn reconcile_statefulset(
         live_resource.clone(),
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await?
     {

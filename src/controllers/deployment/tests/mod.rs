@@ -2,6 +2,12 @@ use super::*;
 use serde_json::Value;
 use serde_json::json;
 
+fn coordination() -> &'static crate::controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+    &COORDINATION
+}
+
 async fn reconcile_deployment<T>(
     db: &T,
     pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
@@ -21,6 +27,7 @@ where
         pod_writer,
         pod_delete_sink,
         &non_pod_finalization,
+        coordination(),
         deployment,
         node_name,
     )

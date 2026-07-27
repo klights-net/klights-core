@@ -23,8 +23,8 @@ use crate::datastore::DatastoreBackend;
 use crate::replication::protocol::ForwardedResource;
 use klights_cluster_core::command::StorageCommand;
 use klights_reconcile_api::{
-    ControllerReconcileSink, GcNonPodFinalizationPort, GcPodDeleteSink, ReconcileKey,
-    ServiceReconcileKey, ServiceReconcileSink,
+    ControllerReconcileSink, GcForegroundDeleteCoordination, GcNonPodFinalizationPort,
+    GcPodDeleteSink, ReconcileKey, ServiceReconcileKey, ServiceReconcileSink,
 };
 
 pub struct PodSideEffectSinks<'a> {
@@ -32,6 +32,22 @@ pub struct PodSideEffectSinks<'a> {
     pub service: Option<&'a dyn ServiceReconcileSink>,
     pub pod_delete: Option<&'a dyn GcPodDeleteSink>,
     pub non_pod_finalization: Option<&'a dyn GcNonPodFinalizationPort>,
+    pub gc_coordination: &'a dyn GcForegroundDeleteCoordination,
+}
+
+pub(crate) fn needs_committed_pod_side_effects(command: &StorageCommand) -> bool {
+    matches!(
+        command,
+        StorageCommand::UpdateStatus {
+            api_version,
+            kind,
+            ..
+        } | StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            ..
+        } if api_version == "v1" && kind == "Pod"
+    ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
 }
 
 pub async fn handle_applied_pod_side_effects(
@@ -48,6 +64,7 @@ pub async fn handle_applied_pod_side_effects(
     cascade_dependents_after_actor_pod_delete(
         sinks.pod_delete,
         sinks.non_pod_finalization,
+        sinks.gc_coordination,
         command,
         resource,
         db,
@@ -65,6 +82,7 @@ pub async fn handle_applied_pod_side_effects(
     finalize_foreground_owners_after_pod_delete(
         sinks.pod_delete,
         sinks.non_pod_finalization,
+        sinks.gc_coordination,
         command,
         resource,
         db,
@@ -225,6 +243,7 @@ async fn enqueue_service_keys(
 async fn finalize_foreground_owners_after_pod_delete(
     gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
     non_pod_finalization: Option<&dyn GcNonPodFinalizationPort>,
+    coordination: &dyn GcForegroundDeleteCoordination,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
@@ -247,13 +266,13 @@ async fn finalize_foreground_owners_after_pod_delete(
     let Some(non_pod_finalization) = non_pod_finalization else {
         return;
     };
-
     let deleted_resource = resource.clone().into_resource();
     if let Err(err) = crate::controllers::gc::finalize_foreground_owners_after_dependent_delete(
         db,
         &deleted_resource,
         gc_pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await
     {
@@ -270,6 +289,7 @@ async fn finalize_foreground_owners_after_pod_delete(
 async fn cascade_dependents_after_actor_pod_delete(
     gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
     non_pod_finalization: Option<&dyn GcNonPodFinalizationPort>,
+    coordination: &dyn GcForegroundDeleteCoordination,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
@@ -310,6 +330,7 @@ async fn cascade_dependents_after_actor_pod_delete(
         namespace,
         gc_pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await
     .map_err(|error| {
@@ -399,6 +420,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn gc_coordination() -> &'static crate::controllers::ControllerCoordination {
+        static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
+            std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+        &COORDINATION
+    }
 
     use crate::controllers::ControllerDispatcher;
     use crate::datastore::ResourcePreconditions;
@@ -590,6 +617,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                gc_coordination: gc_coordination(),
             },
             &command,
             Some(&receipt),
@@ -608,6 +636,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                gc_coordination: gc_coordination(),
             },
             &command,
             Some(&receipt),
@@ -624,6 +653,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                gc_coordination: gc_coordination(),
             },
             &command,
             None,
@@ -702,6 +732,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                gc_coordination: gc_coordination(),
             },
             &command,
             Some(&receipt),
@@ -720,6 +751,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                gc_coordination: gc_coordination(),
             },
             &command,
             Some(&receipt),

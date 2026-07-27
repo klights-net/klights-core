@@ -8,6 +8,34 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Barrier, Notify};
 
+fn coordination() -> &'static crate::controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+    &COORDINATION
+}
+
+async fn reconcile_replicationcontroller(
+    db: &(impl ReplicationControllerStore + ?Sized),
+    pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
+    pod_writer: &(impl ReplicationControllerPodMutation + ?Sized),
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    rc: &Value,
+    node_name: &str,
+) -> Result<()> {
+    super::reconcile_replicationcontroller(
+        db,
+        pod_reader,
+        pod_writer,
+        pod_delete_sink,
+        non_pod_finalization,
+        coordination(),
+        rc,
+        node_name,
+    )
+    .await
+}
+
 struct SlowFirstCreateWriter {
     db: crate::datastore::sqlite::Datastore,
     creates: AtomicUsize,
@@ -368,7 +396,7 @@ async fn reconcile_rc_test(
     node_name: &str,
 ) -> Result<()> {
     let repo = crate::controllers::test_utils::pod_repository_for_test(db);
-    super::reconcile_replicationcontroller(
+    reconcile_replicationcontroller(
         db,
         repo.as_ref(),
         repo.as_ref(),
@@ -1430,7 +1458,7 @@ async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbo
         crate::controllers::test_utils::deferred_outbox_pod_repository_for_test(&db).await;
     let delete_sink = crate::controllers::gc::NoOpGcPodDeleteSink;
 
-    super::reconcile_replicationcontroller(
+    reconcile_replicationcontroller(
         &db,
         repository.as_ref(),
         repository.as_ref(),
@@ -1468,7 +1496,7 @@ async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbo
     )
     .await
     .unwrap();
-    super::reconcile_replicationcontroller(
+    reconcile_replicationcontroller(
         &db,
         repository.as_ref(),
         repository.as_ref(),

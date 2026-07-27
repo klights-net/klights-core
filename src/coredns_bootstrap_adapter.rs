@@ -15,6 +15,7 @@ struct CoreDnsBootstrapAdapter<'a> {
     db: &'a dyn DatastoreBackend,
     pod_repository: Arc<PodRepository>,
     non_pod_finalization: &'a dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &'a crate::controllers::ControllerCoordination,
 }
 
 fn coordinates(
@@ -104,6 +105,7 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             pod_repository,
             pod_repository,
             self.non_pod_finalization,
+            self.coordination,
             &deployment,
             node_name,
         )
@@ -115,6 +117,7 @@ pub async fn bootstrap_coredns(
     db: &dyn DatastoreBackend,
     pod_repository: Arc<PodRepository>,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     tls_port: u16,
     service_cidr: &str,
     containerd_namespace: &str,
@@ -125,6 +128,7 @@ pub async fn bootstrap_coredns(
             db,
             pod_repository,
             non_pod_finalization,
+            coordination,
         },
         tls_port,
         service_cidr,

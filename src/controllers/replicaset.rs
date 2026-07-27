@@ -4,13 +4,6 @@ use klights_cluster_core::Resource;
 use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
 use klights_reconcile_api::GcPodDeleteSink;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-
-type ReplicaSetReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
-
-static REPLICASET_RECONCILE_LOCKS: LazyLock<tokio::sync::Mutex<ReplicaSetReconcileLocks>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 #[async_trait]
 pub trait ReplicaSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
@@ -35,20 +28,13 @@ pub trait ReplicaSetPodMutation: Send + Sync {
     ) -> Result<Resource>;
 }
 
-async fn replicaset_reconcile_lock(namespace: &str, name: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = REPLICASET_RECONCILE_LOCKS.lock().await;
-    locks
-        .entry(format!("{namespace}/{name}"))
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
-
-pub async fn reconcile_replicaset(
+pub(crate) async fn reconcile_replicaset(
     db: &(impl ReplicaSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),
     pod_writer: &(impl ReplicaSetPodMutation + ?Sized),
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &crate::controllers::ControllerCoordination,
     replicaset: &Value,
     node_name: &str,
 ) -> Result<()> {
@@ -64,7 +50,11 @@ pub async fn reconcile_replicaset(
         .get("namespace")
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing namespace"))?;
-    let reconcile_lock = replicaset_reconcile_lock(namespace, name).await;
+    let reconcile_lock = coordination.reconcile_lock(
+        crate::controllers::CoordinatedControllerKind::ReplicaSet,
+        namespace,
+        name,
+    );
     let _reconcile_guard = reconcile_lock.lock().await;
 
     // Preserve validation semantics for malformed reconcile payloads.
@@ -86,6 +76,7 @@ pub async fn reconcile_replicaset(
         live_resource.clone(),
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await?
     {

@@ -1321,7 +1321,17 @@ impl LocalApiClient {
             )
             .await?;
         if let Some(command) = outcome.command.as_ref() {
+            if !crate::control_plane::client::pod_status_side_effects::needs_committed_pod_side_effects(
+                command,
+            ) {
+                return Ok(outcome.result.into());
+            }
             let controller_dispatcher = self.controller_dispatcher.get();
+            let controller_dispatcher = controller_dispatcher.ok_or_else(|| {
+                crate::node_outbox::OutboxApplyError::Retryable(
+                    "controller dispatcher is not ready for committed Pod side effects".to_string(),
+                )
+            })?;
             #[cfg(not(test))]
             let gc_pod_delete_sink =
                 if matches!(
@@ -1330,42 +1340,38 @@ impl LocalApiClient {
                         if api_version == "v1" && kind == "Pod"
                 ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
                 {
-                    controller_dispatcher.map(|dispatcher| dispatcher.pod_delete_sink())
+                    Some(controller_dispatcher.pod_delete_sink())
                 } else {
                     None
                 };
             #[cfg(test)]
-            let gc_pod_delete_sink =
-                if matches!(
-                    command,
-                    StorageCommand::DeleteResource { api_version, kind, .. }
-                        if api_version == "v1" && kind == "Pod"
-                ) || matches!(command, StorageCommand::FinalizeBoundPod { .. })
-                {
-                    match controller_dispatcher {
-                        Some(dispatcher) => {
-                            dispatcher.current_pod_repository().await.map(|repository| {
-                                repository as Arc<dyn klights_reconcile_api::GcPodDeleteSink>
-                            })
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                };
+            let gc_pod_delete_sink = if matches!(
+                command,
+                StorageCommand::DeleteResource { api_version, kind, .. }
+                    if api_version == "v1" && kind == "Pod"
+            ) || matches!(
+                command,
+                StorageCommand::FinalizeBoundPod { .. }
+            ) {
+                controller_dispatcher
+                    .current_pod_repository()
+                    .await
+                    .map(|repository| repository as Arc<dyn klights_reconcile_api::GcPodDeleteSink>)
+            } else {
+                None
+            };
             crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
                 crate::control_plane::client::pod_status_side_effects::PodSideEffectSinks {
-                    controller: controller_dispatcher.map(|dispatcher| {
-                        dispatcher.as_ref() as &dyn klights_reconcile_api::ControllerReconcileSink
-                    }),
-                    service: controller_dispatcher.map(|dispatcher| {
-                        dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
-                    }),
+                    controller: Some(controller_dispatcher.as_ref()
+                        as &dyn klights_reconcile_api::ControllerReconcileSink),
+                    service: Some(controller_dispatcher.as_ref()
+                        as &dyn klights_reconcile_api::ServiceReconcileSink),
                     #[cfg(not(test))]
                     pod_delete: gc_pod_delete_sink,
                     #[cfg(test)]
                     pod_delete: gc_pod_delete_sink.as_deref(),
                     non_pod_finalization: self.non_pod_finalization.get().map(Arc::as_ref),
+                    gc_coordination: controller_dispatcher.gc_coordination(),
                 },
                 command,
                 outcome.resource.as_ref(),

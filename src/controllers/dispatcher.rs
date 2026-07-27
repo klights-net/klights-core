@@ -83,6 +83,7 @@ pub struct ControllerDispatcher {
     dependencies: ControllerRuntimeDependencies,
     #[cfg(test)]
     file_process: klights_supervisor::FileProcessExecutor,
+    coordination: Arc<crate::controllers::ControllerCoordination>,
     active_reconciles: Arc<Mutex<ActiveReconciles>>,
     active_reconciles_changed: Arc<Notify>,
 }
@@ -94,6 +95,12 @@ struct ActiveReconciles {
 }
 
 impl ControllerDispatcher {
+    pub(crate) fn gc_coordination(
+        &self,
+    ) -> &dyn klights_reconcile_api::GcForegroundDeleteCoordination {
+        self.coordination.as_ref()
+    }
+
     #[cfg(not(test))]
     pub(crate) fn pod_delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
         self.dependencies.pods.delete_sink()
@@ -207,6 +214,7 @@ impl ControllerDispatcher {
             pod_repository: Arc::new(Mutex::new(None)),
             metrics_provider: Arc::new(Mutex::new(None)),
             file_process,
+            coordination: Arc::new(crate::controllers::ControllerCoordination::new()),
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
             active_reconciles_changed: Arc::new(Notify::new()),
         }
@@ -276,12 +284,14 @@ impl ControllerDispatcher {
         let mut controllers =
             Self::controller_registry(service_ipam, nodeport_alloc, csr_issuer, hpa_controller);
         let queue = WorkQueue::with_task_supervisor(task_supervisor);
+        let coordination = dependencies.coordination.clone();
         Self {
             controllers: std::mem::take(&mut controllers),
             queue,
             retry_count: Arc::new(Mutex::new(HashMap::new())),
             worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             dependencies,
+            coordination,
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
             active_reconciles_changed: Arc::new(Notify::new()),
         }
@@ -294,7 +304,7 @@ impl ControllerDispatcher {
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         csr_issuer: Option<Arc<dyn crate::controllers::csr_signer::CsrIssuer>>,
         hpa_controller: Arc<dyn Controller>,
-        _dependencies: ControllerRuntimeDependencies,
+        dependencies: ControllerRuntimeDependencies,
     ) -> Self {
         Self {
             controllers: Self::controller_registry(
@@ -311,6 +321,7 @@ impl ControllerDispatcher {
             pod_repository: Arc::new(Mutex::new(None)),
             metrics_provider: Arc::new(Mutex::new(None)),
             file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            coordination: dependencies.coordination,
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
             active_reconciles_changed: Arc::new(Notify::new()),
         }

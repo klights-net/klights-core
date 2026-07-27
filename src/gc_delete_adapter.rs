@@ -8,17 +8,32 @@ pub(crate) struct GcOwnerLifecycleAdapter {
     db: DatastoreHandle,
     pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
     non_pod_finalization: GcNonPodFinalizationAdapter,
+    coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
 
 impl GcOwnerLifecycleAdapter {
+    #[cfg(test)]
     pub(crate) fn new(
         db: DatastoreHandle,
         pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+    ) -> Self {
+        Self::new_with_coordination(
+            db,
+            pod_delete_sink,
+            std::sync::Arc::new(crate::controllers::ControllerCoordination::new()),
+        )
+    }
+
+    pub(crate) fn new_with_coordination(
+        db: DatastoreHandle,
+        pod_delete_sink: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+        coordination: std::sync::Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Self {
         Self {
             non_pod_finalization: GcNonPodFinalizationAdapter::new(db.clone()),
             db,
             pod_delete_sink,
+            coordination,
         }
     }
 
@@ -38,6 +53,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
                 resource,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map(|_| ())
@@ -59,6 +75,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
                 owner.namespace,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map_err(Self::sink_error)
@@ -79,6 +96,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
                 owner.namespace,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map_err(Self::sink_error)
@@ -95,6 +113,7 @@ impl klights_reconcile_api::GcOwnerLifecyclePort for GcOwnerLifecycleAdapter {
                 &owner,
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             .map_err(Self::sink_error)

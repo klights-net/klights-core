@@ -3,11 +3,11 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_reconcile_api::{
-    GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
+    GcForegroundDeleteCoordination, GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest,
+    GcPodDeleteSink,
 };
 use klights_types::PodIdentity;
 use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
 
 #[async_trait]
 pub trait GcResourceStore: Send + Sync {
@@ -44,53 +44,6 @@ pub trait GcResourceStore: Send + Sync {
 }
 
 const OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES: usize = 8;
-
-type ForegroundPodDeleteInFlightKey = (String, String);
-
-static FOREGROUND_POD_DELETE_IN_FLIGHT: LazyLock<Mutex<HashSet<ForegroundPodDeleteInFlightKey>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-fn is_foreground_pod_delete_in_flight(owner_uid: &str, child_uid: &str) -> bool {
-    if owner_uid.is_empty() || child_uid.is_empty() {
-        return false;
-    }
-    FOREGROUND_POD_DELETE_IN_FLIGHT
-        .lock()
-        .unwrap()
-        .contains(&(owner_uid.to_string(), child_uid.to_string()))
-}
-
-fn mark_foreground_pod_delete_in_flight(owner_uid: &str, child_uid: &str) {
-    if owner_uid.is_empty() || child_uid.is_empty() {
-        return;
-    }
-    FOREGROUND_POD_DELETE_IN_FLIGHT
-        .lock()
-        .unwrap()
-        .insert((owner_uid.to_string(), child_uid.to_string()));
-}
-
-fn clear_foreground_pod_delete_in_flight(owner_uid: &str, child_uid: &str) {
-    if owner_uid.is_empty() || child_uid.is_empty() {
-        return;
-    }
-    FOREGROUND_POD_DELETE_IN_FLIGHT
-        .lock()
-        .unwrap()
-        .remove(&(owner_uid.to_string(), child_uid.to_string()));
-}
-
-fn prune_foreground_pod_delete_in_flight(owner_uid: &str, seen_child_uids: &HashSet<String>) {
-    let mut in_flight = FOREGROUND_POD_DELETE_IN_FLIGHT.lock().unwrap();
-    in_flight.retain(|(in_flight_owner_uid, in_flight_child_uid)| {
-        in_flight_owner_uid != owner_uid || seen_child_uids.contains(in_flight_child_uid)
-    });
-}
-
-fn clear_all_foreground_pod_delete_in_flight_for_owner(owner_uid: &str) {
-    let mut in_flight = FOREGROUND_POD_DELETE_IN_FLIGHT.lock().unwrap();
-    in_flight.retain(|(in_flight_owner_uid, _)| in_flight_owner_uid != owner_uid);
-}
 
 /// No-op sink for use in tests and contexts where Pod children will not
 /// be encountered. Returns a typed unavailable error if called for a Pod
@@ -737,6 +690,7 @@ async fn delete_resource_and_dependents(
     resource: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<()> {
     let owner_uid = resource
         .data
@@ -775,6 +729,7 @@ async fn delete_resource_and_dependents(
             owner_namespace,
             pod_delete_sink,
             non_pod_finalization,
+            coordination,
         ))
         .await?;
     }
@@ -792,6 +747,7 @@ pub async fn reconcile_owner_references(
     resource: Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<OwnerReferenceReconcile> {
     let Some(owner_refs) = resource
         .data
@@ -832,7 +788,14 @@ pub async fn reconcile_owner_references(
         return Ok(OwnerReferenceReconcile::HasLiveOwner);
     }
 
-    delete_resource_and_dependents(db, &resource, pod_delete_sink, non_pod_finalization).await?;
+    delete_resource_and_dependents(
+        db,
+        &resource,
+        pod_delete_sink,
+        non_pod_finalization,
+        coordination,
+    )
+    .await?;
     Ok(OwnerReferenceReconcile::Deleted)
 }
 
@@ -928,6 +891,7 @@ pub async fn cascade_delete_with_uid(
     namespace: Option<String>,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     cascade_delete_with_uid_inner(
@@ -941,6 +905,7 @@ pub async fn cascade_delete_with_uid(
         },
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
         &mut visited,
     )
     .await
@@ -981,6 +946,7 @@ pub async fn owner_cascade_sweep_once(
     namespace: Option<String>,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<bool> {
     cascade_delete_with_uid(
         db,
@@ -991,6 +957,7 @@ pub async fn owner_cascade_sweep_once(
         namespace.clone(),
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await?;
 
@@ -1013,6 +980,7 @@ async fn cascade_delete_with_uid_inner(
     request: CascadeDeleteRequest<'_>,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
     visited: &mut HashSet<CascadeOwnerKey>,
 ) -> Result<()> {
     let CascadeDeleteRequest {
@@ -1213,6 +1181,7 @@ async fn cascade_delete_with_uid_inner(
             },
             pod_delete_sink,
             non_pod_finalization,
+            coordination,
             visited,
         ))
         .await
@@ -1322,6 +1291,7 @@ pub async fn check_foreground_deletion_ready(
     namespace: Option<String>,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<bool> {
     if owner_uid.is_empty() {
         return Ok(true);
@@ -1356,7 +1326,7 @@ pub async fn check_foreground_deletion_ready(
 
     if owned.is_empty() {
         // No children left, parent can be deleted
-        clear_all_foreground_pod_delete_in_flight_for_owner(owner_uid);
+        coordination.clear_owner(owner_uid);
         return Ok(true);
     }
 
@@ -1378,7 +1348,7 @@ pub async fn check_foreground_deletion_ready(
             None => {
                 let child_uid = resource.uid.clone();
                 if !child_uid.is_empty() {
-                    clear_foreground_pod_delete_in_flight(owner_uid, &child_uid);
+                    coordination.release(owner_uid, &child_uid);
                     seen_child_uids.insert(child_uid);
                 }
                 continue;
@@ -1432,7 +1402,7 @@ pub async fn check_foreground_deletion_ready(
                         .map(std::string::ToString::to_string)
                 };
                 if let Some(child_uid) = child_uid {
-                    clear_foreground_pod_delete_in_flight(owner_uid, &child_uid);
+                    coordination.release(owner_uid, &child_uid);
                     seen_child_uids.insert(child_uid);
                 }
             }
@@ -1489,11 +1459,11 @@ pub async fn check_foreground_deletion_ready(
                 continue;
             }
             if has_deletion_timestamp(&current) {
-                clear_foreground_pod_delete_in_flight(owner_uid, &child_uid);
+                coordination.release(owner_uid, &child_uid);
                 continue;
             }
 
-            if is_foreground_pod_delete_in_flight(owner_uid, &child_uid) {
+            if !coordination.reserve(owner_uid, &child_uid) {
                 tracing::debug!(
                     "Foreground deletion: child {}/{} is already queued for Pod delete; skipping duplicate request",
                     current.api_version,
@@ -1503,7 +1473,6 @@ pub async fn check_foreground_deletion_ready(
                 continue;
             }
 
-            mark_foreground_pod_delete_in_flight(owner_uid, &child_uid);
             let namespace = current
                 .namespace
                 .clone()
@@ -1542,6 +1511,7 @@ pub async fn check_foreground_deletion_ready(
                 child_ns,
                 pod_delete_sink,
                 non_pod_finalization,
+                coordination,
             ))
             .await;
         }
@@ -1552,7 +1522,7 @@ pub async fn check_foreground_deletion_ready(
             let outcome =
                 request_gc_pod_delete_for_gc(pod_delete_sink, &namespace, &name, &uid).await;
             if !matches!(outcome, Ok(GcDeleteOutcome::MarkedTerminating)) {
-                clear_foreground_pod_delete_in_flight(owner_uid, &uid);
+                coordination.release(owner_uid, &uid);
             }
             outcome
         })
@@ -1567,7 +1537,7 @@ pub async fn check_foreground_deletion_ready(
     }
 
     if pending_child_delete {
-        prune_foreground_pod_delete_in_flight(owner_uid, &seen_child_uids);
+        coordination.retain_owner_children(owner_uid, &seen_child_uids);
         return Ok(false);
     }
 
@@ -1581,9 +1551,9 @@ pub async fn check_foreground_deletion_ready(
     )
     .await?;
     if ready {
-        clear_all_foreground_pod_delete_in_flight_for_owner(owner_uid);
+        coordination.clear_owner(owner_uid);
     }
-    prune_foreground_pod_delete_in_flight(owner_uid, &seen_child_uids);
+    coordination.retain_owner_children(owner_uid, &seen_child_uids);
 
     Ok(ready)
 }
@@ -1595,6 +1565,7 @@ pub async fn finalize_foreground_owners_after_dependent_delete(
     deleted_resource: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<()> {
     let Some(owner_refs) = deleted_resource
         .data
@@ -1612,9 +1583,14 @@ pub async fn finalize_foreground_owners_after_dependent_delete(
         else {
             continue;
         };
-        let _ =
-            finalize_foreground_owner_if_ready(db, &owner, pod_delete_sink, non_pod_finalization)
-                .await?;
+        let _ = finalize_foreground_owner_if_ready(
+            db,
+            &owner,
+            pod_delete_sink,
+            non_pod_finalization,
+            coordination,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1674,6 +1650,7 @@ pub async fn finalize_foreground_owner_if_ready(
     owner: &Resource,
     pod_delete_sink: &dyn GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    coordination: &dyn GcForegroundDeleteCoordination,
 ) -> Result<bool> {
     if !is_waiting_for_dependents_deletion(&owner.data) {
         return Ok(false);
@@ -1688,6 +1665,7 @@ pub async fn finalize_foreground_owner_if_ready(
         owner.namespace.clone(),
         pod_delete_sink,
         non_pod_finalization,
+        coordination,
     )
     .await?;
     if !ready {

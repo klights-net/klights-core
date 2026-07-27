@@ -1,12 +1,62 @@
-use crate::controllers::deployment::reconcile_deployment;
-use crate::controllers::replicaset::reconcile_replicaset;
+use crate::controllers::deployment::reconcile_deployment as reconcile_deployment_core;
+use crate::controllers::replicaset::reconcile_replicaset as reconcile_replicaset_core;
 use crate::controllers::service::ServiceIpam;
 use serde_json::json;
+
+fn controller_coordination() -> &'static crate::controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+    &COORDINATION
+}
 
 fn gc_non_pod_finalization(
     db: &crate::datastore::sqlite::Datastore,
 ) -> crate::gc_delete_adapter::GcNonPodFinalizationAdapter {
     crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(std::sync::Arc::new(db.clone()))
+}
+
+async fn reconcile_deployment(
+    db: &crate::datastore::sqlite::Datastore,
+    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_writer: &dyn crate::kubelet::pod_repository::PodObjectWriter,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    deployment: &serde_json::Value,
+    node_name: &str,
+) -> anyhow::Result<()> {
+    reconcile_deployment_core(
+        db,
+        pod_reader,
+        pod_writer,
+        pod_delete_sink,
+        non_pod_finalization,
+        controller_coordination(),
+        deployment,
+        node_name,
+    )
+    .await
+}
+
+async fn reconcile_replicaset(
+    db: &crate::datastore::sqlite::Datastore,
+    pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
+    pod_writer: &dyn crate::kubelet::pod_repository::PodObjectWriter,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+    replicaset: &serde_json::Value,
+    node_name: &str,
+) -> anyhow::Result<()> {
+    reconcile_replicaset_core(
+        db,
+        pod_reader,
+        pod_writer,
+        pod_delete_sink,
+        non_pod_finalization,
+        controller_coordination(),
+        replicaset,
+        node_name,
+    )
+    .await
 }
 
 // ========================
@@ -1181,6 +1231,7 @@ async fn test_delete_deployment_cascade_deletes_replicaset_and_pods() {
         Some("default".to_string()),
         __pod_repo.as_ref(),
         &gc_non_pod_finalization(&db),
+        controller_coordination(),
     )
     .await
     .unwrap();
@@ -1360,6 +1411,7 @@ async fn test_delete_collection_deployment_cascade_deletes_replicaset_and_pods()
         Some("default".to_string()),
         __pod_repo.as_ref(),
         &gc_non_pod_finalization(&db),
+        controller_coordination(),
     )
     .await
     .unwrap();

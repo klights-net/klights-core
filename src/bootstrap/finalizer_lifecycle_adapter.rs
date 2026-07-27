@@ -15,14 +15,32 @@ pub(crate) struct DatastoreFinalizerLifecycleAdapter {
     side_effects: Arc<crate::side_effects::SideEffectRegistry>,
     metrics: Arc<crate::side_effects::SideEffectMetrics>,
     non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter,
+    coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
 
 impl DatastoreFinalizerLifecycleAdapter {
+    #[cfg(test)]
     pub(crate) fn new(
         db: DatastoreHandle,
         pod_delete_sink: Arc<dyn GcPodDeleteSink>,
         side_effects: Arc<crate::side_effects::SideEffectRegistry>,
         metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    ) -> Arc<Self> {
+        Self::new_with_coordination(
+            db,
+            pod_delete_sink,
+            side_effects,
+            metrics,
+            Arc::new(crate::controllers::ControllerCoordination::new()),
+        )
+    }
+
+    pub(crate) fn new_with_coordination(
+        db: DatastoreHandle,
+        pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+        side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
     ) -> Arc<Self> {
         Arc::new(Self {
             non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
@@ -32,6 +50,7 @@ impl DatastoreFinalizerLifecycleAdapter {
             pod_delete_sink,
             side_effects,
             metrics,
+            coordination,
         })
     }
 }
@@ -147,6 +166,7 @@ impl FinalizerLifecyclePort for DatastoreFinalizerLifecycleAdapter {
                 resource.namespace.clone(),
                 self.pod_delete_sink.as_ref(),
                 &self.non_pod_finalization,
+                self.coordination.as_ref(),
             )
             .await
             {

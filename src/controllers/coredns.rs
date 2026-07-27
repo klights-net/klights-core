@@ -490,6 +490,7 @@ mod tests {
             db,
             pod_repository,
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
+            &crate::controllers::ControllerCoordination::new(),
             tls_port,
             service_cidr,
             containerd_namespace,

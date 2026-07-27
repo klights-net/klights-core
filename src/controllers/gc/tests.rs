@@ -7,6 +7,128 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+fn test_gc_coordination() -> &'static crate::controllers::ControllerCoordination {
+    static COORDINATION: std::sync::LazyLock<crate::controllers::ControllerCoordination> =
+        std::sync::LazyLock::new(crate::controllers::ControllerCoordination::new);
+    &COORDINATION
+}
+
+async fn reconcile_owner_references(
+    db: &(impl GcResourceStore + ?Sized),
+    resource: Resource,
+    pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+) -> Result<OwnerReferenceReconcile> {
+    super::reconcile_owner_references(
+        db,
+        resource,
+        pod_delete_sink,
+        non_pod_finalization,
+        test_gc_coordination(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test compatibility wrapper preserves the UID-qualified owner identity"
+)]
+async fn cascade_delete_with_uid(
+    db: &(impl GcResourceStore + ?Sized),
+    owner_uid: &str,
+    owner_api_version: &str,
+    owner_name: &str,
+    owner_kind: &str,
+    namespace: Option<String>,
+    pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+) -> Result<()> {
+    super::cascade_delete_with_uid(
+        db,
+        owner_uid,
+        owner_api_version,
+        owner_name,
+        owner_kind,
+        namespace,
+        pod_delete_sink,
+        non_pod_finalization,
+        test_gc_coordination(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test compatibility wrapper preserves the UID-qualified owner identity"
+)]
+async fn owner_cascade_sweep_once(
+    db: &(impl GcResourceStore + ?Sized),
+    owner_uid: &str,
+    owner_api_version: &str,
+    owner_name: &str,
+    owner_kind: &str,
+    namespace: Option<String>,
+    pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+) -> Result<bool> {
+    super::owner_cascade_sweep_once(
+        db,
+        owner_uid,
+        owner_api_version,
+        owner_name,
+        owner_kind,
+        namespace,
+        pod_delete_sink,
+        non_pod_finalization,
+        test_gc_coordination(),
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test compatibility wrapper preserves the UID-qualified owner identity"
+)]
+async fn check_foreground_deletion_ready(
+    db: &(impl GcResourceStore + ?Sized),
+    owner_uid: &str,
+    owner_api_version: &str,
+    owner_name: &str,
+    owner_kind: &str,
+    namespace: Option<String>,
+    pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+) -> Result<bool> {
+    super::check_foreground_deletion_ready(
+        db,
+        owner_uid,
+        owner_api_version,
+        owner_name,
+        owner_kind,
+        namespace,
+        pod_delete_sink,
+        non_pod_finalization,
+        test_gc_coordination(),
+    )
+    .await
+}
+
+async fn finalize_foreground_owner_if_ready(
+    db: &(impl GcResourceStore + ?Sized),
+    owner: &Resource,
+    pod_delete_sink: &dyn GcPodDeleteSink,
+    non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
+) -> Result<bool> {
+    super::finalize_foreground_owner_if_ready(
+        db,
+        owner,
+        pod_delete_sink,
+        non_pod_finalization,
+        test_gc_coordination(),
+    )
+    .await
+}
+
 fn non_pod_finalization(
     db: &crate::datastore::sqlite::Datastore,
 ) -> crate::gc_delete_adapter::GcNonPodFinalizationAdapter {
@@ -84,6 +206,42 @@ impl GcPodDeleteSink for RecordingGcPodDeleteSink {
                 .unwrap()
                 .push((identity.namespace, identity.name, identity.uid));
             Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FirstGcPodDeleteResult {
+    Unavailable,
+    Gone,
+}
+
+struct FailOrLoseFirstGcPodDeleteSink {
+    first_result: FirstGcPodDeleteResult,
+    attempts: AtomicUsize,
+}
+
+impl FailOrLoseFirstGcPodDeleteSink {
+    fn new(first_result: FirstGcPodDeleteResult) -> Self {
+        Self {
+            first_result,
+            attempts: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl GcPodDeleteSink for FailOrLoseFirstGcPodDeleteSink {
+    fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async move {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(());
+            }
+            Err(match self.first_result {
+                FirstGcPodDeleteResult::Unavailable => {
+                    GcPodDeleteError::unavailable("transient delete failure")
+                }
+                FirstGcPodDeleteResult::Gone => GcPodDeleteError::not_found("Pod already gone"),
+            })
         })
     }
 }
@@ -2113,6 +2271,94 @@ async fn foreground_gc_skips_duplicate_pod_delete_requests_across_retries() {
         second_attempt, first_attempt,
         "GC should not duplicate delete requests for unchanged non-terminated Pods"
     );
+}
+
+async fn assert_foreground_delete_reservation_released_after(
+    first_result: FirstGcPodDeleteResult,
+    suffix: &str,
+) {
+    let db = crate::datastore::test_support::in_memory().await;
+    let owner_uid = format!("foreground-release-owner-{suffix}");
+    let owner_name = format!("foreground-release-{suffix}");
+    let child_uid = format!("foreground-release-child-{suffix}");
+    let child_name = format!("foreground-release-pod-{suffix}");
+    db.create_resource(
+        "apps/v1",
+        "Deployment",
+        Some("default"),
+        &owner_name,
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": owner_name,
+                "namespace": "default",
+                "uid": owner_uid,
+                "deletionTimestamp": "2026-06-07T10:00:00Z",
+                "finalizers": ["foregroundDeletion"]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        &child_name,
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": child_name,
+                "namespace": "default",
+                "uid": child_uid,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": owner_name,
+                    "uid": owner_uid,
+                    "blockOwnerDeletion": true
+                }]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let coordination = crate::controllers::ControllerCoordination::new();
+    let sink = FailOrLoseFirstGcPodDeleteSink::new(first_result);
+    for _ in 0..2 {
+        let ready = super::check_foreground_deletion_ready(
+            &db,
+            &owner_uid,
+            "apps/v1",
+            &owner_name,
+            "Deployment",
+            Some("default".to_string()),
+            &sink,
+            &non_pod_finalization(&db),
+            &coordination,
+        )
+        .await
+        .unwrap();
+        assert!(!ready);
+    }
+    assert_eq!(
+        sink.attempts.load(Ordering::SeqCst),
+        2,
+        "a failed or terminally Gone request must release its reservation for retry"
+    );
+}
+
+#[tokio::test]
+async fn foreground_gc_releases_failed_and_gone_delete_reservations() {
+    assert_foreground_delete_reservation_released_after(
+        FirstGcPodDeleteResult::Unavailable,
+        "failed",
+    )
+    .await;
+    assert_foreground_delete_reservation_released_after(FirstGcPodDeleteResult::Gone, "gone").await;
 }
 
 #[tokio::test]
