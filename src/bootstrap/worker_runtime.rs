@@ -416,13 +416,6 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     };
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
-    let side_effects =
-        std::sync::Arc::new(crate::side_effect_registry_composition::default_registry(
-            metrics.clone(),
-            Some(services.clone()),
-            Some(task_supervisor.clone()),
-            None,
-        ));
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(128);
     let pod_lifecycle_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(pod_lifecycle_rx)));
@@ -436,7 +429,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_parts = crate::pod_repository_composition::build_worker_pod_repository_parts(
+    let pod_repository_parts = compose_worker_pod_repository_parts(
         crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
             resource_query: leader_ports.resource_query.clone(),
             node_local: node_local.clone(),
@@ -535,8 +528,6 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let plr = pod_subsystem.lifecycle_router.clone();
     pod_repository.set_pod_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
     worker_store.set_pod_lifecycle_router(plr.clone());
-    side_effects.set_pod_ports(pod_repository.clone(), pod_repository.clone());
-
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
         config.service_cidr.clone(),
         config.node_name.clone(),
@@ -672,6 +663,12 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn compose_worker_pod_repository_parts(
+    config: crate::pod_repository_composition::WorkerPodRepositoryBuildConfig,
+) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
+    crate::pod_repository_composition::build_worker_pod_repository_parts(config)
+}
+
 /// Subsystems enabled for a worker node.
 // dispatcher no longer validates it inline.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -767,6 +764,70 @@ pub fn validate_worker_config(config: &WorkerSubsystemConfig) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct UnavailableWorkerQuery;
+
+    impl klights_leader_api::LeaderResourceQuery for UnavailableWorkerQuery {
+        fn get_resource(
+            &self,
+            _request: klights_leader_api::ResourceGetRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, Option<klights_cluster_core::Resource>>
+        {
+            Box::pin(async {
+                Err(klights_leader_api::ResourceQueryError::retryable(
+                    "test query is intentionally unavailable",
+                ))
+            })
+        }
+
+        fn list_resources(
+            &self,
+            _request: klights_leader_api::ResourceListRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult>
+        {
+            Box::pin(async {
+                Err(klights_leader_api::ResourceQueryError::retryable(
+                    "test query is intentionally unavailable",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_repository_graph_starts_without_cluster_datastore_or_side_effect_registry() {
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-runtime-repository-graph",
+        )
+        .await
+        .expect("open worker node-local store");
+        let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone()));
+
+        let parts = compose_worker_pod_repository_parts(
+            crate::pod_repository_composition::WorkerPodRepositoryBuildConfig {
+                resource_query: std::sync::Arc::new(UnavailableWorkerQuery),
+                node_local,
+                supervisor,
+                metrics: crate::side_effects::SideEffectMetrics::new(),
+                pod_network_cache: crate::kubelet::pod_repository::empty_test_pod_network_cache(),
+                assignment_waiter: crate::kubelet::pod_repository::test_assignment_bus(),
+                outbox,
+            },
+        );
+
+        parts
+            .background
+            .start()
+            .await
+            .expect("worker repository background starts without cluster datastore");
+        assert!(parts.background.workqueue_start_called());
+    }
 
     #[test]
     fn worker_config_has_no_cluster_controllers() {
