@@ -71,7 +71,10 @@ impl Default for TaskCategoryConfig {
             background: 0,
             file: 3,
             db: 1,
-            db_read: 1,
+            // The datastore connection actor already serializes each SQLite
+            // read lane. A second single-permit queue here can starve the
+            // actor handoff during concurrent watch-replay startup bursts.
+            db_read: 0,
             timer: 0,
             network: 256,
             pod_delete_workqueue: 10,

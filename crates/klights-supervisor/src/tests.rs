@@ -17,7 +17,7 @@ fn defaults_match_p0_category_limits() {
     assert_eq!(cfg.background, 0);
     assert_eq!(cfg.file, 3);
     assert_eq!(cfg.db, 1);
-    assert_eq!(cfg.db_read, 1);
+    assert_eq!(cfg.db_read, 0);
     assert_eq!(cfg.timer, 0);
     assert_eq!(cfg.network, 256);
     assert_eq!(cfg.pod_delete_workqueue, 10);
@@ -95,7 +95,7 @@ fn semaphore_presence_matches_category_limits() {
     assert_eq!(supervisor.semaphore_limit(TaskCategory::Others), None);
     assert_eq!(supervisor.semaphore_limit(TaskCategory::File), Some(3));
     assert_eq!(supervisor.semaphore_limit(TaskCategory::Db), Some(1));
-    assert_eq!(supervisor.semaphore_limit(TaskCategory::DbRead), Some(1));
+    assert_eq!(supervisor.semaphore_limit(TaskCategory::DbRead), None);
 }
 
 #[tokio::test]
@@ -1245,6 +1245,51 @@ async fn db_active_status_only_while_call_in_flight() {
         Duration::from_secs(2),
     )
     .await;
+}
+
+#[tokio::test]
+async fn default_db_read_admission_defers_serialization_to_the_connection_actor() {
+    let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let conn = tokio_rusqlite::Connection::open_in_memory().await.unwrap();
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let mut tasks = Vec::new();
+
+    for index in 0..3 {
+        let supervisor = supervisor.clone();
+        let conn = conn.clone();
+        let gate = gate.clone();
+        tasks.push(tokio::spawn(async move {
+            supervisor
+                .call_db_read(format!("read-{index}"), "conn-read", conn, move |_conn| {
+                    if index == 0 {
+                        wait_on_gate(&gate);
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }));
+    }
+
+    wait_for(
+        || {
+            let status = category_status(&supervisor, TaskCategory::DbRead);
+            status.active + status.queued == 3
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    let status_while_actor_blocked = category_status(&supervisor, TaskCategory::DbRead);
+    release_gate(&gate, 1);
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    assert_eq!(
+        status_while_actor_blocked.active, 3,
+        "the supervised read boundary must admit every call while the connection actor owns serialization"
+    );
+    assert_eq!(status_while_actor_blocked.queued, 0);
 }
 
 #[tokio::test]
