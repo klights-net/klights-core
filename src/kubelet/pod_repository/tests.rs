@@ -7695,7 +7695,7 @@ async fn leader_scheduler_binds_node_and_podscheduled_condition_in_one_pod_event
         .unwrap();
     let schedule_events: Vec<_> = pod_events
         .into_iter()
-        .map(|entry| entry.into_watch_event())
+        .map(crate::watch::WatchEvent::from_catch_up)
         .filter(|event| {
             event
                 .object
@@ -9395,7 +9395,7 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
         .unwrap();
     let terminating_victim_events: Vec<_> = pod_events
         .into_iter()
-        .map(|entry| entry.into_watch_event())
+        .map(crate::watch::WatchEvent::from_catch_up)
         .filter(|event| {
             event.event_type == EventType::Modified
                 && event
@@ -9590,7 +9590,7 @@ async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_g
         .build_log_apply_commit_for_outbox(
             "stale-worker-status-after-preemption",
             "PodStatus",
-            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "worker-a",
         )
         .await

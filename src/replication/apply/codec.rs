@@ -15,7 +15,7 @@
 
 use klights_cluster_core::{CommandMeta, StorageCommand, StorageResponse};
 
-use crate::storage_wire_codec::{
+use crate::replication::storage_wire_codec::{
     decode_command_protobuf, decode_meta_protobuf, decode_response_protobuf,
     encode_command_protobuf, encode_meta_protobuf, encode_response_protobuf,
 };

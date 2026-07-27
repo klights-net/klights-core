@@ -8,6 +8,7 @@ pub mod network;
 pub mod pod_status_merge;
 pub mod quantity;
 pub mod resource_semantics;
+pub mod rtt_estimator;
 
 use std::fmt;
 
@@ -64,6 +65,7 @@ pub use resource_semantics::{
     mark_terminating_pod_unready_at, pod_delete_mark_patch_without_status,
     preserve_status_subresource_on_main_update,
 };
+pub use rtt_estimator::{RTT_DEFAULT_MS, RttEstimator};
 
 /// API resource identity used by leader queries and API mutations.
 ///

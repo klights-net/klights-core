@@ -1,6 +1,9 @@
+#[cfg(test)]
+use crate::replication::storage_wire_codec::{
+    decode_outbox_payload_protobuf, encode_outbox_payload_protobuf,
+};
+#[cfg(test)]
 use anyhow::Result;
-
-use crate::storage_wire_codec::{decode_outbox_payload_protobuf, encode_outbox_payload_protobuf};
 use klights_cluster_core::{ResourcePreconditions, StorageCommand};
 
 pub use klights_cluster_core::OutboxOperation;
@@ -273,12 +276,14 @@ impl OutboxPayload {
         Self { command }
     }
 
+    #[cfg(test)]
     pub fn encode_protobuf(&self) -> Result<Vec<u8>> {
         Ok(encode_outbox_payload_protobuf(
             &klights_cluster_core::OutboxPayload::new(self.command.clone()),
         )?)
     }
 
+    #[cfg(test)]
     pub fn decode_protobuf(bytes: &[u8]) -> Result<Self> {
         Ok(Self {
             command: decode_outbox_payload_protobuf(bytes)?.into_command(),
@@ -286,11 +291,11 @@ impl OutboxPayload {
     }
 }
 
-/// Encode the existing stale UID-bound Pod sentinel used to commit an outbox
+/// Build the existing stale UID-bound Pod sentinel used to commit an outbox
 /// ledger and exact stream watermark without mutating a Kubernetes resource.
 /// The invalid namespace cannot collide with an API-created Pod.
-pub(crate) fn terminal_decision_payload(idempotency_key: &str) -> Result<Vec<u8>> {
-    OutboxPayload::from_command(StorageCommand::UpdateStatus {
+pub(crate) fn terminal_decision_command(idempotency_key: &str) -> StorageCommand {
+    StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
         namespace: Some("__klights-terminal-outbox__".to_string()),
@@ -299,6 +304,5 @@ pub(crate) fn terminal_decision_payload(idempotency_key: &str) -> Result<Vec<u8>
         expected_rv: None,
         preconditions: ResourcePreconditions::uid(idempotency_key),
         observed_status_stamp: None,
-    })
-    .encode_protobuf()
+    }
 }

@@ -5577,8 +5577,9 @@ mod tests {
         let status = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
                 klights_internal_protobuf::SubmitResourceCommandRequest {
-                    command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
-                        .expect("encode command"),
+                    command_protobuf:
+                        crate::replication::storage_wire_codec::encode_command_protobuf(&command)
+                            .expect("encode command"),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "cp1",
@@ -5605,8 +5606,9 @@ mod tests {
         let response = grpc
             .submit_resource_command(request_with_controlplane_client_cert(
                 klights_internal_protobuf::SubmitResourceCommandRequest {
-                    command_protobuf: crate::storage_wire_codec::encode_command_protobuf(&command)
-                        .expect("encode command"),
+                    command_protobuf:
+                        crate::replication::storage_wire_codec::encode_command_protobuf(&command)
+                            .expect("encode command"),
                     codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
                 },
                 "cp1",

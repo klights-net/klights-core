@@ -6779,7 +6779,7 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
         .build_log_apply_commit_for_outbox(
             "guestbook-watch-raft-status",
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
             node,
         )
         .await

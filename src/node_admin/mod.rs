@@ -70,10 +70,11 @@ async fn dead_letter_replay(
         .ok_or(StatusCode::NOT_FOUND)?;
     let operation = crate::node_outbox::payload::OutboxOperation::try_from(row.operation.as_str())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let payload = crate::node_outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let payload =
+        crate::replication::storage_wire_codec::decode_outbox_payload_protobuf(&row.payload_proto)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let classification = operation
-        .classification(&payload.command)
+        .classification(payload.command())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let replayed = state
         .node_db

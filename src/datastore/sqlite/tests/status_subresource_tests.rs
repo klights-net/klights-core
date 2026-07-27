@@ -557,7 +557,7 @@ async fn test_update_status_only_emits_modified_watch_event() {
         .unwrap();
     // Two events: ADDED from create_resource, MODIFIED from update_status_only.
     assert_eq!(replay.len(), 2, "expected ADDED + MODIFIED");
-    let modified = replay.last().unwrap().clone().into_watch_event();
+    let modified = crate::watch::WatchEvent::from_catch_up(replay.last().unwrap().clone());
     assert_eq!(modified.event_type, EventType::Modified);
     assert_eq!(modified.object["status"]["phase"], "Running");
     assert_eq!(modified.object["spec"]["containers"][0]["image"], "x");

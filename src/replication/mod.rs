@@ -13,8 +13,11 @@
 pub mod apply;
 pub mod grpc;
 pub mod log_apply_wire;
+pub(crate) mod outbox_payload_codec;
+pub(crate) mod outbox_response_wire;
 pub mod protocol;
 pub mod service;
+pub(crate) mod storage_wire_codec;
 #[cfg(test)]
 pub mod test_proto_channel_sink;
 pub use service::ReplicationService;

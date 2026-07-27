@@ -825,7 +825,7 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         .build_log_apply_commit_for_outbox(
             "pending-delete-list-watch",
             crate::node_outbox::payload::OutboxOperation::PodStatus.as_str(),
-            crate::storage_wire_codec::test_outbox_command(payload.as_ref()),
+            crate::replication::storage_wire_codec::test_outbox_command(payload.as_ref()),
             "mn-controlplane1",
         )
         .await
@@ -1033,8 +1033,8 @@ async fn test_update_hook_emits_snapshot_event_data_for_fast_create_then_update(
         .unwrap();
     assert_eq!(replay.len(), 2);
 
-    let first = replay[0].clone().into_watch_event();
-    let second = replay[1].clone().into_watch_event();
+    let first = crate::watch::WatchEvent::from_catch_up(replay[0].clone());
+    let second = crate::watch::WatchEvent::from_catch_up(replay[1].clone());
 
     assert_eq!(first.event_type, EventType::Added);
     assert_eq!(first.resource_version(), Some(created_rv));

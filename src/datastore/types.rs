@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 
+#[cfg(test)]
 use crate::watch::WatchEvent;
 use klights_types::{NodeName, PodSubnet};
 
@@ -203,12 +203,6 @@ impl WatchReplayFloor {
                 resource_version: self.floor_resource_version,
             }
         }
-    }
-}
-
-impl klights_cluster_core::ResourceEventObject for WatchEvent {
-    fn resource_object(&self) -> &Arc<Value> {
-        &self.object
     }
 }
 
@@ -453,44 +447,8 @@ impl CatchUpResource {
         }
     }
 
-    pub fn into_watch_event(self) -> WatchEvent {
-        let CatchUpResource {
-            resource,
-            event_type,
-        } = self;
-        let Resource {
-            api_version,
-            kind,
-            namespace,
-            name,
-            uid,
-            resource_version,
-            data,
-            ..
-        } = resource;
-
-        // Cheap if we hold the only Arc ref (steady-state); copy-on-write otherwise.
-        let mut data = Arc::unwrap_or_clone(data);
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert("apiVersion".to_string(), serde_json::json!(api_version));
-            obj.insert("kind".to_string(), serde_json::json!(kind));
-            let metadata = obj
-                .entry("metadata")
-                .or_insert_with(|| serde_json::json!({}));
-            if let Some(meta) = metadata.as_object_mut() {
-                meta.insert("name".to_string(), serde_json::json!(name));
-                meta.insert("uid".to_string(), serde_json::json!(uid));
-                if let Some(namespace) = namespace {
-                    meta.insert("namespace".to_string(), serde_json::json!(namespace));
-                }
-                meta.insert(
-                    "resourceVersion".to_string(),
-                    serde_json::json!(resource_version.to_string()),
-                );
-            }
-        }
-
-        WatchEvent::from_type(event_type.as_ref(), data)
+    pub fn into_parts(self) -> (Resource, Cow<'static, str>) {
+        (self.resource, self.event_type)
     }
 }
 

@@ -10,7 +10,7 @@ use klights_cluster_core::WatchReplayPosition;
 
 #[cfg(test)]
 use crate::replication::log_apply_wire::{decode_commit_protobuf, encode_commit_protobuf};
-use crate::storage_wire_codec::{
+use crate::replication::storage_wire_codec::{
     decode_command_protobuf, decode_meta_protobuf, encode_command_protobuf, encode_meta_protobuf,
 };
 use klights_internal_protobuf;

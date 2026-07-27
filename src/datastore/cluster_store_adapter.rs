@@ -1401,7 +1401,7 @@ mod tests {
                     operation: "PodStatus".to_string(),
                     first_seen_ms: status_stamp,
                     applied_rv: None,
-                    result_proto: klights_cluster_datastore::encode_outbox_response(
+                    result_proto: crate::replication::outbox_response_wire::encode_outbox_response(
                         &klights_cluster_core::command::StorageResponse::Ack {
                             resource_version: 0,
                         },
@@ -2792,7 +2792,7 @@ mod tests {
     #[tokio::test]
     async fn capture_keyset_pages_every_unbounded_family_without_gaps_or_duplicates() {
         let db = Datastore::new_in_memory().await.unwrap();
-        let result_proto = klights_cluster_datastore::encode_outbox_response(
+        let result_proto = crate::replication::outbox_response_wire::encode_outbox_response(
             &klights_cluster_core::command::StorageResponse::Ack {
                 resource_version: 1,
             },
@@ -2935,7 +2935,7 @@ mod tests {
     #[tokio::test]
     async fn capture_restores_every_durable_family_and_preserves_outbox_dedupe() {
         let source = Datastore::new_in_memory().await.unwrap();
-        let result_proto = klights_cluster_datastore::encode_outbox_response(
+        let result_proto = crate::replication::outbox_response_wire::encode_outbox_response(
             &klights_cluster_core::command::StorageResponse::Ack {
                 resource_version: 7,
             },

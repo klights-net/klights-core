@@ -1171,7 +1171,7 @@ pub fn legacy_build_label_selector_watch_stream(
             }
             for resource in baseline.items {
                 if requested_rv <= 0 {
-                    let event = CatchUpResource::added(resource).into_watch_event();
+                    let event = WatchEvent::from_catch_up(CatchUpResource::added(resource));
                     let line = match try_serialize_watch_event_for_stream(
                         event.clone(),
                         &kind,
@@ -1187,7 +1187,7 @@ pub fn legacy_build_label_selector_watch_stream(
                     session_bootstrap.record_baseline_event(&event);
                     yield Ok::<_, std::convert::Infallible>(line);
                 } else {
-                    let event = CatchUpResource::added(resource).into_watch_event();
+                    let event = WatchEvent::from_catch_up(CatchUpResource::added(resource));
                     session_bootstrap.record_baseline_event(&event);
                 }
             }
@@ -1219,7 +1219,7 @@ pub fn legacy_build_label_selector_watch_stream(
             let mut last_rv = requested_rv.max(list.resource_version);
             for resource in list.items {
                 let resource_rv = resource.resource_version;
-                let event = CatchUpResource::added(resource).into_watch_event();
+                let event = WatchEvent::from_catch_up(CatchUpResource::added(resource));
                 let line = match try_serialize_watch_event_for_stream(
                     event.clone(),
                     &kind,
@@ -2632,7 +2632,7 @@ mod tests {
             std::borrow::Cow::Borrowed(s) => assert_eq!(*s, "ADDED"),
             std::borrow::Cow::Owned(_) => panic!("static literal must stay borrowed"),
         }
-        let watch_event = event.into_watch_event();
+        let watch_event = WatchEvent::from_catch_up(event);
         assert_eq!(watch_event.event_type, EventType::Added);
     }
 

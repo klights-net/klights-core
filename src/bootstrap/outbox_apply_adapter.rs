@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::datastore::DatastoreBackend;
 use crate::replication::protocol::ForwardedResource;
-use crate::storage_wire_codec::decode_outbox_payload_protobuf;
+use crate::replication::storage_wire_codec::decode_outbox_payload_protobuf;
 
 #[derive(Clone)]
 pub(crate) struct RootOutboxApplyAdapter {

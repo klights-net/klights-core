@@ -193,7 +193,6 @@ vergen = { workspace = true }
 [dependencies]
 klights-types = { workspace = true }
 klights-cluster-core = { workspace = true }
-klights-cluster-datastore = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-leader-api = { workspace = true }
 klights-watch = { workspace = true }

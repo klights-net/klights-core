@@ -1,4 +1,5 @@
 pub mod backend;
+pub(crate) mod delivery_adapter;
 pub mod handle;
 pub(crate) mod network_adapter;
 pub mod redb;

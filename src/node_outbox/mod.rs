@@ -4,20 +4,25 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
+use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest, OutboxPayloadCodec};
+use klights_node_store::{
+    OutboxAttemptFailure, OutboxAttemptFailureRecord, OutboxBatchClaimRequest, OutboxClaimRequest,
+    OutboxCompletion, OutboxDispatchCounters, OutboxDispatcherStore, OutboxEnqueue,
+    OutboxFailureDisposition, OutboxLease, OutboxNow, OutboxProducerStore, OutboxRecord,
+    OutboxStatusStampStore, OutboxSupersedeRequest, PodCheckpointKey, PodStatusCheckpointApplied,
+    PodStatusCheckpointStore, PodStatusCheckpointUpsert, RuntimeObservationCheckpointStore,
+    RuntimeObservationGeneration,
+};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::datastore::node_local::sqlite::{PodStatusCheckpoint, RuntimeObservationCheckpoint};
-use crate::datastore::node_local::{
-    NodeLocalHandle, OutboxFailureDisposition, OutboxInsert, OutboxRow,
-};
 use klights_cluster_core::Resource;
 use klights_cluster_core::StorageCommand;
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_types::{PodIdentity, ResourceKey};
 
-use self::payload::{OutboxOperation, OutboxOperationExt as _, OutboxPayload};
+use self::payload::{OutboxOperation, OutboxOperationExt as _};
 
 pub(crate) use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome as OutboxApplyResult};
 
@@ -66,8 +71,334 @@ impl<'a> OutboxSendPlanner<'a> {
 }
 
 #[derive(Clone)]
+pub(crate) struct OutboxStores {
+    producer: Arc<dyn OutboxProducerStore>,
+    dispatcher: Arc<dyn OutboxDispatcherStore>,
+    pod_checkpoints: Arc<dyn PodStatusCheckpointStore>,
+    runtime_checkpoints: Arc<dyn RuntimeObservationCheckpointStore>,
+    status_stamps: Arc<dyn OutboxStatusStampStore>,
+}
+
+impl OutboxStores {
+    pub(crate) fn new(
+        producer: Arc<dyn OutboxProducerStore>,
+        dispatcher: Arc<dyn OutboxDispatcherStore>,
+        pod_checkpoints: Arc<dyn PodStatusCheckpointStore>,
+        runtime_checkpoints: Arc<dyn RuntimeObservationCheckpointStore>,
+        status_stamps: Arc<dyn OutboxStatusStampStore>,
+    ) -> Self {
+        Self {
+            producer,
+            dispatcher,
+            pod_checkpoints,
+            runtime_checkpoints,
+            status_stamps,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_node_db(node_db: crate::datastore::node_local::NodeLocalHandle) -> Self {
+        let adapter =
+            crate::datastore::node_local::delivery_adapter::NodeLocalDeliveryAdapter::new(node_db);
+        Self::new(
+            adapter.clone(),
+            adapter.clone(),
+            adapter.clone(),
+            adapter.clone(),
+            adapter,
+        )
+    }
+
+    async fn enqueue_outbox(&self, entry: OutboxEnqueue) -> Result<()> {
+        self.producer
+            .enqueue_outbox(entry)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_pod_status_checkpoint(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<PodStatusCheckpointState>> {
+        let checkpoint = self
+            .pod_checkpoints
+            .get_pod_status_checkpoint(PodCheckpointKey::try_new(pod_uid)?)
+            .await?;
+        checkpoint
+            .map(|checkpoint| {
+                Ok(PodStatusCheckpointState {
+                    pod_uid: checkpoint.pod().uid.clone(),
+                    namespace: checkpoint.pod().namespace.clone(),
+                    pod_name: checkpoint.pod().name.clone(),
+                    base_rv: checkpoint.base_position(),
+                    applied_rv: checkpoint.applied_position(),
+                    status: serde_json::from_slice(checkpoint.status_payload())?,
+                })
+            })
+            .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_pod_status_checkpoint(
+        &self,
+        pod_uid: &str,
+        namespace: &str,
+        pod_name: &str,
+        base_rv: i64,
+        status: Value,
+        updated_ms: i64,
+    ) -> Result<()> {
+        let checkpoint = PodStatusCheckpointUpsert::try_new(
+            PodIdentity::new(namespace, pod_name, pod_uid),
+            base_rv,
+            serde_json::to_vec(&status)?,
+            updated_ms,
+        )?;
+        self.pod_checkpoints
+            .upsert_pod_status_checkpoint(checkpoint)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_pod_status_checkpoint_applied(
+        &self,
+        pod_uid: &str,
+        applied_rv: i64,
+        updated_ms: i64,
+    ) -> Result<()> {
+        self.pod_checkpoints
+            .mark_pod_status_checkpoint_applied(PodStatusCheckpointApplied::try_new(
+                pod_uid, applied_rv, updated_ms,
+            )?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
+        self.pod_checkpoints
+            .delete_pod_status_checkpoint(PodCheckpointKey::try_new(pod_uid)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn upsert_runtime_observation_checkpoint(
+        &self,
+        checkpoint: RuntimeObservationCheckpointState,
+    ) -> Result<()> {
+        self.runtime_checkpoints
+            .upsert_runtime_observation_checkpoint(
+                klights_node_store::RuntimeObservationCheckpoint::try_new(
+                    checkpoint.pod_uid,
+                    checkpoint.container_ids,
+                    RuntimeObservationGeneration::try_from(checkpoint.generation)?,
+                    checkpoint.updated_ms,
+                )?,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_runtime_observation_checkpoint(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<RuntimeObservationCheckpointState>> {
+        Ok(self
+            .runtime_checkpoints
+            .get_runtime_observation_checkpoint(PodCheckpointKey::try_new(pod_uid)?)
+            .await?
+            .map(|checkpoint| RuntimeObservationCheckpointState {
+                pod_uid: checkpoint.pod_uid().to_string(),
+                container_ids: checkpoint.container_ids().to_vec(),
+                generation: checkpoint.generation().get() as u64,
+                updated_ms: checkpoint.updated_ms(),
+            }))
+    }
+
+    async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
+        self.runtime_checkpoints
+            .delete_runtime_observation_checkpoint(PodCheckpointKey::try_new(pod_uid)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize> {
+        self.dispatcher
+            .requeue_expired_outbox_leases(OutboxNow::try_new(now_ms)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn claim_due_outbox_batch(
+        &self,
+        now_ms: i64,
+        limit: usize,
+        lease_ms: i64,
+        lease_token: &str,
+    ) -> Result<Vec<OutboxRow>> {
+        self.dispatcher
+            .claim_due_outbox_batch(OutboxBatchClaimRequest::try_new(
+                now_ms,
+                limit,
+                lease_ms,
+                lease_token,
+            )?)
+            .await?
+            .into_iter()
+            .map(OutboxRow::try_from_record)
+            .collect()
+    }
+
+    async fn claim_next_due_outbox(
+        &self,
+        now_ms: i64,
+        lease_ms: i64,
+        lease_token: &str,
+    ) -> Result<Option<OutboxRow>> {
+        self.dispatcher
+            .claim_next_due_outbox(OutboxClaimRequest::try_new(now_ms, lease_ms, lease_token)?)
+            .await?
+            .map(OutboxRow::try_from_record)
+            .transpose()
+    }
+
+    async fn next_outbox_wake_ms(&self, now_ms: i64) -> Result<Option<i64>> {
+        self.dispatcher
+            .next_outbox_wake_ms(OutboxNow::try_new(now_ms)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_outbox_attempt_failed(
+        &self,
+        id: i64,
+        lease_token: &str,
+        backoff_until_ms: i64,
+        error: &str,
+    ) -> Result<bool> {
+        self.dispatcher
+            .mark_outbox_attempt_failed(OutboxAttemptFailure::try_new(
+                id,
+                lease_token,
+                backoff_until_ms,
+                error,
+            )?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_outbox_failure(
+        &self,
+        id: i64,
+        lease_token: &str,
+        backoff_until_ms: i64,
+        error: &str,
+        max_attempts: i64,
+    ) -> Result<OutboxFailureDisposition> {
+        self.dispatcher
+            .record_outbox_failure(OutboxAttemptFailureRecord::try_new(
+                id,
+                lease_token,
+                backoff_until_ms,
+                error,
+                max_attempts,
+            )?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn renew_outbox_lease(
+        &self,
+        id: i64,
+        lease_token: &str,
+        leased_until_ms: i64,
+    ) -> Result<bool> {
+        self.dispatcher
+            .renew_outbox_lease(OutboxLease::try_new(id, lease_token, leased_until_ms)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool> {
+        self.dispatcher
+            .complete_outbox(OutboxCompletion::try_new(id, lease_token)?)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn complete_superseded_status_outbox_for_terminal_pod_delete(
+        &self,
+        subject_key: &str,
+        terminal_delete_id: i64,
+    ) -> Result<usize> {
+        self.dispatcher
+            .complete_superseded_status_outbox_for_terminal_pod_delete(
+                OutboxSupersedeRequest::try_new(subject_key, terminal_delete_id)?,
+            )
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PodStatusCheckpointState {
+    pod_uid: String,
+    namespace: String,
+    pod_name: String,
+    base_rv: i64,
+    applied_rv: Option<i64>,
+    status: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeObservationCheckpointState {
+    pub pod_uid: String,
+    pub container_ids: Vec<String>,
+    pub generation: u64,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct OutboxRow {
+    id: i64,
+    client_id: String,
+    idempotency_key: String,
+    subject_key: String,
+    pod_uid: String,
+    operation: String,
+    is_terminal_pod_delete: bool,
+    stream_id: i64,
+    stream_seq: i64,
+    payload_proto: Vec<u8>,
+    attempt: i64,
+    next_due_ms: i64,
+    lease_token: Option<String>,
+}
+
+impl OutboxRow {
+    fn try_from_record(record: OutboxRecord) -> Result<Self> {
+        Ok(Self {
+            id: record.id(),
+            client_id: record.client_id().to_string(),
+            idempotency_key: record.idempotency_key().to_string(),
+            subject_key: record.subject().subject_key().to_string(),
+            pod_uid: record.subject().pod_uid().to_string(),
+            operation: record.operation().to_string(),
+            is_terminal_pod_delete: record.classification().terminal_delete()
+                == klights_node_store::TerminalDeleteClassification::ActorOwnedPodDelete,
+            stream_id: record.sequence().stream_id(),
+            stream_seq: record.sequence().stream_seq(),
+            payload_proto: record.payload().to_vec(),
+            attempt: record.attempt(),
+            next_due_ms: record.next_due_ms(),
+            lease_token: record.lease_token().map(str::to_string),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct Outbox {
-    node_db: NodeLocalHandle,
+    stores: OutboxStores,
+    codec: Arc<dyn OutboxPayloadCodec>,
     notify: Arc<Notify>,
     stamp: Arc<tokio::sync::Mutex<StampState>>,
 }
@@ -83,9 +414,6 @@ struct StampState {
     reserved: i64,
 }
 
-/// Node-local meta key holding the durable status-stamp high-water (the reserved
-/// ceiling). Survives worker process restarts so stamps never regress.
-const STATUS_STAMP_META_KEY: &str = "pod_status_stamp_high_water";
 /// Headroom (in stamp units) reserved per node-local persistence write. The
 /// ceiling is persisted at most once per this many issued stamps (or per this
 /// many microseconds of wall-clock advance), bounding node-local writes while
@@ -146,13 +474,30 @@ impl OutboxCommand {
 
 impl Outbox {
     #[cfg(test)]
-    pub fn new(node_db: NodeLocalHandle) -> Self {
+    pub fn new(node_db: crate::datastore::node_local::NodeLocalHandle) -> Self {
         Self::with_notify(node_db, Arc::new(Notify::new()))
     }
 
-    pub fn with_notify(node_db: NodeLocalHandle, notify: Arc<Notify>) -> Self {
+    #[cfg(test)]
+    pub fn with_notify(
+        node_db: crate::datastore::node_local::NodeLocalHandle,
+        notify: Arc<Notify>,
+    ) -> Self {
+        Self::compose(
+            OutboxStores::from_node_db(node_db),
+            crate::replication::outbox_payload_codec::new_codec(),
+            notify,
+        )
+    }
+
+    pub(crate) fn compose(
+        stores: OutboxStores,
+        codec: Arc<dyn OutboxPayloadCodec>,
+        notify: Arc<Notify>,
+    ) -> Self {
         Self {
-            node_db,
+            stores,
+            codec,
             notify,
             stamp: Arc::new(tokio::sync::Mutex::new(StampState::default())),
         }
@@ -188,11 +533,10 @@ impl Outbox {
         let mut st = self.stamp.lock().await;
         if !st.seeded {
             let persisted = self
-                .node_db
-                .get_node_meta(STATUS_STAMP_META_KEY)
-                .await?
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
+                .stores
+                .status_stamps
+                .read_status_stamp_high_water()
+                .await?;
             // Seed both the issue cursor and the reserved ceiling from the
             // persisted high-water so the first stamp after restart exceeds
             // every previously issued stamp even if the clock has regressed.
@@ -205,8 +549,9 @@ impl Outbox {
             // Reserve and durably persist a new ceiling BEFORE issuing, so a
             // crash can never lose a stamp below what was already handed out.
             let new_reserved = candidate.saturating_add(STATUS_STAMP_RESERVE_BLOCK);
-            self.node_db
-                .set_node_meta(STATUS_STAMP_META_KEY, &new_reserved.to_string())
+            self.stores
+                .status_stamps
+                .write_status_stamp_high_water(new_reserved)
                 .await?;
             st.reserved = new_reserved;
         }
@@ -251,24 +596,24 @@ impl Outbox {
         let classification = operation
             .classification(&command)
             .map_err(anyhow::Error::new)?;
-        let payload = OutboxPayload::from_command(command).encode_protobuf()?;
+        let payload = self.codec.encode(&command)?.to_vec();
         let (subject_api_version, subject_kind) = operation.subject_api_version_kind();
-        self.node_db
-            .enqueue_outbox(OutboxInsert {
+        let resource = ResourceKey::new(
+            subject_api_version,
+            subject_kind,
+            subject_namespace,
+            subject_name,
+        );
+        self.stores
+            .enqueue_outbox(OutboxEnqueue::try_new(
                 idempotency_key,
-                enqueued_ms: now_ms,
-                subject_key,
-                subject_api_version: subject_api_version.to_string(),
-                subject_kind: subject_kind.to_string(),
-                subject_namespace,
-                subject_name,
-                subject_uid,
-                pod_uid,
-                operation: operation.as_str().to_string(),
-                payload_proto: payload,
-                next_due_ms: now_ms,
+                now_ms,
+                klights_node_store::OutboxSubject::new(subject_key, resource, subject_uid, pod_uid),
+                operation.as_str(),
                 classification,
-            })
+                payload,
+                now_ms,
+            )?)
             .await?;
         self.notify.notify_one();
         Ok(())
@@ -281,9 +626,9 @@ impl Outbox {
         updated_ms: i64,
     ) -> Result<()> {
         let namespace = pod.namespace.as_deref().unwrap_or("default");
-        let previous = self.node_db.get_pod_status_checkpoint(&pod.uid).await?;
+        let previous = self.stores.get_pod_status_checkpoint(&pod.uid).await?;
         let status = merge_checkpoint_status_for_record(pod, status, previous.as_ref());
-        self.node_db
+        self.stores
             .upsert_pod_status_checkpoint(
                 &pod.uid,
                 namespace,
@@ -296,13 +641,13 @@ impl Outbox {
     }
 
     pub async fn merge_pod_status_checkpoint(&self, mut pod: Resource) -> Result<Resource> {
-        let Some(checkpoint) = self.node_db.get_pod_status_checkpoint(&pod.uid).await? else {
+        let Some(checkpoint) = self.stores.get_pod_status_checkpoint(&pod.uid).await? else {
             return Ok(pod);
         };
 
         let namespace = pod.namespace.as_deref().unwrap_or("default");
         if checkpoint.namespace != namespace || checkpoint.pod_name != pod.name {
-            self.node_db
+            self.stores
                 .delete_pod_status_checkpoint(&checkpoint.pod_uid)
                 .await?;
             return Ok(pod);
@@ -312,7 +657,7 @@ impl Outbox {
             && pod.resource_version >= applied_rv
             && pod_status_contains_checkpoint(&pod.data, &checkpoint.status)
         {
-            self.node_db
+            self.stores
                 .delete_pod_status_checkpoint(&checkpoint.pod_uid)
                 .await?;
             return Ok(pod);
@@ -357,7 +702,7 @@ impl Outbox {
             | OutboxApplyResult::AlreadyApplied {
                 applied_rv: Some(applied_rv),
             } => {
-                self.node_db
+                self.stores
                     .mark_pod_status_checkpoint_applied(pod_uid, *applied_rv, updated_ms)
                     .await
             }
@@ -366,7 +711,7 @@ impl Outbox {
     }
 
     pub async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        self.node_db.delete_pod_status_checkpoint(pod_uid).await
+        self.stores.delete_pod_status_checkpoint(pod_uid).await
     }
 
     pub async fn record_runtime_observation_checkpoint(
@@ -376,8 +721,8 @@ impl Outbox {
         generation: u64,
         updated_ms: i64,
     ) -> Result<()> {
-        self.node_db
-            .upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        self.stores
+            .upsert_runtime_observation_checkpoint(RuntimeObservationCheckpointState {
                 pod_uid: pod_uid.to_string(),
                 container_ids,
                 generation,
@@ -389,14 +734,14 @@ impl Outbox {
     pub async fn get_runtime_observation_checkpoint(
         &self,
         pod_uid: &str,
-    ) -> Result<Option<RuntimeObservationCheckpoint>> {
-        self.node_db
+    ) -> Result<Option<RuntimeObservationCheckpointState>> {
+        self.stores
             .get_runtime_observation_checkpoint(pod_uid)
             .await
     }
 
     pub async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        self.node_db
+        self.stores
             .delete_runtime_observation_checkpoint(pod_uid)
             .await
     }
@@ -530,7 +875,7 @@ impl klights_leader_api::NodeOutbox for Outbox {
 fn merge_checkpoint_status_for_record(
     pod: &Resource,
     mut incoming: Value,
-    previous: Option<&PodStatusCheckpoint>,
+    previous: Option<&PodStatusCheckpointState>,
 ) -> Value {
     let namespace = pod.namespace.as_deref().unwrap_or("default");
     let Some(previous) = previous else {
@@ -702,7 +1047,8 @@ pub enum DispatchOutcome {
 }
 
 pub struct OutboxDispatcher {
-    node_db: NodeLocalHandle,
+    stores: OutboxStores,
+    codec: Arc<dyn OutboxPayloadCodec>,
     client: Arc<dyn LeaderOutboxDelivery>,
     notify: Arc<Notify>,
     lease_renewal_supervisor: Option<Arc<TaskSupervisor>>,
@@ -715,31 +1061,35 @@ pub struct OutboxDispatcher {
     /// round-trips. The retry backoff reads `estimate_ms()` instead of the
     /// old fixed 200 ms default, so a lossy ~400 ms RTT backs off on the right
     /// scale. Idle-silent (no applies ⇒ no samples).
-    rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
+    rtt: std::sync::Arc<klights_types::RttEstimator>,
 }
 
 impl OutboxDispatcher {
-    pub fn new(
-        node_db: NodeLocalHandle,
+    pub(crate) fn new(
+        stores: OutboxStores,
+        codec: Arc<dyn OutboxPayloadCodec>,
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
     ) -> Self {
         Self::new_with_rtt_estimator(
-            node_db,
+            stores,
+            codec,
             client,
             notify,
-            std::sync::Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
+            std::sync::Arc::new(klights_types::RttEstimator::new()),
         )
     }
 
-    pub fn new_with_rtt_estimator(
-        node_db: NodeLocalHandle,
+    fn new_with_rtt_estimator(
+        stores: OutboxStores,
+        codec: Arc<dyn OutboxPayloadCodec>,
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
-        rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
+        rtt: std::sync::Arc<klights_types::RttEstimator>,
     ) -> Self {
         Self {
-            node_db,
+            stores,
+            codec,
             client,
             notify,
             lease_renewal_supervisor: None,
@@ -753,11 +1103,12 @@ impl OutboxDispatcher {
     }
 
     pub(crate) fn production(
-        node_db: NodeLocalHandle,
+        stores: OutboxStores,
+        codec: Arc<dyn OutboxPayloadCodec>,
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
     ) -> Self {
-        Self::new(node_db, client, notify).with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
+        Self::new(stores, codec, client, notify).with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
     }
 
     /// Return shared counters so callers (node_admin) can read them
@@ -791,27 +1142,41 @@ impl OutboxDispatcher {
     }
 
     #[cfg(test)]
-    pub fn for_tests(node_db: NodeLocalHandle, client: Arc<dyn LeaderOutboxDelivery>) -> Self {
-        Self::new(node_db, client, Arc::new(Notify::new()))
+    pub fn for_tests(
+        node_db: crate::datastore::node_local::NodeLocalHandle,
+        client: Arc<dyn LeaderOutboxDelivery>,
+    ) -> Self {
+        Self::new(
+            OutboxStores::from_node_db(node_db),
+            crate::replication::outbox_payload_codec::new_codec(),
+            client,
+            Arc::new(Notify::new()),
+        )
     }
 
     #[cfg(test)]
     pub fn for_tests_with_rtt_estimator(
-        node_db: NodeLocalHandle,
+        node_db: crate::datastore::node_local::NodeLocalHandle,
         client: Arc<dyn LeaderOutboxDelivery>,
-        rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
+        rtt: std::sync::Arc<klights_types::RttEstimator>,
     ) -> Self {
-        Self::new_with_rtt_estimator(node_db, client, Arc::new(Notify::new()), rtt)
+        Self::new_with_rtt_estimator(
+            OutboxStores::from_node_db(node_db),
+            crate::replication::outbox_payload_codec::new_codec(),
+            client,
+            Arc::new(Notify::new()),
+            rtt,
+        )
     }
 
     #[cfg(test)]
     pub fn for_tests_with_lease_renewal(
-        node_db: NodeLocalHandle,
+        node_db: crate::datastore::node_local::NodeLocalHandle,
         client: Arc<dyn LeaderOutboxDelivery>,
         supervisor: Arc<TaskSupervisor>,
         lease_ms: i64,
     ) -> Self {
-        let mut dispatcher = Self::new(node_db, client, Arc::new(Notify::new()));
+        let mut dispatcher = Self::for_tests(node_db, client);
         dispatcher.lease_renewal_supervisor = Some(supervisor);
         dispatcher.lease_ms = lease_ms.max(1);
         dispatcher
@@ -819,11 +1184,26 @@ impl OutboxDispatcher {
 
     #[cfg(test)]
     pub fn batch_mode_for_tests(
-        node_db: NodeLocalHandle,
+        node_db: crate::datastore::node_local::NodeLocalHandle,
         client: Arc<dyn LeaderOutboxDelivery>,
         batch_size: usize,
     ) -> Self {
-        Self::new(node_db, client, Arc::new(Notify::new())).with_batch_mode(batch_size)
+        Self::for_tests(node_db, client).with_batch_mode(batch_size)
+    }
+
+    #[cfg(test)]
+    fn production_for_tests(
+        node_db: crate::datastore::node_local::NodeLocalHandle,
+        client: Arc<dyn LeaderOutboxDelivery>,
+        notify: Arc<Notify>,
+    ) -> Self {
+        Self::new(
+            OutboxStores::from_node_db(node_db),
+            crate::replication::outbox_payload_codec::new_codec(),
+            client,
+            notify,
+        )
+        .with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
     }
 
     pub async fn start(
@@ -899,7 +1279,7 @@ impl OutboxDispatcher {
     }
 
     pub async fn dispatch_due_once(&self, now_ms: i64) -> Result<DispatchOutcome> {
-        self.node_db.requeue_expired_outbox_leases(now_ms).await?;
+        self.stores.requeue_expired_outbox_leases(now_ms).await?;
 
         // Claim a window of due rows. In single mode the window is 1; in
         // batch mode it is `batch_size`. Either way the claimed rows are
@@ -908,11 +1288,11 @@ impl OutboxDispatcher {
         // one row per RTT.
         let lease_token = uuid::Uuid::new_v4().to_string();
         let rows = if self.batch_mode {
-            self.node_db
+            self.stores
                 .claim_due_outbox_batch(now_ms, self.batch_size, self.lease_ms, &lease_token)
                 .await?
         } else {
-            self.node_db
+            self.stores
                 .claim_next_due_outbox(now_ms, self.lease_ms, &lease_token)
                 .await?
                 .into_iter()
@@ -921,7 +1301,7 @@ impl OutboxDispatcher {
 
         if rows.is_empty() {
             return Ok(DispatchOutcome::Idle {
-                next_wake_ms: self.node_db.next_outbox_wake_ms(now_ms).await?,
+                next_wake_ms: self.stores.next_outbox_wake_ms(now_ms).await?,
             });
         }
 
@@ -1046,8 +1426,11 @@ impl OutboxDispatcher {
         }
         let dispatch_start = std::time::Instant::now();
         let delivery_payload = if use_terminal_sentinel {
-            match payload::terminal_decision_payload(&row.idempotency_key) {
-                Ok(payload) => payload,
+            match self
+                .codec
+                .encode(&payload::terminal_decision_command(&row.idempotency_key))
+            {
+                Ok(payload) => payload.to_vec(),
                 Err(err) => {
                     tracing::warn!(
                         idempotency_key = %row.idempotency_key,
@@ -1060,7 +1443,7 @@ impl OutboxDispatcher {
                         self.rtt.estimate_ms(),
                     ));
                     if let Err(error) = self
-                        .node_db
+                        .stores
                         .mark_outbox_attempt_failed(
                             row.id,
                             lease_token,
@@ -1097,7 +1480,10 @@ impl OutboxDispatcher {
                     && row.stream_id > 0
                     && row.stream_seq > 0;
                 if has_exact_delivery_identity {
-                    let sentinel = payload::terminal_decision_payload(&row.idempotency_key)
+                    let sentinel = self
+                        .codec
+                        .encode(&payload::terminal_decision_command(&row.idempotency_key))
+                        .map_err(anyhow::Error::from)
                         .and_then(|payload| {
                             OutboxDeliveryRequest::try_new(
                                 row.idempotency_key.clone(),
@@ -1172,7 +1558,7 @@ impl OutboxDispatcher {
                     .await;
                 if row.is_terminal_pod_delete
                     && let Err(err) = self
-                        .node_db
+                        .stores
                         .complete_superseded_status_outbox_for_terminal_pod_delete(
                             &row.subject_key,
                             row.id,
@@ -1187,10 +1573,7 @@ impl OutboxDispatcher {
                     );
                 }
                 if row.is_terminal_pod_delete
-                    && let Err(err) = self
-                        .node_db
-                        .delete_pod_status_checkpoint(&row.pod_uid)
-                        .await
+                    && let Err(err) = self.stores.delete_pod_status_checkpoint(&row.pod_uid).await
                 {
                     tracing::warn!(
                         outbox_id = row.id,
@@ -1214,7 +1597,7 @@ impl OutboxDispatcher {
                     klights_leader_api::OutboxDeliveryError::CodecIncompatible { .. }
                 ) {
                     match self
-                        .node_db
+                        .stores
                         .mark_outbox_attempt_failed(row.id, lease_token, backoff_until_ms, &error)
                         .await
                     {
@@ -1232,7 +1615,7 @@ impl OutboxDispatcher {
                     return;
                 }
                 match self
-                    .node_db
+                    .stores
                     .record_outbox_failure(
                         row.id,
                         lease_token,
@@ -1249,10 +1632,8 @@ impl OutboxDispatcher {
                             "outbox row exceeded max attempts, moving to dead letter"
                         );
                         if records_checkpoint
-                            && let Err(err) = self
-                                .node_db
-                                .delete_pod_status_checkpoint(&row.pod_uid)
-                                .await
+                            && let Err(err) =
+                                self.stores.delete_pod_status_checkpoint(&row.pod_uid).await
                         {
                             tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
                         }
@@ -1282,16 +1663,14 @@ impl OutboxDispatcher {
                         "actor-owned Pod delete hit terminal outbox error; moving to dead letter"
                     );
                     match self
-                        .node_db
+                        .stores
                         .record_outbox_failure(row.id, lease_token, now_ms, &err.to_string(), 1)
                         .await
                     {
                         Ok(OutboxFailureDisposition::DeadLettered) => {
                             if (records_checkpoint || row.is_terminal_pod_delete)
-                                && let Err(error) = self
-                                    .node_db
-                                    .delete_pod_status_checkpoint(&row.pod_uid)
-                                    .await
+                                && let Err(error) =
+                                    self.stores.delete_pod_status_checkpoint(&row.pod_uid).await
                             {
                                 tracing::warn!(pod_uid = %row.pod_uid, error = %error, "delete checkpoint failed");
                             }
@@ -1318,10 +1697,7 @@ impl OutboxDispatcher {
                     }
                 }
                 if (records_checkpoint || row.is_terminal_pod_delete)
-                    && let Err(error) = self
-                        .node_db
-                        .delete_pod_status_checkpoint(&row.pod_uid)
-                        .await
+                    && let Err(error) = self.stores.delete_pod_status_checkpoint(&row.pod_uid).await
                 {
                     tracing::warn!(pod_uid = %row.pod_uid, error = %error, "delete checkpoint failed");
                 }
@@ -1343,7 +1719,7 @@ impl OutboxDispatcher {
         error: &str,
     ) {
         match self
-            .node_db
+            .stores
             .record_outbox_failure(row.id, lease_token, row.next_due_ms, error, 1)
             .await
         {
@@ -1394,7 +1770,7 @@ impl OutboxDispatcher {
                     }
                     let leased_until_ms = now_ms().saturating_add(self.lease_ms.max(1));
                     let renewed = self
-                        .node_db
+                        .stores
                         .renew_outbox_lease(row.id, lease_token, leased_until_ms)
                         .await
                         .map_err(|error| {
@@ -1415,7 +1791,7 @@ impl OutboxDispatcher {
     /// changed / node.db error) as non-fatal — the row stays
     /// claimed-expired and `requeue_expired_outbox_leases` re-handles it.
     async fn complete_row(&self, id: i64, lease_token: &str, idempotency_key: &str) {
-        match self.node_db.complete_outbox(id, lease_token).await {
+        match self.stores.complete_outbox(id, lease_token).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(
@@ -1443,12 +1819,15 @@ impl OutboxDispatcher {
             .dispatch_errors_total
             .load(std::sync::atomic::Ordering::Relaxed);
         let _ = self
-            .node_db
-            .set_node_meta("outbox_dispatch_total", &total.to_string())
-            .await;
-        let _ = self
-            .node_db
-            .set_node_meta("outbox_dispatch_errors_total", &errors.to_string())
+            .stores
+            .dispatcher
+            .write_dispatch_counters(
+                OutboxDispatchCounters::try_new(
+                    total.min(i64::MAX as u64) as i64,
+                    errors.min(i64::MAX as u64) as i64,
+                )
+                .expect("bounded dispatch counters are non-negative"),
+            )
             .await;
     }
 
@@ -1463,7 +1842,7 @@ impl OutboxDispatcher {
             | OutboxApplyResult::AlreadyApplied {
                 applied_rv: Some(applied_rv),
             } => {
-                self.node_db
+                self.stores
                     .mark_pod_status_checkpoint_applied(pod_uid, *applied_rv, updated_ms)
                     .await
             }
@@ -1538,10 +1917,7 @@ fn actor_owned_pod_delete_needs_dead_letter(
     ) {
         return false;
     }
-    let Ok(payload) = OutboxPayload::decode_protobuf(&row.payload_proto) else {
-        return false;
-    };
-    matches!(payload.command, StorageCommand::FinalizeBoundPod { .. })
+    row.is_terminal_pod_delete
 }
 
 fn now_ms() -> i64 {
@@ -2081,10 +2457,8 @@ mod tests {
             .await
             .expect("read next jittered wake")
             .expect("retry wake exists");
-        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(
-            0,
-            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
-        );
+        let (backoff_lower, backoff_upper) =
+            super::adaptive_backoff_bounds(0, klights_types::RTT_DEFAULT_MS);
         assert!(
             (20 + backoff_lower..=20 + backoff_upper).contains(&after_backoff),
             "retry wake must stay inside the first-attempt adaptive jitter window \
@@ -2232,8 +2606,11 @@ mod tests {
         let node_db = node_db().await;
         let outbox = Outbox::new(node_db.clone());
         let client = Arc::new(FakeApplyClient::default());
-        let dispatcher =
-            OutboxDispatcher::production(node_db.clone(), client.clone(), Arc::new(Notify::new()));
+        let dispatcher = OutboxDispatcher::production_for_tests(
+            node_db.clone(),
+            client.clone(),
+            Arc::new(Notify::new()),
+        );
 
         for i in 0..8 {
             let pod = format!("production-pod-{i}");
@@ -2552,10 +2929,8 @@ mod tests {
             } => next,
             other => panic!("expected idle retry wake, got {other:?}"),
         };
-        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(
-            0,
-            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
-        );
+        let (backoff_lower, backoff_upper) =
+            super::adaptive_backoff_bounds(0, klights_types::RTT_DEFAULT_MS);
         assert!(
             (1_000 + backoff_lower..=1_000 + backoff_upper).contains(&next_retry),
             "retry wake must stay inside the first-attempt adaptive jitter window \
@@ -2701,10 +3076,8 @@ mod tests {
             unique.len() > 1,
             "retryable rows must not all re-fire at the same millisecond: {next_due_times:?}"
         );
-        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(
-            0,
-            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
-        );
+        let (backoff_lower, backoff_upper) =
+            super::adaptive_backoff_bounds(0, klights_types::RTT_DEFAULT_MS);
         assert!(
             next_due_times
                 .iter()
@@ -2819,7 +3192,7 @@ mod tests {
         let estimate = dispatcher.rtt_estimate_ms();
         assert_ne!(
             estimate,
-            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
+            klights_types::RTT_DEFAULT_MS,
             "a successful apply round-trip must update the RTT estimator off the default"
         );
     }
@@ -2829,7 +3202,7 @@ mod tests {
         let node_db = node_db().await;
         let outbox = Outbox::new(node_db.clone());
         let client = Arc::new(FakeApplyClient::default());
-        let raft_rtt = Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new());
+        let raft_rtt = Arc::new(klights_types::RttEstimator::new());
         raft_rtt.record_sample(std::time::Duration::from_millis(800));
         let dispatcher = OutboxDispatcher::for_tests_with_rtt_estimator(
             node_db.clone(),

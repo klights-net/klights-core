@@ -3613,6 +3613,66 @@ pub enum OutboxDeliveryError {
     },
 }
 
+/// Representation-boundary failure for one durable outbox command payload.
+///
+/// Generated protobuf values remain private to the replication adapter. Node
+/// runtime and persistence owners see only canonical commands and opaque
+/// bytes through this typed contract.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutboxPayloadCodecError {
+    InvalidPayload { message: String },
+    EncodingFailed { message: String },
+}
+
+impl OutboxPayloadCodecError {
+    pub fn invalid_payload(message: impl Into<String>) -> Self {
+        Self::InvalidPayload {
+            message: message.into(),
+        }
+    }
+
+    pub fn encoding_failed(message: impl Into<String>) -> Self {
+        Self::EncodingFailed {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for OutboxPayloadCodecError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayload { message } => {
+                write!(formatter, "invalid durable outbox payload: {message}")
+            }
+            Self::EncodingFailed { message } => {
+                write!(
+                    formatter,
+                    "durable outbox payload encoding failed: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutboxPayloadCodecError {}
+
+/// Transport-neutral codec port for durable outbox command payloads.
+///
+/// The replication boundary implements this port with the internal protobuf
+/// schema. Node outbox producers never import generated wire values.
+pub trait OutboxPayloadCodec: Send + Sync {
+    fn encode(
+        &self,
+        command: &klights_cluster_core::StorageCommand,
+    ) -> Result<Arc<[u8]>, OutboxPayloadCodecError>;
+
+    fn decode(
+        &self,
+        payload: &[u8],
+    ) -> Result<klights_cluster_core::StorageCommand, OutboxPayloadCodecError>;
+}
+
 impl OutboxDeliveryError {
     pub fn invalid(field: &'static str, message: impl Into<String>) -> Self {
         Self::InvalidRequest {
