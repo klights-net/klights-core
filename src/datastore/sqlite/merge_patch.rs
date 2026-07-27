@@ -64,6 +64,15 @@ impl Datastore {
             preconditions,
             strict_resource_version,
         } = request;
+        #[cfg(test)]
+        self.pause_resource_mutation_if_requested(
+            ResourceMutationPauseOperation::PatchLatest,
+            api_version,
+            kind,
+            namespace,
+            name,
+        )
+        .await;
         // All four owned strings are captured by the move closure below
         // and consumed by both the SQL parameters and the constructed
         // return value. `'static` for the closure (db_call boundary)

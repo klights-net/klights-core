@@ -2859,14 +2859,14 @@ async fn test_deployment_unconditional_main_update_ignores_status_churn() {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
+    use std::sync::Arc;
     use tower::ServiceExt;
 
-    let state = build_test_app_state().await;
-    let db = state.resource_mutation().db.clone();
+    let db = crate::datastore::sqlite::Datastore::new_in_memory()
+        .await
+        .unwrap();
+    let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
+    let state = crate::api::test_support::build_test_app_state_with_db(db_handle).await;
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -2914,95 +2914,65 @@ async fn test_deployment_unconditional_main_update_ignores_status_churn() {
         .await
         .unwrap();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let status_writes = Arc::new(AtomicUsize::new(0));
-    let churn_db = db.clone();
-    let churn_stop = stop.clone();
-    let churn_count = status_writes.clone();
-    let uid = created.uid.clone();
-    let churn = tokio::spawn(async move {
-        let mut replicas = 0_i64;
-        while !churn_stop.load(Ordering::SeqCst) {
-            let _ = churn_db
-                .update_status_only_with_preconditions(
-                    "apps/v1",
-                    "Deployment",
-                    Some("deploy-main-update-race"),
-                    "web",
-                    serde_json::json!({
-                        "replicas": replicas,
-                        "readyReplicas": replicas,
-                        "availableReplicas": replicas
-                    }),
-                    crate::datastore::ResourcePreconditions::uid(&uid),
-                )
-                .await;
-            replicas = (replicas + 1) % 3;
-            churn_count.fetch_add(1, Ordering::SeqCst);
-            tokio::task::yield_now().await;
+    let pause = db.install_resource_mutation_pause(
+        crate::datastore::sqlite::ResourceMutationPauseOperation::MainUpdate,
+        "apps/v1",
+        "Deployment",
+        Some("deploy-main-update-race"),
+        "web",
+    );
+    let update_body = serde_json::json!({
+        "apiVersion":"apps/v1",
+        "kind":"Deployment",
+        "metadata":{
+            "name":"web",
+            "namespace":"deploy-main-update-race"
+        },
+        "spec":{
+            "replicas":1,
+            "selector":{"matchLabels":{"app":"web"}},
+            "template":{
+                "metadata":{"labels":{"app":"web"}},
+                "spec":{"containers":[{"name":"web","image":"webserver:deterministic"}]}
+            }
         }
     });
-
-    while status_writes.load(Ordering::SeqCst) < 5 {
-        tokio::task::yield_now().await;
-    }
-
-    let mut conflict_at = None;
-    let mut unexpected = None;
-    for version in 0..100 {
-        let update_body = serde_json::json!({
-            "apiVersion":"apps/v1",
-            "kind":"Deployment",
-            "metadata":{
-                "name":"web",
-                "namespace":"deploy-main-update-race"
-            },
-            "spec":{
-                "replicas":1,
-                "selector":{"matchLabels":{"app":"web"}},
-                "template":{
-                    "metadata":{"labels":{"app":"web"}},
-                    "spec":{"containers":[{"name":"web","image":format!("webserver:{version}")}]}
-                }
-            }
-        });
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/apis/apps/v1/namespaces/deploy-main-update-race/deployments/web")
-                    .header("content-type", "application/json")
-                    .body(Body::from(update_body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        if response.status() == StatusCode::CONFLICT {
-            conflict_at = Some(version);
-            break;
-        }
-        if response.status() != StatusCode::OK {
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            unexpected = Some((version, status, String::from_utf8_lossy(&body).to_string()));
-            break;
-        }
-    }
-
-    stop.store(true, Ordering::SeqCst);
-    churn.await.unwrap();
-
-    assert!(
-        conflict_at.is_none(),
-        "Deployment PUT without metadata.resourceVersion must not return 409 while status updates race; first conflict at image version {:?}",
-        conflict_at
+    let update = tokio::spawn(
+        app.clone().oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/apis/apps/v1/namespaces/deploy-main-update-race/deployments/web")
+                .header("content-type", "application/json")
+                .body(Body::from(update_body.to_string()))
+                .unwrap(),
+        ),
     );
-    assert!(
-        unexpected.is_none(),
-        "unexpected Deployment PUT response while status updates race: {:?}",
-        unexpected
+
+    pause.wait_until_reached().await;
+    db.update_status_only_with_preconditions(
+        "apps/v1",
+        "Deployment",
+        Some("deploy-main-update-race"),
+        "web",
+        serde_json::json!({
+            "replicas": 7,
+            "readyReplicas": 6,
+            "availableReplicas": 5
+        }),
+        crate::datastore::ResourcePreconditions::uid(&created.uid),
+    )
+    .await
+    .unwrap();
+    pause.resume();
+
+    let response = update.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["status"]["readyReplicas"], 6);
+    assert_eq!(
+        body["spec"]["template"]["spec"]["containers"][0]["image"],
+        "webserver:deterministic"
     );
 }
 

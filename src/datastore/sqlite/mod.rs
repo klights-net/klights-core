@@ -115,6 +115,40 @@ use scope::use_namespaced_table;
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResourceMutationPauseOperation {
+    MainUpdate,
+    PatchLatest,
+}
+
+#[cfg(test)]
+pub(crate) struct ResourceMutationPause {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ResourceMutationPause {
+    pub(crate) async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn resume(&self) {
+        self.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+struct ResourceMutationPauseRegistration {
+    operation: ResourceMutationPauseOperation,
+    api_version: String,
+    kind: String,
+    namespace: Option<String>,
+    name: String,
+    pause: std::sync::Arc<ResourceMutationPause>,
+}
+
 #[derive(Clone)]
 pub struct Datastore {
     executor: DbExecutor,
@@ -132,6 +166,9 @@ pub struct Datastore {
     #[cfg(test)]
     post_commit_publish_pause:
         std::sync::Arc<std::sync::Mutex<Option<cluster_replace::PostCommitPublishPause>>>,
+    #[cfg(test)]
+    resource_mutation_pause:
+        std::sync::Arc<std::sync::Mutex<Option<ResourceMutationPauseRegistration>>>,
 }
 
 struct AtomicOutboxMutation {
@@ -205,6 +242,66 @@ impl crate::kubelet::volume_sources::VolumeSourceReader for Datastore {
 }
 
 impl Datastore {
+    #[cfg(test)]
+    pub(crate) fn install_resource_mutation_pause(
+        &self,
+        operation: ResourceMutationPauseOperation,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> std::sync::Arc<ResourceMutationPause> {
+        let pause = std::sync::Arc::new(ResourceMutationPause {
+            reached: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let registration = ResourceMutationPauseRegistration {
+            operation,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            pause: pause.clone(),
+        };
+        *self
+            .resource_mutation_pause
+            .lock()
+            .expect("resource mutation pause mutex poisoned") = Some(registration);
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_resource_mutation_if_requested(
+        &self,
+        operation: ResourceMutationPauseOperation,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) {
+        let pause = {
+            let mut slot = self
+                .resource_mutation_pause
+                .lock()
+                .expect("resource mutation pause mutex poisoned");
+            if slot.as_ref().is_some_and(|registration| {
+                registration.operation == operation
+                    && registration.api_version == api_version
+                    && registration.kind == kind
+                    && registration.namespace.as_deref() == namespace
+                    && registration.name == name
+            }) {
+                slot.take().map(|registration| registration.pause)
+            } else {
+                None
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
     fn completed_outbox_record_in_tx(
         tx: &rusqlite::Transaction<'_>,
         idempotency_key: &str,
@@ -3346,6 +3443,8 @@ impl Datastore {
             resource_get_call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             post_commit_publish_pause: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            resource_mutation_pause: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 

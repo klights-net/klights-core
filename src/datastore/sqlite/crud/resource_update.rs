@@ -386,6 +386,15 @@ impl Datastore {
             preconditions,
             preserve_latest_status,
         } = request;
+        #[cfg(test)]
+        self.pause_resource_mutation_if_requested(
+            ResourceMutationPauseOperation::MainUpdate,
+            api_version,
+            kind,
+            namespace,
+            name,
+        )
+        .await;
         let mut effective_preconditions = preconditions.clone();
         ensure_resource_type_meta(&mut data, api_version, kind);
         ensure_metadata_identity(&mut data, namespace, name);
