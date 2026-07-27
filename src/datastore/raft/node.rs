@@ -2710,23 +2710,27 @@ mod tests {
             .initialize(members)
             .await
             .expect("initialize cluster");
-        // Wait for any node to become leader.
+        // Wait until every node has observed the same leader. Seeing a leader
+        // on one member does not imply that a selected follower has received
+        // the corresponding metrics update yet.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut leader_id: Option<NodeId> = None;
         while std::time::Instant::now() < deadline {
-            for n in &nodes {
-                let m = n.raft.metrics().borrow().clone();
-                if let Some(lid) = m.current_leader {
-                    leader_id = Some(lid);
-                    break;
-                }
-            }
-            if leader_id.is_some() {
+            let observed = nodes
+                .iter()
+                .map(|node| node.raft.metrics().borrow().current_leader)
+                .collect::<Vec<_>>();
+            if let Some(Some(candidate)) = observed.first()
+                && observed
+                    .iter()
+                    .all(|observed_leader| *observed_leader == Some(*candidate))
+            {
+                leader_id = Some(*candidate);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let leader_id = leader_id.expect("a leader was elected");
+        let leader_id = leader_id.expect("all members observed the elected leader");
         let follower_idx = nodes
             .iter()
             .position(|n| n.node_id != leader_id)

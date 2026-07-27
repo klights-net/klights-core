@@ -1576,7 +1576,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_finished_job_with_future_ttl_is_requeued_for_cleanup_deadline() {
         let db = crate::datastore::test_support::in_memory().await;
         let db_handle = handle_for(db.clone());
