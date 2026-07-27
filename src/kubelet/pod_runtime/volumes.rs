@@ -147,20 +147,14 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn real_pod_volume_runtime_cleanup_removes_pod_volumes_directory() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let temp = tempfile::tempdir().expect("tempdir");
         let containerd_ns = "rt-volumes-test";
-        unsafe {
-            std::env::set_var("KLIGHTS_DATA_ROOT", temp.path());
-            std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", containerd_ns);
-        }
+        let temp = crate::paths::test_data_root_fixture(containerd_ns);
+        let runtime_paths =
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
+                .unwrap();
 
         let runtime = RealPodVolumeRuntime::new(
             crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
@@ -169,17 +163,15 @@ mod tests {
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
             crate::kubelet::node::NodeCapacity::default(),
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
-                containerd_ns,
-            ))
-            .unwrap(),
+            runtime_paths.clone(),
         );
         let key = PodRuntimeKey {
             namespace: "default".to_string(),
             name: "web".to_string(),
             uid: "uid-1".to_string(),
         };
-        let pod_volumes_dir = crate::paths::volumes_root_path(containerd_ns)
+        let pod_volumes_dir = runtime_paths
+            .volumes_root()
             .join(key.volume_dir_id())
             .join("volumes");
         std::fs::create_dir_all(pod_volumes_dir.join("empty-dir")).expect("create volume dir");
@@ -194,23 +186,12 @@ mod tests {
             !pod_volumes_dir.exists(),
             "volume directory should be removed"
         );
-
-        unsafe {
-            std::env::remove_var("KLIGHTS_DATA_ROOT");
-            std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE");
-        }
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn real_pod_volume_runtime_emptydir_is_uid_qualified_for_same_name_recreate() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let temp = tempfile::tempdir().expect("tempdir");
         let containerd_ns = "rt-volumes-uid-test";
-        unsafe {
-            std::env::set_var("KLIGHTS_DATA_ROOT", temp.path());
-            std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", containerd_ns);
-        }
+        let temp = crate::paths::test_data_root_fixture(containerd_ns);
 
         let runtime = RealPodVolumeRuntime::new(
             crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
@@ -219,10 +200,8 @@ mod tests {
                 klights_supervisor::TaskCategoryConfig::default(),
             )),
             crate::kubelet::node::NodeCapacity::default(),
-            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
-                containerd_ns,
-            ))
-            .unwrap(),
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
+                .unwrap(),
         );
         let pod = serde_json::json!({
             "spec": {
@@ -271,10 +250,5 @@ mod tests {
             !new_results.join("done").exists(),
             "new same-name Pod must not inherit stale Sonobuoy done marker"
         );
-
-        unsafe {
-            std::env::remove_var("KLIGHTS_DATA_ROOT");
-            std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE");
-        }
     }
 }

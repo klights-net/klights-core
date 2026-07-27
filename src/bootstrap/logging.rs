@@ -5,10 +5,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 const TRUE_LOG_FILE_VALUE: &str = "true";
 
 pub(crate) fn resolve_log_file_path(raw: &str, containerd_namespace: &str) -> PathBuf {
+    resolve_log_file_path_under(raw, &crate::paths::data_root_path(containerd_namespace))
+}
+
+fn resolve_log_file_path_under(raw: &str, data_root: &std::path::Path) -> PathBuf {
     if raw.trim().eq_ignore_ascii_case(TRUE_LOG_FILE_VALUE) {
-        crate::paths::data_root_path(containerd_namespace)
-            .join("logs")
-            .join("klights.log")
+        data_root.join("logs").join("klights.log")
     } else {
         PathBuf::from(raw)
     }
@@ -57,22 +59,15 @@ pub(crate) fn init_tracing_from_env(containerd_namespace: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn log_file_true_uses_data_root_klights_log_case_insensitive() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_DATA_ROOT", "/tmp/klights-log-test") };
-        let path = resolve_log_file_path("TrUe", "ignored-ns");
+        let path =
+            resolve_log_file_path_under("TrUe", std::path::Path::new("/tmp/klights-log-test"));
         assert_eq!(
             path,
             PathBuf::from("/tmp/klights-log-test/logs/klights.log")
         );
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_DATA_ROOT") };
     }
 
     #[test]

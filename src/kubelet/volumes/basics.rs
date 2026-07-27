@@ -670,16 +670,16 @@ pub fn resolve_host_path(host_path: &str, host_type: Option<&str>) -> Result<Str
 /// Async so recursive `remove_dir_all` on large emptyDir volumes does not
 /// block the tokio runtime (HR2: the event loop must never block).
 #[cfg(test)]
-pub async fn cleanup_volumes(pod_name: &str) -> Result<()> {
+async fn cleanup_volumes_under(volumes_root: &std::path::Path, pod_name: &str) -> Result<()> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-    let volumes_root = volumes_root();
-    let pod_volumes_path = format!("{}/{}/volumes", volumes_root, pod_name);
+    let pod_volumes_path = volumes_root.join(pod_name).join("volumes");
+    let pod_volumes_path_string = pod_volumes_path.to_string_lossy().into_owned();
     // Best-effort unmount first to prevent recursive tmpfs stacking leaks
     // and remove_dir_all failures when mount points are still attached.
-    unmount_volume_mounts_under(&file_process, &pod_volumes_path).await?;
+    unmount_volume_mounts_under(&file_process, &pod_volumes_path_string).await?;
     crate::utils::remove_dir_all_if_exists_async(&file_process, &pod_volumes_path)
         .await
-        .with_context(|| format!("Failed to remove volumes at {}", pod_volumes_path))?;
+        .with_context(|| format!("Failed to remove volumes at {}", pod_volumes_path.display()))?;
     Ok(())
 }
 
@@ -687,33 +687,18 @@ pub async fn cleanup_volumes(pod_name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Serializes env-var mutation across the cleanup_volumes tests. Cargo
-    /// runs `#[tokio::test]` cases in parallel; without this lock, two tests
-    /// can race on KLIGHTS_DATA_ROOT and one observes the other's value.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Verifies cleanup_volumes is fully async — the tokio::time::timeout
     /// failsafe ensures the function never reverts to a sync recursive
     /// remove_dir_all that could block the runtime under load.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // ENV_LOCK serializes env-var-mutating tests; intentional
     async fn test_cleanup_volumes_removes_directory_async() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp = tempfile::tempdir().expect("tempdir");
-        let test_ns = "rt01-cleanup";
-        // Safety: serialized via ENV_LOCK so no concurrent reader observes
-        // an inconsistent state.
-        unsafe {
-            std::env::set_var("KLIGHTS_DATA_ROOT", temp.path());
-            std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", test_ns);
-        }
+        let temp = crate::paths::test_data_root_fixture("cleanup-volumes");
+        let volumes_root = temp.path().join("pods");
 
         // Build the directory tree cleanup_volumes expects:
         //   {data_root}/pods/{pod_id}/volumes/{kind}/{name}/file
         let pod_id = "default_my-pod";
-        let pod_dir = std::path::PathBuf::from(volumes_root())
-            .join(pod_id)
-            .join("volumes");
+        let pod_dir = volumes_root.join(pod_id).join("volumes");
         let nested = pod_dir.join("empty-dir").join("scratch");
         std::fs::create_dir_all(&nested).expect("create nested");
         std::fs::write(nested.join("a.txt"), b"hello").expect("write file");
@@ -726,46 +711,33 @@ mod tests {
 
         // 1s timeout: catches any future regression that reintroduces a
         // blocking std::fs::remove_dir_all on the runtime worker.
-        tokio::time::timeout(std::time::Duration::from_secs(1), cleanup_volumes(pod_id))
-            .await
-            .expect("cleanup_volumes did not complete within 1s — possible blocking regression")
-            .expect("cleanup_volumes returned Err");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cleanup_volumes_under(&volumes_root, pod_id),
+        )
+        .await
+        .expect("cleanup_volumes did not complete within 1s — possible blocking regression")
+        .expect("cleanup_volumes returned Err");
 
         assert!(
             !pod_dir.exists(),
             "expected pod volumes dir {} to be removed",
             pod_dir.display()
         );
-
-        unsafe {
-            std::env::remove_var("KLIGHTS_DATA_ROOT");
-            std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE");
-        }
     }
 
     /// Idempotent: cleanup on a non-existent path returns Ok, not Err.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // ENV_LOCK serializes env-var-mutating tests; intentional
     async fn test_cleanup_volumes_missing_path_is_ok() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let temp = tempfile::tempdir().expect("tempdir");
-        let test_ns = "rt01-missing";
-        unsafe {
-            std::env::set_var("KLIGHTS_DATA_ROOT", temp.path());
-            std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", test_ns);
-        }
+        let temp = crate::paths::test_data_root_fixture("cleanup-volumes-missing");
+        let volumes_root = temp.path().join("pods");
 
-        let result = cleanup_volumes("nonexistent_pod").await;
+        let result = cleanup_volumes_under(&volumes_root, "nonexistent_pod").await;
         assert!(
             result.is_ok(),
             "expected Ok for missing path, got {:?}",
             result
         );
-
-        unsafe {
-            std::env::remove_var("KLIGHTS_DATA_ROOT");
-            std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE");
-        }
     }
 
     #[test]

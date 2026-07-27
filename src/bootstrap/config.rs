@@ -546,7 +546,6 @@ mod tests {
         unsafe { std::env::remove_var("KLIGHTS_DATASTORE_BACKEND") };
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_NODE_LOCAL_BACKEND") };
-        unsafe { std::env::remove_var("KLIGHTS_DATA_ROOT") };
         unsafe { std::env::remove_var("KLIGHTS_API_SLOW_LOG_MS") };
         unsafe { std::env::remove_var("KLIGHTS_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS") };
         unsafe { std::env::remove_var("KLIGHTS_MAX_WATCH_EVENTS") };
@@ -649,12 +648,10 @@ mod tests {
         assert_eq!(captured.max_watch_events, 12_345);
 
         unsafe { std::env::set_var("KLIGHTS_API_SLOW_LOG_MS", "900") };
-        unsafe { std::env::set_var("KLIGHTS_DATA_ROOT", "/tmp/changed-after-capture") };
         assert_eq!(
             captured.api_slow_log_threshold,
             std::time::Duration::from_millis(700)
         );
-        assert!(!captured.data_root.starts_with("/tmp/changed-after-capture"));
         clear_klights_env();
     }
 

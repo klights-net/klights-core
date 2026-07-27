@@ -681,29 +681,6 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(name);
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                unsafe { std::env::set_var(self.name, previous) };
-            } else {
-                unsafe { std::env::remove_var(self.name) };
-            }
-        }
-    }
-
     fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
         Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
@@ -870,13 +847,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes process-global env used to prove the handler ignores it
-    async fn configmap_watch_refresh_uses_configured_runtime_namespace_not_global_env() {
-        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let wrong_global_ns = "event-handler-wrong-global-ns";
-        let _data_root = EnvVarGuard::set("KLIGHTS_DATA_ROOT", temp.path());
-        let _runtime_env = EnvVarGuard::set("KLIGHTS_CONTAINERD_NAMESPACE", wrong_global_ns);
+    async fn configmap_watch_refresh_uses_injected_runtime_paths() {
+        let temp = crate::paths::test_data_root_fixture("event-handler-configmap-refresh");
 
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
@@ -934,10 +906,9 @@ mod tests {
             "cm-pod",
             "uid-cm-pod",
         );
-        let paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-            std::path::PathBuf::from("/tmp/klights-event-handler-test"),
-        )
-        .unwrap();
+        let paths =
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
+                .unwrap();
         let volume_path = paths
             .volumes_root()
             .join(pod_dir_id)

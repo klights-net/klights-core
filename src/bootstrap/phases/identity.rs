@@ -48,7 +48,7 @@ pub async fn setup_leader(
     .await
     .context("Failed to initialize certificates")?;
 
-    let grpc_ca_cert_path = Some(crate::paths::ca_cert_path(&cfg.config.containerd_namespace));
+    let grpc_ca_cert_path = Some(std::path::Path::new(&cfg.etc_dir).join("ca.crt"));
 
     match cert_result {
         auth::CertInitResult::Complete(_paths) => {}
@@ -103,7 +103,7 @@ async fn resolve_csr_via_rpc(
     let token_value = token.clone().unwrap_or_default();
     let client_identity = controlplane_rpc_client_identity_for_token(
         &token_value,
-        &cfg.config.containerd_namespace,
+        std::path::Path::new(&cfg.etc_dir),
         &cfg.config.node_name,
         cfg.supervisor.clone(),
     )
@@ -269,7 +269,7 @@ fn role_allows_local_ca_generation(role: &crate::bootstrap::NodeRole) -> bool {
 
 async fn controlplane_rpc_client_identity_for_token(
     token: &str,
-    namespace: &str,
+    etc_dir: &std::path::Path,
     node_name: &str,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<(Option<String>, Option<String>)> {
@@ -281,8 +281,8 @@ async fn controlplane_rpc_client_identity_for_token(
         CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
     };
 
-    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-        namespace,
+    let store = SupervisedFilesystemWorkerCredentialStore::new(
+        etc_dir.to_path_buf(),
         node_name,
         supervisor.clone(),
     );
@@ -304,8 +304,9 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         WorkerCredential, credential_has_group, resolve_credential_async,
     };
 
-    let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-        &cfg.config.containerd_namespace,
+    let etc_dir = std::path::Path::new(&cfg.etc_dir);
+    let store = SupervisedFilesystemWorkerCredentialStore::new(
+        etc_dir.to_path_buf(),
         &cfg.config.node_name,
         cfg.supervisor.clone(),
     );
@@ -336,8 +337,8 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         );
     }
 
-    let ca_cert_path = crate::paths::ca_cert_path(&cfg.config.containerd_namespace);
-    let ca_key_path = crate::paths::ca_key_path(&cfg.config.containerd_namespace);
+    let ca_cert_path = etc_dir.join("ca.crt");
+    let ca_key_path = etc_dir.join("ca.key");
     let ca_cert_path_for_task = ca_cert_path.clone();
     let ca_key_path_for_task = ca_key_path.clone();
     let (ca_cert_pem, ca_key_pem) = cfg
@@ -477,6 +478,39 @@ mod tests {
             .to_string()
     }
 
+    fn test_config_phase(
+        mut config: crate::KlightsConfig,
+        data_root: &std::path::Path,
+        supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    ) -> crate::bootstrap::phases::config::ConfigPhase {
+        config.data_root = data_root.to_path_buf();
+        let config = std::sync::Arc::new(config);
+        let node_mode = crate::bootstrap::NodeMode::Root;
+        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
+        crate::bootstrap::phases::config::ConfigPhase {
+            config: config.clone(),
+            node_mode: node_mode.clone(),
+            supervisor,
+            file_process: file_process.clone(),
+            grpc_transport_policy:
+                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+            network_cleanup: crate::networking::NetworkCleanup::from_config(
+                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
+                file_process,
+            ),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            etc_dir: data_root.join("etc").to_string_lossy().into_owned(),
+            containerd_state_dir: data_root
+                .join("containerd/state")
+                .to_string_lossy()
+                .into_owned(),
+            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
+                data_root.to_path_buf(),
+            )
+            .unwrap(),
+        }
+    }
+
     #[test]
     fn csr_signing_ca_cert_path_prefers_leader_ca_for_controlplane_join() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -525,39 +559,15 @@ mod tests {
     #[tokio::test]
     async fn setup_worker_does_not_create_local_ca_or_server_certs() {
         let namespace = format!("worker-no-local-ca-{}", uuid::Uuid::new_v4());
+        let data_root = crate::paths::test_data_root_fixture(&namespace);
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-worker".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let config = std::sync::Arc::new(config);
-        let node_mode = crate::bootstrap::NodeMode::Root;
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
-        let cfg = crate::bootstrap::phases::config::ConfigPhase {
-            config: config.clone(),
-            node_mode: node_mode.clone(),
-            supervisor: supervisor.clone(),
-            file_process: file_process.clone(),
-            grpc_transport_policy:
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
-                file_process,
-            ),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            etc_dir: crate::paths::etc_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-                crate::paths::data_root_path(&namespace),
-            )
-            .unwrap(),
-        };
+        let cfg = test_config_phase(config, data_root.path(), supervisor.clone());
 
         let identity = setup_worker(&cfg, "10.99.0.20")
             .await
@@ -565,56 +575,31 @@ mod tests {
 
         assert!(identity.follower_dataplane.is_some());
         assert!(
-            !crate::paths::ca_cert_path(&namespace).exists(),
+            !data_root.path().join("etc/ca.crt").exists(),
             "worker identity setup must not create a local ca.crt"
         );
         assert!(
-            !crate::paths::ca_key_path(&namespace).exists(),
+            !data_root.path().join("etc/ca.key").exists(),
             "worker identity setup must not create a local ca.key"
         );
         assert!(
-            !crate::paths::server_cert_path(&namespace).exists(),
+            !data_root.path().join("etc/server.crt").exists(),
             "worker identity setup must not create local server certs"
         );
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&namespace));
     }
 
     #[tokio::test]
     async fn setup_leader_persists_local_node_client_certificate_for_tokenless_rejoin() {
         let namespace = format!("cp-seed-node-cert-{}", uuid::Uuid::new_v4());
+        let data_root = crate::paths::test_data_root_fixture(&namespace);
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-controlplane1".to_string();
-        let config = std::sync::Arc::new(config);
-        let node_mode = crate::bootstrap::NodeMode::Root;
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
-        let cfg = crate::bootstrap::phases::config::ConfigPhase {
-            config: config.clone(),
-            node_mode: node_mode.clone(),
-            supervisor: supervisor.clone(),
-            file_process: file_process.clone(),
-            grpc_transport_policy:
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
-                file_process,
-            ),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            etc_dir: crate::paths::etc_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-                crate::paths::data_root_path(&namespace),
-            )
-            .unwrap(),
-        };
+        let cfg = test_config_phase(config, data_root.path(), supervisor.clone());
 
         setup_leader(
             &cfg,
@@ -629,11 +614,12 @@ mod tests {
         .await
         .expect("seed controlplane identity setup");
 
-        let store = crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore::for_namespace(
-            &namespace,
-            "mn-controlplane1",
-            supervisor.clone(),
-        );
+        let store =
+            crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore::new(
+                data_root.path().join("etc"),
+                "mn-controlplane1",
+                supervisor.clone(),
+            );
         let crypto = klights_supervisor::CryptoExecutor::new(cfg.supervisor.clone());
         let source = crate::bootstrap::worker_identity::resolve_credential_async(&store, &crypto)
             .await
@@ -647,7 +633,6 @@ mod tests {
         );
 
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&namespace));
     }
 
     #[tokio::test]
@@ -792,40 +777,16 @@ mod tests {
     #[tokio::test]
     async fn setup_leader_prepares_wireguard_dataplane_metadata_for_controlplane_join() {
         let namespace = format!("cp-dataplane-{}", uuid::Uuid::new_v4());
+        let data_root = crate::paths::test_data_root_fixture(&namespace);
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-controlplane2".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Enabled;
         config.external_endpoint = Some("10.99.0.14".to_string());
-        let config = std::sync::Arc::new(config);
-        let node_mode = crate::bootstrap::NodeMode::Root;
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
-        let cfg = crate::bootstrap::phases::config::ConfigPhase {
-            config: config.clone(),
-            node_mode: node_mode.clone(),
-            supervisor: supervisor.clone(),
-            file_process: file_process.clone(),
-            grpc_transport_policy:
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
-                file_process,
-            ),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            etc_dir: crate::paths::etc_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-                crate::paths::data_root_path(&namespace),
-            )
-            .unwrap(),
-        };
+        let cfg = test_config_phase(config, data_root.path(), supervisor.clone());
 
         let identity = setup_leader(
             &cfg,
@@ -853,53 +814,30 @@ mod tests {
             "encrypted raft/controlplane joins must send the local WireGuard public key"
         );
         assert!(
-            crate::paths::etc_dir_path(&namespace)
+            data_root
+                .path()
+                .join("etc")
                 .join("wireguard-private.key")
                 .exists(),
             "dataplane identity must persist the WireGuard private key"
         );
 
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&namespace));
     }
 
     #[tokio::test]
     async fn setup_leader_server_cert_uses_external_endpoint_san_when_internal_ip_differs() {
         let namespace = format!("cp-api-external-{}", uuid::Uuid::new_v4());
+        let data_root = crate::paths::test_data_root_fixture(&namespace);
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = namespace.clone();
         config.node_name = "mn-controlplane1".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
         config.external_endpoint = Some("10.99.0.10".to_string());
-        let config = std::sync::Arc::new(config);
-        let node_mode = crate::bootstrap::NodeMode::Root;
         let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
-        let cfg = crate::bootstrap::phases::config::ConfigPhase {
-            config: config.clone(),
-            node_mode: node_mode.clone(),
-            supervisor: supervisor.clone(),
-            file_process: file_process.clone(),
-            grpc_transport_policy:
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
-                file_process,
-            ),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            etc_dir: crate::paths::etc_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            containerd_state_dir: crate::paths::containerd_state_dir_path(&namespace)
-                .to_string_lossy()
-                .into_owned(),
-            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-                crate::paths::data_root_path(&namespace),
-            )
-            .unwrap(),
-        };
+        let cfg = test_config_phase(config, data_root.path(), supervisor.clone());
 
         setup_leader(
             &cfg,
@@ -914,7 +852,7 @@ mod tests {
         .await
         .expect("seed controlplane identity should initialize");
 
-        let server_cert = std::fs::read_to_string(crate::paths::server_cert_path(&namespace))
+        let server_cert = std::fs::read_to_string(data_root.path().join("etc/server.crt"))
             .expect("server cert must exist");
         let (_, pem) = x509_parser::pem::parse_x509_pem(server_cert.as_bytes())
             .expect("server cert PEM must parse");
@@ -943,6 +881,41 @@ mod tests {
         );
 
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&namespace));
+    }
+
+    #[tokio::test]
+    async fn setup_leader_uses_config_phase_paths_instead_of_ambient_namespace_paths() {
+        let namespace = format!("cp-captured-paths-{}", uuid::Uuid::new_v4());
+        let data_root = crate::paths::test_data_root_fixture(&namespace);
+        let mut config = crate::KlightsConfig::test_default();
+        config.containerd_namespace = namespace;
+        config.node_name = "mn-controlplane1".to_string();
+        config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let etc_dir = data_root.path().join("etc");
+        let cfg = test_config_phase(config, data_root.path(), supervisor.clone());
+
+        setup_leader(
+            &cfg,
+            "10.99.0.10",
+            &crate::bootstrap::NodeRole::Controlplane {
+                leader_endpoints: vec![],
+                token: None,
+                skip_ca: false,
+                as_learner: false,
+            },
+        )
+        .await
+        .expect("seed identity must use the paths captured by ConfigPhase");
+
+        assert!(etc_dir.join("ca.crt").exists());
+        assert!(etc_dir.join("ca.key").exists());
+        assert!(etc_dir.join("server.crt").exists());
+        assert!(etc_dir.join("node.crt").exists());
+        assert!(etc_dir.join("node.key").exists());
+
+        let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
     }
 }

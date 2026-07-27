@@ -2,7 +2,7 @@
 
 use crate::bootstrap::NodeMode;
 use crate::node_outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
-use crate::{KlightsConfig, datastore, paths};
+use crate::{KlightsConfig, datastore};
 
 use super::leader_control_stream::runtime_epoch_ms;
 
@@ -103,8 +103,7 @@ async fn local_dataplane_identity(
         None
     };
     let public_key = if encryption == crate::networking::wireguard::DataplaneEncryption::Enabled {
-        let key_path =
-            paths::etc_dir_path(&config.containerd_namespace).join("wireguard-private.key");
+        let key_path = config.data_root.join("etc/wireguard-private.key");
         let identity =
             crate::networking::wireguard::WireGuardIdentity::load_or_create(&key_path, supervisor)
                 .await?;

@@ -13,9 +13,11 @@ fn absolute_path(path: PathBuf) -> PathBuf {
 }
 
 fn env_path(name: &str, default: impl FnOnce() -> PathBuf) -> PathBuf {
-    let path = std::env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(default);
+    env_path_value(std::env::var_os(name), default)
+}
+
+fn env_path_value(value: Option<std::ffi::OsString>, default: impl FnOnce() -> PathBuf) -> PathBuf {
+    let path = value.map(PathBuf::from).unwrap_or_else(default);
     absolute_path(path)
 }
 
@@ -34,11 +36,18 @@ pub fn db_root_path(namespace: &str) -> PathBuf {
 }
 
 fn backend_db_dir_path(namespace: &str, backend: &str) -> PathBuf {
-    db_root_path(namespace).join(backend)
+    backend_db_dir_under(db_root_path(namespace), backend)
+}
+
+fn backend_db_dir_under(db_root: PathBuf, backend: &str) -> PathBuf {
+    db_root.join(backend)
 }
 
 pub fn cluster_db_path(namespace: &str, backend: &str) -> PathBuf {
-    let dir = backend_db_dir_path(namespace, backend);
+    cluster_db_path_under(backend_db_dir_path(namespace, backend), backend)
+}
+
+fn cluster_db_path_under(dir: PathBuf, backend: &str) -> PathBuf {
     match backend {
         "redb" => dir.join("cluster.redb"),
         _ => dir.join("cluster.db"),
@@ -46,7 +55,10 @@ pub fn cluster_db_path(namespace: &str, backend: &str) -> PathBuf {
 }
 
 pub fn node_db_path(namespace: &str, backend: &str) -> PathBuf {
-    let dir = backend_db_dir_path(namespace, backend);
+    node_db_path_under(backend_db_dir_path(namespace, backend), backend)
+}
+
+fn node_db_path_under(dir: PathBuf, backend: &str) -> PathBuf {
     match backend {
         "redb" => dir.join("node.redb"),
         _ => dir.join("node.db"),
@@ -57,11 +69,8 @@ pub fn runtime_namespace() -> String {
     std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())
 }
 
-/// Per-process unique test root, stable across all tests in a single `cargo test`
-/// run.  Avoids `/tmp` collisions when multiple users or CI workers share the
-/// same host.
-///
-/// Pattern: `/tmp/{namespace}-test-{pid}-{nanos}`
+/// Per-process fallback token for direct `cargo test` invocations that do not
+/// provide the build-owned `KLIGHTS_TEST_DATA_ROOT`.
 #[cfg(test)]
 fn test_random_token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();
@@ -76,8 +85,71 @@ fn test_random_token() -> &'static str {
 }
 
 #[cfg(test)]
+fn test_run_root_path() -> PathBuf {
+    std::env::var_os("KLIGHTS_TEST_DATA_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/klights-test-run-{}", test_random_token())))
+}
+
+#[cfg(test)]
+fn test_path_component(raw: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let readable = raw
+        .rsplit("::")
+        .next()
+        .unwrap_or(raw)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    format!("{readable}-{:016x}", hasher.finish())
+}
+
+#[cfg(test)]
+fn test_case_root_path() -> PathBuf {
+    let identity = std::thread::current()
+        .name()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
+    test_run_root_path().join(test_path_component(&identity))
+}
+
+/// Stable path for a namespace within the current test case.
+///
+/// `build.sh` owns the run root and removes it on exit. The test case component
+/// prevents parallel tests that reuse a runtime namespace from sharing files.
+#[cfg(test)]
 pub fn test_data_root_path(namespace: &str) -> PathBuf {
-    PathBuf::from(format!("/tmp/{}-test-{}", namespace, test_random_token()))
+    test_case_root_path().join(test_path_component(namespace))
+}
+
+/// Create a unique test-owned data root below the current run and test case.
+///
+/// The returned `TempDir` removes the complete fixture subtree on drop;
+/// `build.sh` removes the run root as a final safeguard after the suite exits.
+#[cfg(test)]
+pub fn test_data_root_fixture(namespace: &str) -> tempfile::TempDir {
+    if std::env::var_os("KLIGHTS_TEST_DATA_ROOT").is_none() {
+        return tempfile::Builder::new()
+            .prefix(&format!("klights-test-{}-", test_path_component(namespace)))
+            .tempdir()
+            .expect("create isolated direct-test data fixture");
+    }
+    let test_case_root = test_case_root_path();
+    std::fs::create_dir_all(&test_case_root).expect("create per-test data root");
+    tempfile::Builder::new()
+        .prefix(&format!("{}-", test_path_component(namespace)))
+        .tempdir_in(test_case_root)
+        .expect("create isolated test data fixture")
 }
 
 pub fn etc_dir_path(namespace: &str) -> PathBuf {
@@ -213,49 +285,10 @@ pub fn cni_rpc_socket_path(namespace: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(name);
-            // TODO: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::set_var(name, value) };
-            Self { name, previous }
-        }
-
-        fn remove(name: &'static str) -> Self {
-            let previous = std::env::var_os(name);
-            // TODO: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::remove_var(name) };
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                // TODO: Audit that the environment access only happens in single-threaded code.
-                unsafe { std::env::set_var(self.name, value) };
-            } else {
-                // TODO: Audit that the environment access only happens in single-threaded code.
-                unsafe { std::env::remove_var(self.name) };
-            }
-        }
-    }
 
     #[test]
     fn default_data_root_resolves_to_absolute_paths() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::remove("KLIGHTS_DATA_ROOT");
-
-        let root = data_root_path("klights");
+        let root = env_path_value(None, || home_dir().join("klights"));
 
         assert!(
             root.is_absolute(),
@@ -286,6 +319,27 @@ mod tests {
     }
 
     #[test]
+    fn test_data_root_is_test_case_scoped() {
+        let first = std::thread::Builder::new()
+            .name("paths::first_parallel_test".to_string())
+            .spawn(|| test_data_root_path("shared-namespace"))
+            .unwrap()
+            .join()
+            .unwrap();
+        let second = std::thread::Builder::new()
+            .name("paths::second_parallel_test".to_string())
+            .spawn(|| test_data_root_path("shared-namespace"))
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_ne!(
+            first, second,
+            "parallel tests using the same runtime namespace need isolated roots"
+        );
+    }
+
+    #[test]
     fn test_data_root_lives_under_tmp() {
         let r = test_data_root_path("klights");
         assert!(
@@ -296,51 +350,57 @@ mod tests {
     }
 
     #[test]
-    fn relative_data_root_env_resolves_to_absolute_paths() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::set("KLIGHTS_DATA_ROOT", "relative-klights-root");
+    fn test_data_root_fixture_removes_its_subtree_on_drop() {
+        let path;
+        {
+            let fixture = test_data_root_fixture("cleanup");
+            path = fixture.path().to_path_buf();
+            std::fs::write(path.join("owned-file"), b"fixture").unwrap();
+            assert!(path.exists());
+        }
+        assert!(
+            !path.exists(),
+            "dropping a test data fixture must remove its complete subtree"
+        );
+    }
 
-        let root = data_root_path("klights");
+    #[test]
+    fn relative_data_root_env_resolves_to_absolute_paths() {
+        let root = env_path_value(Some("relative-klights-root".into()), || {
+            PathBuf::from("unused")
+        });
 
         assert!(
             root.is_absolute(),
             "containerd root/state paths must never be relative"
         );
         assert!(root.ends_with("relative-klights-root"));
-        assert_eq!(
-            containerd_state_dir_path("klights"),
-            root.join("containerd").join("state")
-        );
     }
 
     #[test]
     fn sqlite_cluster_and_node_db_paths_are_separate_files_under_db_root() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::set("KLIGHTS_DATA_ROOT", "/var/lib/klights-test");
-        let _db_env = EnvVarGuard::remove("KLIGHTS_DB_DIR");
+        let directory = backend_db_dir_under(PathBuf::from("/var/lib/klights-test/db"), "sqlite");
 
         assert_eq!(
-            cluster_db_path("klights", "sqlite"),
+            cluster_db_path_under(directory.clone(), "sqlite"),
             PathBuf::from("/var/lib/klights-test/db/sqlite/cluster.db")
         );
         assert_eq!(
-            node_db_path("klights", "sqlite"),
+            node_db_path_under(directory, "sqlite"),
             PathBuf::from("/var/lib/klights-test/db/sqlite/node.db")
         );
     }
 
     #[test]
     fn redb_cluster_and_node_db_paths_are_separate_files_under_db_root() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvVarGuard::set("KLIGHTS_DB_DIR", "/var/lib/klights-db");
-        let _data_env = EnvVarGuard::remove("KLIGHTS_DATA_ROOT");
+        let directory = backend_db_dir_under(PathBuf::from("/var/lib/klights-db"), "redb");
 
         assert_eq!(
-            cluster_db_path("klights", "redb"),
+            cluster_db_path_under(directory.clone(), "redb"),
             PathBuf::from("/var/lib/klights-db/redb/cluster.redb")
         );
         assert_eq!(
-            node_db_path("klights", "redb"),
+            node_db_path_under(directory, "redb"),
             PathBuf::from("/var/lib/klights-db/redb/node.redb")
         );
     }
