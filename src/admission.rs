@@ -1,4 +1,3 @@
-mod http_client;
 mod request_context;
 mod selectors;
 mod validating_policy;
@@ -7,24 +6,21 @@ mod webhook_response;
 mod webhook_rules;
 
 use anyhow::Result;
-#[cfg(test)]
-use http_client::webhook_http_client_for;
 pub use request_context::AdmissionRequestContext;
 use request_context::{is_admission_operation, is_webhook_configuration_resource};
 use selectors::get_namespace_labels_value;
 #[cfg(test)]
 use selectors::{get_namespace_labels, matches_label_selector};
 use serde_json::Value;
-#[cfg(test)]
 use std::net::SocketAddr;
+use std::sync::Arc;
 use validating_policy::run_validating_admission_policies;
 pub use validating_policy::{
     apply_validating_admission_policy_typechecking_status, validate_validating_admission_policy,
     validate_validating_admission_policy_binding,
 };
 use webhook_call::call_webhook;
-#[cfg(test)]
-use webhook_call::{format_webhook_call_error, resolve_webhook_target};
+pub(crate) use webhook_call::format_webhook_call_error;
 use webhook_response::{
     apply_mutation, build_admission_review, ensure_webhook_allowed, webhook_warnings,
 };
@@ -40,17 +36,57 @@ use webhook_rules::{
     webhook_side_effects_allow_dry_run,
 };
 
-/// API-server-owned reads for admission policy, webhook, parameter and
-/// namespace-selector evaluation.
+#[derive(Clone, Debug)]
+pub(crate) struct AdmissionResource {
+    pub(crate) name: String,
+    pub(crate) data: Arc<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionDependencyError {
+    message: String,
+}
+
+impl AdmissionDependencyError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AdmissionDependencyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AdmissionDependencyError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WebhookTarget {
+    pub(crate) base_url: String,
+    pub(crate) dns_override: Option<(String, SocketAddr)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AdmissionWebhookRequest {
+    pub(crate) target: WebhookTarget,
+    pub(crate) client_config: Arc<Value>,
+    pub(crate) admission_review: Value,
+    pub(crate) timeout_seconds: u64,
+}
+
+/// Admission-policy reads. Concrete datastore adaptation belongs to root.
 #[async_trait::async_trait]
-pub(crate) trait AdmissionLookup: Send + Sync {
+pub(crate) trait AdmissionQuery: Send + Sync {
     async fn get_resource(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> anyhow::Result<Option<klights_cluster_core::Resource>>;
+    ) -> std::result::Result<Option<AdmissionResource>, AdmissionDependencyError>;
 
     async fn list_resources(
         &self,
@@ -58,18 +94,44 @@ pub(crate) trait AdmissionLookup: Send + Sync {
         kind: &str,
         namespace: Option<&str>,
         label_selector: Option<&str>,
-    ) -> anyhow::Result<Vec<klights_cluster_core::Resource>>;
+    ) -> std::result::Result<Vec<AdmissionResource>, AdmissionDependencyError>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait WebhookTargetResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        client_config: &Value,
+    ) -> std::result::Result<WebhookTarget, AdmissionDependencyError>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait AdmissionWebhookClient: Send + Sync {
+    async fn call(
+        &self,
+        request: AdmissionWebhookRequest,
+    ) -> std::result::Result<Value, AdmissionDependencyError>;
 }
 
 /// Shared OO runner for mutating and validating admission webhooks.
 /// Mutating and validating paths share rule matching, selector checks and callout flow.
 pub struct AdmissionEngine<'a> {
-    lookup: &'a dyn AdmissionLookup,
+    query: &'a dyn AdmissionQuery,
+    target_resolver: &'a dyn WebhookTargetResolver,
+    webhook_client: &'a dyn AdmissionWebhookClient,
 }
 
 impl<'a> AdmissionEngine<'a> {
-    pub(crate) fn new(lookup: &'a dyn AdmissionLookup) -> Self {
-        Self { lookup }
+    pub(crate) fn new(
+        query: &'a dyn AdmissionQuery,
+        target_resolver: &'a dyn WebhookTargetResolver,
+        webhook_client: &'a dyn AdmissionWebhookClient,
+    ) -> Self {
+        Self {
+            query,
+            target_resolver,
+            webhook_client,
+        }
     }
 
     #[cfg(test)]
@@ -129,7 +191,7 @@ impl<'a> AdmissionEngine<'a> {
         let resource_namespace = context.namespace.clone();
 
         let mut configs = self
-            .lookup
+            .query
             .list_resources("admissionregistration.k8s.io/v1", webhook_kind, None, None)
             .await?;
         configs.sort_by(|a, b| {
@@ -157,7 +219,7 @@ impl<'a> AdmissionEngine<'a> {
         let ns_labels: Option<serde_json::Map<String, Value>> =
             if let Some(ref ns) = resource_namespace {
                 Some(
-                    get_namespace_labels_value(self.lookup, ns)
+                    get_namespace_labels_value(self.query, ns)
                         .await
                         .unwrap_or_default(),
                 )
@@ -207,7 +269,8 @@ impl<'a> AdmissionEngine<'a> {
                 let timeout_seconds = webhook_timeout_seconds(webhook);
 
                 match call_webhook(
-                    self.lookup,
+                    self.target_resolver,
+                    self.webhook_client,
                     webhook,
                     &mutated_resource,
                     context,
@@ -274,7 +337,8 @@ impl<'a> AdmissionEngine<'a> {
                     .unwrap_or("Fail");
                 let timeout_seconds = webhook_timeout_seconds(webhook);
                 match call_webhook(
-                    self.lookup,
+                    self.target_resolver,
+                    self.webhook_client,
                     webhook,
                     &mutated_resource,
                     context,
@@ -297,7 +361,7 @@ impl<'a> AdmissionEngine<'a> {
         }
 
         if !is_mutating {
-            run_validating_admission_policies(self.lookup, context, &mutated_resource).await?;
+            run_validating_admission_policies(self.query, context, &mutated_resource).await?;
         }
 
         Ok(mutated_resource)

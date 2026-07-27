@@ -747,6 +747,7 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
             .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                 api_version: self.api_version.to_string(),
                 kind: self.kind.to_string(),
+                resource: None,
                 operation: "CREATE".to_string(),
                 namespace: self.namespace.map(str::to_string),
                 name: body
@@ -999,6 +1000,7 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
             .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                 api_version: self.api_version.to_string(),
                 kind: kind.to_string(),
+                resource: None,
                 operation: "UPDATE".to_string(),
                 namespace: ns.map(str::to_string),
                 name: Some(self.name.to_string()),
@@ -1189,6 +1191,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                         api_version: api_version.to_string(),
                         kind: kind.to_string(),
+                        resource: None,
                         operation: "CREATE".to_string(),
                         namespace: ns.map(str::to_string),
                         name: Some(name.to_string()),
@@ -1300,6 +1303,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                 .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                     api_version: api_version.to_string(),
                     kind: kind.to_string(),
+                    resource: None,
                     operation: "UPDATE".to_string(),
                     namespace: ns.map(str::to_string),
                     name: Some(name.to_string()),
@@ -1740,6 +1744,7 @@ pub(in crate::api) async fn delete_inner(
         .admit(crate::api::admission_ports::ResourceAdmissionRequest {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
+            resource: None,
             operation: "DELETE".to_string(),
             namespace: ns.map(str::to_string),
             name: Some(name.to_string()),

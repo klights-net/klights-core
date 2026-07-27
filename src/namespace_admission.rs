@@ -11,28 +11,24 @@ pub(crate) fn is_protected(name: &str) -> bool {
     ["default", "kube-system", "kube-public", "kube-node-lease"].contains(&name)
 }
 
-pub(crate) async fn create_eligibility(
-    lookup: &(impl crate::admission::AdmissionLookup + ?Sized),
+pub(crate) fn classify_namespace(
     namespace: &str,
-) -> anyhow::Result<NamespaceCreateEligibility> {
-    let Some(resource) = lookup
-        .get_resource("v1", "Namespace", None, namespace)
-        .await?
-    else {
-        return Ok(if is_protected(namespace) {
+    resource: Option<&serde_json::Value>,
+) -> NamespaceCreateEligibility {
+    let Some(resource) = resource else {
+        return if is_protected(namespace) {
             NamespaceCreateEligibility::Allowed
         } else {
             NamespaceCreateEligibility::Missing
-        });
+        };
     };
     if resource
-        .data
         .pointer("/metadata/deletionTimestamp")
         .and_then(serde_json::Value::as_str)
         .is_some()
     {
-        Ok(NamespaceCreateEligibility::Terminating)
+        NamespaceCreateEligibility::Terminating
     } else {
-        Ok(NamespaceCreateEligibility::Allowed)
+        NamespaceCreateEligibility::Allowed
     }
 }

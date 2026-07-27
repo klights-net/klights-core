@@ -178,13 +178,13 @@ pub(crate) use state::{
 pub(crate) use state::{ApiRuntimeInputs, ApiRuntimePaths};
 #[cfg(not(test))]
 pub(crate) use state::{RootApiRole, build_router_from_root};
+pub(crate) use validation::run_admission_for_request;
 pub use validation::{
-    AdmissionContextRequest, AdmissionExecution, AdmissionExecutionFuture, DeleteOptions,
-    apply_crd_defaults, apply_crd_pruning, build_admission_context, check_content_type,
-    check_cr_field_validation_strict, check_deployment_strict_decode_from_raw_json,
-    check_field_validation_strict, check_field_validation_strict_typed, check_immutable_fields,
-    inject_resource_version, parse_apply_yaml, parse_delete_options_body,
-    prepare_admissionregistration_resource, run_admission, run_admission_for_request,
+    AdmissionContextRequest, DeleteOptions, apply_crd_defaults, apply_crd_pruning,
+    build_admission_context, check_content_type, check_cr_field_validation_strict,
+    check_deployment_strict_decode_from_raw_json, check_field_validation_strict,
+    check_field_validation_strict_typed, check_immutable_fields, inject_resource_version,
+    parse_apply_yaml, parse_delete_options_body, prepare_admissionregistration_resource,
     validate_builtin_field_selector, validate_builtin_resource_spec, validate_crd_field_selector,
     validate_pod_resource_requirements_immutable, validate_pod_sysctls,
     validate_priorityclass_update_immutable,

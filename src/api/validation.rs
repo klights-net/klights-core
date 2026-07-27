@@ -2,18 +2,6 @@ use crate::api::*;
 use axum::http::HeaderMap;
 use klights_kube_protobuf as k8s_pb;
 use serde_json::Value;
-use std::future::Future;
-use std::pin::Pin;
-
-pub type AdmissionExecutionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Value, AppError>> + Send + 'a>>;
-
-pub trait AdmissionExecution: Send + Sync {
-    fn execute_admission<'a>(
-        &'a self,
-        context: crate::admission::AdmissionRequestContext,
-    ) -> AdmissionExecutionFuture<'a>;
-}
 
 pub fn validate_crd_field_selector(
     api_version: &str,
@@ -1707,18 +1695,25 @@ pub fn build_admission_context(
     ctx
 }
 
-pub async fn run_admission_for_request(
-    admission: &(impl AdmissionExecution + ?Sized),
+pub(crate) async fn run_admission_for_request(
+    admission: &(impl crate::api::admission_ports::ResourceAdmissionPort + ?Sized),
     ctx: crate::admission::AdmissionRequestContext,
 ) -> Result<Value, AppError> {
-    admission.execute_admission(ctx).await
-}
-
-pub async fn run_admission(
-    admission: &(impl AdmissionExecution + ?Sized),
-    request: AdmissionContextRequest<'_>,
-) -> Result<Value, AppError> {
-    run_admission_for_request(admission, build_admission_context(request)).await
+    admission
+        .admit(crate::api::admission_ports::ResourceAdmissionRequest {
+            api_version: ctx.api_version,
+            kind: ctx.kind,
+            resource: Some(ctx.resource),
+            operation: ctx.operation,
+            namespace: ctx.namespace,
+            name: ctx.name,
+            object: ctx.object,
+            old_object: ctx.old_object,
+            dry_run: ctx.dry_run.unwrap_or(false),
+            subresource: ctx.subresource,
+            options: ctx.options,
+        })
+        .await
 }
 
 // Helper function to check content negotiation

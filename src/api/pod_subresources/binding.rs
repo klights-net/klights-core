@@ -41,8 +41,11 @@ pub(in crate::api) async fn pod_binding(
         options: None,
     });
     admission_context.resource = "pods".to_string();
-    let binding =
-        run_admission_for_request(state.resource_mutation().db.as_ref(), admission_context).await?;
+    let binding = run_admission_for_request(
+        state.resource_mutation().admission.as_ref(),
+        admission_context,
+    )
+    .await?;
     state
         .resource_mutation()
         .pod_repository

@@ -1,4 +1,4 @@
-use super::AdmissionLookup;
+use super::AdmissionQuery;
 use super::request_context::{AdmissionRequestContext, is_admission_operation};
 use super::webhook_response::build_admission_review;
 use super::webhook_rules::resource_rule_matches;
@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(super) async fn run_validating_admission_policies(
-    lookup: &dyn AdmissionLookup,
+    lookup: &dyn AdmissionQuery,
     context: &AdmissionRequestContext,
     resource: &Value,
 ) -> Result<()> {
@@ -123,9 +123,9 @@ pub(super) async fn run_validating_admission_policies(
 }
 
 fn bindings_for_policy<'a>(
-    bindings: &'a [crate::datastore::Resource],
+    bindings: &'a [super::AdmissionResource],
     policy_name: &'a str,
-) -> impl Iterator<Item = &'a crate::datastore::Resource> + 'a {
+) -> impl Iterator<Item = &'a super::AdmissionResource> + 'a {
     bindings.iter().filter(move |binding| {
         binding
             .data
@@ -136,7 +136,7 @@ fn bindings_for_policy<'a>(
 }
 
 async fn namespace_labels_for_request(
-    lookup: &dyn AdmissionLookup,
+    lookup: &dyn AdmissionQuery,
     context: &AdmissionRequestContext,
     resource: &Value,
 ) -> Result<Option<Map<String, Value>>> {
@@ -161,7 +161,7 @@ async fn namespace_labels_for_request(
 }
 
 async fn namespace_object_for_request(
-    lookup: &dyn AdmissionLookup,
+    lookup: &dyn AdmissionQuery,
     context: &AdmissionRequestContext,
 ) -> Result<Value> {
     let Some(namespace) = context.namespace.as_deref() else {
@@ -439,7 +439,7 @@ fn evaluate_variables(
 }
 
 async fn resolve_params(
-    lookup: &dyn AdmissionLookup,
+    lookup: &dyn AdmissionQuery,
     policy_spec: &Value,
     binding_spec: &Value,
     context: &AdmissionRequestContext,

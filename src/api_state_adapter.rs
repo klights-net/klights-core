@@ -7,9 +7,7 @@ use crate::api::state_ports::{
     ApiFailureEntry, ApiFailureMetrics, ApiNodeLeaseObservations, ApiNodeLeaseObservedFuture,
     ApiPodRepository, ApiResourceStore,
 };
-use crate::api::{
-    AdmissionExecution, AdmissionExecutionFuture, AppError, NamespaceTerminationStore,
-};
+use crate::api::{AppError, NamespaceTerminationStore};
 use crate::datastore::DatastoreHandle;
 
 pub(crate) struct RootApiResourceStore {
@@ -19,15 +17,6 @@ pub(crate) struct RootApiResourceStore {
 impl RootApiResourceStore {
     pub(crate) fn new(inner: DatastoreHandle) -> Arc<Self> {
         Arc::new(Self { inner })
-    }
-}
-
-impl AdmissionExecution for RootApiResourceStore {
-    fn execute_admission<'a>(
-        &'a self,
-        context: crate::admission::AdmissionRequestContext,
-    ) -> AdmissionExecutionFuture<'a> {
-        AdmissionExecution::execute_admission(self.inner.as_ref(), context)
     }
 }
 

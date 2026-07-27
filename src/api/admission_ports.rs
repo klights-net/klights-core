@@ -8,6 +8,11 @@ use crate::api::AppError;
 pub(crate) struct ResourceAdmissionRequest {
     pub api_version: String,
     pub kind: String,
+    /// Exact Kubernetes resource name used for webhook rule matching.
+    /// `None` derives the ordinary plural from `kind`; subresource callers
+    /// supply the discovery resource explicitly (for example, `pods` for
+    /// a `Binding` object submitted to `pods/binding`).
+    pub resource: Option<String>,
     pub operation: String,
     pub namespace: Option<String>,
     pub name: Option<String>,

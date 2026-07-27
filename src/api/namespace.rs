@@ -166,7 +166,7 @@ pub(in crate::api) async fn create_namespace(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
-        state.resource_mutation().db.as_ref(),
+        state.resource_mutation().admission.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Namespace",
@@ -324,7 +324,7 @@ pub(in crate::api) async fn update_namespace(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
-        state.resource_mutation().db.as_ref(),
+        state.resource_mutation().admission.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Namespace",
@@ -477,7 +477,7 @@ pub(in crate::api) async fn patch_namespace(
         .map_err(|e| AppError::BadRequest(format!("Invalid patch body: {}", e)))?;
     let patched = apply_patch(&current.data, &patch_value, content_type)?;
     let patched = run_admission_for_request(
-        state.resource_mutation().db.as_ref(),
+        state.resource_mutation().admission.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Namespace",

@@ -1,4 +1,4 @@
-use super::AdmissionLookup;
+use super::AdmissionQuery;
 use serde_json::Value;
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 /// Fetch namespace labels from DB for namespaceSelector matching.
 #[cfg(test)]
 pub(super) async fn get_namespace_labels(
-    lookup: &dyn AdmissionLookup,
+    lookup: &dyn AdmissionQuery,
     namespace: &str,
 ) -> BTreeMap<String, String> {
     lookup
@@ -32,7 +32,7 @@ pub(super) async fn get_namespace_labels(
 /// shape so the cached `LabelSelector` can match against them without an
 /// intermediate BTreeMap rebuild on every webhook evaluation.
 pub(super) async fn get_namespace_labels_value(
-    lookup: &dyn AdmissionLookup,
+    lookup: &dyn AdmissionQuery,
     namespace: &str,
 ) -> Option<serde_json::Map<String, Value>> {
     lookup

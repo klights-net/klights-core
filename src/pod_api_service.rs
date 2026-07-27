@@ -192,6 +192,7 @@ pub struct PodApiService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
     db: DatastoreHandle,
+    admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     supervisor: Arc<TaskSupervisor>,
@@ -208,6 +209,7 @@ pub struct PodApiServiceDependencies {
     pub(crate) store: Arc<PodStore>,
     pub status_only: Arc<dyn StateOnlyWriter>,
     pub db: DatastoreHandle,
+    pub admission: Arc<dyn crate::api::admission_ports::ResourceAdmissionPort>,
     pub resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub quota_runtime: Arc<dyn klights_reconcile_api::ResourceQuotaAdmissionRuntime>,
     pub supervisor: Arc<TaskSupervisor>,
@@ -224,6 +226,7 @@ impl PodApiService {
             store,
             status_only,
             db,
+            admission,
             resource_query,
             quota_runtime,
             supervisor,
@@ -237,6 +240,7 @@ impl PodApiService {
             store,
             status_only,
             db,
+            admission,
             resource_query,
             quota_runtime,
             supervisor,
@@ -283,7 +287,14 @@ impl PodApiService {
             run_admission,
         } = request;
 
-        match crate::namespace_admission::create_eligibility(self.db.as_ref(), &namespace).await? {
+        let namespace_resource =
+            crate::datastore::DatastoreBackend::get_namespace(self.db.as_ref(), &namespace).await?;
+        match crate::namespace_admission::classify_namespace(
+            &namespace,
+            namespace_resource
+                .as_ref()
+                .map(|resource| resource.data.as_ref()),
+        ) {
             crate::namespace_admission::NamespaceCreateEligibility::Allowed => {}
             crate::namespace_admission::NamespaceCreateEligibility::Missing => {
                 return Err(AppError::Forbidden(format!(
@@ -307,7 +318,7 @@ impl PodApiService {
 
         if run_admission {
             body = run_admission_for_request(
-                self.db.as_ref(),
+                self.admission.as_ref(),
                 build_admission_context(AdmissionContextRequest {
                     api_version: "v1",
                     kind: "Pod",
@@ -903,7 +914,7 @@ impl PodApiService {
         validate_pod_sysctls(&body)?;
 
         body = run_admission_for_request(
-            self.db.as_ref(),
+            self.admission.as_ref(),
             build_admission_context(AdmissionContextRequest {
                 api_version: "v1",
                 kind: "Pod",
@@ -1023,7 +1034,7 @@ impl PodApiService {
             }
 
             patched = run_admission_for_request(
-                self.db.as_ref(),
+                self.admission.as_ref(),
                 build_admission_context(AdmissionContextRequest {
                     api_version: "v1",
                     kind: "Pod",
@@ -1204,7 +1215,7 @@ impl PodApiService {
 
         let delete_options_value = serde_json::to_value(&options).unwrap_or_else(|_| json!({}));
         let _ = run_admission_for_request(
-            self.db.as_ref(),
+            self.admission.as_ref(),
             build_admission_context(AdmissionContextRequest {
                 api_version: "v1",
                 kind: "Pod",

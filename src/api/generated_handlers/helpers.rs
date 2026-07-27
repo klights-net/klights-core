@@ -79,7 +79,11 @@ pub async fn reject_if_namespace_missing_or_terminating(
     db: &dyn DatastoreBackend,
     namespace: &str,
 ) -> Result<(), AppError> {
-    match crate::namespace_admission::create_eligibility(db, namespace).await? {
+    let resource = db.get_namespace(namespace).await?;
+    match crate::namespace_admission::classify_namespace(
+        namespace,
+        resource.as_ref().map(|resource| resource.data.as_ref()),
+    ) {
         crate::namespace_admission::NamespaceCreateEligibility::Allowed => Ok(()),
         crate::namespace_admission::NamespaceCreateEligibility::Missing => Err(
             AppError::Forbidden(format!("namespace {} not found", namespace)),

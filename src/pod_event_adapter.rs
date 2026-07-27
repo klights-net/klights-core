@@ -9,7 +9,11 @@ where
         &self,
         namespace: &str,
     ) -> anyhow::Result<crate::namespace_admission::NamespaceCreateEligibility> {
-        crate::namespace_admission::create_eligibility(self, namespace).await
+        let resource = crate::datastore::DatastoreBackend::get_namespace(self, namespace).await?;
+        Ok(crate::namespace_admission::classify_namespace(
+            namespace,
+            resource.as_ref().map(|resource| resource.data.as_ref()),
+        ))
     }
 
     async fn list_events(

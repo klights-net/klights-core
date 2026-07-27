@@ -974,13 +974,15 @@ impl RootPodRepositoryComposition {
         let subresource = Arc::new(crate::pod_subresource_service::PodSubresourceService::new(
             dependencies.store.clone(),
             dependencies.status_only.clone(),
-            self.db.clone(),
-            self.side_effects.controller_dispatcher_slot(),
+            pod_reconcile.clone(),
         ));
         let api = Arc::new(PodApiService::new(PodApiServiceDependencies {
             store: dependencies.store,
             status_only: dependencies.status_only,
             db: self.db.clone(),
+            admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
+                self.db.clone(),
+            ),
             resource_query: self.resource_query.clone(),
             quota_runtime:
                 crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(

@@ -399,7 +399,7 @@ async fn create_crd_with_registration(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     let admitted = run_admission_for_request(
-        state.resource_mutation().db.as_ref(),
+        state.resource_mutation().admission.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "apiextensions.k8s.io/v1",
             kind: "CustomResourceDefinition",
@@ -519,7 +519,7 @@ async fn update_crd_with_registration(
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
-        state.resource_mutation().db.as_ref(),
+        state.resource_mutation().admission.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "apiextensions.k8s.io/v1",
             kind: "CustomResourceDefinition",
@@ -663,7 +663,7 @@ async fn patch_crd_with_registration(
             }
 
             let admitted = run_admission_for_request(
-                state.resource_mutation().db.as_ref(),
+                state.resource_mutation().admission.as_ref(),
                 build_admission_context(AdmissionContextRequest {
                     api_version: "apiextensions.k8s.io/v1",
                     kind: "CustomResourceDefinition",
@@ -749,7 +749,7 @@ async fn patch_crd_with_registration(
 
         let patched = apply_patch(&current.data, &patch, content_type)?;
         let patched = run_admission_for_request(
-            state.resource_mutation().db.as_ref(),
+            state.resource_mutation().admission.as_ref(),
             build_admission_context(AdmissionContextRequest {
                 api_version: "apiextensions.k8s.io/v1",
                 kind: "CustomResourceDefinition",

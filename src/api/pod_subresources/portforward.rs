@@ -31,7 +31,7 @@ pub(in crate::api) async fn pod_portforward(
     .ok_or_else(|| AppError::NotFound(format!("Pod {}/{} not found", namespace, name)))?;
 
     let _ = run_admission_for_request(
-        state.resource_mutation().db.as_ref(),
+        state.resource_mutation().admission.as_ref(),
         build_admission_context(AdmissionContextRequest {
             api_version: "v1",
             kind: "Pod",

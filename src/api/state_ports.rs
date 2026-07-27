@@ -14,11 +14,7 @@ use serde_json::Value;
 /// enter API state.
 #[async_trait::async_trait]
 pub(crate) trait ApiResourceStore:
-    crate::api::AdmissionExecution
-    + crate::api::NamespaceTerminationStore
-    + crate::api::watch_stream::WatchStreamSource
-    + Send
-    + Sync
+    crate::api::NamespaceTerminationStore + crate::api::watch_stream::WatchStreamSource + Send + Sync
 {
     async fn create_resource(
         &self,

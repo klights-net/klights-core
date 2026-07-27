@@ -1,5 +1,123 @@
 use super::*;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
+
+use crate::resource_admission_adapter::{
+    CaBundleClientCache, RootAdmissionQuery, RootAdmissionWebhookClient, RootWebhookTargetResolver,
+    add_timeout_query, build_webhook_http_client, ca_bundle_fingerprint,
+    lock_ca_bundle_cache_for_test,
+};
+
+#[derive(Default)]
+struct FakeAdmissionQuery {
+    resources: Vec<AdmissionResource>,
+}
+
+#[async_trait::async_trait]
+impl AdmissionQuery for FakeAdmissionQuery {
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> std::result::Result<Option<AdmissionResource>, AdmissionDependencyError> {
+        Ok(self
+            .resources
+            .iter()
+            .find(|resource| {
+                resource.name == name
+                    && resource.data["apiVersion"] == api_version
+                    && resource.data["kind"] == kind
+                    && resource
+                        .data
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        == namespace
+            })
+            .cloned())
+    }
+
+    async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        _label_selector: Option<&str>,
+    ) -> std::result::Result<Vec<AdmissionResource>, AdmissionDependencyError> {
+        Ok(self
+            .resources
+            .iter()
+            .filter(|resource| {
+                resource.data["apiVersion"] == api_version
+                    && resource.data["kind"] == kind
+                    && resource
+                        .data
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        == namespace
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+struct FakeWebhookTargetResolver;
+
+#[async_trait::async_trait]
+impl WebhookTargetResolver for FakeWebhookTargetResolver {
+    async fn resolve(
+        &self,
+        client_config: &Value,
+    ) -> std::result::Result<WebhookTarget, AdmissionDependencyError> {
+        Ok(WebhookTarget {
+            base_url: client_config["url"]
+                .as_str()
+                .unwrap_or("https://fake")
+                .to_string(),
+            dns_override: None,
+        })
+    }
+}
+
+#[derive(Default)]
+struct FakeAdmissionWebhookClient {
+    requests: Mutex<Vec<AdmissionWebhookRequest>>,
+}
+
+#[async_trait::async_trait]
+impl AdmissionWebhookClient for FakeAdmissionWebhookClient {
+    async fn call(
+        &self,
+        request: AdmissionWebhookRequest,
+    ) -> std::result::Result<Value, AdmissionDependencyError> {
+        self.requests.lock().unwrap().push(request);
+        Ok(json!({"response": {"allowed": true}}))
+    }
+}
+
+macro_rules! admission_engine_for_db_handle {
+    ($engine:ident, $db_handle:expr) => {
+        let admission_query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new($db_handle);
+        let admission_resolver = RootWebhookTargetResolver::new(admission_query.clone());
+        let admission_client = RootAdmissionWebhookClient::new();
+        let $engine = AdmissionEngine::new(
+            admission_query.as_ref(),
+            admission_resolver.as_ref(),
+            admission_client.as_ref(),
+        );
+    };
+}
+
+async fn resolve_webhook_target_for_test(
+    db: crate::datastore::DatastoreHandle,
+    client_config: &Value,
+) -> std::result::Result<WebhookTarget, AdmissionDependencyError> {
+    let query: Arc<dyn AdmissionQuery> = RootAdmissionQuery::new(db);
+    RootWebhookTargetResolver::new(query)
+        .resolve(client_config)
+        .await
+}
 
 fn test_ctx(
     api_version: &str,
@@ -527,7 +645,9 @@ fn test_should_reinvoke_ifneeded_webhook_after_later_mutation() {
 #[test]
 fn test_webhook_http_client_for_invalid_cabundle_errors() {
     let cfg = json!({"caBundle": "%%%not-base64%%%"});
-    let err = webhook_http_client_for(&cfg, None).unwrap_err().to_string();
+    let err = build_webhook_http_client(&cfg, None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("Invalid base64"));
 }
 
@@ -547,8 +667,8 @@ fn test_webhook_http_client_cache_source_uses_fingerprint_and_no_expect() {
 fn test_webhook_ca_bundle_cache_hits_by_fingerprint() {
     let bundle = test_ca_bundle("cache-hit.example");
     let config = json!({"caBundle": bundle});
-    let fingerprint = super::http_client::ca_bundle_fingerprint(&config).unwrap();
-    let mut cache = super::http_client::CaBundleClientCache::new_for_test(4);
+    let fingerprint = ca_bundle_fingerprint(&config).unwrap();
+    let mut cache = CaBundleClientCache::new_for_test(4);
 
     cache.client_for(&config).unwrap();
     cache.client_for(&config).unwrap();
@@ -565,10 +685,10 @@ fn test_webhook_ca_bundle_cache_evicts_lru_entry() {
     let config_a = json!({"caBundle": bundle_a});
     let config_b = json!({"caBundle": bundle_b});
     let config_c = json!({"caBundle": bundle_c});
-    let fingerprint_a = super::http_client::ca_bundle_fingerprint(&config_a).unwrap();
-    let fingerprint_b = super::http_client::ca_bundle_fingerprint(&config_b).unwrap();
-    let fingerprint_c = super::http_client::ca_bundle_fingerprint(&config_c).unwrap();
-    let mut cache = super::http_client::CaBundleClientCache::new_for_test(2);
+    let fingerprint_a = ca_bundle_fingerprint(&config_a).unwrap();
+    let fingerprint_b = ca_bundle_fingerprint(&config_b).unwrap();
+    let fingerprint_c = ca_bundle_fingerprint(&config_c).unwrap();
+    let mut cache = CaBundleClientCache::new_for_test(2);
 
     cache.client_for(&config_a).unwrap();
     cache.client_for(&config_b).unwrap();
@@ -583,11 +703,7 @@ fn test_webhook_ca_bundle_cache_evicts_lru_entry() {
 
 #[test]
 fn test_webhook_ca_bundle_cache_poisoned_lock_returns_error() {
-    use std::sync::{Arc, Mutex};
-
-    let cache = Arc::new(Mutex::new(
-        super::http_client::CaBundleClientCache::new_for_test(1),
-    ));
+    let cache = Arc::new(Mutex::new(CaBundleClientCache::new_for_test(1)));
     let poisoned = Arc::clone(&cache);
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -599,7 +715,7 @@ fn test_webhook_ca_bundle_cache_poisoned_lock_returns_error() {
     std::panic::set_hook(default_hook);
     assert!(result.is_err());
 
-    let err = match super::http_client::lock_ca_bundle_cache_for_test(&cache) {
+    let err = match lock_ca_bundle_cache_for_test(&cache) {
         Ok(_) => panic!("poisoned cache lock must return an error"),
         Err(err) => err.to_string(),
     };
@@ -803,17 +919,19 @@ fn test_ensure_webhook_allowed_rejects_denied_response() {
 
 #[tokio::test]
 async fn test_resolve_webhook_target_from_url_field() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
     let client_config = json!({"url": "https://webhook.example.com/validate"});
 
-    let target = resolve_webhook_target(&db, &client_config).await.unwrap();
+    let target = resolve_webhook_target_for_test(db_handle, &client_config)
+        .await
+        .unwrap();
     assert_eq!(target.base_url, "https://webhook.example.com/validate");
     assert_eq!(target.dns_override, None);
 }
 
 #[tokio::test]
 async fn test_resolve_webhook_target_from_service_reference() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
 
     // Create a Service in the DB
     let service = json!({
@@ -866,7 +984,9 @@ async fn test_resolve_webhook_target_from_service_reference() {
         }
     });
 
-    let target = resolve_webhook_target(&db, &client_config).await.unwrap();
+    let target = resolve_webhook_target_for_test(db_handle, &client_config)
+        .await
+        .unwrap();
     assert_eq!(
         target.base_url,
         "https://webhook-service.cert-manager.svc:443/validate"
@@ -882,7 +1002,7 @@ async fn test_resolve_webhook_target_from_service_reference() {
 
 #[tokio::test]
 async fn test_resolve_webhook_target_service_with_port_specified() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
 
     let service = json!({
         "apiVersion": "v1",
@@ -928,7 +1048,9 @@ async fn test_resolve_webhook_target_service_with_port_specified() {
         }
     });
 
-    let target = resolve_webhook_target(&db, &client_config).await.unwrap();
+    let target = resolve_webhook_target_for_test(db_handle, &client_config)
+        .await
+        .unwrap();
     assert_eq!(target.base_url, "https://webhook-service.default.svc:9443");
     assert_eq!(
         target.dns_override,
@@ -941,7 +1063,7 @@ async fn test_resolve_webhook_target_service_with_port_specified() {
 
 #[tokio::test]
 async fn test_resolve_webhook_target_uses_endpoint_target_port_when_endpoints_exist() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
 
     let service = json!({
         "apiVersion": "v1",
@@ -988,7 +1110,9 @@ async fn test_resolve_webhook_target_uses_endpoint_target_port_when_endpoints_ex
         }
     });
 
-    let target = resolve_webhook_target(&db, &client_config).await.unwrap();
+    let target = resolve_webhook_target_for_test(db_handle, &client_config)
+        .await
+        .unwrap();
     assert_eq!(target.base_url, "https://webhook-service.default.svc:9443");
     assert_eq!(
         target.dns_override,
@@ -1001,7 +1125,7 @@ async fn test_resolve_webhook_target_uses_endpoint_target_port_when_endpoints_ex
 
 #[tokio::test]
 async fn test_resolve_webhook_target_service_not_found_returns_error() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
 
     let client_config = json!({
         "service": {
@@ -1010,7 +1134,7 @@ async fn test_resolve_webhook_target_service_not_found_returns_error() {
         }
     });
 
-    let result = resolve_webhook_target(&db, &client_config).await;
+    let result = resolve_webhook_target_for_test(db_handle, &client_config).await;
     assert!(result.is_err());
     assert!(
         result
@@ -1022,7 +1146,7 @@ async fn test_resolve_webhook_target_service_not_found_returns_error() {
 
 #[tokio::test]
 async fn test_get_namespace_labels_reads_namespace_table() {
-    let db = crate::datastore::test_support::in_memory().await;
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
     db.create_namespace(
         "label-ns",
         json!({
@@ -1040,7 +1164,8 @@ async fn test_get_namespace_labels_reads_namespace_table() {
     .await
     .unwrap();
 
-    let labels = get_namespace_labels(&db, "label-ns").await;
+    let query = RootAdmissionQuery::new(db_handle);
+    let labels = get_namespace_labels(query.as_ref(), "label-ns").await;
     assert_eq!(
         labels.get("webhook-ready").map(String::as_str),
         Some("true")
@@ -1050,8 +1175,8 @@ async fn test_get_namespace_labels_reads_namespace_table() {
 
 #[tokio::test]
 async fn test_admission_engine_shared_runner_no_webhooks_keeps_resource() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -1074,9 +1199,10 @@ async fn test_admission_engine_shared_runner_no_webhooks_keeps_resource() {
 
 #[tokio::test]
 async fn test_admission_engine_accepts_focused_lookup_trait_object() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let lookup: &dyn AdmissionLookup = &db;
-    let engine = AdmissionEngine::new(lookup);
+    let query = FakeAdmissionQuery::default();
+    let resolver = FakeWebhookTargetResolver;
+    let client = FakeAdmissionWebhookClient::default();
+    let engine = AdmissionEngine::new(&query, &resolver, &client);
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -1092,6 +1218,56 @@ async fn test_admission_engine_accepts_focused_lookup_trait_object() {
         .await
         .unwrap();
     assert_eq!(got, pod);
+}
+
+#[tokio::test]
+async fn test_admission_policy_uses_fake_query_target_and_client_ports() {
+    let query = FakeAdmissionQuery {
+        resources: vec![AdmissionResource {
+            name: "fake-mutator".to_string(),
+            data: Arc::new(json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "MutatingWebhookConfiguration",
+                "metadata": {"name": "fake-mutator"},
+                "webhooks": [{
+                    "name": "fake.mutator.example",
+                    "clientConfig": {"url": "https://fake.example/mutate"},
+                    "rules": [{
+                        "operations": ["CREATE"],
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["pods"]
+                    }]
+                }]
+            })),
+        }],
+    };
+    let resolver = FakeWebhookTargetResolver;
+    let client = FakeAdmissionWebhookClient::default();
+    let engine = AdmissionEngine::new(&query, &resolver, &client);
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "fake-ports-pod", "namespace": "default"},
+        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+    });
+
+    let admitted = engine
+        .run_mutating(&pod, "v1", "Pod", "CREATE")
+        .await
+        .unwrap();
+
+    assert_eq!(admitted, pod);
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].target.base_url, "https://fake.example/mutate");
+    assert_eq!(
+        requests[0]
+            .admission_review
+            .pointer("/request/object/metadata/name")
+            .and_then(Value::as_str),
+        Some("fake-ports-pod")
+    );
 }
 
 #[test]
@@ -1123,8 +1299,8 @@ fn test_admission_request_context_from_legacy_fields() {
 
 #[tokio::test]
 async fn test_engine_skips_non_write_operations_even_if_webhook_exists() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
 
     // Matching webhook exists, but non-write ops must not trigger callout.
     let mwc = json!({
@@ -1164,8 +1340,8 @@ async fn test_engine_skips_non_write_operations_even_if_webhook_exists() {
 
 #[tokio::test]
 async fn test_namespace_selector_non_match_skips_namespaced_call() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
 
     let ns = json!({
         "apiVersion": "v1",
@@ -1220,8 +1396,8 @@ async fn test_namespace_selector_non_match_skips_namespaced_call() {
 
 #[tokio::test]
 async fn test_namespace_selector_non_match_skips_failing_match_condition() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
 
     let ns = json!({
         "apiVersion": "v1",
@@ -1279,8 +1455,8 @@ async fn test_namespace_selector_non_match_skips_failing_match_condition() {
 
 #[tokio::test]
 async fn test_namespace_selector_ignored_for_cluster_scoped_request() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
 
     let mwc = json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
@@ -1326,8 +1502,8 @@ async fn test_namespace_selector_ignored_for_cluster_scoped_request() {
 
 #[tokio::test]
 async fn test_dry_run_rejects_webhook_with_side_effects() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
     let mwc = json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
         "kind": "MutatingWebhookConfiguration",
@@ -1372,8 +1548,8 @@ async fn test_dry_run_rejects_webhook_with_side_effects() {
 
 #[tokio::test]
 async fn test_webhook_call_error_includes_timeout_query_parameter() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
 
     let vwc = json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
@@ -1421,8 +1597,8 @@ async fn test_webhook_call_error_includes_timeout_query_parameter() {
 
 #[tokio::test]
 async fn test_webhook_configuration_objects_are_exempt_from_dynamic_admission() {
-    let db = crate::datastore::test_support::in_memory().await;
-    let engine = AdmissionEngine::new(&db);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    admission_engine_for_db_handle!(engine, db_handle);
 
     let mwc = json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
@@ -1472,8 +1648,6 @@ async fn test_webhook_configuration_objects_are_exempt_from_dynamic_admission() 
 // ========================
 // add_timeout_query tests
 // ========================
-
-use crate::admission::webhook_call::add_timeout_query;
 
 #[test]
 fn test_add_timeout_query_appends_timeout_seconds_when_no_existing_query() {

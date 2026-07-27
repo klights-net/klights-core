@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 
 use crate::api::apply_patch;
 use crate::datastore::Resource;
-use crate::side_effects::ControllerDispatcherSlot;
 
 use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
 use crate::kubelet::pod_repository::store::PodStore;
@@ -23,22 +22,40 @@ use crate::kubelet::pod_repository::types::PodStatusPatchType;
 pub(crate) struct PodSubresourceService {
     store: Arc<PodStore>,
     status_only: Arc<dyn StateOnlyWriter>,
-    db: crate::datastore::DatastoreHandle,
-    controller_dispatcher: ControllerDispatcherSlot,
+    mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
 }
 
 impl PodSubresourceService {
     pub(crate) fn new(
         store: Arc<PodStore>,
         status_only: Arc<dyn StateOnlyWriter>,
-        db: crate::datastore::DatastoreHandle,
-        controller_dispatcher: ControllerDispatcherSlot,
+        mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     ) -> Self {
         Self {
             store,
             status_only,
-            db,
-            controller_dispatcher,
+            mutation_reconcile,
+        }
+    }
+
+    async fn reconcile_status_change(&self, previous: Value, updated: &Resource, operation: &str) {
+        if let Err(err) = self
+            .mutation_reconcile
+            .reconcile_pod_mutation(
+                klights_reconcile_api::PodMutationReconcileRequest::StatusChanged {
+                    previous: Resource::from_data_lossy(Arc::new(previous)),
+                    updated: updated.clone(),
+                },
+            )
+            .await
+        {
+            tracing::debug!(
+                target: "klights::kubelet::pod_repository::subresource",
+                error = %err,
+                pod = %updated.name,
+                operation,
+                "failed to reconcile controllers after API status mutation"
+            );
         }
     }
 
@@ -77,21 +94,8 @@ impl PodSubresourceService {
             .status_only
             .write_status(ns, name, status, Some(expected_rv))
             .await?;
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
-            &previous,
-            &updated.data,
-            self.db.as_ref(),
-            &self.controller_dispatcher,
-        )
-        .await
-        {
-            tracing::debug!(
-                target: "klights::kubelet::pod_repository::subresource",
-                error = %err,
-                pod = %name,
-                "failed to enqueue Service reconcile after API status replace"
-            );
-        }
+        self.reconcile_status_change(previous, &updated, "replace")
+            .await;
         Ok(updated)
     }
 
@@ -135,21 +139,8 @@ impl PodSubresourceService {
             .status_only
             .write_status(ns, name, next_status, Some(expected_rv))
             .await?;
-        if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
-            &previous,
-            &updated.data,
-            self.db.as_ref(),
-            &self.controller_dispatcher,
-        )
-        .await
-        {
-            tracing::debug!(
-                target: "klights::kubelet::pod_repository::subresource",
-                error = %err,
-                pod = %name,
-                "failed to enqueue Service reconcile after API status patch"
-            );
-        }
+        self.reconcile_status_change(previous, &updated, "patch")
+            .await;
         Ok(updated)
     }
 
@@ -331,5 +322,121 @@ fn bump_metadata_generation(obj: &mut Value) {
             .and_then(|v| v.as_i64())
             .unwrap_or(1);
         meta_obj.insert("generation".to_string(), json!(current_generation + 1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use klights_reconcile_api::{
+        PodMutationReconcileRequest, PodMutationReconcileSink, ReconcileSinkFuture,
+    };
+    use serde_json::json;
+
+    use super::PodSubresourceService;
+    use crate::kubelet::pod_repository::state_only_writer::StatusOnlyWriterService;
+    use crate::kubelet::pod_repository::store::PodStore;
+    use crate::kubelet::pod_repository::types::PodStatusPatchType;
+
+    #[derive(Default)]
+    struct RecordingMutationReconcile {
+        requests: Mutex<Vec<PodMutationReconcileRequest>>,
+    }
+
+    impl PodMutationReconcileSink for RecordingMutationReconcile {
+        fn reconcile_pod_mutation(
+            &self,
+            request: PodMutationReconcileRequest,
+        ) -> ReconcileSinkFuture<'_> {
+            Box::pin(async move {
+                self.requests.lock().unwrap().push(request);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn api_status_replace_and_patch_emit_focused_status_changed_reconcile() {
+        for operation in ["replace", "patch"] {
+            let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+            let store = Arc::new(PodStore::new(db.clone()));
+            let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
+            let reconcile = Arc::new(RecordingMutationReconcile::default());
+            let service = PodSubresourceService::new(store.clone(), status_only, reconcile.clone());
+            let created = store
+                .create(
+                    "default",
+                    "node-agent",
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "node-agent",
+                            "namespace": "default",
+                            "uid": "pod-node-agent",
+                            "ownerReferences": [{
+                                "apiVersion": "apps/v1",
+                                "kind": "DaemonSet",
+                                "name": "node-agent",
+                                "uid": "ds-node-agent",
+                                "controller": true
+                            }]
+                        },
+                        "spec": {
+                            "nodeName": "node-a",
+                            "containers": [{"name": "agent", "image": "busybox"}]
+                        },
+                        "status": {"phase": "Running"}
+                    }),
+                )
+                .await
+                .unwrap();
+
+            match operation {
+                "replace" => {
+                    service
+                        .replace_status_from_api_checked(
+                            "default",
+                            "node-agent",
+                            None,
+                            json!({"phase": "Failed"}),
+                            created.resource_version,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "patch" => {
+                    service
+                        .patch_status_from_api(
+                            "default",
+                            "node-agent",
+                            json!({"status": {"phase": "Failed"}}),
+                            PodStatusPatchType::MergePatch,
+                            created.resource_version,
+                        )
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let requests = reconcile.requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "{operation} must route the status transition through the focused mutation reconcile sink"
+            );
+            let PodMutationReconcileRequest::StatusChanged { previous, updated } = &requests[0]
+            else {
+                panic!("{operation} emitted the wrong reconcile intent");
+            };
+            assert_eq!(previous.data["status"]["phase"], "Running");
+            assert_eq!(updated.data["status"]["phase"], "Failed");
+            assert_eq!(
+                updated.data["metadata"]["ownerReferences"][0]["kind"],
+                "DaemonSet"
+            );
+        }
     }
 }

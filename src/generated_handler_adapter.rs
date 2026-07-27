@@ -36,9 +36,13 @@ impl GeneratedHandlerAdapter {
 impl BuiltinAdmissionDefaultsPort for GeneratedHandlerAdapter {
     fn ensure_namespace_active(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            match crate::namespace_admission::create_eligibility(self.db.as_ref(), &namespace)
-                .await?
-            {
+            let resource =
+                crate::datastore::DatastoreBackend::get_namespace(self.db.as_ref(), &namespace)
+                    .await?;
+            match crate::namespace_admission::classify_namespace(
+                &namespace,
+                resource.as_ref().map(|resource| resource.data.as_ref()),
+            ) {
                 crate::namespace_admission::NamespaceCreateEligibility::Allowed => Ok(()),
                 crate::namespace_admission::NamespaceCreateEligibility::Missing => Err(
                     AppError::Forbidden(format!("namespace {namespace} not found")),

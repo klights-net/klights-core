@@ -2155,6 +2155,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
             .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                 api_version,
                 kind: info.kind.clone(),
+                resource: None,
                 operation: "CREATE".to_string(),
                 namespace,
                 name,
@@ -2311,6 +2312,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
             .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                 api_version,
                 kind: info.kind.clone(),
+                resource: None,
                 operation: "UPDATE".to_string(),
                 namespace: ns.map(str::to_string),
                 name: Some(self.target.name.to_string()),
@@ -2488,6 +2490,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                     .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                         api_version: api_version.clone(),
                         kind: info.kind.clone(),
+                        resource: None,
                         operation: "CREATE".to_string(),
                         namespace: ns.map(str::to_string),
                         name: Some(self.target.name.to_string()),
@@ -2565,6 +2568,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
             .admit(crate::api::admission_ports::ResourceAdmissionRequest {
                 api_version: api_version.clone(),
                 kind: info.kind.clone(),
+                resource: None,
                 operation: "UPDATE".to_string(),
                 namespace: ns.map(str::to_string),
                 name: Some(self.target.name.to_string()),
@@ -2778,6 +2782,7 @@ async fn delete_cr_inner(
         .admit(crate::api::admission_ports::ResourceAdmissionRequest {
             api_version: requested_api_version.clone(),
             kind: info.kind.clone(),
+            resource: None,
             operation: "DELETE".to_string(),
             namespace: ns.map(str::to_string),
             name: Some(name.to_string()),
