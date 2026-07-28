@@ -130,7 +130,9 @@ pub fn format_age_at(creation_timestamp: &str, now: time::OffsetDateTime) -> Str
     if let Ok(created) = chrono::DateTime::parse_from_rfc3339(creation_timestamp) {
         let now = chrono::DateTime::from_timestamp(now.unix_timestamp(), now.nanosecond())
             .expect("OffsetDateTime timestamp must be representable by chrono");
-        let duration = now.signed_duration_since(created.with_timezone(&chrono::Utc));
+        let duration = now
+            .signed_duration_since(created.with_timezone(&chrono::Utc))
+            .max(chrono::Duration::zero());
         if duration.num_days() > 0 {
             format!("{}d", duration.num_days())
         } else if duration.num_hours() > 0 {
@@ -1453,6 +1455,17 @@ mod table_printer_tests {
 
         assert_eq!(format_age_at("2026-07-26T12:00:00Z", now), "2d");
         assert_eq!(format_age_at("2026-07-28T11:30:00Z", now), "30m");
+    }
+
+    #[test]
+    fn age_formatting_clamps_future_timestamps_to_zero() {
+        let now = time::OffsetDateTime::parse(
+            "2026-07-28T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed operation time");
+
+        assert_eq!(format_age_at("2026-07-28T12:03:00Z", now), "0s");
     }
 
     fn col_names(kind: &str) -> Vec<String> {

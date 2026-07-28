@@ -187,9 +187,9 @@ impl PodSubresourceService {
             .await?
             .ok_or_else(|| anyhow!("Pod not found"))?;
         if current.resource_version != expected_rv {
-            return Err(anyhow!(
-                "Resource not found or version conflict (409 Conflict)"
-            ));
+            return Err(anyhow!(PodRepositoryError::conflict(
+                "the Pod resourceVersion does not match the current object",
+            )));
         }
         let existing_count = current
             .data
@@ -334,7 +334,7 @@ mod tests {
     use klights_pod_api::{
         PodPersistence, PodPersistenceCreateRequest, PodPersistenceReplaceRequest,
         PodRepositoryError, PodRepositoryFuture, PodStatusPatchKind, PodStatusPersistence,
-        PodStatusWriteRequest,
+        PodStatusWriteRequest, PodSubresourceMutation,
     };
 
     struct TestPodWrites {
@@ -517,5 +517,58 @@ mod tests {
                 "DaemonSet"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stale_ephemeral_container_write_preserves_typed_conflict() {
+        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let store = Arc::new(PodStore::new(db));
+        let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
+        let writes = Arc::new(TestPodWrites {
+            store: store.clone(),
+            status: status_only,
+        });
+        let service = PodSubresourceService::new(
+            store.clone(),
+            writes.clone(),
+            writes,
+            Arc::new(RecordingMutationReconcile::default()),
+        );
+        let created = store
+            .create(
+                "default",
+                "debuggable",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "debuggable",
+                        "namespace": "default",
+                        "uid": "pod-debuggable"
+                    },
+                    "spec": {
+                        "containers": [{"name": "main", "image": "busybox"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let error = PodSubresourceMutation::update_ephemeral_containers(
+            &service,
+            klights_pod_api::PodEphemeralContainersRequest {
+                namespace: "default".to_string(),
+                name: "debuggable".to_string(),
+                containers: vec![json!({"name": "debug", "image": "busybox"})],
+                expected_resource_version: created.resource_version - 1,
+            },
+        )
+        .await
+        .expect_err("stale ephemeral-container update must conflict");
+
+        assert!(
+            matches!(error, PodRepositoryError::Conflict { .. }),
+            "neutral subresource boundary changed stale write into {error:?}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::body::Body;
 use klights_cluster_core::Resource;
@@ -80,7 +81,7 @@ pub(crate) struct GeneratedWatchRequest {
     pub stream_format: crate::api::watch_stream::WatchStreamFormat,
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
-    pub operation_now: time::OffsetDateTime,
+    pub wall_clock: Arc<dyn crate::auth::clock::Clock>,
 }
 
 pub(crate) trait GeneratedWatchPort: Send + Sync {

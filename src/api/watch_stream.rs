@@ -770,7 +770,7 @@ pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
     pub stream_format: WatchStreamFormat,
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
-    pub operation_now: time::OffsetDateTime,
+    pub wall_clock: Arc<dyn crate::auth::clock::Clock>,
 }
 
 #[cfg(test)]
@@ -854,7 +854,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         stream_format,
         timeout_seconds,
         emit_initial_state_for_resource_version_zero,
-        operation_now,
+        wall_clock,
     } = request;
     let api_version = api_version.to_string();
     wait_until_datastore_fresh(&source, requested_rv, &api_version, &kind, &task_supervisor).await;
@@ -871,6 +871,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
     let mut last_delivered_rv = requested_rv;
     let mut initial_frames = Vec::new();
     if emit_baseline {
+        let baseline_now = wall_clock.now();
         let list = match source
             .list_watch_resources(
                 &api_version,
@@ -910,7 +911,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                 &kind,
                 table_format,
                 stream_format,
-                operation_now,
+                baseline_now,
             ) {
                 Ok(frame) => initial_frames.push(frame),
                 Err(frame) => return single_watch_frame_body(frame),
@@ -924,7 +925,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                 &kind,
                 table_format,
                 stream_format,
-                operation_now,
+                baseline_now,
             ) {
                 Ok(frame) => initial_frames.push(frame),
                 Err(frame) => return single_watch_frame_body(frame),
@@ -1006,7 +1007,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                         &kind,
                         table_format,
                         stream_format,
-                        operation_now,
+                        wall_clock.now(),
                     ) {
                         Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
                         Err(frame) => {
@@ -1034,7 +1035,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                         &kind,
                         table_format,
                         stream_format,
-                        operation_now,
+                        wall_clock.now(),
                     ) {
                         Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
                         Err(frame) => {
@@ -1604,7 +1605,60 @@ mod tests {
     use klights_watch::WatchSignal;
     use prost::Message;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct FiniteWatchSource {
+        events: Vec<klights_leader_api::ResourceEvent>,
+    }
+
+    impl WatchStreamSource for FiniteWatchSource {
+        fn wait_until_fresh<'a>(
+            &'a self,
+            _target_rv: i64,
+            _api_version: &'a str,
+            _kind: &'a str,
+            _task_supervisor: &'a klights_supervisor::TaskSupervisor,
+        ) -> WatchSourceWaitFuture<'a> {
+            Box::pin(async {})
+        }
+
+        fn list_watch_resources<'a>(
+            &'a self,
+            _api_version: &'a str,
+            _kind: &'a str,
+            _namespace: Option<&'a str>,
+            _label_selector: Option<&'a str>,
+            _field_selector: Option<&'a str>,
+            _limit: Option<i64>,
+        ) -> WatchSourceListFuture<'a> {
+            Box::pin(async { panic!("finite live-watch fixture must not perform a baseline LIST") })
+        }
+
+        fn watch_resources(
+            &self,
+            _request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            let events = self.events.clone();
+            Box::pin(async move {
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::iter(events.into_iter().map(Ok)),
+                ))
+            })
+        }
+    }
+
+    struct AdvancingClock {
+        base: time::OffsetDateTime,
+        reads: AtomicUsize,
+    }
+
+    impl crate::auth::clock::Clock for AdvancingClock {
+        fn now(&self) -> time::OffsetDateTime {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            self.base + time::Duration::seconds(10 + 60 * read as i64)
+        }
+    }
 
     struct OrderedWatchAnchor {
         subscribed: Arc<AtomicBool>,
@@ -1661,6 +1715,72 @@ mod tests {
     #[tokio::test]
     async fn http_pod_watch_subscribes_before_the_first_anchor_await() {
         assert_http_handoff_subscribes_first(WatchTopic::new("v1", "Pod")).await;
+    }
+
+    #[tokio::test]
+    async fn table_watch_reads_wall_clock_for_each_live_event() {
+        let creation = "2026-07-28T12:00:00Z";
+        let events = [1, 2]
+            .into_iter()
+            .map(|resource_version| {
+                let resource =
+                    klights_cluster_core::Resource::from_data_lossy(Arc::new(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": format!("pod-{resource_version}"),
+                            "namespace": "default",
+                            "uid": format!("uid-{resource_version}"),
+                            "resourceVersion": resource_version.to_string(),
+                            "creationTimestamp": creation
+                        },
+                        "spec": {"containers": [{"name": "main", "image": "busybox"}]},
+                        "status": {"phase": "Running"}
+                    })));
+                klights_leader_api::ResourceEvent::try_new(
+                    klights_leader_api::WatchEventType::Added,
+                    resource,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let base =
+            time::OffsetDateTime::parse(creation, &time::format_description::well_known::Rfc3339)
+                .unwrap();
+        let wall_clock: Arc<dyn crate::auth::clock::Clock> = Arc::new(AdvancingClock {
+            base,
+            reads: AtomicUsize::new(0),
+        });
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
+            source: FiniteWatchSource { events },
+            task_supervisor: supervisor,
+            api_version: "v1",
+            kind: "Pod".to_string(),
+            watch_namespace: Some("default".to_string()),
+            requested_rv: 0,
+            send_initial_events: false,
+            send_bookmarks: false,
+            label_selector: None,
+            field_selector: None,
+            table_format: true,
+            stream_format: WatchStreamFormat::Json,
+            timeout_seconds: None,
+            emit_initial_state_for_resource_version_zero: false,
+            wall_clock,
+        })
+        .await;
+
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let frames: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice(frame).unwrap())
+            .collect();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0]["object"]["rows"][0]["cells"][4], "10s");
+        assert_eq!(frames[1]["object"]["rows"][0]["cells"][4], "1m");
     }
 
     #[tokio::test]

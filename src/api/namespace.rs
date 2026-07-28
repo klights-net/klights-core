@@ -82,7 +82,7 @@ pub(in crate::api) async fn list_namespaces(
             stream_format,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
-            operation_now: state.operational().clock.now(),
+            wall_clock: state.operational().clock.clone(),
         })
         .await;
         return Ok(Response::builder()
