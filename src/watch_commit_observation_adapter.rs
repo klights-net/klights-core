@@ -48,14 +48,6 @@ pub(crate) fn test_signal_source(
         .signal_source()
 }
 
-#[cfg(test)]
-pub(crate) fn subscribe_from_db(
-    db: &crate::datastore::DatastoreHandle,
-    topic: klights_watch::WatchTopic,
-) -> klights_watch::WatchSignalReceiver {
-    test_signal_source(db).subscribe(topic)
-}
-
 pub(crate) fn subscribe(
     source: &dyn klights_watch::WatchSignalSubscribe,
     topic: klights_watch::WatchTopic,

@@ -1,19 +1,5 @@
 use crate::api::watch_event::{EventType, WatchContentType, WatchEvent};
-#[cfg(test)]
-use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
 use crate::api::{AppError, watch_event_to_table_at};
-#[cfg(test)]
-#[cfg(test)]
-use crate::datastore::{CatchUpResource, DatastoreHandle};
-#[cfg(test)]
-use crate::datastore::{
-    DatastoreBackendWatchStore, RawWatchReplayStore, SnapshotAtRv, WatchReplayAnchorStore,
-    WatchReplayPosition, WatchTarget,
-};
-#[cfg(test)]
-use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
-#[cfg(test)]
-use crate::watch::{RawSignalWatchCursor, WatchCursorError, WatchDeliveryScope};
 #[cfg(test)]
 use crate::watch::{event_key as watch_event_key, resource_key as resource_to_seen_key};
 use axum::body::Body;
@@ -21,10 +7,6 @@ use axum::http::HeaderMap;
 #[cfg(test)]
 use klights_kube_protobuf as k8s_pb;
 use klights_kube_protobuf::{AcceptValue, ResponseFormat};
-#[cfg(test)]
-use klights_types::LabelSelector;
-#[cfg(test)]
-use klights_watch::{WatchSignalReceiver, WatchTopic};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,12 +89,6 @@ where
     ) -> klights_leader_api::LeaderWatchFuture<'_> {
         self.as_ref().watch_resources(request)
     }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WatchCatchUpMode {
-    NamespacedScoped,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,57 +466,6 @@ pub fn serialize_watch_status_for_stream(
     }
 }
 
-/// Convert any live cursor failure into the watch protocol's terminal frame.
-/// A closed signal channel ends cleanly; replay failures and expired history
-/// require the client to reconnect rather than parking with an undelivered row.
-#[cfg(test)]
-pub(crate) fn serialize_live_watch_cursor_error(error: &WatchCursorError) -> Option<Vec<u8>> {
-    match error {
-        WatchCursorError::Replay(_) => Some(serialize_watch_status_line(
-            500,
-            "InternalError",
-            "failed to replay live watch events",
-        )),
-        WatchCursorError::Expired => Some(serialize_watch_status_line(
-            410,
-            "Expired",
-            "too old resource version: watch fell behind the history window",
-        )),
-        WatchCursorError::Closed => None,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn serialize_live_watch_cursor_error_for_stream(
-    error: &WatchCursorError,
-    stream_format: WatchStreamFormat,
-) -> Option<Vec<u8>> {
-    match error {
-        WatchCursorError::Replay(_) => Some(serialize_watch_status_for_stream(
-            stream_format,
-            500,
-            "InternalError",
-            "failed to replay live watch events",
-        )),
-        WatchCursorError::Expired => Some(serialize_watch_status_for_stream(
-            stream_format,
-            410,
-            "Expired",
-            "too old resource version: watch fell behind the history window",
-        )),
-        WatchCursorError::Closed => None,
-    }
-}
-
-#[cfg(test)]
-fn serialize_watch_catch_up_failure_status_line() -> Vec<u8> {
-    serialize_watch_status_line(
-        410,
-        "Expired",
-        "too old resource version: unable to replay watch catch-up; relist required",
-    )
-}
-
 pub async fn spawn_bookmark_tick_stream(
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     task_name: impl Into<String>,
@@ -774,69 +699,6 @@ pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
     pub wall_clock: Arc<dyn crate::auth::clock::Clock>,
-}
-
-#[cfg(test)]
-pub struct LegacyLabelSelectorWatchStreamRequest<'a> {
-    pub db: DatastoreHandle,
-    pub watch_anchor: Arc<dyn WatchReplayAnchorStore>,
-    pub signal_rx: WatchSignalReceiver,
-    pub replay_start_position: WatchReplayPosition,
-    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    pub api_version: &'a str,
-    pub kind: String,
-    pub watch_namespace: Option<String>,
-    pub requested_rv: i64,
-    pub send_initial_events: bool,
-    pub send_bookmarks: bool,
-    pub label_selector: Option<String>,
-    pub field_selector: Option<String>,
-    pub table_format: bool,
-    pub stream_format: WatchStreamFormat,
-    pub catch_up_mode: WatchCatchUpMode,
-    pub timeout_seconds: Option<u64>,
-    pub emit_initial_state_for_resource_version_zero: bool,
-}
-
-/// Capture the durable replay boundary before subscribing to signal wakeups.
-/// Writes in the narrow boundary-to-subscribe interval remain visible through
-/// positioned replay, so correctness never depends on observing their signal.
-#[cfg(test)]
-pub fn watch_replay_anchor_from_backend(db: &DatastoreHandle) -> Arc<dyn WatchReplayAnchorStore> {
-    Arc::new(DatastoreBackendWatchStore::new(db.clone()))
-}
-
-#[cfg(test)]
-pub async fn subscribe_watch_handoff<F>(
-    watch_anchor: &dyn WatchReplayAnchorStore,
-    subscribe: F,
-    requested_rv: i64,
-) -> Result<(WatchSignalReceiver, WatchReplayPosition), AppError>
-where
-    F: FnOnce() -> WatchSignalReceiver,
-{
-    // Install the wakeup edge before the first anchor await. Replay covers
-    // writes before the captured anchor; the installed receiver covers writes
-    // after it, so there is no boundary in which both mechanisms can miss a
-    // committed event.
-    let signal_rx = subscribe();
-    let handoff_position = watch_anchor
-        .current_watch_replay_position()
-        .await
-        .map_err(|err| {
-            AppError::InternalError(format!(
-                "failed to capture durable watch establishment position: {err}"
-            ))
-        })?;
-    let replay_start_position = if requested_rv <= 0 {
-        handoff_position
-    } else {
-        WatchReplayPosition::from_resource_version_through_event_id(
-            requested_rv,
-            handoff_position.event_id,
-        )
-    };
-    Ok((signal_rx, replay_start_position))
 }
 
 pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
@@ -1076,539 +938,16 @@ fn serialize_positioned_watch_error_for_stream(
 }
 
 #[cfg(test)]
-pub fn legacy_build_label_selector_watch_stream(
-    request: LegacyLabelSelectorWatchStreamRequest<'_>,
-) -> Body {
-    let LegacyLabelSelectorWatchStreamRequest {
-        db,
-        watch_anchor,
-        signal_rx,
-        replay_start_position,
-        task_supervisor,
-        api_version,
-        kind,
-        watch_namespace,
-        requested_rv,
-        send_initial_events,
-        send_bookmarks,
-        label_selector,
-        field_selector,
-        table_format,
-        stream_format,
-        catch_up_mode,
-        timeout_seconds,
-        emit_initial_state_for_resource_version_zero,
-    } = request;
-
-    let api_version = api_version.to_string();
-    let field_selector = field_selector.filter(|selector| !selector.trim().is_empty());
-    let parsed_label_selector = label_selector
-        .as_deref()
-        .filter(|selector| !selector.trim().is_empty())
-        .map(LabelSelector::parse)
-        .transpose()
-        .map_err(|err| format!("Invalid label selector: {err}"));
-
-    let stream = async_stream::stream! {
-        let parsed_label_selector = match parsed_label_selector.as_ref() {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                    stream_format,
-                    400,
-                    "BadRequest",
-                    err,
-                ));
-                return;
-            }
-        };
-        let has_label_selector = parsed_label_selector.is_some();
-        let has_selector = has_label_selector || field_selector.is_some();
-        let use_raw_selectorless_stream =
-            !has_selector
-                && !table_format
-                && (stream_format == WatchStreamFormat::Json
-                    || klights_kube_protobuf::supports_raw_json_protobuf_resource(
-                        &api_version,
-                        &kind,
-                    ));
-        let replay_target = match (catch_up_mode, watch_namespace.clone()) {
-            (WatchCatchUpMode::NamespacedScoped, Some(ns)) => {
-                WatchTarget::namespaced_in_namespace(api_version.clone(), kind.clone(), ns)
-            }
-            (WatchCatchUpMode::NamespacedScoped, None) => {
-                WatchTarget::namespaced(api_version.clone(), kind.clone())
-            }
-        };
-        let has_scope_filter = watch_namespace.is_some() || has_selector;
-
-        // Read-freshness: when resuming from a resourceVersion, ensure this
-        // node's datastore has applied up to that point before serving. A
-        // follower can receive a WATCH whose resourceVersion was minted by
-        // the leader (the conformance "service status lifecycle" flow lists
-        // cluster-wide on the leader, then watches a namespace), and serving
-        // the catch-up query against not-yet-applied follower state would
-        // miss events. Event-driven and bounded; a no-op on a fresh node.
-        wait_until_datastore_fresh(
-            &db,
-            requested_rv,
-            &api_version,
-            &kind,
-            &task_supervisor,
-        )
-        .await;
-
-        // Client/bookmark RV progress is independent from the durable replay
-        // boundary captured before signal subscription. Initial and catch-up
-        // delivery may advance this scoped RV without moving replay past an
-        // event that landed during establishment.
-        let mut session_bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
-            requested_rv,
-            has_selector,
-        });
-        session_bootstrap.set_replay_start_position(replay_start_position);
-
-        // Track resources visible to this watcher for label-selector-aware transitions.
-        // If a MODIFIED event enters selector view -> send ADDED.
-        // If a visible resource leaves selector view -> send DELETED.
-        // Keyed by (namespace, name) to avoid collisions across namespaces
-        // in cluster-wide watches.
-
-        // Label-selector watches need a current membership baseline. For
-        // resourceVersion-less selector watches, Kubernetes-compatible clients
-        // such as the ServiceAccount lifecycle conformance test expect existing
-        // matching objects to be delivered as ADDED. Explicit
-        // resourceVersion=0 has the same current-state replay semantics even
-        // without selectors; omitted resourceVersion still starts from now.
-        if (has_selector || emit_initial_state_for_resource_version_zero) && !send_initial_events {
-            let baseline_query = || crate::datastore::ResourceListQuery::new(
-                label_selector.as_deref(),
-                field_selector.as_deref(),
-                None,
-                None,
-            );
-            let baseline = if requested_rv > 0 {
-                match watch_anchor
-                    .snapshot_resources_at_position(
-                        std::slice::from_ref(&replay_target),
-                        label_selector.as_deref(),
-                        field_selector.as_deref(),
-                        replay_start_position,
-                    )
-                    .await
-                {
-                    Ok(SnapshotAtRv::List(list)) => Ok(list),
-                    Ok(SnapshotAtRv::Current) => db
-                        .list_resources(
-                            &api_version,
-                            &kind,
-                            watch_namespace.as_deref(),
-                            baseline_query(),
-                        )
-                        .await,
-                    Ok(SnapshotAtRv::Expired) => {
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                            stream_format,
-                            410,
-                            "Expired",
-                            "too old resource version: selector membership snapshot expired",
-                        ));
-                        return;
-                    }
-                    Err(err) => Err(err),
-                }
-            } else {
-                db.list_resources(
-                    &api_version,
-                    &kind,
-                    watch_namespace.as_deref(),
-                    baseline_query(),
-                )
-                .await
-            };
-            let baseline = match baseline {
-                Ok(baseline) => baseline,
-                Err(err) => {
-                    tracing::warn!(error = %err, "watch selector baseline LIST failed");
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                        stream_format,
-                        500,
-                        "InternalError",
-                        "failed to establish watch selector baseline",
-                    ));
-                    return;
-                }
-            };
-            if requested_rv <= 0
-                && let Some(position) = baseline.watch_replay_position
-            {
-                session_bootstrap.set_replay_start_position(position);
-            }
-            for resource in baseline.items {
-                if requested_rv <= 0 {
-                    let event = WatchEvent::from_catch_up(CatchUpResource::added(resource));
-                    let line = match try_serialize_watch_event_for_stream(
-                        event.clone(),
-                        &kind,
-                        table_format,
-                        stream_format,
-                    ) {
-                        Ok(line) => line,
-                        Err(line) => {
-                            yield Ok::<_, std::convert::Infallible>(line);
-                            return;
-                        }
-                    };
-                    session_bootstrap.record_baseline_event(&event);
-                    yield Ok::<_, std::convert::Infallible>(line);
-                } else {
-                    let event = WatchEvent::from_catch_up(CatchUpResource::added(resource));
-                    session_bootstrap.record_baseline_event(&event);
-                }
-            }
-            // Baseline delivery advances scoped/bookmark RV independently
-            // from the exact durable position captured with the LIST.
-        }
-
-        if send_initial_events {
-            let initial_list = db
-                .list_resources(&api_version, &kind, watch_namespace.clone().as_deref(), crate::datastore::ResourceListQuery::new(label_selector.clone().as_deref(), field_selector.as_deref(), None, None))
-                .await;
-
-            let list = match initial_list {
-                Ok(list) => list,
-                Err(err) => {
-                    tracing::warn!(error = %err, "WatchList snapshot LIST failed");
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                        stream_format,
-                        500,
-                        "InternalError",
-                        "failed to establish WatchList snapshot",
-                    ));
-                    return;
-                }
-            };
-            if let Some(position) = list.watch_replay_position {
-                session_bootstrap.set_replay_start_position(position);
-            }
-            let mut last_rv = requested_rv.max(list.resource_version);
-            for resource in list.items {
-                let resource_rv = resource.resource_version;
-                let event = WatchEvent::from_catch_up(CatchUpResource::added(resource));
-                let line = match try_serialize_watch_event_for_stream(
-                    event.clone(),
-                    &kind,
-                    table_format,
-                    stream_format,
-                ) {
-                    Ok(line) => line,
-                    Err(line) => {
-                        yield Ok::<_, std::convert::Infallible>(line);
-                        return;
-                    }
-                };
-                last_rv = last_rv.max(resource_rv);
-                session_bootstrap.record_baseline_event(&event);
-                yield Ok::<_, std::convert::Infallible>(line);
-            }
-                // Anchor the initial-events-end bookmark (and the live-event
-                // floor) to the collection's snapshot resourceVersion, not
-                // just `max(item rv)`. K8s requires the `initial-events-end`
-                // bookmark to report the resourceVersion at which the initial
-                // list was taken so a WatchList client can resume from it. For
-                // an EMPTY initial list (e.g. a label-selector informer over a
-                // fresh namespace, which is exactly the `[sig-scheduling]
-                // LimitRange ... defaults` conformance flow) `max(item rv)` is
-                // absent, leaving the bookmark/floor at the stale
-                // `requested_rv` (0 when the client sends `resourceVersion=""`)
-                // — an invalid resume point. This is the WatchList sibling of
-                // the complete-list snapshot-RV fix on the plain list path.
-            last_rv = last_rv.max(list.resource_version);
-
-            session_bootstrap.observe_snapshot_rv(last_rv);
-
-            let bookmark_event =
-                WatchEvent::bookmark_initial_events_end(last_rv, &api_version, &kind);
-            match try_serialize_watch_event_for_stream(
-                bookmark_event,
-                &kind,
-                table_format,
-                stream_format,
-            ) {
-                Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
-                Err(line) => {
-                    yield Ok::<_, std::convert::Infallible>(line);
-                    return;
-                }
-            }
-        }
-
-        let replay_source = DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(db.clone())),
-            vec![replay_target.clone()],
-        );
-        let topic = WatchTopic::new(&api_version, &kind);
-        let delivery_scope = match (catch_up_mode, watch_namespace.clone()) {
-            (WatchCatchUpMode::NamespacedScoped, Some(ns)) => WatchDeliveryScope::Namespaced(ns),
-            (WatchCatchUpMode::NamespacedScoped, None) => WatchDeliveryScope::NamespacedAll,
-        };
-        if use_raw_selectorless_stream {
-            let mut cursor = RawSignalWatchCursor::new_at_position(
-                signal_rx,
-                Arc::new(DatastoreBackendWatchStore::new(db.clone()))
-                    as Arc<dyn RawWatchReplayStore>,
-                vec![replay_target.clone()],
-                topic.clone(),
-                delivery_scope.clone(),
-                session_bootstrap.cursor_floor(),
-                session_bootstrap.replay_start_position(),
-            );
-            match cursor.prime_replay_or_expired().await {
-                    Ok(_) => {}
-                    Err(WatchCursorError::Expired) => {
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                            stream_format,
-                            410,
-                            "Expired",
-                            "too old resource version: requested resourceVersion is older than the watch history window",
-                        ));
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::warn!("Initial raw watch replay failed for {}: {:#?}", kind, err);
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                            stream_format,
-                            500,
-                            "InternalError",
-                            "failed to establish initial watch replay",
-                        ));
-                        return;
-                    }
-            }
-
-            let bookmark_task_name = format!("watch_stream_bookmarks_{}_{}", api_version, kind);
-            let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
-                send_bookmarks,
-                task_supervisor.clone(),
-                bookmark_task_name,
-            )
-            .await;
-            let timeout_task_name = format!("watch_stream_timeout_{}_{}", api_version, kind);
-            let mut timeout_tick = maybe_spawn_watch_timeout_stream(
-                timeout_seconds,
-                task_supervisor.clone(),
-                timeout_task_name,
-            )
-            .await;
-
-            loop {
-                tokio::select! {
-                    Some(()) = recv_watch_timeout(&mut timeout_tick) => {
-                        break;
-                    }
-                    result = cursor.next_event() => {
-                        let event = match result {
-                            Ok(event) => event,
-                            Err(err) => {
-                                match watch_namespace.as_deref() {
-                                    Some(ns) => tracing::warn!("Raw watch terminated for {}/{}: {:#?}", ns, kind, err),
-                                    None => tracing::warn!("Raw watch terminated for {}: {:#?}", kind, err),
-                                }
-                                if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format) {
-                                    yield Ok::<_, std::convert::Infallible>(line);
-                                }
-                                break;
-                            }
-                        };
-
-                        let rv = event.resource_version;
-                        match try_serialize_raw_watch_event_for_stream(&event, stream_format) {
-                            Ok(line) => {
-                                yield Ok::<_, std::convert::Infallible>(line);
-                                cursor.accept_event(rv);
-                                session_bootstrap.observe_delivered_rv(rv);
-                            }
-                            Err(line) => {
-                                yield Ok::<_, std::convert::Infallible>(line);
-                                break;
-                            }
-                        }
-                    }
-                    Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-                            db: &db,
-                            api_version: &api_version,
-                            kind: &kind,
-                            watch_namespace: watch_namespace.as_deref(),
-                            label_selector: label_selector.as_deref(),
-                            field_selector: field_selector.as_deref(),
-                            requested_rv,
-                            has_scope_filter,
-                            cursor_high_water_rv: cursor.accepted_rv(),
-                            last_delivered_scoped_rv: session_bootstrap.last_delivered_scoped_rv(),
-                        })
-                        .await;
-                        let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                        match try_serialize_watch_event_for_stream(
-                            event,
-                            &kind,
-                            table_format,
-                            stream_format,
-                        ) {
-                            Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
-                            Err(line) => {
-                                yield Ok::<_, std::convert::Infallible>(line);
-                                break;
-                            }
-                        }
-                }
-            }
-            }
-            return;
-        }
-        let mut session = session_bootstrap.establish_many(
-            signal_rx,
-            replay_source,
-            vec![topic],
-            delivery_scope,
-        );
-        match session.prime_replay_or_expired().await {
-                Ok(_) => {}
-                Err(WatchCursorError::Expired) => {
-                    // Resume point predates the retained watch-event window;
-                    // tell the client to relist (HTTP 410 Gone semantics).
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                        stream_format,
-                        410,
-                        "Expired",
-                        "too old resource version: requested resourceVersion is older than the watch history window",
-                    ));
-                    return;
-                }
-                Err(err) => {
-                    tracing::warn!("Initial watch replay failed for {}: {:#?}", kind, err);
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                        stream_format,
-                        500,
-                        "InternalError",
-                        "failed to establish initial watch replay",
-                    ));
-                    return;
-                }
-        }
-
-        let bookmark_task_name = format!("watch_stream_bookmarks_{}_{}", api_version, kind);
-        let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
-            send_bookmarks,
-            task_supervisor.clone(),
-            bookmark_task_name,
-        )
-        .await;
-        let timeout_task_name = format!("watch_stream_timeout_{}_{}", api_version, kind);
-        let mut timeout_tick = maybe_spawn_watch_timeout_stream(
-            timeout_seconds,
-            task_supervisor.clone(),
-            timeout_task_name,
-        )
-        .await;
-
-        loop {
-            tokio::select! {
-                Some(()) = recv_watch_timeout(&mut timeout_tick) => {
-                    break;
-                }
-                result = session.next_event() => {
-                    let event = match result {
-                        Ok(event) => event,
-                        Err(err) => {
-                            match watch_namespace.as_deref() {
-                                Some(ns) => tracing::warn!("Watch terminated for {}/{}: {:#?}", ns, kind, err),
-                                None => tracing::warn!("Watch terminated for {}: {:#?}", kind, err),
-                            }
-                            if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format) {
-                                yield Ok::<_, std::convert::Infallible>(line);
-                            }
-                            break;
-                        }
-                    };
-
-                    let matches = event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
-                        && event.matches_field_selector(field_selector.as_deref());
-                    let source_rv = event.resource_version();
-                    match session.classify_event(event, matches) {
-                        WatchSessionEvent::Deliver(event) => {
-                            match try_serialize_watch_event_for_stream(
-                                event,
-                                &kind,
-                                table_format,
-                                stream_format,
-                            ) {
-                                Ok(line) => {
-                                    yield Ok::<_, std::convert::Infallible>(line);
-                                    if let Some(rv) = source_rv {
-                                        session.accept_delivered_rv(rv);
-                                    }
-                                }
-                                Err(line) => {
-                                    yield Ok::<_, std::convert::Infallible>(line);
-                                    break;
-                                }
-                            }
-                        }
-                        WatchSessionEvent::Filtered => {
-                            if let Some(rv) = source_rv {
-                                session.accept_filtered_rv(rv);
-                            }
-                        }
-                    }
-                }
-                Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                    let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-                        db: &db,
-                        api_version: &api_version,
-                        kind: &kind,
-                        watch_namespace: watch_namespace.as_deref(),
-                        label_selector: label_selector.as_deref(),
-                        field_selector: field_selector.as_deref(),
-                        requested_rv,
-                        has_scope_filter,
-                        cursor_high_water_rv: session.accepted_rv(),
-                        last_delivered_scoped_rv: session.last_delivered_scoped_rv(),
-                    })
-                    .await;
-                    let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                    match try_serialize_watch_event_for_stream(
-                        event,
-                        &kind,
-                        table_format,
-                        stream_format,
-                    ) {
-                        Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
-                        Err(line) => {
-                            yield Ok::<_, std::convert::Infallible>(line);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    Body::from_stream(stream)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::watch::SelectorMembership;
-    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::StreamExt;
+    use klights_cluster_core::WatchReplayPosition;
     use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
-    use klights_watch::WatchSignal;
     use prost::Message;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct FiniteWatchSource {
@@ -1651,6 +990,55 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FallibleWatchSource {
+        establish_error: Option<klights_leader_api::LeaderWatchError>,
+        events:
+            Vec<Result<klights_leader_api::ResourceEvent, klights_leader_api::LeaderWatchError>>,
+    }
+
+    impl WatchStreamSource for FallibleWatchSource {
+        fn wait_until_fresh<'a>(
+            &'a self,
+            _target_rv: i64,
+            _api_version: &'a str,
+            _kind: &'a str,
+            _task_supervisor: &'a klights_supervisor::TaskSupervisor,
+        ) -> WatchSourceWaitFuture<'a> {
+            Box::pin(async {})
+        }
+
+        fn list_watch_resources<'a>(
+            &'a self,
+            _api_version: &'a str,
+            _kind: &'a str,
+            _namespace: Option<&'a str>,
+            _label_selector: Option<&'a str>,
+            _field_selector: Option<&'a str>,
+            _limit: Option<i64>,
+        ) -> WatchSourceListFuture<'a> {
+            Box::pin(async {
+                panic!("fallible live-watch fixture must not perform a baseline LIST")
+            })
+        }
+
+        fn watch_resources(
+            &self,
+            _request: klights_leader_api::WatchRequest,
+        ) -> klights_leader_api::LeaderWatchFuture<'_> {
+            let establish_error = self.establish_error.clone();
+            let events = self.events.clone();
+            Box::pin(async move {
+                if let Some(error) = establish_error {
+                    return Err(error);
+                }
+                Ok(klights_leader_api::WatchStream::unpositioned_test_stream(
+                    futures::stream::iter(events),
+                ))
+            })
+        }
+    }
+
     struct AdvancingClock {
         base: time::OffsetDateTime,
         reads: AtomicUsize,
@@ -1661,63 +1049,6 @@ mod tests {
             let read = self.reads.fetch_add(1, Ordering::SeqCst);
             self.base + time::Duration::seconds(10 + 60 * read as i64)
         }
-    }
-
-    struct OrderedWatchAnchor {
-        subscribed: Arc<AtomicBool>,
-        position: WatchReplayPosition,
-    }
-
-    #[async_trait]
-    impl WatchReplayAnchorStore for OrderedWatchAnchor {
-        async fn current_watch_replay_position(&self) -> anyhow::Result<WatchReplayPosition> {
-            assert!(
-                self.subscribed.load(Ordering::Acquire),
-                "HTTP watch must install its signal subscriber before polling the anchor port"
-            );
-            Ok(self.position)
-        }
-
-        async fn snapshot_resources_at_position(
-            &self,
-            _targets: &[WatchTarget],
-            _label_selector: Option<&str>,
-            _field_selector: Option<&str>,
-            _position: WatchReplayPosition,
-        ) -> anyhow::Result<SnapshotAtRv> {
-            panic!("handoff ordering does not read a snapshot")
-        }
-    }
-
-    async fn assert_http_handoff_subscribes_first(topic: WatchTopic) {
-        let subscribed = Arc::new(AtomicBool::new(false));
-        let expected = WatchReplayPosition {
-            resource_version: 17,
-            event_id: 23,
-            resource_version_filter_through_event_id: 0,
-        };
-        let anchor = OrderedWatchAnchor {
-            subscribed: subscribed.clone(),
-            position: expected,
-        };
-        let (receiver, observed) = subscribe_watch_handoff(
-            &anchor,
-            || {
-                assert!(!topic.kind().is_empty());
-                subscribed.store(true, Ordering::Release);
-                WatchSignalReceiver::closed()
-            },
-            0,
-        )
-        .await
-        .expect("ordered handoff");
-        drop(receiver);
-        assert_eq!(observed, expected);
-    }
-
-    #[tokio::test]
-    async fn http_pod_watch_subscribes_before_the_first_anchor_await() {
-        assert_http_handoff_subscribes_first(WatchTopic::new("v1", "Pod")).await;
     }
 
     #[tokio::test]
@@ -1784,11 +1115,6 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0]["object"]["rows"][0]["cells"][4], "10s");
         assert_eq!(frames[1]["object"]["rows"][0]["cells"][4], "1m");
-    }
-
-    #[tokio::test]
-    async fn http_custom_resource_watch_subscribes_before_the_first_anchor_await() {
-        assert_http_handoff_subscribes_first(WatchTopic::new("example.com/v1", "Widget")).await;
     }
 
     fn apply_selector_transition_event(
@@ -2656,44 +1982,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_replay_failure_emits_error_and_terminates_raw_and_parsed_streams() {
+    async fn positioned_watch_establishment_failure_emits_error_and_terminates() {
         for table_format in [false, true] {
-            let db: DatastoreHandle = Arc::new(
-                crate::datastore::redb::RedbDatastore::new_in_memory()
-                    .await
-                    .unwrap(),
-            );
-            let topic = WatchTopic::new("v1", "ConfigMap");
-            let signal_rx = WatchSignalReceiver::new(vec![
-                crate::watch_commit_observation_adapter::subscribe_from_db(&db, topic),
-            ]);
-            db.close();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let body =
-                legacy_build_label_selector_watch_stream(LegacyLabelSelectorWatchStreamRequest {
-                    watch_anchor: watch_replay_anchor_from_backend(&db),
-                    db,
-                    signal_rx,
-                    replay_start_position: WatchReplayPosition {
-                        resource_version: 0,
-                        event_id: 1,
-                        resource_version_filter_through_event_id: 0,
-                    },
-                    task_supervisor: supervisor,
-                    api_version: "v1",
-                    kind: "ConfigMap".to_string(),
-                    watch_namespace: None,
-                    requested_rv: 0,
-                    send_initial_events: false,
-                    send_bookmarks: false,
-                    label_selector: None,
-                    field_selector: None,
-                    table_format,
-                    stream_format: WatchStreamFormat::Json,
-                    catch_up_mode: WatchCatchUpMode::NamespacedScoped,
-                    timeout_seconds: None,
-                    emit_initial_state_for_resource_version_zero: false,
-                });
+            let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
+                source: FallibleWatchSource {
+                    establish_error: Some(klights_leader_api::LeaderWatchError::unavailable(
+                        "history unavailable",
+                    )),
+                    events: Vec::new(),
+                },
+                task_supervisor: supervisor,
+                api_version: "v1",
+                kind: "ConfigMap".to_string(),
+                watch_namespace: None,
+                requested_rv: 0,
+                send_initial_events: false,
+                send_bookmarks: false,
+                label_selector: None,
+                field_selector: None,
+                table_format,
+                stream_format: WatchStreamFormat::Json,
+                timeout_seconds: None,
+                emit_initial_state_for_resource_version_zero: false,
+                wall_clock: Arc::new(crate::auth::clock::SystemClock),
+            })
+            .await;
 
             let bytes = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -2710,50 +2024,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_replay_failure_emits_one_error_and_terminates_raw_and_parsed_streams() {
+    async fn positioned_watch_pull_failure_emits_one_error_and_terminates() {
         for table_format in [false, true] {
-            let db: DatastoreHandle = Arc::new(
-                crate::datastore::redb::RedbDatastore::new_in_memory()
-                    .await
-                    .unwrap(),
-            );
-            db.create_resource(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "established",
-                serde_json::json!({
+            let event = klights_leader_api::ResourceEvent::try_new(
+                klights_leader_api::WatchEventType::Added,
+                klights_cluster_core::Resource::from_data_lossy(Arc::new(serde_json::json!({
                     "apiVersion": "v1",
                     "kind": "ConfigMap",
-                    "metadata": {"namespace": "default", "name": "established"}
-                }),
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "established",
+                        "resourceVersion": "1"
+                    }
+                }))),
+                None,
             )
-            .await
             .unwrap();
-            let signal_hub = klights_watch::WatchSignalHub::new(4);
-            let signal_rx = signal_hub.subscribe(WatchTopic::new("v1", "ConfigMap"));
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let body =
-                legacy_build_label_selector_watch_stream(LegacyLabelSelectorWatchStreamRequest {
-                    watch_anchor: watch_replay_anchor_from_backend(&db),
-                    db: db.clone(),
-                    signal_rx,
-                    replay_start_position: WatchReplayPosition::default(),
-                    task_supervisor: supervisor,
-                    api_version: "v1",
-                    kind: "ConfigMap".to_string(),
-                    watch_namespace: None,
-                    requested_rv: 0,
-                    send_initial_events: false,
-                    send_bookmarks: false,
-                    label_selector: None,
-                    field_selector: None,
-                    table_format,
-                    stream_format: WatchStreamFormat::Json,
-                    catch_up_mode: WatchCatchUpMode::NamespacedScoped,
-                    timeout_seconds: None,
-                    emit_initial_state_for_resource_version_zero: false,
-                });
+            let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
+                source: FallibleWatchSource {
+                    establish_error: None,
+                    events: vec![
+                        Ok(event),
+                        Err(klights_leader_api::LeaderWatchError::unavailable(
+                            "history unavailable",
+                        )),
+                    ],
+                },
+                task_supervisor: supervisor,
+                api_version: "v1",
+                kind: "ConfigMap".to_string(),
+                watch_namespace: None,
+                requested_rv: 0,
+                send_initial_events: false,
+                send_bookmarks: false,
+                label_selector: None,
+                field_selector: None,
+                table_format,
+                stream_format: WatchStreamFormat::Json,
+                timeout_seconds: None,
+                emit_initial_state_for_resource_version_zero: false,
+                wall_clock: Arc::new(crate::auth::clock::SystemClock),
+            })
+            .await;
             let mut stream = body.into_data_stream();
 
             let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -2763,18 +2076,6 @@ mod tests {
                 .expect("initial replay frame should be readable");
             let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
             assert_eq!(first["type"], "ADDED", "table_format={table_format}");
-
-            db.close();
-            let wake = WatchEvent::modified(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "namespace": "default",
-                    "name": "wake",
-                    "resourceVersion": "2"
-                }
-            }));
-            signal_hub.publish(WatchSignal::from_event(&wake).unwrap());
 
             let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
                 .await
@@ -2796,37 +2097,17 @@ mod tests {
 
     #[test]
     fn catch_up_failure_status_line_forces_client_relist() {
-        let line = serialize_watch_catch_up_failure_status_line();
+        let line = serialize_positioned_watch_error_for_stream(
+            &klights_leader_api::LeaderWatchError::ReplayExpired {
+                accepted_resource_version: 37,
+            },
+            WatchStreamFormat::Json,
+        );
         let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
 
         assert_eq!(value["type"], "ERROR");
         assert_eq!(value["object"]["code"], 410);
         assert_eq!(value["object"]["reason"], "Expired");
-    }
-
-    #[test]
-    fn catchup_resource_event_type_uses_static_literal_for_added() {
-        // The watch hot path constructs CatchUpResource per event during
-        // initial-list. Holding event_type as Cow<'static, str> avoids the
-        // per-event String allocation when the literal "ADDED" is reused.
-        // Confirm the static literal flows through unchanged (no deep copy).
-        let resource = klights_cluster_core::Resource {
-            id: 0,
-            api_version: "v1".into(),
-            kind: "Pod".into(),
-            namespace: Some("default".into()),
-            name: "p1".into(),
-            uid: "uid-p1".into(),
-            resource_version: 1,
-            data: std::sync::Arc::new(serde_json::json!({"metadata": {"name": "p1"}})),
-        };
-        let event = CatchUpResource::added(resource);
-        match &event.event_type {
-            std::borrow::Cow::Borrowed(s) => assert_eq!(*s, "ADDED"),
-            std::borrow::Cow::Owned(_) => panic!("static literal must stay borrowed"),
-        }
-        let watch_event = WatchEvent::from_catch_up(event);
-        assert_eq!(watch_event.event_type, EventType::Added);
     }
 
     #[test]
@@ -3893,19 +3174,22 @@ mod tests {
         );
 
         for (error, expected_code, expected_reason) in [
-            (WatchCursorError::Expired, 410, "Expired"),
             (
-                WatchCursorError::Replay(anyhow::anyhow!("history unavailable")),
+                klights_leader_api::LeaderWatchError::ReplayExpired {
+                    accepted_resource_version: 73,
+                },
+                410,
+                "Expired",
+            ),
+            (
+                klights_leader_api::LeaderWatchError::unavailable("history unavailable"),
                 500,
                 "InternalError",
             ),
         ] {
-            let json =
-                serialize_live_watch_cursor_error_for_stream(&error, WatchStreamFormat::Json)
-                    .expect("terminal JSON error");
+            let json = serialize_positioned_watch_error_for_stream(&error, WatchStreamFormat::Json);
             let protobuf =
-                serialize_live_watch_cursor_error_for_stream(&error, WatchStreamFormat::Protobuf)
-                    .expect("terminal protobuf error");
+                serialize_positioned_watch_error_for_stream(&error, WatchStreamFormat::Protobuf);
             let json = decode_split_json_watch_lines(&split_watch_bytes(&json));
             let protobuf = decode_k8s_protobuf_watch_frames(&split_watch_bytes(&protobuf));
             assert_eq!(json[0]["type"], "ERROR");

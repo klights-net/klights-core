@@ -7657,7 +7657,6 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
 async fn leader_scheduler_binds_node_and_podscheduled_condition_in_one_pod_event() {
     use super::{PodApiWriter, PodReader};
     use crate::datastore::WatchTarget;
-    use crate::watch::EventType;
 
     let repo = build_repo_with_scheduling_mode(
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
@@ -7748,10 +7747,10 @@ async fn leader_scheduler_binds_node_and_podscheduled_condition_in_one_pod_event
         .unwrap();
     let schedule_events: Vec<_> = pod_events
         .into_iter()
-        .map(crate::watch::WatchEvent::from_catch_up)
         .filter(|event| {
             event
-                .object
+                .resource
+                .data
                 .pointer("/metadata/name")
                 .and_then(|v| v.as_str())
                 == Some("single-bind-event")
@@ -7763,17 +7762,19 @@ async fn leader_scheduler_binds_node_and_podscheduled_condition_in_one_pod_event
         1,
         "scheduler bind and PodScheduled=True status must be one logical pod update"
     );
-    assert_eq!(schedule_events[0].event_type, EventType::Modified);
+    assert_eq!(schedule_events[0].event_type, "MODIFIED");
     assert_eq!(
         schedule_events[0]
-            .object
+            .resource
+            .data
             .pointer("/spec/nodeName")
             .and_then(|v| v.as_str()),
         Some("test-node")
     );
     assert_eq!(
         schedule_events[0]
-            .object
+            .resource
+            .data
             .pointer("/status/conditions")
             .and_then(|v| v.as_array())
             .and_then(|conditions| {
@@ -9354,7 +9355,6 @@ async fn scheduler_marks_finalized_preemption_victim_disruption_target() {
 async fn scheduler_preemption_victim_terminating_event_includes_disruption_target() {
     use super::{PodApiWriter, PodReader};
     use crate::datastore::WatchTarget;
-    use crate::watch::EventType;
 
     let repo = build_repo_with_scheduling_mode(
         crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
@@ -9448,16 +9448,17 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
         .unwrap();
     let terminating_victim_events: Vec<_> = pod_events
         .into_iter()
-        .map(crate::watch::WatchEvent::from_catch_up)
         .filter(|event| {
-            event.event_type == EventType::Modified
+            event.event_type == "MODIFIED"
                 && event
-                    .object
+                    .resource
+                    .data
                     .pointer("/metadata/name")
                     .and_then(|v| v.as_str())
                     == Some("victim")
                 && event
-                    .object
+                    .resource
+                    .data
                     .pointer("/metadata/deletionTimestamp")
                     .and_then(|v| v.as_str())
                     .is_some()
@@ -9471,7 +9472,8 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
     assert!(
         terminating_victim_events.iter().all(|event| {
             event
-                .object
+                .resource
+                .data
                 .pointer("/status/conditions")
                 .and_then(|v| v.as_array())
                 .is_some_and(|conditions| {
@@ -9486,7 +9488,7 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
         "preemption victim must not be observable as terminating before DisruptionTarget is set: {:?}",
         terminating_victim_events
             .iter()
-            .map(|event| event.object.clone())
+            .map(|event| event.resource.data.clone())
             .collect::<Vec<_>>()
     );
 }

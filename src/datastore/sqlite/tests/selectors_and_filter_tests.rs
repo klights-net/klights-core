@@ -979,7 +979,6 @@ async fn list_resources_response_rv_is_global_snapshot_not_max_item() {
 
 #[tokio::test]
 async fn test_update_hook_emits_snapshot_event_data_for_fast_create_then_update() {
-    use crate::watch::EventType;
     let db = Datastore::new_in_memory().await.unwrap();
 
     let create_data = json!({
@@ -1033,25 +1032,27 @@ async fn test_update_hook_emits_snapshot_event_data_for_fast_create_then_update(
         .unwrap();
     assert_eq!(replay.len(), 2);
 
-    let first = crate::watch::WatchEvent::from_catch_up(replay[0].clone());
-    let second = crate::watch::WatchEvent::from_catch_up(replay[1].clone());
+    let first = &replay[0];
+    let second = &replay[1];
 
-    assert_eq!(first.event_type, EventType::Added);
-    assert_eq!(first.resource_version(), Some(created_rv));
+    assert_eq!(first.event_type, "ADDED");
+    assert_eq!(first.resource.resource_version, created_rv);
     assert!(
         first
-            .object
+            .resource
+            .data
             .pointer("/data/mutation")
             .and_then(|v| v.as_str())
             .is_none(),
         "ADDED event must preserve create snapshot, not post-update data"
     );
 
-    assert_eq!(second.event_type, EventType::Modified);
-    assert_eq!(second.resource_version(), Some(updated_rv));
+    assert_eq!(second.event_type, "MODIFIED");
+    assert_eq!(second.resource.resource_version, updated_rv);
     assert_eq!(
         second
-            .object
+            .resource
+            .data
             .pointer("/data/mutation")
             .and_then(|v| v.as_str()),
         Some("1")

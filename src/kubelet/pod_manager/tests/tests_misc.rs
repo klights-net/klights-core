@@ -1,5 +1,4 @@
 use super::*;
-use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_dns_policy;
 
 #[test]
@@ -20,92 +19,6 @@ fn pod_watcher_does_not_call_remove_actor_on_watch_deleted() {
 #[test]
 fn pod_watcher_limits_pod_events_to_local_node_field_selector() {
     // R4: invariant now enforced by check_kubelet_invariants.sh
-}
-
-#[test]
-fn pod_watcher_node_event_filter_matches_only_local_pods() {
-    let filter = pod_watcher_node_event_filter("node-a");
-    let local_pod = crate::watch::WatchEvent::added(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "local-pod", "namespace": "default"},
-        "spec": {"nodeName": "node-a"}
-    }));
-    let remote_pod = crate::watch::WatchEvent::added(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": "remote-pod", "namespace": "default"},
-        "spec": {"nodeName": "node-b"}
-    }));
-    let configmap = crate::watch::WatchEvent::modified(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {"name": "mounted-config", "namespace": "default"}
-    }));
-
-    assert!(filter.matches(&local_pod));
-    assert!(!filter.matches(&remote_pod));
-    assert!(filter.matches(&configmap));
-}
-
-#[tokio::test]
-async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
-    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let (tx, rx) = crate::watch::test_signal_channel(4, [WatchTopic::new("v1", "Pod")]);
-    let mut cursor = SignalWatchCursor::new(
-        rx,
-        DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(db_handle)),
-            vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
-        ),
-        WatchTopic::new("v1", "Pod"),
-        WatchDeliveryScope::Namespaced("default".to_string()),
-        0,
-        WindowPolicy::default_watch_delivery(),
-    )
-    .with_event_filter(pod_watcher_node_event_filter("node-a"));
-    db.create_resource(
-        "v1",
-        "Pod",
-        Some("default"),
-        "remote-pod",
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": "remote-pod",
-                "namespace": "default"
-            },
-            "spec": {"nodeName": "node-b"}
-        }),
-    )
-    .await
-    .expect("create remote pod");
-    let remote_rv = db
-        .get_current_resource_version()
-        .await
-        .expect("current rv after remote pod create");
-
-    tx.publish(klights_watch::WatchSignal {
-        topic: WatchTopic::new("v1", "Pod"),
-        advances: vec![klights_watch::WatchAdvance {
-            namespace: Some("default".to_string()),
-            low_rv: remote_rv,
-            high_rv: remote_rv,
-        }],
-    });
-    let result =
-        tokio::time::timeout(std::time::Duration::from_millis(100), cursor.next_event()).await;
-
-    assert!(
-        result.is_err(),
-        "node-selector-filtered Pod events must not be emitted by the cursor"
-    );
-    assert_eq!(
-        cursor.accepted_rv(),
-        0,
-        "node-selector-filtered Pod events must not move the cursor past unseen lower-RV local Pod updates"
-    );
 }
 
 #[tokio::test]

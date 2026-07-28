@@ -5462,20 +5462,19 @@ async fn raft_create_resource_applies_server_metadata_defaults() {
         )
         .await
         .unwrap();
-    let added = crate::watch::WatchEvent::from_catch_up(
-        replayed
-            .into_iter()
-            .find(|event| event.event_type == "ADDED")
-            .expect("watch history should include the create event"),
-    );
+    let added = replayed
+        .into_iter()
+        .find(|event| event.event_type == "ADDED")
+        .expect("watch history should include the create event");
     assert_eq!(
-        added.object.pointer("/metadata/creationTimestamp"),
+        added.resource.data.pointer("/metadata/creationTimestamp"),
         stored.data.pointer("/metadata/creationTimestamp"),
         "watch replay must emit the same creationTimestamp returned by create"
     );
     assert_eq!(
         added
-            .object
+            .resource
+            .data
             .pointer("/metadata/generation")
             .and_then(|value| value.as_i64()),
         Some(1),

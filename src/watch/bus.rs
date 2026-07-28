@@ -59,26 +59,6 @@ impl klights_watch::WatchSignalEvent for WatchEvent {
     }
 }
 
-/// Test-only construction seam for legacy cursor fixtures. Tokio broadcast
-/// channels remain private to the extracted watch leaf in every build.
-#[cfg(test)]
-pub(crate) fn test_signal_channel(
-    capacity: usize,
-    topics: impl IntoIterator<Item = WatchTopic>,
-) -> (
-    std::sync::Arc<klights_watch::WatchSignalHub>,
-    WatchSignalReceiver,
-) {
-    let hub = std::sync::Arc::new(klights_watch::WatchSignalHub::new(capacity));
-    let receiver = WatchSignalReceiver::new(
-        topics
-            .into_iter()
-            .map(|topic| hub.subscribe(topic))
-            .collect(),
-    );
-    (hub, receiver)
-}
-
 #[cfg(test)]
 fn event_topic(event: &WatchEvent) -> Option<WatchTopic> {
     Some(WatchTopic::new(

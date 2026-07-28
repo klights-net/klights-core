@@ -298,24 +298,6 @@ fn merge_custom_resource_watch_baseline(
     resources
 }
 
-#[cfg(test)]
-fn crd_watch_topics(
-    group: &str,
-    kind: &str,
-    conversion: Option<&crate::api::crd_conversion::CrdConversionConfig>,
-    requested_version: &str,
-) -> Vec<klights_watch::WatchTopic> {
-    crd_watch_versions(conversion, requested_version)
-        .into_iter()
-        .map(|version| klights_watch::WatchTopic::new(format!("{group}/{version}"), kind))
-        .collect()
-}
-
-#[inline]
-fn canonical_crd_positioned_watch_enabled() -> bool {
-    true
-}
-
 fn crd_watch_frame_response(
     stream_format: crate::api::watch_stream::WatchStreamFormat,
     frame: Vec<u8>,
@@ -376,7 +358,7 @@ mod crd_watch_topic_tests {
     use super::*;
 
     #[test]
-    fn conversion_crd_live_watch_topics_cover_all_served_versions() {
+    fn conversion_crd_watch_versions_cover_storage_and_requested_versions() {
         let conversion = crate::api::crd_conversion::CrdConversionConfig {
             storage_version: "v1".to_string(),
             served_versions: vec!["v1".to_string(), "v2".to_string()],
@@ -385,31 +367,18 @@ mod crd_watch_topic_tests {
             webhook_review_versions: vec!["v1".to_string()],
         };
 
-        let topics = crd_watch_topics(
-            "stable.example.com",
-            "SelectableFieldCrd",
-            Some(&conversion),
-            "v2",
-        );
+        let versions = crd_watch_versions(Some(&conversion), "v2");
 
         assert_eq!(
-            topics[0],
-            klights_watch::WatchTopic::new("stable.example.com/v1", "SelectableFieldCrd",),
+            versions[0], "v1",
             "storage-version collection must be the deterministic baseline precedence"
         );
-
         assert!(
-            topics.contains(&klights_watch::WatchTopic::new(
-                "stable.example.com/v1",
-                "SelectableFieldCrd",
-            )),
+            versions.iter().any(|version| version == "v1"),
             "a v2 CRD watch must subscribe to storage-version live events"
         );
         assert!(
-            topics.contains(&klights_watch::WatchTopic::new(
-                "stable.example.com/v2",
-                "SelectableFieldCrd",
-            )),
+            versions.iter().any(|version| version == "v2"),
             "a v2 CRD watch must subscribe to requested-version live events"
         );
     }
@@ -796,31 +765,6 @@ async fn list_cr_inner(
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty());
 
-        #[cfg(test)]
-        let watch_topics = crd_watch_topics(group, &kind, conversion.as_ref(), version);
-        #[cfg(test)]
-        let db = state.resource_mutation().db.clone();
-        #[cfg(test)]
-        let resource_query = state.resource_mutation().resource_query.clone();
-        #[cfg(test)]
-        let watch_anchor = crate::api::watch_stream::watch_replay_anchor_from_backend(&db);
-        #[cfg(test)]
-        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
-            watch_anchor.as_ref(),
-            || {
-                klights_watch::WatchSignalReceiver::new(
-                    watch_topics
-                        .iter()
-                        .cloned()
-                        .map(|topic| {
-                            crate::watch_commit_observation_adapter::subscribe_from_db(&db, topic)
-                        })
-                        .collect(),
-                )
-            },
-            requested_rv,
-        )
-        .await?;
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let stream_format =
             crate::api::watch_stream::negotiate_watch_stream_format(headers, false)?;
@@ -839,12 +783,6 @@ async fn list_cr_inner(
         let group_for_watch = group.to_string();
         let plural_for_watch = plural.to_string();
         let requested_version_for_watch = version.to_string();
-        #[cfg(test)]
-        let log_prefix = if is_cluster_scope {
-            "Cluster custom resource"
-        } else {
-            "Custom resource"
-        };
         let task_prefix = if is_cluster_scope {
             "cluster_custom_resource"
         } else {
@@ -887,28 +825,7 @@ async fn list_cr_inner(
                 })
                 .collect::<Vec<_>>()
         };
-        #[cfg(test)]
-        let replay_targets = custom_watch_targets
-            .iter()
-            .map(|target| match target {
-                crate::api::custom_resource_ports::CustomResourceWatchTarget::Cluster {
-                    api_version,
-                    kind,
-                } => WatchTarget::cluster(api_version, kind),
-                crate::api::custom_resource_ports::CustomResourceWatchTarget::Namespaced {
-                    api_version,
-                    kind,
-                    namespace: None,
-                } => WatchTarget::namespaced(api_version, kind),
-                crate::api::custom_resource_ports::CustomResourceWatchTarget::Namespaced {
-                    api_version,
-                    kind,
-                    namespace: Some(namespace),
-                } => WatchTarget::namespaced_in_namespace(api_version, kind, namespace),
-            })
-            .collect::<Vec<_>>();
-
-        if canonical_crd_positioned_watch_enabled() {
+        {
             let projection = Arc::new(CrdWatchProjection {
                 resource_query: state.resource_mutation().resource_query.clone(),
                 conversion: conversion_for_watch.clone(),
@@ -1137,448 +1054,6 @@ async fn list_cr_inner(
                 .header("Content-Type", stream_format.content_type())
                 .header("Transfer-Encoding", "chunked")
                 .body(Body::from_stream(stream))
-                .unwrap());
-        }
-
-        #[cfg(test)]
-        {
-            let stream = async_stream::stream! {
-                let mut session_bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
-                    requested_rv,
-                    has_selector,
-                });
-                session_bootstrap.set_replay_start_position(replay_start_position);
-
-                // Read-freshness: a follower can receive a WATCH whose resume RV was
-                // minted on the leader; serving the catch-up below against
-                // not-yet-applied follower state would miss events. Event-driven and
-                // bounded; a no-op on a fresh node. Mirrors
-                // `build_label_selector_watch_stream` (the built-in path) — the CR
-                // builder previously omitted it, so a multinode CR watch resuming
-                // from a leader-minted RV could serve catch-up against stale state.
-                crate::api::watch_stream::wait_until_datastore_fresh(
-                    &db,
-                    requested_rv,
-                    &av,
-                    &kind,
-                    &task_supervisor,
-                )
-                .await;
-                if send_initial_events {
-                    let list = match db
-                        .list_resources_for_watch_targets(
-                            &replay_targets,
-                            label_selector.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(list) => list,
-                        Err(err) => {
-                            tracing::warn!(error = ?err, "custom-resource WatchList snapshot failed");
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_status_line(
-                                    500,
-                                    "InternalError",
-                                    "failed to establish custom-resource WatchList snapshot",
-                                ),
-                            );
-                            return;
-                        }
-                    };
-                    if let Some(position) = list.watch_replay_position {
-                        session_bootstrap.set_replay_start_position(position);
-                    }
-                    let send_initial_snapshot_rv = list.resource_version.max(requested_rv);
-                    for resource in merge_custom_resource_watch_baseline(list.items) {
-                        let event = crate::watch::WatchEvent::from_catch_up(
-                            CatchUpResource::added(resource),
-                        )
-                        .into();
-                        let event = match convert_custom_resource_watch_event_to_requested_version(
-                            resource_query.as_ref(),
-                            conversion_for_watch.as_ref(),
-                            &group_for_watch,
-                            &plural_for_watch,
-                            &av,
-                            event,
-                        )
-                        .await
-                        {
-                            Ok(event) => event,
-                            Err(err) => {
-                                tracing::warn!(error = ?err, "custom-resource WatchList conversion failed");
-                                yield Ok::<_, std::convert::Infallible>(
-                                    crate::api::watch_stream::serialize_watch_status_line(
-                                        500,
-                                        "InternalError",
-                                        "failed to convert custom-resource WatchList snapshot",
-                                    ),
-                                );
-                                return;
-                            }
-                        };
-                        let matches_selector = event.matches_filter_parsed(
-                            &kind,
-                            watch_ns.as_deref(),
-                            parsed_label_selector.as_ref(),
-                        ) && event.matches_field_selector(field_selector.as_deref());
-                        let Some(event) = session_bootstrap
-                            .classify_event(event, matches_selector)
-                            .into_deliverable()
-                        else {
-                            continue;
-                        };
-                        session_bootstrap.record_baseline_event(&event);
-                        let mut json = serde_json::to_vec(&event).unwrap_or_default();
-                        json.push(b'\n');
-                        yield Ok::<_, std::convert::Infallible>(json);
-                    }
-                    session_bootstrap.observe_snapshot_rv(send_initial_snapshot_rv);
-                    let bookmark =
-                        WatchEvent::bookmark_initial_events_end(send_initial_snapshot_rv, &av, &kind);
-                    yield Ok::<_, std::convert::Infallible>(
-                        crate::api::watch_stream::serialize_watch_event_line_without_table(bookmark),
-                    );
-                } else if (has_selector || emit_initial_state_for_resource_version_zero)
-                    && requested_rv <= 0
-                {
-                    // rv-less selector custom-resource watch: emit existing matches
-                    // as a baseline ADDED list, mirroring the built-in path. The
-                    // cursor resumes from the LIST boundary, so events already
-                    // represented by the snapshot are never replayed.
-                    let baseline = match db
-                        .list_resources_for_watch_targets(
-                            &replay_targets,
-                            label_selector.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(list) => list,
-                        Err(err) => {
-                            tracing::warn!(error = ?err, "custom-resource watch baseline LIST failed");
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_status_line(
-                                    500,
-                                    "InternalError",
-                                    "failed to establish custom-resource watch baseline",
-                                ),
-                            );
-                            return;
-                        }
-                    };
-                    if let Some(position) = baseline.watch_replay_position {
-                        session_bootstrap.set_replay_start_position(position);
-                    }
-                    for resource in merge_custom_resource_watch_baseline(baseline.items) {
-                            let event = crate::watch::WatchEvent::from_catch_up(
-                                CatchUpResource::added(resource),
-                            )
-                            .into();
-                            let event = match convert_custom_resource_watch_event_to_requested_version(
-                                resource_query.as_ref(),
-                                conversion_for_watch.as_ref(),
-                                &group_for_watch,
-                                &plural_for_watch,
-                                &av,
-                                event,
-                            )
-                            .await
-                            {
-                                Ok(event) => event,
-                                Err(err) => {
-                                    tracing::warn!(error = ?err, "custom-resource watch baseline conversion failed");
-                                    yield Ok::<_, std::convert::Infallible>(
-                                        crate::api::watch_stream::serialize_watch_status_line(
-                                            500,
-                                            "InternalError",
-                                            "failed to convert custom-resource watch baseline",
-                                        ),
-                                    );
-                                    return;
-                                }
-                            };
-                            let matches_selector = event.matches_filter_parsed(
-                                &kind,
-                                watch_ns.as_deref(),
-                                parsed_label_selector.as_ref(),
-                            ) && event.matches_field_selector(field_selector.as_deref());
-                            let Some(event) = session_bootstrap
-                                .classify_event(event, matches_selector)
-                                .into_deliverable()
-                            else {
-                                continue;
-                            };
-                            session_bootstrap.record_baseline_event(&event);
-                            let mut json = serde_json::to_vec(&event).unwrap_or_default();
-                            json.push(b'\n');
-                            yield Ok::<_, std::convert::Infallible>(json);
-                    }
-                    // Baseline delivery advances scoped/bookmark RV independently
-                    // from the durable LIST replay position.
-                } else if has_selector && requested_rv > 0 {
-                    // Selector transition semantics need membership as it existed
-                    // at the requested RV, not current membership after catch-up.
-                    // Reconstruct every served-version collection at the requested
-                    // RV, merge logical identities, convert, and seed keys without
-                    // emitting. Legacy rows may still live under an older served
-                    // API version until storage migration touches them.
-                    let membership = match watch_anchor
-                        .snapshot_resources_at_position(
-                            &replay_targets,
-                            None,
-                            None,
-                            replay_start_position,
-                        )
-                        .await
-                    {
-                            Ok(crate::datastore::SnapshotAtRv::List(list)) => list,
-                            Ok(crate::datastore::SnapshotAtRv::Current) => match db
-                                .list_resources_for_watch_targets(&replay_targets, None)
-                                .await
-                            {
-                                Ok(list) => list,
-                                Err(err) => {
-                                    tracing::warn!(error = %err, "custom-resource selector current membership LIST failed");
-                                    yield Ok::<_, std::convert::Infallible>(
-                                        crate::api::watch_stream::serialize_watch_status_line(
-                                            500,
-                                            "InternalError",
-                                            "failed to establish custom-resource selector membership",
-                                        ),
-                                    );
-                                    return;
-                                }
-                            },
-                            Ok(crate::datastore::SnapshotAtRv::Expired) => {
-                                yield Ok::<_, std::convert::Infallible>(
-                                    crate::api::watch_stream::serialize_watch_status_line(
-                                        410,
-                                        "Expired",
-                                        "too old resource version: selector membership snapshot expired",
-                                    ),
-                                );
-                                return;
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "custom-resource selector membership snapshot failed");
-                                yield Ok::<_, std::convert::Infallible>(
-                                    crate::api::watch_stream::serialize_watch_status_line(
-                                        500,
-                                        "InternalError",
-                                        "failed to establish custom-resource selector membership",
-                                    ),
-                                );
-                                return;
-                            }
-                        };
-                    for resource in merge_custom_resource_watch_baseline(membership.items) {
-                            let event = crate::watch::WatchEvent::from_catch_up(
-                                CatchUpResource::added(resource),
-                            )
-                            .into();
-                            let event = match convert_custom_resource_watch_event_to_requested_version(
-                                resource_query.as_ref(),
-                                conversion_for_watch.as_ref(),
-                                &group_for_watch,
-                                &plural_for_watch,
-                                &av,
-                                event,
-                            )
-                            .await
-                            {
-                                Ok(event) => event,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        error = ?err,
-                                        "custom-resource selector membership conversion failed"
-                                    );
-                                    yield Ok::<_, std::convert::Infallible>(
-                                        crate::api::watch_stream::serialize_watch_status_line(
-                                            500,
-                                            "InternalError",
-                                            "failed to convert custom-resource selector membership",
-                                        ),
-                                    );
-                                    return;
-                                }
-                            };
-                            if event.matches_filter_parsed(
-                                &kind,
-                                watch_ns.as_deref(),
-                                parsed_label_selector.as_ref(),
-                            ) && event.matches_field_selector(field_selector.as_deref())
-                            {
-                                session_bootstrap.record_baseline_event(&event);
-                            }
-                    }
-                }
-
-                let replay_source = DatastoreWatchReplaySource::new(
-                    std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                        db.clone(),
-                    )),
-                    replay_targets,
-                );
-                let delivery_scope = if is_cluster_scope {
-                    crate::watch::WatchDeliveryScope::Cluster
-                } else if let Some(ns) = watch_ns.clone() {
-                    crate::watch::WatchDeliveryScope::Namespaced(ns)
-                } else {
-                    crate::watch::WatchDeliveryScope::NamespacedAll
-                };
-                let mut session = session_bootstrap.establish_many(
-                    signal_rx,
-                    replay_source,
-                    watch_topics,
-                    delivery_scope,
-                );
-                match session.prime_replay_or_expired().await {
-                        Ok(_) => {}
-                        Err(WatchCursorError::Expired) => {
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_status_line(
-                                    410,
-                                    "Expired",
-                                    "too old resource version: requested resourceVersion is older than the watch history window",
-                                ),
-                            );
-                            return;
-                        }
-                        Err(err) => {
-                            tracing::warn!("Initial {} watch replay failed for {}: {:#?}", log_prefix, kind, err);
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_status_line(
-                                    500,
-                                    "InternalError",
-                                    "failed to establish initial custom-resource watch replay",
-                                ),
-                            );
-                            return;
-                        }
-                }
-                let bookmark_task_name = format!(
-                    "{}_watch_bookmarks_{}_{}",
-                    task_prefix, group_for_watch, plural_for_watch
-                );
-                let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
-                    send_bookmarks,
-                    task_supervisor.clone(),
-                    bookmark_task_name,
-                )
-                .await;
-                let timeout_task_name = format!(
-                    "{}_watch_timeout_{}_{}",
-                    task_prefix, group_for_watch, plural_for_watch
-                );
-                let mut timeout_tick = maybe_spawn_watch_timeout_stream(
-                    timeout_seconds,
-                    task_supervisor.clone(),
-                    timeout_task_name,
-                )
-                .await;
-
-                loop {
-                    tokio::select! {
-                        Some(()) = recv_watch_timeout(&mut timeout_tick) => {
-                            break;
-                        }
-                        result = session.next_event() => {
-                            let event = match result {
-                                Ok(event) => event,
-                                Err(err) => {
-                                    tracing::warn!("{} watch terminated for {}: {:#?}", log_prefix, kind, err);
-                                    if let Some(line) = crate::api::watch_stream::serialize_live_watch_cursor_error(&err) {
-                                        yield Ok::<_, std::convert::Infallible>(line);
-                                    }
-                                    break;
-                                }
-                            };
-                            if !event.matches_filter(&kind, watch_ns.as_deref(), None) {
-                                continue;
-                            }
-                            let event = match convert_custom_resource_watch_event_to_requested_version(
-                                resource_query.as_ref(),
-                                conversion_for_watch.as_ref(),
-                                &group_for_watch,
-                                &plural_for_watch,
-                                &av,
-                                event,
-                            )
-                            .await
-                            {
-                                Ok(event) => event,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        "{} watch event conversion failed for {}.{}: {:?}",
-                                        log_prefix,
-                                        plural_for_watch,
-                                        group_for_watch,
-                                        err
-                                    );
-                                    yield Ok::<_, std::convert::Infallible>(
-                                        crate::api::watch_stream::serialize_watch_status_line(
-                                            500,
-                                            "InternalError",
-                                            "failed to convert custom-resource watch event",
-                                        ),
-                                    );
-                                    return;
-                                }
-                            };
-                            let matches_selector = event.matches_filter_parsed(
-                                &kind,
-                                watch_ns.as_deref(),
-                                parsed_label_selector.as_ref(),
-                            ) && event.matches_field_selector(field_selector.as_deref());
-                            let source_rv = event.resource_version();
-                            let event = match session.classify_event(event, matches_selector) {
-                                WatchSessionEvent::Deliver(event) => event,
-                                WatchSessionEvent::Filtered => {
-                                    if let Some(source_rv) = source_rv {
-                                        session.accept_filtered_rv(source_rv);
-                                    }
-                                    continue;
-                                }
-                            };
-                            let mut json = serde_json::to_vec(&event).unwrap_or_default();
-                            json.push(b'\n');
-                            yield Ok::<_, std::convert::Infallible>(json);
-                            if let Some(source_rv) = source_rv {
-                                session.accept_delivered_rv(source_rv);
-                            }
-                        }
-                        Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                            let rv = crate::api::watch_stream::resolve_periodic_bookmark_rv(
-                                crate::api::watch_stream::PeriodicBookmarkContext {
-                                    db: &db,
-                                    api_version: &av,
-                                    kind: &kind,
-                                    watch_namespace: watch_ns.as_deref(),
-                                    label_selector: label_selector.as_deref(),
-                                    field_selector: field_selector.as_deref(),
-                                    requested_rv,
-                                    has_scope_filter,
-                                    cursor_high_water_rv: session.accepted_rv(),
-                                    last_delivered_scoped_rv: session.last_delivered_scoped_rv(),
-                                },
-                            )
-                            .await;
-                            let event = WatchEvent::bookmark_typed(rv, &av, &kind);
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_event_line_without_table(
-                                    event,
-                                ),
-                            );
-                        }
-                    }
-                }
-            };
-
-            let body = Body::from_stream(stream);
-            return Ok(Response::builder()
-                .header("Content-Type", stream_format.content_type())
-                .header("Transfer-Encoding", "chunked")
-                .body(body)
                 .unwrap());
         }
     }

@@ -26,15 +26,11 @@ use crate::kubelet::pod_watch_source::{
     PodWatchCheckpoint, PodWatchDisconnect, PodWatchEvent, PodWatchRecoveryPlan, PodWatchSession,
     PodWatchSource, PodWatchStream,
 };
-#[cfg(test)]
-use crate::watch::{SignalWatchCursor, WatchDeliveryScope, WatchEventFilter, WindowPolicy};
 use anyhow::Result;
 #[cfg(test)]
 use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
 use futures::StreamExt as _;
 use klights_leader_api::{LeaderWatchError, WatchEventType};
-#[cfg(test)]
-use klights_watch::WatchTopic;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -110,15 +106,6 @@ impl PodWatcherRuntimeContext {
 
 fn pod_watcher_node_field_selector(node_name: &str) -> String {
     format!("spec.nodeName={node_name}")
-}
-
-#[cfg(test)]
-fn pod_watcher_node_event_filter(node_name: &str) -> WatchEventFilter {
-    WatchEventFilter::new().with_field_selector(
-        "v1",
-        "Pod",
-        pod_watcher_node_field_selector(node_name),
-    )
 }
 
 #[cfg(test)]

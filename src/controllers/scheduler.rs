@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn scheduler_uses_local_watch_not_http_watch() {
-        // Structural assertion: the controller imports WatchBootstrap and WatchTarget,
+        // Structural assertion: the controller uses the positioned leader-watch port,
         // not any HTTP watch client.
     }
 }

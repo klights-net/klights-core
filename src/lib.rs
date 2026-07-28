@@ -28,8 +28,6 @@ mod daemonset_node_side_effect_adapter;
 mod daemonset_store_adapter;
 pub mod datastore;
 mod datastore_leader_watch_adapter;
-#[cfg(test)]
-mod datastore_watch_replay_adapter;
 mod endpoint_mirror_side_effect_adapter;
 mod endpoint_reconcile_adapter;
 mod endpoint_slice_sync_side_effect_adapter;

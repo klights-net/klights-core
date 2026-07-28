@@ -9,9 +9,9 @@ use futures::{FutureExt as _, StreamExt as _, pin_mut, poll};
 use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
 use klights_cluster_store::{
     AllocatorStateFuture, DurableAllocatorRead, DurableAllocatorState, DurableWatchEvent,
-    DurableWatchHistoryRead, ResourceGetRequest, ResourceListRead, ResourceListRequest,
-    ResourceReadFuture, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead,
-    WatchHistoryRequest,
+    DurableWatchHistoryRead, MAX_WATCH_HISTORY_PAGE, ResourceGetRequest, ResourceListRead,
+    ResourceListRequest, ResourceReadFuture, WatchHistoryFuture, WatchHistoryPage,
+    WatchHistoryRead, WatchHistoryRequest,
 };
 use klights_leader_api::{LeaderWatch, WatchRequest};
 use klights_watch::{
@@ -125,6 +125,11 @@ impl DurableWatchHistoryRead for QueueHistory {
         &self,
         request: WatchHistoryRequest,
     ) -> WatchHistoryFuture<'_, WatchHistoryRead> {
+        assert_eq!(
+            request.limit().get(),
+            MAX_WATCH_HISTORY_PAGE,
+            "positioned sessions must read bounded canonical history pages"
+        );
         self.requests
             .lock()
             .expect("requests lock")
@@ -147,6 +152,124 @@ impl DurableWatchHistoryRead for QueueHistory {
     ) -> WatchHistoryFuture<'_, Vec<klights_cluster_store::DurableReplayFloor>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+}
+
+#[tokio::test]
+async fn short_nonempty_pages_preserve_same_rv_event_order_before_waiting_for_signal() {
+    let anchor = position(10, 20);
+    let first_position = position(11, 21);
+    let second_position = position(11, 22);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let history = QueueHistory {
+        requests: requests.clone(),
+        pages: Mutex::new(VecDeque::from([
+            WatchHistoryRead::Events(
+                WatchHistoryPage::try_new(
+                    vec![PositionedWatchEvent {
+                        position: first_position,
+                        event: DurableWatchEvent::new("ADDED", resource(11, "first")),
+                    }],
+                    first_position,
+                )
+                .expect("first short page"),
+            ),
+            WatchHistoryRead::Events(
+                WatchHistoryPage::try_new(
+                    vec![PositionedWatchEvent {
+                        position: second_position,
+                        event: DurableWatchEvent::new("ADDED", resource(11, "second")),
+                    }],
+                    second_position,
+                )
+                .expect("second short page"),
+            ),
+        ])),
+    };
+    let service = PositionedWatchService::new(
+        Arc::new(NoLists),
+        Arc::new(history),
+        Arc::new(FixedAllocator(
+            DurableAllocatorState::try_new(anchor).expect("allocator"),
+        )),
+        Arc::new(WatchSignalHub::new(1)),
+        Arc::new(NamespacedScopes),
+    );
+    let mut stream = service
+        .watch_resources(
+            WatchRequest::try_new(
+                "v1",
+                "ConfigMap",
+                Some("default".to_string()),
+                None,
+                None,
+                Some(10),
+                Some(anchor),
+            )
+            .expect("watch"),
+        )
+        .await
+        .expect("watch opens");
+
+    let first = stream
+        .next()
+        .await
+        .expect("first event")
+        .expect("first event is valid");
+    let second = stream
+        .next()
+        .await
+        .expect("second event")
+        .expect("second event is valid");
+
+    assert_eq!(first.resource().name, "first");
+    assert_eq!(first.resume_position(), Some(first_position));
+    assert_eq!(second.resource().name, "second");
+    assert_eq!(second.resume_position(), Some(second_position));
+    assert_eq!(
+        requests.lock().expect("requests lock").as_slice(),
+        &[anchor, first_position],
+        "a short nonempty page must advance directly into the next bounded read"
+    );
+}
+
+#[tokio::test]
+async fn expired_history_returns_typed_relist_error() {
+    let anchor = position(14, 30);
+    let history = QueueHistory {
+        requests: Arc::new(Mutex::new(Vec::new())),
+        pages: Mutex::new(VecDeque::from([WatchHistoryRead::Expired])),
+    };
+    let service = PositionedWatchService::new(
+        Arc::new(NoLists),
+        Arc::new(history),
+        Arc::new(FixedAllocator(
+            DurableAllocatorState::try_new(anchor).expect("allocator"),
+        )),
+        Arc::new(WatchSignalHub::new(1)),
+        Arc::new(NamespacedScopes),
+    );
+    let mut stream = service
+        .watch_resources(
+            WatchRequest::try_new(
+                "v1",
+                "ConfigMap",
+                Some("default".to_string()),
+                None,
+                None,
+                Some(14),
+                Some(anchor),
+            )
+            .expect("watch"),
+        )
+        .await
+        .expect("watch opens");
+
+    assert!(matches!(
+        stream.next().await.expect("terminal replay error"),
+        Err(klights_leader_api::LeaderWatchError::ReplayExpired {
+            accepted_resource_version: 14
+        })
+    ));
 }
 
 #[tokio::test]

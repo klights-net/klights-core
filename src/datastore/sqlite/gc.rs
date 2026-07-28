@@ -129,7 +129,7 @@ impl Datastore {
     /// resource history needed by lagged watches.
     ///
     /// Workers that fall behind this window get `RecvError::Lagged` → replay
-    /// via `DatastoreWatchReplaySource`; workers further behind than the
+    /// through the positioned watch-history port; workers further behind than the
     /// persisted window get `410 Gone` and relist.
     pub async fn watch_events_gc_prunable_count(
         &self,

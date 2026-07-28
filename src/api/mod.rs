@@ -69,8 +69,6 @@ pub mod test_support;
 mod validation;
 pub(crate) mod version;
 mod watch_event;
-#[cfg(test)]
-mod watch_session;
 pub(crate) mod watch_stream;
 
 #[cfg(test)]
@@ -198,10 +196,6 @@ pub use validation::{
     apply_schema_defaults_pub, validate_against_schema, validate_metadata_fields,
     validate_webhook_configuration,
 };
-#[cfg(test)]
-use watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
-#[cfg(test)]
-use watch_stream::subscribe_watch_handoff;
 use watch_stream::{
     LabelSelectorWatchStreamRequest, build_label_selector_watch_stream,
     maybe_spawn_bookmark_tick_stream, maybe_spawn_watch_timeout_stream,
@@ -280,13 +274,6 @@ use crate::api::status::{
 use crate::api::watch_event::WatchEvent;
 #[cfg(test)]
 use crate::controllers;
-#[cfg(test)]
-use crate::datastore::{CatchUpResource, WatchTarget};
-#[cfg(test)]
-use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
-#[cfg(test)]
-#[cfg(test)]
-use crate::watch::WatchCursorError;
 use klights_cluster_core::Resource;
 use klights_types::LabelSelector;
 
