@@ -1,5 +1,6 @@
 //! Transport-neutral node-facing API contracts for klights.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -1449,6 +1450,118 @@ pub struct NodeMetricsResult {
     target: NodeMetricsTarget,
     node: Option<NodeMetricsNodeSample>,
     pods: Vec<NodeMetricsPodSample>,
+}
+
+/// Transport-neutral CPU and memory usage reported by a node runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NodeMetricsUsage {
+    cpu_nanos: u64,
+    memory_bytes: u64,
+}
+
+impl NodeMetricsUsage {
+    pub const fn new(cpu_nanos: u64, memory_bytes: u64) -> Self {
+        Self {
+            cpu_nanos,
+            memory_bytes,
+        }
+    }
+
+    pub const fn cpu_nanos(self) -> u64 {
+        self.cpu_nanos
+    }
+
+    pub const fn memory_bytes(self) -> u64 {
+        self.memory_bytes
+    }
+
+    pub fn resource_value(self, resource: &str) -> Option<u64> {
+        match resource {
+            "cpu" => Some(self.cpu_nanos),
+            "memory" => Some(self.memory_bytes),
+            _ => None,
+        }
+    }
+
+    pub fn saturating_add_assign(&mut self, other: Self) {
+        self.cpu_nanos = self.cpu_nanos.saturating_add(other.cpu_nanos);
+        self.memory_bytes = self.memory_bytes.saturating_add(other.memory_bytes);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct NodeMetricsPodSnapshot {
+    containers: BTreeMap<String, NodeMetricsUsage>,
+}
+
+/// Indexed view of node-metrics results shared by consumers without exposing
+/// a CRI client, Kubernetes HTTP representation, or cluster-store type.
+#[derive(Clone, Debug, Default)]
+pub struct NodeMetricsSnapshot {
+    node_usage: BTreeMap<String, NodeMetricsUsage>,
+    pods_by_uid: BTreeMap<String, NodeMetricsPodSnapshot>,
+    pods_by_namespace_name: BTreeMap<(String, String), NodeMetricsPodSnapshot>,
+}
+
+impl NodeMetricsSnapshot {
+    pub fn from_results(results: impl IntoIterator<Item = NodeMetricsResult>) -> Self {
+        let mut snapshot = Self::default();
+        for result in results {
+            let (target, node, pods) = result.into_parts();
+            if let Some(node) = node {
+                snapshot.node_usage.insert(
+                    target.into_node_name(),
+                    NodeMetricsUsage::new(node.cpu_nanos(), node.memory_bytes()),
+                );
+            }
+            for pod in pods {
+                snapshot.insert_pod(pod);
+            }
+        }
+        snapshot
+    }
+
+    pub fn node_usage(&self, node_name: &str) -> Option<NodeMetricsUsage> {
+        self.node_usage.get(node_name).copied()
+    }
+
+    pub fn container_usage(
+        &self,
+        uid: &str,
+        namespace: &str,
+        pod_name: &str,
+        container_name: &str,
+    ) -> Option<NodeMetricsUsage> {
+        if !uid.is_empty()
+            && let Some(pod) = self.pods_by_uid.get(uid)
+            && let Some(usage) = pod.containers.get(container_name)
+        {
+            return Some(*usage);
+        }
+        self.pods_by_namespace_name
+            .get(&(namespace.to_string(), pod_name.to_string()))
+            .and_then(|pod| pod.containers.get(container_name))
+            .copied()
+    }
+
+    fn insert_pod(&mut self, pod: NodeMetricsPodSample) {
+        let (namespace, name, uid, containers) = pod.into_parts();
+        let pod = NodeMetricsPodSnapshot {
+            containers: containers
+                .into_iter()
+                .map(|container| {
+                    let (name, cpu_nanos, memory_bytes) = container.into_parts();
+                    (name, NodeMetricsUsage::new(cpu_nanos, memory_bytes))
+                })
+                .collect(),
+        };
+        if !uid.is_empty() {
+            self.pods_by_uid.insert(uid, pod.clone());
+        }
+        if !namespace.is_empty() && !name.is_empty() {
+            self.pods_by_namespace_name.insert((namespace, name), pod);
+        }
+    }
 }
 
 impl NodeMetricsResult {

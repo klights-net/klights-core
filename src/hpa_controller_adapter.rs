@@ -10,7 +10,7 @@ use crate::controllers::hpa::{
 use crate::controllers::{Context, Controller};
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
-use crate::metrics::MetricsProvider;
+use klights_node_api::NodeMetrics;
 
 #[cfg(test)]
 pub struct HpaController;
@@ -23,7 +23,7 @@ impl HpaController {
         _non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
         _coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
         _node_name: std::sync::Arc<str>,
-        _metrics_provider: std::sync::Arc<dyn MetricsProvider>,
+        _node_metrics: std::sync::Arc<dyn NodeMetrics>,
     ) -> Self {
         Self
     }
@@ -36,7 +36,7 @@ pub struct HpaController {
     non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
     coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
     node_name: std::sync::Arc<str>,
-    metrics_provider: std::sync::Arc<dyn MetricsProvider>,
+    node_metrics: std::sync::Arc<dyn NodeMetrics>,
 }
 
 #[cfg(not(test))]
@@ -47,7 +47,7 @@ impl HpaController {
         non_pod_finalization: std::sync::Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
         coordination: std::sync::Arc<crate::controllers::ControllerCoordination>,
         node_name: std::sync::Arc<str>,
-        metrics_provider: std::sync::Arc<dyn MetricsProvider>,
+        node_metrics: std::sync::Arc<dyn NodeMetrics>,
     ) -> Self {
         Self {
             db,
@@ -55,7 +55,7 @@ impl HpaController {
             non_pod_finalization,
             coordination,
             node_name,
-            metrics_provider,
+            node_metrics,
         }
     }
 }
@@ -76,7 +76,7 @@ impl Controller for HpaController {
                 self.coordination.as_ref(),
                 &resource,
                 &self.node_name,
-                self.metrics_provider.as_ref(),
+                self.node_metrics.as_ref(),
                 ctx.reconcile_time(),
             )
             .await;
@@ -90,11 +90,11 @@ impl Controller for HpaController {
                 )
             })?;
             let fallback_metrics;
-            let metrics_provider = match ctx.metrics_provider() {
+            let node_metrics = match ctx.node_metrics() {
                 Some(provider) => provider.as_ref(),
                 None => {
-                    fallback_metrics = crate::metrics::FallbackOnlyMetricsProvider;
-                    &fallback_metrics as &dyn MetricsProvider
+                    fallback_metrics = crate::node_metrics_adapter::UnavailableNodeMetrics;
+                    &fallback_metrics as &dyn NodeMetrics
                 }
             };
             let non_pod_finalization = ctx.non_pod_finalization().ok_or_else(|| {
@@ -109,7 +109,7 @@ impl Controller for HpaController {
                 ctx.coordination(),
                 &resource,
                 ctx.node_name(),
-                metrics_provider,
+                node_metrics,
                 ctx.reconcile_time(),
             )
             .await
@@ -313,7 +313,7 @@ pub async fn reconcile_hpa(
         &crate::controllers::ControllerCoordination::new(),
         hpa,
         node_name,
-        &crate::metrics::FallbackOnlyMetricsProvider,
+        &crate::node_metrics_adapter::UnavailableNodeMetrics,
         chrono::Utc::now(),
     )
     .await
@@ -326,7 +326,7 @@ pub async fn reconcile_hpa_with_metrics(
     coordination: &crate::controllers::ControllerCoordination,
     hpa: &Value,
     node_name: &str,
-    metrics_provider: &dyn MetricsProvider,
+    node_metrics: &dyn NodeMetrics,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     reconcile_hpa_with_runtime(
@@ -338,7 +338,7 @@ pub async fn reconcile_hpa_with_metrics(
         },
         hpa,
         node_name,
-        metrics_provider,
+        node_metrics,
         now,
     )
     .await

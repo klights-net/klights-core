@@ -36,6 +36,7 @@ mod handlers;
 pub mod helpers;
 #[cfg(test)]
 mod integration_tests;
+pub(crate) mod metrics;
 #[cfg(test)]
 mod mod_tests;
 pub mod mutation;

@@ -107,7 +107,7 @@ async fn start_controlplane_leader_control_stream_if_needed(
             )),
             crate::replication::grpc::client::NodeMetricsCapability::Available(
                 std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
-                    std::sync::Arc::new(crate::metrics::CriNodeMetricsSampler::new(
+                    std::sync::Arc::new(crate::kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
                     )),

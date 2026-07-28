@@ -9,6 +9,7 @@ pub(crate) mod cri_exec;
 pub mod file_blocking;
 pub mod lifecycle;
 pub mod log_rotation;
+pub(crate) mod metrics;
 pub mod node;
 pub(crate) mod node_config;
 pub mod node_heartbeat;

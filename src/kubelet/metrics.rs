@@ -1,9 +1,8 @@
-use super::model::RuntimePodSample;
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use klights_node_api::{
-    NodeMetricsError, NodeMetricsNodeSample, NodeMetricsPodSample, NodeMetricsRequest,
-    NodeMetricsResult, NodeMetricsTarget,
+    NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample, NodeMetricsPodSample,
+    NodeMetricsRequest, NodeMetricsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -11,22 +10,8 @@ use std::time::Duration;
 
 const NODE_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(100);
 
-pub(super) async fn collect_local_cri_node_metrics(
-    cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
-    node_name: String,
-    supervisor: Arc<klights_supervisor::TaskSupervisor>,
-) -> Result<NodeMetricsResult, NodeMetricsError> {
-    let target = NodeMetricsTarget::try_new(node_name)?;
-    collect_local_cri_node_metrics_request(
-        cri,
-        NodeMetricsRequest::new(target, Vec::new()),
-        supervisor,
-    )
-    .await
-}
-
 async fn collect_local_cri_node_metrics_request(
-    cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
+    cri: Option<Arc<tokio::sync::Mutex<super::cri::CriClient>>>,
     request: NodeMetricsRequest,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<NodeMetricsResult, NodeMetricsError> {
@@ -69,13 +54,13 @@ async fn collect_local_cri_node_metrics_request(
 }
 
 pub(crate) struct CriNodeMetricsSampler {
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+    cri: Arc<tokio::sync::Mutex<super::cri::CriClient>>,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl CriNodeMetricsSampler {
     pub(crate) fn new(
-        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+        cri: Arc<tokio::sync::Mutex<super::cri::CriClient>>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self { cri, supervisor }
@@ -111,12 +96,52 @@ fn node_metrics_result_from_pod_sandbox_stats(
         .collect();
     let pods = stats
         .into_iter()
-        .filter_map(RuntimePodSample::from_cri)
-        .filter(|sample| wanted_uids.is_empty() || wanted_uids.contains(sample.uid.as_str()))
-        .map(NodeMetricsPodSample::from)
+        .filter_map(node_metrics_pod_sample_from_cri)
+        .filter(|sample| wanted_uids.is_empty() || wanted_uids.contains(sample.uid()))
         .collect();
 
     NodeMetricsResult::new(request.target().clone(), node, pods)
+}
+
+fn node_metrics_pod_sample_from_cri(
+    stats: k8s_cri::v1::PodSandboxStats,
+) -> Option<NodeMetricsPodSample> {
+    let attributes = stats.attributes?;
+    let metadata = attributes.metadata?;
+    let containers = stats
+        .linux
+        .into_iter()
+        .flat_map(|linux| linux.containers)
+        .filter_map(|container| {
+            let name = container
+                .attributes
+                .as_ref()
+                .and_then(|attrs| attrs.metadata.as_ref())
+                .map(|metadata| metadata.name.as_str())
+                .filter(|name| !name.is_empty())?;
+            let cpu_nanos = container
+                .cpu
+                .as_ref()
+                .and_then(|cpu| cpu.usage_nano_cores)
+                .map(|value| value.value)?;
+            let memory_bytes = container
+                .memory
+                .as_ref()
+                .and_then(|memory| memory.working_set_bytes.or(memory.usage_bytes))
+                .map(|value| value.value)?;
+            Some(NodeMetricsContainerSample::new(
+                name,
+                cpu_nanos,
+                memory_bytes,
+            ))
+        })
+        .collect();
+    Some(NodeMetricsPodSample::new(
+        metadata.namespace,
+        metadata.name,
+        metadata.uid,
+        containers,
+    ))
 }
 
 #[async_trait]
@@ -232,4 +257,67 @@ fn parse_meminfo_kib(meminfo: &str, key: &str) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow!("missing {key} value in /proc/meminfo"))?
         .parse::<u64>()
         .with_context(|| format!("invalid {key} value in /proc/meminfo"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_cri_pod_stats_to_transport_neutral_sample() {
+        let stats = k8s_cri::v1::PodSandboxStats {
+            attributes: Some(k8s_cri::v1::PodSandboxAttributes {
+                metadata: Some(k8s_cri::v1::PodSandboxMetadata {
+                    name: "pod-a".to_string(),
+                    namespace: "default".to_string(),
+                    uid: "uid-a".to_string(),
+                    attempt: 0,
+                }),
+                ..Default::default()
+            }),
+            linux: Some(k8s_cri::v1::LinuxPodSandboxStats {
+                containers: vec![k8s_cri::v1::ContainerStats {
+                    attributes: Some(k8s_cri::v1::ContainerAttributes {
+                        metadata: Some(k8s_cri::v1::ContainerMetadata {
+                            name: "app".to_string(),
+                            attempt: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    cpu: Some(k8s_cri::v1::CpuUsage {
+                        usage_nano_cores: Some(k8s_cri::v1::UInt64Value { value: 123_000_000 }),
+                        ..Default::default()
+                    }),
+                    memory: Some(k8s_cri::v1::MemoryUsage {
+                        working_set_bytes: Some(k8s_cri::v1::UInt64Value {
+                            value: 9 * 1024 * 1024,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let sample = node_metrics_pod_sample_from_cri(stats).unwrap();
+        assert_eq!(sample.uid(), "uid-a");
+        assert_eq!(sample.containers()[0].name(), "app");
+        assert_eq!(sample.containers()[0].cpu_nanos(), 123_000_000);
+        assert_eq!(sample.containers()[0].memory_bytes(), 9 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proc_node_usage_parser_reports_used_memory_and_cpu_counters() {
+        let usage = parse_proc_node_usage(
+            "cpu 10 20 30 100 5 2 3 0 0 0\ncpu0 1 2 3 4 5 6 7 0 0 0\n",
+            "MemTotal:       1024 kB\nMemAvailable:    256 kB\n",
+        )
+        .unwrap();
+
+        assert_eq!(usage.cpu_total_jiffies, 170);
+        assert_eq!(usage.cpu_idle_jiffies, 105);
+        assert_eq!(usage.memory_used_bytes, 768 * 1024);
+    }
 }

@@ -32,7 +32,7 @@ pub(crate) struct Context {
     #[cfg(test)]
     non_pod_finalization: Option<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>,
     #[cfg(test)]
-    metrics_provider: Option<Arc<dyn crate::metrics::MetricsProvider>>,
+    node_metrics: Option<Arc<dyn klights_node_api::NodeMetrics>>,
 }
 
 impl Context {
@@ -141,7 +141,7 @@ impl Context {
             db_handle,
             pod_repository: Some(repository),
             non_pod_finalization: Some(non_pod_finalization),
-            metrics_provider: None,
+            node_metrics: None,
         }
     }
 
@@ -219,11 +219,11 @@ impl Context {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_metrics_provider(
+    pub(crate) fn with_node_metrics(
         mut self,
-        metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+        node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     ) -> Self {
-        self.metrics_provider = Some(metrics_provider);
+        self.node_metrics = Some(node_metrics);
         self
     }
 
@@ -247,8 +247,8 @@ impl Context {
     }
 
     #[cfg(test)]
-    pub(crate) fn metrics_provider(&self) -> Option<&Arc<dyn crate::metrics::MetricsProvider>> {
-        self.metrics_provider.as_ref()
+    pub(crate) fn node_metrics(&self) -> Option<&Arc<dyn klights_node_api::NodeMetrics>> {
+        self.node_metrics.as_ref()
     }
 
     pub(crate) fn deployment_store(&self) -> &dyn super::deployment::DeploymentStore {

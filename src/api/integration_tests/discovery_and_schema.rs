@@ -285,54 +285,51 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     use tower::ServiceExt;
 
     #[derive(Clone)]
-    struct StaticMetricsProvider {
-        runtime: crate::metrics::RuntimeMetricsSnapshot,
+    struct StaticNodeMetrics {
+        result: klights_node_api::NodeMetricsResult,
     }
 
-    #[async_trait::async_trait]
-    impl crate::metrics::MetricsProvider for StaticMetricsProvider {
-        async fn runtime_snapshot_for_pods(
+    impl klights_node_api::NodeMetrics for StaticNodeMetrics {
+        fn collect_metrics(
             &self,
-            _pods: &[crate::datastore::Resource],
-        ) -> crate::metrics::RuntimeMetricsSnapshot {
-            self.runtime.clone()
+            _request: klights_node_api::NodeMetricsRequest,
+        ) -> klights_node_api::NodeMetricsFuture<'_, klights_node_api::NodeMetricsResult> {
+            Box::pin(async { Ok(self.result.clone()) })
         }
     }
 
-    let runtime = crate::metrics::RuntimeMetricsSnapshot::from_node_metrics_results([Ok(
-        klights_node_api::NodeMetricsResult::new(
-            klights_node_api::NodeMetricsTarget::try_new("node-a").unwrap(),
-            Some(klights_node_api::NodeMetricsNodeSample::new(
-                777_000_000,
-                256 * 1024 * 1024,
-            )),
-            vec![klights_node_api::NodeMetricsPodSample::new(
-                "metrics-ns",
-                "pod-a",
-                "",
-                vec![
-                    klights_node_api::NodeMetricsContainerSample::new(
-                        "app",
-                        123_000_000,
-                        9 * 1024 * 1024,
-                    ),
-                    klights_node_api::NodeMetricsContainerSample::new(
-                        "sidecar",
-                        45_000_000,
-                        5 * 1024 * 1024,
-                    ),
-                    klights_node_api::NodeMetricsContainerSample::new(
-                        "besteffort",
-                        1_000_000,
-                        1024 * 1024,
-                    ),
-                ],
-            )],
-        ),
-    )]);
+    let result = klights_node_api::NodeMetricsResult::new(
+        klights_node_api::NodeMetricsTarget::try_new("node-a").unwrap(),
+        Some(klights_node_api::NodeMetricsNodeSample::new(
+            777_000_000,
+            256 * 1024 * 1024,
+        )),
+        vec![klights_node_api::NodeMetricsPodSample::new(
+            "metrics-ns",
+            "pod-a",
+            "",
+            vec![
+                klights_node_api::NodeMetricsContainerSample::new(
+                    "app",
+                    123_000_000,
+                    9 * 1024 * 1024,
+                ),
+                klights_node_api::NodeMetricsContainerSample::new(
+                    "sidecar",
+                    45_000_000,
+                    5 * 1024 * 1024,
+                ),
+                klights_node_api::NodeMetricsContainerSample::new(
+                    "besteffort",
+                    1_000_000,
+                    1024 * 1024,
+                ),
+            ],
+        )],
+    );
     let mut state = build_test_app_state().await;
-    state.pod_node_subresources_mut().metrics_provider =
-        std::sync::Arc::new(StaticMetricsProvider { runtime });
+    state.pod_node_subresources_mut().node_metrics =
+        std::sync::Arc::new(StaticNodeMetrics { result });
     let db = state.resource_mutation().db.clone();
     let app = crate::api::build_router(state);
     db.create_resource(

@@ -1,12 +1,11 @@
 //! HorizontalPodAutoscaler controller reconcile logic.
 
-use crate::metrics::{
-    MetricsProvider, PodMetric, RuntimeMetricsSnapshot, format_resource_quantity,
-    parse_resource_quantity_value, pod_request_for_resource,
-};
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_node_api::{
+    NodeMetrics, NodeMetricsRequest, NodeMetricsResult, NodeMetricsSnapshot, NodeMetricsTarget,
+};
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 
@@ -53,7 +52,7 @@ pub(crate) async fn reconcile_hpa_with_runtime(
     runtime: &dyn HpaRuntime,
     hpa: &Value,
     node_name: &str,
-    metrics_provider: &dyn MetricsProvider,
+    node_metrics: &dyn NodeMetrics,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let api_version = hpa
@@ -78,7 +77,7 @@ pub(crate) async fn reconcile_hpa_with_runtime(
             .await?
             .context("HPA not found")?;
 
-        let decision = evaluate_hpa(runtime, metrics_provider, &current.data, namespace).await?;
+        let decision = evaluate_hpa(runtime, node_metrics, &current.data, namespace).await?;
         if decision.scale_active
             && let Some(target) = &decision.target
             && target.spec_replicas != decision.desired_replicas
@@ -153,7 +152,7 @@ struct HpaDecision {
 
 async fn evaluate_hpa(
     runtime: &dyn HpaRuntime,
-    metrics_provider: &dyn MetricsProvider,
+    node_metrics: &dyn NodeMetrics,
     hpa: &Value,
     namespace: &str,
 ) -> Result<HpaDecision> {
@@ -184,7 +183,7 @@ async fn evaluate_hpa(
         });
     };
 
-    let observations = observe_metrics(runtime, metrics_provider, hpa, spec, &target).await?;
+    let observations = observe_metrics(runtime, node_metrics, hpa, spec, &target).await?;
     if observations.is_empty() {
         let current = target.status_replicas;
         return Ok(HpaDecision {
@@ -317,7 +316,7 @@ async fn get_scale_target(
 
 async fn observe_metrics(
     runtime: &dyn HpaRuntime,
-    metrics_provider: &dyn MetricsProvider,
+    node_metrics: &dyn NodeMetrics,
     hpa: &Value,
     spec: &Value,
     target: &ScaleTarget,
@@ -336,9 +335,7 @@ async fn observe_metrics(
     if matching_ready_pods.is_empty() {
         return Ok(Vec::new());
     }
-    let runtime = metrics_provider
-        .runtime_snapshot_for_pods(&matching_ready_pods)
-        .await;
+    let snapshot = collect_metrics_snapshot(node_metrics, &matching_ready_pods).await;
 
     if hpa.get("apiVersion").and_then(|v| v.as_str()) == Some("autoscaling/v1") {
         if let Some(target_utilization) = spec
@@ -352,7 +349,7 @@ async fn observe_metrics(
                 target_utilization,
                 target,
                 &matching_ready_pods,
-                &runtime,
+                &snapshot,
             )
             .into_iter()
             .collect());
@@ -390,12 +387,12 @@ async fn observe_metrics(
                 .filter(|value| *value > 0),
             "AverageValue" => target_metric
                 .get("averageValue")
-                .and_then(|value| parse_resource_quantity_value(name, value))
+                .and_then(|value| parse_metrics_quantity_value(name, value))
                 .and_then(|value| i64::try_from(value).ok())
                 .filter(|value| *value > 0),
             "Value" => target_metric
                 .get("value")
-                .and_then(|value| parse_resource_quantity_value(name, value))
+                .and_then(|value| parse_metrics_quantity_value(name, value))
                 .and_then(|value| i64::try_from(value).ok())
                 .filter(|value| *value > 0),
             _ => None,
@@ -408,7 +405,7 @@ async fn observe_metrics(
                 target_value,
                 target,
                 &matching_ready_pods,
-                &runtime,
+                &snapshot,
             )
         {
             observations.push(observation);
@@ -423,9 +420,9 @@ fn observe_resource_metric(
     target_value: i64,
     target: &ScaleTarget,
     pods: &[Resource],
-    runtime: &RuntimeMetricsSnapshot,
+    snapshot: &NodeMetricsSnapshot,
 ) -> Option<MetricObservation> {
-    let summary = ResourceMetricSummary::from_pods(name, pods, runtime)?;
+    let summary = ResourceMetricSummary::from_pods(name, pods, snapshot)?;
     let target_value = u64::try_from(target_value).ok()?;
     let desired_replicas = match target_type {
         "Utilization" => {
@@ -468,15 +465,15 @@ impl ResourceMetricSummary {
     fn from_pods(
         resource: &str,
         pods: &[Resource],
-        runtime: &RuntimeMetricsSnapshot,
+        snapshot: &NodeMetricsSnapshot,
     ) -> Option<Self> {
         let mut pod_count = 0_u64;
         let mut total_usage = 0_u64;
         let mut total_request = 0_u64;
         let mut request_complete = true;
         for pod in pods {
-            let metric = PodMetric::from_resource(pod, runtime)?;
-            total_usage = total_usage.saturating_add(metric.usage_for_resource(resource)?);
+            total_usage =
+                total_usage.saturating_add(pod_usage_for_resource(pod, snapshot, resource)?);
             if let Some(request) = pod_request_for_resource(pod, resource) {
                 total_request = total_request.saturating_add(request);
             } else {
@@ -504,19 +501,121 @@ impl ResourceMetricSummary {
     }
 }
 
+async fn collect_metrics_snapshot(
+    node_metrics: &dyn NodeMetrics,
+    pods: &[Resource],
+) -> NodeMetricsSnapshot {
+    let nodes = pods
+        .iter()
+        .filter_map(|pod| {
+            pod.data
+                .pointer("/spec/nodeName")
+                .and_then(Value::as_str)
+                .filter(|node| !node.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let results = futures::future::join_all(nodes.into_iter().map(|node_name| async move {
+        let request = NodeMetricsTarget::try_new(node_name)
+            .map(|target| NodeMetricsRequest::new(target, Vec::new()));
+        match request {
+            Ok(request) => node_metrics.collect_metrics(request).await,
+            Err(error) => Err(error),
+        }
+    }))
+    .await;
+    NodeMetricsSnapshot::from_results(results.into_iter().filter_map(
+        |result: Result<NodeMetricsResult, klights_node_api::NodeMetricsError>| result.ok(),
+    ))
+}
+
+fn pod_usage_for_resource(
+    pod: &Resource,
+    snapshot: &NodeMetricsSnapshot,
+    resource: &str,
+) -> Option<u64> {
+    let namespace = pod
+        .namespace
+        .as_deref()
+        .or_else(|| {
+            pod.data
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    let uid = if pod.uid.is_empty() {
+        pod.data
+            .pointer("/metadata/uid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    } else {
+        &pod.uid
+    };
+    pod.data
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)?
+        .iter()
+        .try_fold(0_u64, |total, container| {
+            let container_name = container.get("name").and_then(Value::as_str)?;
+            let usage = snapshot.container_usage(uid, namespace, &pod.name, container_name)?;
+            Some(total.saturating_add(usage.resource_value(resource)?))
+        })
+}
+
+fn pod_request_for_resource(pod: &Resource, resource: &str) -> Option<u64> {
+    pod.data
+        .pointer("/spec/containers")
+        .and_then(Value::as_array)?
+        .iter()
+        .try_fold(0_u64, |total, container| {
+            let raw = container
+                .pointer(&format!("/resources/requests/{resource}"))
+                .and_then(Value::as_str)?;
+            Some(total.saturating_add(parse_metrics_quantity(resource, raw)?))
+        })
+}
+
+fn parse_metrics_quantity(resource: &str, raw: &str) -> Option<u64> {
+    let value = match resource {
+        "cpu" => klights_types::parse_cpu_milli(raw)?.checked_mul(1_000_000)?,
+        "memory" => klights_types::parse_memory_bytes(raw)?,
+        _ => return None,
+    };
+    u64::try_from(value).ok()
+}
+
+fn parse_metrics_quantity_value(resource: &str, value: &Value) -> Option<u64> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| Some(value.to_string()))
+        .and_then(|raw| parse_metrics_quantity(resource, &raw))
+}
+
+fn format_metrics_quantity(resource: &str, value: u64) -> Result<String> {
+    match resource {
+        "cpu" if value == 0 => Ok("0".to_string()),
+        "cpu" if value.is_multiple_of(1_000_000) => Ok(format!("{}m", value / 1_000_000)),
+        "cpu" => Ok(format!("{value}n")),
+        "memory" if value == 0 => Ok("0".to_string()),
+        "memory" => Ok(format!("{}Ki", value.div_ceil(1024))),
+        _ => anyhow::bail!("unsupported resource metric '{resource}'"),
+    }
+}
+
 fn resource_current_metric(
     name: &str,
     target_type: &str,
     summary: &ResourceMetricSummary,
 ) -> Result<Value> {
     let current = match target_type {
-        "Value" => json!({"value": format_resource_quantity(name, summary.total_usage)?}),
+        "Value" => json!({"value": format_metrics_quantity(name, summary.total_usage)?}),
         "AverageValue" => {
-            json!({"averageValue": format_resource_quantity(name, summary.average_usage())?})
+            json!({"averageValue": format_metrics_quantity(name, summary.average_usage())?})
         }
         _ => json!({
             "averageUtilization": summary.average_utilization.unwrap_or(0),
-            "averageValue": format_resource_quantity(name, summary.average_usage())?
+            "averageValue": format_metrics_quantity(name, summary.average_usage())?
         }),
     };
     Ok(json!({
@@ -706,7 +805,7 @@ mod tests {
         pod_repository: &crate::kubelet::pod_repository::PodRepository,
         hpa: &serde_json::Value,
         node_name: &str,
-        metrics_provider: &dyn crate::metrics::MetricsProvider,
+        node_metrics: &dyn NodeMetrics,
     ) -> anyhow::Result<()> {
         reconcile_hpa_with_metrics_root(
             db,
@@ -715,7 +814,7 @@ mod tests {
             &crate::controllers::ControllerCoordination::new(),
             hpa,
             node_name,
-            metrics_provider,
+            node_metrics,
             chrono::Utc::now(),
         )
         .await
@@ -821,7 +920,7 @@ mod tests {
     async fn missing_target_retries_status_conflict_and_then_stabilizes_as_noop() {
         let runtime = missing_target_runtime(1);
         let hpa = (*runtime.current.lock().unwrap().data).clone();
-        let metrics = crate::metrics::FallbackOnlyMetricsProvider;
+        let metrics = crate::node_metrics_adapter::UnavailableNodeMetrics;
         reconcile_hpa_with_runtime(&runtime, &hpa, "node-a", &metrics, chrono::Utc::now())
             .await
             .unwrap();
@@ -868,6 +967,7 @@ mod tests {
                     "labels": labels
                 },
                 "spec": {
+                    "nodeName": "node-a",
                     "containers": [{
                         "name": "app",
                         "image": "nginx",
@@ -886,14 +986,16 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct StaticMetricsProvider {
-        runtime: RuntimeMetricsSnapshot,
+    struct StaticNodeMetrics {
+        result: NodeMetricsResult,
     }
 
-    #[async_trait::async_trait]
-    impl MetricsProvider for StaticMetricsProvider {
-        async fn runtime_snapshot_for_pods(&self, _pods: &[Resource]) -> RuntimeMetricsSnapshot {
-            self.runtime.clone()
+    impl NodeMetrics for StaticNodeMetrics {
+        fn collect_metrics(
+            &self,
+            _request: klights_node_api::NodeMetricsRequest,
+        ) -> klights_node_api::NodeMetricsFuture<'_, NodeMetricsResult> {
+            Box::pin(async { Ok(self.result.clone()) })
         }
     }
 
@@ -902,8 +1004,8 @@ mod tests {
         pod_names: impl IntoIterator<Item = &'a str>,
         cpu_nanos: u64,
         memory_bytes: u64,
-    ) -> RuntimeMetricsSnapshot {
-        RuntimeMetricsSnapshot::from_node_metrics_results([Ok(NodeMetricsResult::new(
+    ) -> NodeMetricsResult {
+        NodeMetricsResult::new(
             NodeMetricsTarget::try_new("node-a").unwrap(),
             None,
             pod_names
@@ -921,7 +1023,7 @@ mod tests {
                     )
                 })
                 .collect(),
-        ))])
+        )
     }
 
     #[tokio::test]
@@ -990,23 +1092,17 @@ mod tests {
 
         let pod_names: Vec<String> = (0..4).map(|index| format!("web-{index}")).collect();
         let pod_name_refs: Vec<&str> = pod_names.iter().map(String::as_str).collect();
-        let metrics_provider = StaticMetricsProvider {
-            runtime: runtime_metrics_for_pods(
+        let node_metrics = StaticNodeMetrics {
+            result: runtime_metrics_for_pods(
                 "default",
                 pod_name_refs.iter().copied(),
                 100_000_000,
                 64 * 1024 * 1024,
             ),
         };
-        reconcile_hpa_with_metrics(
-            &db,
-            pod_repository.as_ref(),
-            &hpa,
-            "node-a",
-            &metrics_provider,
-        )
-        .await
-        .unwrap();
+        reconcile_hpa_with_metrics(&db, pod_repository.as_ref(), &hpa, "node-a", &node_metrics)
+            .await
+            .unwrap();
 
         let deployment = db
             .get_resource("apps/v1", "Deployment", Some("default"), "web")
@@ -1104,23 +1200,17 @@ mod tests {
 
         let pod_names: Vec<String> = (0..3).map(|index| format!("legacy-{index}")).collect();
         let pod_name_refs: Vec<&str> = pod_names.iter().map(String::as_str).collect();
-        let metrics_provider = StaticMetricsProvider {
-            runtime: runtime_metrics_for_pods(
+        let node_metrics = StaticNodeMetrics {
+            result: runtime_metrics_for_pods(
                 "default",
                 pod_name_refs.iter().copied(),
                 100_000_000,
                 64 * 1024 * 1024,
             ),
         };
-        reconcile_hpa_with_metrics(
-            &db,
-            pod_repository.as_ref(),
-            &hpa,
-            "node-a",
-            &metrics_provider,
-        )
-        .await
-        .unwrap();
+        reconcile_hpa_with_metrics(&db, pod_repository.as_ref(), &hpa, "node-a", &node_metrics)
+            .await
+            .unwrap();
 
         let rc = db
             .get_resource("v1", "ReplicationController", Some("default"), "legacy")

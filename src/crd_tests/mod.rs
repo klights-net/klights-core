@@ -191,7 +191,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                 )),
             )),
             None,
-            std::sync::Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
+            std::sync::Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
             crate::portforward::local_node_port_forward(task_supervisor.clone()),
             None,
             None,

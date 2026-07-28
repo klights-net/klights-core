@@ -444,10 +444,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         }
     };
 
-    let metrics_provider: Arc<dyn crate::metrics::MetricsProvider> =
-        Arc::new(crate::metrics::OnDemandMetricsProvider::new(
+    let local_node_metrics = cri_for_api.clone().map(|cri| {
+        Arc::new(crate::kubelet::metrics::CriNodeMetricsSampler::new(
+            cri,
+            supervisor.clone(),
+        )) as Arc<dyn klights_node_api::NodeMetricsSampler>
+    });
+    let node_metrics: Arc<dyn klights_node_api::NodeMetrics> =
+        Arc::new(crate::node_metrics_adapter::RootNodeMetrics::new(
             config.node_name.clone(),
-            cri_for_api.clone(),
+            local_node_metrics,
             replication_service_for_router
                 .clone()
                 .map(|service| service as Arc<dyn klights_node_api::NodeMetrics>),
@@ -729,7 +735,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         non_pod_finalization,
         controller_coordination.clone(),
         Arc::from(config.node_name.as_str()),
-        metrics_provider.clone(),
+        node_metrics.clone(),
     ));
     let controller_dispatcher = Arc::new(crate::controllers::ControllerDispatcher::new_complete(
         service_ipam.clone(),
@@ -1011,7 +1017,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 ))
             },
             None,
-            metrics_provider.clone(),
+            node_metrics.clone(),
             node_port_forward,
             #[cfg(test)]
             Some(pod_lifecycle_router.clone()),
@@ -1711,7 +1717,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ))
         },
         local_node_exec,
-        metrics_provider.clone(),
+        node_metrics.clone(),
         node_port_forward,
         Some(pod_lifecycle_router.clone()),
         Some(

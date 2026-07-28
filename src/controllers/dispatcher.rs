@@ -78,7 +78,7 @@ pub struct ControllerDispatcher {
     #[cfg(test)]
     pod_repository: Arc<Mutex<Option<Arc<crate::kubelet::pod_repository::PodRepository>>>>,
     #[cfg(test)]
-    metrics_provider: Arc<Mutex<Option<Arc<dyn crate::metrics::MetricsProvider>>>>,
+    node_metrics: Arc<Mutex<Option<Arc<dyn klights_node_api::NodeMetrics>>>>,
     #[cfg(not(test))]
     dependencies: ControllerRuntimeDependencies,
     #[cfg(test)]
@@ -212,7 +212,7 @@ impl ControllerDispatcher {
             sync_ctx: Arc::new(Mutex::new(None)),
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
-            metrics_provider: Arc::new(Mutex::new(None)),
+            node_metrics: Arc::new(Mutex::new(None)),
             file_process,
             coordination: Arc::new(crate::controllers::ControllerCoordination::new()),
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
@@ -319,7 +319,7 @@ impl ControllerDispatcher {
             sync_ctx: Arc::new(Mutex::new(None)),
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
-            metrics_provider: Arc::new(Mutex::new(None)),
+            node_metrics: Arc::new(Mutex::new(None)),
             file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor),
             coordination: dependencies.coordination,
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
@@ -361,16 +361,13 @@ impl ControllerDispatcher {
     }
 
     #[cfg(test)]
-    pub async fn set_metrics_provider(
-        &self,
-        metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
-    ) {
-        *self.metrics_provider.lock().await = Some(metrics_provider);
+    pub async fn set_node_metrics(&self, node_metrics: Arc<dyn klights_node_api::NodeMetrics>) {
+        *self.node_metrics.lock().await = Some(node_metrics);
     }
 
     #[cfg(test)]
-    async fn current_metrics_provider(&self) -> Option<Arc<dyn crate::metrics::MetricsProvider>> {
-        self.metrics_provider.lock().await.clone()
+    async fn current_node_metrics(&self) -> Option<Arc<dyn klights_node_api::NodeMetrics>> {
+        self.node_metrics.lock().await.clone()
     }
 
     /// Extract the workqueue key from a resource and enqueue it. Producers
@@ -876,8 +873,8 @@ impl ControllerDispatcher {
                 Some(pod_repository) => ctx.with_pod_repository(pod_repository),
                 None => ctx,
             };
-            let ctx = match self.current_metrics_provider().await {
-                Some(metrics_provider) => ctx.with_metrics_provider(metrics_provider),
+            let ctx = match self.current_node_metrics().await {
+                Some(node_metrics) => ctx.with_node_metrics(node_metrics),
                 None => ctx,
             };
             let ctx = ctx.with_non_pod_finalization(Arc::new(

@@ -170,7 +170,7 @@ pub(crate) struct ApiPodNodeSubresourceServices {
     pub(crate) services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
     pub(crate) pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
     pub(crate) local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
-    pub(crate) metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+    pub(crate) node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     pub(crate) node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
     #[cfg(test)]
     pub(crate) pod_lifecycle_router:
@@ -186,7 +186,7 @@ impl ApiPodNodeSubresourceServices {
         services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
         pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
         local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
-        metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+        node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
         node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
         #[cfg(test)] pod_lifecycle_router: Option<
             Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
@@ -198,7 +198,7 @@ impl ApiPodNodeSubresourceServices {
             services,
             pod_log_follow_watch,
             local_node_exec,
-            metrics_provider,
+            node_metrics,
             node_port_forward,
             #[cfg(test)]
             pod_lifecycle_router,
@@ -429,7 +429,7 @@ pub(crate) fn build_router_from_root(
     services: Arc<dyn klights_reconcile_api::ServiceRoutingSync>,
     pod_log_follow_watch: crate::api::pod_subresources::logs::PodLogFollowWatchSource,
     local_node_exec: Option<Arc<dyn klights_node_api::NodeExec>>,
-    metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+    node_metrics: Arc<dyn klights_node_api::NodeMetrics>,
     node_port_forward: Arc<dyn klights_node_api::NodePortForward>,
     pod_lifecycle_diagnostics: Option<Arc<dyn klights_pod_api::PodLifecycleDiagnosticsQuery>>,
     pod_start_retry_state: Option<Arc<dyn klights_pod_api::PodStartRetryDiagnostics>>,
@@ -499,7 +499,7 @@ pub(crate) fn build_router_from_root(
             services,
             pod_log_follow_watch,
             local_node_exec,
-            metrics_provider,
+            node_metrics,
             node_port_forward,
             pod_lifecycle_diagnostics,
             pod_start_retry_state,

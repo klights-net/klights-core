@@ -188,7 +188,7 @@ pub(crate) async fn build_test_app_state_with_db(
                 )),
             )),
             None,
-            Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
+            Arc::new(crate::node_metrics_adapter::UnavailableNodeMetrics),
             crate::portforward::local_node_port_forward(task_supervisor.clone()),
             None,
             None,

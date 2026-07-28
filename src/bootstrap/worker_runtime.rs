@@ -346,7 +346,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             )),
             crate::replication::grpc::client::NodeMetricsCapability::Available(
                 std::sync::Arc::new(crate::kubelet::remote_runtime::CriNodeMetricsRuntime::new(
-                    std::sync::Arc::new(crate::metrics::CriNodeMetricsSampler::new(
+                    std::sync::Arc::new(crate::kubelet::metrics::CriNodeMetricsSampler::new(
                         cri.clone(),
                         task_supervisor.clone(),
                     )),
