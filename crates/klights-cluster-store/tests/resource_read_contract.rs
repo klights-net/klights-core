@@ -251,6 +251,9 @@ fn list_snapshot_accepts_a_valid_scalar_rv_handoff_position() {
 #[test]
 fn resource_read_errors_preserve_kubernetes_semantics() {
     let errors = [
+        ResourceReadError::InvalidRequest {
+            message: "bad request".into(),
+        },
         ResourceReadError::InvalidSelector {
             message: "bad selector".into(),
         },
@@ -276,7 +279,7 @@ fn resource_read_errors_preserve_kubernetes_semantics() {
         ResourceReadError::Timeout,
         ResourceReadError::Cancelled,
     ];
-    assert_eq!(errors.len(), 9);
+    assert_eq!(errors.len(), 10);
     let statuses = errors
         .iter()
         .map(ResourceReadError::status)
@@ -289,6 +292,7 @@ fn resource_read_errors_preserve_kubernetes_semantics() {
         vec![
             (400, "BadRequest"),
             (400, "BadRequest"),
+            (400, "BadRequest"),
             (410, "Expired"),
             (409, "Conflict"),
             (501, "NotImplemented"),
@@ -298,5 +302,5 @@ fn resource_read_errors_preserve_kubernetes_semantics() {
             (499, "Cancelled"),
         ]
     );
-    assert!(statuses[6].retryable && statuses[7].retryable);
+    assert!(statuses[7].retryable && statuses[8].retryable);
 }

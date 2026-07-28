@@ -2149,6 +2149,7 @@ name = "klights-cluster-store"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "klights-cluster-core",
  "klights-types",
 ]

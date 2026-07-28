@@ -2,7 +2,6 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::{Result, anyhow};
 
-use crate::datastore::RawWatchEvent;
 use klights_watch::{
     PositionedWatchEvent, PositionedWatchReplayRead, WatchReplayPosition, WatchSignal,
     WatchSignalReceiver, WatchTopic,
@@ -255,7 +254,7 @@ impl ReplayCursorEvent for WatchEvent {
     }
 }
 
-impl ReplayCursorEvent for RawWatchEvent {
+impl ReplayCursorEvent for klights_cluster_store::DurableRawWatchEvent {
     fn resource_version(&self) -> Option<i64> {
         Some(self.resource_version)
     }

@@ -8,7 +8,6 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use crate::datastore::types::*;
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::tables;
 use klights_types::HostPortRange;
@@ -41,7 +40,7 @@ impl RedbNetworkStore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         let cluster_cidr_owned = cluster_cidr.to_string();
         let node_ip_owned = node_ip.to_string();
         let node_name_owned = node_name.to_string();
@@ -76,7 +75,7 @@ impl RedbNetworkStore {
                 let existing = parse_persisted_node_subnet(&bytes)?;
 
                 w.commit()?;
-                return Ok(NodeSubnet {
+                return Ok(klights_cluster_store::StoredNodeSubnet {
                     node_name: node_name_typed,
                     subnet: existing.subnet,
                     subnet_base_int: existing.subnet_base_int,
@@ -125,7 +124,7 @@ impl RedbNetworkStore {
                     t.insert(node_name, serde_json::to_vec(&v)?.as_slice())?;
                 }
                 w.commit()?;
-                return Ok(NodeSubnet {
+                return Ok(klights_cluster_store::StoredNodeSubnet {
                     node_name: node_name_typed,
                     subnet: subnet_typed,
                     subnet_base_int: base,
@@ -188,7 +187,10 @@ impl RedbNetworkStore {
         .await
     }
 
-    pub async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    pub async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         let node_name_owned = node_name.to_string();
         self.db_call("get_node_subnet_impl", move |db| {
             let node_name: &str = &node_name_owned;
@@ -202,17 +204,23 @@ impl RedbNetworkStore {
         .await
     }
 
-    pub async fn list_peer_subnets(&self, my_node: &str) -> Result<Vec<NodeSubnet>> {
-        let my_node_owned = my_node.to_string();
+    pub async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        let excluded_node_name = request
+            .excluded_node_name()
+            .map(|node_name| node_name.as_str().to_string());
         self.db_call("list_peer_subnets_impl", move |db| {
-            let my_node: &str = &my_node_owned;
             let r = db.begin_read()?;
             let t = r.open_table(tables::NODE_SUBNETS)?;
             let mut items = Vec::new();
             for e in t.iter()? {
                 let (k, val) = e?;
                 let name = k.value();
-                if name == my_node {
+                if (excluded_node_name.is_none() && name.is_empty())
+                    || excluded_node_name.as_deref() == Some(name)
+                {
                     continue;
                 }
                 items.push(parse_node_subnet_value(name, val.value())?);
@@ -365,10 +373,13 @@ fn parse_persisted_node_subnet(body: &[u8]) -> Result<PersistedNodeSubnet> {
     })
 }
 
-fn parse_node_subnet_value(name: &str, body: &[u8]) -> Result<NodeSubnet> {
+fn parse_node_subnet_value(
+    name: &str,
+    body: &[u8],
+) -> Result<klights_cluster_store::StoredNodeSubnet> {
     let node_name = NodeName::parse(name).map_err(|e| anyhow!("bad node name: {e}"))?;
     let subnet = parse_persisted_node_subnet(body)?;
-    Ok(NodeSubnet {
+    Ok(klights_cluster_store::StoredNodeSubnet {
         node_name,
         subnet: subnet.subnet,
         subnet_base_int: subnet.subnet_base_int,
@@ -520,12 +531,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_peer_subnets_ignores_empty_key_and_excluding_still_filters_node() {
+        let store_with_empty_key = store().await;
+        insert_raw_node_subnet_value(&store_with_empty_key, "", valid_node_subnet_value()).await;
+        insert_raw_node_subnet_value(
+            &store_with_empty_key,
+            "healthy-a",
+            valid_node_subnet_value(),
+        )
+        .await;
+        insert_raw_node_subnet_value(
+            &store_with_empty_key,
+            "healthy-b",
+            valid_node_subnet_value(),
+        )
+        .await;
+
+        let all = store_with_empty_key
+            .list_peer_subnets(klights_cluster_store::PeerTopologyRequest::all())
+            .await
+            .expect("the empty snapshot sentinel must be filtered before row decoding");
+        let mut all_names = all
+            .iter()
+            .map(|row| row.node_name.as_str())
+            .collect::<Vec<_>>();
+        all_names.sort_unstable();
+        assert_eq!(all_names, ["healthy-a", "healthy-b"]);
+
+        let excluding_with_empty_key = store_with_empty_key
+            .list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("healthy-a").unwrap(),
+            )
+            .await;
+        assert!(
+            excluding_with_empty_key.is_err(),
+            "excluding must preserve the legacy empty-key parse error"
+        );
+
+        let clean_store = store().await;
+        insert_raw_node_subnet_value(&clean_store, "healthy-a", valid_node_subnet_value()).await;
+        insert_raw_node_subnet_value(&clean_store, "healthy-b", valid_node_subnet_value()).await;
+        let excluding = clean_store
+            .list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("healthy-a").unwrap(),
+            )
+            .await
+            .expect("excluding a healthy node must retain the other healthy row");
+        assert_eq!(excluding.len(), 1);
+        assert_eq!(excluding[0].node_name.as_str(), "healthy-b");
+    }
+
+    #[tokio::test]
     async fn node_subnet_read_paths_reject_unknown_persisted_mode() {
         let s = store().await;
         insert_raw_node_subnet(&s, "peer-a", "mystery").await;
 
         assert!(s.get_node_subnet("peer-a").await.is_err());
-        assert!(s.list_peer_subnets("local-node").await.is_err());
+        assert!(
+            s.list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("local-node").unwrap(),
+            )
+            .await
+            .is_err()
+        );
         assert!(
             s.allocate_node_subnet("peer-a", "10.42.0.0/16", "192.0.2.7")
                 .await
@@ -588,7 +656,11 @@ mod tests {
                 "{name} must fail get"
             );
             assert!(
-                s.list_peer_subnets("local-node").await.is_err(),
+                s.list_peer_subnets(
+                    klights_cluster_store::PeerTopologyRequest::excluding("local-node").unwrap(),
+                )
+                .await
+                .is_err(),
                 "{name} must fail list"
             );
             assert!(
@@ -630,7 +702,12 @@ mod tests {
             assert_eq!(fetched.mode, NodePeerMode::Root, "{name} hostport field");
             assert_eq!(fetched.hostport_range, None, "{name} hostport field");
 
-            let listed = s.list_peer_subnets("local-node").await.unwrap();
+            let listed = s
+                .list_peer_subnets(
+                    klights_cluster_store::PeerTopologyRequest::excluding("local-node").unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].mode, NodePeerMode::Root);
             assert_eq!(listed[0].hostport_range, None);
@@ -652,7 +729,14 @@ mod tests {
             value["mode"] = mode;
             insert_raw_node_subnet_value(&s, "peer-a", value).await;
             assert!(s.get_node_subnet("peer-a").await.is_err(), "{name}");
-            assert!(s.list_peer_subnets("local-node").await.is_err(), "{name}");
+            assert!(
+                s.list_peer_subnets(
+                    klights_cluster_store::PeerTopologyRequest::excluding("local-node").unwrap(),
+                )
+                .await
+                .is_err(),
+                "{name}"
+            );
             assert!(
                 s.allocate_node_subnet("peer-a", "10.42.0.0/16", "192.0.2.7")
                     .await

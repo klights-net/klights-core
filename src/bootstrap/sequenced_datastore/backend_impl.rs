@@ -17,9 +17,9 @@ use tokio::sync::broadcast;
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{
-    AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PodCleanupIntent,
-    PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata, ResourceList,
-    ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+    AppliedOutboxRecord, CatchUpResource, ListPageRequest, PodCleanupIntent,
+    PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 #[cfg(test)]
 use crate::datastore::types::{PendingWatchEvent, ReplicatedCreateOptions};
@@ -792,7 +792,7 @@ impl DatastoreBackend for SequencedDatastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.passive
             .list_raw_watch_events_since_checked_bounded(targets, since_rv, limit)
             .await
@@ -803,7 +803,7 @@ impl DatastoreBackend for SequencedDatastore {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.passive
             .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
@@ -863,7 +863,7 @@ impl DatastoreBackend for SequencedDatastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         self.propose_command(StorageCommand::AllocateNodeSubnet {
             node_name: node_name.to_string(),
             subnet: cluster_cidr.to_string(),
@@ -921,11 +921,17 @@ impl DatastoreBackend for SequencedDatastore {
         self.passive.get_node_dataplane(node_name).await
     }
 
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         self.passive.get_node_subnet(node_name).await
     }
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.passive.list_peer_subnets(my_node_name).await
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        self.passive.list_peer_subnets(request).await
     }
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
         self.propose_command(StorageCommand::DeleteNodeSubnet {
@@ -1696,7 +1702,7 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<crate::datastore::NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         crate::datastore::DatastoreBackend::allocate_node_subnet(
             self,
             node_name,
@@ -1738,15 +1744,15 @@ impl crate::datastore::NetworkMetadataStore for SequencedDatastore {
     async fn get_node_subnet(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::datastore::NodeSubnet>> {
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         crate::datastore::DatastoreBackend::get_node_subnet(self, node_name).await
     }
 
     async fn list_peer_subnets(
         &self,
-        my_node_name: &str,
-    ) -> Result<Vec<crate::datastore::NodeSubnet>> {
-        crate::datastore::DatastoreBackend::list_peer_subnets(self, my_node_name).await
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        crate::datastore::DatastoreBackend::list_peer_subnets(self, request).await
     }
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
@@ -2056,7 +2062,8 @@ impl crate::datastore::WatchMaintenanceStore for SequencedDatastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<crate::datastore::WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<crate::datastore::WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>
+    {
         crate::datastore::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
             self, targets, since_rv, limit,
         )

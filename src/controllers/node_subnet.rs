@@ -18,7 +18,7 @@ use crate::controllers::annotations::{
 #[cfg(test)]
 use crate::datastore::WatchTarget;
 #[cfg(test)]
-use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet};
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
 #[cfg(test)]
 use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 #[cfg(test)]
@@ -152,7 +152,7 @@ pub trait NodeReadinessPublisher: Send + Sync {
 #[cfg(test)]
 async fn endpoint_for_peer(
     db: &dyn DatastoreBackend,
-    peer: &NodeSubnet,
+    peer: &klights_cluster_store::StoredNodeSubnet,
 ) -> Result<Option<klights_network_api::PeerRoute>> {
     let Some(metadata) = db.get_node_dataplane(peer.node_name.as_ref()).await? else {
         tracing::warn!(
@@ -172,7 +172,7 @@ async fn endpoint_for_peer(
 }
 
 /// Tracks every peer the controller has actually installed against the network
-/// `PeerRouter`, keyed by node name. Stores both the projected `NodeSubnet`
+/// `PeerRouter`, keyed by node name. Stores both the persisted node subnet
 /// (for change detection) and the exact `PeerRoute` variant we applied so
 /// removal hits the same shape — root removal must not be issued against a
 /// rootless endpoint or vice versa.
@@ -263,7 +263,7 @@ pub async fn ensure_local_node_subnet(
     node_name: &str,
     cluster_cidr: &str,
     node_ip: &str,
-) -> Result<NodeSubnet> {
+) -> Result<klights_cluster_store::StoredNodeSubnet> {
     let subnet = db
         .allocate_node_subnet(node_name, cluster_cidr, node_ip)
         .await
@@ -840,10 +840,13 @@ pub async fn sync_peer_routes(
     applied: &mut HashMap<String, AppliedPeer>,
 ) -> Result<PeerSyncOutcome> {
     let desired_list = db
-        .list_peer_subnets(my_node_name)
+        .list_peer_subnets(
+            klights_cluster_store::PeerTopologyRequest::excluding(my_node_name)
+                .map_err(anyhow::Error::new)?,
+        )
         .await
         .context("list_peer_subnets failed")?;
-    let desired: HashMap<String, NodeSubnet> = desired_list
+    let desired: HashMap<String, klights_cluster_store::StoredNodeSubnet> = desired_list
         .into_iter()
         .map(|peer| (peer.node_name.as_str().to_string(), peer))
         .collect();
@@ -1980,9 +1983,19 @@ mod tests {
         db.allocate_node_subnet("node-b", "10.42.0.0/16", "10.0.0.2")
             .await
             .unwrap();
-        let peers = db.list_peer_subnets("node-a").await.unwrap();
+        let peers = db
+            .list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("node-a").unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(peers.len(), 1, "self excluded, peer row included");
         assert_eq!(peers[0].node_name.as_str(), "node-b");
+        let all = db
+            .list_peer_subnets(klights_cluster_store::PeerTopologyRequest::all())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "snapshot domain includes every stored row");
     }
 
     #[tokio::test]
@@ -2693,7 +2706,12 @@ mod tests {
         db.allocate_node_subnet("rootless-d", "10.42.0.0/16", "10.0.0.4")
             .await
             .unwrap();
-        let peers = db.list_peer_subnets("node-a").await.unwrap();
+        let peers = db
+            .list_peer_subnets(
+                klights_cluster_store::PeerTopologyRequest::excluding("node-a").unwrap(),
+            )
+            .await
+            .unwrap();
         let rootless_peer = peers
             .iter()
             .find(|p| p.node_name.as_str() == "rootless-d")

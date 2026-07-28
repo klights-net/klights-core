@@ -369,7 +369,7 @@ impl Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         if targets.is_empty() {
             return Ok(WatchReplayRead::Events(Vec::new()));
         }
@@ -396,7 +396,7 @@ impl Datastore {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         if targets.is_empty() {
             return Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
                 events: Vec::new(),
@@ -539,7 +539,12 @@ impl Datastore {
         position: WatchReplayPosition,
         high_water_event_id: i64,
         limit: std::num::NonZeroUsize,
-    ) -> rusqlite::Result<Vec<(WatchReplayPosition, RawWatchEvent)>> {
+    ) -> rusqlite::Result<
+        Vec<(
+            WatchReplayPosition,
+            klights_cluster_store::DurableRawWatchEvent,
+        )>,
+    > {
         let (query, params) =
             Self::positioned_watch_query(targets, position, high_water_event_id, limit);
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -626,7 +631,7 @@ impl Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: Option<std::num::NonZeroUsize>,
-    ) -> rusqlite::Result<Vec<RawWatchEvent>> {
+    ) -> rusqlite::Result<Vec<klights_cluster_store::DurableRawWatchEvent>> {
         let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
 

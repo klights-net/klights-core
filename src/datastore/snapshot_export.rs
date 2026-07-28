@@ -25,7 +25,7 @@ use anyhow::Result;
 use klights_cluster_core::Resource;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::types::{NodeSubnet, PodCleanupIntent};
+use crate::datastore::types::PodCleanupIntent;
 use klights_cluster_core::{
     ClusterMutation, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
     LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
@@ -217,7 +217,9 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
 
     let current_rv = db.get_current_resource_version().await.unwrap_or(0);
     if current_rv > 0 {
-        let mut peers = db.list_peer_subnets("").await?;
+        let mut peers = db
+            .list_peer_subnets(klights_cluster_store::PeerTopologyRequest::all())
+            .await?;
         peers.sort_by(|a, b| a.node_name.as_str().cmp(b.node_name.as_str()));
         for peer in peers {
             let node_name = peer.node_name.to_string();
@@ -492,7 +494,9 @@ pub(crate) fn watch_event_mutation(
     }))
 }
 
-fn cluster_network_mutation_from_subnet(row: &NodeSubnet) -> ClusterMutation {
+fn cluster_network_mutation_from_subnet(
+    row: &klights_cluster_store::StoredNodeSubnet,
+) -> ClusterMutation {
     ClusterMutation::Network(NetworkMutation::PutNodeSubnet(LogApplyNodeSubnetRow {
         node_name: row.node_name.as_str().to_string(),
         subnet: row.subnet.to_string(),

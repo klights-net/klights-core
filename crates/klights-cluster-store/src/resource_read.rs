@@ -11,6 +11,9 @@ use klights_types::ResourceKey;
 #[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResourceReadError {
+    InvalidRequest {
+        message: String,
+    },
     InvalidLimit {
         limit: i64,
     },
@@ -62,7 +65,8 @@ impl ResourceReadError {
 
     pub const fn status(&self) -> ResourceReadStatus {
         match self {
-            Self::InvalidLimit { .. }
+            Self::InvalidRequest { .. }
+            | Self::InvalidLimit { .. }
             | Self::InvalidSelector { .. }
             | Self::InvalidContinuation { .. } => ResourceReadStatus {
                 code: 400,
@@ -122,7 +126,8 @@ impl fmt::Display for ResourceReadError {
                 formatter,
                 "resourceVersion {requested} is expired; oldest available is {oldest_available}"
             ),
-            Self::InvalidSelector { message }
+            Self::InvalidRequest { message }
+            | Self::InvalidSelector { message }
             | Self::InvalidContinuation { message }
             | Self::Conflict { message }
             | Self::UnsupportedMode { message }

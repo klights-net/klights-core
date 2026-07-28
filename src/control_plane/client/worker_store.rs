@@ -14,7 +14,7 @@ use crate::control_plane::client::{
 };
 use crate::datastore::replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 use crate::datastore::{
-    CatchUpResource, ListPageRequest, NodeSubnet, PodCleanupIntent, PositionedWatchEvent,
+    CatchUpResource, ListPageRequest, PodCleanupIntent, PositionedWatchEvent,
     PositionedWatchReplay, PositionedWatchReplayRead, Resource, ResourceList,
     ResourcePreconditions, WatchReplayPosition, WatchStore, WatchTarget, WatchTargetScope,
 };
@@ -1417,7 +1417,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
             .map_err(anyhow::Error::new)?;
         let result = self
@@ -1459,7 +1459,10 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
             .map_err(anyhow::Error::new)
     }
 
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         let request = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
         self.network_topology
             .get_node_subnet(request)
@@ -1471,8 +1474,15 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
             .map_err(anyhow::Error::new)
     }
 
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        let request = PeerSubnetsQuery::try_new(my_node_name).map_err(anyhow::Error::new)?;
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        let excluded_node_name = request.excluded_node_name().ok_or_else(|| {
+            anyhow!("worker topology transport does not expose an all-subnets snapshot query")
+        })?;
+        let request =
+            PeerSubnetsQuery::try_new(excluded_node_name.as_str()).map_err(anyhow::Error::new)?;
         self.network_topology
             .list_peer_subnets(request)
             .await
@@ -1750,15 +1760,21 @@ mod tests {
             Some(worker_b.clone())
         );
         assert_eq!(
-            NetworkMetadataStore::list_peer_subnets(&adapter, "worker-a")
-                .await
-                .expect("list focused peers"),
+            NetworkMetadataStore::list_peer_subnets(
+                &adapter,
+                klights_cluster_store::PeerTopologyRequest::excluding("worker-a").unwrap(),
+            )
+            .await
+            .expect("list focused peers"),
             vec![worker_b]
         );
         assert_eq!(
-            crate::datastore::NetworkMetadataStore::list_peer_subnets(&adapter, "worker-b")
-                .await
-                .expect("list focused peers"),
+            crate::datastore::NetworkMetadataStore::list_peer_subnets(
+                &adapter,
+                klights_cluster_store::PeerTopologyRequest::excluding("worker-b").unwrap(),
+            )
+            .await
+            .expect("list focused peers"),
             vec![worker_a]
         );
         assert_eq!(

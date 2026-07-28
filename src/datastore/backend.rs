@@ -132,9 +132,8 @@ use super::types::PendingWatchEvent;
 use super::types::ReplicatedCreateOptions;
 use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, NodeSubnet, PodCleanupIntent, PositionedWatchReplayRead, RawWatchEvent,
-    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor,
-    WatchReplayRead, WatchTarget,
+    ListPageRequest, PodCleanupIntent, PositionedWatchReplayRead, ReplicatedSnapshotMetadata,
+    ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 #[cfg(test)]
 use klights_cluster_core::command::CommandMeta;
@@ -902,14 +901,14 @@ pub trait DatastoreBackend: Send + Sync {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>>;
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>;
 
     async fn list_raw_watch_events_after_position_checked_bounded(
         &self,
         _targets: &[WatchTarget],
         _position: WatchReplayPosition,
         _limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         Err(anyhow::anyhow!(
             "datastore backend does not implement durable raw positioned watch replay"
         ))
@@ -1034,7 +1033,7 @@ pub trait DatastoreBackend: Send + Sync {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet>;
+    ) -> Result<klights_cluster_store::StoredNodeSubnet>;
 
     /// F2-04: persist peer-mode + hostport-range projected from
     /// `klights.io/mode` / `klights.io/hostport-range` Node annotations.
@@ -1068,10 +1067,16 @@ pub trait DatastoreBackend: Send + Sync {
     }
 
     /// Get node subnet record.
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>>;
 
     /// List peer node subnets. Includes root and rootless peers.
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>>;
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>>;
 
     /// Delete a node subnet row.
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()>;
@@ -1509,7 +1514,7 @@ pub trait RawWatchReplayStore: Send + Sync {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>>;
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>;
 }
 
 /// Watch-event subscription, broadcast access, and replay queries.
@@ -1631,7 +1636,7 @@ impl RawWatchReplayStore for DatastoreBackendWatchStore {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.db
             .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
@@ -1734,7 +1739,7 @@ pub trait NetworkMetadataStore: Send + Sync {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet>;
+    ) -> Result<klights_cluster_store::StoredNodeSubnet>;
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
@@ -1749,8 +1754,14 @@ pub trait NetworkMetadataStore: Send + Sync {
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>>;
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>>;
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>>;
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>>;
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()>;
 }
 
@@ -2121,7 +2132,7 @@ pub trait WatchMaintenanceStore: Send + Sync {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>>;
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>;
     async fn snapshot_resources_at_rv(
         &self,
         _api_version: &str,

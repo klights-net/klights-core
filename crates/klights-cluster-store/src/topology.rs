@@ -1,9 +1,13 @@
 //! Persistence-facing cluster topology values.
 
 use std::fmt;
+use std::future::Future;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::pin::Pin;
 
 use base64::Engine;
+use klights_types::{HostPortRange, NodeName, NodePeerMode, PodSubnet};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataplaneMetadataError(String);
@@ -163,6 +167,181 @@ impl DataplanePeerMetadata {
             port: port.filter(|value| *value != 0),
         })
     }
+}
+
+/// One exact persisted `node_subnets` row.
+///
+/// This persistence DTO deliberately does not create a broadly shared
+/// `klights-types::NodeSubnet`: leader-facing routing projections remain owned
+/// by their transport contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredNodeSubnet {
+    pub node_name: NodeName,
+    pub subnet: PodSubnet,
+    pub subnet_base_int: u32,
+    pub gateway_ip: Ipv4Addr,
+    pub node_ip: Ipv4Addr,
+    pub mode: NodePeerMode,
+    pub hostport_range: Option<HostPortRange>,
+}
+
+impl StoredNodeSubnet {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        node_name: NodeName,
+        subnet: PodSubnet,
+        subnet_base_int: u32,
+        gateway_ip: Ipv4Addr,
+        node_ip: Ipv4Addr,
+        mode: NodePeerMode,
+        hostport_range: Option<HostPortRange>,
+    ) -> Self {
+        Self {
+            node_name,
+            subnet,
+            subnet_base_int,
+            gateway_ip,
+            node_ip,
+            mode,
+            hostport_range,
+        }
+    }
+
+    pub const fn node_name(&self) -> &NodeName {
+        &self.node_name
+    }
+
+    pub const fn subnet(&self) -> &PodSubnet {
+        &self.subnet
+    }
+
+    pub const fn subnet_base_int(&self) -> u32 {
+        self.subnet_base_int
+    }
+
+    pub const fn gateway_ip(&self) -> Ipv4Addr {
+        self.gateway_ip
+    }
+
+    pub const fn node_ip(&self) -> Ipv4Addr {
+        self.node_ip
+    }
+
+    pub const fn mode(&self) -> NodePeerMode {
+        self.mode
+    }
+
+    pub const fn hostport_range(&self) -> Option<HostPortRange> {
+        self.hostport_range
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeTopologyRequest {
+    node_name: NodeName,
+}
+
+impl NodeTopologyRequest {
+    pub fn try_new(node_name: impl AsRef<str>) -> Result<Self, ClusterTopologyReadError> {
+        Ok(Self {
+            node_name: NodeName::parse(node_name.as_ref())
+                .map_err(ClusterTopologyReadError::invalid_request)?,
+        })
+    }
+
+    pub const fn node_name(&self) -> &NodeName {
+        &self.node_name
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PeerTopologyRequest {
+    All,
+    Excluding(NodeName),
+}
+
+impl PeerTopologyRequest {
+    pub const fn all() -> Self {
+        Self::All
+    }
+
+    pub fn excluding(node_name: impl AsRef<str>) -> Result<Self, ClusterTopologyReadError> {
+        Ok(Self::Excluding(
+            NodeName::parse(node_name.as_ref())
+                .map_err(ClusterTopologyReadError::invalid_request)?,
+        ))
+    }
+
+    pub const fn excluded_node_name(&self) -> Option<&NodeName> {
+        match self {
+            Self::All => None,
+            Self::Excluding(node_name) => Some(node_name),
+        }
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterTopologyReadError {
+    InvalidRequest { message: String },
+    CorruptData { message: String },
+    Retryable { message: String },
+    Timeout,
+    Cancelled,
+}
+
+impl ClusterTopologyReadError {
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            message: message.into(),
+        }
+    }
+
+    pub fn corrupt_data(message: impl Into<String>) -> Self {
+        Self::CorruptData {
+            message: message.into(),
+        }
+    }
+
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self::Retryable {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ClusterTopologyReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { message }
+            | Self::CorruptData { message }
+            | Self::Retryable { message } => formatter.write_str(message),
+            Self::Timeout => formatter.write_str("cluster topology read timed out"),
+            Self::Cancelled => formatter.write_str("cluster topology read was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for ClusterTopologyReadError {}
+
+pub type ClusterTopologyFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ClusterTopologyReadError>> + Send + 'a>>;
+
+pub trait ClusterTopologyRead: Send + Sync {
+    fn get_node_dataplane(
+        &self,
+        request: NodeTopologyRequest,
+    ) -> ClusterTopologyFuture<'_, Option<DataplanePeerMetadata>>;
+
+    fn get_node_subnet(
+        &self,
+        request: NodeTopologyRequest,
+    ) -> ClusterTopologyFuture<'_, Option<StoredNodeSubnet>>;
+
+    fn list_peer_subnets(
+        &self,
+        request: PeerTopologyRequest,
+    ) -> ClusterTopologyFuture<'_, Vec<StoredNodeSubnet>>;
 }
 
 #[cfg(test)]

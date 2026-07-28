@@ -7,7 +7,6 @@
 #[cfg(test)]
 use crate::datastore::node_local::{PodSlotAdmissionResult, PodSlotAdmissionState};
 #[cfg(test)]
-use crate::datastore::types::NodeSubnet;
 #[cfg(test)]
 use anyhow::{Context, Result, anyhow};
 use klights_cluster_core::{ClusterMetadata, CommandMeta, Resource, StorageCommand};
@@ -259,8 +258,8 @@ pub struct ForwardedNodeSubnet {
 }
 
 #[cfg(test)]
-impl From<NodeSubnet> for ForwardedNodeSubnet {
-    fn from(subnet: NodeSubnet) -> Self {
+impl From<klights_cluster_store::StoredNodeSubnet> for ForwardedNodeSubnet {
+    fn from(subnet: klights_cluster_store::StoredNodeSubnet) -> Self {
         Self {
             node_name: subnet.node_name.to_string(),
             subnet: subnet.subnet.to_string(),
@@ -279,7 +278,7 @@ impl From<NodeSubnet> for ForwardedNodeSubnet {
 
 #[cfg(test)]
 impl ForwardedNodeSubnet {
-    pub fn into_node_subnet(self) -> Result<NodeSubnet> {
+    pub fn into_node_subnet(self) -> Result<klights_cluster_store::StoredNodeSubnet> {
         let node_name = NodeName::parse(&self.node_name)
             .map_err(|err| anyhow!("invalid forwarded node name '{}': {}", self.node_name, err))?;
         let subnet = PodSubnet::parse(&self.subnet)
@@ -303,7 +302,7 @@ impl ForwardedNodeSubnet {
             .transpose()
             .map_err(|err| anyhow!("invalid forwarded hostport range: {err}"))?;
 
-        Ok(NodeSubnet {
+        Ok(klights_cluster_store::StoredNodeSubnet {
             node_name,
             subnet,
             subnet_base_int: self.subnet_base_int,

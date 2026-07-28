@@ -16,7 +16,7 @@ use klights_leader_api::{
 };
 use std::sync::Arc;
 
-use crate::datastore::{NodeSubnet, Resource, ResourceList};
+use crate::datastore::{Resource, ResourceList};
 use crate::watch::WatchEvent;
 
 pub type Pod = Resource;
@@ -25,7 +25,7 @@ pub type Secret = Resource;
 pub type Node = Resource;
 
 pub(crate) fn focused_node_subnet(
-    subnet: NodeSubnet,
+    subnet: klights_cluster_store::StoredNodeSubnet,
 ) -> std::result::Result<klights_leader_api::NodeSubnet, NetworkTopologyError> {
     let mode = match subnet.mode {
         crate::controllers::annotations::NodePeerMode::Root => NetworkNodeMode::Root,
@@ -48,7 +48,7 @@ pub(crate) fn focused_node_subnet(
 
 pub(crate) fn legacy_node_subnet(
     subnet: klights_leader_api::NodeSubnet,
-) -> std::result::Result<NodeSubnet, NetworkTopologyError> {
+) -> std::result::Result<klights_cluster_store::StoredNodeSubnet, NetworkTopologyError> {
     let node_name = klights_types::NodeName::parse(subnet.node_name())
         .map_err(NetworkTopologyError::corrupt_response)?;
     let pod_subnet = klights_types::PodSubnet::parse(subnet.subnet())
@@ -63,7 +63,7 @@ pub(crate) fn legacy_node_subnet(
             start: range.start(),
             end: range.end(),
         });
-    Ok(NodeSubnet {
+    Ok(klights_cluster_store::StoredNodeSubnet {
         node_name,
         subnet: pod_subnet,
         subnet_base_int: subnet.subnet_base_int(),

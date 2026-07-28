@@ -148,7 +148,6 @@ fn is_retryable_allocation_error(err: &NodeSubnetAllocationError) -> bool {
 mod tests {
     use super::*;
     use crate::control_plane::client::focused_node_subnet;
-    use crate::datastore::NodeSubnet;
     use klights_leader_api::{
         NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
         NodeSubnetAllocationFuture, NodeSubnetAllocationResult, NodeSubnetResult, PeerSubnetsQuery,
@@ -164,7 +163,7 @@ mod tests {
 
     #[derive(Clone)]
     enum Outcome {
-        Ok(NodeSubnet),
+        Ok(klights_cluster_store::StoredNodeSubnet),
         Err(NodeSubnetAllocationError),
     }
 
@@ -188,12 +187,12 @@ mod tests {
 
     struct FakeTopologyClient {
         calls: AtomicUsize,
-        row: Mutex<Option<NodeSubnet>>,
+        row: Mutex<Option<klights_cluster_store::StoredNodeSubnet>>,
         error: Option<&'static str>,
     }
 
     impl FakeTopologyClient {
-        fn new(row: Option<NodeSubnet>) -> Self {
+        fn new(row: Option<klights_cluster_store::StoredNodeSubnet>) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
                 row: Mutex::new(row),
@@ -280,8 +279,8 @@ mod tests {
         }
     }
 
-    fn subnet_row() -> NodeSubnet {
-        NodeSubnet {
+    fn subnet_row() -> klights_cluster_store::StoredNodeSubnet {
+        klights_cluster_store::StoredNodeSubnet {
             node_name: NodeName::parse("node-a").unwrap(),
             subnet: PodSubnet::parse("10.50.1.0/24").unwrap(),
             subnet_base_int: u32::from(Ipv4Addr::new(10, 50, 1, 0)),

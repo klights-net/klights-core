@@ -137,7 +137,7 @@ impl RedbWatchStore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         if targets.is_empty() {
             return Ok(WatchReplayRead::Events(Vec::new()));
         }
@@ -280,7 +280,7 @@ impl RedbWatchStore {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         let targets = targets.to_vec();
         self.db_call("watch_list_raw_positioned", move |db| {
             let read = db.begin_read()?;
@@ -341,7 +341,7 @@ impl RedbWatchStore {
                         event_id,
                         resource_version_filter_through_event_id: 0,
                     },
-                    event: RawWatchEvent {
+                    event: klights_cluster_store::DurableRawWatchEvent {
                         api_version: av.to_string(),
                         kind: kind.to_string(),
                         namespace: event.namespace.map(str::to_string),
@@ -375,7 +375,7 @@ impl RedbWatchStore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: usize,
-    ) -> Result<Vec<RawWatchEvent>> {
+    ) -> Result<Vec<klights_cluster_store::DurableRawWatchEvent>> {
         let tbl = read_txn.open_table(tables::WATCH_EVENTS)?;
         let mut result = Vec::new();
         for e in tbl.iter()? {
@@ -398,7 +398,7 @@ impl RedbWatchStore {
                 continue;
             }
 
-            result.push(RawWatchEvent {
+            result.push(klights_cluster_store::DurableRawWatchEvent {
                 api_version: ev_av.to_string(),
                 kind: ev_kind.to_string(),
                 namespace: ev_ns.map(str::to_string),

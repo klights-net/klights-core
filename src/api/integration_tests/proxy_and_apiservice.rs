@@ -436,17 +436,14 @@ async fn test_apiservice_status_reports_missing_backend_service_unavailable() {
 async fn test_apiservice_status_reconciles_after_backend_service_and_endpoints_create() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use klights_reconcile_api::ReconcileKey;
     use serde_json::json;
-    use tokio::time::{Duration, timeout};
-    use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
     let state = build_test_app_state().await;
     let dispatcher = state.controller_reconcile().controller_dispatcher.clone();
     let db = state.resource_mutation().db.clone();
     let node_name = state.operational().config.node_name.clone();
-    let cancel = CancellationToken::new();
-    let worker = tokio::spawn(dispatcher.run_worker(db, node_name, cancel.clone()));
     let app = crate::api::build_router(state);
 
     let apiservice = json!({
@@ -517,41 +514,31 @@ async fn test_apiservice_status_reconciles_after_backend_service_and_endpoints_c
         .unwrap();
     assert_eq!(create_endpoints.status(), StatusCode::CREATED);
 
-    let body = timeout(Duration::from_secs(2), async {
-        loop {
-            let status = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri(
-                            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.ready.example.com/status",
-                        )
-                        .body(Body::empty())
-                        .unwrap(),
+    let dispatched = dispatcher.dispatch_next_key_for_test(&db, &node_name).await;
+    assert_eq!(
+        dispatched,
+        ReconcileKey::cluster(
+            "apiregistration.k8s.io/v1",
+            "APIService",
+            "v1alpha1.ready.example.com",
+        )
+    );
+
+    let status = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.ready.example.com/status",
                 )
-                .await
-                .unwrap();
-            assert_eq!(status.status(), StatusCode::OK);
-            let body: serde_json::Value =
-                serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
-                    .unwrap();
-            let available = body["status"]["conditions"]
-                .as_array()
-                .and_then(|conditions| {
-                    conditions
-                        .iter()
-                        .find(|condition| condition["type"].as_str() == Some("Available"))
-                })
-                .expect("APIService status must contain Available condition");
-            if available["status"].as_str() == Some("True") {
-                return body;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("APIService status should become Available=True after backend readiness");
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap()).unwrap();
     let available = body["status"]["conditions"]
         .as_array()
         .and_then(|conditions| {
@@ -560,10 +547,8 @@ async fn test_apiservice_status_reconciles_after_backend_service_and_endpoints_c
                 .find(|condition| condition["type"].as_str() == Some("Available"))
         })
         .expect("APIService status must contain Available condition");
+    assert_eq!(available["status"], "True");
     assert_eq!(available["reason"], "Passed");
-
-    cancel.cancel();
-    worker.await.unwrap();
 }
 
 #[tokio::test]

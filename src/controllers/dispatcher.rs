@@ -424,6 +424,22 @@ impl ControllerDispatcher {
         self.queue.take().await
     }
 
+    #[cfg(test)]
+    pub async fn dispatch_next_key_for_test(
+        &self,
+        db_handle: &crate::datastore::DatastoreHandle,
+        node_name: &str,
+    ) -> ReconcileKey {
+        let key = self.queue.take().await;
+        assert!(
+            self.begin_key_dispatch(&key).await,
+            "test dispatcher cannot drain a key that is already in flight"
+        );
+        self.dispatch_key(&key, db_handle, node_name).await;
+        self.finish_key_dispatch(key.clone()).await;
+        key
+    }
+
     /// Configure the synchronous-fallback context for [`enqueue`] when no
     /// worker is running. Tests that exercise HTTP handlers should call this
     /// so the post-mutation reconcile lands.

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::datastore::{RawWatchEvent, RawWatchReplayStore, WatchTarget};
+use crate::datastore::{RawWatchReplayStore, WatchTarget};
 
 use super::signal_replay_cursor_core::{SignalReplayCursorCore, SignalReplayCursorSource};
 use klights_watch::{
@@ -12,7 +12,7 @@ use klights_watch::{
 use super::{WatchCursorError, WatchDeliveryScope, WindowPolicy};
 
 pub struct RawSignalWatchCursor {
-    core: SignalReplayCursorCore<RawWatchEvent, RawWatchReplaySource>,
+    core: SignalReplayCursorCore<klights_cluster_store::DurableRawWatchEvent, RawWatchReplaySource>,
 }
 
 impl RawSignalWatchCursor {
@@ -72,7 +72,9 @@ impl RawSignalWatchCursor {
         self.core.prime_replay_or_expired().await
     }
 
-    pub async fn next_event(&mut self) -> Result<RawWatchEvent, WatchCursorError> {
+    pub async fn next_event(
+        &mut self,
+    ) -> Result<klights_cluster_store::DurableRawWatchEvent, WatchCursorError> {
         self.core.next_event().await
     }
 }
@@ -83,12 +85,14 @@ struct RawWatchReplaySource {
 }
 
 #[async_trait::async_trait]
-impl SignalReplayCursorSource<RawWatchEvent> for RawWatchReplaySource {
+impl SignalReplayCursorSource<klights_cluster_store::DurableRawWatchEvent>
+    for RawWatchReplaySource
+{
     async fn replay_after_checked(
         &self,
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         match self
             .replay_store
             .list_raw_watch_events_after_position_checked_bounded(&self.targets, position, limit)

@@ -1161,7 +1161,10 @@ impl LeaderNetworkTopologyQuery for LocalApiClient {
             let node_name = request.into_node_name();
             let subnets = self
                 .db
-                .list_peer_subnets(&node_name)
+                .list_peer_subnets(
+                    klights_cluster_store::PeerTopologyRequest::excluding(&node_name)
+                        .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?,
+                )
                 .await
                 .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
                 .into_iter()

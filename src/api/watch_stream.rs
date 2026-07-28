@@ -3,7 +3,6 @@ use crate::api::watch_event::{EventType, WatchContentType, WatchEvent};
 use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
 use crate::api::{AppError, watch_event_to_table_at};
 #[cfg(test)]
-use crate::datastore::RawWatchEvent;
 #[cfg(test)]
 use crate::datastore::{CatchUpResource, DatastoreHandle};
 #[cfg(test)]
@@ -288,7 +287,9 @@ pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Re
 }
 
 #[cfg(test)]
-pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<Vec<u8>> {
+pub fn serialize_raw_watch_event_frame(
+    event: &klights_cluster_store::DurableRawWatchEvent,
+) -> anyhow::Result<Vec<u8>> {
     let raw = klights_kube_protobuf::encode_protobuf_resource_from_json_bytes(
         &event.api_version,
         &event.kind,
@@ -400,7 +401,9 @@ pub fn serialize_positioned_watch_event_for_stream(
 }
 
 #[cfg(test)]
-pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
+pub fn serialize_raw_watch_event_line(
+    event: &klights_cluster_store::DurableRawWatchEvent,
+) -> Vec<u8> {
     let event_type = event.event_type.as_ref();
     let mut line = Vec::with_capacity(event_type.len() + event.object_json.len() + 23);
     line.extend_from_slice(br#"{"type":""#);
@@ -413,7 +416,7 @@ pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
 
 #[cfg(test)]
 pub fn serialize_raw_watch_event_for_stream(
-    event: &RawWatchEvent,
+    event: &klights_cluster_store::DurableRawWatchEvent,
     stream_format: WatchStreamFormat,
 ) -> Vec<u8> {
     match try_serialize_raw_watch_event_for_stream(event, stream_format) {
@@ -423,7 +426,7 @@ pub fn serialize_raw_watch_event_for_stream(
 
 #[cfg(test)]
 pub fn try_serialize_raw_watch_event_for_stream(
-    event: &RawWatchEvent,
+    event: &klights_cluster_store::DurableRawWatchEvent,
     stream_format: WatchStreamFormat,
 ) -> Result<Vec<u8>, Vec<u8>> {
     match stream_format {
@@ -2095,7 +2098,7 @@ mod tests {
         ];
 
         for (api_version, kind, object_json) in cases {
-            let row = RawWatchEvent {
+            let row = klights_cluster_store::DurableRawWatchEvent {
                 api_version: (*api_version).to_string(),
                 kind: (*kind).to_string(),
                 namespace: Some("default".to_string()),
@@ -2232,7 +2235,7 @@ mod tests {
         })
         .to_string();
         for event_type in ["ADDED", "MODIFIED", "DELETED"] {
-            let row = RawWatchEvent {
+            let row = klights_cluster_store::DurableRawWatchEvent {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),
@@ -2292,7 +2295,7 @@ mod tests {
         ];
 
         for (api_version, kind, namespace, name, event_type, object) in cases {
-            let row = RawWatchEvent {
+            let row = klights_cluster_store::DurableRawWatchEvent {
                 api_version: api_version.to_string(),
                 kind: kind.to_string(),
                 namespace: namespace.map(str::to_string),
@@ -3560,7 +3563,7 @@ mod tests {
 
     #[test]
     fn raw_watch_json_line_wraps_stored_object_bytes_without_reparse() {
-        let row = crate::datastore::RawWatchEvent {
+        let row = klights_cluster_store::DurableRawWatchEvent {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
             namespace: Some("default".to_string()),

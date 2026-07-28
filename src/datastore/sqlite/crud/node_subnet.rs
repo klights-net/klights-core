@@ -5,7 +5,9 @@ use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMet
 use klights_types::ClusterCidr;
 use rusqlite::OptionalExtension;
 
-fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {
+fn row_to_node_subnet(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<klights_cluster_store::StoredNodeSubnet> {
     use klights_types::HostPortRange;
     use klights_types::{NodePeerMode, parse_node_peer_mode};
 
@@ -43,7 +45,7 @@ fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {
         .filter(|value| !value.is_empty())
         .and_then(|value| HostPortRange::parse(value).ok());
 
-    Ok(NodeSubnet {
+    Ok(klights_cluster_store::StoredNodeSubnet {
         node_name,
         subnet,
         subnet_base_int: row.get::<_, i64>(2)? as u32,
@@ -86,7 +88,7 @@ impl Datastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         let node_name_typed = NodeName::parse(node_name)
             .map_err(|e| anyhow!("Invalid node name {}: {}", node_name, e))?;
         let node_ip_typed: Ipv4Addr = node_ip
@@ -107,7 +109,7 @@ impl Datastore {
 
         self.db_call("db_query", move |conn| {
             // Return existing allocation if present.
-            let existing: Option<NodeSubnet> = conn
+            let existing: Option<klights_cluster_store::StoredNodeSubnet> = conn
                 .query_row(
                     queries::NODE_SUBNET_SELECT_BY_NAME,
                     rusqlite::params![node_name_str],
@@ -145,7 +147,7 @@ impl Datastore {
                 )?;
 
                 if result > 0 {
-                    return Ok(NodeSubnet {
+                    return Ok(klights_cluster_store::StoredNodeSubnet {
                         node_name: NodeName::parse(&node_name_str).expect("validated"),
                         subnet: subnet_typed,
                         subnet_base_int: base,
@@ -166,7 +168,10 @@ impl Datastore {
     }
 
     /// Get the subnet record for a specific node.
-    pub async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    pub async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         let node_name = node_name.to_string();
         self.read_db_call("db_query", move |conn| {
             conn.query_row(
@@ -181,18 +186,22 @@ impl Datastore {
         .map_err(|e| anyhow!("Failed to get node subnet: {}", e))
     }
 
-    /// List all peer node subnets (everyone except `my_node_name`).
+    /// List all node subnets or every peer except one explicitly named node.
     ///
     /// Includes root and rootless peers. The controller decides per-peer
     /// routing from the projected `mode`.
-    pub async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        let my_node_name = my_node_name.to_string();
+    pub async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        let excluded_node_name = request
+            .excluded_node_name()
+            .map_or_else(String::new, |node_name| node_name.as_str().to_string());
         self.read_db_call("db_query", move |conn| {
             let mut stmt = conn.prepare(queries::NODE_SUBNET_LIST_PEERS)?;
-            let rows = stmt
-                .query_map(rusqlite::params![my_node_name], row_to_node_subnet)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+            stmt.query_map(rusqlite::params![excluded_node_name], row_to_node_subnet)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(tokio_rusqlite::Error::from)
         })
         .await
         .map_err(|e| anyhow!("Failed to list peer subnets: {}", e))
@@ -299,4 +308,48 @@ fn row_to_node_dataplane(row: &rusqlite::Row<'_>) -> rusqlite::Result<DataplaneP
 
 fn to_sql_error(err: impl std::fmt::Display) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn all_peer_subnets_ignores_the_empty_snapshot_sentinel_row() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.allocate_node_subnet("healthy-a", "10.42.0.0/16", "192.0.2.10")
+            .await
+            .unwrap();
+        db.allocate_node_subnet("healthy-b", "10.42.0.0/16", "192.0.2.11")
+            .await
+            .unwrap();
+        db.db_call("insert_empty_node_subnet_test", |conn| {
+            conn.execute(
+                queries::NODE_SUBNET_UPSERT_EXACT,
+                rusqlite::params![
+                    "",
+                    "10.42.99.0/24",
+                    i64::from(u32::from(Ipv4Addr::new(10, 42, 99, 0))),
+                    "10.42.99.0",
+                    "192.0.2.99",
+                    "root",
+                    Option::<String>::None,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let rows = db
+            .list_peer_subnets(klights_cluster_store::PeerTopologyRequest::all())
+            .await
+            .expect("the empty snapshot sentinel must be filtered before row decoding");
+        let mut names = rows
+            .iter()
+            .map(|row| row.node_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["healthy-a", "healthy-b"]);
+    }
 }

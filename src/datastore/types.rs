@@ -5,15 +5,12 @@
 //! against `crate::datastore::*` without pulling in SQLite-specific code.
 
 use anyhow::{Result, anyhow};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::net::Ipv4Addr;
 
 #[cfg(test)]
 use crate::watch::WatchEvent;
-use klights_types::{NodeName, PodSubnet};
 
 use klights_cluster_core::Resource;
 
@@ -190,27 +187,6 @@ pub struct CatchUpResource {
     /// three labels) reuses static literals — avoiding a per-event String
     /// allocation across N watchers × M events/sec.
     pub event_type: std::borrow::Cow<'static, str>,
-}
-
-/// Durable watch replay row with routing/cursor fields lifted out of the JSON
-/// object payload. Selectorless JSON watch streams can use this shape to avoid
-/// parsing `watch_events.data` just to recover metadata already stored in
-/// columns.
-#[derive(Debug, Clone)]
-pub struct RawWatchEvent {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-    pub resource_version: i64,
-    pub event_type: Cow<'static, str>,
-    pub object_json: Bytes,
-}
-
-impl RawWatchEvent {
-    pub fn key(&self) -> (Option<String>, String) {
-        (self.namespace.clone(), self.name.clone())
-    }
 }
 
 /// Neutral post-commit notification emitted by persistence after a resource
@@ -436,28 +412,6 @@ impl ListPageRequest {
         }
         list
     }
-}
-
-/// One row from the `node_subnets` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeSubnet {
-    pub node_name: NodeName,
-    /// CIDR block for this node's pods (e.g. "10.42.1.0/24").
-    pub subnet: PodSubnet,
-    /// Base address of `subnet` as a `u32` (host byte order). Stored for DB allocation logic.
-    pub subnet_base_int: u32,
-    /// First address of the subnet, retained for row-shape compatibility with
-    /// older node-subnet allocation code.
-    pub gateway_ip: Ipv4Addr,
-    /// Host's primary underlay IP used for direct/WireGuard peer routing.
-    pub node_ip: Ipv4Addr,
-    /// Peer mode projected from the node's `klights.io/mode` annotation
-    /// (F2-04). Defaults to `Root` for legacy rows or pre-F2-05 nodes.
-    pub mode: klights_types::NodePeerMode,
-    /// Rootless host-port graft range projected from `klights.io/hostport-range`.
-    /// `None` for root peers; `Some` for rootless peers when the annotation
-    /// parses cleanly.
-    pub hostport_range: Option<klights_types::HostPortRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

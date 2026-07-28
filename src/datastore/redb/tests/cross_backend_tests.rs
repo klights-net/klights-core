@@ -1778,8 +1778,16 @@ async fn redb_node_subnet() {
         .await
         .unwrap();
     assert_ne!(ns3.subnet_base_int, ns.subnet_base_int);
-    let peers = db.list_peer_subnets("node1").await.unwrap();
+    let peers = db
+        .list_peer_subnets(klights_cluster_store::PeerTopologyRequest::excluding("node1").unwrap())
+        .await
+        .unwrap();
     assert_eq!(peers.len(), 1);
+    let all = db
+        .list_peer_subnets(klights_cluster_store::PeerTopologyRequest::all())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
     db.delete_node_subnet("node2").await.unwrap();
     assert!(db.get_node_subnet("node2").await.unwrap().is_none());
 }

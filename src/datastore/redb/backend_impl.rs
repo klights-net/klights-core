@@ -709,7 +709,7 @@ impl DatastoreBackend for RedbDatastore {
         t: &[WatchTarget],
         s: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.watch_store
             .watch_list_raw_checked_bounded(t, s, limit)
             .await
@@ -719,7 +719,7 @@ impl DatastoreBackend for RedbDatastore {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         self.watch_store
             .watch_list_raw_positioned_checked_bounded(targets, position, limit)
             .await
@@ -764,7 +764,12 @@ impl DatastoreBackend for RedbDatastore {
     async fn list_deleted_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
         self.watch_store.watch_list_deleted_since(s).await
     }
-    async fn allocate_node_subnet(&self, n: &str, c: &str, i: &str) -> Result<NodeSubnet> {
+    async fn allocate_node_subnet(
+        &self,
+        n: &str,
+        c: &str,
+        i: &str,
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         self.network.allocate_node_subnet(n, c, i).await
     }
     async fn update_node_peer_attributes(
@@ -787,11 +792,17 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
         self.network.get_node_dataplane(node_name).await
     }
-    async fn get_node_subnet(&self, n: &str) -> Result<Option<NodeSubnet>> {
+    async fn get_node_subnet(
+        &self,
+        n: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         self.network.get_node_subnet(n).await
     }
-    async fn list_peer_subnets(&self, m: &str) -> Result<Vec<NodeSubnet>> {
-        self.network.list_peer_subnets(m).await
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        self.network.list_peer_subnets(request).await
     }
     async fn delete_node_subnet(&self, n: &str) -> Result<()> {
         self.network.delete_node_subnet(n).await
@@ -1653,7 +1664,7 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<crate::datastore::NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         crate::datastore::DatastoreBackend::allocate_node_subnet(
             self,
             node_name,
@@ -1695,15 +1706,15 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
     async fn get_node_subnet(
         &self,
         node_name: &str,
-    ) -> Result<Option<crate::datastore::NodeSubnet>> {
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         crate::datastore::DatastoreBackend::get_node_subnet(self, node_name).await
     }
 
     async fn list_peer_subnets(
         &self,
-        my_node_name: &str,
-    ) -> Result<Vec<crate::datastore::NodeSubnet>> {
-        crate::datastore::DatastoreBackend::list_peer_subnets(self, my_node_name).await
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        crate::datastore::DatastoreBackend::list_peer_subnets(self, request).await
     }
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
@@ -2021,7 +2032,8 @@ impl crate::datastore::WatchMaintenanceStore for RedbDatastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<crate::datastore::WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<crate::datastore::WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>>
+    {
         crate::datastore::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
             self, targets, since_rv, limit,
         )

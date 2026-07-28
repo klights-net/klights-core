@@ -7,9 +7,15 @@ pub const LEADER_EPOCH_META_KEY: &str = "leader_epoch";
 
 mod committed_apply;
 mod durable_recovery;
+mod namespace_content;
+mod ownership;
 mod pod_uid_precondition;
+mod raw_watch_history;
+mod read_validation;
 mod resource_read;
+mod resource_scope;
 mod topology;
+mod watch_range;
 
 pub use committed_apply::{
     AppliedOutboxLookup, CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
@@ -28,9 +34,21 @@ pub use durable_recovery::{
     SnapshotPersistenceError, SnapshotPersistenceFuture, SnapshotReplayFloorCursor,
     WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
 };
+pub use namespace_content::{
+    NamespaceContentFuture, NamespaceContentRead, NamespaceKindRequest, NamespaceRequest,
+};
+pub use ownership::{
+    ClusterOwnershipRead, OwnedKindRequest, OwnerNameKindRequest, OwnerUidRequest,
+    OwnershipReadFuture,
+};
 pub use pod_uid_precondition::{
     PodUidPreconditionError, PodUidPreconditionFuture, PodUidPreconditionRead,
     PodUidPreconditionRequest, PodUidPreconditionState,
+};
+pub use raw_watch_history::{
+    DurableRawWatchEvent, DurableRawWatchHistoryRead, PositionedRawWatchHistoryPage,
+    PositionedRawWatchHistoryRead, RawWatchEventsAfterPositionRequest, RawWatchEventsSinceRequest,
+    RawWatchHistoryFuture, RawWatchHistoryPage, RawWatchHistoryRead,
 };
 pub use resource_read::{
     ClusterResourceRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
@@ -38,7 +56,16 @@ pub use resource_read::{
     ResourceListSnapshot, ResourceReadError, ResourceReadFuture, ResourceReadStatus,
     ResourceVersionMatch,
 };
+pub use resource_scope::{
+    ClusterResourceScopeRead, ResourceKeyScopeRequest, ResourceScopeSnapshot,
+    ResourceSnapshotAtPositionRequest, ResourceSnapshotRead, ResourceWatchTargetsRequest,
+};
 pub use topology::{
-    DataplaneEncryption, DataplaneMetadataError, DataplaneMode, DataplanePeerMetadata,
-    WireGuardPublicKey,
+    ClusterTopologyFuture, ClusterTopologyRead, ClusterTopologyReadError, DataplaneEncryption,
+    DataplaneMetadataError, DataplaneMode, DataplanePeerMetadata, NodeTopologyRequest,
+    PeerTopologyRequest, StoredNodeSubnet, WireGuardPublicKey,
+};
+pub use watch_range::{
+    DurableWatchRangeRead, ModifiedClusterResourcesRequest, ModifiedResourcesRequest,
+    WatchEventsSinceRequest, WatchRangeFuture, WatchRangeStart,
 };

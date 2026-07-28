@@ -9,7 +9,7 @@ use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_pay
 #[cfg(test)]
 use klights_watch::WatchTopic;
 
-use super::{CatchUpResource, Datastore, PendingWatchEvent, RawWatchEvent};
+use super::{CatchUpResource, Datastore, PendingWatchEvent};
 #[cfg(test)]
 use super::{CommitObservation, CommitObservationSink};
 use klights_cluster_core::Resource;
@@ -107,10 +107,10 @@ pub fn create_pending_watch_event(
 impl Datastore {
     pub(super) fn watch_row_to_raw_watch_event(
         row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<RawWatchEvent> {
+    ) -> rusqlite::Result<klights_cluster_store::DurableRawWatchEvent> {
         let data_bytes: Vec<u8> = row.get(6)?;
         let event_type: String = row.get(5)?;
-        Ok(RawWatchEvent {
+        Ok(klights_cluster_store::DurableRawWatchEvent {
             api_version: row.get(0)?,
             kind: row.get(1)?,
             namespace: row.get(2)?,

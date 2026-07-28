@@ -445,7 +445,7 @@ impl crate::datastore::NetworkMetadataStore for Datastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         crate::datastore::DatastoreBackend::allocate_node_subnet(
             self,
             node_name,
@@ -484,12 +484,18 @@ impl crate::datastore::NetworkMetadataStore for Datastore {
         crate::datastore::DatastoreBackend::get_node_dataplane(self, node_name).await
     }
 
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         crate::datastore::DatastoreBackend::get_node_subnet(self, node_name).await
     }
 
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        crate::datastore::DatastoreBackend::list_peer_subnets(self, my_node_name).await
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        crate::datastore::DatastoreBackend::list_peer_subnets(self, request).await
     }
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
@@ -810,7 +816,9 @@ impl crate::datastore::WatchMaintenanceStore for Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<crate::datastore::WatchReplayRead<RawWatchEvent>> {
+    ) -> anyhow::Result<
+        crate::datastore::WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>,
+    > {
         crate::datastore::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
             self, targets, since_rv, limit,
         )

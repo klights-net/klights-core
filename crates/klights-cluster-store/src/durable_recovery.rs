@@ -195,7 +195,7 @@ impl WatchHistoryRequest {
     }
 }
 
-fn validate_watch_target(target: &DurableWatchTarget) -> Result<(), WatchHistoryError> {
+pub(crate) fn validate_watch_target(target: &DurableWatchTarget) -> Result<(), WatchHistoryError> {
     if !valid_api_version(&target.api_version) || !valid_kind(&target.kind) {
         return Err(WatchHistoryError::InvalidTarget {
             message: "watch-history target contains an empty, malformed, or reserved API identity"

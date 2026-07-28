@@ -65,8 +65,8 @@ pub use super::backend::{
 pub use super::types::CommitObservation;
 pub use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent, PositionedWatchReplay,
-    PositionedWatchReplayRead, RawWatchEvent, ReplicatedCreateOptions, ReplicatedMembershipState,
+    ListPageRequest, PendingWatchEvent, PodCleanupIntent, PositionedWatchReplay,
+    PositionedWatchReplayRead, ReplicatedCreateOptions, ReplicatedMembershipState,
     ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchTarget,
     WatchTargetScope,
 };
@@ -4338,7 +4338,7 @@ impl DatastoreBackend for Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         Datastore::list_raw_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
     }
 
@@ -4347,7 +4347,7 @@ impl DatastoreBackend for Datastore {
         targets: &[WatchTarget],
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
         Datastore::list_raw_watch_events_after_position_checked_bounded(
             self, targets, position, limit,
         )
@@ -4409,7 +4409,7 @@ impl DatastoreBackend for Datastore {
         node_name: &str,
         cluster_cidr: &str,
         node_ip: &str,
-    ) -> Result<NodeSubnet> {
+    ) -> Result<klights_cluster_store::StoredNodeSubnet> {
         Datastore::allocate_node_subnet(self, node_name, cluster_cidr, node_ip).await
     }
 
@@ -4436,12 +4436,18 @@ impl DatastoreBackend for Datastore {
         Datastore::get_node_dataplane(self, node_name).await
     }
 
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
         Datastore::get_node_subnet(self, node_name).await
     }
 
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        Datastore::list_peer_subnets(self, my_node_name).await
+    async fn list_peer_subnets(
+        &self,
+        request: klights_cluster_store::PeerTopologyRequest,
+    ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
+        Datastore::list_peer_subnets(self, request).await
     }
 
     async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
