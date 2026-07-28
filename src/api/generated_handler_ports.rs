@@ -80,6 +80,7 @@ pub(crate) struct GeneratedWatchRequest {
     pub stream_format: crate::api::watch_stream::WatchStreamFormat,
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
+    pub operation_now: time::OffsetDateTime,
 }
 
 pub(crate) trait GeneratedWatchPort: Send + Sync {

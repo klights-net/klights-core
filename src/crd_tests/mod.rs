@@ -204,6 +204,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
                 let config = crate::KlightsConfig::test_default();
                 crate::api::ApiOperationalConfig::from_test(config)
             },
+            std::sync::Arc::new(crate::auth::clock::SystemClock),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),
             ),

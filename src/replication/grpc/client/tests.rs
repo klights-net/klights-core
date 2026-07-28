@@ -2784,6 +2784,7 @@ mod cases {
         let handler = LocalNodeLogRuntime::new_with_pod_event_store(
             crate::paths::pod_logs_root_path(&runtime_ns),
             supervisor.clone(),
+            Arc::new(crate::auth::clock::SystemClock),
             crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
                     crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),

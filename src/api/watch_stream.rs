@@ -1,7 +1,7 @@
 use crate::api::watch_event::{EventType, WatchContentType, WatchEvent};
 #[cfg(test)]
 use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
-use crate::api::{AppError, watch_event_to_table};
+use crate::api::{AppError, watch_event_to_table_at};
 #[cfg(test)]
 use crate::datastore::RawWatchEvent;
 #[cfg(test)]
@@ -228,9 +228,22 @@ pub fn can_reuse_encoded_watch_payload(ctx: &WatchEncodeReuseContext<'_>) -> boo
     }
 }
 
-pub fn serialize_watch_event_line(event: WatchEvent, kind: &str, table_format: bool) -> Vec<u8> {
+pub fn serialize_watch_event_line_at(
+    event: WatchEvent,
+    kind: &str,
+    table_format: bool,
+    now: time::OffsetDateTime,
+) -> Vec<u8> {
+    let event = if table_format {
+        watch_event_to_table_at(event, kind, now)
+    } else {
+        event
+    };
+    serialize_watch_event_line_without_table(event)
+}
+
+pub fn serialize_watch_event_line_without_table(event: WatchEvent) -> Vec<u8> {
     if let Some(ref payload) = event.encoded_payload
-        && !table_format
         && payload.content_type == WatchContentType::Json
         && event.event_type != EventType::Bookmark
     {
@@ -239,14 +252,14 @@ pub fn serialize_watch_event_line(event: WatchEvent, kind: &str, table_format: b
         buf.push(b'\n');
         return buf;
     }
-    let event = if table_format {
-        watch_event_to_table(event, kind)
-    } else {
-        event
-    };
     let mut json = serde_json::to_vec(&event).unwrap_or_default();
     json.push(b'\n');
     json
+}
+
+#[cfg(test)]
+pub fn serialize_watch_event_line(event: WatchEvent, kind: &str, table_format: bool) -> Vec<u8> {
+    serialize_watch_event_line_at(event, kind, table_format, time::OffsetDateTime::now_utc())
 }
 
 pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Result<Vec<u8>> {
@@ -304,14 +317,20 @@ pub fn serialize_watch_event_for_stream(
     }
 }
 
-pub fn try_serialize_watch_event_for_stream(
+pub fn try_serialize_watch_event_for_stream_at(
     event: WatchEvent,
     kind: &str,
     table_format: bool,
     stream_format: WatchStreamFormat,
+    now: time::OffsetDateTime,
 ) -> Result<Vec<u8>, Vec<u8>> {
     match stream_format {
-        WatchStreamFormat::Json => Ok(serialize_watch_event_line(event, kind, table_format)),
+        WatchStreamFormat::Json => Ok(serialize_watch_event_line_at(
+            event,
+            kind,
+            table_format,
+            now,
+        )),
         WatchStreamFormat::Protobuf => match serialize_watch_event_frame(&event, kind) {
             Ok(frame) => Ok(frame),
             Err(err) => Err(serialize_watch_status_for_stream(
@@ -324,14 +343,31 @@ pub fn try_serialize_watch_event_for_stream(
     }
 }
 
+#[cfg(test)]
+pub fn try_serialize_watch_event_for_stream(
+    event: WatchEvent,
+    kind: &str,
+    table_format: bool,
+    stream_format: WatchStreamFormat,
+) -> Result<Vec<u8>, Vec<u8>> {
+    try_serialize_watch_event_for_stream_at(
+        event,
+        kind,
+        table_format,
+        stream_format,
+        time::OffsetDateTime::now_utc(),
+    )
+}
+
 /// Adapt one transport-neutral positioned event into the existing Kubernetes
 /// JSON/protobuf watch codecs. The durable resume position remains session
 /// state and is intentionally not added to either Kubernetes wire format.
-pub fn serialize_positioned_watch_event_for_stream(
+pub fn serialize_positioned_watch_event_for_stream_at(
     event: klights_leader_api::ResourceEvent,
     kind: &str,
     table_format: bool,
     stream_format: WatchStreamFormat,
+    now: time::OffsetDateTime,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let event = WatchEvent {
         event_type: match event.event_type() {
@@ -344,7 +380,23 @@ pub fn serialize_positioned_watch_event_for_stream(
         object: event.resource().data.clone(),
         encoded_payload: None,
     };
-    try_serialize_watch_event_for_stream(event, kind, table_format, stream_format)
+    try_serialize_watch_event_for_stream_at(event, kind, table_format, stream_format, now)
+}
+
+#[cfg(test)]
+pub fn serialize_positioned_watch_event_for_stream(
+    event: klights_leader_api::ResourceEvent,
+    kind: &str,
+    table_format: bool,
+    stream_format: WatchStreamFormat,
+) -> Result<Vec<u8>, Vec<u8>> {
+    serialize_positioned_watch_event_for_stream_at(
+        event,
+        kind,
+        table_format,
+        stream_format,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 #[cfg(test)]
@@ -718,6 +770,7 @@ pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
     pub stream_format: WatchStreamFormat,
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
+    pub operation_now: time::OffsetDateTime,
 }
 
 #[cfg(test)]
@@ -801,6 +854,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         stream_format,
         timeout_seconds,
         emit_initial_state_for_resource_version_zero,
+        operation_now,
     } = request;
     let api_version = api_version.to_string();
     wait_until_datastore_fresh(&source, requested_rv, &api_version, &kind, &task_supervisor).await;
@@ -851,7 +905,13 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         last_delivered_rv = last_delivered_rv.max(list.resource_version());
         for resource in list.into_items() {
             let event = WatchEvent::added((*resource.data).clone());
-            match try_serialize_watch_event_for_stream(event, &kind, table_format, stream_format) {
+            match try_serialize_watch_event_for_stream_at(
+                event,
+                &kind,
+                table_format,
+                stream_format,
+                operation_now,
+            ) {
                 Ok(frame) => initial_frames.push(frame),
                 Err(frame) => return single_watch_frame_body(frame),
             }
@@ -859,8 +919,13 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         if send_initial_events {
             let bookmark =
                 WatchEvent::bookmark_initial_events_end(last_delivered_rv, &api_version, &kind);
-            match try_serialize_watch_event_for_stream(bookmark, &kind, table_format, stream_format)
-            {
+            match try_serialize_watch_event_for_stream_at(
+                bookmark,
+                &kind,
+                table_format,
+                stream_format,
+                operation_now,
+            ) {
                 Ok(frame) => initial_frames.push(frame),
                 Err(frame) => return single_watch_frame_body(frame),
             }
@@ -936,11 +1001,12 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                         }
                     };
                     last_delivered_rv = last_delivered_rv.max(event.resource().resource_version);
-                    match serialize_positioned_watch_event_for_stream(
+                    match serialize_positioned_watch_event_for_stream_at(
                         event,
                         &kind,
                         table_format,
                         stream_format,
+                        operation_now,
                     ) {
                         Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
                         Err(frame) => {
@@ -963,11 +1029,12 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                         last_delivered_scoped_rv: last_delivered_rv,
                     }).await;
                     let bookmark = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                    match try_serialize_watch_event_for_stream(
+                    match try_serialize_watch_event_for_stream_at(
                         bookmark,
                         &kind,
                         table_format,
                         stream_format,
+                        operation_now,
                     ) {
                         Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
                         Err(frame) => {

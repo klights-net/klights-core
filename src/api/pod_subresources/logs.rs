@@ -112,6 +112,7 @@ pub(in crate::api) async fn get_pod_log(
     Query(params): Query<LogQuery>,
     req: Request,
 ) -> Result<Response, AppError> {
+    let operation_now = state.operational().clock.now();
     // Get pod from PodRepository
     let pod = crate::api::pod_repository_ports::get_pod(
         state.resource_mutation().pod_repository.as_ref(),
@@ -258,6 +259,7 @@ pub(in crate::api) async fn get_pod_log(
                                 task_supervisor,
                                 log_path,
                                 params,
+                                operation_now,
                             )
                             .await;
                         }
@@ -291,18 +293,20 @@ pub(in crate::api) async fn get_pod_log(
             &container_name,
         )
         .await?;
-        let stream = follow_log_file_with_termination_watch(
+        let stream = follow_log_file_with_termination_watch_at(
             log_path,
             params,
             state.operational().task_supervisor.clone(),
             termination,
+            operation_now,
         );
         build_text_log_response(axum::body::Body::from_stream(stream))
     } else {
-        let output = build_log_output_bytes(
+        let output = build_log_output_bytes_at(
             &log_path,
             &params,
             state.operational().task_supervisor.as_ref(),
+            operation_now,
         )
         .await?;
 
@@ -443,6 +447,7 @@ pub async fn handle_pod_log_websocket_tungstenite<S>(
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     log_path: String,
     params: LogQuery,
+    operation_now: time::OffsetDateTime,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -461,7 +466,12 @@ pub async fn handle_pod_log_websocket_tungstenite<S>(
     }
 
     if params.follow.as_deref() == Some("true") {
-        let stream = follow_log_file_with_initial_query(log_path, params, task_supervisor.clone());
+        let stream = follow_log_file_with_initial_query_at(
+            log_path,
+            params,
+            task_supervisor.clone(),
+            operation_now,
+        );
         futures::pin_mut!(stream);
         while let Some(item) = stream.next().await {
             match item {
@@ -481,7 +491,9 @@ pub async fn handle_pod_log_websocket_tungstenite<S>(
             }
         }
     } else {
-        match build_log_output_bytes(&log_path, &params, task_supervisor.as_ref()).await {
+        match build_log_output_bytes_at(&log_path, &params, task_supervisor.as_ref(), operation_now)
+            .await
+        {
             Ok(output) => {
                 if !output.is_empty()
                     && socket
@@ -506,25 +518,48 @@ pub async fn handle_pod_log_websocket_tungstenite<S>(
         .await;
 }
 
+#[cfg(test)]
 pub async fn build_log_output(
     log_path: &str,
     params: &LogQuery,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<String, AppError> {
-    let bytes = build_log_output_bytes(log_path, params, task_supervisor).await?;
+    let bytes = build_log_output_bytes_at(
+        log_path,
+        params,
+        task_supervisor,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
     Ok(String::from_utf8_lossy(bytes.as_ref()).into_owned())
 }
 
+#[cfg(test)]
 pub async fn build_log_output_bytes(
     log_path: &str,
     params: &LogQuery,
     task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<Bytes, AppError> {
+    build_log_output_bytes_at(
+        log_path,
+        params,
+        task_supervisor,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+}
+
+pub async fn build_log_output_bytes_at(
+    log_path: &str,
+    params: &LogQuery,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    operation_now: time::OffsetDateTime,
+) -> Result<Bytes, AppError> {
     const ATTEMPTS: usize = 50;
     const RETRY_DELAY_MS: u64 = 100;
 
     for attempt in 0..ATTEMPTS {
-        match build_log_output_once_bytes(log_path, params, task_supervisor).await {
+        match build_log_output_once_bytes(log_path, params, task_supervisor, operation_now).await {
             Ok(output) if !output.is_empty() || attempt + 1 == ATTEMPTS => return Ok(output),
             Ok(_) => {
                 let _ = task_supervisor
@@ -564,11 +599,12 @@ async fn build_log_output_once_bytes(
     log_path: &str,
     params: &LogQuery,
     task_supervisor: &klights_supervisor::TaskSupervisor,
+    operation_now: time::OffsetDateTime,
 ) -> io::Result<Bytes> {
     let path = PathBuf::from(log_path);
     let key = log_path.to_string();
     let params = params.clone();
-    let since_cutoff = log_query_since_cutoff(&params);
+    let since_cutoff = log_query_since_cutoff_at(&params, operation_now);
 
     task_supervisor
         .run_blocking_file_keyed("pod_logs_build_output", key, move || {
@@ -670,15 +706,20 @@ fn append_filtered_log_line_bytes(
     append_raw_cri_log_line_for_client(output, raw_line_with_ending, show_timestamps);
 }
 
-fn log_query_since_cutoff(params: &LogQuery) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn log_query_since_cutoff_at(
+    params: &LogQuery,
+    now: time::OffsetDateTime,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Some(ref ts) = params.since_time {
         chrono::DateTime::parse_from_rfc3339(ts)
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc))
     } else {
+        let now = chrono::DateTime::from_timestamp(now.unix_timestamp(), now.nanosecond())
+            .expect("OffsetDateTime timestamp must be representable by chrono");
         params
             .since_seconds
-            .map(|secs| chrono::Utc::now() - chrono::Duration::seconds(secs))
+            .map(|secs| now - chrono::Duration::seconds(secs))
     }
 }
 
@@ -740,12 +781,27 @@ fn is_log_line_after_cutoff_bytes(
         .unwrap_or(true)
 }
 
+pub fn follow_log_file_with_initial_query_at(
+    log_path: String,
+    params: LogQuery,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    operation_now: time::OffsetDateTime,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    follow_log_file_inner(log_path, params, task_supervisor, None, operation_now)
+}
+
+#[cfg(test)]
 pub fn follow_log_file_with_initial_query(
     log_path: String,
     params: LogQuery,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
-    follow_log_file_inner(log_path, params, task_supervisor, None)
+    follow_log_file_with_initial_query_at(
+        log_path,
+        params,
+        task_supervisor,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 pub struct PodLogFollowTermination {
@@ -838,13 +894,36 @@ impl PodLogEventSource {
     }
 }
 
+pub fn follow_log_file_with_termination_watch_at(
+    log_path: String,
+    params: LogQuery,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    termination: PodLogFollowTermination,
+    operation_now: time::OffsetDateTime,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    follow_log_file_inner(
+        log_path,
+        params,
+        task_supervisor,
+        Some(termination),
+        operation_now,
+    )
+}
+
+#[cfg(test)]
 pub fn follow_log_file_with_termination_watch(
     log_path: String,
     params: LogQuery,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     termination: PodLogFollowTermination,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
-    follow_log_file_inner(log_path, params, task_supervisor, Some(termination))
+    follow_log_file_with_termination_watch_at(
+        log_path,
+        params,
+        task_supervisor,
+        termination,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 fn follow_log_file_inner(
@@ -852,6 +931,7 @@ fn follow_log_file_inner(
     initial_params: LogQuery,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     mut termination: Option<PodLogFollowTermination>,
+    operation_now: time::OffsetDateTime,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         use inotify::{Inotify, WatchMask};
@@ -916,7 +996,12 @@ fn follow_log_file_inner(
         };
 
         if initial_follow_requires_snapshot(&initial_params) {
-            match read_initial_follow_snapshot(&log_path, &initial_params, task_supervisor.as_ref()).await {
+            match read_initial_follow_snapshot(
+                &log_path,
+                &initial_params,
+                task_supervisor.as_ref(),
+                operation_now,
+            ).await {
                 Ok((offset, initial)) => {
                     match seek_log_file_supervised(&log_path, file, offset, task_supervisor.as_ref()).await {
                         Ok(seeked) => file = seeked,
@@ -1518,11 +1603,12 @@ async fn read_initial_follow_snapshot(
     log_path: &str,
     params: &LogQuery,
     task_supervisor: &klights_supervisor::TaskSupervisor,
+    operation_now: time::OffsetDateTime,
 ) -> io::Result<(u64, Bytes)> {
     let path = PathBuf::from(log_path);
     let key = log_path.to_string();
     let params = params.clone();
-    let read = move || read_initial_follow_snapshot_blocking(path, &params);
+    let read = move || read_initial_follow_snapshot_blocking(path, &params, operation_now);
 
     task_supervisor
         .run_blocking_file_keyed("pod_log_follow_initial_snapshot", key, read)
@@ -1540,11 +1626,12 @@ fn initial_follow_requires_snapshot(params: &LogQuery) -> bool {
 fn read_initial_follow_snapshot_blocking(
     path: PathBuf,
     params: &LogQuery,
+    operation_now: time::OffsetDateTime,
 ) -> io::Result<(u64, Bytes)> {
     let mut file = blocking_fs::File::open(path)?;
     let len = file.metadata()?.len();
     let len_usize = len.min(usize::MAX as u64) as usize;
-    let since_cutoff = log_query_since_cutoff(params);
+    let since_cutoff = log_query_since_cutoff_at(params, operation_now);
     let mut output = if let Some(ref cutoff) = since_cutoff {
         read_since_filtered_prefix_bytes(&mut file, cutoff, params.limit_bytes)?
     } else if let Some(tail_lines) = params.tail_lines {

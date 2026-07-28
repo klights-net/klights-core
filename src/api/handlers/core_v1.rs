@@ -651,8 +651,6 @@ async fn create_serviceaccount_token(
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
-    use crate::auth::clock::Clock;
-
     let sa = crate::api::resource_query_ports::get_resource(
         state.resource_mutation().resource_query.as_ref(),
         "v1",
@@ -798,7 +796,7 @@ async fn create_serviceaccount_token(
         .and_then(|u| u.as_str())
         .map(str::to_string);
     bound.sa_uid = sa_uid.as_deref();
-    let issued_at = crate::auth::clock::SystemClock.now();
+    let issued_at = state.operational().clock.now();
     let owned_bound = (
         bound.pod_name.map(str::to_string),
         bound.pod_uid.map(str::to_string),

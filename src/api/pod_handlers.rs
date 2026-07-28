@@ -94,6 +94,7 @@ pub(in crate::api) async fn list_pods(
             stream_format,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
+            operation_now: state.operational().clock.now(),
         })
         .await;
         return Ok(Response::builder()
@@ -172,7 +173,8 @@ pub(in crate::api) async fn list_pods(
 
     // Return Table format if requested by kubectl
     if wants_table_format(&headers)? {
-        let table = pod_list_to_table(items, resource_version);
+        let now = state.operational().clock.now();
+        let table = pod_list_to_table_at(items, resource_version, now);
         return Ok(Json(table).into_response());
     }
 
@@ -510,6 +512,7 @@ pub(in crate::api) async fn list_all_pods(
             stream_format,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
+            operation_now: state.operational().clock.now(),
         })
         .await;
         return Ok(Response::builder()
@@ -582,7 +585,8 @@ pub(in crate::api) async fn list_all_pods(
 
     // Return Table format if requested by kubectl
     if wants_table_format(&headers)? {
-        let table = pod_list_to_table(items, resource_version);
+        let now = state.operational().clock.now();
+        let table = pod_list_to_table_at(items, resource_version, now);
         return Ok(Json(table).into_response());
     }
 

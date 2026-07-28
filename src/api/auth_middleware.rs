@@ -11,7 +11,7 @@ use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_types::TlsClientCertificate;
 
 use super::{ApiState, AppError};
-use crate::auth::clock::SystemClock;
+use crate::auth::clock::SnapshotClock;
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::impersonation::ImpersonationRequest;
 use crate::auth::middleware::{
@@ -132,7 +132,7 @@ pub(in crate::api) async fn authenticate_token_for_review(
     audiences: &[String],
 ) -> Result<crate::auth::middleware::ReviewedTokenIdentity, AuthenticationError> {
     let resources = ApiAuthResources { state };
-    let clock = SystemClock;
+    let clock = SnapshotClock::new(state.operational().clock.now());
     let auth_policy = state.auth_policy();
     let runtime = AuthnRuntime::new(
         auth_policy.bootstrap_token_authenticator.as_ref(),
@@ -179,7 +179,7 @@ pub(in crate::api) async fn authenticate_request(
     };
 
     let resources = ApiAuthResources { state: &state };
-    let clock = SystemClock;
+    let clock = SnapshotClock::new(state.operational().clock.now());
     let auth_policy = state.auth_policy();
     let runtime = AuthnRuntime::new(
         auth_policy.bootstrap_token_authenticator.as_ref(),

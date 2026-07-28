@@ -126,10 +126,11 @@ impl IntoResponse for K8sResponse {
     }
 }
 
-pub fn format_age(creation_timestamp: &str) -> String {
+pub fn format_age_at(creation_timestamp: &str, now: time::OffsetDateTime) -> String {
     if let Ok(created) = chrono::DateTime::parse_from_rfc3339(creation_timestamp) {
-        let duration =
-            chrono::Utc::now().signed_duration_since(created.with_timezone(&chrono::Utc));
+        let now = chrono::DateTime::from_timestamp(now.unix_timestamp(), now.nanosecond())
+            .expect("OffsetDateTime timestamp must be representable by chrono");
+        let duration = now.signed_duration_since(created.with_timezone(&chrono::Utc));
         if duration.num_days() > 0 {
             format!("{}d", duration.num_days())
         } else if duration.num_hours() > 0 {
@@ -203,7 +204,11 @@ fn pod_table_column_definitions() -> Value {
     ])
 }
 
-pub fn pod_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+pub fn pod_list_to_table_at(
+    items: Vec<Value>,
+    resource_version: String,
+    now: time::OffsetDateTime,
+) -> Value {
     let rows: Vec<Value> = items
         .into_iter()
         .map(|pod| {
@@ -217,7 +222,7 @@ pub fn pod_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
                 .unwrap_or("")
                 .to_string();
 
-            let age = format_age(&creation_timestamp);
+            let age = format_age_at(&creation_timestamp, now);
 
             let container_statuses = pod["status"]["containerStatuses"].as_array();
             let init_container_statuses = pod["status"]["initContainerStatuses"].as_array();
@@ -320,7 +325,11 @@ pub fn pod_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
     })
 }
 
-pub fn node_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+pub fn node_list_to_table_at(
+    items: Vec<Value>,
+    resource_version: String,
+    now: time::OffsetDateTime,
+) -> Value {
     let rows: Vec<Value> = items
         .into_iter()
         .map(|node| {
@@ -332,7 +341,7 @@ pub fn node_list_to_table(items: Vec<Value>, resource_version: String) -> Value 
                 .unwrap_or("")
                 .to_string();
 
-            let age = format_age(&creation_timestamp);
+            let age = format_age_at(&creation_timestamp, now);
 
             let conditions = node["status"]["conditions"].as_array();
             let ready_condition = conditions
@@ -466,7 +475,11 @@ fn node_info_for_table(node: &Value, field: &str) -> String {
 }
 
 /// ReplicaSet table: NAME DESIRED CURRENT READY AGE
-pub fn replicaset_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+pub fn replicaset_list_to_table_at(
+    items: Vec<Value>,
+    resource_version: String,
+    now: time::OffsetDateTime,
+) -> Value {
     let rows: Vec<Value> = items
         .into_iter()
         .map(|rs| {
@@ -475,7 +488,7 @@ pub fn replicaset_list_to_table(items: Vec<Value>, resource_version: String) -> 
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let age = format_age(&creation_timestamp);
+            let age = format_age_at(&creation_timestamp, now);
 
             let desired = rs["spec"]["replicas"].as_i64().unwrap_or(0);
             let current = rs["status"]["replicas"].as_i64().unwrap_or(0);
@@ -506,7 +519,11 @@ pub fn replicaset_list_to_table(items: Vec<Value>, resource_version: String) -> 
 }
 
 /// Deployment table: NAME READY UP-TO-DATE AVAILABLE AGE
-pub fn deployment_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+pub fn deployment_list_to_table_at(
+    items: Vec<Value>,
+    resource_version: String,
+    now: time::OffsetDateTime,
+) -> Value {
     let rows: Vec<Value> = items
         .into_iter()
         .map(|dep| {
@@ -515,7 +532,7 @@ pub fn deployment_list_to_table(items: Vec<Value>, resource_version: String) -> 
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let age = format_age(&creation_timestamp);
+            let age = format_age_at(&creation_timestamp, now);
 
             let ready = dep["status"]["readyReplicas"].as_i64().unwrap_or(0);
             let updated = dep["status"]["updatedReplicas"].as_i64().unwrap_or(0);
@@ -546,7 +563,11 @@ pub fn deployment_list_to_table(items: Vec<Value>, resource_version: String) -> 
 }
 
 /// StatefulSet table: NAME READY AGE
-pub fn statefulset_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+pub fn statefulset_list_to_table_at(
+    items: Vec<Value>,
+    resource_version: String,
+    now: time::OffsetDateTime,
+) -> Value {
     let rows: Vec<Value> = items
         .into_iter()
         .map(|sts| {
@@ -555,7 +576,7 @@ pub fn statefulset_list_to_table(items: Vec<Value>, resource_version: String) ->
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let age = format_age(&creation_timestamp);
+            let age = format_age_at(&creation_timestamp, now);
 
             let ready_replicas = sts["status"]["readyReplicas"].as_i64().unwrap_or(0);
             let desired_replicas = sts["spec"]["replicas"].as_i64().unwrap_or(1);
@@ -583,7 +604,11 @@ pub fn statefulset_list_to_table(items: Vec<Value>, resource_version: String) ->
     })
 }
 
-pub fn watch_event_to_table(event: WatchEvent, kind: &str) -> WatchEvent {
+pub fn watch_event_to_table_at(
+    event: WatchEvent,
+    kind: &str,
+    now: time::OffsetDateTime,
+) -> WatchEvent {
     let resource_version = event
         .object
         .get("metadata")
@@ -651,13 +676,13 @@ pub fn watch_event_to_table(event: WatchEvent, kind: &str) -> WatchEvent {
 
     let object_val = Arc::try_unwrap(event.object).unwrap_or_else(|arc| (*arc).clone());
     let mut table = match kind {
-        "Pod" => pod_list_to_table(vec![object_val], resource_version),
-        "Node" => node_list_to_table(vec![object_val], resource_version),
-        "ReplicaSet" => replicaset_list_to_table(vec![object_val], resource_version),
-        "Deployment" => deployment_list_to_table(vec![object_val], resource_version),
-        "StatefulSet" => statefulset_list_to_table(vec![object_val], resource_version),
+        "Pod" => pod_list_to_table_at(vec![object_val], resource_version, now),
+        "Node" => node_list_to_table_at(vec![object_val], resource_version, now),
+        "ReplicaSet" => replicaset_list_to_table_at(vec![object_val], resource_version, now),
+        "Deployment" => deployment_list_to_table_at(vec![object_val], resource_version, now),
+        "StatefulSet" => statefulset_list_to_table_at(vec![object_val], resource_version, now),
         _ => {
-            let cells = table_row_cells_for_kind(kind, &object_val);
+            let cells = table_row_cells_for_kind_at(kind, &object_val, now);
             serde_json::json!({
                 "apiVersion": "meta.k8s.io/v1",
                 "kind": "Table",
@@ -768,13 +793,17 @@ pub fn table_column_definitions_for_kind(kind: &str) -> Value {
 
 /// Row cells for an `item` of `kind`, aligned 1:1 with
 /// [`table_column_definitions_for_kind`].
-pub fn table_row_cells_for_kind(kind: &str, item: &Value) -> Vec<Value> {
+pub fn table_row_cells_for_kind_at(
+    kind: &str,
+    item: &Value,
+    now: time::OffsetDateTime,
+) -> Vec<Value> {
     let name = item["metadata"]["name"].as_str().unwrap_or("").to_string();
     let created_at = item["metadata"]["creationTimestamp"]
         .as_str()
         .unwrap_or("")
         .to_string();
-    let age = format_age(&created_at);
+    let age = format_age_at(&created_at, now);
 
     match kind {
         "Service" => vec![
@@ -852,11 +881,16 @@ pub fn table_row_cells_for_kind(kind: &str, item: &Value) -> Vec<Value> {
 }
 
 /// Build a Table for a list of items of `kind` using the kind's column set.
-pub fn generic_list_to_table(kind: &str, items: Vec<Value>, resource_version: String) -> Value {
+pub fn generic_list_to_table_at(
+    kind: &str,
+    items: Vec<Value>,
+    resource_version: String,
+    now: time::OffsetDateTime,
+) -> Value {
     let rows: Vec<Value> = items
         .into_iter()
         .map(|item| {
-            let cells = table_row_cells_for_kind(kind, &item);
+            let cells = table_row_cells_for_kind_at(kind, &item, now);
             serde_json::json!({"cells": cells, "object": item})
         })
         .collect();
@@ -867,6 +901,36 @@ pub fn generic_list_to_table(kind: &str, items: Vec<Value>, resource_version: St
         "columnDefinitions": table_column_definitions_for_kind(kind),
         "rows": rows,
     })
+}
+
+#[cfg(test)]
+fn test_wall_clock_now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
+
+#[cfg(test)]
+pub fn pod_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+    pod_list_to_table_at(items, resource_version, test_wall_clock_now())
+}
+
+#[cfg(test)]
+pub fn node_list_to_table(items: Vec<Value>, resource_version: String) -> Value {
+    node_list_to_table_at(items, resource_version, test_wall_clock_now())
+}
+
+#[cfg(test)]
+pub fn watch_event_to_table(event: WatchEvent, kind: &str) -> WatchEvent {
+    watch_event_to_table_at(event, kind, test_wall_clock_now())
+}
+
+#[cfg(test)]
+pub fn table_row_cells_for_kind(kind: &str, item: &Value) -> Vec<Value> {
+    table_row_cells_for_kind_at(kind, item, test_wall_clock_now())
+}
+
+#[cfg(test)]
+pub fn generic_list_to_table(kind: &str, items: Vec<Value>, resource_version: String) -> Value {
+    generic_list_to_table_at(kind, items, resource_version, test_wall_clock_now())
 }
 
 fn table_service_type(svc: &Value) -> String {
@@ -1378,6 +1442,18 @@ mod response_negotiation_tests {
 mod table_printer_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn age_formatting_uses_the_explicit_operation_time() {
+        let now = time::OffsetDateTime::parse(
+            "2026-07-28T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed operation time");
+
+        assert_eq!(format_age_at("2026-07-26T12:00:00Z", now), "2d");
+        assert_eq!(format_age_at("2026-07-28T11:30:00Z", now), "30m");
+    }
 
     fn col_names(kind: &str) -> Vec<String> {
         table_column_definitions_for_kind(kind)

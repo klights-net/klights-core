@@ -279,6 +279,7 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
                     timeout_seconds: request.timeout_seconds,
                     emit_initial_state_for_resource_version_zero: request
                         .emit_initial_state_for_resource_version_zero,
+                    operation_now: request.operation_now,
                 },
             )
             .await

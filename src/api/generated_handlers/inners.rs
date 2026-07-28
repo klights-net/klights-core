@@ -439,6 +439,7 @@ pub(in crate::api) async fn list_inner(
                 stream_format,
                 timeout_seconds: query.timeout_seconds,
                 emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
+                operation_now: state.operational().clock.now(),
             })
             .await;
         return Ok(Response::builder()
@@ -526,15 +527,16 @@ pub(in crate::api) async fn list_inner(
     let resource_version = response_rv.to_string();
 
     if wants_table_format(&headers)? {
+        let now = state.operational().clock.now();
         let table = match kind {
-            "Pod" => pod_list_to_table(items, resource_version),
-            "Node" => node_list_to_table(items, resource_version),
-            "ReplicaSet" => replicaset_list_to_table(items, resource_version),
-            "Deployment" => deployment_list_to_table(items, resource_version),
-            "StatefulSet" => statefulset_list_to_table(items, resource_version),
+            "Pod" => pod_list_to_table_at(items, resource_version, now),
+            "Node" => node_list_to_table_at(items, resource_version, now),
+            "ReplicaSet" => replicaset_list_to_table_at(items, resource_version, now),
+            "Deployment" => deployment_list_to_table_at(items, resource_version, now),
+            "StatefulSet" => statefulset_list_to_table_at(items, resource_version, now),
             // Resources without a dedicated converter use kubectl's per-kind
             // columns, falling back to the upstream default (NAME + CREATED AT).
-            _ => crate::api::response::generic_list_to_table(kind, items, resource_version),
+            _ => crate::api::response::generic_list_to_table_at(kind, items, resource_version, now),
         };
         return Ok(Json(table).into_response());
     }

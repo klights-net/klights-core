@@ -1276,6 +1276,33 @@ async fn test_follow_log_file_since_time_respects_limit_bytes() {
 // --- is_log_line_after_cutoff tests ---
 
 #[test]
+fn test_since_seconds_cutoff_uses_explicit_operation_time() {
+    let params = LogQuery {
+        container: None,
+        follow: None,
+        tail_lines: None,
+        timestamps: None,
+        since_seconds: Some(90),
+        since_time: None,
+        limit_bytes: None,
+        previous: None,
+        insecure_skip_tls_verify_backend: false,
+    };
+    let now = time::OffsetDateTime::parse(
+        "2026-07-28T12:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed operation time");
+
+    assert_eq!(
+        log_query_since_cutoff_at(&params, now)
+            .expect("sinceSeconds cutoff")
+            .to_rfc3339(),
+        "2026-07-28T11:58:30+00:00"
+    );
+}
+
+#[test]
 fn test_is_log_line_after_cutoff_no_cutoff_includes_all() {
     let line = "2024-01-15T10:30:00Z stdout F message";
     assert!(is_log_line_after_cutoff(line, None));

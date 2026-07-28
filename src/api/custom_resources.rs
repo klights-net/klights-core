@@ -995,16 +995,16 @@ async fn list_cr_inner(
                             .is_none_or(|selector| selector.matches_resource(&resource.data))
                 }) {
                     let event = crate::api::custom_resource_ports::added_watch_event(resource);
-                    initial_frames.push(crate::api::watch_stream::serialize_watch_event_line(
-                        event, &kind, false,
-                    ));
+                    initial_frames.push(
+                        crate::api::watch_stream::serialize_watch_event_line_without_table(event),
+                    );
                 }
                 if send_initial_events {
-                    initial_frames.push(crate::api::watch_stream::serialize_watch_event_line(
-                        WatchEvent::bookmark_initial_events_end(last_rv, &av, &kind),
-                        &kind,
-                        false,
-                    ));
+                    initial_frames.push(
+                        crate::api::watch_stream::serialize_watch_event_line_without_table(
+                            WatchEvent::bookmark_initial_events_end(last_rv, &av, &kind),
+                        ),
+                    );
                 }
             }
             let start_resource_version = if requested_rv == 0
@@ -1103,10 +1103,8 @@ async fn list_cr_inner(
                             };
                             last_rv = last_rv.max(event.resource().resource_version);
                             yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_event_line(
+                                crate::api::watch_stream::serialize_watch_event_line_without_table(
                                     crate::api::custom_resource_ports::resource_event_to_watch_event(&event),
-                                    &kind,
-                                    false,
                                 ),
                             );
                         }
@@ -1127,10 +1125,8 @@ async fn list_cr_inner(
                                     .unwrap_or(0);
                             }
                             yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_event_line(
+                                crate::api::watch_stream::serialize_watch_event_line_without_table(
                                     WatchEvent::bookmark_typed(rv, &av, &kind),
-                                    &kind,
-                                    false,
                                 ),
                             );
                         }
@@ -1241,7 +1237,7 @@ async fn list_cr_inner(
                     let bookmark =
                         WatchEvent::bookmark_initial_events_end(send_initial_snapshot_rv, &av, &kind);
                     yield Ok::<_, std::convert::Infallible>(
-                        crate::api::watch_stream::serialize_watch_event_line(bookmark, &kind, false),
+                        crate::api::watch_stream::serialize_watch_event_line_without_table(bookmark),
                     );
                 } else if (has_selector || emit_initial_state_for_resource_version_zero)
                     && requested_rv <= 0
@@ -1569,8 +1565,8 @@ async fn list_cr_inner(
                             .await;
                             let event = WatchEvent::bookmark_typed(rv, &av, &kind);
                             yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_event_line(
-                                    event, &kind, false,
+                                crate::api::watch_stream::serialize_watch_event_line_without_table(
+                                    event,
                                 ),
                             );
                         }

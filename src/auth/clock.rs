@@ -16,6 +16,26 @@ impl Clock for SystemClock {
     }
 }
 
+/// Operation-scoped wall-clock snapshot.
+///
+/// Policy code can pass this through interfaces that accept [`Clock`] while
+/// guaranteeing every read in that operation observes the same instant.
+pub(crate) struct SnapshotClock {
+    now: OffsetDateTime,
+}
+
+impl SnapshotClock {
+    pub(crate) fn new(now: OffsetDateTime) -> Self {
+        Self { now }
+    }
+}
+
+impl Clock for SnapshotClock {
+    fn now(&self) -> OffsetDateTime {
+        self.now
+    }
+}
+
 /// Object-safe monotonic time source for auth caches.
 pub trait MonotonicClock: Send + Sync {
     fn now(&self) -> Instant;

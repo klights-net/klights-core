@@ -198,6 +198,7 @@ pub(crate) async fn build_test_app_state_with_db(
             crate::api::ApiNodeRole::Leader,
             None,
             crate::api::ApiOperationalConfig::from_test(config.as_ref().clone()),
+            std::sync::Arc::new(crate::auth::clock::SystemClock),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),
             ),

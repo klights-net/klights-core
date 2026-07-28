@@ -15,9 +15,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::logs::{
-    LogQuery, PodLogFollowTermination, PodLogFollowWatchSource, build_log_output_bytes,
-    build_pod_log_follow_event_cursor, follow_log_file_with_initial_query,
-    follow_log_file_with_termination_watch,
+    LogQuery, PodLogFollowTermination, PodLogFollowWatchSource, build_log_output_bytes_at,
+    build_pod_log_follow_event_cursor, follow_log_file_with_initial_query_at,
+    follow_log_file_with_termination_watch_at,
 };
 
 const NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
@@ -30,6 +30,7 @@ const NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
 pub(crate) struct LocalNodeLogRuntime {
     pod_logs_root: PathBuf,
     task_supervisor: Arc<TaskSupervisor>,
+    clock: Arc<dyn crate::auth::clock::Clock>,
     pod_log_follow_watch: Option<PodLogFollowWatchSource>,
 }
 
@@ -39,6 +40,7 @@ impl LocalNodeLogRuntime {
         Self {
             pod_logs_root: crate::paths::pod_logs_root_path(&containerd_namespace),
             task_supervisor,
+            clock: Arc::new(crate::auth::clock::SystemClock),
             pod_log_follow_watch: None,
         }
     }
@@ -46,11 +48,13 @@ impl LocalNodeLogRuntime {
     pub(crate) fn new_with_pod_event_store(
         pod_logs_root: PathBuf,
         task_supervisor: Arc<TaskSupervisor>,
+        clock: Arc<dyn crate::auth::clock::Clock>,
         pod_log_follow_watch: PodLogFollowWatchSource,
     ) -> Self {
         Self {
             pod_logs_root,
             task_supervisor,
+            clock,
             pod_log_follow_watch: Some(pod_log_follow_watch),
         }
     }
@@ -88,12 +92,20 @@ impl NodeLogRuntime for LocalNodeLogRuntime {
             previous,
             insecure_skip_tls_verify_backend: false,
         };
+        let operation_now = self.clock.now();
 
         Box::pin(async move {
             if is_previous {
                 return Ok(NodeLogResult::success(Vec::new()));
             }
-            match build_log_output_bytes(&log_path, &params, self.task_supervisor.as_ref()).await {
+            match build_log_output_bytes_at(
+                &log_path,
+                &params,
+                self.task_supervisor.as_ref(),
+                operation_now,
+            )
+            .await
+            {
                 Ok(content) => Ok(NodeLogResult::success(content.to_vec())),
                 Err(error) => Ok(NodeLogResult::failed(
                     Vec::new(),
@@ -126,6 +138,7 @@ impl NodeLogRuntime for LocalNodeLogRuntime {
         let pod_name = target.pod_name().to_string();
         let pod_uid = target.pod_uid().to_string();
         let container_name = target.container_name().to_string();
+        let operation_now = self.clock.now();
 
         if params.previous.as_deref() == Some("true") {
             return Box::pin(async move {
@@ -172,20 +185,22 @@ impl NodeLogRuntime for LocalNodeLogRuntime {
                     container_name,
                     false,
                 );
-                Box::pin(follow_log_file_with_termination_watch(
+                Box::pin(follow_log_file_with_termination_watch_at(
                     log_path,
                     params,
                     producer_supervisor.clone(),
                     termination,
+                    operation_now,
                 ))
                     as Pin<
                         Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
                     >
             } else {
-                Box::pin(follow_log_file_with_initial_query(
+                Box::pin(follow_log_file_with_initial_query_at(
                     log_path,
                     params,
                     producer_supervisor.clone(),
+                    operation_now,
                 ))
             };
             loop {

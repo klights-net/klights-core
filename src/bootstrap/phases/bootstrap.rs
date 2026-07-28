@@ -1032,6 +1032,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             api_role,
             api_replication,
             api_config,
+            Arc::new(crate::auth::clock::SystemClock),
             crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(
                 db_handle.clone(),
             ),
@@ -1730,6 +1731,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         config.node_name.clone(),
         config.anonymous_auth,
         api_runtime_inputs,
+        Arc::new(crate::auth::clock::SystemClock),
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
         api_signing_keys,

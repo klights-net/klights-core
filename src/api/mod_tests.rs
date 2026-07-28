@@ -5234,6 +5234,13 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
         crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
             signing_key_pem.clone(),
         );
+    let fixed_now = time::OffsetDateTime::parse(
+        "2040-01-02T03:04:05Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed authentication time");
+    state.operational_mut().clock =
+        std::sync::Arc::new(crate::auth::clock::FixedClock { now: fixed_now });
 
     // Phase 2B: SA must exist for UID validation.
     // Create the ServiceAccount before generating the token.
@@ -5261,13 +5268,21 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
 
     let app = crate::api::build_router(state);
 
-    let token = crate::auth::generate_sa_token_with_sa_uid(
-        &signing_key_pem,
-        "sonobuoy-serviceaccount",
-        "sonobuoy",
-        &["https://kubernetes.default.svc.cluster.local"],
-        klights_types::DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
-        &sa_uid,
+    let token = crate::auth::generate_sa_token_with_bound_pod_at(
+        crate::auth::ServiceAccountTokenRequest {
+            ca_key_pem: &signing_key_pem,
+            service_account: "sonobuoy-serviceaccount",
+            namespace: "sonobuoy",
+            audiences: &["https://kubernetes.default.svc.cluster.local"],
+            expiration_seconds: Some(
+                klights_types::DEFAULT_SERVICE_ACCOUNT_TOKEN_EXPIRATION_SECONDS,
+            ),
+            bound: crate::auth::BoundServiceAccountToken {
+                sa_uid: Some(&sa_uid),
+                ..Default::default()
+            },
+        },
+        fixed_now,
     )
     .unwrap();
 
@@ -5284,6 +5299,74 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn serviceaccount_token_request_uses_injected_api_wall_clock() {
+    use tower::ServiceExt;
+
+    let mut state = crate::api::test_support::build_test_app_state().await;
+    let fixed_now = time::OffsetDateTime::parse(
+        "2026-07-28T12:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("fixed API wall clock");
+    state.operational_mut().clock =
+        std::sync::Arc::new(crate::auth::clock::FixedClock { now: fixed_now });
+    state
+        .resource_mutation()
+        .db
+        .create_resource(
+            "v1",
+            "ServiceAccount",
+            Some("default"),
+            "clock-test",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": "clock-test",
+                    "namespace": "default",
+                    "uid": "clock-test-uid"
+                }
+            }),
+        )
+        .await
+        .expect("create ServiceAccount");
+
+    let response = crate::api::build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/serviceaccounts/clock-test/token")
+                .header("content-type", "application/json")
+                .extension(crate::auth::AuthenticatedIdentity::admin("test-admin"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "apiVersion": "authentication.k8s.io/v1",
+                        "kind": "TokenRequest",
+                        "spec": {"expirationSeconds": 600}
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("TokenRequest response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("TokenRequest JSON");
+
+    assert_eq!(
+        body.pointer("/metadata/creationTimestamp"),
+        Some(&serde_json::json!("2026-07-28T12:00:00Z"))
+    );
+    assert_eq!(
+        body.pointer("/status/expirationTimestamp"),
+        Some(&serde_json::json!("2026-07-28T12:10:00Z"))
+    );
 }
 
 #[tokio::test]
