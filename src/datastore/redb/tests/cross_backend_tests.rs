@@ -512,7 +512,7 @@ async fn update_with_wrong_rv_conflict_redb() {
         .await
         .expect_err("redb must enforce resourceVersion preconditions");
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
 }

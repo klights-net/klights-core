@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn upsert_and_delete_round_trip() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_owner_refs() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data_v1 = json!({
             "metadata": {
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn cluster_scoped_uses_empty_namespace() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn ordinal_is_array_index() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {

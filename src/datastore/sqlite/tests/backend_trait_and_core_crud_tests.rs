@@ -5637,7 +5637,7 @@ async fn update_resource_rejects_metadata_uid_change() {
         .expect_err("metadata.uid changes must be rejected");
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     let stored = db
@@ -5687,7 +5687,7 @@ async fn update_status_only_rejects_uid_precondition_mismatch() {
         .expect_err("stale uid precondition must reject status writes");
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     let stored = db
@@ -5827,7 +5827,7 @@ async fn patch_resource_latest_rejects_uid_precondition_mismatch() {
         .expect_err("stale uid precondition must reject patches");
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     let stored = db
@@ -5870,7 +5870,7 @@ async fn patch_resource_latest_rejects_metadata_uid_change() {
         .expect_err("metadata.uid changes must be rejected");
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
 }
@@ -5903,7 +5903,7 @@ async fn delete_resource_rejects_uid_precondition_mismatch() {
         .expect_err("stale uid precondition must reject delete");
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected conflict, got {err:#}"
     );
     assert!(
@@ -7451,7 +7451,7 @@ async fn from_executor_initializes_watch_and_fingerprint() {
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let executor = crate::datastore::sqlite::open::open_in_memory(supervisor, "dsb03:fp-test")
+    let executor = klights_cluster_datastore::sqlite::open_in_memory(supervisor, "dsb03:fp-test")
         .await
         .unwrap();
     let ds = Datastore::new_in_memory_with_watch_and_executor(executor)

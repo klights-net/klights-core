@@ -481,8 +481,8 @@ async fn test_update_status_only_resource_version_conflict_is_typed() {
         .expect_err("stale status writer must fail with a typed conflict");
 
     assert!(
-        err.downcast_ref::<crate::datastore::errors::DatastoreError>()
-            .is_some_and(crate::datastore::errors::DatastoreError::is_conflict),
+        err.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>()
+            .is_some_and(klights_cluster_datastore::errors::DatastoreError::is_conflict),
         "expected typed datastore conflict, got {err:#}"
     );
 }
@@ -715,8 +715,8 @@ async fn pod_status_patch_with_resource_version_conflict_returns_409() {
     );
     let err = result.unwrap_err();
     assert!(
-        err.downcast_ref::<crate::datastore::errors::DatastoreError>()
-            .is_some_and(crate::datastore::errors::DatastoreError::is_conflict)
+        err.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>()
+            .is_some_and(klights_cluster_datastore::errors::DatastoreError::is_conflict)
             || err.to_string().contains("409")
             || err.to_string().to_lowercase().contains("conflict"),
         "expected 409/conflict error, got: {}",

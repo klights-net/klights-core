@@ -16,7 +16,6 @@ use tokio::sync::broadcast;
 #[cfg(test)]
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::errors::DatastoreError;
 use crate::datastore::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PodCleanupIntent,
     PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata, ResourceList,
@@ -24,6 +23,7 @@ use crate::datastore::types::{
 };
 #[cfg(test)]
 use crate::datastore::types::{PendingWatchEvent, ReplicatedCreateOptions};
+use klights_cluster_datastore::errors::DatastoreError;
 
 use super::SequencedDatastore;
 #[cfg(test)]

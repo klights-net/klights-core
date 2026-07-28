@@ -805,7 +805,7 @@ mod owner_index_tests {
     fn explain_query_plan_owner_uid_uses_index() {
         use rusqlite::Connection;
         let mut conn = Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let mut plan_parts = Vec::new();
         let mut stmt = conn
@@ -837,7 +837,7 @@ mod owner_index_tests {
     fn owner_ref_schema_has_composite_lookup_indexes() {
         use rusqlite::Connection;
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::datastore::sqlite::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let indexes = conn
             .prepare("PRAGMA index_list('resource_owner_refs')")
@@ -871,7 +871,7 @@ mod owner_index_tests {
     fn empty_uid_owner_lookup_uses_owner_identity_index() {
         use rusqlite::Connection;
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::datastore::sqlite::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let mut stmt = conn
             .prepare(

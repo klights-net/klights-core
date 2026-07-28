@@ -191,7 +191,8 @@ pub(super) fn validate_metadata_uid_immutable(incoming: &Value, existing: &Value
         }),
     )
     .map_err(|_| {
-        crate::datastore::errors::DatastoreError::conflict("metadata.uid is immutable").into()
+        klights_cluster_datastore::errors::DatastoreError::conflict("metadata.uid is immutable")
+            .into()
     })
 }
 
@@ -213,18 +214,20 @@ pub(super) fn validate_resource_preconditions(
     )
     .map_err(|violation| match violation {
         klights_cluster_core::ApplyPreconditionViolation::Uid { expected, .. } => {
-            crate::datastore::errors::DatastoreError::conflict(format!(
+            klights_cluster_datastore::errors::DatastoreError::conflict(format!(
                 "UID precondition failed: expected {expected}"
             ))
             .into()
         }
         klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { expected, actual } => {
-            crate::datastore::errors::DatastoreError::conflict(format!(
+            klights_cluster_datastore::errors::DatastoreError::conflict(format!(
                 "resourceVersion precondition failed: expected {expected} got {actual}"
             ))
             .into()
         }
-        other => crate::datastore::errors::DatastoreError::conflict(other.to_string()).into(),
+        other => {
+            klights_cluster_datastore::errors::DatastoreError::conflict(other.to_string()).into()
+        }
     })
 }
 

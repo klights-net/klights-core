@@ -6182,7 +6182,7 @@ async fn set_probe_readiness_exhausts_unpinned_conflict_retries() {
     };
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected typed conflict after exhausting retries, got {err:?}"
     );
     assert_eq!(
@@ -6234,7 +6234,7 @@ async fn set_probe_readiness_pinned_rv_conflict_does_not_retry() {
     };
 
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected typed conflict for pinned probe-readiness write, got {err:?}"
     );
     assert_eq!(

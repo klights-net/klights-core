@@ -8,10 +8,11 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
-use crate::datastore::redb::accessor::RedbAccessor;
-use crate::datastore::redb::{helpers, tables};
+use crate::datastore::redb::helpers;
 use crate::datastore::types::*;
 use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
+use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::tables;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
@@ -1151,16 +1152,18 @@ fn floor_key_prefix(api_version: &str, kind: &str) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::datastore::redb::accessor::RedbAccessor;
     use crate::datastore::redb::helpers;
-    use crate::datastore::redb::open_boundary;
+    use klights_cluster_datastore::redb as open_boundary;
+    use klights_cluster_datastore::redb::RedbAccessor;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;
 
-    fn store() -> RedbWatchStore {
-        let db = open_boundary::open_in_memory_blocking().unwrap();
+    async fn store() -> RedbWatchStore {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let db = open_boundary::open_in_memory(supervisor.as_ref())
+            .await
+            .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         RedbWatchStore::new(accessor)
     }
@@ -1183,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_floor_keyset_pages_are_bounded_complete_and_exclusive() {
-        let s = store();
+        let s = store().await;
         let db = s.accessor.db().unwrap();
         let write = db.begin_write().unwrap();
         {
@@ -1251,7 +1254,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_list_filters_by_target() {
-        let s = store();
+        let s = store().await;
         insert_watch_event(&s, 1, "v1", "Pod", Some("ns"), "p", "ADDED");
         insert_watch_event(&s, 2, "v1", "ConfigMap", Some("ns"), "cm", "ADDED");
 
@@ -1267,7 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_list_deleted_only_returns_deleted() {
-        let s = store();
+        let s = store().await;
         insert_watch_event(&s, 1, "v1", "Pod", Some("ns"), "p", "ADDED");
         insert_watch_event(&s, 2, "v1", "Pod", Some("ns"), "p", "DELETED");
         insert_watch_event(&s, 3, "v1", "Pod", Some("ns"), "q", "MODIFIED");
@@ -1279,7 +1282,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_list_respects_since_rv() {
-        let s = store();
+        let s = store().await;
         insert_watch_event(&s, 1, "v1", "Pod", Some("ns"), "old", "ADDED");
         insert_watch_event(&s, 2, "v1", "Pod", Some("ns"), "new", "ADDED");
 
@@ -1290,7 +1293,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_list_all_since_paged_keysets_across_resource_versions() {
-        let s = store();
+        let s = store().await;
         for i in 1..=5 {
             insert_watch_event(&s, i, "v1", "Pod", Some("ns"), &format!("p{i}"), "ADDED");
         }
@@ -1329,7 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_replay_preserves_one_hundred_same_revision_siblings() {
-        let s = store();
+        let s = store().await;
         for index in 0..100 {
             insert_watch_event(
                 &s,
@@ -1377,7 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_replay_gc_expiry_is_scope_specific() {
-        let s = store();
+        let s = store().await;
         insert_watch_event(&s, 1, "v1", "Secret", Some("seed"), "anchor", "ADDED");
         let target = [WatchTarget::namespaced_in_namespace(
             "v1",
@@ -1439,7 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_wildcard_floor_expires_unknown_positioned_scope() {
-        let s = store();
+        let s = store().await;
         for rv in 1..=5 {
             insert_watch_event(
                 &s,
@@ -1489,7 +1492,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_watch_trims_oldest() {
-        let s = store();
+        let s = store().await;
         for i in 1..=10 {
             insert_watch_event(&s, i, "v1", "Pod", Some("ns"), &format!("p{i}"), "ADDED");
         }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use klights_supervisor::TaskSupervisor;
 
-use crate::datastore::errors::OpenError;
+use crate::errors::OpenError;
 use klights_supervisor::DbExecutor;
 use klights_supervisor::sqlite_open::{self, OpenOpts, OpenPath};
 

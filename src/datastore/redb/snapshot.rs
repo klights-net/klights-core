@@ -16,7 +16,7 @@ use crate::datastore::snapshot::{
 use klights_cluster_core::command::COMMAND_CODEC_VERSION;
 
 use super::RedbDatastore;
-use super::tables;
+use klights_cluster_datastore::redb::tables;
 
 /// Tables included in cluster snapshots (ClusterReplicated + ConfigReplicated).
 /// NodeLocal tables are excluded — they belong to individual nodes.

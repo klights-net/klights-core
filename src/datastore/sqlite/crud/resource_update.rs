@@ -201,7 +201,7 @@ impl Datastore {
             Ok(Some(resource_data)) => resource_data,
             Ok(None) => return Ok(None),
             Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
-                return Err(crate::datastore::errors::DatastoreError::conflict(
+                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "Resource not found or version conflict",
                 )
                 .into());
@@ -606,7 +606,7 @@ impl Datastore {
                     )
                     .await;
                 }
-                Err(crate::datastore::errors::DatastoreError::conflict(
+                Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "Resource not found or version conflict",
                 )
                 .into())
@@ -857,7 +857,7 @@ impl Datastore {
                     )
                     .await;
                 }
-                Err(crate::datastore::errors::DatastoreError::conflict(
+                Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "Resource not found or version conflict",
                 )
                 .into())

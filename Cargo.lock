@@ -2029,6 +2029,7 @@ dependencies = [
  "k8s-openapi",
  "klights-auth",
  "klights-cluster-core",
+ "klights-cluster-datastore",
  "klights-cluster-store",
  "klights-internal-protobuf",
  "klights-kube-protobuf",
@@ -2129,6 +2130,19 @@ dependencies = [
 [[package]]
 name = "klights-cluster-datastore"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "klights-supervisor",
+ "redb",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rusqlite",
+ "tracing",
+]
 
 [[package]]
 name = "klights-cluster-store"

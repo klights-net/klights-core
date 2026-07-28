@@ -45,17 +45,15 @@ impl RedbAccessor {
             .ok_or_else(|| anyhow!("redb datastore closed"))
     }
 
-    pub(super) fn supervisor(&self) -> Arc<TaskSupervisor> {
+    pub fn supervisor(&self) -> Arc<TaskSupervisor> {
         self.supervisor.clone()
     }
 
-    pub(super) async fn acquire_snapshot_exclusive(
-        &self,
-    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    pub async fn acquire_snapshot_exclusive(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         self.snapshot_fence.clone().write_owned().await
     }
 
-    pub(super) async fn acquire_snapshot_mutation(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+    pub async fn acquire_snapshot_mutation(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
         self.snapshot_fence.clone().read_owned().await
     }
 
@@ -101,10 +99,7 @@ impl RedbAccessor {
             };
             match self.call(&label, factory(skip_rv_check)).await {
                 ok @ Ok(_) => return ok,
-                Err(e)
-                    if crate::datastore::errors::is_conflict_error(&e)
-                        && attempt < MAX_RV_RETRIES =>
-                {
+                Err(e) if crate::errors::is_conflict_error(&e) && attempt < MAX_RV_RETRIES => {
                     attempt += 1;
                     tracing::debug!(
                         "{}: RV conflict, retry {}/{}",

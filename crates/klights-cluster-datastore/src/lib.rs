@@ -1,1 +1,9 @@
-//! Cluster datastore adapters for klights.
+//! Passive cluster datastore adapters for klights.
+//!
+//! This package owns concrete SQLite/Redb open policy, current schemas and
+//! migrations, and the supervised database-call boundary. Backend selection
+//! and composition remain the responsibility of the root `klights` package.
+
+pub mod errors;
+pub mod redb;
+pub mod sqlite;

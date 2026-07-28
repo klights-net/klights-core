@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use super::tables;
+use klights_cluster_datastore::redb::tables;
 
 const LEGACY_WILDCARD: (&str, &str, &str) = ("*", "*", "*");
 

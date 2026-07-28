@@ -2,12 +2,12 @@
 //!
 //! Tests for schema fingerprint check and corruption fail-fast.
 
-use crate::datastore::errors::OpenError;
 use crate::datastore::sqlite::Datastore;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
     LogApplyNodeSubnetRow, LogApplyPodCleanupIntentRow, LogApplyResourceRow, LogApplyWatchEventRow,
 };
+use klights_cluster_datastore::errors::OpenError;
 use rusqlite::OptionalExtension;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -23,10 +23,10 @@ fn fresh_db_initializes_schema_and_writes_fingerprint() {
 
     // Apply pragmas and init schema.
     opener::apply_pragmas(&conn, opener::PragmaProfile::Plaintext).expect("pragmas");
-    crate::datastore::sqlite::open::init_schema(&mut conn).expect("init schema");
+    klights_cluster_datastore::sqlite::init_schema(&mut conn).expect("init schema");
 
     // check_db_health writes the fingerprint on fresh DB.
-    crate::datastore::sqlite::open::check_db_health(&mut conn, &path)
+    klights_cluster_datastore::sqlite::check_db_health(&mut conn, &path)
         .expect("check_db_health on fresh");
 
     // Check fingerprint is written.
@@ -52,15 +52,15 @@ fn existing_db_with_matching_fingerprint_opens_cleanly() {
 
     // Set up DB with current schema and fingerprint.
     opener::apply_pragmas(&conn, opener::PragmaProfile::Plaintext).expect("pragmas");
-    crate::datastore::sqlite::open::init_schema(&mut conn).expect("init schema");
-    crate::datastore::sqlite::open::check_db_health(&mut conn, &path)
+    klights_cluster_datastore::sqlite::init_schema(&mut conn).expect("init schema");
+    klights_cluster_datastore::sqlite::check_db_health(&mut conn, &path)
         .expect("check_db_health on fresh");
 
     // Close and reopen — fingerprint check should pass.
     drop(conn);
     let mut conn2 = rusqlite::Connection::open(&path).expect("reopen");
     opener::apply_pragmas(&conn2, opener::PragmaProfile::Plaintext).expect("pragmas");
-    crate::datastore::sqlite::open::check_db_health(&mut conn2, &path)
+    klights_cluster_datastore::sqlite::check_db_health(&mut conn2, &path)
         .expect("check_db_health on reopen");
 }
 
@@ -72,7 +72,7 @@ fn existing_db_with_different_fingerprint_fails_with_actionable_error() {
 
     // Set up DB with current schema.
     opener::apply_pragmas(&conn, opener::PragmaProfile::Plaintext).expect("pragmas");
-    crate::datastore::sqlite::open::init_schema(&mut conn).expect("init schema");
+    klights_cluster_datastore::sqlite::init_schema(&mut conn).expect("init schema");
 
     // Write a stale fingerprint.
     conn.execute(
@@ -81,7 +81,7 @@ fn existing_db_with_different_fingerprint_fails_with_actionable_error() {
     ).expect("insert stale fingerprint");
 
     // Fingerprint check should fail with SchemaMismatch.
-    let err = crate::datastore::sqlite::open::check_db_health(&mut conn, &path)
+    let err = klights_cluster_datastore::sqlite::check_db_health(&mut conn, &path)
         .expect_err("should fail with stale fingerprint");
     let OpenError::SchemaMismatch {
         path: err_path,
@@ -118,8 +118,8 @@ fn corrupt_main_db_fails_open_with_path_and_sqlite_error() {
     {
         let mut conn = rusqlite::Connection::open(&path).expect("open");
         opener::apply_pragmas(&conn, opener::PragmaProfile::Plaintext).expect("pragmas");
-        crate::datastore::sqlite::open::init_schema(&mut conn).expect("init schema");
-        crate::datastore::sqlite::open::check_db_health(&mut conn, &path).expect("first check");
+        klights_cluster_datastore::sqlite::init_schema(&mut conn).expect("init schema");
+        klights_cluster_datastore::sqlite::check_db_health(&mut conn, &path).expect("first check");
 
         // Add some data
         conn.execute(
@@ -148,7 +148,7 @@ fn corrupt_main_db_fails_open_with_path_and_sqlite_error() {
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .expect("open may succeed");
 
-    let err = crate::datastore::sqlite::open::check_db_health(&mut conn, &path)
+    let err = klights_cluster_datastore::sqlite::check_db_health(&mut conn, &path)
         .expect_err("should detect corruption");
     let OpenError::Corrupt { path: p, details } = err else {
         panic!("expected Corrupt error, got: {:?}", err);
@@ -204,7 +204,7 @@ fn migrated_replay_floor_column_preserves_nonzero_exact_event_floors() {
     .expect("insert legacy floor");
 
     // Reopening runs the migration that introduces the exactness column.
-    crate::datastore::sqlite::open::init_schema(&mut conn).expect("init schema migrates column");
+    klights_cluster_datastore::sqlite::init_schema(&mut conn).expect("init schema migrates column");
 
     let exact: i64 = conn
         .query_row(

@@ -10,11 +10,9 @@ mod cluster_replace;
 mod cluster_state_apply;
 mod crud;
 mod filters;
-pub(crate) mod fingerprint;
 mod focused_ports;
 mod gc;
 mod merge_patch;
-pub(crate) mod open;
 mod outbox_codec;
 pub(super) mod owner_ref_index;
 mod position_membership;
@@ -22,7 +20,6 @@ pub(crate) mod queries;
 mod replay_floor;
 mod resource_shape;
 mod rv_helpers;
-pub(crate) mod schema;
 pub(crate) mod scope;
 mod selector_index;
 mod snapshot_capture;
@@ -3489,17 +3486,21 @@ impl Datastore {
             );
         }
 
-        let executor = open::open_with_opts(opts, supervisor.clone(), "sqlite:cluster")
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "failed to open persistent cluster datastore at {}: {}",
-                    db_path.display(),
-                    e
-                )
-            })?;
+        let executor = klights_cluster_datastore::sqlite::open_with_opts(
+            opts,
+            supervisor.clone(),
+            "sqlite:cluster",
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "failed to open persistent cluster datastore at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
         let read_opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
-        let read_executor = open::open_read_only_with_opts(
+        let read_executor = klights_cluster_datastore::sqlite::open_read_only_with_opts(
             read_opts.clone(),
             supervisor.clone(),
             "sqlite:cluster-read",
@@ -3575,7 +3576,11 @@ impl Datastore {
         let supervisor = std::sync::Arc::new(TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let executor = open::open_in_memory(supervisor.clone(), "sqlite:memory:cluster").await?;
+        let executor = klights_cluster_datastore::sqlite::open_in_memory(
+            supervisor.clone(),
+            "sqlite:memory:cluster",
+        )
+        .await?;
         let snapshot_factory = executor
             .snapshot_open_opts()
             .map(|opts| snapshot_capture::SqliteSnapshotFactory::new(opts, supervisor.clone()));
@@ -3657,8 +3662,12 @@ impl DatastoreBackend for Datastore {
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
         self.read_db_call("read_cluster_metadata_observation", |conn| {
             let get = |key: &str| -> rusqlite::Result<Option<String>> {
-                conn.query_row(queries::META_SELECT, [key], |row| row.get(0))
-                    .optional()
+                conn.query_row(
+                    klights_cluster_datastore::sqlite::META_SELECT,
+                    [key],
+                    |row| row.get(0),
+                )
+                .optional()
             };
             let cluster_id = get(klights_cluster_store::CLUSTER_ID_META_KEY)?
                 .filter(|value| !value.is_empty())

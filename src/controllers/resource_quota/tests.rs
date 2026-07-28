@@ -514,7 +514,7 @@ async fn test_reconcile_resource_quota_rejects_stale_status_overlap() {
     let result = reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default").await;
     let err = result.expect_err("stale ResourceQuota status overlap must be rejected");
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected status conflict, got {err:#}"
     );
 
@@ -576,7 +576,7 @@ async fn test_reconcile_resource_quota_rejects_stale_spec_overlap() {
     let result = reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default").await;
     let err = result.expect_err("stale ResourceQuota spec overlap must be rejected");
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected status conflict, got {err:#}"
     );
 

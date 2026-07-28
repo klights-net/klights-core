@@ -1355,9 +1355,9 @@ async fn prepare_service_for_create_populates_allocated_fields() {
 #[test]
 fn create_service_allocation_conflict_maps_to_kubernetes_409() {
     use crate::api::AppError;
-    use crate::datastore::errors::DatastoreError;
     use axum::http::StatusCode;
     use axum::response::IntoResponse as _;
+    use klights_cluster_datastore::errors::DatastoreError;
 
     // When create_resource fails with DatastoreError::Conflict (duplicate name),
     // AppError::from(e) must produce a 409 CONFLICT response — not 500.

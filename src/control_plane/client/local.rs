@@ -836,19 +836,19 @@ pub(crate) async fn submit_resource_command_to_store(
 }
 
 fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
-    if let Some(error) = error.downcast_ref::<crate::datastore::errors::DatastoreError>() {
+    if let Some(error) = error.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>() {
         return match error {
-            crate::datastore::errors::DatastoreError::AlreadyExists { message } => {
+            klights_cluster_datastore::errors::DatastoreError::AlreadyExists { message } => {
                 ResourceCommandError::AlreadyExists {
                     message: message.clone(),
                 }
             }
-            crate::datastore::errors::DatastoreError::Conflict { message } => {
+            klights_cluster_datastore::errors::DatastoreError::Conflict { message } => {
                 ResourceCommandError::Conflict {
                     message: message.clone(),
                 }
             }
-            crate::datastore::errors::DatastoreError::NotFound { message } => {
+            klights_cluster_datastore::errors::DatastoreError::NotFound { message } => {
                 ResourceCommandError::NotFound {
                     message: message.clone(),
                 }
@@ -861,7 +861,7 @@ fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
             message: error.to_string(),
         };
     }
-    if crate::datastore::errors::is_conflict_error(&error) {
+    if klights_cluster_datastore::errors::is_conflict_error(&error) {
         return ResourceCommandError::Conflict {
             message: error.to_string(),
         };

@@ -20,14 +20,6 @@ pub(super) const METADATA_SET_RV: &str =
     "UPDATE metadata SET value = ?1 WHERE key = 'resource_version'";
 
 // ---------------------------------------------------------------------------
-// _klights_meta (schema fingerprint, per-binary local state)
-// ---------------------------------------------------------------------------
-
-pub(super) const META_SELECT: &str = "SELECT value FROM _klights_meta WHERE key = ?1";
-pub(super) const META_INSERT: &str =
-    "INSERT OR REPLACE INTO _klights_meta (key, value) VALUES (?1, ?2)";
-
-// ---------------------------------------------------------------------------
 // watch_events
 // ---------------------------------------------------------------------------
 

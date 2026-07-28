@@ -9,7 +9,6 @@ pub mod backend_kind;
 pub(crate) mod cluster_store_adapter;
 pub mod diagnostics;
 pub mod domain;
-pub mod errors;
 pub mod node_local;
 pub mod pod_serviceaccount;
 pub(crate) mod position_membership;

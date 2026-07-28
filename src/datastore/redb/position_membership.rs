@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
-use super::{RedbDatastore, helpers, tables};
+use super::{RedbDatastore, helpers};
 use crate::datastore::position_membership::{
     MembershipHistoryEvent, MembershipReconstructor, ReconstructedMembership,
     apply_membership_selectors, resource_from_history, sort_for_watch_targets,
@@ -11,6 +11,7 @@ use crate::datastore::position_membership::{
 use crate::datastore::{
     Resource, ResourceList, SnapshotAtRv, WatchReplayPosition, WatchTarget, WatchTargetScope,
 };
+use klights_cluster_datastore::redb::tables;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 

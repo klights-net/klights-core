@@ -14,12 +14,12 @@ use ::redb::{ReadableDatabase, ReadableTable};
 
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::helpers;
-use crate::datastore::redb::tables;
 use crate::datastore::types::*;
 use klights_cluster_core::{
     PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
     WatchReplayPosition,
 };
+use klights_cluster_datastore::redb::tables;
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 #[cfg(test)]
@@ -336,7 +336,7 @@ impl DatastoreBackend for RedbDatastore {
                     .pointer("/metadata/uid")
                     .and_then(|v| v.as_str());
                 if actual_uid != Some(expected_uid) {
-                    return Err(crate::datastore::errors::DatastoreError::conflict(
+                    return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                         "UID precondition failed",
                     )
                     .into());
@@ -345,7 +345,7 @@ impl DatastoreBackend for RedbDatastore {
             if let Some(expected_rv) = p.resource_version
                 && resource.resource_version != expected_rv
             {
-                return Err(crate::datastore::errors::DatastoreError::conflict(
+                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "resourceVersion precondition failed",
                 )
                 .into());
@@ -438,7 +438,7 @@ impl DatastoreBackend for RedbDatastore {
                 .pointer("/metadata/uid")
                 .and_then(|v| v.as_str());
             if actual_uid != Some(expected_uid) {
-                return Err(crate::datastore::errors::DatastoreError::conflict(
+                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "UID precondition failed",
                 )
                 .into());
@@ -831,7 +831,7 @@ impl DatastoreBackend for RedbDatastore {
                     .pointer("/metadata/uid")
                     .and_then(|v| v.as_str());
                 if actual_uid != Some(expected_uid) {
-                    return Err(crate::datastore::errors::DatastoreError::conflict(
+                    return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                         "UID precondition failed",
                     )
                     .into());
@@ -840,7 +840,7 @@ impl DatastoreBackend for RedbDatastore {
             if let Some(expected_rv) = preconditions.resource_version
                 && resource.resource_version != expected_rv
             {
-                return Err(crate::datastore::errors::DatastoreError::conflict(
+                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "resourceVersion precondition failed",
                 )
                 .into());
@@ -856,7 +856,7 @@ impl DatastoreBackend for RedbDatastore {
         self.watch_store.gc_watch(m, b).await
     }
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
-        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
         self.accessor
             .call("redb_applied_outbox_prunable_count", move |db| {
                 let read_txn = db
@@ -946,7 +946,7 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        use crate::datastore::redb::tables::KLIGHTS_META;
+        use klights_cluster_datastore::redb::tables::KLIGHTS_META;
         let key_owned = key.to_string();
         self.accessor
             .call("redb_get_klights_meta", move |db| {
@@ -965,7 +965,7 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        use crate::datastore::redb::tables::KLIGHTS_META;
+        use klights_cluster_datastore::redb::tables::KLIGHTS_META;
         let key_owned = key.to_string();
         let value_owned = value.to_string();
         self.accessor
@@ -993,7 +993,7 @@ impl DatastoreBackend for RedbDatastore {
         &self,
         idempotency_key: &str,
     ) -> anyhow::Result<Option<AppliedOutboxRecord>> {
-        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
         let key = idempotency_key.to_string();
         self.accessor
             .call("redb_get_applied_outbox", move |db| {
@@ -1015,7 +1015,7 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
-        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
         self.accessor
             .call("redb_insert_applied_outbox", move |db| {
                 let write_txn = db
@@ -1048,7 +1048,7 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
-        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
         self.accessor
             .call("redb_list_applied_outbox", move |db| {
                 let read_txn = db
@@ -1079,7 +1079,7 @@ impl DatastoreBackend for RedbDatastore {
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<AppliedOutboxRecord>> {
-        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
         if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
             return Err(anyhow::anyhow!(
                 "applied-outbox page limit {} exceeds {}",
@@ -1162,7 +1162,7 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
 
         let cutoff = now_ms.saturating_sub(ttl_ms);
         self.accessor

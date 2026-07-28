@@ -1,13 +1,8 @@
-use std::net::Ipv4Addr;
-
-use klights_types::{NodeName, PodSubnet};
 use rusqlite::OptionalExtension;
-
-use super::NodeSubnet;
 
 /// Standalone function that initializes the schema on a raw connection.
 /// Used by the opener in `executor.rs::open_with_opts`.
-pub(crate) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
 
     // Namespaced resources: namespace is NOT NULL, UNIQUE(api_version, kind, namespace, name).
@@ -419,7 +414,7 @@ fn migrate_watch_events_monotonic_id(conn: &mut rusqlite::Connection) -> rusqlit
     let high_water = retained_high_water.max(retained_floor_high_water);
     if create_sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
         if high_water > retained_high_water {
-            super::Datastore::advance_watch_event_allocator_in_conn(conn, high_water)?;
+            advance_watch_event_allocator_in_conn(conn, high_water)?;
         }
         return Ok(());
     }
@@ -449,7 +444,7 @@ fn migrate_watch_events_monotonic_id(conn: &mut rusqlite::Connection) -> rusqlit
     )?;
     tx.execute("DROP TABLE watch_events_old", [])?;
     if high_water > retained_high_water {
-        super::Datastore::advance_watch_event_allocator_in_conn(&tx, high_water)?;
+        advance_watch_event_allocator_in_conn(&tx, high_water)?;
     }
     tx.commit()
 }
@@ -543,63 +538,22 @@ fn migrate_node_subnets_gateway_ip(conn: &mut rusqlite::Connection) -> rusqlite:
     Ok(())
 }
 
-pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {
-    use klights_types::HostPortRange;
-    use klights_types::{NodePeerMode, parse_node_peer_mode};
-
-    let node_name_str: String = row.get(0)?;
-    let subnet_str: String = row.get(1)?;
-    let gateway_ip_str: String = row.get(3)?;
-    let node_ip_str: String = row.get(4)?;
-    let mode_str: String = row.get(5).unwrap_or_else(|_| "root".to_string());
-    let hostport_range_opt: Option<String> = row.get(6).unwrap_or(None);
-
-    let node_name = NodeName::parse(&node_name_str).map_err(parse_err(0))?;
-    let subnet = PodSubnet::parse(&subnet_str).map_err(parse_err(1))?;
-    let gateway_ip: Ipv4Addr = gateway_ip_str
-        .parse()
-        .map_err(|e: std::net::AddrParseError| {
-            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
-        })?;
-    let node_ip: Ipv4Addr = node_ip_str.parse().map_err(|e: std::net::AddrParseError| {
-        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    let mode = parse_node_peer_mode(Some(mode_str.as_str())).unwrap_or(NodePeerMode::Root);
-    let hostport_range = hostport_range_opt
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| HostPortRange::parse(s).ok());
-
-    Ok(NodeSubnet {
-        node_name,
-        subnet,
-        subnet_base_int: row.get::<_, i64>(2)? as u32,
-        gateway_ip,
-        node_ip,
-        mode,
-        hostport_range,
-    })
-}
-
-fn parse_err(idx: usize) -> impl Fn(String) -> rusqlite::Error {
-    move |msg| {
-        rusqlite::Error::FromSqlConversionFailure(
-            idx,
-            rusqlite::types::Type::Text,
-            Box::new(NodeSubnetParseError(msg)),
-        )
+fn advance_watch_event_allocator_in_conn(
+    conn: &rusqlite::Connection,
+    high_water: i64,
+) -> rusqlite::Result<()> {
+    let updated = conn.execute(
+        "UPDATE sqlite_sequence SET seq = MAX(seq, ?1) WHERE name = 'watch_events'",
+        rusqlite::params![high_water],
+    )?;
+    if updated == 0 {
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('watch_events', ?1)",
+            rusqlite::params![high_water],
+        )?;
     }
+    Ok(())
 }
-
-#[derive(Debug)]
-struct NodeSubnetParseError(String);
-
-impl std::fmt::Display for NodeSubnetParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for NodeSubnetParseError {}
 
 #[cfg(test)]
 mod tests {

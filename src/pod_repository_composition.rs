@@ -414,17 +414,19 @@ pub(crate) fn new_pod_store(
 }
 
 fn pod_persistence_error(error: anyhow::Error, namespace: &str, name: &str) -> anyhow::Error {
-    if let Some(error) = error.downcast_ref::<crate::datastore::errors::DatastoreError>() {
+    if let Some(error) = error.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>() {
         return match error {
-            crate::datastore::errors::DatastoreError::AlreadyExists { message } => {
+            klights_cluster_datastore::errors::DatastoreError::AlreadyExists { message } => {
                 anyhow::Error::new(klights_pod_api::PodRepositoryError::already_exists(message))
             }
-            crate::datastore::errors::DatastoreError::Conflict { message } => {
+            klights_cluster_datastore::errors::DatastoreError::Conflict { message } => {
                 anyhow::Error::new(klights_pod_api::PodRepositoryError::conflict(message))
             }
-            crate::datastore::errors::DatastoreError::NotFound { .. } => anyhow::Error::new(
-                klights_pod_api::PodRepositoryError::not_found(namespace, name),
-            ),
+            klights_cluster_datastore::errors::DatastoreError::NotFound { .. } => {
+                anyhow::Error::new(klights_pod_api::PodRepositoryError::not_found(
+                    namespace, name,
+                ))
+            }
         };
     }
     anyhow::Error::new(klights_pod_api::PodRepositoryError::unavailable(
@@ -613,16 +615,16 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
             .await
         {
             Ok(()) => Ok(crate::kubelet::pod_repository::store::PodDeleteCasOutcome::Removed),
-            Err(error) if crate::datastore::errors::is_conflict_error(&error) => {
+            Err(error) if klights_cluster_datastore::errors::is_conflict_error(&error) => {
                 Ok(crate::kubelet::pod_repository::store::PodDeleteCasOutcome::Conflict)
             }
             Err(error)
                 if error
-                    .downcast_ref::<crate::datastore::errors::DatastoreError>()
+                    .downcast_ref::<klights_cluster_datastore::errors::DatastoreError>()
                     .is_some_and(|error| {
                         matches!(
                             error,
-                            crate::datastore::errors::DatastoreError::NotFound { .. }
+                            klights_cluster_datastore::errors::DatastoreError::NotFound { .. }
                         )
                     }) =>
             {

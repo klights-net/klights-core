@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn insert_index_entries_materializes_default_for_absent_unschedulable() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
         let data = json!({"metadata": {"name": "n"}, "spec": {}});
         let bytes = serde_json::to_vec(&data).unwrap();
         upsert_index_entries(&conn, "v1", "Node", "", "n", &bytes).unwrap();
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn upsert_and_delete_round_trip() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {"labels": {"app": "test"}},
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_entries() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data_v1 = json!({"metadata": {"labels": {"app": "v1"}}});
         let data_v2 = json!({"metadata": {"labels": {"app": "v2", "env": "prod"}}});
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn cluster_scoped_uses_empty_namespace() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::schema::init_schema_in_conn(&mut conn).unwrap();
+        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({"metadata": {"labels": {"role": "control-plane"}}, "spec": {"unschedulable": true}});
         upsert_index_entries(

@@ -8,13 +8,13 @@ use serde_json::Value;
 
 #[cfg(test)]
 use crate::datastore::CommitObservationSink;
-use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
-use crate::datastore::redb::tables;
 use crate::datastore::sqlite::create_pending_watch_event;
 #[cfg(test)]
 use crate::datastore::sqlite::publish_pending;
 use klights_cluster_core::Resource;
+use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::tables;
 
 pub struct RedbNamespaceStore {
     pub accessor: Arc<RedbAccessor>,
@@ -367,17 +367,19 @@ impl RedbNamespaceStore {
 mod tests {
     use std::sync::Arc;
 
-    use crate::datastore::redb::accessor::RedbAccessor;
     use crate::datastore::redb::crud::resources::RedbResourceStore;
-    use crate::datastore::redb::open_boundary;
+    use klights_cluster_datastore::redb as open_boundary;
+    use klights_cluster_datastore::redb::RedbAccessor;
     use klights_supervisor::TaskSupervisor;
     use serde_json::json;
 
     use super::*;
 
-    fn store() -> RedbNamespaceStore {
-        let db = open_boundary::open_in_memory_blocking().unwrap();
+    async fn store() -> RedbNamespaceStore {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let db = open_boundary::open_in_memory(supervisor.as_ref())
+            .await
+            .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         RedbNamespaceStore::new(
             accessor,
@@ -387,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_list_namespace() {
-        let s = store();
+        let s = store().await;
         s.create_ns("testns", json!({"metadata":{"name":"testns"}}))
             .await
             .unwrap();
@@ -397,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_duplicate_namespace_fails() {
-        let s = store();
+        let s = store().await;
         s.create_ns("dupns", json!({"metadata":{"name":"dupns"}}))
             .await
             .unwrap();
@@ -410,7 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_namespace_fails_if_content_exists() {
-        let s = store();
+        let s = store().await;
         s.create_ns("hascontent", json!({"metadata":{"name":"hascontent"}}))
             .await
             .unwrap();
@@ -424,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_namespace_resources() {
-        let s = store();
+        let s = store().await;
         s.create_ns("cnt", json!({"metadata":{"name":"cnt"}}))
             .await
             .unwrap();
@@ -454,7 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_namespace_resources_excluding_kind() {
-        let s = store();
+        let s = store().await;
         s.create_ns("excl", json!({"metadata":{"name":"excl"}}))
             .await
             .unwrap();

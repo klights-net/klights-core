@@ -223,15 +223,24 @@ impl Datastore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use klights_supervisor::{DbExecutor, TaskCategoryConfig, TaskSupervisor};
+
     use super::*;
+
+    async fn open_in_memory(connection_key: &'static str) -> DbExecutor {
+        klights_cluster_datastore::sqlite::open_in_memory(
+            Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+            connection_key,
+        )
+        .await
+        .expect("open in-memory cluster datastore")
+    }
 
     #[tokio::test]
     async fn broadcast_watch_event_sends_to_subscribers() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:broadcast-test",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:broadcast-test").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();
@@ -254,11 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_create_broadcasts_after_commit() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:create-broadcast-test",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:create-broadcast-test").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();
@@ -286,11 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_update_broadcasts_after_commit() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:update-broadcast-test",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:update-broadcast-test").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();
@@ -338,11 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn resource_delete_broadcasts_after_commit() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:delete-broadcast-test",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:delete-broadcast-test").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();
@@ -376,11 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_update_broadcasts_after_commit() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:status-broadcast-test",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:status-broadcast-test").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();
@@ -429,11 +422,7 @@ mod tests {
     /// one event reaches a subscriber for a create operation.
     #[tokio::test]
     async fn persistent_create_emits_one_watch_event() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:dsb04-one-event",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:dsb04-one-event").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();
@@ -476,11 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_watch_event_routes_only_to_subscribed_topic() {
-        let executor = crate::datastore::sqlite::open::open_in_memory_with_default_supervisor(
-            "sqlite:memory:watch-bus-topic-routing",
-        )
-        .await
-        .unwrap();
+        let executor = open_in_memory("sqlite:memory:watch-bus-topic-routing").await;
         let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
             .await
             .unwrap();

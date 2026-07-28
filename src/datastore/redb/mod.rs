@@ -11,22 +11,17 @@ use crate::datastore::CommitObservationSink;
 use anyhow::{Result, anyhow};
 use klights_supervisor::TaskSupervisor;
 
-pub mod accessor;
 pub mod advance;
 #[cfg(test)]
 mod applier;
 mod backend_impl;
 mod helpers;
 pub mod key_codec;
-pub mod meta;
 pub mod network;
-pub mod open_boundary;
-pub mod opener;
 mod position_membership;
 mod replay_floor;
 pub mod snapshot;
 mod snapshot_capture;
-pub mod tables;
 pub mod watch;
 
 pub mod crud {
@@ -38,14 +33,10 @@ pub mod crud {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub use open_boundary::open_persistent_blocking as open;
-pub use opener::RedbOpenOpts;
-
-use accessor::RedbAccessor;
 use advance::RedbRvStore;
 use crud::namespaces::RedbNamespaceStore;
 use crud::resources::RedbResourceStore;
+use klights_cluster_datastore::redb::{RedbAccessor, RedbOpenOpts};
 use network::RedbNetworkStore;
 use watch::RedbWatchStore;
 
@@ -113,9 +104,9 @@ impl RedbDatastore {
         } else {
             path.to_path_buf()
         };
-        let db = open_boundary::open_persistent(
+        let db = klights_cluster_datastore::redb::open_persistent(
             supervisor.as_ref(),
-            opener::RedbOpenOpts {
+            RedbOpenOpts {
                 path,
                 cache_size: 40 * 1024 * 1024,
             },
@@ -136,7 +127,7 @@ impl RedbDatastore {
         supervisor: Arc<TaskSupervisor>,
         #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
     ) -> Result<Self> {
-        let db = open_boundary::open_in_memory(supervisor.as_ref()).await?;
+        let db = klights_cluster_datastore::redb::open_in_memory(supervisor.as_ref()).await?;
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         Ok(Self::from_accessor(
             accessor,
@@ -170,8 +161,8 @@ impl RedbDatastore {
 
     #[cfg(test)]
     pub async fn new_in_memory() -> Result<Self> {
-        let db = open_boundary::open_in_memory_blocking()?;
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let db = klights_cluster_datastore::redb::open_in_memory(supervisor.as_ref()).await?;
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         Ok(Self::from_accessor(
             accessor,

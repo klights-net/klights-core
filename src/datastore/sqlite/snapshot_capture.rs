@@ -72,7 +72,7 @@ impl SqliteSnapshotFactory {
                 message: "snapshot session capacity exhausted".to_string(),
             })
         })?;
-        let executor = super::open::open_read_only_with_opts(
+        let executor = klights_cluster_datastore::sqlite::open_read_only_with_opts(
             self.opts.clone(),
             self.supervisor.clone(),
             "sqlite:cluster-snapshot",
@@ -1012,7 +1012,7 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let executor = crate::datastore::sqlite::open::open_with_opts(
+        let executor = klights_cluster_datastore::sqlite::open_with_opts(
             klights_supervisor::OpenOpts::in_memory(),
             supervisor,
             "snapshot-rollback-failure",

@@ -1291,7 +1291,7 @@ mod cases {
         .await
         .expect_err("stale main update must still reject a real spec conflict");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "expected spec conflict, got: {err:#}"
         );
 
@@ -1399,7 +1399,7 @@ mod cases {
         .await
         .expect_err("status-only rebase must not cross a same-name replacement");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "expected replacement conflict, got: {err:#}"
         );
 
@@ -1482,7 +1482,7 @@ mod cases {
         .await
         .expect_err("status updates must remain strict against status conflicts");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "expected status conflict, got: {err:#}"
         );
 
@@ -1703,7 +1703,7 @@ mod cases {
         .await
         .expect_err("stale patch must still reject a real spec conflict");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "expected spec conflict, got: {err:#}"
         );
 
@@ -1810,7 +1810,7 @@ mod cases {
         .await
         .expect_err("patch rebase must not cross a same-name replacement");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "expected replacement conflict, got: {err:#}"
         );
 
@@ -2634,7 +2634,7 @@ mod cases {
             .expect_err("stale delete precondition must be rejected");
 
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "stale raft delete precondition must surface as conflict, got: {err:#}"
         );
         assert!(

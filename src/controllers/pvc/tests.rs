@@ -382,7 +382,7 @@ async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
     .await;
     let err = stale_write.expect_err("stale PVC controller status write must not rebase");
     assert!(
-        crate::datastore::errors::is_conflict_error(&err),
+        klights_cluster_datastore::errors::is_conflict_error(&err),
         "expected stale PVC status write conflict, got {err:#}"
     );
 

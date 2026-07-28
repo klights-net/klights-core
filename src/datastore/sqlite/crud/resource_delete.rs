@@ -207,7 +207,7 @@ impl Datastore {
                         live_uid.as_deref(),
                     );
                 }
-                Err(crate::datastore::errors::DatastoreError::conflict(message).into())
+                Err(klights_cluster_datastore::errors::DatastoreError::conflict(message).into())
             }
             Err(e) => Err(anyhow!("Failed to delete resource: {}", e)),
         }

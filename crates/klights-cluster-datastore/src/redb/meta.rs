@@ -6,7 +6,7 @@
 
 use ::redb::{Database, ReadableDatabase, TableHandle};
 
-use crate::datastore::errors::OpenError;
+use crate::errors::OpenError;
 
 use super::tables;
 

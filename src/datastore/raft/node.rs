@@ -1297,13 +1297,14 @@ impl super::proposal::RaftProposal for RaftNode {
         if let Some(message) = apply_result.error_message {
             return Err(match apply_result.rejection_code {
                 Some(super::types::StorageCommandRejectionCode::AlreadyExists) => {
-                    super::super::errors::DatastoreError::already_exists(message).into()
+                    klights_cluster_datastore::errors::DatastoreError::already_exists(message)
+                        .into()
                 }
                 Some(super::types::StorageCommandRejectionCode::NotFound) => {
-                    super::super::errors::DatastoreError::not_found(message).into()
+                    klights_cluster_datastore::errors::DatastoreError::not_found(message).into()
                 }
                 Some(super::types::StorageCommandRejectionCode::Conflict) => {
-                    super::super::errors::DatastoreError::conflict(message).into()
+                    klights_cluster_datastore::errors::DatastoreError::conflict(message).into()
                 }
                 Some(super::types::StorageCommandRejectionCode::InvalidCommit) | None => {
                     anyhow::anyhow!(message)
@@ -1481,12 +1482,14 @@ fn map_commit_materialization_error(error: RaftMaterializationError) -> anyhow::
     let diagnostic = format!("{contextual:#}");
     let lower = diagnostic.to_ascii_lowercase();
 
-    if lower.contains("already exists") && super::super::errors::is_conflict_error(&contextual) {
-        super::super::errors::DatastoreError::already_exists(diagnostic).into()
-    } else if super::super::errors::is_conflict_error(&contextual) {
-        super::super::errors::DatastoreError::conflict(diagnostic).into()
+    if lower.contains("already exists")
+        && klights_cluster_datastore::errors::is_conflict_error(&contextual)
+    {
+        klights_cluster_datastore::errors::DatastoreError::already_exists(diagnostic).into()
+    } else if klights_cluster_datastore::errors::is_conflict_error(&contextual) {
+        klights_cluster_datastore::errors::DatastoreError::conflict(diagnostic).into()
     } else if lower.contains("not found") {
-        super::super::errors::DatastoreError::not_found(diagnostic).into()
+        klights_cluster_datastore::errors::DatastoreError::not_found(diagnostic).into()
     } else {
         contextual
     }
@@ -2904,8 +2907,8 @@ mod tests {
             .await
             .expect_err("duplicate create must fail before raft overwrites the live row");
         assert!(matches!(
-            err.downcast_ref::<super::super::super::errors::DatastoreError>(),
-            Some(super::super::super::errors::DatastoreError::AlreadyExists { .. })
+            err.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>(),
+            Some(klights_cluster_datastore::errors::DatastoreError::AlreadyExists { .. })
         ));
         let msg = err.to_string();
         assert!(

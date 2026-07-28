@@ -36,7 +36,7 @@ impl Datastore {
         if let Some(expected_uid) = meta_uid.as_deref()
             && expected_uid != incoming_uid
         {
-            return Err(crate::datastore::errors::DatastoreError::conflict(format!(
+            return Err(klights_cluster_datastore::errors::DatastoreError::conflict(format!(
                     "replicated create UID precondition failed: expected {expected_uid} got {incoming_uid}"
                 ))
                 .into());

@@ -1755,7 +1755,7 @@ mod tests {
         let result = super::sync_active_status(&db, &created, None).await;
         let err = result.expect_err("stale CronJob status overlap must be rejected");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            klights_cluster_datastore::errors::is_conflict_error(&err),
             "expected status conflict, got {err:#}"
         );
 

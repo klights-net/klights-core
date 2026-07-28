@@ -366,7 +366,7 @@ pub trait DatastoreBackend: Send + Sync {
             && !incoming_uid.is_empty()
             && expected_uid != incoming_uid
         {
-            return Err(super::errors::DatastoreError::conflict(format!(
+            return Err(klights_cluster_datastore::errors::DatastoreError::conflict(format!(
                     "replicated create UID precondition failed: expected {expected_uid} got {incoming_uid}"
                 ))
                 .into());
@@ -641,7 +641,7 @@ pub trait DatastoreBackend: Send + Sync {
             .get_resource(api_version, kind, namespace, name)
             .await?
             .ok_or_else(|| {
-                super::errors::DatastoreError::not_found(format!(
+                klights_cluster_datastore::errors::DatastoreError::not_found(format!(
                     "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} not found"
                 ))
             })?;

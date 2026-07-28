@@ -326,7 +326,7 @@ fn normalize_collection_page(
 fn map_query_error(error: anyhow::Error) -> ResourceReadError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
-    if crate::datastore::errors::is_conflict_error(&error) {
+    if klights_cluster_datastore::errors::is_conflict_error(&error) {
         ResourceReadError::Conflict { message }
     } else if lower.contains("selector") {
         ResourceReadError::InvalidSelector { message }

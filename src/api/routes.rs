@@ -907,7 +907,8 @@ mod status_tests {
                         build log_apply commit failed: Rusqlite(\"resourceVersion \
                         precondition failed: expected 1 got 2 (409 Conflict)\")";
                     let error: anyhow::Error =
-                        crate::datastore::errors::DatastoreError::conflict(diagnostic).into();
+                        klights_cluster_datastore::errors::DatastoreError::conflict(diagnostic)
+                            .into();
                     Err::<(), crate::api::AppError>(crate::api::AppError::from(error))
                 }),
             )

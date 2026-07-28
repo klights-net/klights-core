@@ -16,9 +16,11 @@
 
 use std::path::Path;
 
-use super::queries;
-use crate::datastore::errors::OpenError;
+use crate::errors::OpenError;
 use rusqlite::OptionalExtension;
+
+pub const META_SELECT: &str = "SELECT value FROM _klights_meta WHERE key = ?1";
+pub const META_INSERT: &str = "INSERT OR REPLACE INTO _klights_meta (key, value) VALUES (?1, ?2)";
 
 /// SHA256 hash of the current schema DDL. Regenerated whenever the schema
 /// changes — the test `fingerprint_matches_live_schema` enforces this so a
@@ -39,9 +41,7 @@ pub(super) const SCHEMA_FINGERPRINT: &str =
 /// Returns `Err(OpenError::SchemaMismatch)` if the stored fingerprint differs.
 pub(crate) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Result<(), OpenError> {
     let stored: Option<String> = conn
-        .query_row(queries::META_SELECT, ["schema_fingerprint"], |row| {
-            row.get(0)
-        })
+        .query_row(META_SELECT, ["schema_fingerprint"], |row| row.get(0))
         .optional()
         .map_err(|e| OpenError::Corrupt {
             path: db_path.display().to_string(),
@@ -51,14 +51,11 @@ pub(crate) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Resu
     match stored {
         None => {
             // Fresh install: init_schema already ran; record fingerprint.
-            conn.execute(
-                queries::META_INSERT,
-                ("schema_fingerprint", SCHEMA_FINGERPRINT),
-            )
-            .map_err(|e| OpenError::Corrupt {
-                path: db_path.display().to_string(),
-                details: format!("failed to write schema_fingerprint: {}", e),
-            })?;
+            conn.execute(META_INSERT, ("schema_fingerprint", SCHEMA_FINGERPRINT))
+                .map_err(|e| OpenError::Corrupt {
+                    path: db_path.display().to_string(),
+                    details: format!("failed to write schema_fingerprint: {}", e),
+                })?;
             Ok(())
         }
         Some(v) if v == SCHEMA_FINGERPRINT => Ok(()),

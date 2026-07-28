@@ -45,7 +45,7 @@ fn map_namespace_lifecycle_error(
     let message = error.to_string();
     if message.to_ascii_lowercase().contains("not found") {
         klights_reconcile_api::NamespaceLifecycleError::NotFound { message }
-    } else if crate::datastore::errors::is_conflict_error(&error) {
+    } else if klights_cluster_datastore::errors::is_conflict_error(&error) {
         klights_reconcile_api::NamespaceLifecycleError::Conflict { message }
     } else {
         klights_reconcile_api::NamespaceLifecycleError::Internal { message }

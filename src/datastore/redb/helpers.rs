@@ -9,8 +9,8 @@ use ::redb::ReadableTable;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::datastore::redb::tables;
 use klights_cluster_core::{Resource, ResourcePreconditions, WatchReplayPosition};
+use klights_cluster_datastore::redb::tables;
 
 /// Deserialize a redb value body into an Arc<Value>.
 pub fn body_val(body: &[u8]) -> std::sync::Arc<Value> {
@@ -119,7 +119,8 @@ pub fn validate_uid_immutable(incoming: &Value, current: &Value) -> Result<()> {
         }),
     )
     .map_err(|_| {
-        crate::datastore::errors::DatastoreError::conflict("metadata.uid is immutable").into()
+        klights_cluster_datastore::errors::DatastoreError::conflict("metadata.uid is immutable")
+            .into()
     })
 }
 
@@ -142,15 +143,18 @@ pub fn validate_resource_preconditions(
     )
     .map_err(|violation| match violation {
         klights_cluster_core::ApplyPreconditionViolation::Uid { .. } => {
-            crate::datastore::errors::DatastoreError::conflict("UID precondition failed").into()
+            klights_cluster_datastore::errors::DatastoreError::conflict("UID precondition failed")
+                .into()
         }
         klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { .. } => {
-            crate::datastore::errors::DatastoreError::conflict(
+            klights_cluster_datastore::errors::DatastoreError::conflict(
                 "resourceVersion precondition failed",
             )
             .into()
         }
-        other => crate::datastore::errors::DatastoreError::conflict(other.to_string()).into(),
+        other => {
+            klights_cluster_datastore::errors::DatastoreError::conflict(other.to_string()).into()
+        }
     })
 }
 

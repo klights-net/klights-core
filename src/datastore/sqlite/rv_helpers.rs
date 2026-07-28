@@ -12,23 +12,6 @@ impl Datastore {
         )
     }
 
-    pub(super) fn advance_watch_event_allocator_in_conn(
-        conn: &rusqlite::Connection,
-        high_water: i64,
-    ) -> rusqlite::Result<()> {
-        let updated = conn.execute(
-            "UPDATE sqlite_sequence SET seq = MAX(seq, ?1) WHERE name = 'watch_events'",
-            rusqlite::params![high_water],
-        )?;
-        if updated == 0 {
-            conn.execute(
-                "INSERT INTO sqlite_sequence(name, seq) VALUES ('watch_events', ?1)",
-                rusqlite::params![high_water],
-            )?;
-        }
-        Ok(())
-    }
-
     /// Set the watch allocator to an authoritative snapshot boundary.
     /// Unlike the upgrade helper above, replacement must be allowed to move a
     /// divergent follower's local sequence back to the leader's exact value.

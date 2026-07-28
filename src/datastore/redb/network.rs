@@ -8,9 +8,9 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use crate::datastore::redb::accessor::RedbAccessor;
-use crate::datastore::redb::tables;
 use crate::datastore::types::*;
+use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::tables;
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 use klights_types::{ClusterCidr, NodeName, PodSubnet};
@@ -453,15 +453,17 @@ fn parse_peer_mode(s: &str) -> Result<NodePeerMode> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::datastore::redb::accessor::RedbAccessor;
-    use crate::datastore::redb::open_boundary;
+    use klights_cluster_datastore::redb as open_boundary;
+    use klights_cluster_datastore::redb::RedbAccessor;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;
 
-    fn store() -> RedbNetworkStore {
-        let db = open_boundary::open_in_memory_blocking().unwrap();
+    async fn store() -> RedbNetworkStore {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let db = open_boundary::open_in_memory(supervisor.as_ref())
+            .await
+            .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         RedbNetworkStore::new(accessor)
     }
@@ -519,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_subnet_read_paths_reject_unknown_persisted_mode() {
-        let s = store();
+        let s = store().await;
         insert_raw_node_subnet(&s, "peer-a", "mystery").await;
 
         assert!(s.get_node_subnet("peer-a").await.is_err());
@@ -579,7 +581,7 @@ mod tests {
         ));
 
         for (name, value) in cases {
-            let s = store();
+            let s = store().await;
             insert_raw_node_subnet_value(&s, "peer-a", value.clone()).await;
             assert!(
                 s.get_node_subnet("peer-a").await.is_err(),
@@ -596,7 +598,7 @@ mod tests {
                 "{name} must fail idempotent allocation"
             );
 
-            let s = store();
+            let s = store().await;
             insert_raw_node_subnet_value(&s, "peer-a", value).await;
             assert!(
                 s.allocate_node_subnet("fresh-peer", "10.42.0.0/16", "192.0.2.8")
@@ -610,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn node_subnet_legacy_missing_mode_defaults_to_root() {
         for (name, hostport) in [("absent", None), ("null", Some(Value::Null))] {
-            let s = store();
+            let s = store().await;
             let mut value = valid_node_subnet_value();
             let object = value.as_object_mut().unwrap();
             object.remove("mode");
@@ -645,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn node_subnet_paths_reject_present_non_string_mode() {
         for (name, mode) in [("null", Value::Null), ("number", serde_json::json!(1))] {
-            let s = store();
+            let s = store().await;
             let mut value = valid_node_subnet_value();
             value["mode"] = mode;
             insert_raw_node_subnet_value(&s, "peer-a", value).await;
@@ -670,7 +672,7 @@ mod tests {
             ),
             ("rootless without range", NodePeerMode::Rootless, None),
         ] {
-            let s = store();
+            let s = store().await;
             insert_raw_node_subnet_value(&s, "peer-a", valid_node_subnet_value()).await;
             let before = s.get_node_subnet("peer-a").await.unwrap().unwrap();
 
@@ -688,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_peer_attrs_accepts_both_valid_mode_range_combinations() {
-        let s = store();
+        let s = store().await;
         insert_raw_node_subnet_value(&s, "peer-a", valid_node_subnet_value()).await;
         let rootless_range = HostPortRange::parse("20000-20999").unwrap();
 
@@ -730,7 +732,7 @@ mod tests {
             ("oversized", serde_json::json!(65536)),
             ("non-integer", serde_json::json!("51820")),
         ] {
-            let s = store();
+            let s = store().await;
             insert_raw_node_dataplane(
                 &s,
                 "peer-a",
@@ -749,7 +751,7 @@ mod tests {
             );
         }
 
-        let s = store();
+        let s = store().await;
         let key = "broken".to_string();
         s.accessor
             .call("insert_malformed_node_dataplane_test", move |db| {
@@ -819,7 +821,7 @@ mod tests {
         cases.push(("encrypted row missing port".to_string(), missing_port));
 
         for (name, value) in cases {
-            let s = store();
+            let s = store().await;
             insert_raw_node_dataplane(&s, "peer-a", value).await;
             assert!(
                 s.get_node_dataplane("peer-a").await.is_err(),

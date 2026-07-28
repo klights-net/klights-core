@@ -4,6 +4,77 @@ use anyhow::Context;
 use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use klights_types::ClusterCidr;
 use rusqlite::OptionalExtension;
+
+fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {
+    use klights_types::HostPortRange;
+    use klights_types::{NodePeerMode, parse_node_peer_mode};
+
+    let node_name_str: String = row.get(0)?;
+    let subnet_str: String = row.get(1)?;
+    let gateway_ip_str: String = row.get(3)?;
+    let node_ip_str: String = row.get(4)?;
+    let mode_str: String = row.get(5).unwrap_or_else(|_| "root".to_string());
+    let hostport_range_opt: Option<String> = row.get(6).unwrap_or(None);
+
+    let node_name = NodeName::parse(&node_name_str).map_err(parse_node_subnet_error(0))?;
+    let subnet = PodSubnet::parse(&subnet_str).map_err(parse_node_subnet_error(1))?;
+    let gateway_ip: Ipv4Addr =
+        gateway_ip_str
+            .parse()
+            .map_err(|error: std::net::AddrParseError| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+    let node_ip: Ipv4Addr = node_ip_str
+        .parse()
+        .map_err(|error: std::net::AddrParseError| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let mode = parse_node_peer_mode(Some(mode_str.as_str())).unwrap_or(NodePeerMode::Root);
+    let hostport_range = hostport_range_opt
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| HostPortRange::parse(value).ok());
+
+    Ok(NodeSubnet {
+        node_name,
+        subnet,
+        subnet_base_int: row.get::<_, i64>(2)? as u32,
+        gateway_ip,
+        node_ip,
+        mode,
+        hostport_range,
+    })
+}
+
+fn parse_node_subnet_error(index: usize) -> impl Fn(String) -> rusqlite::Error {
+    move |message| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(NodeSubnetParseError(message)),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct NodeSubnetParseError(String);
+
+impl std::fmt::Display for NodeSubnetParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NodeSubnetParseError {}
+
 impl Datastore {
     // ---- node_subnets CRUD ----------------------------------------
 

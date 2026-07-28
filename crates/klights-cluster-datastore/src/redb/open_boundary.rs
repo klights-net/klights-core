@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ::redb::{Database, ReadableTable};
 
-use crate::datastore::errors::OpenError;
+use crate::errors::OpenError;
 use klights_supervisor::TaskSupervisor;
 
 use super::meta;
@@ -15,7 +15,7 @@ use super::tables;
 const REDB_OPEN_RETRY_ATTEMPTS: usize = 50;
 const REDB_OPEN_RETRY_DELAY: Duration = Duration::from_millis(500);
 
-pub(super) async fn open_persistent(
+pub async fn open_persistent(
     supervisor: &TaskSupervisor,
     opts: RedbOpenOpts,
 ) -> Result<Database, OpenError> {
@@ -76,14 +76,14 @@ where
         })?
 }
 
-pub(super) async fn open_in_memory(supervisor: &TaskSupervisor) -> anyhow::Result<Database> {
+pub async fn open_in_memory(supervisor: &TaskSupervisor) -> anyhow::Result<Database> {
     supervisor
         .run_db_blocking("redb_open_in_memory", "redb", open_in_memory_blocking)
         .await
         .map_err(|err| anyhow::anyhow!("supervised in-memory redb open task failed: {err}"))?
 }
 
-pub(super) fn open_in_memory_blocking() -> anyhow::Result<Database> {
+fn open_in_memory_blocking() -> anyhow::Result<Database> {
     let db = ::redb::Database::builder()
         .create_with_backend(::redb::backends::InMemoryBackend::new())
         .map_err(|e| anyhow::anyhow!("in-memory redb: {e}"))?;
@@ -91,7 +91,7 @@ pub(super) fn open_in_memory_blocking() -> anyhow::Result<Database> {
     Ok(db)
 }
 
-pub fn open_persistent_blocking(opts: &RedbOpenOpts) -> Result<Database, OpenError> {
+fn open_persistent_blocking(opts: &RedbOpenOpts) -> Result<Database, OpenError> {
     ensure_parent_dir(&opts.path)?;
     let db = try_open_db(opts).map_err(|e| OpenError::Corrupt {
         path: opts.path.display().to_string(),
@@ -228,8 +228,50 @@ fn is_retryable_already_open(err: &OpenError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
     use super::*;
-    use redb::ReadableDatabase;
+    use klights_supervisor::{TaskCategory, TaskCategoryConfig};
+    use redb::{ReadableDatabase, TableHandle};
+    use tempfile::TempDir;
+
+    fn temp_db_dir() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o700)).ok();
+        let path = dir.path().join("state.redb");
+        (dir, path)
+    }
+
+    fn insert_watch_event(
+        write: &redb::WriteTransaction,
+        resource_version: i64,
+        event: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let event_id = {
+            let mut metadata = write.open_table(tables::META)?;
+            let current = metadata
+                .get("watch_event_id")?
+                .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok())
+                .unwrap_or(0);
+            let next = current.saturating_add(1);
+            metadata.insert("watch_event_id", next.to_string().as_bytes())?;
+            next
+        };
+        let mut stored = event.clone();
+        if let Some(object) = stored.as_object_mut() {
+            object.insert(
+                "resourceVersion".to_string(),
+                serde_json::Value::from(resource_version),
+            );
+        }
+        let encoded = serde_json::to_vec(&stored)?;
+        write
+            .open_table(tables::WATCH_EVENTS)?
+            .insert(event_id, encoded.as_slice())?;
+        Ok(())
+    }
 
     #[test]
     fn migrates_legacy_rv_key_and_allows_same_rv_sibling() {
@@ -254,7 +296,7 @@ mod tests {
 
         initialize_tables(&db).unwrap();
         let write = db.begin_write().unwrap();
-        crate::datastore::redb::helpers::watch_insert(
+        insert_watch_event(
             &write,
             7,
             &serde_json::json!({
@@ -301,7 +343,7 @@ mod tests {
 
         initialize_tables(&db).unwrap();
         let write = db.begin_write().unwrap();
-        crate::datastore::redb::helpers::watch_insert(
+        insert_watch_event(
             &write,
             8,
             &serde_json::json!({
@@ -327,5 +369,120 @@ mod tests {
         assert_eq!(ids, vec![7, 8]);
         let meta = read.open_table(tables::META).unwrap();
         assert_eq!(meta.get("watch_event_id").unwrap().unwrap().value(), b"8");
+    }
+
+    #[test]
+    fn open_fresh_creates_cluster_tables_without_node_local_tables() {
+        let (_dir, path) = temp_db_dir();
+        let db = open_persistent_blocking(&RedbOpenOpts {
+            path,
+            cache_size: 40 * 1024 * 1024,
+        })
+        .expect("open fresh");
+        let read = db.begin_read().expect("read transaction");
+        let names = read
+            .list_tables()
+            .expect("list tables")
+            .map(|table| table.name().to_string())
+            .collect::<Vec<_>>();
+        for expected in [
+            "res_cluster",
+            "res_ns",
+            "namespaces",
+            "watch_events",
+            "resources_by_owner",
+            "rv_to_key",
+            "node_subnets",
+            "pod_cleanup_intents",
+            "meta",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing table: {expected}"
+            );
+        }
+        for node_local in [
+            "pod_sandboxes",
+            "pod_networks",
+            "pod_slot_admissions",
+            "pod_endpoints",
+            "pod_workqueue",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == node_local),
+                "cluster store must not create node-local table: {node_local}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_database_with_current_schema_reopens() {
+        let (_dir, path) = temp_db_dir();
+        let opts = RedbOpenOpts {
+            path,
+            cache_size: 40 * 1024 * 1024,
+        };
+        open_persistent_blocking(&opts).expect("first open");
+        open_persistent_blocking(&opts).expect("reopen");
+    }
+
+    #[test]
+    fn persistent_open_sets_file_and_parent_permissions() {
+        let (_dir, path) = temp_db_dir();
+        open_persistent_blocking(&RedbOpenOpts {
+            path: path.clone(),
+            cache_size: 40 * 1024 * 1024,
+        })
+        .expect("open");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("database metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().expect("parent"))
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_open_runs_inside_supervised_db_boundary() {
+        let (_dir, path) = temp_db_dir();
+        let opts = RedbOpenOpts {
+            path,
+            cache_size: 40 * 1024 * 1024,
+        };
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let supervisor_for_open = Arc::clone(&supervisor);
+
+        let handle = tokio::spawn(async move {
+            open_persistent_with(&supervisor_for_open, opts, move |opts| {
+                let _ = entered_tx.send(());
+                release_rx.recv().unwrap();
+                open_persistent_blocking(opts)
+            })
+            .await
+        });
+
+        entered_rx.await.unwrap();
+        let active_db_tasks = supervisor.active_tasks(Some(TaskCategory::Db));
+        assert!(
+            active_db_tasks
+                .iter()
+                .any(|task| task.name == "redb_open_persistent"),
+            "redb open must be visible as a supervised DB task, got {active_db_tasks:?}"
+        );
+
+        release_tx.send(()).unwrap();
+        drop(handle.await.unwrap().unwrap());
     }
 }

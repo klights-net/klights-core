@@ -15,7 +15,8 @@ use klights_cluster_store::{
 };
 use tokio::sync::oneshot;
 
-use super::{RedbDatastore, key_codec, tables};
+use super::{RedbDatastore, key_codec};
+use klights_cluster_datastore::redb::tables;
 
 enum Command {
     Next(oneshot::Sender<Result<Option<SnapshotCapturePage>, SnapshotPersistenceError>>),

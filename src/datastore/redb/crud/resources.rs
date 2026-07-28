@@ -11,15 +11,15 @@ use serde_json::Value;
 
 #[cfg(test)]
 use crate::datastore::CommitObservationSink;
-use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::key_codec::{lex_next, resource_key, resource_prefix};
-use crate::datastore::redb::tables;
 use crate::datastore::sqlite::create_pending_watch_event;
 #[cfg(test)]
 use crate::datastore::sqlite::publish_pending;
 use crate::datastore::types::*;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::tables;
 
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
@@ -174,7 +174,7 @@ impl RedbResourceStore {
         if let Some(expected_uid) = meta_uid.as_deref()
             && expected_uid != incoming_uid
         {
-            return Err(crate::datastore::errors::DatastoreError::conflict(format!(
+            return Err(klights_cluster_datastore::errors::DatastoreError::conflict(format!(
                 "replicated create UID precondition failed: expected {expected_uid} got {incoming_uid}"
             ))
             .into());
@@ -775,7 +775,7 @@ impl RedbResourceStore {
                 let (old_body, data, _) = {
                     let table = w.open_table(res_tbl)?;
                     let Some(current_row) = table.get(key.as_slice())? else {
-                        return Err(crate::datastore::errors::DatastoreError::not_found(format!(
+                        return Err(klights_cluster_datastore::errors::DatastoreError::not_found(format!(
                             "delete_resource_without_watch_with_tombstone: {av_error}/{kind_error}/{name_error} not found"
                         ))
                         .into());
@@ -1251,7 +1251,7 @@ impl RedbResourceStore {
                 let rv = g.value().0 as i64;
                 if let Some(er) = er
                     && er > 0 && rv != er {
-                        return Err(crate::datastore::errors::DatastoreError::conflict(
+                        return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                             format!("rv conflict: expected {er} got {rv}"),
                         )
                         .into());
@@ -1516,15 +1516,17 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::datastore::redb::accessor::RedbAccessor;
-    use crate::datastore::redb::open_boundary;
+    use klights_cluster_datastore::redb as open_boundary;
+    use klights_cluster_datastore::redb::RedbAccessor;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;
 
-    fn store() -> RedbResourceStore {
-        let db = open_boundary::open_in_memory_blocking().unwrap();
+    async fn store() -> RedbResourceStore {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let db = open_boundary::open_in_memory(supervisor.as_ref())
+            .await
+            .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         RedbResourceStore::new(
             accessor,
@@ -1598,7 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_res_with_continue_token_paginates() {
-        let s = store();
+        let s = store().await;
         for i in 0..5 {
             s.create_res("v1", "Pod", Some("default"), &format!("p{i}"),
                 json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":format!("p{i}"),"namespace":"default"}})).await.unwrap();
@@ -1634,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_res_nonexistent_is_noop() {
-        let s = store();
+        let s = store().await;
         s.delete_res("v1", "Pod", Some("default"), "ghost")
             .await
             .unwrap();
@@ -1642,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_res_returns_none_for_missing() {
-        let s = store();
+        let s = store().await;
         let r = s
             .get_res("v1", "Pod", Some("default"), "nope")
             .await
@@ -1653,8 +1655,10 @@ mod tests {
     #[tokio::test]
     async fn watch_events_emitted_on_create_update_delete() {
         use crate::watch::events::EventType;
-        let db = open_boundary::open_in_memory_blocking().unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
+        let db = open_boundary::open_in_memory(supervisor.as_ref())
+            .await
+            .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         let watch_sink = crate::watch_commit_observation_adapter::new_sink();
         let mut watch_rx = crate::watch_commit_observation_adapter::subscribe_test_events(
@@ -1687,7 +1691,7 @@ mod tests {
 
     #[tokio::test]
     async fn redb_selector_limit_does_not_decode_all_rows() {
-        let s = store();
+        let s = store().await;
         // Create 20 resources, only 2 match the label selector.
         for i in 0..20 {
             let labels = if i == 5 || i == 15 {
@@ -1754,7 +1758,7 @@ mod tests {
 
     #[tokio::test]
     async fn redb_selector_continue_token_returns_next_filtered_page() {
-        let s = store();
+        let s = store().await;
         // Create 6 matching resources, request pages of 2.
         for i in 0..6 {
             s.create_res(
@@ -1830,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn redb_residual_selector_late_match_is_not_dropped() {
-        let s = store();
+        let s = store().await;
         // Create many non-matching resources, then one matching at the end.
         // The match comes after many non-matches by name sort order.
         for i in 0..50 {
@@ -1890,7 +1894,7 @@ mod tests {
 
     #[tokio::test]
     async fn redb_selector_pagination_omits_remaining_item_count() {
-        let s = store();
+        let s = store().await;
         for i in 0..4 {
             s.create_res(
                 "v1",
@@ -1934,7 +1938,7 @@ mod tests {
 
     #[tokio::test]
     async fn redb_field_selector_with_limit_paginates() {
-        let s = store();
+        let s = store().await;
         for i in 0..4 {
             s.create_res(
                 "v1",

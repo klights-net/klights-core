@@ -282,7 +282,7 @@ impl Datastore {
                 })
             }
             Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
-                Err(crate::datastore::errors::DatastoreError::conflict(
+                Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "Namespace not found or version conflict",
                 )
                 .into())
@@ -363,7 +363,7 @@ impl Datastore {
                 Ok(rv)
             }
             Ok(NamespaceDeleteResult::HasRemainingContent) => {
-                Err(crate::datastore::errors::DatastoreError::conflict(
+                Err(klights_cluster_datastore::errors::DatastoreError::conflict(
                     "Namespace has remaining content",
                 )
                 .into())

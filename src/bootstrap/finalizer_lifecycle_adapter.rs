@@ -7,7 +7,8 @@ use klights_reconcile_api::{
 };
 
 use crate::datastore::DatastoreBackend;
-use crate::datastore::{DatastoreHandle, errors::DatastoreError};
+use crate::datastore::DatastoreHandle;
+use klights_cluster_datastore::errors::DatastoreError;
 
 pub(crate) struct DatastoreFinalizerLifecycleAdapter {
     db: DatastoreHandle,
@@ -66,7 +67,7 @@ fn lifecycle_error(error: anyhow::Error) -> FinalizerLifecycleError {
             }
         };
     }
-    if crate::datastore::errors::is_conflict_error(&error) {
+    if klights_cluster_datastore::errors::is_conflict_error(&error) {
         FinalizerLifecycleError::Conflict(error.to_string())
     } else {
         FinalizerLifecycleError::Internal(error.to_string())
