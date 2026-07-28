@@ -97,6 +97,7 @@ mod tests {
                     crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
+                scheduler_bind_gate: None,
             },
         );
         let pod_repo = Arc::new(parts.repository);

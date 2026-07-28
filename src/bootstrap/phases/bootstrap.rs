@@ -21,6 +21,7 @@ pub struct BootstrapPhase {
     pub _node_lifecycle_start_resource_version: i64,
     pub pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_api_service: Arc<crate::pod_api_service::PodApiService>,
+    pub pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     pub crd_registry_watch_handle: SupervisedJoinHandle<()>,
     pub leader_peer_endpoint_observer_handle: Option<SupervisedJoinHandle<()>>,
     pub pod_watcher_handle: Option<SupervisedJoinHandle<()>>,
@@ -534,6 +535,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 scheduling_mode,
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(leader_ports.resource_query.clone()),
+                #[cfg(test)]
+                scheduler_bind_gate: None,
                 #[cfg(not(test))]
                 gc_coordination: controller_coordination.clone(),
             },
@@ -541,7 +544,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         );
         (
             root_parts.repository_parts,
-            Some((root_parts.api, root_parts.subresource)),
+            Some((
+                root_parts.api,
+                root_parts.subresource,
+                root_parts.scheduling,
+            )),
         )
     };
     let pod_slot_adapter =
@@ -642,7 +649,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if let Some(worker_store_adapter) = worker_store_adapter.as_ref() {
         worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
     }
-    let (api_pod_repository, pod_api_service, pod_subresource_service) =
+    let (api_pod_repository, pod_api_service, pod_subresource_service, pod_scheduling) =
         if kubelet_uses_worker_store_adapter {
             let root_parts = crate::pod_repository_composition::build_pod_repository_parts(
                 crate::pod_repository_composition::PodRepositoryBuildConfig {
@@ -656,6 +663,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     scheduling_mode,
                     outbox: Some(outbox_runtime.clone()),
                     cluster_api: Some(leader_ports.resource_query.clone()),
+                    #[cfg(test)]
+                    scheduler_bind_gate: None,
                     #[cfg(not(test))]
                     gc_coordination: controller_coordination.clone(),
                 },
@@ -672,11 +681,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 .start()
                 .await
                 .context("API Pod repository background startup")?;
-            (repo, root_parts.api, root_parts.subresource)
+            (
+                repo,
+                root_parts.api,
+                root_parts.subresource,
+                root_parts.scheduling,
+            )
         } else {
-            let (api, subresource) = root_pod_api_services
+            let (api, subresource, scheduling) = root_pod_api_services
                 .expect("root Pod API services must accompany the root repository");
-            (pod_repository.clone(), api, subresource)
+            (pod_repository.clone(), api, subresource, scheduling)
         };
     let controller_pod_port = Arc::new(
         crate::controller_runtime_adapter::RootControllerPodPort::new(
@@ -1830,6 +1844,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         _watcher_state: watcher_state,
         pod_repository: api_pod_repository,
         pod_api_service,
+        pod_scheduling,
         crd_registry_watch_handle,
         leader_peer_endpoint_observer_handle,
         _node_lifecycle_start_resource_version: node_lifecycle_start_resource_version,

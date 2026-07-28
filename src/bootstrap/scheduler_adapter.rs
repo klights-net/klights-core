@@ -8,7 +8,7 @@ use crate::datastore::DatastoreHandle;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
 
 pub(crate) struct LeaderSchedulerRuntime {
-    pods: Arc<crate::pod_api_service::PodApiService>,
+    pods: Arc<dyn klights_pod_api::PodScheduling>,
     positioned_watch: klights_watch::PositionedWatchService,
 }
 
@@ -16,7 +16,7 @@ impl LeaderSchedulerRuntime {
     pub(crate) fn new(
         db: DatastoreHandle,
         watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-        pods: Arc<crate::pod_api_service::PodApiService>,
+        pods: Arc<dyn klights_pod_api::PodScheduling>,
     ) -> Self {
         Self {
             positioned_watch:
@@ -50,9 +50,7 @@ impl SchedulerRuntime for LeaderSchedulerRuntime {
             .schedule_all_unbound_pods()
             .await
             .map_err(|error| {
-                ControllerStoreError::unavailable(format!(
-                    "schedule unbound Pods failed: {error:?}"
-                ))
+                ControllerStoreError::unavailable(format!("schedule unbound Pods failed: {error}"))
             })
     }
 }

@@ -9,6 +9,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -18,9 +20,44 @@ const DEFAULT_MTU: u32 = crate::networking::wireguard::WIREGUARD_MTU;
 const CLEANUP_RPC_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 pub struct CniRpcState {
-    pub containerd_namespace: String,
-    pub network: std::sync::Arc<crate::networking::Network>,
-    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    pub socket_path: CniSocketPath,
+    pub socket_filesystem: Arc<dyn CniSocketFilesystem>,
+    pub network: Arc<crate::networking::Network>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CniSocketPath(Arc<str>);
+
+impl CniSocketPath {
+    pub fn try_new(path: impl Into<String>) -> Result<Self> {
+        let path = path.into();
+        if path.is_empty() {
+            return Err(anyhow!("CNI RPC socket path must not be empty"));
+        }
+        if path.as_bytes().contains(&0) {
+            return Err(anyhow!("CNI RPC socket path must not contain NUL"));
+        }
+        if !std::path::Path::new(&path).is_absolute() {
+            return Err(anyhow!("CNI RPC socket path must be absolute"));
+        }
+        Ok(Self(Arc::from(path)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+pub type CniSocketFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
+
+pub trait CniSocketFilesystem: Send + Sync {
+    fn bind_listener(
+        &self,
+        socket_path: &CniSocketPath,
+    ) -> CniSocketFuture<'_, tokio::net::UnixListener>;
+
+    fn remove_socket(&self, socket_path: &CniSocketPath) -> CniSocketFuture<'_, ()>;
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -54,22 +91,16 @@ struct RpcResponse {
     error: Option<String>,
 }
 
-pub fn rpc_socket_path(namespace: &str) -> String {
-    crate::paths::cni_rpc_socket_path(namespace)
-        .to_string_lossy()
-        .into_owned()
-}
-
 pub struct CleanupRpcServer {
-    socket_path: String,
+    socket_path: CniSocketPath,
     listener: tokio::net::UnixListener,
     task_supervisor: klights_supervisor::TaskSupervisor,
-    file_process: klights_supervisor::FileProcessExecutor,
+    socket_filesystem: Arc<dyn CniSocketFilesystem>,
 }
 
 impl CleanupRpcServer {
     pub fn socket_path(&self) -> &str {
-        &self.socket_path
+        self.socket_path.as_str()
     }
 
     pub async fn serve(self, cancel: CancellationToken) -> Result<()> {
@@ -77,7 +108,7 @@ impl CleanupRpcServer {
             socket_path,
             listener,
             task_supervisor,
-            file_process,
+            socket_filesystem,
         } = self;
 
         loop {
@@ -111,30 +142,28 @@ impl CleanupRpcServer {
             }
         }
 
-        let _ = crate::runtime_fs::remove_file_if_exists_async(&file_process, &socket_path).await;
+        let _ = socket_filesystem.remove_socket(&socket_path).await;
         Ok(())
     }
 }
 
 pub async fn bind_cleanup_rpc_server(
-    namespace: &str,
+    socket_path: CniSocketPath,
+    socket_filesystem: Arc<dyn CniSocketFilesystem>,
     task_supervisor: klights_supervisor::TaskSupervisor,
 ) -> Result<CleanupRpcServer> {
-    let socket_path = rpc_socket_path(namespace);
-    let file_process =
-        klights_supervisor::FileProcessExecutor::new(std::sync::Arc::new(task_supervisor.clone()));
-    let listener = bind_rpc_listener(&file_process, &socket_path).await?;
-    tracing::info!("cleanup-cni-rpc: listening on {}", socket_path);
+    let listener = socket_filesystem.bind_listener(&socket_path).await?;
+    tracing::info!("cleanup-cni-rpc: listening on {}", socket_path.as_str());
     Ok(CleanupRpcServer {
         socket_path,
         listener,
         task_supervisor,
-        file_process,
+        socket_filesystem,
     })
 }
 
-pub fn run_from_env() -> i32 {
-    match run() {
+pub fn run_from_env(default_rpc_socket: CniSocketPath) -> i32 {
+    match run(default_rpc_socket) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("klights-cni: {e:#}");
@@ -143,7 +172,7 @@ pub fn run_from_env() -> i32 {
     }
 }
 
-fn run() -> Result<()> {
+fn run(default_rpc_socket: CniSocketPath) -> Result<()> {
     let command = std::env::var("CNI_COMMAND").context("CNI_COMMAND is required")?;
     let ifname = std::env::var("CNI_IFNAME").unwrap_or_else(|_| "eth0".to_string());
     let netns = std::env::var("CNI_NETNS").unwrap_or_default();
@@ -192,7 +221,12 @@ fn run() -> Result<()> {
                     .ok_or_else(|| anyhow!("missing netns path"))?,
             )
             .context("failed to open CNI_NETNS for fd passing")?;
-            let resp = send_rpc(&config, &req, Some(netns_file.as_raw_fd()))?;
+            let resp = send_rpc(
+                &config,
+                &req,
+                Some(netns_file.as_raw_fd()),
+                &default_rpc_socket,
+            )?;
             if !resp.ok {
                 return Err(anyhow!(
                     "{}",
@@ -222,7 +256,7 @@ fn run() -> Result<()> {
                 pod_uid: None,
                 config: config.clone(),
             };
-            let resp = send_rpc(&config, &req, None)?;
+            let resp = send_rpc(&config, &req, None, &default_rpc_socket)?;
             if !resp.ok {
                 return Err(anyhow!(
                     "{}",
@@ -246,11 +280,16 @@ fn run() -> Result<()> {
     }
 }
 
-fn send_rpc(config: &CniConfig, req: &RpcRequest, netns_fd: Option<RawFd>) -> Result<RpcResponse> {
+fn send_rpc(
+    config: &CniConfig,
+    req: &RpcRequest,
+    netns_fd: Option<RawFd>,
+    default_rpc_socket: &CniSocketPath,
+) -> Result<RpcResponse> {
     let socket = config
         .rpc_socket
         .clone()
-        .unwrap_or_else(|| rpc_socket_path("klights"));
+        .unwrap_or_else(|| default_rpc_socket.as_str().to_string());
     let mut stream =
         UnixStream::connect(&socket).with_context(|| format!("failed to connect {}", socket))?;
     let payload = serde_json::to_vec(req).context("failed to serialize CNI RPC request")?;
@@ -288,10 +327,9 @@ pub async fn run_rpc_server(
     state: std::sync::Arc<CniRpcState>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let socket_path = rpc_socket_path(&state.containerd_namespace);
-    let file_process = klights_supervisor::FileProcessExecutor::new(state.task_supervisor.clone());
-    let listener = bind_rpc_listener(&file_process, &socket_path).await?;
-    tracing::info!("cni-rpc: listening on {}", socket_path);
+    let socket_path = state.socket_path.clone();
+    let listener = state.socket_filesystem.bind_listener(&socket_path).await?;
+    tracing::info!("cni-rpc: listening on {}", socket_path.as_str());
 
     loop {
         tokio::select! {
@@ -390,23 +428,8 @@ pub async fn run_rpc_server(
         }
     }
 
-    let _ = crate::runtime_fs::remove_file_if_exists_async(&file_process, &socket_path).await;
+    let _ = state.socket_filesystem.remove_socket(&socket_path).await;
     Ok(())
-}
-
-async fn bind_rpc_listener(
-    file_process: &klights_supervisor::FileProcessExecutor,
-    socket_path: &str,
-) -> Result<tokio::net::UnixListener> {
-    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-        crate::runtime_fs::create_dir_all_async(file_process, parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let _ = crate::runtime_fs::remove_file_if_exists_async(file_process, socket_path).await;
-    let listener = tokio::net::UnixListener::bind(socket_path)
-        .with_context(|| format!("failed to bind {}", socket_path))?;
-    Ok(listener)
 }
 
 async fn handle_cleanup_rpc_stream(mut stream: tokio::net::UnixStream) -> Result<()> {
@@ -719,13 +742,11 @@ mod tests {
     }
 
     #[test]
-    fn rpc_socket_path_uses_namespace() {
-        assert_eq!(
-            rpc_socket_path("klights"),
-            crate::paths::cni_rpc_socket_path("klights")
-                .to_string_lossy()
-                .into_owned()
-        );
+    fn socket_path_validation_rejects_ambient_or_invalid_paths() {
+        assert!(CniSocketPath::try_new("/run/klights/cni.sock").is_ok());
+        assert!(CniSocketPath::try_new("relative/cni.sock").is_err());
+        assert!(CniSocketPath::try_new("").is_err());
+        assert!(CniSocketPath::try_new("/run/klights/\0cni.sock").is_err());
     }
 
     #[test]
@@ -863,13 +884,17 @@ mod tests {
         let socket_path = tmp.path().join("cleanup.sock");
         let socket_path = socket_path.to_string_lossy().into_owned();
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
-        let listener = bind_rpc_listener(&file_process, &socket_path)
+        let socket_filesystem =
+            crate::cni_socket_adapter::RootCniSocketFilesystem::shared(file_process);
+        let validated_socket_path = CniSocketPath::try_new(socket_path.clone()).unwrap();
+        let listener = socket_filesystem
+            .bind_listener(&validated_socket_path)
             .await
             .unwrap();
         let server = CleanupRpcServer {
-            socket_path: socket_path.clone(),
+            socket_path: validated_socket_path,
             listener,
-            file_process,
+            socket_filesystem,
             task_supervisor: klights_supervisor::TaskSupervisor::new(
                 klights_supervisor::TaskCategoryConfig::default(),
             ),

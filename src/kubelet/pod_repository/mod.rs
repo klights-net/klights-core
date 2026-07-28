@@ -289,83 +289,6 @@ use store::PodStore;
 use watch::PodWatchService;
 use workqueue::PodWorkqueue;
 
-#[cfg(test)]
-#[async_trait]
-pub(crate) trait PodApiPort: Send + Sync {
-    async fn create(
-        &self,
-        request: PodApiCreateRequest,
-    ) -> std::result::Result<PodApiCreateResult, PodRepositoryError>;
-    async fn update(
-        &self,
-        ns: &str,
-        name: &str,
-        body: Value,
-        current: Resource,
-        dry_run: bool,
-    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError>;
-    async fn patch(
-        &self,
-        ns: &str,
-        name: &str,
-        patch: Value,
-        patch_type: PodStatusPatchType,
-        dry_run: bool,
-    ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError>;
-    async fn delete(
-        &self,
-        ns: &str,
-        name: &str,
-        options: PodDeleteOptions,
-        dry_run: bool,
-    ) -> std::result::Result<PodApiDeleteOutcome, PodRepositoryError>;
-    async fn delete_collection(
-        &self,
-        ns: &str,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        dry_run: bool,
-    ) -> std::result::Result<(), PodRepositoryError>;
-    async fn mark_terminating(
-        &self,
-        target: &klights_pod_api::PodMutationTarget,
-    ) -> std::result::Result<Resource, PodRepositoryError>;
-    async fn schedule_pending(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> std::result::Result<Option<Resource>, PodRepositoryError>;
-    async fn bind(
-        &self,
-        namespace: &str,
-        name: &str,
-        binding: Value,
-        dry_run: bool,
-    ) -> std::result::Result<(), PodRepositoryError>;
-    async fn schedule_all(self: Arc<Self>) -> std::result::Result<(), PodRepositoryError>;
-}
-
-#[cfg(test)]
-#[async_trait]
-pub(crate) trait PodSubresourcePort: Send + Sync {
-    async fn replace_status(
-        &self,
-        ns: &str,
-        name: &str,
-        pod_uid: Option<&str>,
-        status: Value,
-        expected_rv: i64,
-    ) -> std::result::Result<Resource, PodRepositoryError>;
-    async fn patch_status(
-        &self,
-        ns: &str,
-        name: &str,
-        patch: Value,
-        patch_type: PodStatusPatchType,
-        expected_rv: i64,
-    ) -> std::result::Result<Resource, PodRepositoryError>;
-}
-
 pub(crate) struct PodRepositoryAdapterDependencies {
     pub store: Arc<PodStore>,
     pub status_only: Arc<dyn StateOnlyWriter>,
@@ -404,9 +327,13 @@ pub(crate) struct PodRepositoryAdapters {
     pub namespace_termination: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
     pub mutation_reconcile: Arc<dyn klights_reconcile_api::PodMutationReconcileSink>,
     #[cfg(test)]
-    pub test_api: Option<Arc<crate::pod_api_service::PodApiService>>,
+    pub test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
     #[cfg(test)]
-    pub test_subresource: Option<Arc<crate::pod_subresource_service::PodSubresourceService>>,
+    pub test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
+    #[cfg(test)]
+    pub test_scheduling: Option<Arc<dyn klights_pod_api::PodScheduling>>,
+    #[cfg(test)]
+    pub test_mark_terminating: Option<Arc<dyn klights_pod_api::PodMarkTerminating>>,
 }
 
 #[async_trait]
@@ -788,11 +715,15 @@ pub struct PodRepository {
     status: PodStatusService,
     objects: PodObjectService,
     #[cfg(test)]
-    test_subresource: Option<Arc<crate::pod_subresource_service::PodSubresourceService>>,
+    test_subresource: Option<Arc<dyn klights_pod_api::PodSubresourceMutation>>,
     network_svc: PodNetworkService,
     _watch: PodWatchService,
     #[cfg(test)]
-    test_api: Option<Arc<crate::pod_api_service::PodApiService>>,
+    test_api: Option<Arc<dyn klights_pod_api::PodApiMutation>>,
+    #[cfg(test)]
+    test_scheduling: Option<Arc<dyn klights_pod_api::PodScheduling>>,
+    #[cfg(test)]
+    test_mark_terminating: Option<Arc<dyn klights_pod_api::PodMarkTerminating>>,
     gc_delete: Arc<dyn GcPodDeleteSink>,
     eviction_admission: Arc<dyn PodEvictionAdmissionSink>,
     namespace_bootstrap: Arc<dyn klights_reconcile_api::NamespaceBootstrapSink>,
@@ -812,8 +743,8 @@ impl PodRepository {
     pub(crate) fn test_root_api_services(
         &self,
     ) -> (
-        Arc<crate::pod_api_service::PodApiService>,
-        Arc<crate::pod_subresource_service::PodSubresourceService>,
+        Arc<dyn klights_pod_api::PodApiMutation>,
+        Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) {
         (
             self.test_api
@@ -1065,6 +996,7 @@ impl PodRepository {
             scheduling_mode,
             outbox,
             cluster_api: Some(cluster_api),
+            scheduler_bind_gate: None,
         })
     }
 
@@ -1090,6 +1022,7 @@ impl PodRepository {
             scheduling_mode,
             outbox,
             cluster_api: None,
+            scheduler_bind_gate: None,
         })
     }
 
@@ -1193,6 +1126,10 @@ impl PodRepository {
             _watch: watch,
             #[cfg(test)]
             test_api: adapters.test_api,
+            #[cfg(test)]
+            test_scheduling: adapters.test_scheduling,
+            #[cfg(test)]
+            test_mark_terminating: adapters.test_mark_terminating,
             gc_delete: adapters.gc_delete,
             eviction_admission,
             namespace_bootstrap,
@@ -1332,15 +1269,12 @@ impl PodRepository {
         namespace: &str,
         name: &str,
     ) -> Result<Option<Resource>> {
-        PodApiPort::schedule_pending(
-            self.test_api
-                .as_deref()
-                .expect("test scheduler requires the root Pod API adapter"),
-            namespace,
-            name,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))
+        self.test_scheduling
+            .as_deref()
+            .expect("test scheduler requires the neutral Pod scheduling port")
+            .schedule_pending_pod(namespace.to_string(), name.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
     #[cfg(test)]
@@ -1351,39 +1285,27 @@ impl PodRepository {
         binding: serde_json::Value,
         dry_run: bool,
     ) -> Result<()> {
-        PodApiPort::bind(
-            self.test_api
-                .as_deref()
-                .expect("test bind requires the root Pod API adapter"),
-            namespace,
-            name,
-            binding,
-            dry_run,
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        self.test_api
+            .as_deref()
+            .expect("test bind requires the neutral Pod API port")
+            .bind_pod(klights_pod_api::PodBindingRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                binding,
+                dry_run,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     #[cfg(test)]
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
-        PodApiPort::schedule_all(
-            self.test_api
-                .clone()
-                .expect("test scheduler requires the root Pod API adapter"),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e:?}"))
-    }
-
-    #[cfg(test)]
-    fn set_scheduler_bind_gate_for_test(
-        &self,
-        gate: Arc<crate::pod_api_service::SchedulerBindGateForTest>,
-    ) {
-        self.test_api
-            .as_ref()
-            .expect("scheduler bind gate requires root Pod API adapter")
-            .set_scheduler_bind_gate_for_test(gate);
+        self.test_scheduling
+            .as_deref()
+            .expect("test scheduler requires the neutral Pod scheduling port")
+            .schedule_all_unbound_pods()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
     /// Enqueue the owning Job for asynchronous reconciliation after a pod
@@ -1799,23 +1721,20 @@ impl PodObjectWriter for PodRepository {
     ) -> Result<Resource> {
         #[cfg(test)]
         {
-            let result = PodApiPort::create(
-                self.test_api
-                    .as_deref()
-                    .expect("test controller create requires the root Pod API adapter"),
-                PodApiCreateRequest {
+            let result = self
+                .test_api
+                .as_deref()
+                .expect("test controller create requires the neutral Pod API port")
+                .create_pod(klights_pod_api::PodApiCreateRequest {
                     namespace: ns.to_string(),
-                    name: name.to_string(),
                     body: pod,
                     dry_run: false,
-                    run_admission: true,
-                },
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let created = result
-                .resource
-                .ok_or_else(|| anyhow::anyhow!("controller pod create returned dry-run"))?;
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let created = result.resource.ok_or_else(|| {
+                anyhow::anyhow!("controller pod {ns}/{name} create returned dry-run")
+            })?;
             self.spawn_post_write_maintenance(ns).await;
             return Ok(created);
         }
@@ -1920,8 +1839,14 @@ impl PodSubresourceWriter for PodRepository {
         let updated = self
             .test_subresource
             .as_deref()
-            .expect("test status replace requires the root subresource adapter")
-            .replace_status(ns, name, None, status, expected_rv)
+            .expect("test status replace requires the neutral Pod subresource port")
+            .replace_status(klights_pod_api::PodStatusReplaceRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                expected_uid: None,
+                status,
+                expected_resource_version: expected_rv,
+            })
             .await?;
         let _ = self
             .mutation_reconcile
@@ -1946,8 +1871,14 @@ impl PodSubresourceWriter for PodRepository {
         let updated = self
             .test_subresource
             .as_deref()
-            .expect("test status replace requires the root subresource adapter")
-            .replace_status(ns, name, Some(pod_uid), status, expected_rv)
+            .expect("test status replace requires the neutral Pod subresource port")
+            .replace_status(klights_pod_api::PodStatusReplaceRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                expected_uid: Some(pod_uid.to_string()),
+                status,
+                expected_resource_version: expected_rv,
+            })
             .await?;
         let _ = self
             .mutation_reconcile
@@ -1972,8 +1903,25 @@ impl PodSubresourceWriter for PodRepository {
         let updated = self
             .test_subresource
             .as_deref()
-            .expect("test status patch requires the root subresource adapter")
-            .patch_status(ns, name, patch, patch_type, expected_rv)
+            .expect("test status patch requires the neutral Pod subresource port")
+            .patch_status(klights_pod_api::PodStatusPatchRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                patch,
+                patch_kind: match patch_type {
+                    PodStatusPatchType::JsonPatch => klights_pod_api::PodStatusPatchKind::JsonPatch,
+                    PodStatusPatchType::MergePatch => {
+                        klights_pod_api::PodStatusPatchKind::MergePatch
+                    }
+                    PodStatusPatchType::StrategicMerge => {
+                        klights_pod_api::PodStatusPatchKind::StrategicMerge
+                    }
+                    PodStatusPatchType::ApplyPatch => {
+                        klights_pod_api::PodStatusPatchKind::ApplyPatch
+                    }
+                },
+                expected_resource_version: expected_rv,
+            })
             .await?;
         let _ = self
             .mutation_reconcile
@@ -1996,8 +1944,13 @@ impl PodSubresourceWriter for PodRepository {
     ) -> Result<Resource> {
         self.test_subresource
             .as_deref()
-            .expect("test ephemeral-container update requires the root subresource adapter")
-            .update_ephemeral_containers(ns, name, containers, expected_rv)
+            .expect("test ephemeral-container update requires the neutral Pod subresource port")
+            .update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                containers,
+                expected_resource_version: expected_rv,
+            })
             .await
             .map_err(Into::into)
     }
@@ -2013,17 +1966,33 @@ impl klights_pod_api::PodSubresourceMutation for PodRepository {
             let klights_pod_api::PodStatusReplaceRequest {
                 namespace,
                 name,
+                expected_uid,
                 status,
                 expected_resource_version,
             } = request;
-            PodSubresourceWriter::replace_status_from_api(
-                self,
-                &namespace,
-                &name,
-                status,
-                expected_resource_version,
-            )
-            .await
+            match expected_uid {
+                Some(uid) => {
+                    PodSubresourceWriter::replace_status_from_api_for_uid(
+                        self,
+                        &namespace,
+                        &name,
+                        &uid,
+                        status,
+                        expected_resource_version,
+                    )
+                    .await
+                }
+                None => {
+                    PodSubresourceWriter::replace_status_from_api(
+                        self,
+                        &namespace,
+                        &name,
+                        status,
+                        expected_resource_version,
+                    )
+                    .await
+                }
+            }
             .map_err(|error| ordinary_access::map_repository_error(error, &namespace, &name))
         })
     }
@@ -2116,13 +2085,20 @@ impl PodApiWriter for PodRepository {
         &self,
         request: PodApiCreateRequest,
     ) -> std::result::Result<PodApiCreateResult, PodRepositoryError> {
-        PodApiPort::create(
-            self.test_api
-                .as_deref()
-                .expect("test create requires the root Pod API adapter"),
-            request,
-        )
-        .await
+        let result = self
+            .test_api
+            .as_deref()
+            .expect("test create requires the neutral Pod API port")
+            .create_pod(klights_pod_api::PodApiCreateRequest {
+                namespace: request.namespace,
+                body: request.body,
+                dry_run: request.dry_run,
+            })
+            .await?;
+        Ok(PodApiCreateResult {
+            resource: result.resource,
+            body: result.body,
+        })
     }
     async fn api_update_pod(
         &self,
@@ -2132,17 +2108,26 @@ impl PodApiWriter for PodRepository {
         current: Resource,
         dry_run: bool,
     ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
-        PodApiPort::update(
-            self.test_api
-                .as_deref()
-                .expect("test update requires the root Pod API adapter"),
-            ns,
-            name,
-            body,
-            current,
-            dry_run,
-        )
-        .await
+        match self
+            .test_api
+            .as_deref()
+            .expect("test update requires the neutral Pod API port")
+            .update_pod(klights_pod_api::PodApiUpdateRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                body,
+                current,
+                dry_run,
+            })
+            .await?
+        {
+            klights_pod_api::PodApiWriteOutcome::Persisted(resource) => {
+                Ok(PodApiUpdateOutcome::Persisted(resource))
+            }
+            klights_pod_api::PodApiWriteOutcome::DryRun(value) => {
+                Ok(PodApiUpdateOutcome::DryRun(value))
+            }
+        }
     }
     async fn api_patch_pod(
         &self,
@@ -2152,17 +2137,34 @@ impl PodApiWriter for PodRepository {
         patch_type: PodStatusPatchType,
         dry_run: bool,
     ) -> std::result::Result<PodApiUpdateOutcome, PodRepositoryError> {
-        PodApiPort::patch(
-            self.test_api
-                .as_deref()
-                .expect("test patch requires the root Pod API adapter"),
-            ns,
-            name,
-            patch,
-            patch_type,
-            dry_run,
-        )
-        .await
+        let patch_kind = match patch_type {
+            PodStatusPatchType::JsonPatch => klights_pod_api::PodStatusPatchKind::JsonPatch,
+            PodStatusPatchType::MergePatch => klights_pod_api::PodStatusPatchKind::MergePatch,
+            PodStatusPatchType::StrategicMerge => {
+                klights_pod_api::PodStatusPatchKind::StrategicMerge
+            }
+            PodStatusPatchType::ApplyPatch => klights_pod_api::PodStatusPatchKind::ApplyPatch,
+        };
+        match self
+            .test_api
+            .as_deref()
+            .expect("test patch requires the neutral Pod API port")
+            .patch_pod(klights_pod_api::PodApiPatchRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                patch,
+                patch_kind,
+                dry_run,
+            })
+            .await?
+        {
+            klights_pod_api::PodApiWriteOutcome::Persisted(resource) => {
+                Ok(PodApiUpdateOutcome::Persisted(resource))
+            }
+            klights_pod_api::PodApiWriteOutcome::DryRun(value) => {
+                Ok(PodApiUpdateOutcome::DryRun(value))
+            }
+        }
     }
     async fn api_delete_pod<O>(
         &self,
@@ -2174,16 +2176,25 @@ impl PodApiWriter for PodRepository {
     where
         O: Into<PodDeleteOptions> + Send,
     {
-        PodApiPort::delete(
-            self.test_api
-                .as_deref()
-                .expect("test delete requires the root Pod API adapter"),
-            ns,
-            name,
-            options.into(),
-            dry_run,
-        )
-        .await
+        match self
+            .test_api
+            .as_deref()
+            .expect("test delete requires the neutral Pod API port")
+            .delete_pod(klights_pod_api::PodApiDeleteRequest {
+                namespace: ns.to_string(),
+                name: name.to_string(),
+                options: options.into(),
+                dry_run,
+            })
+            .await?
+        {
+            klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => {
+                Ok(PodApiDeleteOutcome::GracefulSet(resource))
+            }
+            klights_pod_api::PodApiDeleteOutcome::DryRun(value) => {
+                Ok(PodApiDeleteOutcome::DryRun(value))
+            }
+        }
     }
     async fn api_delete_collection_pods(
         &self,
@@ -2192,16 +2203,16 @@ impl PodApiWriter for PodRepository {
         field_selector: Option<&str>,
         dry_run: bool,
     ) -> std::result::Result<(), PodRepositoryError> {
-        PodApiPort::delete_collection(
-            self.test_api
-                .as_deref()
-                .expect("test collection delete requires the root Pod API adapter"),
-            ns,
-            label_selector,
-            field_selector,
-            dry_run,
-        )
-        .await
+        self.test_api
+            .as_deref()
+            .expect("test collection delete requires the neutral Pod API port")
+            .delete_collection_pods(klights_pod_api::PodApiDeleteCollectionRequest {
+                namespace: ns.to_string(),
+                label_selector: label_selector.map(str::to_string),
+                field_selector: field_selector.map(str::to_string),
+                dry_run,
+            })
+            .await
     }
 }
 

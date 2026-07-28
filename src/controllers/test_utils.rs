@@ -92,6 +92,7 @@ pub async fn pod_repository_with_node_local_for_test(
             scheduling_mode: crate::kubelet::pod_repository::PodSchedulingMode::InlineSingleNode,
             outbox: None,
             cluster_api: None,
+            scheduler_bind_gate: None,
         },
     )
     .repository;

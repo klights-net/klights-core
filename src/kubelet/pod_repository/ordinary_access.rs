@@ -250,14 +250,12 @@ impl PodMarkTerminating for PodRepository {
         request: PodMarkTerminatingRequest,
     ) -> PodRepositoryFuture<'_, klights_cluster_core::Resource> {
         Box::pin(async move {
-            let target = request.into_target();
-            let resource = super::PodApiPort::mark_terminating(
-                self.test_api
-                    .as_deref()
-                    .expect("test termination requires the root Pod API adapter"),
-                &target,
-            )
-            .await?;
+            let resource = self
+                .test_mark_terminating
+                .as_deref()
+                .expect("test termination requires the neutral Pod termination port")
+                .mark_pod_terminating(request)
+                .await?;
 
             let _ = self
                 .mutation_reconcile
@@ -282,19 +280,22 @@ impl PodEvictionDelete for PodRepository {
     ) -> PodRepositoryFuture<'_, PodEvictionDeleteOutcome> {
         Box::pin(async move {
             let (namespace, name, options, dry_run) = request.into_parts();
-            let outcome = super::PodApiPort::delete(
-                self.test_api
-                    .as_deref()
-                    .expect("test eviction requires the root Pod API adapter"),
-                &namespace,
-                &name,
-                options,
-                dry_run,
-            )
-            .await?;
+            let outcome = self
+                .test_api
+                .as_deref()
+                .expect("test eviction requires the neutral Pod API port")
+                .delete_pod(PodApiDeleteRequest {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    options,
+                    dry_run,
+                })
+                .await?;
             match outcome {
-                super::PodApiDeleteOutcome::DryRun(_) => Ok(PodEvictionDeleteOutcome::DryRun),
-                super::PodApiDeleteOutcome::GracefulSet(resource) => {
+                klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
+                    Ok(PodEvictionDeleteOutcome::DryRun)
+                }
+                klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => {
                     let _ = self
                         .mutation_reconcile
                         .reconcile_pod_mutation(
@@ -318,148 +319,57 @@ impl PodApiMutation for PodRepository {
         &self,
         request: klights_pod_api::PodApiCreateRequest,
     ) -> PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
-        Box::pin(async move {
-            let result = super::PodApiPort::create(
-                self.test_api
-                    .as_deref()
-                    .expect("test create requires the root Pod API adapter"),
-                super::PodApiCreateRequest {
-                    namespace: request.namespace,
-                    name: String::new(),
-                    body: request.body,
-                    dry_run: request.dry_run,
-                    run_admission: true,
-                },
-            )
-            .await?;
-            Ok(klights_pod_api::PodApiCreateResult {
-                resource: result.resource,
-                body: result.body,
-            })
-        })
+        self.test_api
+            .as_deref()
+            .expect("test create requires the neutral Pod API port")
+            .create_pod(request)
     }
 
     fn update_pod(
         &self,
         request: PodApiUpdateRequest,
     ) -> PodRepositoryFuture<'_, PodApiWriteOutcome> {
-        Box::pin(async move {
-            match super::PodApiPort::update(
-                self.test_api
-                    .as_deref()
-                    .expect("test update requires the root Pod API adapter"),
-                &request.namespace,
-                &request.name,
-                request.body,
-                request.current,
-                request.dry_run,
-            )
-            .await?
-            {
-                super::PodApiUpdateOutcome::Persisted(resource) => {
-                    Ok(PodApiWriteOutcome::Persisted(resource))
-                }
-                super::PodApiUpdateOutcome::DryRun(value) => Ok(PodApiWriteOutcome::DryRun(value)),
-            }
-        })
+        self.test_api
+            .as_deref()
+            .expect("test update requires the neutral Pod API port")
+            .update_pod(request)
     }
 
     fn patch_pod(
         &self,
         request: PodApiPatchRequest,
     ) -> PodRepositoryFuture<'_, PodApiWriteOutcome> {
-        Box::pin(async move {
-            let patch_type = match request.patch_kind {
-                klights_pod_api::PodStatusPatchKind::JsonPatch => {
-                    super::PodStatusPatchType::JsonPatch
-                }
-                klights_pod_api::PodStatusPatchKind::MergePatch => {
-                    super::PodStatusPatchType::MergePatch
-                }
-                klights_pod_api::PodStatusPatchKind::StrategicMerge => {
-                    super::PodStatusPatchType::StrategicMerge
-                }
-                klights_pod_api::PodStatusPatchKind::ApplyPatch => {
-                    super::PodStatusPatchType::ApplyPatch
-                }
-            };
-            match super::PodApiPort::patch(
-                self.test_api
-                    .as_deref()
-                    .expect("test patch requires the root Pod API adapter"),
-                &request.namespace,
-                &request.name,
-                request.patch,
-                patch_type,
-                request.dry_run,
-            )
-            .await?
-            {
-                super::PodApiUpdateOutcome::Persisted(resource) => {
-                    Ok(PodApiWriteOutcome::Persisted(resource))
-                }
-                super::PodApiUpdateOutcome::DryRun(value) => Ok(PodApiWriteOutcome::DryRun(value)),
-            }
-        })
+        self.test_api
+            .as_deref()
+            .expect("test patch requires the neutral Pod API port")
+            .patch_pod(request)
     }
 
     fn delete_pod(
         &self,
         request: PodApiDeleteRequest,
     ) -> PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
-        Box::pin(async move {
-            match super::PodApiPort::delete(
-                self.test_api
-                    .as_deref()
-                    .expect("test delete requires the root Pod API adapter"),
-                &request.namespace,
-                &request.name,
-                request.options,
-                request.dry_run,
-            )
-            .await?
-            {
-                super::PodApiDeleteOutcome::GracefulSet(resource) => {
-                    Ok(klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource))
-                }
-                super::PodApiDeleteOutcome::DryRun(value) => {
-                    Ok(klights_pod_api::PodApiDeleteOutcome::DryRun(value))
-                }
-            }
-        })
+        self.test_api
+            .as_deref()
+            .expect("test delete requires the neutral Pod API port")
+            .delete_pod(request)
     }
 
     fn delete_collection_pods(
         &self,
         request: PodApiDeleteCollectionRequest,
     ) -> PodRepositoryFuture<'_, ()> {
-        Box::pin(async move {
-            super::PodApiPort::delete_collection(
-                self.test_api
-                    .as_deref()
-                    .expect("test collection delete requires the root Pod API adapter"),
-                &request.namespace,
-                request.label_selector.as_deref(),
-                request.field_selector.as_deref(),
-                request.dry_run,
-            )
-            .await
-        })
+        self.test_api
+            .as_deref()
+            .expect("test collection delete requires the neutral Pod API port")
+            .delete_collection_pods(request)
     }
 
     fn bind_pod(&self, request: klights_pod_api::PodBindingRequest) -> PodRepositoryFuture<'_, ()> {
-        Box::pin(async move {
-            super::PodApiPort::bind(
-                self.test_api
-                    .as_deref()
-                    .expect("test bind requires the root Pod API adapter"),
-                &request.namespace,
-                &request.name,
-                request.binding,
-                request.dry_run,
-            )
-            .await
-        })
+        self.test_api
+            .as_deref()
+            .expect("test bind requires the neutral Pod API port")
+            .bind_pod(request)
     }
 }
 
@@ -528,7 +438,7 @@ mod tests {
     use axum::response::IntoResponse;
 
     use crate::api::AppError;
-    use crate::pod_api_service::map_api_error_to_pod_repository;
+    use crate::pod_native_orchestration::map_api_error_to_pod_repository;
 
     #[tokio::test]
     async fn pod_repository_error_round_trips_kubernetes_http_categories() {

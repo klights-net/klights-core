@@ -715,6 +715,7 @@ mod tests {
                         crate::kubelet::pod_repository::PodSchedulingMode::InlineSingleNode,
                     outbox: None,
                     cluster_api: None,
+                    scheduler_bind_gate: None,
                 },
             )
             .repository,

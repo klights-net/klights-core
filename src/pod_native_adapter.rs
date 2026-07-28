@@ -1,0 +1,316 @@
+//! Root adapters from Kubernetes-native Pod ports to kubelet/datastore owners.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use klights_cluster_core::Resource;
+use klights_pod_api::{
+    PodActorFinalizeRequest, PodControlPlaneEventRequest, PodControlPlaneEventSink,
+    PodDeleteMarkOutcome, PodDeleteMarkRequest, PodDeleteOrchestration, PodGetRequest,
+    PodListRequest, PodListResult, PodMarkedRetryRequest, PodPersistence,
+    PodPersistenceCreateRequest, PodPersistenceReplaceRequest, PodQuery, PodRepositoryError,
+    PodRepositoryFuture, PodSpecValidation, PodStatusPersistence, PodStatusWriteRequest,
+};
+
+use crate::api::AdmissionResourceStore;
+use crate::datastore::{DatastoreHandle, ResourceListQuery};
+use crate::kubelet::pod_repository::delete_coordinator::PodDeleteCoordinator;
+use crate::kubelet::pod_repository::state_only_writer::StateOnlyWriter;
+use crate::kubelet::pod_repository::store::PodStore;
+
+pub(crate) struct RootPodNativeAdapter {
+    store: Arc<PodStore>,
+    status_only: Arc<dyn StateOnlyWriter>,
+    delete_coordinator: Arc<PodDeleteCoordinator>,
+    db: DatastoreHandle,
+}
+
+impl RootPodNativeAdapter {
+    pub(crate) fn new(
+        store: Arc<PodStore>,
+        status_only: Arc<dyn StateOnlyWriter>,
+        delete_coordinator: Arc<PodDeleteCoordinator>,
+        db: DatastoreHandle,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            status_only,
+            delete_coordinator,
+            db,
+        })
+    }
+}
+
+fn map_store_error(error: anyhow::Error, namespace: &str, name: &str) -> PodRepositoryError {
+    if let Some(error) = error.downcast_ref::<PodRepositoryError>() {
+        return error.clone();
+    }
+    let message = error.to_string();
+    if message.contains("already exists") && message.contains("409 Conflict") {
+        PodRepositoryError::already_exists(message)
+    } else if message.contains("409 Conflict") {
+        PodRepositoryError::conflict(message)
+    } else if message.to_ascii_lowercase().contains("not found") {
+        PodRepositoryError::not_found(namespace, name)
+    } else {
+        PodRepositoryError::internal(message)
+    }
+}
+
+impl PodQuery for RootPodNativeAdapter {
+    fn get_pod(&self, request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>> {
+        PodQuery::get_pod(self.store.as_ref(), request)
+    }
+
+    fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult> {
+        PodQuery::list_pods(self.store.as_ref(), request)
+    }
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: klights_pod_api::PodOwnerListRequest,
+    ) -> PodRepositoryFuture<'_, Vec<Resource>> {
+        PodQuery::list_pods_by_owner_uid(self.store.as_ref(), request)
+    }
+}
+
+impl PodPersistence for RootPodNativeAdapter {
+    fn create_pod(
+        &self,
+        request: PodPersistenceCreateRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.store
+                .create(&request.namespace, &request.name, request.body)
+                .await
+                .map_err(|error| map_store_error(error, &request.namespace, &request.name))
+        })
+    }
+
+    fn replace_pod(
+        &self,
+        request: PodPersistenceReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.store
+                .update(
+                    &request.namespace,
+                    &request.name,
+                    request.body,
+                    request.expected_resource_version,
+                )
+                .await
+                .map_err(|error| map_store_error(error, &request.namespace, &request.name))
+        })
+    }
+
+    fn replace_pod_including_status(
+        &self,
+        request: PodPersistenceReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.store
+                .update_including_status_for_scheduler(
+                    &request.namespace,
+                    &request.name,
+                    request.body,
+                    request.expected_resource_version,
+                )
+                .await
+                .map_err(|error| map_store_error(error, &request.namespace, &request.name))
+        })
+    }
+}
+
+impl PodStatusPersistence for RootPodNativeAdapter {
+    fn write_pod_status(
+        &self,
+        request: PodStatusWriteRequest,
+    ) -> PodRepositoryFuture<'_, Resource> {
+        Box::pin(async move {
+            self.status_only
+                .write_status(
+                    &request.namespace,
+                    &request.name,
+                    request.status,
+                    request.expected_resource_version,
+                )
+                .await
+                .map_err(|error| map_store_error(error, &request.namespace, &request.name))
+        })
+    }
+}
+
+impl PodDeleteOrchestration for RootPodNativeAdapter {
+    fn preview_delete(
+        &self,
+        resource: &Resource,
+        requested_grace_period_seconds: Option<i64>,
+    ) -> serde_json::Value {
+        self.delete_coordinator
+            .dry_run_delete_body(resource, requested_grace_period_seconds)
+    }
+
+    fn mark_and_queue_delete(
+        &self,
+        request: PodDeleteMarkRequest,
+    ) -> PodRepositoryFuture<'_, PodDeleteMarkOutcome> {
+        Box::pin(async move {
+            let outcome = self
+                .delete_coordinator
+                .mark_and_queue_api_delete(
+                    &request.namespace,
+                    &request.name,
+                    request.requested_grace_period_seconds,
+                    &request.preconditions,
+                    request.initial_resource,
+                )
+                .await?;
+            Ok(PodDeleteMarkOutcome {
+                updated: outcome.updated,
+                previous: outcome.previous,
+                uid: outcome.uid,
+            })
+        })
+    }
+
+    fn enqueue_actor_finalize_if_ready(
+        &self,
+        request: PodActorFinalizeRequest,
+    ) -> PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.delete_coordinator
+                .enqueue_actor_finalize_if_ready(
+                    &request.namespace,
+                    &request.name,
+                    &request.resource,
+                )
+                .await;
+            Ok(())
+        })
+    }
+
+    fn enqueue_marked_retry(&self, request: PodMarkedRetryRequest) -> PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.delete_coordinator
+                .enqueue_marked_pod_retry(
+                    request.namespace,
+                    request.name,
+                    request.uid,
+                    request.run_after,
+                    &request.pod_data,
+                )
+                .await
+                .map_err(|error| PodRepositoryError::internal(error.to_string()))
+        })
+    }
+}
+
+impl PodSpecValidation for RootPodNativeAdapter {
+    fn validate_volume_paths(&self, pod: &serde_json::Value) -> Result<(), PodRepositoryError> {
+        crate::kubelet::volumes::validate_volume_subpaths(pod)
+            .and_then(|()| crate::kubelet::volumes::validate_volume_projection_paths(pod))
+            .map_err(PodRepositoryError::unprocessable)
+    }
+}
+
+impl PodControlPlaneEventSink for RootPodNativeAdapter {
+    fn emit_pod_event(&self, request: PodControlPlaneEventRequest) -> PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            crate::pod_events::emit_control_plane_pod_event(
+                self.db.as_ref(),
+                self.db.as_ref(),
+                crate::pod_events::PodEventRecord {
+                    pod: request.pod.as_ref(),
+                    reason: &request.reason,
+                    message: &request.message,
+                    event_type: &request.event_type,
+                    reporting_component: &request.reporting_component,
+                    reporting_instance: &request.reporting_instance,
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| PodRepositoryError::internal(error.to_string()))
+        })
+    }
+}
+
+#[async_trait]
+impl AdmissionResourceStore for RootPodNativeAdapter {
+    async fn get_admission_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>, klights_leader_api::ResourceQueryError> {
+        self.db
+            .get_resource(api_version, kind, namespace, name)
+            .await
+            .map_err(|error| {
+                klights_leader_api::ResourceQueryError::retryable(format!(
+                    "Pod admission resource read failed: {error}"
+                ))
+            })
+    }
+
+    async fn list_admission_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>, klights_leader_api::ResourceQueryError> {
+        self.db
+            .list_resources(api_version, kind, namespace, ResourceListQuery::all())
+            .await
+            .map(|list| list.items)
+            .map_err(|error| {
+                klights_leader_api::ResourceQueryError::retryable(format!(
+                    "Pod admission resource list failed: {error}"
+                ))
+            })
+    }
+}
+
+impl klights_pod_api::PodPlacement for RootPodNativeAdapter {
+    fn place_pod(
+        &self,
+        request: klights_pod_api::PodPlacementRequest,
+    ) -> Result<klights_pod_api::PodPlacementDecision, PodRepositoryError> {
+        let nodes: Vec<&serde_json::Value> = request.nodes.iter().map(AsRef::as_ref).collect();
+        let namespaces: Vec<&serde_json::Value> =
+            request.namespaces.iter().map(AsRef::as_ref).collect();
+        let disruption_budgets: Vec<&serde_json::Value> = request
+            .disruption_budgets
+            .iter()
+            .map(AsRef::as_ref)
+            .collect();
+        let existing: Vec<(&str, Vec<&serde_json::Value>)> = request
+            .existing_pods_by_node
+            .iter()
+            .map(|(node, pods)| {
+                (
+                    node.as_str(),
+                    pods.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let existing_refs: Vec<(&str, &[&serde_json::Value])> = existing
+            .iter()
+            .map(|(node, pods)| (*node, pods.as_slice()))
+            .collect();
+        let decision = crate::scheduler::engine::schedule_from_json_with_policy(
+            &nodes,
+            request.incoming_pod.as_ref(),
+            &existing_refs,
+            &namespaces,
+            &disruption_budgets,
+        );
+        Ok(klights_pod_api::PodPlacementDecision {
+            selected_node: decision.selected_node,
+            unschedulable_message: decision.unschedulable_message,
+            preemption_victims: decision.preemption_victims,
+        })
+    }
+}

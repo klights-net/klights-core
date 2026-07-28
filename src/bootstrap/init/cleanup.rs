@@ -261,7 +261,19 @@ async fn start_cleanup_cni_rpc_server(
     task_supervisor: &klights_supervisor::TaskSupervisor,
     file_process: &klights_supervisor::FileProcessExecutor,
 ) -> anyhow::Result<CleanupCniRpcServer> {
-    let server = cni_plugin::bind_cleanup_rpc_server(namespace, task_supervisor.clone()).await?;
+    let socket_path = cni_plugin::CniSocketPath::try_new(
+        paths::cni_rpc_socket_path(namespace)
+            .to_string_lossy()
+            .into_owned(),
+    )?;
+    let socket_filesystem =
+        crate::cni_socket_adapter::RootCniSocketFilesystem::shared(file_process.clone());
+    let server = cni_plugin::bind_cleanup_rpc_server(
+        socket_path,
+        socket_filesystem,
+        task_supervisor.clone(),
+    )
+    .await?;
     let socket_path = server.socket_path().to_string();
     let cancel = tokio_util::sync::CancellationToken::new();
     let task_cancel = cancel.clone();

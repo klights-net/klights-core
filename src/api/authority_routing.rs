@@ -500,7 +500,6 @@ fn service_unavailable(msg: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    type RaftLeaderProxy = HttpAuthorityRouter;
 
     #[test]
     fn stamp_forwarded_client_cert_encodes_der_into_header() {
@@ -528,7 +527,7 @@ mod tests {
         let (_, is_leader_rx) = tokio::sync::watch::channel(true);
         let (_, leader_addr_rx) =
             tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
-        let proxy = RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None);
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None);
         assert!(proxy.is_leader());
         assert_eq!(proxy.leader_addr(), None);
     }
@@ -538,7 +537,7 @@ mod tests {
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) =
             tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
-        let proxy = RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None);
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None);
         assert!(!proxy.is_leader());
         assert_eq!(
             proxy.leader_addr(),
@@ -550,7 +549,7 @@ mod tests {
     fn raft_leader_proxy_no_leader() {
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-        let proxy = RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None);
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None);
         assert!(!proxy.is_leader());
         assert_eq!(proxy.leader_addr(), None);
     }
@@ -711,7 +710,7 @@ mod tests {
 
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("https://{addr}")));
-        let proxy = RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, Some(ca_pem))
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_pem))
             .with_proxy_client_identity(Some(identity));
         let response = proxy
             .http_client()
@@ -765,7 +764,7 @@ mod tests {
 
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("https://{addr}")));
-        let proxy = RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, Some(ca_pem));
+        let proxy = HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, Some(ca_pem));
         let response = proxy
             .http_client()
             .get(format!("https://{addr}/api"))

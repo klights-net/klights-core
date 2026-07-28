@@ -740,15 +740,15 @@ impl crate::controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort
 
 pub(crate) struct RootControllerPodPort {
     repository: Arc<PodRepository>,
-    api: Arc<crate::pod_api_service::PodApiService>,
-    subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+    api: Arc<dyn klights_pod_api::PodApiMutation>,
+    subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
 }
 
 impl RootControllerPodPort {
     pub(crate) fn new(
         repository: Arc<PodRepository>,
-        api: Arc<crate::pod_api_service::PodApiService>,
-        subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+        api: Arc<dyn klights_pod_api::PodApiMutation>,
+        subresource: Arc<dyn klights_pod_api::PodSubresourceMutation>,
     ) -> Self {
         Self {
             repository,
@@ -879,14 +879,15 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
     ) -> anyhow::Result<Resource> {
         validate_controller_effect()?;
         self.subresource
-            .replace_status_from_api_checked(
-                namespace,
-                name,
-                None,
+            .replace_status(klights_pod_api::PodStatusReplaceRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                expected_uid: None,
                 status,
                 expected_resource_version,
-            )
+            })
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn replace_status_from_api_for_uid(
@@ -899,14 +900,15 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
     ) -> anyhow::Result<Resource> {
         validate_controller_effect()?;
         self.subresource
-            .replace_status_from_api_checked(
-                namespace,
-                name,
-                Some(pod_uid),
+            .replace_status(klights_pod_api::PodStatusReplaceRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                expected_uid: Some(pod_uid.to_string()),
                 status,
                 expected_resource_version,
-            )
+            })
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn patch_status_from_api(
@@ -918,15 +920,30 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
         expected_resource_version: i64,
     ) -> anyhow::Result<Resource> {
         validate_controller_effect()?;
+        let patch_type = match patch_type {
+            crate::kubelet::pod_repository::PodStatusPatchType::JsonPatch => {
+                klights_pod_api::PodStatusPatchKind::JsonPatch
+            }
+            crate::kubelet::pod_repository::PodStatusPatchType::MergePatch => {
+                klights_pod_api::PodStatusPatchKind::MergePatch
+            }
+            crate::kubelet::pod_repository::PodStatusPatchType::StrategicMerge => {
+                klights_pod_api::PodStatusPatchKind::StrategicMerge
+            }
+            crate::kubelet::pod_repository::PodStatusPatchType::ApplyPatch => {
+                klights_pod_api::PodStatusPatchKind::ApplyPatch
+            }
+        };
         self.subresource
-            .patch_status_from_api(
-                namespace,
-                name,
+            .patch_status(klights_pod_api::PodStatusPatchRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
                 patch,
-                patch_type,
+                patch_kind: patch_type,
                 expected_resource_version,
-            )
+            })
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn update_ephemeral_containers(
@@ -938,8 +955,14 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
     ) -> anyhow::Result<Resource> {
         validate_controller_effect()?;
         self.subresource
-            .update_ephemeral_containers(namespace, name, containers, expected_resource_version)
+            .update_ephemeral_containers(klights_pod_api::PodEphemeralContainersRequest {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                containers,
+                expected_resource_version,
+            })
             .await
+            .map_err(anyhow::Error::new)
     }
 }
 
@@ -967,14 +990,15 @@ impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControlle
     ) -> Result<Resource> {
         validate_controller_effect()?;
         self.subresource
-            .replace_status_from_api_checked(
-                pod.namespace.as_deref().unwrap_or("default"),
-                &pod.name,
-                Some(&pod.uid),
+            .replace_status(klights_pod_api::PodStatusReplaceRequest {
+                namespace: pod.namespace.as_deref().unwrap_or("default").to_string(),
+                name: pod.name.clone(),
+                expected_uid: Some(pod.uid.clone()),
                 status,
-                pod.resource_version,
-            )
+                expected_resource_version: pod.resource_version,
+            })
             .await
+            .map_err(anyhow::Error::new)
             .map_err(crate::controller_store_error_adapter::map_controller_store_error)
     }
 }

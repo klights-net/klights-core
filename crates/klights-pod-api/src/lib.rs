@@ -281,6 +281,188 @@ pub trait PodQuery: Send + Sync {
     ) -> PodRepositoryFuture<'_, Vec<Resource>>;
 }
 
+/// Focused persistence capability consumed by Kubernetes-native Pod
+/// orchestration. It deliberately exposes only Pod create/replace operations;
+/// datastore selection, watches, generic resources, and row deletion are not
+/// reachable through this port.
+pub trait PodPersistence: Send + Sync {
+    fn create_pod(&self, request: PodPersistenceCreateRequest)
+    -> PodRepositoryFuture<'_, Resource>;
+
+    fn replace_pod(
+        &self,
+        request: PodPersistenceReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+
+    fn replace_pod_including_status(
+        &self,
+        request: PodPersistenceReplaceRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodPersistenceCreateRequest {
+    pub namespace: String,
+    pub name: String,
+    pub body: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodPersistenceReplaceRequest {
+    pub namespace: String,
+    pub name: String,
+    pub body: serde_json::Value,
+    pub expected_resource_version: i64,
+}
+
+/// Status-only persistence capability. Implementations must discard every
+/// non-status field supplied by the caller.
+pub trait PodStatusPersistence: Send + Sync {
+    fn write_pod_status(&self, request: PodStatusWriteRequest)
+    -> PodRepositoryFuture<'_, Resource>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodStatusWriteRequest {
+    pub namespace: String,
+    pub name: String,
+    pub status: serde_json::Value,
+    pub expected_resource_version: Option<i64>,
+}
+
+/// API/controller intent for marking a Pod terminating and waking its
+/// UID-qualified lifecycle actor. This port can never hard-delete a Pod row.
+pub trait PodDeleteOrchestration: Send + Sync {
+    fn preview_delete(
+        &self,
+        resource: &Resource,
+        requested_grace_period_seconds: Option<i64>,
+    ) -> serde_json::Value;
+
+    fn mark_and_queue_delete(
+        &self,
+        request: PodDeleteMarkRequest,
+    ) -> PodRepositoryFuture<'_, PodDeleteMarkOutcome>;
+
+    fn enqueue_actor_finalize_if_ready(
+        &self,
+        request: PodActorFinalizeRequest,
+    ) -> PodRepositoryFuture<'_, ()>;
+
+    fn enqueue_marked_retry(&self, request: PodMarkedRetryRequest) -> PodRepositoryFuture<'_, ()>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodDeleteMarkRequest {
+    pub namespace: String,
+    pub name: String,
+    pub requested_grace_period_seconds: Option<i64>,
+    pub preconditions: klights_cluster_core::ResourcePreconditions,
+    pub initial_resource: Resource,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodDeleteMarkOutcome {
+    pub updated: Resource,
+    pub previous: Resource,
+    pub uid: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodActorFinalizeRequest {
+    pub namespace: String,
+    pub name: String,
+    pub resource: Resource,
+}
+
+#[derive(Clone, Debug)]
+pub struct PodMarkedRetryRequest {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub run_after: std::time::Duration,
+    pub pod_data: serde_json::Value,
+}
+
+/// Pure Pod-spec validation whose concrete implementation currently lives
+/// with kubelet volume semantics.
+pub trait PodSpecValidation: Send + Sync {
+    fn validate_volume_paths(&self, pod: &serde_json::Value) -> Result<(), PodRepositoryError>;
+}
+
+/// Focused effect for a control-plane-authored Kubernetes Event about a Pod.
+/// Node-authored outbox routing is intentionally outside this capability.
+pub trait PodControlPlaneEventSink: Send + Sync {
+    fn emit_pod_event(&self, request: PodControlPlaneEventRequest) -> PodRepositoryFuture<'_, ()>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodControlPlaneEventRequest {
+    pub pod: std::sync::Arc<serde_json::Value>,
+    pub reason: String,
+    pub message: String,
+    pub event_type: String,
+    pub reporting_component: String,
+    pub reporting_instance: String,
+}
+
+pub fn preserve_pod_status_from_current(current: &serde_json::Value, next: &mut serde_json::Value) {
+    let Some(next_object) = next.as_object_mut() else {
+        return;
+    };
+    match current.get("status") {
+        Some(status) => {
+            next_object.insert("status".to_string(), status.clone());
+        }
+        None => {
+            next_object.remove("status");
+        }
+    }
+}
+
+pub type PodSchedulingFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, PodRepositoryError>> + Send + 'a>>;
+
+/// Focused controller-owned Pod scheduling capability. Kubernetes-native API
+/// code may request a bind pass through this contract without owning scheduler
+/// placement, preemption, datastore, or kubelet implementation details.
+pub trait PodScheduling: Send + Sync {
+    fn schedule_all_unbound_pods(&self) -> PodSchedulingFuture<'_, ()>;
+
+    fn schedule_pending_pod(
+        &self,
+        namespace: String,
+        name: String,
+    ) -> PodSchedulingFuture<'_, Option<Resource>>;
+}
+
+/// Pure scheduler placement engine consumed by the controller-owned Pod
+/// scheduling service. Resource discovery and persistence remain outside this
+/// port, so the concrete scheduler implementation cannot acquire datastore or
+/// lifecycle authority.
+pub trait PodPlacement: Send + Sync {
+    fn place_pod(
+        &self,
+        request: PodPlacementRequest,
+    ) -> Result<PodPlacementDecision, PodRepositoryError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct PodPlacementRequest {
+    pub nodes: Vec<std::sync::Arc<serde_json::Value>>,
+    pub incoming_pod: std::sync::Arc<serde_json::Value>,
+    pub existing_pods_by_node: Vec<(String, Vec<std::sync::Arc<serde_json::Value>>)>,
+    pub namespaces: Vec<std::sync::Arc<serde_json::Value>>,
+    pub disruption_budgets: Vec<std::sync::Arc<serde_json::Value>>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PodPlacementDecision {
+    pub selected_node: Option<String>,
+    pub unschedulable_message: Option<String>,
+    pub preemption_victims: Vec<String>,
+}
+
 pub trait PodUpdate: Send + Sync {
     fn update_pod(&self, request: PodUpdateRequest) -> PodRepositoryFuture<'_, Resource>;
 }
@@ -476,6 +658,7 @@ impl PodStatusPatchKind {
 pub struct PodStatusReplaceRequest {
     pub namespace: String,
     pub name: String,
+    pub expected_uid: Option<String>,
     pub status: serde_json::Value,
     pub expected_resource_version: i64,
 }

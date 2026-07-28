@@ -13,6 +13,7 @@ pub mod auth;
 mod authority_adapter;
 pub mod cli;
 pub mod cni_plugin;
+mod cni_socket_adapter;
 pub mod control_plane;
 mod controller_pod_adapters;
 mod controller_runtime_adapter;
@@ -63,9 +64,12 @@ pub mod pidfile;
 pub(crate) mod pod_api_service;
 mod pod_event_adapter;
 pub(crate) mod pod_events;
+mod pod_native_adapter;
+mod pod_native_orchestration;
 pub(crate) mod pod_readiness;
 pub(crate) mod pod_reconcile_adapter;
 pub(crate) mod pod_repository_composition;
+mod pod_scheduler_service;
 pub(crate) mod pod_subresource_service;
 pub mod portforward;
 pub(crate) mod reconnect_backoff;
@@ -149,7 +153,13 @@ fn cli_flags_for_runtime(cli: cli::Cli) -> Result<Option<bootstrap::CliFlags>, S
 pub fn main_entry() {
     // CNI plugin mode — invoked by containerd, not the user.
     if std::env::var_os("CNI_COMMAND").is_some() {
-        std::process::exit(cni_plugin::run_from_env());
+        let socket_path = cni_plugin::CniSocketPath::try_new(
+            paths::cni_rpc_socket_path("klights")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .expect("configured CNI RPC socket path must be absolute");
+        std::process::exit(cni_plugin::run_from_env(socket_path));
     }
 
     if std::env::args_os().nth(1).as_deref()

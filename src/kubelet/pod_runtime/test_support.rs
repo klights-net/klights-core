@@ -2262,6 +2262,7 @@ impl PodRuntimeHarness {
                     crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
                 outbox: None,
                 cluster_api: None,
+                scheduler_bind_gate: None,
             },
         );
         let repo = std::sync::Arc::new(parts.repository);

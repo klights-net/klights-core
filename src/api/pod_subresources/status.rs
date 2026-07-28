@@ -101,6 +101,7 @@ pub(in crate::api) async fn update_pod_status_subresource(
         klights_pod_api::PodStatusReplaceRequest {
             namespace: namespace.clone(),
             name: name.clone(),
+            expected_uid: None,
             status: new_status,
             expected_resource_version: requested_rv.unwrap_or(pod.resource_version),
         },

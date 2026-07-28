@@ -98,6 +98,7 @@ async fn fixture_repository_with_node_local(
         scheduling_mode: super::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        scheduler_bind_gate: None,
     })
     .repository;
     (repository, node_local)
@@ -396,6 +397,7 @@ async fn pod_repository_build_parts_exposes_repository_and_background_without_st
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        scheduler_bind_gate: None,
     });
 
     // Repository is constructed.
@@ -426,6 +428,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        scheduler_bind_gate: None,
     });
 
     // build_parts must not call workqueue.start().
@@ -466,6 +469,7 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
         scheduling_mode: crate::pod_repository_composition::PodSchedulingMode::InlineSingleNode,
         outbox: None,
         cluster_api: None,
+        scheduler_bind_gate: None,
     });
 
     // build_parts must not have started the workqueue.
@@ -2692,6 +2696,30 @@ async fn build_repo_with_scheduling_mode(
         metrics,
         scheduling_mode,
     )
+}
+
+async fn build_repo_with_scheduling_mode_and_gate(
+    scheduling_mode: crate::pod_repository_composition::PodSchedulingMode,
+    gate: Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>,
+) -> super::PodRepository {
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let supervisor = fixture_supervisor();
+    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let side_effects = fixture_side_effects();
+    super::PodRepository::build_parts(PodRepositoryBuildConfig {
+        db,
+        node_local: None,
+        supervisor,
+        side_effects,
+        metrics,
+        pod_network_cache: super::empty_test_pod_network_cache(),
+        assignment_waiter: super::test_assignment_bus(),
+        scheduling_mode,
+        outbox: None,
+        cluster_api: None,
+        scheduler_bind_gate: Some(gate),
+    })
+    .repository
 }
 
 async fn build_repo_with_dispatcher() -> (
@@ -7557,14 +7585,14 @@ async fn leader_scheduler_concurrent_wave_reserves_node_capacity_once() {
 async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
     use super::PodReader;
 
+    let gate = Arc::new(crate::pod_native_orchestration::SchedulerBindGateForTest::new());
     let repo = Arc::new(
-        build_repo_with_scheduling_mode(
+        build_repo_with_scheduling_mode_and_gate(
             crate::pod_repository_composition::PodSchedulingMode::DeferredMultiNodeLeader,
+            gate.clone(),
         )
         .await,
     );
-    let gate = Arc::new(crate::pod_api_service::SchedulerBindGateForTest::new());
-    repo.set_scheduler_bind_gate_for_test(gate.clone());
 
     repo.store
         .db()
@@ -7587,7 +7615,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
         .await
         .unwrap();
 
-    for idx in 0..crate::pod_api_service::SCHED_BIND_CONCURRENCY {
+    for idx in 0..crate::pod_native_orchestration::SCHED_BIND_CONCURRENCY {
         let name = format!("parallel-{idx}");
         repo.store
             .create("default", &name, pending_pod(&name))
@@ -7601,7 +7629,7 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        gate.wait_for_entered_at_least(crate::pod_api_service::SCHED_BIND_CONCURRENCY),
+        gate.wait_for_entered_at_least(crate::pod_native_orchestration::SCHED_BIND_CONCURRENCY),
     )
     .await
     .expect("the whole first scheduling wave should reach the bind gate concurrently");
@@ -7619,7 +7647,10 @@ async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
             pod.data.pointer("/spec/nodeName").and_then(|v| v.as_str()) == Some("test-node")
         })
         .count();
-    assert_eq!(bound, crate::pod_api_service::SCHED_BIND_CONCURRENCY);
+    assert_eq!(
+        bound,
+        crate::pod_native_orchestration::SCHED_BIND_CONCURRENCY
+    );
 }
 
 #[tokio::test]
@@ -12656,7 +12687,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         },
         crate::api::AppError::Conflict("retry budget exhausted".to_string()),
     ] {
-        let same_uid = crate::pod_api_service::classify_gc_pod_delete_error(
+        let same_uid = crate::pod_native_orchestration::classify_gc_pod_delete_error(
             repo.store.as_ref(),
             &PodIdentity::new("default", "current", "uid-current"),
             conflict,
@@ -12668,7 +12699,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         );
     }
 
-    let replacement = crate::pod_api_service::classify_gc_pod_delete_error(
+    let replacement = crate::pod_native_orchestration::classify_gc_pod_delete_error(
         repo.store.as_ref(),
         &PodIdentity::new("default", "current", "uid-old"),
         crate::api::AppError::Conflict("UID precondition conflict".to_string()),
@@ -12679,7 +12710,7 @@ async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() 
         GcPodDeleteError::IdentityChanged { .. }
     ));
 
-    let absent = crate::pod_api_service::classify_gc_pod_delete_error(
+    let absent = crate::pod_native_orchestration::classify_gc_pod_delete_error(
         repo.store.as_ref(),
         &PodIdentity::new("default", "absent", "uid-old"),
         crate::api::AppError::Conflict("delete conflict".to_string()),

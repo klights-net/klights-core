@@ -31,7 +31,7 @@ pub struct LeaderStart<'a> {
     pub dispatcher_for_worker: &'a Arc<crate::controllers::ControllerDispatcher>,
     pub dispatcher_for_cronjobs: &'a Arc<crate::controllers::ControllerDispatcher>,
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
-    pub pod_api_service: &'a Arc<crate::pod_api_service::PodApiService>,
+    pub pod_scheduling: &'a Arc<dyn klights_pod_api::PodScheduling>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
     pub shutdown_token: CancellationToken,
@@ -47,7 +47,7 @@ struct LeaderScopedTaskContext {
     dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
     dispatcher_for_cronjobs: Arc<crate::controllers::ControllerDispatcher>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
-    pod_api_service: Arc<crate::pod_api_service::PodApiService>,
+    pod_scheduling: Arc<dyn klights_pod_api::PodScheduling>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     datapath: Arc<dyn klights_network_api::Datapath>,
 }
@@ -63,7 +63,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
         pod_repository,
-        pod_api_service,
+        pod_scheduling,
         cri_for_shutdown,
         datapath,
         shutdown_token,
@@ -83,7 +83,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         dispatcher_for_worker: dispatcher_for_worker.clone(),
         dispatcher_for_cronjobs: dispatcher_for_cronjobs.clone(),
         pod_repository: pod_repository.clone(),
-        pod_api_service: pod_api_service.clone(),
+        pod_scheduling: pod_scheduling.clone(),
         cri_for_shutdown: cri_for_shutdown.clone(),
         datapath: datapath.clone(),
     };
@@ -207,7 +207,7 @@ async fn start_leader_scoped_tasks(
         dispatcher_for_worker,
         dispatcher_for_cronjobs,
         pod_repository,
-        pod_api_service,
+        pod_scheduling,
         cri_for_shutdown,
         datapath,
     } = context;
@@ -282,7 +282,7 @@ async fn start_leader_scoped_tasks(
         crate::bootstrap::scheduler_adapter::LeaderSchedulerRuntime::new(
             db_handle.clone(),
             watch_signals,
-            pod_api_service,
+            pod_scheduling,
         ),
     );
     let scheduler_cancel = lease_cancel.child_token();

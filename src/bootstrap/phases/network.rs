@@ -207,7 +207,14 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let cni_rpc_token = CancellationToken::new();
     let cni_rpc_handle = {
         let state = Arc::new(crate::cni_plugin::CniRpcState {
-            containerd_namespace: config.containerd_namespace.clone(),
+            socket_path: crate::cni_plugin::CniSocketPath::try_new(
+                crate::paths::cni_rpc_socket_path(&config.containerd_namespace)
+                    .to_string_lossy()
+                    .into_owned(),
+            )?,
+            socket_filesystem: crate::cni_socket_adapter::RootCniSocketFilesystem::shared(
+                klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+            ),
             network: network.clone(),
             task_supervisor: supervisor.clone(),
         });

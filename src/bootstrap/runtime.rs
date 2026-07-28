@@ -397,7 +397,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     })
     .await?;
     let pod_repository = bp.pod_repository;
-    let pod_api_service = bp.pod_api_service;
+    let _pod_api_service = bp.pod_api_service;
+    let pod_scheduling = bp.pod_scheduling;
     let crd_registry_watch_handle = bp.crd_registry_watch_handle;
     let leader_peer_endpoint_observer_handle = bp.leader_peer_endpoint_observer_handle;
     let pod_watcher_handle = bp.pod_watcher_handle;
@@ -420,7 +421,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         dispatcher_for_worker: &dispatcher_for_worker,
         dispatcher_for_cronjobs: &dispatcher_for_cronjobs,
         pod_repository: &pod_repository,
-        pod_api_service: &pod_api_service,
+        pod_scheduling: &pod_scheduling,
         cri_for_shutdown: &cri_for_shutdown,
         datapath: network.datapath(),
         shutdown_token: shutdown_token.clone(),

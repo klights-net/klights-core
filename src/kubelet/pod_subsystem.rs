@@ -393,6 +393,7 @@ mod tests {
                 scheduling_mode,
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),
+                scheduler_bind_gate: None,
             });
         PodSubsystemConfig {
             repository_parts,

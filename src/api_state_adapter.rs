@@ -409,15 +409,21 @@ impl klights_pod_api::PodEvictionDelete for RootApiPodRepository {
         Box::pin(async move {
             validate_pod_effect_authority()?;
             let (namespace, name, options, dry_run) = request.into_parts();
-            let outcome = self
-                .api
-                .repository_delete_pod(&namespace, &name, options, dry_run)
-                .await?;
+            let outcome = klights_pod_api::PodApiMutation::delete_pod(
+                self.api.as_ref(),
+                klights_pod_api::PodApiDeleteRequest {
+                    namespace,
+                    name,
+                    options,
+                    dry_run,
+                },
+            )
+            .await?;
             match outcome {
-                crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(_) => {
+                klights_pod_api::PodApiDeleteOutcome::DryRun(_) => {
                     Ok(klights_pod_api::PodEvictionDeleteOutcome::DryRun)
                 }
-                crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(resource) => {
+                klights_pod_api::PodApiDeleteOutcome::GracefulSet(resource) => {
                     let _ = self
                         .inner
                         .mutation_reconcile_port()

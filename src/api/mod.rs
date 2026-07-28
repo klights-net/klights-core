@@ -51,11 +51,6 @@ pub mod pod_subresources;
 pub mod priority_fairness;
 pub(crate) mod query;
 mod quotas;
-#[cfg(test)]
-pub mod raft_proxy {
-    pub(crate) use super::authority_routing::*;
-    pub(crate) type RaftLeaderProxy = HttpAuthorityRouter;
-}
 mod rbac_admission;
 pub(crate) mod request_info;
 mod resource_command_ports;

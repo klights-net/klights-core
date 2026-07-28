@@ -50,6 +50,7 @@ impl klights_cluster_store::PodUidPreconditionRead for dyn crate::datastore::Dat
     }
 }
 use crate::pod_api_service::{PodApiService, PodApiServiceDependencies};
+use crate::pod_native_orchestration::{PodNativeOrchestration, PodNativeOrchestrationDependencies};
 use crate::side_effects::SideEffectMetrics;
 use crate::side_effects::SideEffectRegistry;
 use klights_leader_api::LeaderResourceQuery;
@@ -74,6 +75,9 @@ pub struct PodRepositoryBuildConfig {
     pub scheduling_mode: PodSchedulingMode,
     pub outbox: Option<Arc<crate::node_outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    #[cfg(test)]
+    pub(crate) scheduler_bind_gate:
+        Option<Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>>,
     #[cfg(not(test))]
     pub gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
 }
@@ -95,12 +99,15 @@ struct RootPodRepositoryComposition {
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
     gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+    #[cfg(test)]
+    scheduler_bind_gate: Option<Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>>,
 }
 
 pub(crate) struct RootPodRepositoryParts {
     pub repository_parts: crate::kubelet::pod_repository::facade::PodRepositoryParts,
     pub api: Arc<PodApiService>,
     pub subresource: Arc<crate::pod_subresource_service::PodSubresourceService>,
+    pub scheduling: Arc<dyn klights_pod_api::PodScheduling>,
 }
 
 #[derive(Clone)]
@@ -119,133 +126,6 @@ struct WorkerPodPersistence {
 }
 
 struct WorkerPodAdapters;
-
-#[cfg(test)]
-fn worker_pod_api_unavailable() -> klights_pod_api::PodRepositoryError {
-    klights_pod_api::PodRepositoryError::unavailable(
-        "worker kubelet does not own the Kubernetes Pod API",
-    )
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodApiPort for WorkerPodAdapters {
-    async fn create(
-        &self,
-        _request: crate::kubelet::pod_repository::types::PodApiCreateRequest,
-    ) -> Result<
-        crate::kubelet::pod_repository::types::PodApiCreateResult,
-        klights_pod_api::PodRepositoryError,
-    > {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn update(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _body: serde_json::Value,
-        _current: klights_cluster_core::Resource,
-        _dry_run: bool,
-    ) -> Result<
-        crate::kubelet::pod_repository::types::PodApiUpdateOutcome,
-        klights_pod_api::PodRepositoryError,
-    > {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn patch(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _patch: serde_json::Value,
-        _patch_type: crate::kubelet::pod_repository::types::PodStatusPatchType,
-        _dry_run: bool,
-    ) -> Result<
-        crate::kubelet::pod_repository::types::PodApiUpdateOutcome,
-        klights_pod_api::PodRepositoryError,
-    > {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn delete(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _options: klights_pod_api::PodDeleteOptions,
-        _dry_run: bool,
-    ) -> Result<
-        crate::kubelet::pod_repository::types::PodApiDeleteOutcome,
-        klights_pod_api::PodRepositoryError,
-    > {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn delete_collection(
-        &self,
-        _namespace: &str,
-        _label_selector: Option<&str>,
-        _field_selector: Option<&str>,
-        _dry_run: bool,
-    ) -> Result<(), klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn mark_terminating(
-        &self,
-        _target: &klights_pod_api::PodMutationTarget,
-    ) -> Result<klights_cluster_core::Resource, klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn schedule_pending(
-        &self,
-        _namespace: &str,
-        _name: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>, klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn bind(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _binding: serde_json::Value,
-        _dry_run: bool,
-    ) -> Result<(), klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn schedule_all(self: Arc<Self>) -> Result<(), klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-}
-
-#[cfg(test)]
-#[async_trait::async_trait]
-impl crate::kubelet::pod_repository::PodSubresourcePort for WorkerPodAdapters {
-    async fn replace_status(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _pod_uid: Option<&str>,
-        _status: serde_json::Value,
-        _expected_rv: i64,
-    ) -> Result<klights_cluster_core::Resource, klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-
-    async fn patch_status(
-        &self,
-        _namespace: &str,
-        _name: &str,
-        _patch: serde_json::Value,
-        _patch_type: crate::kubelet::pod_repository::types::PodStatusPatchType,
-        _expected_rv: i64,
-    ) -> Result<klights_cluster_core::Resource, klights_pod_api::PodRepositoryError> {
-        Err(worker_pod_api_unavailable())
-    }
-}
 
 fn worker_reconcile_ok() -> klights_reconcile_api::ReconcileSinkFuture<'static> {
     Box::pin(async { Ok(()) })
@@ -349,6 +229,10 @@ impl WorkerPodAdapters {
             test_api: None,
             #[cfg(test)]
             test_subresource: None,
+            #[cfg(test)]
+            test_scheduling: None,
+            #[cfg(test)]
+            test_mark_terminating: None,
         }
     }
 }
@@ -960,6 +844,7 @@ impl RootPodRepositoryComposition {
         PodRepositoryAdapters,
         Arc<PodApiService>,
         Arc<crate::pod_subresource_service::PodSubresourceService>,
+        Arc<dyn klights_pod_api::PodScheduling>,
     ) {
         let pod_reconcile = Arc::new(
             crate::pod_reconcile_adapter::PodReconcileAdapter::new_with_coordination(
@@ -971,34 +856,65 @@ impl RootPodRepositoryComposition {
                 self.gc_coordination.clone(),
             ),
         );
-        let subresource = Arc::new(crate::pod_subresource_service::PodSubresourceService::new(
+        let native = crate::pod_native_adapter::RootPodNativeAdapter::new(
             dependencies.store.clone(),
             dependencies.status_only.clone(),
+            dependencies.delete_coordinator.clone(),
+            self.db.clone(),
+        );
+        let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
+        let persistence: Arc<dyn klights_pod_api::PodPersistence> = native.clone();
+        let status_persistence: Arc<dyn klights_pod_api::PodStatusPersistence> = native.clone();
+        let subresource = Arc::new(crate::pod_subresource_service::PodSubresourceService::new(
+            pod_query.clone(),
+            persistence.clone(),
+            status_persistence.clone(),
             pod_reconcile.clone(),
         ));
-        let api = Arc::new(PodApiService::new(PodApiServiceDependencies {
-            store: dependencies.store,
-            status_only: dependencies.status_only,
-            db: self.db.clone(),
-            admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
-                self.db.clone(),
-            ),
-            resource_query: self.resource_query.clone(),
-            quota_runtime:
-                crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
+        let native_orchestration = Arc::new(PodNativeOrchestration::new(
+            PodNativeOrchestrationDependencies {
+                pod_query,
+                persistence,
+                status_persistence,
+                deletion: native.clone(),
+                event_sink: native.clone(),
+                placement: native.clone(),
+                admission_resources: native.clone(),
+                spec_validation: native,
+                admission: crate::resource_admission_adapter::ResourceAdmissionAdapter::new(
                     self.db.clone(),
                 ),
-            supervisor: dependencies.supervisor,
-            delete_coordinator: dependencies.delete_coordinator,
-            gc_reconcile: pod_reconcile.clone(),
-            service_reconcile: pod_reconcile.clone(),
-            mutation_effects:
-                crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
-                    self.side_effects.clone(),
-                    self.metrics.clone(),
-                ),
-            metrics: self.metrics.clone(),
+                resource_query: self.resource_query.clone(),
+                quota_runtime:
+                    crate::resource_quota_admission_adapter::ResourceQuotaAdmissionAdapter::new(
+                        self.db.clone(),
+                    ),
+                supervisor: dependencies.supervisor,
+                gc_reconcile: pod_reconcile.clone(),
+                service_reconcile: pod_reconcile.clone(),
+                mutation_effects:
+                    crate::resource_mutation_effects_adapter::ResourceMutationEffectsAdapter::new(
+                        self.side_effects.clone(),
+                        self.metrics.clone(),
+                    ),
+                metrics: self.metrics.clone(),
+            },
+        ));
+        #[cfg(test)]
+        if let Some(gate) = self.scheduler_bind_gate.clone() {
+            native_orchestration.set_scheduler_bind_gate_for_test(gate);
+        }
+        let mutation: Arc<dyn klights_pod_api::PodApiMutation> = native_orchestration.clone();
+        let gc_delete: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
+            native_orchestration.clone();
+        let api = Arc::new(PodApiService::new(PodApiServiceDependencies {
+            mutation,
+            gc_delete,
         }));
+        let scheduling: Arc<dyn klights_pod_api::PodScheduling> =
+            crate::pod_scheduler_service::PodSchedulerService::new(native_orchestration.clone());
+        #[cfg(test)]
+        let mark_terminating: Arc<dyn klights_pod_api::PodMarkTerminating> = native_orchestration;
         let adapters = PodRepositoryAdapters {
             gc_delete: api.clone(),
             gc_reconcile: pod_reconcile.clone(),
@@ -1011,8 +927,12 @@ impl RootPodRepositoryComposition {
             test_api: Some(api.clone()),
             #[cfg(test)]
             test_subresource: Some(subresource.clone()),
+            #[cfg(test)]
+            test_scheduling: Some(scheduling.clone()),
+            #[cfg(test)]
+            test_mark_terminating: Some(mark_terminating),
         };
-        (adapters, api, subresource)
+        (adapters, api, subresource, scheduling)
     }
 }
 
@@ -1031,6 +951,8 @@ pub(crate) fn build_pod_repository_parts(
         scheduling_mode,
         outbox,
         cluster_api,
+        #[cfg(test)]
+        scheduler_bind_gate,
         #[cfg(not(test))]
         gc_coordination,
     } = config;
@@ -1082,12 +1004,14 @@ pub(crate) fn build_pod_repository_parts(
         supervisor.clone(),
         metrics.clone(),
     ));
-    let (adapters, api, subresource) = RootPodRepositoryComposition {
+    let (adapters, api, subresource, scheduling) = RootPodRepositoryComposition {
         db: db.clone(),
         resource_query,
         side_effects: side_effects.clone(),
         metrics: metrics.clone(),
         gc_coordination,
+        #[cfg(test)]
+        scheduler_bind_gate,
     }
     .build(PodRepositoryAdapterDependencies {
         store: store.clone(),
@@ -1126,6 +1050,7 @@ pub(crate) fn build_pod_repository_parts(
         repository_parts,
         api,
         subresource,
+        scheduling,
     }
 }
 
