@@ -3,6 +3,7 @@ pub mod bootstrap_token;
 pub mod cluster_meta;
 pub mod config;
 pub mod controlplane_discovery;
+pub(crate) mod controlplane_join_adapters;
 pub(crate) mod controlplane_join_handler;
 pub mod credential_store;
 pub(crate) mod finalizer_lifecycle_adapter;

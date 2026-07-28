@@ -2,6 +2,16 @@
 
 mod crd_registry;
 pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
+mod controlplane_join;
+pub use controlplane_join::{
+    ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture, ControlplaneJoinAdmissionOutcome,
+    ControlplaneJoinAuthority, ControlplaneJoinError, ControlplaneJoinFuture,
+    ControlplaneJoinHandler, ControlplaneJoinMetadata, ControlplaneJoinMetadataFuture,
+    ControlplaneJoinOutcome, ControlplaneJoinRegistration, ControlplaneJoinRegistrationFuture,
+    ControlplaneJoinRegistrationSnapshot, ControlplaneJoinRequest, ControlplaneJoinRoute,
+    ControlplaneMemberQuery, ControlplaneMemberQueryFuture, RaftStorageAttestation,
+    RaftStorageLogAttestation, RemoteNodeHostFacts, RemoteNodeMode, RemoteNodeRegistrationSnapshot,
+};
 
 use std::any::Any;
 use std::fmt;

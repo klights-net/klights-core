@@ -5,8 +5,6 @@ use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{DeadLetterTestInsert, NodeLocalHandle, OutboxInsert};
 use crate::datastore::node_local::{SqliteNodeLocalDb, selector};
 use crate::node_outbox::payload::OutboxPayload;
-use crate::sqlite_boundary::DbExecutor;
-use crate::sqlite_open as opener;
 use klights_cluster_core::command::StorageCommand;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -47,8 +45,8 @@ async fn node_db() -> NodeLocalHandle {
 }
 
 async fn node_db_concrete() -> SqliteNodeLocalDb {
-    let executor = DbExecutor::open_with_opts(
-        opener::OpenOpts::node_in_memory(),
+    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+        crate::datastore::node_local::sqlite::open::in_memory_opts(),
         supervisor(),
         "sqlite:dead-letter-concrete-test",
     )

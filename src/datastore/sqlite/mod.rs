@@ -14,6 +14,7 @@ pub(crate) mod fingerprint;
 mod focused_ports;
 mod gc;
 mod merge_patch;
+pub(crate) mod open;
 mod outbox_codec;
 pub(super) mod owner_ref_index;
 mod position_membership;
@@ -3435,7 +3436,7 @@ impl Datastore {
     ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
         let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
-        // Schema + fingerprint already applied inside DbExecutor::open_with_opts.
+        // Schema + fingerprint are applied by the cluster-owned open adapter.
         Ok(Self {
             executor,
             read_executor,
@@ -3501,7 +3502,7 @@ impl Datastore {
             );
         }
 
-        let executor = DbExecutor::open_with_opts(opts, supervisor.clone(), "sqlite:cluster")
+        let executor = open::open_with_opts(opts, supervisor.clone(), "sqlite:cluster")
             .await
             .map_err(|e| {
                 anyhow!(
@@ -3511,7 +3512,7 @@ impl Datastore {
                 )
             })?;
         let read_opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
-        let read_executor = DbExecutor::open_read_only_with_opts(
+        let read_executor = open::open_read_only_with_opts(
             read_opts.clone(),
             supervisor.clone(),
             "sqlite:cluster-read",
@@ -3587,8 +3588,7 @@ impl Datastore {
         let supervisor = std::sync::Arc::new(TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let executor =
-            DbExecutor::open_in_memory(supervisor.clone(), "sqlite:memory:cluster").await?;
+        let executor = open::open_in_memory(supervisor.clone(), "sqlite:memory:cluster").await?;
         let snapshot_factory = executor
             .snapshot_open_opts()
             .map(|opts| snapshot_capture::SqliteSnapshotFactory::new(opts, supervisor.clone()));

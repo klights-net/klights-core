@@ -2177,6 +2177,7 @@ dependencies = [
  "futures-core",
  "klights-cluster-core",
  "klights-types",
+ "serde",
  "serde_json",
  "tokio",
 ]

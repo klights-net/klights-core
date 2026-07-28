@@ -1742,12 +1742,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 let router: Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter> = Arc::new(
                     crate::datastore::raft::node::RaftNodeRpcRouter::from_node(rn.as_ref()),
                 );
-                let handler: Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler> =
-                    Arc::new(
-                        crate::bootstrap::controlplane_join_handler::RaftNodeJoinHandler::new(
-                            rn.clone(),
-                            db_handle.clone(),
-                        ),
+                let handler =
+                    crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler(
+                        rn.clone(),
+                        db_handle.clone(),
                     );
                 (Some(router), Some(handler))
             }

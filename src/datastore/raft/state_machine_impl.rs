@@ -406,8 +406,6 @@ mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::SqliteNodeLocalDb;
-    use crate::sqlite_boundary::DbExecutor;
-    use crate::sqlite_open as opener;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::{Entry, EntryPayload, LeaderId, Membership};
@@ -420,8 +418,8 @@ mod tests {
 
     async fn fresh_sm() -> SqliteRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_executor = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let node_executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-sm-test-node",
         )
@@ -515,8 +513,8 @@ mod tests {
 
     async fn build_sm_with_backend(backend: Arc<dyn DatastoreBackend>) -> SqliteRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_executor = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let node_executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-snapshot-test-node",
         )

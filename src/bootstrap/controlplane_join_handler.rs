@@ -1,190 +1,44 @@
 use std::sync::Arc;
 
-use anyhow::Context;
-use async_trait::async_trait;
-
-use crate::datastore::raft::node::{RaftMemberAdmissionResult, RaftNode};
-use crate::datastore::raft::types::{RaftShape, raft_node_id_for_node_name};
-use crate::replication::grpc::raft_rpc::{
-    ControlplaneJoinHandler, ControlplaneJoinOutcome, ControlplaneJoinRequest, RaftRpcRouterError,
-    RemoteNodeMode, RemoteNodeRegistrationSnapshot,
+use klights_leader_api::{
+    ControlplaneJoinAdmission, ControlplaneJoinAuthority, ControlplaneJoinError,
+    ControlplaneJoinFuture, ControlplaneJoinHandler, ControlplaneJoinMetadata,
+    ControlplaneJoinOutcome, ControlplaneJoinRegistration, ControlplaneJoinRequest,
+    ControlplaneJoinRoute, ControlplaneMemberQuery, ControlplaneMemberQueryFuture,
 };
 
-/// Bootstrap-owned adapter that coordinates authenticated control-plane joins
-/// across Raft admission, Kubernetes Node registration, and cluster metadata.
-pub struct RaftNodeJoinHandler {
-    node: Arc<RaftNode>,
-    pub(crate) db: crate::datastore::DatastoreHandle,
-    membership_metadata_mutex: tokio::sync::Mutex<()>,
+/// Neutral coordinator for authenticated control-plane joins.
+///
+/// Root supplies focused authority, admission, membership-query, registration,
+/// and metadata capabilities. The coordinator owns only sequencing and error
+/// context, so transport and engine adapters remain independently movable.
+pub struct ControlplaneJoinCoordinator {
+    authority: Arc<dyn ControlplaneJoinAuthority>,
+    admission: Arc<dyn ControlplaneJoinAdmission>,
+    member_query: Arc<dyn ControlplaneMemberQuery>,
+    registration: Arc<dyn ControlplaneJoinRegistration>,
+    metadata: Arc<dyn ControlplaneJoinMetadata>,
 }
 
-impl RaftNodeJoinHandler {
-    pub fn new(node: Arc<RaftNode>, db: crate::datastore::DatastoreHandle) -> Self {
+impl ControlplaneJoinCoordinator {
+    pub fn new(
+        authority: Arc<dyn ControlplaneJoinAuthority>,
+        admission: Arc<dyn ControlplaneJoinAdmission>,
+        member_query: Arc<dyn ControlplaneMemberQuery>,
+        registration: Arc<dyn ControlplaneJoinRegistration>,
+        metadata: Arc<dyn ControlplaneJoinMetadata>,
+    ) -> Self {
         Self {
-            node,
-            db,
-            membership_metadata_mutex: tokio::sync::Mutex::new(()),
+            authority,
+            admission,
+            member_query,
+            registration,
+            metadata,
         }
     }
-
-    /// Register a joining control-plane Node through the leader-owned cluster
-    /// datastore so the Raft proposer replicates the row to every voter.
-    async fn register_voter_node(
-        &self,
-        node_name: &str,
-        addr: &str,
-        as_learner: bool,
-        node_internal_ip: Option<String>,
-        node_registration: Option<RemoteNodeRegistrationSnapshot>,
-        legacy_node_git_commit: Option<String>,
-    ) -> anyhow::Result<()> {
-        use crate::kubelet::node::{
-            NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
-        };
-
-        let joiner_ip = addr
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let joiner_grpc_port = addr
-            .rsplit(':')
-            .next()
-            .and_then(|port| port.parse::<u16>().ok());
-        let node_role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner };
-        let leader_shape = self.node.current_shape();
-        let joiner_shape = RaftShape {
-            voter_count: leader_shape.voter_count,
-            is_leader: false,
-            is_learner: as_learner,
-        };
-        let role_projection =
-            crate::authority_adapter::project_raft_shape(&node_role, &joiner_shape);
-        let registration_addresses = NodeRegistrationAddresses::new(
-            node_internal_ip.unwrap_or_else(|| joiner_ip.clone()),
-            Some(joiner_ip),
-        );
-        let (node_mode, host) = match node_registration {
-            Some(registration) => {
-                let node_mode = match registration.node_mode {
-                    RemoteNodeMode::Root => klights_types::NodePeerMode::Root,
-                    RemoteNodeMode::Rootless => klights_types::NodePeerMode::Rootless,
-                };
-                let host = NodeRegistrationHostFacts {
-                    cpu_count: registration.host.cpu_count,
-                    memory_ki: registration.host.memory_ki,
-                    architecture: registration.host.architecture,
-                    operating_system: registration.host.operating_system,
-                    os_image: registration.host.os_image,
-                    kernel_version: registration.host.kernel_version,
-                    container_runtime_version: registration.host.container_runtime_version,
-                    kubelet_version: registration.host.kubelet_version,
-                    git_commit: registration.host.git_commit,
-                };
-                (node_mode, host)
-            }
-            None => {
-                let existing = self
-                    .db
-                    .get_resource("v1", "Node", None, node_name)
-                    .await?
-                    .with_context(|| {
-                        format!(
-                            "legacy JoinAsControlplane rejoin for {node_name} has no persisted Node registration snapshot"
-                        )
-                    })?;
-                let node_mode = klights_types::parse_node_peer_mode(
-                    existing
-                        .data
-                        .pointer("/metadata/annotations/klights.io~1mode")
-                        .and_then(serde_json::Value::as_str),
-                )?;
-                let host = NodeRegistrationHostFacts::from_existing_node(
-                    &existing.data,
-                    legacy_node_git_commit.as_deref(),
-                )?;
-                (node_mode, host)
-            }
-        };
-        let snapshot = NodeRegistrationSnapshot {
-            node_name: node_name.to_string(),
-            node_mode,
-            node_role,
-            publish_external_ip: true,
-            addresses: registration_addresses,
-            role_projection: Some(role_projection),
-            grpc_port: joiner_grpc_port,
-            host,
-        };
-
-        // A remote node owns its kubelet and dataplane status. Keep it
-        // unavailable until it has reconciled peers and publishes status.
-        let pending_dataplane = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
-        pending_dataplane.set_peers_pending();
-        let pending_dataplane = pending_dataplane.snapshot();
-        crate::bootstrap::node_registration_adapter::register_node_snapshot(
-            self.db.as_ref(),
-            None,
-            Some(&pending_dataplane),
-            &snapshot,
-        )
-        .await
-    }
-
-    async fn refresh_cluster_membership_metadata(
-        &self,
-        admitted_node_name: &str,
-        as_learner: bool,
-    ) -> anyhow::Result<()> {
-        let _guard = self.membership_metadata_mutex.lock().await;
-        let membership = match crate::bootstrap::cluster_meta::read_cluster_membership(
-            self.db.as_ref(),
-        )
-        .await
-        {
-            Ok(membership) => membership,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "JoinAsControlplane: cluster membership metadata unavailable; skipping voter metadata refresh"
-                );
-                return Ok(());
-            }
-        };
-        let latest = match crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref())
-            .await
-        {
-            Ok(latest) => Some(latest),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "JoinAsControlplane: latest cluster membership metadata unavailable; refreshing from initial snapshot"
-                );
-                None
-            }
-        };
-        let membership = klights_cluster_core::merge_controlplane_join_membership_metadata(
-            membership,
-            latest.as_ref(),
-            admitted_node_name,
-            as_learner,
-            self.node.authoring_node(),
-        );
-        crate::bootstrap::cluster_meta::write_cluster_membership(self.db.as_ref(), &membership)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to refresh cluster membership metadata after admitting {admitted_node_name}"
-                )
-            })
-    }
 }
 
-pub(crate) fn validate_command_codec_v3_join(
-    command_codec_version: u32,
-) -> std::result::Result<(), String> {
+pub(crate) fn validate_command_codec_v3_join(command_codec_version: u32) -> Result<(), String> {
     if command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
         return Err(
             "joining voters and learners must advertise exact command codec version 3".to_string(),
@@ -193,112 +47,291 @@ pub(crate) fn validate_command_codec_v3_join(
     Ok(())
 }
 
-#[async_trait]
-impl ControlplaneJoinHandler for RaftNodeJoinHandler {
-    async fn join(
-        &self,
-        request: ControlplaneJoinRequest,
-    ) -> std::result::Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
-        let ControlplaneJoinRequest {
-            node_id,
-            addr,
-            node_name,
-            as_learner,
-            storage_incarnation,
-            storage_log_attestation,
-            command_codec_version,
-            node_internal_ip,
-            node_registration,
-            legacy_node_git_commit,
-        } = request;
-        if !self.node.is_leader() {
-            return Ok(match self.node.current_leader_info() {
-                Some((leader_id, leader_addr)) => ControlplaneJoinOutcome::RedirectToLeader {
+impl ControlplaneJoinHandler for ControlplaneJoinCoordinator {
+    fn join(&self, request: ControlplaneJoinRequest) -> ControlplaneJoinFuture<'_> {
+        Box::pin(async move {
+            match self.authority.route() {
+                ControlplaneJoinRoute::Local => {}
+                ControlplaneJoinRoute::Redirect {
                     leader_id,
                     leader_addr,
-                },
-                None => ControlplaneJoinOutcome::Denied {
-                    reason: "no leader currently elected; retry later".into(),
-                },
-            });
-        }
-        if let Err(reason) = validate_command_codec_v3_join(command_codec_version) {
-            return Ok(ControlplaneJoinOutcome::Denied { reason });
-        }
-        tracing::info!(
-            joining_node_id = node_id,
-            joining_node_name = %node_name,
-            joining_addr = %addr,
-            storage_incarnation = %storage_incarnation,
-            as_learner,
-            "JoinAsControlplane: leader admitting durable Raft storage incarnation"
-        );
-        let admission = self
-            .node
-            .admit_controlplane_member_with_limit(
-                node_id,
-                addr.clone(),
-                as_learner,
-                storage_incarnation,
-                storage_log_attestation,
-                crate::bootstrap::node_role::controlplane_limit(),
-            )
-            .await
-            .map_err(|error| {
-                RaftRpcRouterError::Dispatch(format!(
-                    "admit control-plane member {node_id}: {error}"
+                } => {
+                    return Ok(ControlplaneJoinOutcome::RedirectToLeader {
+                        leader_id,
+                        leader_addr,
+                    });
+                }
+                ControlplaneJoinRoute::Unavailable => {
+                    return Ok(ControlplaneJoinOutcome::Denied {
+                        reason: "no leader currently elected; retry later".to_string(),
+                    });
+                }
+            }
+            if let Err(reason) = validate_command_codec_v3_join(request.command_codec_version) {
+                return Ok(ControlplaneJoinOutcome::Denied { reason });
+            }
+            tracing::info!(
+                joining_node_id = request.node_id,
+                joining_node_name = %request.node_name,
+                joining_addr = %request.addr,
+                storage_incarnation = %request.storage_incarnation,
+                as_learner = request.as_learner,
+                "JoinAsControlplane: leader admitting durable consensus storage incarnation"
+            );
+            let admission = self.admission.admit(&request).await.map_err(|error| {
+                ControlplaneJoinError::new(format!(
+                    "admit control-plane member {}: {error}",
+                    request.node_id
                 ))
             })?;
-        if admission == RaftMemberAdmissionResult::Unchanged {
-            return Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after: self.node.current_shape().voter_count,
-                admitted_as_learner: as_learner,
+            if admission.changed {
+                self.registration
+                    .register(&request, admission.voter_count_after)
+                    .await
+                    .map_err(|error| {
+                        ControlplaneJoinError::new(format!(
+                            "register joining Node row for {}: {error}",
+                            request.node_name
+                        ))
+                    })?;
+                self.metadata
+                    .refresh(&request.node_name, request.as_learner)
+                    .await
+                    .map_err(|error| {
+                        ControlplaneJoinError::new(format!(
+                            "refresh cluster membership metadata: {error}"
+                        ))
+                    })?;
+            }
+            Ok(ControlplaneJoinOutcome::Accepted {
+                voter_count_after: admission.voter_count_after,
+                admitted_as_learner: request.as_learner,
                 ca_cert_pem: String::new(),
                 encrypted_ca_key: Vec::new(),
                 ca_key_nonce: [0u8; 12],
-            });
-        }
-        if let Err(error) = self
-            .register_voter_node(
-                &node_name,
-                &addr,
-                as_learner,
-                node_internal_ip,
-                node_registration,
-                legacy_node_git_commit,
-            )
-            .await
-        {
-            return Err(RaftRpcRouterError::Dispatch(format!(
-                "register joining Node row for {node_name}: {error}"
-            )));
-        }
-        let voter_count_after = self.node.current_shape().voter_count;
-        self.refresh_cluster_membership_metadata(&node_name, as_learner)
-            .await
-            .map_err(|error| {
-                RaftRpcRouterError::Dispatch(format!(
-                    "refresh cluster membership metadata: {error}"
-                ))
-            })?;
-        Ok(ControlplaneJoinOutcome::Accepted {
-            voter_count_after,
-            admitted_as_learner: as_learner,
-            ca_cert_pem: String::new(),
-            encrypted_ca_key: Vec::new(),
-            ca_key_nonce: [0u8; 12],
+            })
         })
     }
 
-    async fn is_controlplane_member(&self, node_name: &str) -> bool {
-        let target = raft_node_id_for_node_name(node_name);
-        self.node
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .nodes()
-            .any(|(id, _)| *id == target)
+    fn is_controlplane_member<'a>(
+        &'a self,
+        node_name: &'a str,
+    ) -> ControlplaneMemberQueryFuture<'a> {
+        self.member_query.is_controlplane_member(node_name)
+    }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::ControlplaneJoinCoordinator;
+    use klights_leader_api::{
+        ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture,
+        ControlplaneJoinAdmissionOutcome, ControlplaneJoinAuthority, ControlplaneJoinError,
+        ControlplaneJoinHandler, ControlplaneJoinMetadata, ControlplaneJoinMetadataFuture,
+        ControlplaneJoinOutcome, ControlplaneJoinRegistration, ControlplaneJoinRegistrationFuture,
+        ControlplaneJoinRequest, ControlplaneJoinRoute, ControlplaneMemberQuery,
+        ControlplaneMemberQueryFuture, RaftStorageAttestation,
+    };
+
+    struct FakeAuthority {
+        route: ControlplaneJoinRoute,
+    }
+
+    impl ControlplaneJoinAuthority for FakeAuthority {
+        fn route(&self) -> ControlplaneJoinRoute {
+            self.route.clone()
+        }
+    }
+
+    struct FakeAdmission {
+        calls: AtomicUsize,
+        outcome: ControlplaneJoinAdmissionOutcome,
+    }
+
+    impl ControlplaneJoinAdmission for FakeAdmission {
+        fn admit<'a>(
+            &'a self,
+            _request: &'a ControlplaneJoinRequest,
+        ) -> ControlplaneJoinAdmissionFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.outcome)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMemberQuery;
+
+    impl ControlplaneMemberQuery for FakeMemberQuery {
+        fn is_controlplane_member<'a>(
+            &'a self,
+            _node_name: &'a str,
+        ) -> ControlplaneMemberQueryFuture<'a> {
+            Box::pin(async { false })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRegistration {
+        calls: AtomicUsize,
+    }
+
+    impl ControlplaneJoinRegistration for FakeRegistration {
+        fn register<'a>(
+            &'a self,
+            _request: &'a ControlplaneJoinRequest,
+            _voter_count_after: u32,
+        ) -> ControlplaneJoinRegistrationFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMetadata {
+        calls: AtomicUsize,
+    }
+
+    impl ControlplaneJoinMetadata for FakeMetadata {
+        fn refresh<'a>(
+            &'a self,
+            _node_name: &'a str,
+            _as_learner: bool,
+        ) -> ControlplaneJoinMetadataFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    fn request() -> ControlplaneJoinRequest {
+        ControlplaneJoinRequest {
+            node_id: 2,
+            addr: "https://10.0.0.2:7679".to_string(),
+            node_name: "cp2".to_string(),
+            as_learner: false,
+            storage_incarnation: uuid::Uuid::new_v4().to_string(),
+            storage_log_attestation: RaftStorageAttestation {
+                high_watermark: None,
+                current_boundary: None,
+            },
+            command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
+            node_internal_ip: Some("10.0.0.2".to_string()),
+            node_registration: None,
+            legacy_node_git_commit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_admission_runs_registration_and_metadata_once() {
+        let admission = Arc::new(FakeAdmission {
+            calls: AtomicUsize::new(0),
+            outcome: ControlplaneJoinAdmissionOutcome {
+                changed: true,
+                voter_count_after: 3,
+            },
+        });
+        let registration = Arc::new(FakeRegistration::default());
+        let metadata = Arc::new(FakeMetadata::default());
+        let coordinator = ControlplaneJoinCoordinator::new(
+            Arc::new(FakeAuthority {
+                route: ControlplaneJoinRoute::Local,
+            }),
+            admission.clone(),
+            Arc::new(FakeMemberQuery),
+            registration.clone(),
+            metadata.clone(),
+        );
+
+        let outcome = coordinator.join(request()).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ControlplaneJoinOutcome::Accepted {
+                voter_count_after: 3,
+                admitted_as_learner: false,
+                ..
+            }
+        ));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(registration.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_admission_skips_registration_and_metadata() {
+        let registration = Arc::new(FakeRegistration::default());
+        let metadata = Arc::new(FakeMetadata::default());
+        let coordinator = ControlplaneJoinCoordinator::new(
+            Arc::new(FakeAuthority {
+                route: ControlplaneJoinRoute::Local,
+            }),
+            Arc::new(FakeAdmission {
+                calls: AtomicUsize::new(0),
+                outcome: ControlplaneJoinAdmissionOutcome {
+                    changed: false,
+                    voter_count_after: 2,
+                },
+            }),
+            Arc::new(FakeMemberQuery),
+            registration.clone(),
+            metadata.clone(),
+        );
+
+        let outcome = coordinator.join(request()).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ControlplaneJoinOutcome::Accepted {
+                voter_count_after: 2,
+                ..
+            }
+        ));
+        assert_eq!(registration.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redirect_short_circuits_admission_and_effects() {
+        let admission = Arc::new(FakeAdmission {
+            calls: AtomicUsize::new(0),
+            outcome: ControlplaneJoinAdmissionOutcome {
+                changed: true,
+                voter_count_after: 3,
+            },
+        });
+        let registration = Arc::new(FakeRegistration::default());
+        let metadata = Arc::new(FakeMetadata::default());
+        let coordinator = ControlplaneJoinCoordinator::new(
+            Arc::new(FakeAuthority {
+                route: ControlplaneJoinRoute::Redirect {
+                    leader_id: 1,
+                    leader_addr: "https://10.0.0.1:7679".to_string(),
+                },
+            }),
+            admission.clone(),
+            Arc::new(FakeMemberQuery),
+            registration.clone(),
+            metadata.clone(),
+        );
+
+        let outcome = coordinator.join(request()).await.unwrap();
+        assert!(matches!(
+            outcome,
+            ControlplaneJoinOutcome::RedirectToLeader { leader_id: 1, .. }
+        ));
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(registration.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(metadata.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[allow(dead_code)]
+    fn error_contract_is_transport_neutral(error: ControlplaneJoinError) -> String {
+        error.to_string()
     }
 }

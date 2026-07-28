@@ -2416,25 +2416,22 @@ mod cases {
                 Some(7679),
             )
             .await;
-        let controlplane_registration =
-            crate::replication::grpc::raft_rpc::ControlplaneJoinRegistration {
-                node_name: controlplane_registration.node_name.clone(),
-                node_internal_ip: controlplane_registration
-                    .addresses
-                    .internal_ip()
-                    .to_string(),
-                as_learner: false,
-                storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
-                storage_log_attestation:
-                    crate::replication::grpc::raft_rpc::RaftStorageAttestation {
-                        high_watermark: None,
-                        current_boundary: None,
-                    },
-                snapshot:
-                    crate::replication::grpc::client::RegistrationSnapshotView::remote_snapshot(
-                        &controlplane_registration,
-                    ),
-            };
+        let controlplane_registration = klights_leader_api::ControlplaneJoinRegistrationSnapshot {
+            node_name: controlplane_registration.node_name.clone(),
+            node_internal_ip: controlplane_registration
+                .addresses
+                .internal_ip()
+                .to_string(),
+            as_learner: false,
+            storage_incarnation: "00000000-0000-4000-8000-000000000002".to_string(),
+            storage_log_attestation: klights_leader_api::RaftStorageAttestation {
+                high_watermark: None,
+                current_boundary: None,
+            },
+            snapshot: crate::replication::grpc::client::RegistrationSnapshotView::remote_snapshot(
+                &controlplane_registration,
+            ),
+        };
         assert_bounded!(
             "join_as_controlplane_rpc",
             client.join_as_controlplane_rpc(2, "https://127.0.0.1:1", &controlplane_registration,)

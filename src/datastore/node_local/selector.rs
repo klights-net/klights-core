@@ -5,8 +5,6 @@ use anyhow::Result;
 
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{NodeLocalHandle, SqliteNodeLocalDb};
-use crate::sqlite_boundary::DbExecutor;
-use crate::sqlite_open as opener;
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use klights_supervisor::TaskSupervisor;
 
@@ -87,10 +85,15 @@ async fn open_sqlite(
     connection_key: &'static str,
 ) -> Result<Arc<SqliteNodeLocalDb>> {
     let opts = match path {
-        Some(path) => opener::OpenOpts::node_disk(path.to_path_buf()),
-        None => opener::OpenOpts::node_in_memory(),
+        Some(path) => crate::datastore::node_local::sqlite::open::disk_opts(path.to_path_buf()),
+        None => crate::datastore::node_local::sqlite::open::in_memory_opts(),
     }
     .with_key_file(key_file)?;
-    let executor = DbExecutor::open_with_opts(opts, supervisor, connection_key).await?;
+    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+        opts,
+        supervisor,
+        connection_key,
+    )
+    .await?;
     Ok(Arc::new(SqliteNodeLocalDb::from_executor(executor)?))
 }

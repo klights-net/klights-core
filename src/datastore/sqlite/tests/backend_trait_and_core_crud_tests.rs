@@ -7448,12 +7448,10 @@ async fn cluster_same_kind_name_can_exist_in_different_api_versions() {
 
 #[tokio::test]
 async fn from_executor_initializes_watch_and_fingerprint() {
-    use crate::sqlite_boundary::DbExecutor;
-
     let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let executor = DbExecutor::open_in_memory(supervisor, "dsb03:fp-test")
+    let executor = crate::datastore::sqlite::open::open_in_memory(supervisor, "dsb03:fp-test")
         .await
         .unwrap();
     let ds = Datastore::new_in_memory_with_watch_and_executor(executor)

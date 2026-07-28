@@ -1,3 +1,4 @@
+pub(crate) mod open;
 mod queries;
 mod raft_durability;
 pub mod schema;

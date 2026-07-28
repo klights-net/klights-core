@@ -263,35 +263,26 @@ pub struct GrpcClientConfig {
 }
 
 pub(crate) trait RegistrationSnapshotView {
-    fn remote_snapshot(&self)
-    -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot;
+    fn remote_snapshot(&self) -> klights_leader_api::RemoteNodeRegistrationSnapshot;
 }
 
-impl RegistrationSnapshotView
-    for crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot
-{
-    fn remote_snapshot(
-        &self,
-    ) -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+impl RegistrationSnapshotView for klights_leader_api::RemoteNodeRegistrationSnapshot {
+    fn remote_snapshot(&self) -> klights_leader_api::RemoteNodeRegistrationSnapshot {
         self.clone()
     }
 }
 
 #[cfg(test)]
 impl RegistrationSnapshotView for crate::kubelet::node::NodeRegistrationSnapshot {
-    fn remote_snapshot(
-        &self,
-    ) -> crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
-        crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+    fn remote_snapshot(&self) -> klights_leader_api::RemoteNodeRegistrationSnapshot {
+        klights_leader_api::RemoteNodeRegistrationSnapshot {
             node_mode: match self.node_mode {
-                klights_network_api::NodePeerMode::Root => {
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root
-                }
+                klights_network_api::NodePeerMode::Root => klights_leader_api::RemoteNodeMode::Root,
                 klights_network_api::NodePeerMode::Rootless => {
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless
+                    klights_leader_api::RemoteNodeMode::Rootless
                 }
             },
-            host: crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
+            host: klights_leader_api::RemoteNodeHostFacts {
                 cpu_count: self.host.cpu_count,
                 memory_ki: self.host.memory_ki,
                 architecture: self.host.architecture.clone(),
@@ -311,8 +302,8 @@ pub(crate) fn node_registration_to_proto(
 ) -> klights_internal_protobuf::NodeRegistrationSnapshot {
     let registration = registration.remote_snapshot();
     let node_mode = match &registration.node_mode {
-        crate::replication::grpc::raft_rpc::RemoteNodeMode::Root => "root",
-        crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless => "rootless",
+        klights_leader_api::RemoteNodeMode::Root => "root",
+        klights_leader_api::RemoteNodeMode::Rootless => "rootless",
     };
     klights_internal_protobuf::NodeRegistrationSnapshot {
         cpu_count: registration.host.cpu_count,
@@ -1399,18 +1390,18 @@ impl ReplicationGrpcClient {
         &self,
         node_id: u64,
         addr: &str,
-        registration: &crate::replication::grpc::raft_rpc::ControlplaneJoinRegistration,
-    ) -> Result<crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome> {
-        use crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome;
+        registration: &klights_leader_api::ControlplaneJoinRegistrationSnapshot,
+    ) -> Result<klights_leader_api::ControlplaneJoinOutcome> {
+        use klights_leader_api::ControlplaneJoinOutcome;
         registration.snapshot.host.validate()?;
         anyhow::ensure!(
             matches!(
                 (&registration.snapshot.node_mode, self.config.dataplane.mode),
                 (
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
+                    klights_leader_api::RemoteNodeMode::Root,
                     klights_leader_api::NetworkNodeMode::Root
                 ) | (
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless,
+                    klights_leader_api::RemoteNodeMode::Rootless,
                     klights_leader_api::NetworkNodeMode::Rootless
                 )
             ),

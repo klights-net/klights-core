@@ -1,13 +1,9 @@
 //! Centralized open-time configuration for SQLite-backed datastores.
 //!
-//! Every later DSB task composes this helper:
-//! - DSB-02 calls into the schema-fingerprint check inside the same
-//!   supervised closure that opens the connection.
-//! - DSB-03 funnels every `Datastore` constructor through here so production
-//!   never re-derives PRAGMA / file-mode behaviour per call site.
-//! - DSB-06 fills in the SQLCipher `KeySource::File` variant; DSB-01
-//!   provides the surface and stubs the variants out so the opener only
-//!   has one place to grow.
+//! This module owns only schema-neutral connection policy: paths, permissions,
+//! SQLCipher key application, PRAGMAs, integrity checks, and file metrics.
+//! Cluster and node-local owners compose it with their own schema and
+//! fingerprint adapters.
 //!
 //! All filesystem mutations route through `TaskSupervisor` file-category
 //! helpers — opener never blocks the reactor and never bypasses the
@@ -22,7 +18,22 @@ use anyhow::{Result, anyhow};
 use crate::datastore::errors::OpenError;
 use klights_supervisor::TaskSupervisor;
 
-use crate::datastore::sqlite::{fingerprint, queries, schema};
+const PRAGMA_JOURNAL_MODE: &str = "journal_mode";
+const PRAGMA_SYNCHRONOUS: &str = "synchronous";
+const PRAGMA_AUTO_VACUUM: &str = "auto_vacuum";
+const PRAGMA_CACHE_SIZE: &str = "cache_size";
+const PRAGMA_TEMP_STORE: &str = "temp_store";
+const PRAGMA_MMAP_SIZE: &str = "mmap_size";
+const PRAGMA_FOREIGN_KEYS: &str = "foreign_keys";
+const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
+const PRAGMA_VALUE_JOURNAL_MODE_WAL: &str = "WAL";
+const PRAGMA_VALUE_SYNCHRONOUS_NORMAL: &str = "NORMAL";
+const PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL: &str = "INCREMENTAL";
+const PRAGMA_VALUE_CACHE_SIZE: &str = "-40000";
+const PRAGMA_VALUE_TEMP_STORE_MEMORY: &str = "MEMORY";
+const PRAGMA_VALUE_MMAP_SIZE: &str = "134217728";
+const PRAGMA_VALUE_FOREIGN_KEYS_ON: &str = "ON";
+const PRAGMA_VALUE_BUSY_TIMEOUT_MS: &str = "5000";
 
 /// PRAGMA + key application profile selected at open time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,19 +61,11 @@ pub enum OpenPath {
     Disk(PathBuf),
 }
 
-/// Which schema the connection owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaKind {
-    Cluster,
-    NodeLocal,
-}
-
 /// Bundled options for opening a connection.
 #[derive(Debug, Clone)]
 pub struct OpenOpts {
     pub path: OpenPath,
     pub profile: PragmaProfile,
-    pub schema: SchemaKind,
     /// `None` in DSB-01 (plaintext + in-memory only). DSB-06 plumbs the
     /// real `KeySource::File` value through the encrypted profile.
     pub key_source: Option<KeySource>,
@@ -76,9 +79,8 @@ pub struct OpenOpts {
 impl OpenOpts {
     pub fn in_memory() -> Self {
         Self {
-            path: OpenPath::SharedMemory(shared_memory_uri("cluster")),
+            path: OpenPath::SharedMemory(shared_memory_uri("raw")),
             profile: PragmaProfile::Plaintext,
-            schema: SchemaKind::Cluster,
             key_source: None,
             allow_existing_perms: false,
         }
@@ -88,27 +90,15 @@ impl OpenOpts {
         Self {
             path: OpenPath::Disk(path.into()),
             profile: PragmaProfile::Plaintext,
-            schema: SchemaKind::Cluster,
             key_source: None,
             allow_existing_perms: false,
         }
     }
 
-    pub fn node_in_memory() -> Self {
+    pub fn shared_memory(scope: &str) -> Self {
         Self {
-            path: OpenPath::SharedMemory(shared_memory_uri("node")),
+            path: OpenPath::SharedMemory(shared_memory_uri(scope)),
             profile: PragmaProfile::Plaintext,
-            schema: SchemaKind::NodeLocal,
-            key_source: None,
-            allow_existing_perms: false,
-        }
-    }
-
-    pub fn node_disk(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: OpenPath::Disk(path.into()),
-            profile: PragmaProfile::Plaintext,
-            schema: SchemaKind::NodeLocal,
             key_source: None,
             allow_existing_perms: false,
         }
@@ -176,7 +166,7 @@ pub fn apply_pragmas(conn: &rusqlite::Connection, profile: PragmaProfile) -> rus
     let mmap_val: String = if matches!(profile, PragmaProfile::Encrypted) {
         "0".to_string()
     } else {
-        queries::PRAGMA_VALUE_MMAP_SIZE.to_string()
+        PRAGMA_VALUE_MMAP_SIZE.to_string()
     };
 
     let batch = format!(
@@ -189,22 +179,22 @@ pub fn apply_pragmas(conn: &rusqlite::Connection, profile: PragmaProfile) -> rus
          PRAGMA {mm} = {mm_v}; \
          PRAGMA {fk} = {fk_v}; \
          PRAGMA {bt} = {bt_v};",
-        jm = queries::PRAGMA_JOURNAL_MODE,
-        jm_v = queries::PRAGMA_VALUE_JOURNAL_MODE_WAL,
-        sync = queries::PRAGMA_SYNCHRONOUS,
-        sync_v = queries::PRAGMA_VALUE_SYNCHRONOUS_NORMAL,
-        av = queries::PRAGMA_AUTO_VACUUM,
-        av_v = queries::PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL,
-        cs = queries::PRAGMA_CACHE_SIZE,
-        cs_v = queries::PRAGMA_VALUE_CACHE_SIZE,
-        ts = queries::PRAGMA_TEMP_STORE,
-        ts_v = queries::PRAGMA_VALUE_TEMP_STORE_MEMORY,
-        mm = queries::PRAGMA_MMAP_SIZE,
+        jm = PRAGMA_JOURNAL_MODE,
+        jm_v = PRAGMA_VALUE_JOURNAL_MODE_WAL,
+        sync = PRAGMA_SYNCHRONOUS,
+        sync_v = PRAGMA_VALUE_SYNCHRONOUS_NORMAL,
+        av = PRAGMA_AUTO_VACUUM,
+        av_v = PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL,
+        cs = PRAGMA_CACHE_SIZE,
+        cs_v = PRAGMA_VALUE_CACHE_SIZE,
+        ts = PRAGMA_TEMP_STORE,
+        ts_v = PRAGMA_VALUE_TEMP_STORE_MEMORY,
+        mm = PRAGMA_MMAP_SIZE,
         mm_v = mmap_val,
-        fk = queries::PRAGMA_FOREIGN_KEYS,
-        fk_v = queries::PRAGMA_VALUE_FOREIGN_KEYS_ON,
-        bt = queries::PRAGMA_BUSY_TIMEOUT,
-        bt_v = queries::PRAGMA_VALUE_BUSY_TIMEOUT_MS,
+        fk = PRAGMA_FOREIGN_KEYS,
+        fk_v = PRAGMA_VALUE_FOREIGN_KEYS_ON,
+        bt = PRAGMA_BUSY_TIMEOUT,
+        bt_v = PRAGMA_VALUE_BUSY_TIMEOUT_MS,
     );
     conn.execute_batch(&batch)
 }
@@ -231,7 +221,7 @@ pub fn apply_read_pragmas(
     let mmap_val: String = if matches!(profile, PragmaProfile::Encrypted) {
         "0".to_string()
     } else {
-        queries::PRAGMA_VALUE_MMAP_SIZE.to_string()
+        PRAGMA_VALUE_MMAP_SIZE.to_string()
     };
 
     let batch = format!(
@@ -241,16 +231,16 @@ pub fn apply_read_pragmas(
          PRAGMA {mm} = {mm_v}; \
          PRAGMA {fk} = {fk_v}; \
          PRAGMA {bt} = {bt_v};",
-        cs = queries::PRAGMA_CACHE_SIZE,
-        cs_v = queries::PRAGMA_VALUE_CACHE_SIZE,
-        ts = queries::PRAGMA_TEMP_STORE,
-        ts_v = queries::PRAGMA_VALUE_TEMP_STORE_MEMORY,
-        mm = queries::PRAGMA_MMAP_SIZE,
+        cs = PRAGMA_CACHE_SIZE,
+        cs_v = PRAGMA_VALUE_CACHE_SIZE,
+        ts = PRAGMA_TEMP_STORE,
+        ts_v = PRAGMA_VALUE_TEMP_STORE_MEMORY,
+        mm = PRAGMA_MMAP_SIZE,
         mm_v = mmap_val,
-        fk = queries::PRAGMA_FOREIGN_KEYS,
-        fk_v = queries::PRAGMA_VALUE_FOREIGN_KEYS_ON,
-        bt = queries::PRAGMA_BUSY_TIMEOUT,
-        bt_v = queries::PRAGMA_VALUE_BUSY_TIMEOUT_MS,
+        fk = PRAGMA_FOREIGN_KEYS,
+        fk_v = PRAGMA_VALUE_FOREIGN_KEYS_ON,
+        bt = PRAGMA_BUSY_TIMEOUT,
+        bt_v = PRAGMA_VALUE_BUSY_TIMEOUT_MS,
     );
     conn.execute_batch(&batch)
 }
@@ -457,67 +447,27 @@ pub fn check_orphaned_wal_for_test(db_path: &Path) -> Result<(), OpenError> {
     check_orphaned_wal_blocking(db_path)
 }
 
-/// Run corruption and schema fingerprint checks on a freshly-opened connection.
-///
-/// This must be called after `apply_pragmas` and `init_schema` but before any
-/// other operation. Returns `Ok(())` if both checks pass; returns
-/// `OpenError` for corruption or schema mismatch.
-#[cfg(test)]
-pub fn check_db_health(conn: &mut rusqlite::Connection, db_path: &Path) -> Result<(), OpenError> {
-    check_db_health_for(conn, db_path, SchemaKind::Cluster)
-}
-
-pub fn check_db_health_for(
-    conn: &mut rusqlite::Connection,
-    db_path: &Path,
-    schema_kind: SchemaKind,
-) -> Result<(), OpenError> {
-    // Run integrity_check first — if the DB is corrupted, fingerprint reads
-    // might produce confusing errors.
-    fingerprint::check_integrity(conn, db_path)?;
-
-    // Fingerprint check validates the schema matches what this binary expects.
-    match schema_kind {
-        SchemaKind::Cluster => fingerprint::check_or_init(conn, db_path)?,
-        SchemaKind::NodeLocal => {
-            crate::datastore::node_local::schema::check_or_init_fingerprint(conn, db_path)?
-        }
-    }
-
-    Ok(())
-}
-
-/// Initialize the database schema on a connection.
-///
-/// This must be called after `apply_pragmas` and before `check_db_health`.
-#[cfg(test)]
-pub fn init_schema(conn: &mut rusqlite::Connection) -> Result<(), OpenError> {
-    init_schema_for(conn, SchemaKind::Cluster)
-}
-
-pub fn init_schema_for(
-    conn: &mut rusqlite::Connection,
-    schema_kind: SchemaKind,
-) -> Result<(), OpenError> {
-    if matches!(schema_kind, SchemaKind::NodeLocal) {
-        return crate::datastore::node_local::schema::init_schema_in_conn(conn).map_err(|e| {
-            OpenError::Corrupt {
-                path: "<unknown>".to_string(),
-                details: format!("node-local schema initialization failed: {}", e),
-            }
+/// Run the schema-neutral SQLite integrity check.
+pub fn check_integrity(conn: &rusqlite::Connection, db_path: &Path) -> Result<(), OpenError> {
+    let result: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|error| OpenError::Corrupt {
+            path: db_path.display().to_string(),
+            details: format!("integrity_check query failed: {error}"),
+        })?;
+    if result != "ok" {
+        return Err(OpenError::Corrupt {
+            path: db_path.display().to_string(),
+            details: format!("integrity_check returned: {result}"),
         });
     }
-    schema::init_schema_in_conn(conn).map_err(|e| OpenError::Corrupt {
-        path: "<unknown>".to_string(),
-        details: format!("schema initialization failed: {}", e),
-    })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use klights_supervisor::TaskCategoryConfig;
-    use rusqlite::OptionalExtension;
     use std::sync::Arc;
 
     fn supervisor() -> Arc<TaskSupervisor> {
@@ -670,98 +620,19 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_creates_all_tables() {
-        let mut conn = open_temp_conn();
-        init_schema(&mut conn).expect("init_schema");
-
-        // Verify key tables exist
-        let tables: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .expect("prepare")
-            .query_map([], |row| row.get(0))
-            .expect("query")
-            .collect::<Result<_, _>>()
-            .expect("collect");
-
-        assert!(tables.contains(&"_klights_meta".to_string()));
-        assert!(tables.contains(&"cluster_resources".to_string()));
-        assert!(tables.contains(&"metadata".to_string()));
-        assert!(tables.contains(&"namespaced_resources".to_string()));
-        assert!(tables.contains(&"namespaces".to_string()));
-        assert!(tables.contains(&"node_subnets".to_string()));
-        assert!(tables.contains(&"node_dataplane".to_string()));
-        assert!(tables.contains(&"pod_cleanup_intents".to_string()));
-        assert!(tables.contains(&"watch_events".to_string()));
-        assert!(
-            !tables.contains(&"log_apply_entries".to_string()),
-            "log_apply_entries is removed (T3); it must not live in cluster.db"
-        );
-    }
-
-    #[test]
-    fn check_db_health_initializes_fingerprint_on_fresh_db() {
-        let (dir, mut conn) = open_disk_conn();
-        let path = dir.path().join("state.db");
-        apply_pragmas(&conn, PragmaProfile::Plaintext).expect("pragmas");
-        init_schema(&mut conn).expect("init_schema");
-        check_db_health(&mut conn, &path).expect("check_db_health");
-
-        // Verify fingerprint was written
-        let fp: Option<String> = conn
-            .query_row(
-                "SELECT value FROM _klights_meta WHERE key = 'schema_fingerprint'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .expect("query fingerprint");
-        assert!(fp.is_some(), "fingerprint should be written");
-        let fp = fp.unwrap();
-        assert_eq!(fp.len(), 64, "SHA256 produces 64 hex chars");
-    }
-
-    #[test]
-    fn check_db_health_detects_schema_mismatch() {
-        let (dir, mut conn) = open_disk_conn();
-        let path = dir.path().join("state.db");
-        apply_pragmas(&conn, PragmaProfile::Plaintext).expect("pragmas");
-        init_schema(&mut conn).expect("init_schema");
-        check_db_health(&mut conn, &path).expect("first check");
-
-        // Corrupt the fingerprint
-        conn.execute(
-            "UPDATE _klights_meta SET value = 'deadbeef' WHERE key = 'schema_fingerprint'",
-            [],
-        )
-        .expect("corrupt fingerprint");
-
-        let err = check_db_health(&mut conn, &path).expect_err("should detect mismatch");
-        let OpenError::SchemaMismatch { path: p, .. } = err else {
-            panic!("expected SchemaMismatch, got: {:?}", err);
-        };
-        assert_eq!(p, path.display().to_string());
-    }
-
-    #[test]
-    fn check_db_health_detects_corruption() {
+    fn check_integrity_detects_corruption() {
         use std::io::{Seek, Write};
 
-        // For corruption testing, we create a valid DB, then manually
-        // corrupt a page.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.db");
         {
-            let mut conn = rusqlite::Connection::open(&path).expect("open");
+            let conn = rusqlite::Connection::open(&path).expect("open");
             apply_pragmas(&conn, PragmaProfile::Plaintext).expect("pragmas");
-            init_schema(&mut conn).expect("init_schema");
-            check_db_health(&mut conn, &path).expect("first check");
-
-            // Insert some data
-            conn.execute(
-                "INSERT INTO metadata (key, value) VALUES ('test', 'value')",
-                [],
-            )
-            .expect("insert data");
+            conn.execute("CREATE TABLE integrity_probe (value TEXT NOT NULL)", [])
+                .expect("create probe table");
+            conn.execute("INSERT INTO integrity_probe VALUES ('value')", [])
+                .expect("insert data");
+            check_integrity(&conn, &path).expect("first check");
         }
 
         // Reopen and corrupt the first page
@@ -774,13 +645,13 @@ mod tests {
         file.write_all(b"CORRUPT").expect("write corrupt data");
 
         // Opening should succeed but integrity check should fail
-        let mut conn = rusqlite::Connection::open_with_flags(
+        let conn = rusqlite::Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .expect("open may succeed");
 
-        let err = check_db_health(&mut conn, &path).expect_err("should detect corruption");
+        let err = check_integrity(&conn, &path).expect_err("should detect corruption");
         let OpenError::Corrupt { path: p, details } = err else {
             panic!("expected Corrupt, got: {:?}", err);
         };

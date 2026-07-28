@@ -46,7 +46,7 @@ pub(crate) async fn open_with_sink(
     match request {
         PassiveStoreOpenRequest::SqliteInMemory => {
             tracing::info!(backend = "sqlite", mode = "in-memory", "opening datastore");
-            let executor = crate::sqlite_boundary::DbExecutor::open_in_memory(
+            let executor = crate::datastore::sqlite::open::open_in_memory(
                 supervisor,
                 "sqlite:selector-in-memory",
             )

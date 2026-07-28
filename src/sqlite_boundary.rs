@@ -9,11 +9,7 @@ use tokio_rusqlite::Connection;
 
 use crate::datastore::errors::OpenError;
 use crate::sqlite_open as opener;
-use crate::sqlite_open::{
-    OpenOpts, OpenPath, apply_pragmas, apply_read_pragmas,
-    check_db_health_for as check_db_health_for_executor, ensure_root_only,
-    init_schema_for as init_schema_for_executor,
-};
+use crate::sqlite_open::{OpenOpts, OpenPath, apply_pragmas, apply_read_pragmas, ensure_root_only};
 
 /// Allow `OpenError` to convert to `tokio_rusqlite::Error` for use in
 /// the supervised DB call path.  This is the SQLite-specific error bridge;
@@ -136,22 +132,16 @@ impl DbExecutor {
     /// Open a connection through the centralized `OpenOpts` path.
     ///
     /// For `Disk(path)`: hardens parent dir to `0700`, opens the
-    /// connection, applies the PRAGMA profile, initializes the schema,
-    /// and runs corruption/fingerprint checks inside a supervised
-    /// closure.
+    /// connection, and applies the PRAGMA profile inside a supervised closure.
+    /// The cluster and node-local owners initialize and validate their schemas
+    /// through their focused open adapters.
     ///
-    /// For `InMemory`: just opens and applies PRAGMAs, then initializes
-    /// schema and runs health checks.
+    /// For `InMemory`: opens and applies PRAGMAs without selecting a schema.
     pub async fn open_with_opts(
         opts: OpenOpts,
         task_supervisor: Arc<TaskSupervisor>,
         connection_key: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let db_path = match &opts.path {
-            OpenPath::SharedMemory(_) => None,
-            OpenPath::Disk(p) => Some(p.clone()),
-        };
-
         let connection = match &opts.path {
             OpenPath::SharedMemory(uri) => {
                 let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -175,13 +165,6 @@ impl DbExecutor {
             Some(opts.clone()),
         );
         let profile = opts.profile;
-        let schema_kind = opts.schema;
-        // Build a display path for error messages: real path for disk DBs,
-        // "<in-memory>" for transient connections.
-        let db_display = db_path
-            .as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<in-memory>".to_string());
 
         // Read SQLCipher key if present (DSB-06).
         #[cfg(feature = "sqlcipher")]
@@ -195,19 +178,13 @@ impl DbExecutor {
         let _sqlcipher_key: () = ();
 
         executor
-            .call_raw("opener:apply_pragmas_and_init", move |conn| {
+            .call_raw("opener:apply_pragmas", move |conn| {
                 // Apply SQLCipher key first, before any PRAGMA reads
                 #[cfg(feature = "sqlcipher")]
                 if let Some(ref key) = sqlcipher_key {
                     conn.pragma_update(None, "key", &key[..])?;
                 }
                 apply_pragmas(conn, profile)?;
-                init_schema_for_executor(conn, schema_kind)?;
-                // Run integrity + fingerprint checks for ALL database types.
-                // In-memory DBs get the same checks so bugs in the fingerprint
-                // path are caught early in development.
-                let db_path = std::path::Path::new(&db_display);
-                check_db_health_for_executor(conn, db_path, schema_kind)?;
                 Ok(())
             })
             .await?;
@@ -251,8 +228,6 @@ impl DbExecutor {
             Some(opts.clone()),
         );
         let profile = opts.profile;
-        let schema_kind = opts.schema;
-        let db_display = db_path.display().to_string();
 
         #[cfg(feature = "sqlcipher")]
         let sqlcipher_key: Option<Vec<u8>> = match &opts.key_source {
@@ -265,14 +240,12 @@ impl DbExecutor {
         let _sqlcipher_key: () = ();
 
         executor
-            .call_raw("opener:apply_read_pragmas_and_check", move |conn| {
+            .call_raw("opener:apply_read_pragmas", move |conn| {
                 #[cfg(feature = "sqlcipher")]
                 if let Some(ref key) = sqlcipher_key {
                     conn.pragma_update(None, "key", &key[..])?;
                 }
                 apply_read_pragmas(conn, profile)?;
-                let db_path = std::path::Path::new(&db_display);
-                check_db_health_for_executor(conn, db_path, schema_kind)?;
                 Ok(())
             })
             .await?;
@@ -624,6 +597,10 @@ mod tests {
         write_executor
             .call_raw("seed_committed_metadata", move |conn| {
                 conn.execute(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+                    [],
+                )?;
+                conn.execute(
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES('read_lane_probe', 'old')",
                     [],
                 )?;
@@ -696,5 +673,29 @@ mod tests {
         release_gate(&gate, 1);
         write.await.unwrap();
         read.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_open_boundary_does_not_select_an_owned_schema() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let executor = DbExecutor::open_with_opts(
+            OpenOpts::in_memory(),
+            supervisor,
+            "schema-neutral-open-test",
+        )
+        .await
+        .unwrap();
+        let tables = executor
+            .call_raw("schema-neutral-open:tables", |conn| {
+                let count = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok::<_, tokio_rusqlite::Error>(count)
+            })
+            .await
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 }

@@ -320,13 +320,13 @@ fn validate_controlplane_join_dataplane_metadata_with_endpoint(
 
 fn validate_controlplane_node_registration(
     registration: klights_internal_protobuf::NodeRegistrationSnapshot,
-) -> Result<crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot> {
+) -> Result<klights_leader_api::RemoteNodeRegistrationSnapshot> {
     let node_mode = match registration.node_mode.as_str() {
-        "root" => crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
-        "rootless" => crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless,
+        "root" => klights_leader_api::RemoteNodeMode::Root,
+        "rootless" => klights_leader_api::RemoteNodeMode::Rootless,
         other => return Err(anyhow!("unsupported node registration mode {other:?}")),
     };
-    let host = crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
+    let host = klights_leader_api::RemoteNodeHostFacts {
         cpu_count: registration.cpu_count,
         memory_ki: registration.memory_ki,
         architecture: registration.architecture,
@@ -338,7 +338,7 @@ fn validate_controlplane_node_registration(
         git_commit: registration.git_commit,
     };
     host.validate()?;
-    Ok(crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot { node_mode, host })
+    Ok(klights_leader_api::RemoteNodeRegistrationSnapshot { node_mode, host })
 }
 
 fn uri_host_for_ip(ip: IpAddr) -> String {
@@ -544,8 +544,7 @@ pub struct GrpcReplicationServer {
     /// Phase 3 controlplane join handler. Populated alongside
     /// `raft_rpc_router` by the leader bootstrap. When None,
     /// `JoinAsControlplane` is denied with a fixed reason.
-    controlplane_join_handler:
-        Option<Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>>,
+    controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     /// Supervised reader for in-band CA distribution/signing material.
     controlplane_ca_files: ControlplaneCaFiles,
     /// Fenced authority for leader-owned worker RPCs.
@@ -737,7 +736,7 @@ impl GrpcReplicationServer {
     /// be added to the cluster via `RaftNode::add_voter`.
     pub fn with_controlplane_join_handler(
         mut self,
-        handler: Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
+        handler: Arc<dyn klights_leader_api::ControlplaneJoinHandler>,
     ) -> Self {
         self.controlplane_join_handler = Some(handler);
         self
@@ -1162,9 +1161,7 @@ pub fn mount_service_full(
     controller_dispatcher: Option<Arc<ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<crate::node_lease_tracker::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
-    controlplane_join_handler: Option<
-        Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
-    >,
+    controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     containerd_namespace: &str,
     is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
     local_node_name: Option<String>,
@@ -1206,9 +1203,7 @@ pub fn mount_service_full_with_policy(
     controller_dispatcher: Option<Arc<ControllerDispatcher>>,
     node_lease_tracker: Option<Arc<crate::node_lease_tracker::NodeLeaseTracker>>,
     raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
-    controlplane_join_handler: Option<
-        Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
-    >,
+    controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     containerd_namespace: &str,
     is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
     local_node_name: Option<String>,
@@ -1296,9 +1291,7 @@ pub(crate) fn mount_service_full_production(
     peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
     credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
     raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
-    controlplane_join_handler: Option<
-        Arc<dyn crate::replication::grpc::raft_rpc::ControlplaneJoinHandler>,
-    >,
+    controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     runtime_files: ReplicationRuntimeFiles,
     authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     local_node_name: Option<String>,
@@ -2615,10 +2608,10 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             let mode_matches = matches!(
                 (&registration.node_mode, dataplane.mode()),
                 (
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
+                    klights_leader_api::RemoteNodeMode::Root,
                     klights_leader_api::NetworkNodeMode::Root
                 ) | (
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless,
+                    klights_leader_api::RemoteNodeMode::Rootless,
                     klights_leader_api::NetworkNodeMode::Rootless
                 )
             );
@@ -2646,36 +2639,34 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             Status::invalid_argument("JoinAsControlplane requires storage_log_attestation")
         })?;
         let map_log_id = |attestation: klights_internal_protobuf::RaftStorageLogId| {
-            crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
+            klights_leader_api::RaftStorageLogAttestation {
                 term: attestation.term,
                 leader_node_id: attestation.leader_node_id,
                 index: attestation.index,
             }
         };
-        let storage_log_attestation = crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+        let storage_log_attestation = klights_leader_api::RaftStorageAttestation {
             high_watermark: storage_log_attestation.high_watermark.map(map_log_id),
             current_boundary: storage_log_attestation.current_boundary.map(map_log_id),
         };
         let outcome = handler
-            .join(
-                crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
-                    node_id: req.node_id,
-                    addr: raft_addr,
-                    node_name: req.node_name,
-                    as_learner: req.as_learner,
-                    storage_incarnation,
-                    storage_log_attestation,
-                    command_codec_version: req.command_codec_version,
-                    node_internal_ip,
-                    node_registration,
-                    legacy_node_git_commit: Some(req.node_git_commit)
-                        .filter(|value| !value.trim().is_empty()),
-                },
-            )
+            .join(klights_leader_api::ControlplaneJoinRequest {
+                node_id: req.node_id,
+                addr: raft_addr,
+                node_name: req.node_name,
+                as_learner: req.as_learner,
+                storage_incarnation,
+                storage_log_attestation,
+                command_codec_version: req.command_codec_version,
+                node_internal_ip,
+                node_registration,
+                legacy_node_git_commit: Some(req.node_git_commit)
+                    .filter(|value| !value.trim().is_empty()),
+            })
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|err| Status::internal(format!("raft RPC router dispatch: {err}")))?;
         let result = match outcome {
-            crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::Accepted {
+            klights_leader_api::ControlplaneJoinOutcome::Accepted {
                 voter_count_after,
                 admitted_as_learner,
                 ..
@@ -2699,7 +2690,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                     },
                 )
             }
-            crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::RedirectToLeader {
+            klights_leader_api::ControlplaneJoinOutcome::RedirectToLeader {
                 leader_id,
                 leader_addr,
             } => {
@@ -2710,7 +2701,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                     },
                 )
             }
-            crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::Denied { reason } => {
+            klights_leader_api::ControlplaneJoinOutcome::Denied { reason } => {
                 klights_internal_protobuf::join_as_controlplane_response::Result::Denied(
                     klights_internal_protobuf::JoinAsControlplaneDenied { reason },
                 )
@@ -3598,9 +3589,6 @@ mod tests {
     };
 
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
-    use crate::replication::grpc::raft_rpc::{
-        ControlplaneJoinHandler, ControlplaneJoinOutcome, RaftRpcRouterError,
-    };
     use crate::replication::grpc::server::{
         require_worker_command_codec_v3, validate_join_metadata,
     };
@@ -3612,6 +3600,7 @@ mod tests {
     use klights_internal_protobuf::replication_client::ReplicationClient;
     use klights_internal_protobuf::replication_server::Replication;
     use klights_internal_protobuf::{JoinRequest, JoinRole, MetadataRequest};
+    use klights_leader_api::{ControlplaneJoinHandler, ControlplaneJoinOutcome};
 
     use crate::replication::protocol::ReplicationEntry;
     use crate::replication::service::ReplicationService;
@@ -5166,26 +5155,30 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl ControlplaneJoinHandler for AcceptingControlplaneJoinHandler {
-        async fn join(
+        fn join(
             &self,
-            request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
-        ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
-            Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after: if request.as_learner { 1 } else { 2 },
-                admitted_as_learner: request.as_learner,
-                ca_cert_pem: String::new(),
-                encrypted_ca_key: Vec::new(),
-                ca_key_nonce: [0u8; 12],
+            request: klights_leader_api::ControlplaneJoinRequest,
+        ) -> klights_leader_api::ControlplaneJoinFuture<'_> {
+            Box::pin(async move {
+                Ok(ControlplaneJoinOutcome::Accepted {
+                    voter_count_after: if request.as_learner { 1 } else { 2 },
+                    admitted_as_learner: request.as_learner,
+                    ca_cert_pem: String::new(),
+                    encrypted_ca_key: Vec::new(),
+                    ca_key_nonce: [0u8; 12],
+                })
             })
         }
 
         // Permissive test double: treat callers as existing members so node-cert
         // (rejoin) JoinAsControlplane is accepted without a token. Token-gating
         // and non-member rejection are exercised by dedicated handlers/tests.
-        async fn is_controlplane_member(&self, _node_name: &str) -> bool {
-            true
+        fn is_controlplane_member<'a>(
+            &'a self,
+            _node_name: &'a str,
+        ) -> klights_leader_api::ControlplaneMemberQueryFuture<'a> {
+            Box::pin(async { true })
         }
     }
 
@@ -5194,23 +5187,27 @@ mod tests {
     /// path on JoinAsControlplane.
     struct NonMemberControlplaneJoinHandler;
 
-    #[async_trait::async_trait]
     impl ControlplaneJoinHandler for NonMemberControlplaneJoinHandler {
-        async fn join(
+        fn join(
             &self,
-            request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
-        ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
-            Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after: if request.as_learner { 1 } else { 2 },
-                admitted_as_learner: request.as_learner,
-                ca_cert_pem: String::new(),
-                encrypted_ca_key: Vec::new(),
-                ca_key_nonce: [0u8; 12],
+            request: klights_leader_api::ControlplaneJoinRequest,
+        ) -> klights_leader_api::ControlplaneJoinFuture<'_> {
+            Box::pin(async move {
+                Ok(ControlplaneJoinOutcome::Accepted {
+                    voter_count_after: if request.as_learner { 1 } else { 2 },
+                    admitted_as_learner: request.as_learner,
+                    ca_cert_pem: String::new(),
+                    encrypted_ca_key: Vec::new(),
+                    ca_key_nonce: [0u8; 12],
+                })
             })
         }
 
-        async fn is_controlplane_member(&self, _node_name: &str) -> bool {
-            false
+        fn is_controlplane_member<'a>(
+            &'a self,
+            _node_name: &'a str,
+        ) -> klights_leader_api::ControlplaneMemberQueryFuture<'a> {
+            Box::pin(async { false })
         }
     }
 
@@ -5221,8 +5218,7 @@ mod tests {
         node_name: String,
         as_learner: bool,
         node_internal_ip: Option<String>,
-        node_registration:
-            Option<crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot>,
+        node_registration: Option<klights_leader_api::RemoteNodeRegistrationSnapshot>,
         legacy_node_git_commit: Option<String>,
     }
 
@@ -5240,47 +5236,51 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl ControlplaneJoinHandler for RecordingControlplaneJoinHandler {
-        async fn join(
+        fn join(
             &self,
-            request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
-        ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
-            let crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
-                node_id,
-                addr,
-                node_name,
-                as_learner,
-                storage_incarnation: _,
-                storage_log_attestation: _,
-                command_codec_version: _,
-                node_internal_ip,
-                node_registration,
-                legacy_node_git_commit,
-            } = request;
-            self.calls
-                .lock()
-                .expect("recording join handler mutex poisoned")
-                .push(RecordedControlplaneJoin {
+            request: klights_leader_api::ControlplaneJoinRequest,
+        ) -> klights_leader_api::ControlplaneJoinFuture<'_> {
+            Box::pin(async move {
+                let klights_leader_api::ControlplaneJoinRequest {
                     node_id,
                     addr,
                     node_name,
                     as_learner,
+                    storage_incarnation: _,
+                    storage_log_attestation: _,
+                    command_codec_version: _,
                     node_internal_ip,
                     node_registration,
                     legacy_node_git_commit,
-                });
-            Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after: if as_learner { 1 } else { 2 },
-                admitted_as_learner: as_learner,
-                ca_cert_pem: String::new(),
-                encrypted_ca_key: Vec::new(),
-                ca_key_nonce: [0u8; 12],
+                } = request;
+                self.calls
+                    .lock()
+                    .expect("recording join handler mutex poisoned")
+                    .push(RecordedControlplaneJoin {
+                        node_id,
+                        addr,
+                        node_name,
+                        as_learner,
+                        node_internal_ip,
+                        node_registration,
+                        legacy_node_git_commit,
+                    });
+                Ok(ControlplaneJoinOutcome::Accepted {
+                    voter_count_after: if as_learner { 1 } else { 2 },
+                    admitted_as_learner: as_learner,
+                    ca_cert_pem: String::new(),
+                    encrypted_ca_key: Vec::new(),
+                    ca_key_nonce: [0u8; 12],
+                })
             })
         }
 
-        async fn is_controlplane_member(&self, _node_name: &str) -> bool {
-            true
+        fn is_controlplane_member<'a>(
+            &'a self,
+            _node_name: &'a str,
+        ) -> klights_leader_api::ControlplaneMemberQueryFuture<'a> {
+            Box::pin(async { true })
         }
     }
 

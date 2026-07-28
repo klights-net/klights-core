@@ -29,8 +29,8 @@ async fn node_local_runtime_store()
     let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
         klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let executor = crate::sqlite_boundary::DbExecutor::open_with_opts(
-        crate::sqlite_open::OpenOpts::node_in_memory(),
+    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+        crate::datastore::node_local::sqlite::open::in_memory_opts(),
         supervisor,
         "sqlite:pod-runtime-test",
     )

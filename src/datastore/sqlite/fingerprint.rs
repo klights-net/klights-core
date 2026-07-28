@@ -72,30 +72,6 @@ pub(crate) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Resu
     }
 }
 
-/// Run `PRAGMA integrity_check` and fail if the result is not "ok".
-///
-/// Corruption detection runs once at boot before any `DatastoreBackend`
-/// method is reachable. A non-"ok" result produces `OpenError::Corrupt`.
-pub(crate) fn check_integrity(
-    conn: &rusqlite::Connection,
-    db_path: &Path,
-) -> Result<(), OpenError> {
-    let result: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|e| OpenError::Corrupt {
-            path: db_path.display().to_string(),
-            details: format!("integrity_check query failed: {}", e),
-        })?;
-
-    if result != "ok" {
-        return Err(OpenError::Corrupt {
-            path: db_path.display().to_string(),
-            details: format!("integrity_check returned: {}", result),
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};

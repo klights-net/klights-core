@@ -10,37 +10,6 @@
 //! `mysql/queries.rs`), this is the only file that needs translation.
 
 // ---------------------------------------------------------------------------
-// PRAGMA / opener
-//
-// Plaintext profile only today; the SQLCipher (`Encrypted`) profile shares
-// these and additionally pins `mmap_size = 0` (encrypted pages cannot be
-// memory-mapped raw) plus the `key`/`cipher_compatibility` PRAGMAs that
-// DSB-06 will add.
-// ---------------------------------------------------------------------------
-
-pub(crate) const PRAGMA_JOURNAL_MODE: &str = "journal_mode";
-pub(crate) const PRAGMA_SYNCHRONOUS: &str = "synchronous";
-pub(crate) const PRAGMA_AUTO_VACUUM: &str = "auto_vacuum";
-pub(crate) const PRAGMA_CACHE_SIZE: &str = "cache_size";
-pub(crate) const PRAGMA_TEMP_STORE: &str = "temp_store";
-pub(crate) const PRAGMA_MMAP_SIZE: &str = "mmap_size";
-pub(crate) const PRAGMA_FOREIGN_KEYS: &str = "foreign_keys";
-pub(crate) const PRAGMA_BUSY_TIMEOUT: &str = "busy_timeout";
-
-pub(crate) const PRAGMA_VALUE_JOURNAL_MODE_WAL: &str = "WAL";
-pub(crate) const PRAGMA_VALUE_SYNCHRONOUS_NORMAL: &str = "NORMAL";
-pub(crate) const PRAGMA_VALUE_AUTO_VACUUM_INCREMENTAL: &str = "INCREMENTAL";
-/// Negative cache size = KiB cap (≈ 40 MB). Stored as a SQL literal so
-/// `queries.rs` only exposes `pub(super) const NAME: &str` items per
-/// DSB-00b discipline.
-pub(crate) const PRAGMA_VALUE_CACHE_SIZE: &str = "-40000";
-pub(crate) const PRAGMA_VALUE_TEMP_STORE_MEMORY: &str = "MEMORY";
-/// 128 MiB mmap window. Disabled (0) under SQLCipher per DSB-06.
-pub(crate) const PRAGMA_VALUE_MMAP_SIZE: &str = "134217728";
-pub(crate) const PRAGMA_VALUE_FOREIGN_KEYS_ON: &str = "ON";
-pub(crate) const PRAGMA_VALUE_BUSY_TIMEOUT_MS: &str = "5000";
-
-// ---------------------------------------------------------------------------
 // metadata / resource_version
 // ---------------------------------------------------------------------------
 

@@ -9,8 +9,6 @@ use crate::datastore::{
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
     PodSlotMutationResult,
 };
-use crate::sqlite_boundary::DbExecutor;
-use crate::sqlite_open as opener;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn pod_status_classification() -> klights_node_store::OutboxClassification {
@@ -28,8 +26,8 @@ fn supervisor() -> Arc<TaskSupervisor> {
 }
 
 async fn open_node_local_in_memory() -> NodeLocalDb {
-    let executor = DbExecutor::open_with_opts(
-        opener::OpenOpts::node_in_memory(),
+    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+        crate::datastore::node_local::sqlite::open::in_memory_opts(),
         supervisor(),
         "sqlite:node-local-test",
     )
@@ -39,8 +37,8 @@ async fn open_node_local_in_memory() -> NodeLocalDb {
 }
 
 async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
-    let executor = DbExecutor::open_with_opts(
-        opener::OpenOpts::node_in_memory(),
+    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+        crate::datastore::node_local::sqlite::open::in_memory_opts(),
         supervisor(),
         "sqlite:node-local-backend-test",
     )
@@ -51,11 +49,15 @@ async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
 }
 
 async fn open_node_local_on_disk(path: &std::path::Path) -> NodeLocalDb {
-    let mut opts = opener::OpenOpts::node_disk(path.to_path_buf());
+    let mut opts = crate::datastore::node_local::sqlite::open::disk_opts(path.to_path_buf());
     opts.allow_existing_perms = true;
-    let executor = DbExecutor::open_with_opts(opts, supervisor(), "sqlite:node-local-disk-test")
-        .await
-        .expect("open disk node-local executor");
+    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+        opts,
+        supervisor(),
+        "sqlite:node-local-disk-test",
+    )
+    .await
+    .expect("open disk node-local executor");
     NodeLocalDb::from_executor(executor).expect("create disk node-local db")
 }
 

@@ -574,7 +574,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     )
                     .await;
                 let join_node_registration =
-                    crate::replication::grpc::raft_rpc::ControlplaneJoinRegistration {
+                    klights_leader_api::ControlplaneJoinRegistrationSnapshot {
                         node_name: join_node_registration.node_name.clone(),
                         node_internal_ip: join_node_registration
                             .addresses
@@ -584,35 +584,33 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                             .controlplane_as_learner()
                             .expect("control-plane bootstrap captured a control-plane role"),
                         storage_incarnation: storage_incarnation.clone(),
-                        storage_log_attestation:
-                            crate::replication::grpc::raft_rpc::RaftStorageAttestation {
-                                high_watermark: None,
-                                current_boundary: None,
+                        storage_log_attestation: klights_leader_api::RaftStorageAttestation {
+                            high_watermark: None,
+                            current_boundary: None,
+                        },
+                        snapshot: klights_leader_api::RemoteNodeRegistrationSnapshot {
+                            node_mode: match join_node_registration.node_mode {
+                                crate::controllers::annotations::NodePeerMode::Root => {
+                                    klights_leader_api::RemoteNodeMode::Root
+                                }
+                                crate::controllers::annotations::NodePeerMode::Rootless => {
+                                    klights_leader_api::RemoteNodeMode::Rootless
+                                }
                             },
-                        snapshot:
-                            crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
-                                node_mode: match join_node_registration.node_mode {
-                                    crate::controllers::annotations::NodePeerMode::Root => {
-                                        crate::replication::grpc::raft_rpc::RemoteNodeMode::Root
-                                    }
-                                    crate::controllers::annotations::NodePeerMode::Rootless => {
-                                        crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless
-                                    }
-                                },
-                                host: crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
-                                    cpu_count: join_node_registration.host.cpu_count,
-                                    memory_ki: join_node_registration.host.memory_ki,
-                                    architecture: join_node_registration.host.architecture,
-                                    operating_system: join_node_registration.host.operating_system,
-                                    os_image: join_node_registration.host.os_image,
-                                    kernel_version: join_node_registration.host.kernel_version,
-                                    container_runtime_version: join_node_registration
-                                        .host
-                                        .container_runtime_version,
-                                    kubelet_version: join_node_registration.host.kubelet_version,
-                                    git_commit: join_node_registration.host.git_commit,
-                                },
+                            host: klights_leader_api::RemoteNodeHostFacts {
+                                cpu_count: join_node_registration.host.cpu_count,
+                                memory_ki: join_node_registration.host.memory_ki,
+                                architecture: join_node_registration.host.architecture,
+                                operating_system: join_node_registration.host.operating_system,
+                                os_image: join_node_registration.host.os_image,
+                                kernel_version: join_node_registration.host.kernel_version,
+                                container_runtime_version: join_node_registration
+                                    .host
+                                    .container_runtime_version,
+                                kubelet_version: join_node_registration.host.kubelet_version,
+                                git_commit: join_node_registration.host.git_commit,
                             },
+                        },
                     };
                 let join_namespace = config.containerd_namespace.clone();
                 let join_supervisor_for_loop = join_supervisor.clone();
@@ -707,14 +705,14 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         }
                                     };
                                 let map_coordinate = |coordinate: klights_node_store::RaftLogCoordinate| {
-                                    crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
+                                    klights_leader_api::RaftStorageLogAttestation {
                                         term: coordinate.term(),
                                         leader_node_id: coordinate.leader_node_id(),
                                         index: coordinate.index(),
                                     }
                                 };
                                 current_registration.storage_log_attestation =
-                                    crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+                                    klights_leader_api::RaftStorageAttestation {
                                         high_watermark: high_watermark.map(map_coordinate),
                                         current_boundary: current_boundary.map(map_coordinate),
                                     };
@@ -726,7 +724,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                     )
                                     .await
                                 {
-                                    Ok(crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::Accepted {
+                                    Ok(klights_leader_api::ControlplaneJoinOutcome::Accepted {
                                         voter_count_after,
                                         admitted_as_learner,
                                         ca_cert_pem,
@@ -765,7 +763,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         }
                                         return;
                                     }
-                                    Ok(crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::RedirectToLeader {
+                                    Ok(klights_leader_api::ControlplaneJoinOutcome::RedirectToLeader {
                                         leader_id,
                                         leader_addr,
                                     }) => {
@@ -777,7 +775,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         targets = vec![leader_addr];
                                         continue;
                                     }
-                                    Ok(crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome::Denied {
+                                    Ok(klights_leader_api::ControlplaneJoinOutcome::Denied {
                                         reason,
                                     }) => {
                                         tracing::warn!(

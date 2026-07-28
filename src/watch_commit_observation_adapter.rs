@@ -289,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_emits_commit_observations_only_after_successful_commit() {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
-        let executor = crate::sqlite_boundary::DbExecutor::open_in_memory(
+        let executor = crate::datastore::sqlite::open::open_in_memory(
             supervisor,
             "sqlite:commit-observation-test",
         )

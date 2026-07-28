@@ -40,7 +40,7 @@ struct RaftMemberAdmission {
     storage_incarnation: String,
     addr: String,
     as_learner: bool,
-    proven_log: Option<crate::replication::grpc::raft_rpc::RaftStorageLogAttestation>,
+    proven_log: Option<klights_leader_api::RaftStorageLogAttestation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,7 +846,7 @@ impl RaftNode {
     fn target_replication_match(
         &self,
         node_id: NodeId,
-    ) -> Option<crate::replication::grpc::raft_rpc::RaftStorageLogAttestation> {
+    ) -> Option<klights_leader_api::RaftStorageLogAttestation> {
         self.raft
             .metrics()
             .borrow()
@@ -854,19 +854,17 @@ impl RaftNode {
             .as_ref()
             .and_then(|replication| replication.get(&node_id))
             .and_then(|matched| matched.as_ref())
-            .map(
-                |matched| crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                    term: matched.leader_id.term,
-                    leader_node_id: matched.leader_id.node_id,
-                    index: matched.index,
-                },
-            )
+            .map(|matched| klights_leader_api::RaftStorageLogAttestation {
+                term: matched.leader_id.term,
+                leader_node_id: matched.leader_id.node_id,
+                index: matched.index,
+            })
     }
 
     async fn wait_for_target_replication_match(
         &self,
         node_id: NodeId,
-    ) -> Result<crate::replication::grpc::raft_rpc::RaftStorageLogAttestation> {
+    ) -> Result<klights_leader_api::RaftStorageLogAttestation> {
         let metrics = self
             .raft
             .wait(Some(std::time::Duration::from_secs(5)))
@@ -891,18 +889,16 @@ impl RaftNode {
             .and_then(|replication| replication.get(&node_id))
             .and_then(|matched| matched.as_ref())
             .ok_or_else(|| anyhow::anyhow!("target {node_id} match proof disappeared"))?;
-        Ok(
-            crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                term: matched.leader_id.term,
-                leader_node_id: matched.leader_id.node_id,
-                index: matched.index,
-            },
-        )
+        Ok(klights_leader_api::RaftStorageLogAttestation {
+            term: matched.leader_id.term,
+            leader_node_id: matched.leader_id.node_id,
+            index: matched.index,
+        })
     }
 
     fn attestation_is_behind(
-        reported: Option<&crate::replication::grpc::raft_rpc::RaftStorageLogAttestation>,
-        required: Option<&crate::replication::grpc::raft_rpc::RaftStorageLogAttestation>,
+        reported: Option<&klights_leader_api::RaftStorageLogAttestation>,
+        required: Option<&klights_leader_api::RaftStorageLogAttestation>,
     ) -> bool {
         match (reported, required) {
             (_, None) => false,
@@ -926,7 +922,7 @@ impl RaftNode {
         addr: String,
         as_learner: bool,
         storage_incarnation: String,
-        storage_log_attestation: crate::replication::grpc::raft_rpc::RaftStorageAttestation,
+        storage_log_attestation: klights_leader_api::RaftStorageAttestation,
     ) -> Result<RaftMemberAdmissionResult> {
         self.admit_controlplane_member_with_limit(
             node_id,
@@ -945,7 +941,7 @@ impl RaftNode {
         addr: String,
         as_learner: bool,
         storage_incarnation: String,
-        storage_log_attestation: crate::replication::grpc::raft_rpc::RaftStorageAttestation,
+        storage_log_attestation: klights_leader_api::RaftStorageAttestation,
         controlplane_limit: usize,
     ) -> Result<RaftMemberAdmissionResult> {
         let _guard = self.membership_mutex.lock().await;
@@ -1693,347 +1689,6 @@ impl crate::replication::grpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
     }
 }
 
-/// Server-side handler for `JoinAsControlplane` RPCs. When the current
-/// node is the elected Raft leader, runs `RaftNode::add_voter` (P3-10)
-/// and replies `Accepted`. Otherwise redirects the joiner to the
-/// current leader or denies the request with a transient reason.
-#[cfg(test)]
-#[cfg(any())]
-pub struct RaftNodeJoinHandler {
-    node: Arc<RaftNode>,
-    db: super::super::DatastoreHandle,
-    membership_metadata_mutex: tokio::sync::Mutex<()>,
-}
-
-#[cfg(test)]
-#[cfg(any())]
-impl RaftNodeJoinHandler {
-    pub fn new(node: Arc<RaftNode>, db: super::super::DatastoreHandle) -> Self {
-        Self {
-            node,
-            db,
-            membership_metadata_mutex: tokio::sync::Mutex::new(()),
-        }
-    }
-
-    /// Register a joining voter's Node object in the cluster DB via
-    /// raft. This creates the Node row through the raft proposer (if
-    /// attached) so all voters see the new node.
-    async fn register_voter_node(
-        &self,
-        node_name: &str,
-        addr: &str,
-        as_learner: bool,
-        node_internal_ip: Option<String>,
-        node_registration: Option<
-            crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot,
-        >,
-        legacy_node_git_commit: Option<String>,
-    ) -> anyhow::Result<()> {
-        use crate::kubelet::node::{
-            NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
-        };
-        // Extract the joiner's IP from the gRPC address
-        // (e.g. "https://10.99.0.14:7679" → "10.99.0.14")
-        let joiner_ip = addr
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        // Extract the gRPC port from the joiner's address for the
-        // grpc-port annotation (workers use it for controlplane discovery).
-        let joiner_grpc_port = addr.rsplit(':').next().and_then(|s| s.parse::<u16>().ok());
-
-        let node_role = crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner };
-        let leader_shape = self.node.current_shape();
-        // The joiner is a follower, not the leader; fix the is_leader flag.
-        // is_learner mirrors the join mode so the leader stamps the
-        // correct role label on the joiner's Node row: learners get
-        // `node-role.kubernetes.io/replica`, voter joiners get
-        // `node-role.kubernetes.io/control-plane`.
-        let joiner_shape = super::types::RaftShape {
-            voter_count: leader_shape.voter_count,
-            is_leader: false,
-            is_learner: as_learner,
-        };
-        let registration_addresses = NodeRegistrationAddresses::new(
-            node_internal_ip.unwrap_or_else(|| joiner_ip.clone()),
-            Some(joiner_ip),
-        );
-        let (node_mode, host) = match node_registration {
-            Some(registration) => {
-                let node_mode = match registration.node_mode {
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Root => {
-                        klights_types::NodePeerMode::Root
-                    }
-                    crate::replication::grpc::raft_rpc::RemoteNodeMode::Rootless => {
-                        klights_types::NodePeerMode::Rootless
-                    }
-                };
-                let host = NodeRegistrationHostFacts {
-                    cpu_count: registration.host.cpu_count,
-                    memory_ki: registration.host.memory_ki,
-                    architecture: registration.host.architecture,
-                    operating_system: registration.host.operating_system,
-                    os_image: registration.host.os_image,
-                    kernel_version: registration.host.kernel_version,
-                    container_runtime_version: registration.host.container_runtime_version,
-                    kubelet_version: registration.host.kubelet_version,
-                    git_commit: registration.host.git_commit,
-                };
-                (node_mode, host)
-            }
-            None => {
-                let existing = self
-                    .db
-                    .get_resource("v1", "Node", None, node_name)
-                    .await?
-                    .with_context(|| {
-                        format!(
-                            "legacy JoinAsControlplane rejoin for {node_name} has no persisted Node registration snapshot"
-                        )
-                    })?;
-                let node_mode = klights_types::parse_node_peer_mode(
-                    existing
-                        .data
-                        .pointer("/metadata/annotations/klights.io~1mode")
-                        .and_then(serde_json::Value::as_str),
-                )?;
-                let host = NodeRegistrationHostFacts::from_existing_node(
-                    &existing.data,
-                    legacy_node_git_commit.as_deref(),
-                )?;
-                (node_mode, host)
-            }
-        };
-        let snapshot = NodeRegistrationSnapshot {
-            node_name: node_name.to_string(),
-            node_mode,
-            node_role,
-            publish_external_ip: true,
-            addresses: registration_addresses,
-            role_projection: Some(crate::authority_adapter::project_raft_shape(
-                &node_role,
-                &joiner_shape,
-            )),
-            grpc_port: joiner_grpc_port,
-            host,
-        };
-        // The leader can validate the joiner's identity and host facts, but it
-        // does not own the joiner's kubelet/dataplane health.  Keep a newly
-        // admitted remote Node unavailable until that node publishes its own
-        // status after peer-route reconciliation.  In particular, do not pass
-        // `None` here: local single-node registration intentionally interprets
-        // an absent health tracker as healthy.
-        let pending_dataplane = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
-        pending_dataplane.set_peers_pending();
-        crate::bootstrap::node_registration_adapter::register_node_snapshot(
-            self.db.as_ref(),
-            None,
-            Some(&pending_dataplane),
-            &snapshot,
-        )
-        .await
-    }
-
-    async fn refresh_cluster_membership_metadata(
-        &self,
-        admitted_node_name: &str,
-        as_learner: bool,
-    ) -> anyhow::Result<()> {
-        let _guard = self.membership_metadata_mutex.lock().await;
-        let membership = match crate::bootstrap::cluster_meta::read_cluster_membership(
-            self.db.as_ref(),
-        )
-        .await
-        {
-            Ok(membership) => membership,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "JoinAsControlplane: cluster membership metadata unavailable; skipping voter metadata refresh"
-                );
-                return Ok(());
-            }
-        };
-        let latest = match crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref())
-            .await
-        {
-            Ok(latest) => Some(latest),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "JoinAsControlplane: latest cluster membership metadata unavailable; refreshing from initial snapshot"
-                );
-                None
-            }
-        };
-        let membership = klights_cluster_core::merge_controlplane_join_membership_metadata(
-            membership,
-            latest.as_ref(),
-            admitted_node_name,
-            as_learner,
-            &self.node.authoring_node,
-        );
-        crate::bootstrap::cluster_meta::write_cluster_membership(self.db.as_ref(), &membership)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to refresh cluster membership metadata after admitting {admitted_node_name}"
-                )
-            })
-    }
-}
-
-#[cfg(test)]
-#[cfg(any())]
-fn validate_command_codec_v3_join(command_codec_version: u32) -> std::result::Result<(), String> {
-    if command_codec_version != klights_cluster_core::COMMAND_CODEC_VERSION {
-        return Err(
-            "joining voters and learners must advertise exact command codec version 3".to_string(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-#[cfg(any())]
-#[async_trait]
-impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoinHandler {
-    async fn join(
-        &self,
-        request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
-    ) -> std::result::Result<
-        crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome,
-        crate::replication::grpc::raft_rpc::RaftRpcRouterError,
-    > {
-        use crate::replication::grpc::raft_rpc::{ControlplaneJoinOutcome, RaftRpcRouterError};
-        let crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
-            node_id,
-            addr,
-            node_name,
-            as_learner,
-            storage_incarnation,
-            storage_log_attestation,
-            command_codec_version,
-            node_internal_ip,
-            node_registration,
-            legacy_node_git_commit,
-        } = request;
-        let metrics = self.node.raft.metrics().borrow().clone();
-        let is_leader = metrics.current_leader == Some(self.node.node_id);
-        if !is_leader {
-            return Ok(match self.node.current_leader_info() {
-                Some((leader_id, leader_addr)) => ControlplaneJoinOutcome::RedirectToLeader {
-                    leader_id,
-                    leader_addr,
-                },
-                None => ControlplaneJoinOutcome::Denied {
-                    reason: "no leader currently elected; retry later".into(),
-                },
-            });
-        }
-        if let Err(reason) = validate_command_codec_v3_join(command_codec_version) {
-            return Ok(ControlplaneJoinOutcome::Denied { reason });
-        }
-        tracing::info!(
-            joining_node_id = node_id,
-            joining_node_name = %node_name,
-            joining_addr = %addr,
-            storage_incarnation = %storage_incarnation,
-            as_learner,
-            "JoinAsControlplane: leader admitting durable Raft storage incarnation"
-        );
-        let admission = self
-            .node
-            .admit_controlplane_member(
-                node_id,
-                addr.clone(),
-                as_learner,
-                storage_incarnation,
-                storage_log_attestation,
-            )
-            .await
-            .map_err(|err| {
-                RaftRpcRouterError::Dispatch(format!("admit control-plane member {node_id}: {err}"))
-            })?;
-        if admission == RaftMemberAdmissionResult::Unchanged {
-            let voter_count_after = self
-                .node
-                .raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .membership()
-                .voter_ids()
-                .count() as u32;
-            return Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after,
-                admitted_as_learner: as_learner,
-                ca_cert_pem: String::new(),
-                encrypted_ca_key: Vec::new(),
-                ca_key_nonce: [0u8; 12],
-            });
-        }
-        // Register the joining node's Node object through raft so all
-        // voters see it. The joiner skips its own local registration
-        // during bootstrap, so this is the only path that creates the
-        // Node row. (Learners need a Node row too — they serve reads.)
-        if let Err(err) = self
-            .register_voter_node(
-                &node_name,
-                &addr,
-                as_learner,
-                node_internal_ip,
-                node_registration,
-                legacy_node_git_commit,
-            )
-            .await
-        {
-            return Err(RaftRpcRouterError::Dispatch(format!(
-                "register joining Node row for {node_name}: {err}"
-            )));
-        }
-        let voter_count_after = {
-            // T4: read fresh metrics — a learner join may have demoted
-            // a voter, so voter count can change even for as_learner=true.
-            let metrics_after = self.node.raft.metrics().borrow().clone();
-            metrics_after
-                .membership_config
-                .membership()
-                .voter_ids()
-                .count() as u32
-        };
-        self.refresh_cluster_membership_metadata(&node_name, as_learner)
-            .await
-            .map_err(|err| {
-                RaftRpcRouterError::Dispatch(format!("refresh cluster membership metadata: {err}"))
-            })?;
-        Ok(ControlplaneJoinOutcome::Accepted {
-            voter_count_after,
-            admitted_as_learner: as_learner,
-            ca_cert_pem: String::new(),
-            encrypted_ca_key: Vec::new(),
-            ca_key_nonce: [0u8; 12],
-        })
-    }
-
-    async fn is_controlplane_member(&self, node_name: &str) -> bool {
-        let target = super::types::raft_node_id_for_node_name(node_name);
-        let metrics = self.node.raft.metrics().borrow().clone();
-        // `nodes()` is the full membership set (voters + learners); both are
-        // control-plane members admitted only via a controlplane-token-gated
-        // JoinAsControlplane.
-        metrics
-            .membership_config
-            .membership()
-            .nodes()
-            .any(|(id, _)| *id == target)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // Test assertions briefly lock a mock's recorded-call log to inspect it
@@ -2041,19 +1696,16 @@ mod tests {
     // and the test runtime is single-threaded, so the lint is not a concern.
     #![allow(clippy::await_holding_lock)]
     use super::*;
-    use crate::bootstrap::controlplane_join_handler::{
-        RaftNodeJoinHandler, validate_command_codec_v3_join,
-    };
+    use crate::bootstrap::controlplane_join_adapters::build_controlplane_join_handler;
+    use crate::bootstrap::controlplane_join_handler::validate_command_codec_v3_join;
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::SqliteNodeLocalDb;
-    use crate::sqlite_boundary::DbExecutor;
-    use crate::sqlite_open as opener;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn storage_attestation(
-        log: Option<crate::replication::grpc::raft_rpc::RaftStorageLogAttestation>,
-    ) -> crate::replication::grpc::raft_rpc::RaftStorageAttestation {
-        crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+        log: Option<klights_leader_api::RaftStorageLogAttestation>,
+    ) -> klights_leader_api::RaftStorageAttestation {
+        klights_leader_api::RaftStorageAttestation {
             high_watermark: log.clone(),
             current_boundary: log,
         }
@@ -2362,8 +2014,8 @@ mod tests {
 
     async fn fresh_node(node_id: NodeId) -> (RaftNode, Arc<dyn DatastoreBackend>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_executor = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let node_executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-node-test",
         )
@@ -2488,8 +2140,8 @@ mod tests {
         let mut backends = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = DbExecutor::open_with_opts(
-                opener::OpenOpts::node_in_memory(),
+            let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
+                crate::datastore::node_local::sqlite::open::in_memory_opts(),
                 supervisor.clone(),
                 "sqlite:raft-cluster-test",
             )
@@ -2676,8 +2328,8 @@ mod tests {
         let mut mocks = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = DbExecutor::open_with_opts(
-                opener::OpenOpts::node_in_memory(),
+            let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
+                crate::datastore::node_local::sqlite::open::in_memory_opts(),
                 supervisor.clone(),
                 "sqlite:raft-forward-test",
             )
@@ -2767,8 +2419,8 @@ mod tests {
         let mut backends = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = DbExecutor::open_with_opts(
-                opener::OpenOpts::node_in_memory(),
+            let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
+                crate::datastore::node_local::sqlite::open::in_memory_opts(),
                 supervisor.clone(),
                 "sqlite:raft-follower-no-local-commit-test",
             )
@@ -2880,8 +2532,8 @@ mod tests {
         use crate::datastore::raft::proposal::RaftProposal;
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-rejected-materialized-commit-test",
         )
@@ -3016,8 +2668,8 @@ mod tests {
     ) -> (RaftNode, Arc<dyn DatastoreBackend>) {
         use crate::datastore::raft::network::LoopbackRaftNetworkFactory;
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-voter-test",
         )
@@ -3404,35 +3056,33 @@ mod tests {
         storage_incarnation: &str,
         node_internal_ip: Option<&str>,
         git_commit: &str,
-    ) -> crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
-        crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+    ) -> klights_leader_api::ControlplaneJoinRequest {
+        klights_leader_api::ControlplaneJoinRequest {
             node_id,
             addr: addr.to_string(),
             node_name: node_name.to_string(),
             as_learner,
             storage_incarnation: storage_incarnation.to_string(),
-            storage_log_attestation: crate::replication::grpc::raft_rpc::RaftStorageAttestation {
+            storage_log_attestation: klights_leader_api::RaftStorageAttestation {
                 high_watermark: None,
                 current_boundary: None,
             },
             command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
             node_internal_ip: node_internal_ip.map(str::to_string),
-            node_registration: Some(
-                crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
-                    node_mode: crate::replication::grpc::raft_rpc::RemoteNodeMode::Root,
-                    host: crate::replication::grpc::raft_rpc::RemoteNodeHostFacts {
-                        cpu_count: 4,
-                        memory_ki: 8 * 1024 * 1024,
-                        architecture: "test-arch".to_string(),
-                        operating_system: "linux".to_string(),
-                        os_image: "Test Linux".to_string(),
-                        kernel_version: "6.1-test".to_string(),
-                        container_runtime_version: "containerd://1.7.0".to_string(),
-                        kubelet_version: "v1.34.0-test".to_string(),
-                        git_commit: git_commit.to_string(),
-                    },
+            node_registration: Some(klights_leader_api::RemoteNodeRegistrationSnapshot {
+                node_mode: klights_leader_api::RemoteNodeMode::Root,
+                host: klights_leader_api::RemoteNodeHostFacts {
+                    cpu_count: 4,
+                    memory_ki: 8 * 1024 * 1024,
+                    architecture: "test-arch".to_string(),
+                    operating_system: "linux".to_string(),
+                    os_image: "Test Linux".to_string(),
+                    kernel_version: "6.1-test".to_string(),
+                    container_runtime_version: "containerd://1.7.0".to_string(),
+                    kubelet_version: "v1.34.0-test".to_string(),
+                    git_commit: git_commit.to_string(),
                 },
-            ),
+            }),
             legacy_node_git_commit: None,
         }
     }
@@ -3440,9 +3090,7 @@ mod tests {
     #[tokio::test]
     async fn join_handler_on_leader_runs_add_voter_and_reports_count() {
         use crate::datastore::raft::network::LoopbackRegistry;
-        use crate::replication::grpc::raft_rpc::{
-            ControlplaneJoinHandler, ControlplaneJoinOutcome,
-        };
+        use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(50, &registry).await);
         let follower = fresh_voter_in_registry(51, &registry).await;
@@ -3454,7 +3102,8 @@ mod tests {
             .await
             .unwrap();
 
-        let handler = RaftNodeJoinHandler::new(leader.clone(), test_db().await);
+        let join_db = test_db().await;
+        let handler = build_controlplane_join_handler(leader.clone(), join_db.clone());
         let outcome = handler
             .join(test_controlplane_join_request(
                 51,
@@ -3481,8 +3130,7 @@ mod tests {
             }
             other => panic!("expected Accepted, got {other:?}"),
         }
-        let node = handler
-            .db
+        let node = join_db
             .get_resource("v1", "Node", None, "n51")
             .await
             .expect("read Node row")
@@ -3522,40 +3170,32 @@ mod tests {
         );
 
         handler
-            .join(
-                crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
-                    node_id: 51,
-                    addr: "https://10.99.0.51:7679".to_string(),
-                    node_name: "n51".to_string(),
-                    as_learner: false,
-                    storage_incarnation: follower.storage_incarnation.clone(),
-                    storage_log_attestation:
-                        crate::replication::grpc::raft_rpc::RaftStorageAttestation {
-                            high_watermark: Some(
-                                crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                                    term: u64::MAX,
-                                    leader_node_id: 50,
-                                    index: u64::MAX,
-                                },
-                            ),
-                            current_boundary: Some(
-                                crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                                    term: u64::MAX,
-                                    leader_node_id: 50,
-                                    index: u64::MAX,
-                                },
-                            ),
-                        },
-                    command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
-                    node_internal_ip: None,
-                    node_registration: None,
-                    legacy_node_git_commit: Some("legacyrejoin".to_string()),
+            .join(klights_leader_api::ControlplaneJoinRequest {
+                node_id: 51,
+                addr: "https://10.99.0.51:7679".to_string(),
+                node_name: "n51".to_string(),
+                as_learner: false,
+                storage_incarnation: follower.storage_incarnation.clone(),
+                storage_log_attestation: klights_leader_api::RaftStorageAttestation {
+                    high_watermark: Some(klights_leader_api::RaftStorageLogAttestation {
+                        term: u64::MAX,
+                        leader_node_id: 50,
+                        index: u64::MAX,
+                    }),
+                    current_boundary: Some(klights_leader_api::RaftStorageLogAttestation {
+                        term: u64::MAX,
+                        leader_node_id: 50,
+                        index: u64::MAX,
+                    }),
                 },
-            )
+                command_codec_version: klights_cluster_core::COMMAND_CODEC_VERSION,
+                node_internal_ip: None,
+                node_registration: None,
+                legacy_node_git_commit: Some("legacyrejoin".to_string()),
+            })
             .await
             .expect("persisted member may rejoin without the new snapshot");
-        let rejoined = handler
-            .db
+        let rejoined = join_db
             .get_resource("v1", "Node", None, "n51")
             .await
             .unwrap()
@@ -3574,9 +3214,7 @@ mod tests {
     #[tokio::test]
     async fn join_handler_voter_admission_updates_cluster_membership_metadata() {
         use crate::datastore::raft::network::LoopbackRegistry;
-        use crate::replication::grpc::raft_rpc::{
-            ControlplaneJoinHandler, ControlplaneJoinOutcome,
-        };
+        use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(52, &registry).await);
         let follower = fresh_voter_in_registry(53, &registry).await;
@@ -3600,7 +3238,7 @@ mod tests {
         .await
         .unwrap();
 
-        let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
+        let handler = build_controlplane_join_handler(leader.clone(), leader_db.clone());
         let outcome = handler
             .join(test_controlplane_join_request(
                 53,
@@ -3637,12 +3275,10 @@ mod tests {
 
     #[tokio::test]
     async fn join_handler_returns_no_leader_when_uninitialized() {
-        use crate::replication::grpc::raft_rpc::{
-            ControlplaneJoinHandler, ControlplaneJoinOutcome,
-        };
+        use klights_leader_api::ControlplaneJoinOutcome;
         let (node, _) = fresh_node(60).await;
         let arc = Arc::new(node);
-        let handler = RaftNodeJoinHandler::new(arc, test_db().await);
+        let handler = build_controlplane_join_handler(arc, test_db().await);
         let outcome = handler
             .join(test_controlplane_join_request(
                 61,
@@ -3669,9 +3305,7 @@ mod tests {
     #[tokio::test]
     async fn join_handler_as_learner_admits_via_add_learner_only() {
         use crate::datastore::raft::network::LoopbackRegistry;
-        use crate::replication::grpc::raft_rpc::{
-            ControlplaneJoinHandler, ControlplaneJoinOutcome,
-        };
+        use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(70, &registry).await;
         let learner = fresh_voter_in_registry(71, &registry).await;
@@ -3684,7 +3318,7 @@ mod tests {
             .unwrap();
         let leader = Arc::new(leader);
 
-        let handler = RaftNodeJoinHandler::new(leader.clone(), test_db().await);
+        let handler = build_controlplane_join_handler(leader.clone(), test_db().await);
         let outcome = handler
             .join(test_controlplane_join_request(
                 71,
@@ -3745,9 +3379,7 @@ mod tests {
     #[tokio::test]
     async fn join_handler_as_learner_registers_node_with_replica_label() {
         use crate::datastore::raft::network::LoopbackRegistry;
-        use crate::replication::grpc::raft_rpc::{
-            ControlplaneJoinHandler, ControlplaneJoinOutcome,
-        };
+        use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
         let leader = fresh_voter_in_registry(72, &registry).await;
         let learner = fresh_voter_in_registry(73, &registry).await;
@@ -3761,7 +3393,7 @@ mod tests {
         let leader = Arc::new(leader);
 
         let leader_db = test_db().await;
-        let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
+        let handler = build_controlplane_join_handler(leader.clone(), leader_db.clone());
         let outcome = handler
             .join(test_controlplane_join_request(
                 73,
@@ -3808,9 +3440,7 @@ mod tests {
     #[tokio::test]
     async fn join_handler_registers_internal_ip_separate_from_external_addr() {
         use crate::datastore::raft::network::LoopbackRegistry;
-        use crate::replication::grpc::raft_rpc::{
-            ControlplaneJoinHandler, ControlplaneJoinOutcome,
-        };
+        use klights_leader_api::ControlplaneJoinOutcome;
         let registry = LoopbackRegistry::new();
         let leader = Arc::new(fresh_voter_in_registry(80, &registry).await);
         let follower = fresh_voter_in_registry(81, &registry).await;
@@ -3823,7 +3453,7 @@ mod tests {
             .unwrap();
 
         let leader_db = test_db().await;
-        let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
+        let handler = build_controlplane_join_handler(leader.clone(), leader_db.clone());
         let outcome = handler
             .join(test_controlplane_join_request(
                 81,
@@ -3991,8 +3621,8 @@ mod tests {
     #[tokio::test]
     async fn leader_backs_off_on_session_fence_then_catches_up_without_client_rebuild() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let executor = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-session-fence-leader",
         )
@@ -4100,13 +3730,11 @@ mod tests {
                 "https://10.99.0.73:7679".into(),
                 true,
                 restored_incarnation.clone(),
-                storage_attestation(Some(
-                    crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                        term: u64::MAX,
-                        leader_node_id: 72,
-                        index: u64::MAX,
-                    },
-                )),
+                storage_attestation(Some(klights_leader_api::RaftStorageLogAttestation {
+                    term: u64::MAX,
+                    leader_node_id: 72,
+                    index: u64::MAX,
+                })),
             )
             .await
             .unwrap();
@@ -4307,13 +3935,11 @@ mod tests {
                     "https://10.99.0.81:7679".into(),
                     true,
                     incarnation.clone(),
-                    storage_attestation(Some(
-                        crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                            term: u64::MAX,
-                            leader_node_id: 80,
-                            index: u64::MAX,
-                        },
-                    )),
+                    storage_attestation(Some(klights_leader_api::RaftStorageLogAttestation {
+                        term: u64::MAX,
+                        leader_node_id: 80,
+                        index: u64::MAX,
+                    },)),
                 )
                 .await
                 .unwrap(),
@@ -4328,13 +3954,11 @@ mod tests {
                     "https://10.99.0.81:7679".into(),
                     true,
                     incarnation,
-                    storage_attestation(Some(
-                        crate::replication::grpc::raft_rpc::RaftStorageLogAttestation {
-                            term: u64::MAX,
-                            leader_node_id: 80,
-                            index: u64::MAX,
-                        },
-                    )),
+                    storage_attestation(Some(klights_leader_api::RaftStorageLogAttestation {
+                        term: u64::MAX,
+                        leader_node_id: 80,
+                        index: u64::MAX,
+                    },)),
                 )
                 .await
                 .unwrap(),
@@ -4348,7 +3972,7 @@ mod tests {
 
     #[test]
     fn current_boundary_detects_truncation_even_when_monotonic_highwater_stays_proven() {
-        use crate::replication::grpc::raft_rpc::RaftStorageLogAttestation;
+        use klights_leader_api::RaftStorageLogAttestation;
         let admitted = RaftStorageLogAttestation {
             term: 3,
             leader_node_id: 80,
@@ -4491,8 +4115,8 @@ mod tests {
 
         // Leader node.
         let sup1 = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec1 = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let exec1 = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             sup1.clone(),
             "sqlite:raft-demote-test-l",
         )
@@ -4525,8 +4149,8 @@ mod tests {
 
         // Voter node.
         let sup2 = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec2 = DbExecutor::open_with_opts(
-            opener::OpenOpts::node_in_memory(),
+        let exec2 = crate::datastore::node_local::sqlite::open::open_with_opts(
+            crate::datastore::node_local::sqlite::open::in_memory_opts(),
             sup2.clone(),
             "sqlite:raft-demote-test-v",
         )
