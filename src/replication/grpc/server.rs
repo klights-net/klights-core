@@ -55,6 +55,25 @@ pub(crate) trait GrpcRuntimeSupervision: Send + Sync {
     fn task_supervisor(&self) -> Arc<klights_supervisor::TaskSupervisor>;
 }
 
+/// Root-provided wall-clock capability for policy decisions made at the
+/// authenticated leader RPC boundary.
+///
+/// The transport owns the skew policy but must not discover wall time itself.
+/// This port moves with the reusable leader RPC transport in Phase 12A while
+/// runtime composition remains responsible for selecting the system clock.
+pub(crate) trait GrpcWallClock: Send + Sync {
+    fn now(&self) -> chrono::DateTime<chrono::Utc>;
+}
+
+impl<F> GrpcWallClock for F
+where
+    F: Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync,
+{
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self()
+    }
+}
+
 #[async_trait::async_trait]
 pub(crate) trait GrpcBootstrapRuntime: Send + Sync {
     async fn validate_controlplane_bootstrap_token(
@@ -529,6 +548,7 @@ impl ReplicationServerPorts {
 pub struct GrpcReplicationServer {
     runtime: GrpcReplicationRuntimePorts,
     ports: ReplicationServerPorts,
+    wall_clock: Arc<dyn GrpcWallClock>,
     #[cfg(test)]
     db: Option<DatastoreHandle>,
     node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
@@ -561,12 +581,14 @@ impl GrpcReplicationServer {
         ports: ReplicationServerPorts,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
+        wall_clock: Arc<dyn GrpcWallClock>,
         #[cfg(test)] db: Option<DatastoreHandle>,
     ) -> Self {
         let controlplane_ca_files = ControlplaneCaFiles::new(runtime.supervision.task_supervisor());
         Self {
             runtime,
             ports,
+            wall_clock,
             #[cfg(test)]
             db,
             node_self_query: None,
@@ -619,12 +641,14 @@ impl GrpcReplicationServer {
         ports: ReplicationServerPorts,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
+        wall_clock: Arc<dyn GrpcWallClock>,
     ) -> Self {
         Self::from_parts(
             runtime,
             ports,
             peer_authenticator,
             credential_issuer,
+            wall_clock,
             #[cfg(test)]
             None,
         )
@@ -715,8 +739,15 @@ impl GrpcReplicationServer {
                     supervisor,
                 ),
             ),
+            Arc::new(chrono::Utc::now),
             Some(db),
         )
+    }
+
+    #[cfg(test)]
+    fn with_wall_clock(mut self, wall_clock: Arc<dyn GrpcWallClock>) -> Self {
+        self.wall_clock = wall_clock;
+        self
     }
 
     /// P3-11b: attach a Raft RPC dispatcher so this server can handle
@@ -1290,6 +1321,7 @@ pub(crate) fn mount_service_full_production(
     ports: ReplicationServerPorts,
     peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
     credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
+    wall_clock: Arc<dyn GrpcWallClock>,
     raft_rpc_router: Option<Arc<dyn crate::replication::grpc::raft_rpc::RaftRpcRouter>>,
     controlplane_join_handler: Option<Arc<dyn klights_leader_api::ControlplaneJoinHandler>>,
     runtime_files: ReplicationRuntimeFiles,
@@ -1305,6 +1337,7 @@ pub(crate) fn mount_service_full_production(
         ports,
         peer_authenticator,
         credential_issuer,
+        wall_clock,
     )
     .with_runtime_files(runtime_files)
     .with_watch_heartbeat_interval(transport_policy.watch_heartbeat_interval);
@@ -2182,7 +2215,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                 "lease_duration_seconds must be positive",
             ));
         }
-        validate_node_lease_renew_time_skew(&req.renew_time, chrono::Utc::now())?;
+        validate_node_lease_renew_time_skew(&req.renew_time, self.wall_clock.now())?;
         let renewal = klights_leader_api::NodeLeaseRenewalRequest::try_new(
             req.node_name,
             req.renew_time,
@@ -6567,10 +6600,13 @@ mod tests {
 
     #[tokio::test]
     async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
+        let wall_time = chrono::DateTime::parse_from_rfc3339("2040-02-03T04:05:06Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let db = crate::datastore::test_support::in_memory().await;
         let db: DatastoreHandle = Arc::new(db);
         let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
-            chrono::Utc::now(),
+            wall_time,
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
@@ -6578,10 +6614,10 @@ mod tests {
             service,
             db.clone(),
             tracker.clone(),
-        );
+        )
+        .with_wall_clock(Arc::new(move || wall_time));
 
-        let skewed =
-            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::seconds(101));
+        let skewed = crate::k8s_time::format_time(wall_time - chrono::Duration::seconds(101));
         let status = grpc
             .renew_node_lease(request_with_node_client_cert(
                 klights_internal_protobuf::RenewNodeLeaseRequest {
@@ -7069,15 +7105,16 @@ mod tests {
 
     #[tokio::test]
     async fn renew_node_lease_rpc_updates_memory_without_cluster_db_write() {
+        let wall_time = chrono::DateTime::parse_from_rfc3339("2040-02-03T04:05:06Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let db = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
             .unwrap();
         let before_rv = db.get_current_resource_version().await.unwrap();
         let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
-            chrono::DateTime::parse_from_rfc3339("2026-05-25T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
+            wall_time,
         ));
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
@@ -7085,9 +7122,10 @@ mod tests {
             service,
             db.clone(),
             tracker.clone(),
-        );
+        )
+        .with_wall_clock(Arc::new(move || wall_time));
 
-        let renew_time = crate::k8s_time::format_time(chrono::Utc::now());
+        let renew_time = crate::k8s_time::format_time(wall_time);
         grpc.renew_node_lease(request_with_node_client_cert(
             klights_internal_protobuf::RenewNodeLeaseRequest {
                 node_name: "worker-1".to_string(),

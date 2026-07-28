@@ -1793,6 +1793,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         supervisor.clone(),
                     ),
                 ),
+                Arc::new(chrono::Utc::now),
                 raft_rpc_router,
                 controlplane_join_handler,
                 crate::replication::grpc::ReplicationRuntimeFiles {
