@@ -211,6 +211,7 @@ impl KubeletStatusDeliveryServices {
 pub(crate) struct KubeletLocalExecutionServices {
     pub(crate) pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
     pub(crate) pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
+    pub(crate) wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     pub(crate) task_supervisor: Arc<TaskSupervisor>,
     pub(crate) file_process: FileProcessExecutor,
     pub(crate) config: KubeletConfig,
@@ -220,6 +221,7 @@ impl KubeletLocalExecutionServices {
     pub(crate) fn new(
         pod_runtime_store: Arc<dyn klights_node_store::PodRuntimeStore>,
         pod_endpoint_store: Arc<dyn klights_node_store::PodEndpointStore>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
         task_supervisor: Arc<TaskSupervisor>,
         file_process: FileProcessExecutor,
         config: KubeletConfig,
@@ -227,6 +229,7 @@ impl KubeletLocalExecutionServices {
         Self {
             pod_runtime_store,
             pod_endpoint_store,
+            wall_clock,
             task_supervisor,
             file_process,
             config,

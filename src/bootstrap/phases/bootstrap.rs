@@ -1056,6 +1056,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::kubelet::context::KubeletLocalExecutionServices::new(
             node_pod_runtime_store,
             node_pod_endpoint_store,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             supervisor.clone(),
             kubelet_file_process,
             kubelet_config,

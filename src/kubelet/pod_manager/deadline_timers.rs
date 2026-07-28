@@ -14,8 +14,9 @@ impl DeadlineTimerRegistry {
     }
 }
 
-pub(super) fn parse_deadline_timer_delay_secs(
+pub(super) fn parse_deadline_timer_delay_secs_at(
     pod: &serde_json::Value,
+    now_unix_seconds: i64,
 ) -> Option<(String, String, u64, String)> {
     let deadline_secs = pod
         .pointer("/spec/activeDeadlineSeconds")
@@ -55,8 +56,7 @@ pub(super) fn parse_deadline_timer_delay_secs(
     let start_ts = chrono::DateTime::parse_from_rfc3339(start_time_raw)
         .ok()
         .map(|dt| dt.timestamp())?;
-    let now = chrono::Utc::now().timestamp();
-    let elapsed = std::cmp::max(0, now - start_ts);
+    let elapsed = std::cmp::max(0, now_unix_seconds - start_ts);
     let remaining = std::cmp::max(0, deadline_secs - elapsed) as u64;
     let schedule_key = format!("{}/{}@{}:{}", namespace, pod_name, start_ts, deadline_secs);
     Some((namespace, pod_name, remaining, schedule_key))
@@ -64,12 +64,13 @@ pub(super) fn parse_deadline_timer_delay_secs(
 
 pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
     pod: &serde_json::Value,
+    now_unix_seconds: i64,
     registry: DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     let Some((namespace, pod_name, delay_secs, schedule_key)) =
-        parse_deadline_timer_delay_secs(pod)
+        parse_deadline_timer_delay_secs_at(pod, now_unix_seconds)
     else {
         return;
     };

@@ -2446,12 +2446,14 @@ async fn test_enqueue_job_reconcile_skips_when_dispatcher_not_bound() {
 
 #[test]
 fn test_parse_deadline_timer_delay_secs_uses_creation_timestamp_when_start_time_missing() {
-    let now = chrono::Utc::now();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-04-28T00:00:02Z")
+        .unwrap()
+        .timestamp();
     let pod = serde_json::json!({
         "metadata": {
             "namespace": "default",
             "name": "ads-pod",
-            "creationTimestamp": (now - chrono::Duration::seconds(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            "creationTimestamp": "2026-04-28T00:00:00Z"
         },
         "spec": {
             "activeDeadlineSeconds": 5
@@ -2461,14 +2463,10 @@ fn test_parse_deadline_timer_delay_secs_uses_creation_timestamp_when_start_time_
         }
     });
 
-    let parsed = parse_deadline_timer_delay_secs(&pod).expect("deadline timer metadata");
+    let parsed = parse_deadline_timer_delay_secs_at(&pod, now).expect("deadline timer metadata");
     assert_eq!(parsed.0, "default");
     assert_eq!(parsed.1, "ads-pod");
-    assert!(
-        parsed.2 <= 3 && parsed.2 >= 1,
-        "remaining seconds should be around 3s, got {}",
-        parsed.2
-    );
+    assert_eq!(parsed.2, 3);
 }
 
 #[test]

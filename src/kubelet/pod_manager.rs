@@ -508,6 +508,10 @@ async fn run_pod_watcher_with_runtime(
                         task_supervisor: local_execution.task_supervisor.clone(),
                         file_process: local_execution.file_process.clone(),
                         deadline_timers: state.deadline_timers.clone(),
+                        now_unix_seconds: local_execution
+                            .wall_clock
+                            .now_ms()
+                            .div_euclid(1_000),
                         node_capacity: kubelet_config.node_capacity(),
                         paths: kubelet_config.paths().clone(),
                     },
@@ -709,16 +713,25 @@ async fn clear_pod_start_retry_state(
 fn parse_deadline_timer_delay_secs(
     pod: &serde_json::Value,
 ) -> Option<(String, String, u64, String)> {
-    deadline_timers::parse_deadline_timer_delay_secs(pod)
+    parse_deadline_timer_delay_secs_at(pod, chrono::Utc::now().timestamp())
+}
+#[cfg(test)]
+fn parse_deadline_timer_delay_secs_at(
+    pod: &serde_json::Value,
+    now_unix_seconds: i64,
+) -> Option<(String, String, u64, String)> {
+    deadline_timers::parse_deadline_timer_delay_secs_at(pod, now_unix_seconds)
 }
 async fn schedule_active_deadline_timer_for_modified_pod(
     pod: &serde_json::Value,
+    now_unix_seconds: i64,
     registry: deadline_timers::DeadlineTimerRegistry,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     deadline_timers::schedule_active_deadline_timer_for_modified_pod(
         pod,
+        now_unix_seconds,
         registry,
         task_supervisor,
         pod_lifecycle_router,

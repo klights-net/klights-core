@@ -566,6 +566,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         crate::kubelet::context::KubeletLocalExecutionServices::new(
             pod_runtime_store,
             pod_endpoint_store,
+            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             task_supervisor.clone(),
             file_process.clone(),
             kubelet_config,

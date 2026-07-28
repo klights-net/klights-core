@@ -29,6 +29,7 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pub file_process: klights_supervisor::FileProcessExecutor,
     pub deadline_timers: super::deadline_timers::DeadlineTimerRegistry,
+    pub now_unix_seconds: i64,
     pub node_capacity: crate::kubelet::node::NodeCapacity,
     pub paths: crate::kubelet::runtime_paths::KubeletRuntimePaths,
 }
@@ -46,6 +47,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         task_supervisor,
         file_process,
         deadline_timers,
+        now_unix_seconds,
         node_capacity,
         paths,
     } = context;
@@ -151,6 +153,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
     if event.event_type == EventType::Modified {
         schedule_active_deadline_timer_for_modified_pod(
             &event.object,
+            now_unix_seconds,
             deadline_timers,
             task_supervisor.clone(),
             pod_lifecycle_router.clone(),
@@ -932,6 +935,7 @@ mod tests {
                 pod_lifecycle_router,
                 task_supervisor: supervisor,
                 deadline_timers: super::deadline_timers::DeadlineTimerRegistry::default(),
+                now_unix_seconds: 1_777_334_400,
                 node_capacity: crate::kubelet::node::NodeCapacity::default(),
                 paths,
             },
