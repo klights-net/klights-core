@@ -348,7 +348,7 @@ impl RemoteApiClient {
             let _ = supervisor
                 .sleep(
                     "remote_api_informer_reconnect",
-                    crate::utils::watch_reconnect_delay(attempt),
+                    crate::reconnect_backoff::delay(attempt),
                 )
                 .await;
         }

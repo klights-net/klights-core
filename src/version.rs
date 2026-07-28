@@ -24,6 +24,11 @@ pub const GIT_VERSION_WITH_COMMIT: &str = concat!(
     env!("KLIGHTS_GIT_COMMIT_SHORT"),
 );
 
+/// Immutable identity injected by the composition root into feature code.
+pub fn build_identity() -> klights_types::BuildIdentity {
+    klights_types::BuildIdentity::new(GIT_VERSION, GIT_COMMIT_SHORT)
+}
+
 /// Get klights version from git tag (e.g., "v1.0.0" → "1.0.0", "1.0.0" → "1.0.0")
 ///
 /// Validation is done in build.rs at compile time

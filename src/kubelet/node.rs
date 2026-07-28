@@ -25,7 +25,7 @@ pub use crate::kubelet::node_status_merge::{
     merge_existing_node_mutable_fields, merge_node_status_for_update, set_node_external_ip,
 };
 #[cfg(test)]
-pub(super) use crate::kubelet::node_status_projection::stamp_current_git_commit_annotation;
+pub(super) use crate::kubelet::node_status_projection::stamp_git_commit_annotation;
 pub(super) use crate::kubelet::node_status_projection::{
     NodeNetworkConditions, apply_network_conditions,
 };
@@ -226,7 +226,7 @@ pub async fn refresh_node_network_conditions(
     let dataplane_health = dataplane_health.snapshot();
     let conditions = NodeNetworkConditions::from_health(Some(&dataplane_health));
     let mut node = existing.data.as_ref().clone();
-    let commit_changed = stamp_current_git_commit_annotation(&mut node);
+    let commit_changed = stamp_git_commit_annotation(&mut node, "test-commit");
     let status_changed = apply_network_conditions(&mut node, &conditions);
 
     if let Some(outbox) = outbox {
@@ -280,6 +280,7 @@ pub async fn refresh_current_git_commit_annotation_via_leader(
     query: &dyn klights_leader_api::LeaderResourceQuery,
     commands: &dyn klights_leader_api::LeaderResourceCommand,
     node_name: &str,
+    git_commit: &str,
 ) -> Result<()> {
     let get = klights_leader_api::node_get_request(
         node_name,
@@ -288,7 +289,7 @@ pub async fn refresh_current_git_commit_annotation_via_leader(
     let Some(current) = query.get_resource(get).await? else {
         return Ok(());
     };
-    let command = current_git_commit_annotation_patch_command(&current);
+    let command = current_git_commit_annotation_patch_command(&current, git_commit);
     let request = klights_leader_api::ResourceCommandRequest::try_new(command)?;
     commands
         .submit_resource_command(request)
@@ -301,6 +302,7 @@ pub async fn refresh_current_git_commit_annotation_via_leader(
 
 fn current_git_commit_annotation_patch_command(
     node: &klights_cluster_core::Resource,
+    git_commit: &str,
 ) -> StorageCommand {
     use klights_network_api::GIT_COMMIT_ANNOTATION;
     StorageCommand::PatchResource {
@@ -312,7 +314,7 @@ fn current_git_commit_annotation_patch_command(
         patch: serde_json::json!({
             "metadata": {
                 "annotations": {
-                    GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT,
+                    GIT_COMMIT_ANNOTATION: git_commit,
                 }
             }
         }),
@@ -406,11 +408,11 @@ fn epoch_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
+    use crate::k8s_time::now_time as k8s_time_now;
     use crate::kubelet::node_heartbeat::{
         NODE_HEARTBEAT_INTERVAL, build_lease, run_heartbeat_with_interval,
     };
     use crate::networking::dataplane_health::DataplaneHealth;
-    use crate::utils::k8s_time_now;
     use std::sync::{Arc as StdArc, Mutex};
     use std::time::Duration;
 
@@ -456,7 +458,7 @@ mod tests {
             peer_mode,
             role,
             publish_external_ip,
-            "v1.34.6+klights-test".to_string(),
+            klights_types::BuildIdentity::new("v1.34.6+klights-test", "test-commit"),
         )
     }
 
@@ -724,7 +726,7 @@ mod tests {
                 "metadata": {
                     "name": name,
                     "annotations": {
-                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT
+                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: "test-commit"
                     }
                 },
                 "status": {
@@ -847,7 +849,7 @@ mod tests {
             node.data
                 .pointer("/metadata/annotations/klights.io~1git-commit")
                 .and_then(|value| value.as_str()),
-            Some(crate::version::GIT_COMMIT_SHORT),
+            Some("test-commit"),
             "network status refresh must not forward a stale build commit from the local Node cache"
         );
     }
@@ -884,7 +886,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
 
-        refresh_current_git_commit_annotation_via_leader(&client, &client, "node-a")
+        refresh_current_git_commit_annotation_via_leader(&client, &client, "node-a", "abcdef12")
             .await
             .unwrap();
 
@@ -897,7 +899,7 @@ mod tests {
             node.data
                 .pointer("/metadata/annotations/klights.io~1git-commit")
                 .and_then(|value| value.as_str()),
-            Some(crate::version::GIT_COMMIT_SHORT),
+            Some("abcdef12"),
             "leader-applied self patch must publish the caller's current build commit"
         );
     }
@@ -2228,8 +2230,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("Node must publish klights.io/git-commit annotation");
         assert_eq!(
-            commit,
-            crate::version::GIT_COMMIT_SHORT,
+            commit, "test-commit",
             "published git-commit annotation must match the build-time short hash"
         );
         assert!(

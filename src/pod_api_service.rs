@@ -389,7 +389,7 @@ impl PodApiService {
             {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    Value::String(crate::utils::k8s_time_now()),
+                    Value::String(crate::k8s_time::now_time()),
                 );
             }
             let generation = meta_obj
@@ -425,14 +425,14 @@ impl PodApiService {
                 json!({
                     "type": "PodScheduled",
                     "status": "False",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                     "reason": "SchedulingPending",
                 })
             } else if let Some(message) = scheduling_decision.unschedulable_message.as_deref() {
                 json!({
                     "type": "PodScheduled",
                     "status": "False",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                     "reason": "Unschedulable",
                     "message": message,
                 })
@@ -440,7 +440,7 @@ impl PodApiService {
                 json!({
                     "type": "PodScheduled",
                     "status": "True",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                 })
             };
             tracing::info!(
@@ -456,17 +456,17 @@ impl PodApiService {
                         {
                             "type": "Initialized",
                             "status": "True",
-                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                         },
                         {
                             "type": "Ready",
                             "status": "False",
-                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                         },
                         {
                             "type": "ContainersReady",
                             "status": "False",
-                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                         },
                         pod_scheduled_condition
                     ],
@@ -717,7 +717,7 @@ impl PodApiService {
                         json!({
                             "type": "PodScheduled",
                             "status": "False",
-                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                             "reason": "Unschedulable",
                             "message": message,
                         })
@@ -725,7 +725,7 @@ impl PodApiService {
                         json!({
                             "type": "PodScheduled",
                             "status": "True",
-                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                         })
                     },
                 );
@@ -1835,7 +1835,7 @@ async fn write_preemption_termination(
 }
 
 fn mark_pod_preempted_metadata(data: &mut Value) {
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
     if let Some(meta) = data.get_mut("metadata").and_then(|v| v.as_object_mut()) {
         meta.entry("deletionTimestamp".to_string())
             .or_insert_with(|| json!(now.clone()));
@@ -1856,7 +1856,7 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
     let condition = json!({
         "type": "DisruptionTarget",
         "status": "True",
-        "lastTransitionTime": crate::utils::k8s_timestamp(),
+        "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
         "reason": "PreemptionByScheduler",
         "message": format!("Preempted by pod {preemptor_namespace}/{preemptor_name} on node")
     });
@@ -1877,7 +1877,7 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
                         Some(json!({
                             "type": "PodScheduled",
                             "status": "True",
-                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                         }))
                     })
             } else {
@@ -2057,7 +2057,7 @@ fn upsert_pod_scheduled_true(pod: &mut Value) -> Result<(), AppError> {
     conditions_array.push(json!({
         "type": "PodScheduled",
         "status": "True",
-        "lastTransitionTime": crate::utils::k8s_timestamp()
+        "lastTransitionTime": crate::k8s_time::now_legacy_timestamp()
     }));
     Ok(())
 }

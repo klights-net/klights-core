@@ -2,7 +2,7 @@
 
 /// Derive the Kubernetes API Service IP (the first usable address).
 pub(crate) fn kubernetes_service_ip(service_cidr: &str) -> String {
-    crate::utils::derive_first_ip(service_cidr)
+    klights_types::first_usable_ipv4(service_cidr)
 }
 
 /// Derive the cluster DNS Service IP (network address plus ten).

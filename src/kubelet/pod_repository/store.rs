@@ -245,7 +245,7 @@ impl PodStore {
             .and_then(|m| m.get("deletionTimestamp"))
             .filter(|value| !value.is_null())
             .cloned()
-            .unwrap_or_else(|| Value::String(crate::utils::k8s_timestamp()));
+            .unwrap_or_else(|| Value::String(crate::k8s_time::now_legacy_timestamp()));
         let deletion_grace_period_seconds = metadata
             .and_then(|m| m.get("deletionGracePeriodSeconds"))
             .cloned()

@@ -1,17 +1,29 @@
 //! `Controller` impl for `PodDisruptionBudget`. Registered in `ControllerDispatcher`.
 
-use crate::controllers::controller_wrapper;
 use crate::controllers::pdb as pdb_core;
 
-controller_wrapper!(
-    PDBController,
-    "poddisruptionbudget",
-    pdb_core::reconcile_pdb,
-    no_node,
-    with_pod_reader,
-    store = pdb_store,
-    reader = pdb_reader
-);
+pub struct PDBController;
+
+#[async_trait::async_trait]
+impl crate::controllers::Controller for PDBController {
+    fn name(&self) -> &'static str {
+        "poddisruptionbudget"
+    }
+
+    async fn reconcile(
+        &self,
+        resource: serde_json::Value,
+        ctx: crate::controllers::Context,
+    ) -> anyhow::Result<()> {
+        pdb_core::reconcile_pdb_at(
+            ctx.pdb_store(),
+            ctx.pdb_reader(),
+            &resource,
+            ctx.reconcile_time(),
+        )
+        .await
+    }
+}
 
 #[cfg(test)]
 mod tests {

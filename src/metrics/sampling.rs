@@ -182,8 +182,8 @@ async fn read_proc_node_usage(
 }
 
 fn read_proc_node_usage_blocking() -> anyhow::Result<ProcNodeUsage> {
-    let stat = crate::utils::read_utf8_file("/proc/stat").context("read /proc/stat")?;
-    let meminfo = crate::utils::read_utf8_file("/proc/meminfo").context("read /proc/meminfo")?;
+    let stat = crate::runtime_fs::read_utf8("/proc/stat").context("read /proc/stat")?;
+    let meminfo = crate::runtime_fs::read_utf8("/proc/meminfo").context("read /proc/meminfo")?;
     parse_proc_node_usage(&stat, &meminfo)
 }
 

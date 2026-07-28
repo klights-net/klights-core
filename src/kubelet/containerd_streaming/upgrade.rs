@@ -64,6 +64,7 @@ impl SpdyExec {
         Ok(())
     }
 
+    #[allow(dead_code)] // Used by the private codec's stream-negotiation tests.
     pub fn stream_id_for(&self, stream_type: StreamType) -> Option<u32> {
         self.streams
             .iter()

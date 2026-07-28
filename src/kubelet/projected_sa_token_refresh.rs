@@ -230,7 +230,7 @@ async fn write_projected_service_account_token_file(
     token_ref: ProjectedServiceAccountTokenRef,
     token: String,
 ) -> Result<()> {
-    if !crate::utils::path_exists_async(file_process, &volume_path).await? {
+    if !crate::runtime_fs::exists_async(file_process, &volume_path).await? {
         anyhow::bail!("projected volume path {} no longer exists", volume_path);
     }
     let key = volume_path.clone();
@@ -337,7 +337,7 @@ pub(crate) async fn refresh_projected_service_account_tokens_once(
         if recreated_volumes.contains(&token_ref.volume_name) {
             continue;
         }
-        if !crate::utils::path_exists_async(&request.file_process, &volume_path).await? {
+        if !crate::runtime_fs::exists_async(&request.file_process, &volume_path).await? {
             recreate_projected_service_account_token_volume(&request, pod, &token_ref.volume_name)
                 .await?;
             recreated_volumes.insert(token_ref.volume_name);

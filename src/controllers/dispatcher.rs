@@ -722,7 +722,9 @@ impl ControllerDispatcher {
             return Ok(());
         }
 
-        let Some(delay) = crate::controllers::job::job_ttl_cleanup_delay(&resource.data)? else {
+        let Some(delay) =
+            crate::controllers::job::job_ttl_cleanup_delay_at(&resource.data, chrono::Utc::now())?
+        else {
             return Ok(());
         };
 
@@ -754,7 +756,11 @@ impl ControllerDispatcher {
         {
             return Ok(());
         }
-        let Some(delay) = crate::controllers::job::job_ttl_cleanup_delay(&resource.data)? else {
+        let Some(delay) = crate::controllers::job::job_ttl_cleanup_delay_at(
+            &resource.data,
+            (self.dependencies.wall_time)(),
+        )?
+        else {
             return Ok(());
         };
         if delay.is_zero() {
@@ -908,7 +914,10 @@ impl ControllerDispatcher {
         }
         if let Some(controller) = self.controllers.get(&(api_version, kind)) {
             controller
-                .reconcile(resource.clone(), Context::new(self.dependencies.clone()))
+                .reconcile(
+                    resource.clone(),
+                    Context::new(self.dependencies.clone(), (self.dependencies.wall_time)()),
+                )
                 .await?;
         }
         Ok(())
@@ -1429,7 +1438,7 @@ mod tests {
                 "metadata": {
                     "name": "terminating-jobs",
                     "uid": "terminating-ns-uid",
-                    "deletionTimestamp": crate::utils::k8s_timestamp(),
+                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
                 },
                 "spec": {"finalizers": ["kubernetes"]},
                 "status": {"phase": "Terminating"}
@@ -1722,7 +1731,7 @@ mod tests {
                     "name": "ttl-deleting-job",
                     "namespace": "default",
                     "uid": "uid-ttl-deleting-job",
-                    "deletionTimestamp": crate::utils::k8s_timestamp(),
+                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
                     "finalizers": ["foregroundDeletion"]
                 },
                 "spec": {

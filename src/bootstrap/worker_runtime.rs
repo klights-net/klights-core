@@ -458,7 +458,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let kubelet_capacity =
         crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
             &file_process,
-            crate::version::GIT_VERSION,
+            &registration_profile,
         )
         .await
         .node_capacity();

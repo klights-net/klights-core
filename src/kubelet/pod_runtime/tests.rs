@@ -10335,7 +10335,7 @@ async fn real_runtime_actor_cycle_starts_reconciles_running_and_deletes_pod() {
 
     let mut terminating_pod = running_pod;
     terminating_pod["metadata"]["deletionTimestamp"] =
-        serde_json::Value::String(crate::utils::k8s_timestamp());
+        serde_json::Value::String(crate::k8s_time::now_legacy_timestamp());
     router
         .route(LifecycleMessage::WatchDeleted {
             key: lifecycle_key,

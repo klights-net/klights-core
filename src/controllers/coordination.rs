@@ -20,13 +20,24 @@ pub(crate) enum CoordinatedControllerKind {
 pub(crate) struct ControllerReconcileContext<'a> {
     pub(crate) coordination: &'a ControllerCoordination,
     pub(crate) node_name: &'a str,
+    pub(crate) wall_time: chrono::DateTime<chrono::Utc>,
 }
 
 impl<'a> ControllerReconcileContext<'a> {
+    #[cfg(test)]
     pub(crate) fn new(coordination: &'a ControllerCoordination, node_name: &'a str) -> Self {
+        Self::at(coordination, node_name, chrono::Utc::now())
+    }
+
+    pub(crate) fn at(
+        coordination: &'a ControllerCoordination,
+        node_name: &'a str,
+        wall_time: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         Self {
             coordination,
             node_name,
+            wall_time,
         }
     }
 }

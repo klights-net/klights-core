@@ -33,7 +33,7 @@ async fn test_downward_api_volume_creates_file_with_metadata_name() {
             .await
             .unwrap();
 
-    let content = crate::utils::read_utf8_file(format!("{}/pod-name", volume_path)).unwrap();
+    let content = crate::runtime_fs::read_utf8(format!("{}/pod-name", volume_path)).unwrap();
     assert_eq!(content, "test-pod");
 }
 
@@ -453,7 +453,7 @@ async fn test_downward_api_volume_creates_labels_file() {
             .await
             .unwrap();
 
-    let content = crate::utils::read_utf8_file(format!("{}/labels", volume_path)).unwrap();
+    let content = crate::runtime_fs::read_utf8(format!("{}/labels", volume_path)).unwrap();
     assert!(content.contains("app=\"nginx\""));
     assert!(content.contains("version=\"v1.2\""));
 }
@@ -504,10 +504,10 @@ async fn test_downward_api_volume_creates_resource_limits_file() {
     .unwrap();
 
     // K8s downward API converts: CPU → whole cores (ceiling), memory → bytes
-    let cpu = crate::utils::read_utf8_file(format!("{}/cpu_limit", volume_path)).unwrap();
+    let cpu = crate::runtime_fs::read_utf8(format!("{}/cpu_limit", volume_path)).unwrap();
     assert_eq!(cpu, "1"); // 500m → ceil(500/1000) = 1 core
 
-    let mem = crate::utils::read_utf8_file(format!("{}/mem_limit", volume_path)).unwrap();
+    let mem = crate::runtime_fs::read_utf8(format!("{}/mem_limit", volume_path)).unwrap();
     assert_eq!(mem, "268435456"); // 256Mi → 268435456 bytes
 }
 

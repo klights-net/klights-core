@@ -65,7 +65,7 @@ pub(super) async fn spawn_cri_event_forwarder(
                     stream
                 }
                 Err(e) => {
-                    let delay = crate::utils::watch_reconnect_delay(reconnect_attempt);
+                    let delay = crate::reconnect_backoff::delay(reconnect_attempt);
                     tracing::warn!(
                         "CRI event-stream subscribe attempt {} failed: {:#} - retry in {:?}",
                         reconnect_attempt + 1,

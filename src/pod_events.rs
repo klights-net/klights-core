@@ -338,7 +338,7 @@ where
     let random_suffix = &random_suffix[0..8];
     let event_name = format!("{}.{}", pod_name, random_suffix);
 
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
 
     // Conformance stability: kubelet may re-enter create/reconcile paths for the
     // same pod while assignment is unchanged. Avoid unbounded duplicate Scheduled
@@ -786,7 +786,7 @@ mod tests {
                 "metadata": {
                     "name": "terminating-events",
                     "uid": "terminating-events-uid",
-                    "deletionTimestamp": crate::utils::k8s_timestamp()
+                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp()
                 },
                 "spec": {"finalizers": ["kubernetes"]},
                 "status": {"phase": "Terminating"}

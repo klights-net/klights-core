@@ -448,7 +448,7 @@ pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds
     {
         meta.insert(
             "deletionTimestamp".to_string(),
-            Value::String(crate::utils::k8s_timestamp()),
+            Value::String(crate::k8s_time::now_legacy_timestamp()),
         );
         meta.insert(
             "deletionGracePeriodSeconds".to_string(),
@@ -459,7 +459,7 @@ pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds
         .pointer("/metadata/deletionTimestamp")
         .is_some_and(|timestamp| !timestamp.is_null())
     {
-        let transition_time = crate::utils::k8s_timestamp();
+        let transition_time = crate::k8s_time::now_legacy_timestamp();
         klights_types::mark_terminating_pod_unready_at(&mut data, &transition_time);
     }
     data

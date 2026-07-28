@@ -22,10 +22,11 @@ pub(crate) trait PdbPodReader: Send + Sync {
     async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
 }
 
-pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
+pub(crate) async fn reconcile_pdb_at<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
     store: &Store,
     pod_reader: &Pods,
     pdb: &Value,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let metadata = pdb.get("metadata").context("PDB missing metadata")?;
     let name = metadata
@@ -120,6 +121,7 @@ pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader +
             current_healthy,
             desired_healthy,
             disrupted_pods,
+            now,
         );
 
         if current.data.get("status") == Some(&status) {
@@ -155,6 +157,15 @@ pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader +
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
+    store: &Store,
+    pod_reader: &Pods,
+    pdb: &Value,
+) -> Result<()> {
+    reconcile_pdb_at(store, pod_reader, pdb, chrono::Utc::now()).await
+}
+
 fn build_pdb_status(
     current_pdb: &Value,
     metadata: &Value,
@@ -162,6 +173,7 @@ fn build_pdb_status(
     current_healthy: i64,
     desired_healthy: i64,
     disrupted_pods: serde_json::Map<String, Value>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     let disruptions_allowed =
         (current_healthy - desired_healthy - disrupted_pods.len() as i64).max(0);
@@ -185,7 +197,7 @@ fn build_pdb_status(
         .and_then(|conditions| {
             crate::controllers::common::condition_by_type(conditions, "SufficientPods")
         });
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::format_legacy_timestamp(now);
     crate::controllers::common::preserve_condition_transition_time(&mut condition, previous, &now);
 
     let mut status = json!({
@@ -230,6 +242,7 @@ pub(crate) async fn reconcile_pdbs_for_namespace<
     store: &Store,
     pod_reader: &Pods,
     namespace: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     let pdb_list = match store.list_pdbs(namespace).await {
         Ok(list) => list,
@@ -240,7 +253,7 @@ pub(crate) async fn reconcile_pdbs_for_namespace<
     };
 
     for pdb_resource in pdb_list {
-        if let Err(e) = reconcile_pdb(store, pod_reader, &pdb_resource.data).await {
+        if let Err(e) = reconcile_pdb_at(store, pod_reader, &pdb_resource.data, now).await {
             tracing::warn!(
                 "Failed to reconcile PDB {}/{}: {}",
                 namespace,
@@ -262,17 +275,19 @@ pub(crate) async fn reconcile_pdbs_for_namespace_checked<
     store: &Store,
     pod_reader: &Pods,
     namespace: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     for pdb in store.list_pdbs(namespace).await? {
-        reconcile_pdb(store, pod_reader, &pdb.data).await?;
+        reconcile_pdb_at(store, pod_reader, &pdb.data, now).await?;
     }
     Ok(())
 }
 
-pub(crate) async fn admit_pod_eviction<Store: PdbStore + ?Sized>(
+pub(crate) async fn admit_pod_eviction_at<Store: PdbStore + ?Sized>(
     store: &Store,
     pod: &Resource,
     dry_run: bool,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<PodEvictionAdmissionOutcome> {
     if can_ignore_pdb_for_eviction(&pod.data) {
         return Ok(PodEvictionAdmissionOutcome::Allowed);
@@ -396,7 +411,7 @@ pub(crate) async fn admit_pod_eviction<Store: PdbStore + ?Sized>(
         if !status.get("disruptedPods").is_some_and(Value::is_object) {
             status["disruptedPods"] = json!({});
         }
-        status["disruptedPods"][pod_name] = json!(crate::utils::k8s_timestamp());
+        status["disruptedPods"][pod_name] = json!(crate::k8s_time::format_legacy_timestamp(now));
 
         match store
             .update_status(
@@ -429,6 +444,15 @@ pub(crate) async fn admit_pod_eviction<Store: PdbStore + ?Sized>(
     }
 
     unreachable!("bounded PDB admission retry loop always returns")
+}
+
+#[cfg(test)]
+pub(crate) async fn admit_pod_eviction<Store: PdbStore + ?Sized>(
+    store: &Store,
+    pod: &Resource,
+    dry_run: bool,
+) -> Result<PodEvictionAdmissionOutcome> {
+    admit_pod_eviction_at(store, pod, dry_run, chrono::Utc::now()).await
 }
 
 fn pod_matches_selector(pod: &Value, pdb: &Value) -> bool {

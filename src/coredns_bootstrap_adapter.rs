@@ -102,9 +102,11 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
         deployment: Resource,
         node_name: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
+        let now = chrono::Utc::now();
         let deployment = crate::controllers::resource_projection::with_resource_version(
             deployment.data,
             deployment.resource_version,
+            now,
         );
         crate::controllers::deployment::reconcile_deployment(
             self.db,
@@ -113,7 +115,7 @@ impl CoreDnsBootstrapStore for CoreDnsBootstrapAdapter<'_> {
             self.pod_delete_sink.as_ref(),
             self.non_pod_finalization,
             &deployment,
-            crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+            crate::controllers::ControllerReconcileContext::at(self.coordination, node_name, now),
         )
         .await
         .map_err(map_controller_store_error)

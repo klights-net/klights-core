@@ -72,6 +72,7 @@ pub(crate) trait ControllerEffectPort: Send + Sync {
 #[derive(Clone)]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) struct ControllerRuntimeDependencies {
+    pub(crate) wall_time: fn() -> chrono::DateTime<chrono::Utc>,
     pub(crate) resource_query: Arc<dyn ControllerResourceQuery>,
     pub(crate) deployment_store: Arc<dyn DeploymentStore>,
     pub(crate) replicaset_store: Arc<dyn ReplicaSetStore>,
@@ -128,6 +129,7 @@ mod tests {
         coordination: Arc<crate::controllers::ControllerCoordination>,
     ) -> ControllerRuntimeDependencies {
         ControllerRuntimeDependencies {
+            wall_time: chrono::Utc::now,
             resource_query,
             deployment_store: stores.clone(),
             replicaset_store: stores.clone(),

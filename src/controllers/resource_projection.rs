@@ -6,7 +6,11 @@ use serde_json::Value;
 ///
 /// This mirrors the API response identity projection without making
 /// controllers depend on API-server ownership.
-pub(crate) fn with_resource_version(data: impl Into<Arc<Value>>, resource_version: i64) -> Value {
+pub(crate) fn with_resource_version(
+    data: impl Into<Arc<Value>>,
+    resource_version: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
     let mut data = Arc::unwrap_or_clone(data.into());
     if let Some(metadata) = data
         .as_object_mut()
@@ -28,7 +32,7 @@ pub(crate) fn with_resource_version(data: impl Into<Arc<Value>>, resource_versio
         if metadata.get("creationTimestamp").is_none_or(Value::is_null) {
             metadata.insert(
                 "creationTimestamp".to_string(),
-                Value::String(crate::utils::k8s_time_now()),
+                Value::String(crate::k8s_time::format_time(now)),
             );
         }
     }
@@ -51,6 +55,7 @@ mod tests {
                 }
             })),
             42,
+            chrono::Utc::now(),
         );
 
         assert_eq!(
@@ -69,7 +74,8 @@ mod tests {
 
     #[test]
     fn fills_missing_identity_like_api_projection() {
-        let projected = with_resource_version(json!({"metadata": {"uid": "  "}}), 7);
+        let projected =
+            with_resource_version(json!({"metadata": {"uid": "  "}}), 7, chrono::Utc::now());
 
         assert_eq!(
             projected.pointer("/metadata/resourceVersion"),

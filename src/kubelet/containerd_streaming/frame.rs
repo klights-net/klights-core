@@ -26,6 +26,7 @@ pub const SPDY_VERSION: u16 = 3;
 
 /// Stream type as identified by K8s remotecommand headers
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // The client codec retains the complete Kubernetes stream vocabulary.
 pub enum StreamType {
     Stdin,
     Stdout,
@@ -38,6 +39,7 @@ pub enum StreamType {
 
 /// Parsed SPDY frame
 #[derive(Debug)]
+#[allow(dead_code)] // Parsed peer frame fields are retained for protocol completeness.
 pub enum SpdyFrame {
     SynStream {
         stream_id: u32,
@@ -66,6 +68,7 @@ pub enum SpdyFrame {
 }
 
 /// SPDY connection handler for K8s exec
+#[allow(dead_code)] // Stream bookkeeping is exercised by the codec's protocol tests.
 pub struct SpdyExec {
     pub streams: HashMap<u32, StreamType>,
     /// Frames read while negotiating streams that must be processed by the caller.

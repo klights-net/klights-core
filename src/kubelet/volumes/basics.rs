@@ -402,7 +402,7 @@ pub fn parse_mountinfo_entry(line: &str) -> Option<(&str, &str)> {
 }
 
 fn is_tmpfs_mounted_at_path(path: &str) -> bool {
-    let Ok(mountinfo) = crate::utils::read_utf8_file("/proc/self/mountinfo") else {
+    let Ok(mountinfo) = crate::runtime_fs::read_utf8("/proc/self/mountinfo") else {
         return false;
     };
     mountinfo.lines().any(|line| {
@@ -475,7 +475,7 @@ pub async fn unmount_volume_mounts_under(
     root: &str,
 ) -> Result<()> {
     let mountinfo =
-        match crate::utils::read_utf8_file_async(file_process, "/proc/self/mountinfo").await {
+        match crate::runtime_fs::read_utf8_async(file_process, "/proc/self/mountinfo").await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -486,7 +486,7 @@ pub async fn unmount_volume_mounts_under(
                 return Ok(());
             }
         };
-    let canonical_root = crate::utils::canonicalize_async(file_process, root)
+    let canonical_root = crate::runtime_fs::canonicalize_async(file_process, root)
         .await
         .ok()
         .map(|path| path.to_string_lossy().to_string());
@@ -677,7 +677,7 @@ async fn cleanup_volumes_under(volumes_root: &std::path::Path, pod_name: &str) -
     // Best-effort unmount first to prevent recursive tmpfs stacking leaks
     // and remove_dir_all failures when mount points are still attached.
     unmount_volume_mounts_under(&file_process, &pod_volumes_path_string).await?;
-    crate::utils::remove_dir_all_if_exists_async(&file_process, &pod_volumes_path)
+    crate::runtime_fs::remove_dir_all_if_exists_async(&file_process, &pod_volumes_path)
         .await
         .with_context(|| format!("Failed to remove volumes at {}", pod_volumes_path.display()))?;
     Ok(())

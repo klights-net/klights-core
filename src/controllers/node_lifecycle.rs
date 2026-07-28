@@ -2,10 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::k8s_time::format_time as k8s_time_format;
 use crate::node_lease_tracker::{
     DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseObservation, NodeLeaseTracker,
 };
-use crate::utils::k8s_time_format;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -320,6 +320,7 @@ pub(crate) async fn cleanup_pods_bound_to_deleted_node_event(
     side_effects: Option<&dyn klights_reconcile_api::PodMutationReconcileSink>,
     pod_lifecycle_router: Option<&dyn NodeLostPodLifecycleSink>,
     event: &ResourceEvent,
+    now: DateTime<Utc>,
 ) -> Result<bool> {
     let Some(node_name) = deleted_node_name(event) else {
         return Ok(false);
@@ -330,7 +331,7 @@ pub(crate) async fn cleanup_pods_bound_to_deleted_node_event(
         side_effects,
         pod_lifecycle_router,
         node_name,
-        Utc::now(),
+        now,
     )
     .await?;
     Ok(true)
@@ -1828,6 +1829,7 @@ mod tests {
             None,
             Some(router.as_ref()),
             &event,
+            Utc::now(),
         )
         .await
         .expect("deleted Node cleanup must succeed");

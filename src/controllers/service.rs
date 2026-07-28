@@ -174,7 +174,7 @@ impl ServiceIpam {
         }
 
         allocated.insert(candidate);
-        Ok(crate::utils::ip_u32_to_string(candidate))
+        Ok(klights_types::ipv4_from_u32(candidate))
     }
 
     pub fn release(&self, ip: &str) {
@@ -287,7 +287,7 @@ pub fn release_service_allocations_from_resource(
     let mut cluster_ips = HashSet::new();
     service_allocated_cluster_ips(service, &mut cluster_ips);
     for cluster_ip in cluster_ips {
-        service_ipam.release(&crate::utils::ip_u32_to_string(cluster_ip));
+        service_ipam.release(&klights_types::ipv4_from_u32(cluster_ip));
     }
 
     let Some(ports) = service
@@ -586,15 +586,24 @@ pub async fn reconcile_service(
     service_ipam: &ServiceIpam,
 ) -> Result<Value> {
     let default_alloc = NodePortAllocator::new();
-    reconcile_service_with_nodeport(db, pod_reader, service, service_ipam, &default_alloc).await
+    reconcile_service_with_nodeport_at(
+        db,
+        pod_reader,
+        service,
+        service_ipam,
+        &default_alloc,
+        chrono::Utc::now(),
+    )
+    .await
 }
 
-pub async fn reconcile_service_with_nodeport(
+pub async fn reconcile_service_with_nodeport_at(
     db: &(impl ServiceControllerStore + ?Sized),
     pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
     service: &Value,
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value> {
     // Bounded optimistic-concurrency retry around Service allocation/defaulting.
     // The allocator does a read-then-write with a resourceVersion CAS, but under
@@ -609,7 +618,8 @@ pub async fn reconcile_service_with_nodeport(
     let mut updated_data = None;
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..SERVICE_ALLOC_MAX_ATTEMPTS {
-        match allocate_service_fields_for_api_write(db, service, service_ipam, nodeport_alloc).await
+        match allocate_service_fields_for_api_write(db, service, service_ipam, nodeport_alloc, now)
+            .await
         {
             Ok(Some(data)) => {
                 updated_data = Some(data);
@@ -710,6 +720,25 @@ pub async fn reconcile_service_with_nodeport(
     Ok(updated_data)
 }
 
+#[cfg(test)]
+pub async fn reconcile_service_with_nodeport(
+    db: &(impl ServiceControllerStore + ?Sized),
+    pod_reader: &(impl klights_pod_api::PodQuery + ?Sized),
+    service: &Value,
+    service_ipam: &ServiceIpam,
+    nodeport_alloc: &NodePortAllocator,
+) -> Result<Value> {
+    reconcile_service_with_nodeport_at(
+        db,
+        pod_reader,
+        service,
+        service_ipam,
+        nodeport_alloc,
+        chrono::Utc::now(),
+    )
+    .await
+}
+
 /// Synchronous Service allocation/defaulting for the HTTP write path.
 ///
 /// Loads the live Service, applies K8s defaulting (`spec.type`,
@@ -732,6 +761,7 @@ pub async fn allocate_service_fields_for_api_write(
     service: &Value,
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<Value>> {
     let input_metadata = service
         .get("metadata")
@@ -751,6 +781,7 @@ pub async fn allocate_service_fields_for_api_write(
     let service = crate::controllers::resource_projection::with_resource_version(
         live_service.data,
         live_service.resource_version,
+        now,
     );
     let metadata = service
         .get("metadata")
@@ -758,7 +789,7 @@ pub async fn allocate_service_fields_for_api_write(
     if metadata.get("deletionTimestamp").is_some() {
         return Ok(None);
     }
-    let current_rv = crate::utils::extract_resource_version(metadata);
+    let current_rv = crate::resource_metadata::resource_version(metadata);
     let update_preconditions = ResourcePreconditions::from_metadata(metadata, current_rv)?;
 
     let mut updated_service = service.clone();
@@ -792,6 +823,7 @@ pub async fn allocate_service_fields_for_api_write(
     let service_with_rv = crate::controllers::resource_projection::with_resource_version(
         updated_data.clone(),
         updated_rv,
+        now,
     );
     Ok(Some(service_with_rv))
 }

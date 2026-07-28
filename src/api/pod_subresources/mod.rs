@@ -20,13 +20,14 @@ mod binding;
 mod ephemeral;
 mod eviction;
 mod exec;
-pub mod exec_spdy;
+mod exec_spdy;
 mod exec_ws;
 pub(crate) mod local_node_log_runtime;
 pub mod logs;
 mod node_proxy;
 mod portforward;
 mod proxy;
+mod spdy_framing;
 mod status;
 #[cfg(test)]
 mod tests;

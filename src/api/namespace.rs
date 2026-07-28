@@ -229,7 +229,7 @@ pub(in crate::api) async fn create_namespace(
             {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    serde_json::Value::String(crate::utils::k8s_time_now()),
+                    serde_json::Value::String(crate::k8s_time::now_time()),
                 );
             }
         }
@@ -272,7 +272,7 @@ pub(in crate::api) async fn create_namespace(
         );
     }
     let ca_cert_path = &state.operational().config.runtime.paths.ca_cert;
-    match crate::utils::read_utf8_file_async(&state.operational().file_process, ca_cert_path).await
+    match crate::runtime_fs::read_utf8_async(&state.operational().file_process, ca_cert_path).await
     {
         Ok(ca_cert_pem) => {
             if let Err(e) = namespace_bootstrap

@@ -32,7 +32,7 @@ impl SideEffect for EndpointMirrorEffect {
 #[async_trait]
 impl EndpointMirrorStore for dyn DatastoreBackend + '_ {
     async fn mirror_endpoints(&self, resource: &Value) -> Result<()> {
-        endpoints::mirror_endpoints_to_endpointslice(self, resource).await
+        endpoints::mirror_endpoints_to_endpointslice_at(self, resource, chrono::Utc::now()).await
     }
 
     async fn delete_mirrored_endpointslice(&self, resource: &Value) -> Result<()> {

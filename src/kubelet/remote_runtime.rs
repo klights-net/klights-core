@@ -122,7 +122,7 @@ async fn run_cri_node_exec_stream(
     request: NodeExecRequest,
     session: &mut dyn NodeExecSession,
 ) -> Result<()> {
-    use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
+    use crate::kubelet::containerd_streaming::{SpdyExec, SpdyFrame, StreamType};
 
     let (target, command, options, attach) = request.into_parts();
     let streaming_url = {

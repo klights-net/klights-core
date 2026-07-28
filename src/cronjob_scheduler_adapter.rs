@@ -18,6 +18,10 @@ struct LeaderCronJobSchedulerRuntime {
 
 #[async_trait]
 impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
+    fn wall_time(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
     async fn list_cronjobs(
         &self,
     ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>
@@ -40,11 +44,12 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
     ) -> std::result::Result<(), CronJobSchedulerRuntimeError> {
         klights_leader_api::validate_controller_lease_if_scoped()
             .map_err(|error| CronJobSchedulerRuntimeError::reconcile_failed(error.to_string()))?;
-        crate::controllers::cronjob::reconcile_cronjob_one(
+        crate::controllers::cronjob::reconcile_cronjob_one_at(
             self.db.as_ref(),
             Some(self.dispatcher.as_ref()),
             &resource.data,
             resource.resource_version,
+            self.wall_time(),
         )
         .await
         .map_err(|error| CronJobSchedulerRuntimeError::reconcile_failed(error.to_string()))

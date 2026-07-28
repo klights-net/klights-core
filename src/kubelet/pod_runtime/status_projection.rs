@@ -236,7 +236,7 @@ fn build_reconciled_container_statuses(
                             .and_then(|status| status.pointer("/state/running/startedAt"))
                             .and_then(|value| value.as_str())
                             .map(ToString::to_string)
-                            .unwrap_or_else(crate::utils::k8s_timestamp)
+                            .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
                     };
                     serde_json::json!({ "running": { "startedAt": started_at } })
                 }

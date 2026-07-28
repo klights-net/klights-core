@@ -173,7 +173,7 @@ pub async fn delete_crd_with_deregistration(
     if let Some(meta) = del_data.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         meta.insert(
             "deletionTimestamp".to_string(),
-            serde_json::Value::String(crate::utils::k8s_timestamp()),
+            serde_json::Value::String(crate::k8s_time::now_legacy_timestamp()),
         );
     }
     let _ = crate::api::resource_command_ports::update_non_pod_resource(
@@ -339,7 +339,7 @@ pub fn validate_api_approval(
 
 // Helper to add Established condition to CRD status
 pub fn add_crd_established_condition(mut body: Value) -> Value {
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
 
     let established_condition = serde_json::json!({
         "type": "Established",

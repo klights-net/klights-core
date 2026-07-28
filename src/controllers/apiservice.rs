@@ -40,6 +40,7 @@ pub(crate) trait ApiServiceStore: Send + Sync {
 pub(crate) async fn reconcile_apiservice<S: ApiServiceStore + ?Sized>(
     store: &S,
     apiservice: &Value,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let name = apiservice
         .pointer("/metadata/name")
@@ -52,7 +53,7 @@ pub(crate) async fn reconcile_apiservice<S: ApiServiceStore + ?Sized>(
             .get_apiservice(name)
             .await?
             .context("APIService not found")?;
-        let status = evaluate_apiservice_status(store, &current.data).await?;
+        let status = evaluate_apiservice_status(store, &current.data, now).await?;
         if current.data.get("status") == Some(&status) {
             return Ok(());
         }
@@ -76,6 +77,7 @@ pub(crate) async fn reconcile_apiservice<S: ApiServiceStore + ?Sized>(
 async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
     store: &S,
     apiservice: &Value,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value> {
     let Some(service) = apiservice
         .pointer("/spec/service")
@@ -83,6 +85,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
     else {
         return Ok(status_with_available(
             apiservice,
+            now,
             "True",
             "Local",
             "APIService is handled locally",
@@ -95,6 +98,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
     let Some(name) = service.get("name").and_then(|v| v.as_str()) else {
         return Ok(status_with_available(
             apiservice,
+            now,
             "False",
             "ServiceNotFound",
             "APIService spec.service.name is missing",
@@ -104,6 +108,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
     if !store.service_exists(namespace, name).await? {
         return Ok(status_with_available(
             apiservice,
+            now,
             "False",
             "ServiceNotFound",
             format!("APIService backend Service {namespace}/{name} not found"),
@@ -119,6 +124,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
         if endpointslices_have_ready_address(&slice_refs) {
             return Ok(status_with_available(
                 apiservice,
+                now,
                 "True",
                 "Passed",
                 "all checks passed",
@@ -127,6 +133,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
 
         return Ok(status_with_available(
             apiservice,
+            now,
             "False",
             "MissingEndpoints",
             format!("APIService backend EndpointSlice {namespace}/{name} has no ready addresses"),
@@ -136,6 +143,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
     let Some(endpoints) = store.get_endpoints(namespace, name).await? else {
         return Ok(status_with_available(
             apiservice,
+            now,
             "False",
             "EndpointsNotFound",
             format!("APIService backend Endpoints {namespace}/{name} not found"),
@@ -145,6 +153,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
     if !endpoints_have_ready_address(&endpoints.data) {
         return Ok(status_with_available(
             apiservice,
+            now,
             "False",
             "MissingEndpoints",
             format!("APIService backend Endpoints {namespace}/{name} has no ready addresses"),
@@ -153,6 +162,7 @@ async fn evaluate_apiservice_status<S: ApiServiceStore + ?Sized>(
 
     Ok(status_with_available(
         apiservice,
+        now,
         "True",
         "Passed",
         "all checks passed",
@@ -200,6 +210,7 @@ fn endpoints_have_ready_address(endpoints: &Value) -> bool {
 
 fn status_with_available(
     apiservice: &Value,
+    now: chrono::DateTime<chrono::Utc>,
     status: &'static str,
     reason: &'static str,
     message: impl Into<String>,
@@ -213,7 +224,7 @@ fn status_with_available(
         .filter(|condition| condition.get("type").and_then(|v| v.as_str()) != Some("Available"))
         .collect::<Vec<_>>();
     let last_transition_time = existing_available_transition_time(apiservice, status)
-        .unwrap_or_else(crate::utils::k8s_timestamp);
+        .unwrap_or_else(|| crate::k8s_time::format_legacy_timestamp(now));
     conditions.push(json!({
         "type": "Available",
         "status": status,
@@ -292,7 +303,9 @@ mod tests {
             }
         });
 
-        let status = evaluate_apiservice_status(&db, &apiservice).await.unwrap();
+        let status = evaluate_apiservice_status(&db, &apiservice, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(available_condition_status(&status), Some("True"));
     }
 
@@ -341,7 +354,9 @@ mod tests {
             "spec": {"service": {"namespace": "default", "name": "wardle-service"}}
         });
 
-        let status = evaluate_apiservice_status(&db, &apiservice).await.unwrap();
+        let status = evaluate_apiservice_status(&db, &apiservice, chrono::Utc::now())
+            .await
+            .unwrap();
         assert_eq!(available_condition_status(&status), Some("False"));
         assert_eq!(
             available_condition_reason(&status),

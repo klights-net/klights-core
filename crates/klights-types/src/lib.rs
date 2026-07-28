@@ -1,5 +1,6 @@
 //! Shared domain types for klights.
 
+mod build_identity;
 pub mod field_selector;
 pub mod ip;
 pub mod json_patch;
@@ -35,11 +36,12 @@ pub fn normalize_service_account_token_expiration_seconds(requested: Option<i64>
         )
 }
 
+pub use build_identity::BuildIdentity;
 pub use field_selector::{
     FieldRequirement, FieldSelector, FieldSelectorOperator, FieldSelectorParseError,
     default_field_value, resolve_field_value,
 };
-pub use ip::first_usable_ipv4;
+pub use ip::{first_usable_ipv4, ipv4_from_u32};
 pub use json_patch::apply_merge_patch;
 pub use label_selector::{
     LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,

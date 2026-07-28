@@ -39,8 +39,9 @@ pub fn build_conditions_and_revision(
     matching_rs: &Option<&Resource>,
     next_revision: i64,
     existing_status: Option<&Value>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<Value>, Option<String>) {
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::format_legacy_timestamp(now);
     let mut conditions = Vec::new();
 
     let (available_status, available_reason, available_message) = if available_pods > 0 {

@@ -472,7 +472,7 @@ impl PodStatusService {
             let conditions = if stored_terminal_phase.is_some() {
                 existing_conditions.clone()
             } else {
-                let now = crate::utils::k8s_timestamp();
+                let now = crate::k8s_time::now_legacy_timestamp();
                 let all_containers_ready = if container_statuses.is_empty() {
                     phase == "Running"
                 } else {
@@ -1324,7 +1324,7 @@ impl PodStatusService {
             } else {
                 "ReadinessProbeFailed"
             };
-            let now = crate::utils::k8s_timestamp();
+            let now = crate::k8s_time::now_legacy_timestamp();
 
             let conditions_value = status
                 .as_object_mut()
@@ -1524,7 +1524,7 @@ impl PodStatusService {
         if !status.is_object() {
             status = json!({});
         }
-        let now = crate::utils::k8s_timestamp();
+        let now = crate::k8s_time::now_legacy_timestamp();
         if let Some(obj) = status.as_object_mut() {
             obj.insert("phase".to_string(), json!("Failed"));
             obj.insert("reason".to_string(), json!("DeadlineExceeded"));
@@ -1854,7 +1854,7 @@ fn apply_terminal_readiness_conditions(status: &mut serde_json::Map<String, Valu
         "Failed" => "PodFailed",
         _ => return,
     };
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
     let conditions = status
         .entry("conditions".to_string())
         .or_insert_with(|| json!([]));
@@ -1896,7 +1896,7 @@ fn apply_runtime_readiness_conditions(status: &mut serde_json::Map<String, Value
     } else {
         "False"
     };
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
     let existing_conditions = status
         .get("conditions")
         .and_then(|c| c.as_array())

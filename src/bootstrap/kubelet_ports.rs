@@ -52,7 +52,7 @@ pub struct SystemNodeHeartbeatClock;
 
 impl NodeHeartbeatClock for SystemNodeHeartbeatClock {
     fn now_microtime(&self) -> String {
-        crate::utils::k8s_microtime_now()
+        crate::k8s_time::now_microtime()
     }
 }
 

@@ -745,7 +745,7 @@ mod tests {
             .expect("projected volume path should be created");
 
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/token", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "leader-issued-token"
         );
         let requests = sources.token_requests();
@@ -848,15 +848,15 @@ mod tests {
 
         assert!(std::path::Path::new(&format!("{}/token", resolved)).exists());
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/token", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "worker-leader-token"
         );
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/ca.crt", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/ca.crt", resolved)).unwrap(),
             "cluster-ca-from-configmap"
         );
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/namespace", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/namespace", resolved)).unwrap(),
             "default"
         );
         assert_eq!(sources.token_requests().len(), 1);
@@ -938,7 +938,7 @@ mod tests {
             .expect("projected volume path should be created");
 
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/podname", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/podname", resolved)).unwrap(),
             pod_name
         );
 
@@ -1135,7 +1135,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/token", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "node-bound-token"
         );
 
@@ -1213,7 +1213,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/token", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "service-account-bound-token"
         );
 
@@ -1288,7 +1288,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/token", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "default-service-account-token"
         );
 
@@ -1360,7 +1360,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::utils::read_utf8_file(format!("{}/token", resolved)).unwrap(),
+            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "externally-issued-token"
         );
         assert_eq!(sources.token_requests().len(), 1);

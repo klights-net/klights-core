@@ -120,7 +120,7 @@ pub fn set_namespace_terminating_status(
         {
             metadata.insert(
                 "deletionTimestamp".to_string(),
-                serde_json::json!(crate::utils::k8s_timestamp()),
+                serde_json::json!(crate::k8s_time::now_legacy_timestamp()),
             );
         }
 
@@ -137,7 +137,7 @@ pub fn set_namespace_terminating_status(
                         "status": "True",
                         "reason": "ContentDeletionFailed",
                         "message": "Namespace contains content with pending finalization",
-                        "lastTransitionTime": crate::utils::k8s_timestamp(),
+                        "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                     }]),
                 );
             } else {
@@ -296,7 +296,7 @@ async fn reconcile_namespace_termination_once(
             if let Some(meta) = pod.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                 meta.insert(
                     "deletionTimestamp".to_string(),
-                    serde_json::json!(crate::utils::k8s_timestamp()),
+                    serde_json::json!(crate::k8s_time::now_legacy_timestamp()),
                 );
                 meta.insert(
                     "deletionGracePeriodSeconds".to_string(),
@@ -735,7 +735,7 @@ pub use klights_types::preserve_status_subresource_on_main_update;
 
 pub fn normalize_resource_for_storage(api_version: &str, kind: &str, body: &mut Value) {
     if api_version == "events.k8s.io/v1" && kind == "Event" {
-        crate::utils::normalize_event_microtime_fields(body);
+        crate::k8s_time::normalize_event_microtime_fields(body);
     }
     if api_version == "apps/v1" && kind == "Deployment" {
         apply_deployment_strategy_defaults(body);

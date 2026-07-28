@@ -28,7 +28,7 @@ fn ensure_inotify_limits() -> Result<()> {
     const MINIMUM_INSTANCES: u32 = 1024;
 
     // Read current value
-    let current_str = crate::utils::read_utf8_file(INOTIFY_PATH)
+    let current_str = crate::runtime_fs::read_utf8(INOTIFY_PATH)
         .context("Failed to read /proc/sys/fs/inotify/max_user_instances")?;
     let current = parse_inotify_value(&current_str)?;
 
@@ -663,7 +663,7 @@ state = "{state_dir}"
         image_pull_response_timeout: Duration,
         paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
-        if !crate::utils::path_exists_async(file_process, socket_path).await? {
+        if !crate::runtime_fs::exists_async(file_process, socket_path).await? {
             return Ok(false);
         }
 
@@ -714,7 +714,7 @@ state = "{state_dir}"
         paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         let socket_path = paths.containerd_socket().to_string_lossy().into_owned();
-        if !crate::utils::path_exists_async(file_process, &socket_path).await? {
+        if !crate::runtime_fs::exists_async(file_process, &socket_path).await? {
             return Ok(false);
         }
         Self::socket_is_reusable(
@@ -1870,7 +1870,7 @@ mod tests {
         .unwrap();
 
         let config_path = dir.path().join("10-klights-test.conf");
-        let raw = crate::utils::read_utf8_file(config_path).unwrap();
+        let raw = crate::runtime_fs::read_utf8(config_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(parsed["type"], "klights-cni");

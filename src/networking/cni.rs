@@ -345,7 +345,7 @@ pub async fn add(args: CniAddArgs<'_>) -> Result<PodNetwork> {
         // works. Without this the bridge drops frames that DNAT sends back out
         // the same port they arrived on (hairpin forwarding).
         let hairpin_path = format!("/sys/class/net/{}/brport/hairpin_mode", veth_host);
-        if let Err(e) = crate::utils::write_file_async(&file_process, &hairpin_path, b"1").await {
+        if let Err(e) = crate::runtime_fs::write_async(&file_process, &hairpin_path, b"1").await {
             tracing::warn!(
                 "Failed to set hairpin_mode on {}: {} (continuing anyway)",
                 veth_host,

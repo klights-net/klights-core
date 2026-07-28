@@ -35,7 +35,7 @@ async fn list_node_metrics(
         runtime_snapshot_for_nodes(&state, list.items().iter().map(|node| node.name.as_str()))
             .await?;
     let snapshot = MetricsSnapshot::from_runtime_nodes(&runtime);
-    let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
+    let builder = MetricsObjectBuilder::new(crate::k8s_time::now_legacy_timestamp());
     let items: Vec<Value> = list
         .items()
         .iter()
@@ -81,7 +81,7 @@ async fn get_node_metrics(
     let usage = snapshot.available_node_usage(&node.name).ok_or_else(|| {
         AppError::ServiceUnavailable(format!("NodeMetrics \"{}\" is unavailable", node.name))
     })?;
-    let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
+    let builder = MetricsObjectBuilder::new(crate::k8s_time::now_legacy_timestamp());
     Ok(Json(builder.node_metrics_object(&node.name, usage)))
 }
 
@@ -120,7 +120,7 @@ async fn list_pod_metrics_for_namespace(
         .metrics_provider
         .runtime_snapshot_for_pods(&list.items)
         .await;
-    let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
+    let builder = MetricsObjectBuilder::new(crate::k8s_time::now_legacy_timestamp());
     let items: Vec<Value> = list
         .items
         .iter()
@@ -155,7 +155,7 @@ async fn get_pod_metrics(
         .metrics_provider
         .runtime_snapshot_for_pods(std::slice::from_ref(&pod))
         .await;
-    let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
+    let builder = MetricsObjectBuilder::new(crate::k8s_time::now_legacy_timestamp());
     let metric = PodMetric::from_resource(&pod, &runtime).ok_or_else(|| {
         AppError::ServiceUnavailable(format!("PodMetrics \"{}\" is unavailable", pod.name))
     })?;

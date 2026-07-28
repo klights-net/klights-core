@@ -70,7 +70,7 @@ impl AuditEvent {
         decision: &AuthorizationDecision,
     ) -> Self {
         Self {
-            timestamp: crate::utils::k8s_microtime_now(),
+            timestamp: crate::k8s_time::now_microtime(),
             stage: AuditStage::Authorization,
             user: AuditUser::from(identity),
             verb: request.verb.clone(),

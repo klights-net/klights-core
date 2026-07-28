@@ -196,13 +196,10 @@ pub fn job_ttl_cleanup_delay_at(
     })?))
 }
 
-pub fn job_ttl_cleanup_delay(job: &Value) -> Result<Option<Duration>> {
-    job_ttl_cleanup_delay_at(job, chrono::Utc::now())
-}
-
 async fn mark_job_foreground_deleting(
     db: &(impl JobStore + ?Sized),
     resource: &Resource,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Resource> {
     let mut data: Value = (*resource.data).clone();
     let metadata = data
@@ -216,7 +213,7 @@ async fn mark_job_foreground_deleting(
     {
         metadata.insert(
             "deletionTimestamp".to_string(),
-            json!(crate::utils::k8s_timestamp()),
+            json!(crate::k8s_time::format_legacy_timestamp(now)),
         );
     }
     let finalizers = metadata
@@ -248,6 +245,7 @@ async fn delete_finished_job_for_ttl(
     pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     gc_coordination: &dyn klights_reconcile_api::GcForegroundDeleteCoordination,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     if resource
         .data
@@ -257,7 +255,7 @@ async fn delete_finished_job_for_ttl(
         return Ok(());
     }
 
-    let marked = mark_job_foreground_deleting(db, resource).await?;
+    let marked = mark_job_foreground_deleting(db, resource, now).await?;
     let _ = crate::controllers::gc::finalize_foreground_owner_if_ready(
         db,
         &marked,
@@ -507,7 +505,11 @@ fn preserve_job_condition_timestamps(
 /// Derive the Job `.status` subtree from the current Job object and its owned
 /// Pods without creating or deleting Pods. This is the shared status owner used
 /// by full Job reconciliation and by bottom-up Pod status refreshes.
-pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -> Value {
+pub fn derive_job_status_from_owned_pods_at(
+    job: &Value,
+    owned_pods: &[Resource],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
     let common = crate::controllers::common::controller_common();
     let metadata = job.get("metadata").unwrap_or(&Value::Null);
     let spec = job.get("spec").unwrap_or(&Value::Null);
@@ -717,7 +719,7 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let condition_now = crate::utils::k8s_timestamp();
+    let condition_now = crate::k8s_time::format_legacy_timestamp(now);
     let mut conditions = Vec::new();
 
     let success_policy_ready_for_complete =
@@ -808,7 +810,7 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         .get("creationTimestamp")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(crate::utils::k8s_time_now);
+        .unwrap_or_else(|| crate::k8s_time::format_time(now));
     let mut status = json!({
         "active": active_count,
         "ready": ready_count,
@@ -832,11 +834,16 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         let completion_time = job
             .pointer("/status/completionTime")
             .cloned()
-            .unwrap_or_else(|| json!(crate::utils::k8s_time_now()));
+            .unwrap_or_else(|| json!(crate::k8s_time::format_time(now)));
         s.insert("completionTime".into(), completion_time);
     }
 
     status
+}
+
+#[cfg(test)]
+pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -> Value {
+    derive_job_status_from_owned_pods_at(job, owned_pods, chrono::Utc::now())
 }
 
 /// Reconcile a Job: manage pod creation/deletion against `completions`,
@@ -849,6 +856,7 @@ pub(crate) async fn reconcile_job(
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     job: &Value,
     reconcile_context: crate::controllers::ControllerReconcileContext<'_>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value> {
     let coordination = reconcile_context.coordination;
     let node_name = reconcile_context.node_name;
@@ -888,13 +896,14 @@ pub(crate) async fn reconcile_job(
         return Ok(std::sync::Arc::unwrap_or_clone(latest_job.data.clone()));
     }
 
-    if job_ttl_cleanup_delay(&latest_job.data)?.is_some_and(|delay| delay.is_zero()) {
+    if job_ttl_cleanup_delay_at(&latest_job.data, now)?.is_some_and(|delay| delay.is_zero()) {
         delete_finished_job_for_ttl(
             db,
             &latest_job,
             pod_delete_sink,
             non_pod_finalization,
             coordination,
+            now,
         )
         .await?;
         return Ok(std::sync::Arc::unwrap_or_clone(latest_job.data.clone()));
@@ -1410,17 +1419,19 @@ pub(crate) async fn reconcile_job(
             status_job_resource.data.clone(),
         ));
     }
-    let status = derive_job_status_from_owned_pods(&status_job_resource.data, &final_owned_pods);
+    let status =
+        derive_job_status_from_owned_pods_at(&status_job_resource.data, &final_owned_pods, now);
 
     let updated_resource = db.update_job_status(&status_job_resource, status).await?;
 
-    if job_ttl_cleanup_delay(&updated_resource.data)?.is_some_and(|delay| delay.is_zero()) {
+    if job_ttl_cleanup_delay_at(&updated_resource.data, now)?.is_some_and(|delay| delay.is_zero()) {
         delete_finished_job_for_ttl(
             db,
             &updated_resource,
             pod_delete_sink,
             non_pod_finalization,
             coordination,
+            now,
         )
         .await?;
     }

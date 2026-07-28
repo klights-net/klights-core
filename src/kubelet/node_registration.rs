@@ -1,8 +1,8 @@
+use crate::k8s_time::now_time as k8s_time_now;
 use crate::kubelet::node;
 use crate::kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
 use crate::kubelet::outbox::OutboxOperation;
 use crate::kubelet::outbox::{Outbox, OutboxSendRoute};
-use crate::utils::k8s_time_now;
 use anyhow::{Context, Result};
 use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_core::StorageCommand;
@@ -80,11 +80,11 @@ impl NodeRegistrationHostFacts {
 
     pub async fn capture_local(
         file_process: &klights_supervisor::FileProcessExecutor,
-        kubelet_version: &str,
+        profile: &NodeRegistrationProfile,
     ) -> Self {
         let (host_info, memory_info) = tokio::join!(
             host_node_info(file_process),
-            crate::utils::read_utf8_file_async(file_process, "/proc/meminfo")
+            crate::runtime_fs::read_utf8_async(file_process, "/proc/meminfo")
         );
         let memory_ki = memory_info
             .ok()
@@ -98,8 +98,8 @@ impl NodeRegistrationHostFacts {
             os_image: host_info.os_image,
             kernel_version: host_info.kernel_version,
             container_runtime_version: "containerd://1.7.0".to_string(),
-            kubelet_version: kubelet_version.to_string(),
-            git_commit: crate::version::GIT_COMMIT_SHORT.to_string(),
+            kubelet_version: profile.kubelet_version().to_string(),
+            git_commit: profile.git_commit().to_string(),
         }
     }
 
@@ -218,8 +218,7 @@ impl NodeRegistrationSnapshot {
             addresses,
             role_projection,
             grpc_port,
-            host: NodeRegistrationHostFacts::capture_local(file_process, profile.kubelet_version())
-                .await,
+            host: NodeRegistrationHostFacts::capture_local(file_process, profile).await,
         }
     }
 
@@ -287,13 +286,13 @@ struct HostNodeInfo {
 }
 
 async fn host_node_info(file_process: &klights_supervisor::FileProcessExecutor) -> HostNodeInfo {
-    let os_image = crate::utils::read_utf8_file_async(file_process, "/etc/os-release")
+    let os_image = crate::runtime_fs::read_utf8_async(file_process, "/etc/os-release")
         .await
         .ok()
         .and_then(|content| os_release_pretty_name(&content))
         .unwrap_or_else(|| "Linux".to_string());
     let kernel_version =
-        crate::utils::read_utf8_file_async(file_process, "/proc/sys/kernel/osrelease")
+        crate::runtime_fs::read_utf8_async(file_process, "/proc/sys/kernel/osrelease")
             .await
             .ok()
             .map(|content| content.trim().to_string())

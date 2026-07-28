@@ -602,7 +602,7 @@ impl RedbResourceStore {
 
             let body = serde_json::to_vec(&data)?;
 
-            if crate::utils::resource_bodies_equal_ignoring_metadata_field(
+            if klights_cluster_core::resource_bodies_equal_ignoring_metadata_field(
                 &current,
                 &data,
                 "resourceVersion",
@@ -796,7 +796,7 @@ impl RedbResourceStore {
                     {
                         metadata.insert(
                             "deletionTimestamp".to_string(),
-                            serde_json::Value::String(crate::utils::k8s_timestamp()),
+                            serde_json::Value::String(crate::k8s_time::now_legacy_timestamp()),
                         );
                     }
                     metadata
@@ -1367,7 +1367,7 @@ impl RedbResourceStore {
             let before_patch = current_data.clone();
             klights_types::apply_merge_patch(&mut current_data, &patch);
             helpers::validate_uid_immutable(&current_data, &before_patch)?;
-            if crate::utils::resource_bodies_equal_ignoring_metadata_field(
+            if klights_cluster_core::resource_bodies_equal_ignoring_metadata_field(
                 &before_patch,
                 &current_data,
                 "resourceVersion",

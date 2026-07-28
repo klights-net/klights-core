@@ -335,7 +335,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(path, hosts_dir.join("hosts").to_string_lossy());
-        assert_eq!(crate::utils::read_utf8_file(&path).unwrap(), content);
+        assert_eq!(crate::runtime_fs::read_utf8(&path).unwrap(), content);
     }
 
     #[tokio::test]

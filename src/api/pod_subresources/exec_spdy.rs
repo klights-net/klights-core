@@ -2,17 +2,11 @@ use std::collections::HashMap;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use super::spdy_framing::{SpdyConnection, SpdyFrame, StreamType};
 use super::*;
-use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
 use klights_node_api::{
     ExecStreamChannel, ExecStreamOptions as NodeExecStreamOptions, NodeExec, NodeExecRequest,
-    NodeExecSession, NodeExecTarget, exec_error_status_payload_is_terminal,
-};
-
-#[cfg(test)]
-use crate::kubelet::cri_exec::{
-    AttachRequest, ExecRequest, ExecStreamOptions as CriExecStreamOptions,
-    attach_with_created_state_retry, exec_with_created_state_retry,
+    NodeExecSession, NodeExecTarget,
 };
 
 const SPDY_UPGRADE_VALUE: &str = "SPDY/3.1";
@@ -27,14 +21,6 @@ pub struct SpdyExecStreamRequest {
     pub stderr: bool,
     pub tty: bool,
     pub attach: bool,
-}
-
-#[cfg(test)]
-pub struct LocalExecSpdyRequest {
-    pub cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    pub target: ExecTarget,
-    pub stream_request: SpdyExecStreamRequest,
 }
 
 pub struct RemoteExecSpdyRequest {
@@ -85,7 +71,7 @@ impl SpdyClientStreams {
     }
 }
 
-pub fn is_spdy_upgrade(headers: &header::HeaderMap) -> bool {
+pub(super) fn is_spdy_upgrade(headers: &header::HeaderMap) -> bool {
     headers
         .get(header::UPGRADE)
         .and_then(|value| value.to_str().ok())
@@ -93,7 +79,7 @@ pub fn is_spdy_upgrade(headers: &header::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-pub fn negotiate_spdy_subprotocol(headers: &header::HeaderMap) -> String {
+pub(super) fn negotiate_spdy_subprotocol(headers: &header::HeaderMap) -> String {
     const PREFERRED: &[&str] = &[
         "v4.channel.k8s.io",
         "v3.channel.k8s.io",
@@ -137,8 +123,8 @@ fn spdy_stream_type_from_headers(headers: &HashMap<String, String>) -> Option<St
         })
 }
 
-pub async fn collect_spdy_client_streams<S>(
-    client_spdy: &mut SpdyExec,
+pub(super) async fn collect_spdy_client_streams<S>(
+    client_spdy: &mut SpdyConnection,
     client_stream: &mut S,
     request: SpdyExecStreamRequest,
     task_supervisor: &klights_supervisor::TaskSupervisor,
@@ -221,8 +207,8 @@ where
     Ok(streams)
 }
 
-pub async fn write_spdy_exec_channel_frame<S>(
-    client_spdy: &SpdyExec,
+pub(super) async fn write_spdy_exec_channel_frame<S>(
+    client_spdy: &SpdyConnection,
     client_stream: &mut S,
     streams: &SpdyClientStreams,
     channel: StreamType,
@@ -241,7 +227,7 @@ where
 }
 
 async fn write_spdy_exec_error<S>(
-    client_spdy: &SpdyExec,
+    client_spdy: &SpdyConnection,
     client_stream: &mut S,
     streams: &SpdyClientStreams,
     message: String,
@@ -267,174 +253,8 @@ where
     .await
 }
 
-#[cfg(test)]
-struct LocalSpdyExecTarget<'a> {
-    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    container_id: &'a str,
-    command: &'a [String],
-    request: SpdyExecStreamRequest,
-}
-
-#[derive(Debug, Clone)]
-pub struct ContainerdSpdyBridgeState {
-    wait_for_container_close: bool,
-    terminal_error_seen: bool,
-}
-
-impl ContainerdSpdyBridgeState {
-    pub fn new(request: SpdyExecStreamRequest) -> Self {
-        Self {
-            wait_for_container_close: request.stdout || (request.stderr && !request.tty),
-            terminal_error_seen: false,
-        }
-    }
-
-    pub fn terminal_error_seen(&self) -> bool {
-        self.terminal_error_seen
-    }
-
-    pub fn observe_data_frame(&mut self, stream_id: u32, data: &[u8], fin: bool) -> bool {
-        match stream_id {
-            7 if fin || exec_error_status_payload_is_terminal(data) => {
-                self.terminal_error_seen = true;
-            }
-            _ => {}
-        }
-
-        self.terminal_error_seen && !self.wait_for_container_close
-    }
-}
-
-#[cfg(test)]
-fn spdy_stream_error_is_unexpected_eof(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<std::io::Error>()
-        .map(|io_err| io_err.kind() == std::io::ErrorKind::UnexpectedEof)
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-async fn bridge_containerd_spdy_to_client<S>(
-    client_spdy: &SpdyExec,
-    client_stream: &mut S,
-    streams: &SpdyClientStreams,
-    target: LocalSpdyExecTarget<'_>,
-) -> anyhow::Result<()>
-where
-    S: AsyncWrite + Unpin,
-{
-    let streaming_url = {
-        let mut cri_client = target.cri.lock().await;
-        if target.request.attach {
-            attach_with_created_state_retry(
-                &mut cri_client,
-                target.task_supervisor.as_ref(),
-                AttachRequest {
-                    container_id: target.container_id,
-                    stream_options: CriExecStreamOptions {
-                        tty: target.request.tty,
-                        stdin: target.request.stdin,
-                        stdout: target.request.stdout,
-                        stderr: target.request.stderr && !target.request.tty,
-                    },
-                },
-            )
-            .await?
-            .url
-        } else {
-            exec_with_created_state_retry(
-                &mut cri_client,
-                target.task_supervisor.as_ref(),
-                ExecRequest {
-                    container_id: target.container_id,
-                    command: target.command,
-                    stream_options: CriExecStreamOptions {
-                        tty: target.request.tty,
-                        stdin: target.request.stdin,
-                        stdout: target.request.stdout,
-                        stderr: target.request.stderr && !target.request.tty,
-                    },
-                },
-            )
-            .await?
-            .url
-        }
-    };
-
-    let mut containerd_stream = SpdyExec::connect_to_streaming_url(&streaming_url).await?;
-    let mut containerd_spdy = SpdyExec::new();
-    if target.request.stdout {
-        containerd_spdy
-            .write_syn_stream(&mut containerd_stream, 3, StreamType::Stdout)
-            .await?;
-    }
-    if target.request.stderr && !target.request.tty {
-        containerd_spdy
-            .write_syn_stream(&mut containerd_stream, 5, StreamType::Stderr)
-            .await?;
-    }
-    containerd_spdy
-        .write_syn_stream(&mut containerd_stream, 7, StreamType::Error)
-        .await?;
-
-    let mut completion = ContainerdSpdyBridgeState::new(target.request);
-    loop {
-        let frame = match containerd_spdy.read_frame(&mut containerd_stream).await {
-            Ok(frame) => frame,
-            Err(err)
-                if completion.terminal_error_seen()
-                    && spdy_stream_error_is_unexpected_eof(&err) =>
-            {
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        };
-
-        match frame {
-            SpdyFrame::Data {
-                stream_id,
-                data,
-                fin,
-            } => {
-                let channel = match stream_id {
-                    3 => Some(StreamType::Stdout),
-                    5 => Some(StreamType::Stderr),
-                    7 => Some(StreamType::Error),
-                    _ => None,
-                };
-                if let Some(channel) = channel {
-                    let complete = completion.observe_data_frame(stream_id, &data, fin);
-                    write_spdy_exec_channel_frame(
-                        client_spdy,
-                        client_stream,
-                        streams,
-                        channel,
-                        &data,
-                        fin,
-                    )
-                    .await?;
-                    if complete {
-                        return Ok(());
-                    }
-                }
-            }
-            SpdyFrame::Ping { id } => {
-                containerd_spdy
-                    .write_ping(&mut containerd_stream, id)
-                    .await?;
-            }
-            SpdyFrame::RstStream { .. } | SpdyFrame::GoAway => return Ok(()),
-            SpdyFrame::SynReply { .. }
-            | SpdyFrame::Settings
-            | SpdyFrame::WindowUpdate { .. }
-            | SpdyFrame::Unknown
-            | SpdyFrame::SynStream { .. } => {}
-        }
-    }
-}
-
 async fn bridge_remote_exec_full_duplex<S>(
-    mut client_spdy: SpdyExec,
+    mut client_spdy: SpdyConnection,
     client_stream: S,
     streams: SpdyClientStreams,
     mut session: Box<dyn NodeExecSession>,
@@ -443,7 +263,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let client_writer = SpdyExec::new();
+    let client_writer = SpdyConnection::new();
     let mut pending_input: Option<klights_node_api::NodeExecFrame> = None;
     let mut pending_output: Option<klights_node_api::NodeExecFrame> = None;
 
@@ -553,70 +373,7 @@ where
     }
 }
 
-#[cfg(test)]
-pub async fn handle_local_exec_spdy<S>(mut client_stream: S, request: LocalExecSpdyRequest)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let LocalExecSpdyRequest {
-        cri,
-        task_supervisor,
-        target,
-        stream_request: request,
-    } = request;
-    let ExecTarget {
-        namespace,
-        pod_name,
-        container_id,
-        command,
-    } = target;
-    let mut client_spdy = SpdyExec::new();
-    let streams = match collect_spdy_client_streams(
-        &mut client_spdy,
-        &mut client_stream,
-        request,
-        task_supervisor.as_ref(),
-    )
-    .await
-    {
-        Ok(streams) => streams,
-        Err(err) => {
-            tracing::error!("SPDY exec stream negotiation failed: {}", err);
-            let _ = client_stream.shutdown().await;
-            return;
-        }
-    };
-
-    if let Err(err) = bridge_containerd_spdy_to_client(
-        &client_spdy,
-        &mut client_stream,
-        &streams,
-        LocalSpdyExecTarget {
-            cri,
-            task_supervisor,
-            container_id: &container_id,
-            command: &command,
-            request,
-        },
-    )
-    .await
-    {
-        tracing::error!(
-            "SPDY exec failed: pod={}/{}, container={}, error={}",
-            namespace,
-            pod_name,
-            container_id,
-            err
-        );
-        let _ = write_spdy_exec_error(&client_spdy, &mut client_stream, &streams, err.to_string())
-            .await;
-    }
-
-    let _ = client_stream.shutdown().await;
-    tracing::info!("SPDY exec completed: pod={}/{}", namespace, pod_name);
-}
-
-pub async fn handle_remote_exec_spdy<S>(mut client_stream: S, request: RemoteExecSpdyRequest)
+pub(super) async fn handle_remote_exec_spdy<S>(mut client_stream: S, request: RemoteExecSpdyRequest)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -633,7 +390,7 @@ where
         container_id,
         command,
     } = target;
-    let mut client_spdy = SpdyExec::new();
+    let mut client_spdy = SpdyConnection::new();
     let streams = match collect_spdy_client_streams(
         &mut client_spdy,
         &mut client_stream,
@@ -700,7 +457,7 @@ where
     tracing::info!("Remote SPDY exec completed: pod={}/{}", namespace, pod_name);
 }
 
-pub fn spdy_switching_protocols_response(subprotocol: String) -> Result<Response, AppError> {
+pub(super) fn spdy_switching_protocols_response(subprotocol: String) -> Result<Response, AppError> {
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(header::UPGRADE, SPDY_UPGRADE_VALUE)
@@ -784,12 +541,12 @@ mod remote_full_duplex_tests {
             resize: None,
         };
         let relay = tokio::spawn(bridge_remote_exec_full_duplex(
-            SpdyExec::new(),
+            SpdyConnection::new(),
             server_io,
             streams,
             session,
         ));
-        let client_spdy = SpdyExec::new();
+        let client_spdy = SpdyConnection::new();
         client_spdy
             .write_data_frame(&mut client_io, 1, b"blocked-input", false)
             .await
@@ -803,7 +560,7 @@ mod remote_full_duplex_tests {
             .await
             .unwrap();
 
-        let mut decoder = SpdyExec::new();
+        let mut decoder = SpdyConnection::new();
         let frame = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             decoder.read_frame(&mut client_io),

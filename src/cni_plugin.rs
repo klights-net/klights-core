@@ -111,7 +111,7 @@ impl CleanupRpcServer {
             }
         }
 
-        let _ = crate::utils::remove_file_if_exists_async(&file_process, &socket_path).await;
+        let _ = crate::runtime_fs::remove_file_if_exists_async(&file_process, &socket_path).await;
         Ok(())
     }
 }
@@ -390,7 +390,7 @@ pub async fn run_rpc_server(
         }
     }
 
-    let _ = crate::utils::remove_file_if_exists_async(&file_process, &socket_path).await;
+    let _ = crate::runtime_fs::remove_file_if_exists_async(&file_process, &socket_path).await;
     Ok(())
 }
 
@@ -399,11 +399,11 @@ async fn bind_rpc_listener(
     socket_path: &str,
 ) -> Result<tokio::net::UnixListener> {
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-        crate::utils::create_dir_all_async(file_process, parent)
+        crate::runtime_fs::create_dir_all_async(file_process, parent)
             .await
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let _ = crate::utils::remove_file_if_exists_async(file_process, socket_path).await;
+    let _ = crate::runtime_fs::remove_file_if_exists_async(file_process, socket_path).await;
     let listener = tokio::net::UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind {}", socket_path))?;
     Ok(listener)

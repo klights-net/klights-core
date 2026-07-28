@@ -154,7 +154,7 @@ pub(super) fn ensure_metadata_create_defaults(data: &mut Value) {
     {
         meta_obj.insert(
             "creationTimestamp".to_string(),
-            serde_json::Value::String(crate::utils::k8s_time_now()),
+            serde_json::Value::String(crate::k8s_time::now_time()),
         );
     }
 

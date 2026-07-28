@@ -2404,7 +2404,7 @@ mod cases {
             klights_network_api::NodePeerMode::Root,
             crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false },
             true,
-            crate::version::git_version(),
+            klights_types::BuildIdentity::new(crate::version::git_version(), "test-commit"),
         );
         let controlplane_registration =
             crate::kubelet::node::NodeRegistrationSnapshot::capture_local(

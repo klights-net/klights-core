@@ -920,7 +920,7 @@ async fn sleep_before_watch_mirror_reconnect(
         _ = cancel.cancelled() => false,
         _ = supervisor.sleep(
             "worker_store_watch_mirror_reconnect",
-            crate::utils::watch_reconnect_delay(attempt),
+            crate::reconnect_backoff::delay(attempt),
         ) => true,
     }
 }

@@ -35,7 +35,7 @@ pub(crate) fn build(node_mode: &NodeMode, node_role: &NodeRole) -> NodeRegistrat
         peer_mode,
         role,
         publish_external_ip,
-        crate::version::GIT_VERSION.to_string(),
+        crate::version::build_identity(),
     )
 }
 

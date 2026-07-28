@@ -22,6 +22,7 @@ async fn reconcile_daemonset_test(db: &Datastore, daemonset: &Value) -> anyhow::
         crate::controllers::test_utils::non_pod_finalization_port_for_test(),
         &crate::controllers::ControllerCoordination::new(),
         daemonset,
+        chrono::Utc::now(),
     )
     .await
 }

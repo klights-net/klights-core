@@ -139,9 +139,10 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn create_default_service_account(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            crate::controllers::namespace::create_default_service_account(
+            crate::controllers::namespace::create_default_service_account_at(
                 self.db.as_ref(),
                 &namespace,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -151,13 +152,14 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
     fn create_root_ca_config_map(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
             let ca_cert_pem =
-                crate::utils::read_utf8_file_async(&self.file_process, &self.ca_cert_path)
+                crate::runtime_fs::read_utf8_async(&self.file_process, &self.ca_cert_path)
                     .await
                     .map_err(|error| AppError::Internal(error.to_string()))?;
-            crate::controllers::namespace::create_kube_root_ca_configmap(
+            crate::controllers::namespace::create_kube_root_ca_configmap_at(
                 self.db.as_ref(),
                 &namespace,
                 &ca_cert_pem,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -171,6 +173,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
                 self.db.as_ref(),
                 &namespace,
                 &self.ca_cert_path,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))
@@ -184,6 +187,7 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
                 self.db.as_ref(),
                 &namespace,
                 &self.ca_cert_path,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| AppError::Internal(error.to_string()))

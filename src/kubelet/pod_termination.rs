@@ -104,7 +104,7 @@ pub fn read_termination_message_from_logs(log_path: &str) -> String {
     const MAX_LOG_BYTES: usize = 2048;
     const MAX_LOG_LINES: usize = 80;
 
-    let content = match crate::utils::read_utf8_file(log_path) {
+    let content = match crate::runtime_fs::read_utf8(log_path) {
         Ok(content) => content,
         Err(_) => return String::new(),
     };

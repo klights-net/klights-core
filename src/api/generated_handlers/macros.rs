@@ -846,7 +846,7 @@ cluster_resource_handlers!(
 
 // Helper to add Established condition to CRD status
 pub fn add_crd_established_condition(mut body: Value) -> Value {
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
 
     let established_condition = serde_json::json!({
         "type": "Established",

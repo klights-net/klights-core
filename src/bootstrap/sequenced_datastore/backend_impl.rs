@@ -42,7 +42,7 @@ fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
     {
         metadata.insert(
             "deletionTimestamp".to_string(),
-            Value::String(crate::utils::k8s_timestamp()),
+            Value::String(crate::k8s_time::now_legacy_timestamp()),
         );
     }
     metadata

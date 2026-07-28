@@ -52,7 +52,7 @@ impl crate::controllers::pdb::PdbPodReader for BoundPdbPort<'_> {
 #[async_trait]
 impl PdbSideEffectPort for BoundPdbPort<'_> {
     async fn reconcile_namespace(&self, namespace: &str) -> Result<()> {
-        pdb::reconcile_pdbs_for_namespace(self.db, self, namespace).await;
+        pdb::reconcile_pdbs_for_namespace(self.db, self, namespace, chrono::Utc::now()).await;
         Ok(())
     }
 }

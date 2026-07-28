@@ -587,6 +587,7 @@ pub(crate) async fn reconcile_daemonset(
     non_pod_finalization: &dyn klights_reconcile_api::GcNonPodFinalizationPort,
     coordination: &crate::controllers::ControllerCoordination,
     daemonset: &Value,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let common = crate::controllers::common::controller_common();
     let input_metadata = daemonset
@@ -632,6 +633,7 @@ pub(crate) async fn reconcile_daemonset(
     let daemonset = crate::controllers::resource_projection::with_resource_version(
         live_resource.data,
         live_resource.resource_version,
+        now,
     );
 
     let metadata = daemonset

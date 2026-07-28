@@ -1,18 +1,38 @@
 //! `Controller` impl for `Job`. Registered in `ControllerDispatcher`.
 
-use crate::controllers::controller_wrapper;
 use crate::controllers::job as job_core;
 
-controller_wrapper!(
-    JobController,
-    "job",
-    job_core::reconcile_job,
-    with_node,
-    discard,
-    with_pod_repository,
-    store = job_store,
-    mutation = job_mutation
-);
+pub struct JobController;
+
+#[async_trait::async_trait]
+impl crate::controllers::Controller for JobController {
+    fn name(&self) -> &'static str {
+        "job"
+    }
+
+    async fn reconcile(
+        &self,
+        resource: serde_json::Value,
+        ctx: crate::controllers::Context,
+    ) -> anyhow::Result<()> {
+        job_core::reconcile_job(
+            ctx.job_store(),
+            ctx.pod_query(),
+            ctx.job_mutation(),
+            ctx.pod_delete_sink(),
+            ctx.reconcile_port().non_pod_finalization(),
+            &resource,
+            crate::controllers::ControllerReconcileContext::at(
+                ctx.coordination(),
+                ctx.node_name(),
+                ctx.reconcile_time(),
+            ),
+            ctx.reconcile_time(),
+        )
+        .await
+        .map(|_| ())
+    }
+}
 
 #[cfg(test)]
 mod tests {

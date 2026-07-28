@@ -145,6 +145,7 @@ pub(crate) async fn reconcile_replicationcontroller(
     let rc = crate::controllers::resource_projection::with_resource_version(
         live_resource.data,
         live_resource.resource_version,
+        reconcile_context.wall_time,
     );
 
     if rc.pointer("/metadata/deletionTimestamp").is_some() {
@@ -681,7 +682,7 @@ async fn update_replicationcontroller_status(
         .filter(|c| c["type"] != "ReplicaFailure")
         .collect::<Vec<_>>();
 
-    let now = crate::utils::k8s_time_now();
+    let now = crate::k8s_time::now_time();
     if let Some(msg) = creation_failure {
         conditions.push(json!({
             "type": "ReplicaFailure",

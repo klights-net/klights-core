@@ -27,8 +27,8 @@ pub(crate) async fn capture_sandbox_inputs(
     node_mode: &crate::bootstrap::NodeMode,
 ) -> crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs {
     let (primary, resolved_upstream) = tokio::join!(
-        crate::utils::read_utf8_file_async(file_process, "/etc/resolv.conf"),
-        crate::utils::read_utf8_file_async(file_process, "/run/systemd/resolve/resolv.conf"),
+        crate::runtime_fs::read_utf8_async(file_process, "/etc/resolv.conf"),
+        crate::runtime_fs::read_utf8_async(file_process, "/run/systemd/resolve/resolv.conf"),
     );
     crate::kubelet::pod_sandbox_config::SandboxRuntimeInputs {
         host_dns: crate::kubelet::pod_dns::HostDnsConfig::from_resolv_conf_contents(

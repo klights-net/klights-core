@@ -68,6 +68,8 @@ impl CronJobSchedulerRuntimeError {
 
 #[async_trait::async_trait]
 pub trait CronJobSchedulerRuntime: Send + Sync {
+    fn wall_time(&self) -> DateTime<Utc>;
+
     async fn list_cronjobs(
         &self,
     ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>;
@@ -171,7 +173,7 @@ impl CronJobScheduler {
             return;
         }
 
-        let now = Utc::now();
+        let now = self.runtime.wall_time();
         let next = match compute_next_fire(cj, now) {
             Ok(Some(t)) => t,
             Ok(None) => {
@@ -458,6 +460,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CronJobSchedulerRuntime for ReplayExpiryRuntime {
+        fn wall_time(&self) -> DateTime<Utc> {
+            Utc::now()
+        }
+
         async fn list_cronjobs(
             &self,
         ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>

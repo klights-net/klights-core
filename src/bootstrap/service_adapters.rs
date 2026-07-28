@@ -77,6 +77,7 @@ impl klights_reconcile_api::ServiceWriteAllocator for ApiServiceWriteAllocator {
                 service,
                 &self.service_ipam,
                 &self.nodeport_alloc,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| {

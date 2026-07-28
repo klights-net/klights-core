@@ -69,7 +69,6 @@ impl Controller for HpaController {
     async fn reconcile(&self, resource: Value, ctx: Context) -> Result<()> {
         #[cfg(not(test))]
         {
-            let _ = &ctx;
             return reconcile_hpa_with_metrics(
                 self.db.as_ref(),
                 self.pod_repository.as_ref(),
@@ -78,6 +77,7 @@ impl Controller for HpaController {
                 &resource,
                 &self.node_name,
                 self.metrics_provider.as_ref(),
+                ctx.reconcile_time(),
             )
             .await;
         }
@@ -110,6 +110,7 @@ impl Controller for HpaController {
                 &resource,
                 ctx.node_name(),
                 metrics_provider,
+                ctx.reconcile_time(),
             )
             .await
         }
@@ -210,6 +211,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         node_name: &str,
     ) -> klights_reconcile_api::ControllerStoreResult<()> {
         let pods = self.pod_repository;
+        let now = chrono::Utc::now();
         match target.kind_tag {
             ScaleTargetKind::Deployment => crate::controllers::deployment::reconcile_deployment(
                 self.db,
@@ -218,7 +220,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 pods,
                 self.non_pod_finalization,
                 resource,
-                crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+                crate::controllers::ControllerReconcileContext::at(
+                    self.coordination,
+                    node_name,
+                    now,
+                ),
             )
             .await
             .map_err(map_controller_store_error),
@@ -229,7 +235,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 pods,
                 self.non_pod_finalization,
                 resource,
-                crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+                crate::controllers::ControllerReconcileContext::at(
+                    self.coordination,
+                    node_name,
+                    now,
+                ),
             )
             .await
             .map_err(map_controller_store_error),
@@ -240,7 +250,11 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 pods,
                 self.non_pod_finalization,
                 resource,
-                crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+                crate::controllers::ControllerReconcileContext::at(
+                    self.coordination,
+                    node_name,
+                    now,
+                ),
             )
             .await
             .map_err(map_controller_store_error),
@@ -252,9 +266,10 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     pods,
                     self.non_pod_finalization,
                     resource,
-                    crate::controllers::ControllerReconcileContext::new(
+                    crate::controllers::ControllerReconcileContext::at(
                         self.coordination,
                         node_name,
+                        now,
                     ),
                 )
                 .await
@@ -299,6 +314,7 @@ pub async fn reconcile_hpa(
         hpa,
         node_name,
         &crate::metrics::FallbackOnlyMetricsProvider,
+        chrono::Utc::now(),
     )
     .await
 }
@@ -311,6 +327,7 @@ pub async fn reconcile_hpa_with_metrics(
     hpa: &Value,
     node_name: &str,
     metrics_provider: &dyn MetricsProvider,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     reconcile_hpa_with_runtime(
         &HpaControllerAdapter {
@@ -322,6 +339,7 @@ pub async fn reconcile_hpa_with_metrics(
         hpa,
         node_name,
         metrics_provider,
+        now,
     )
     .await
 }

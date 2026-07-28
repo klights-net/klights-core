@@ -24,12 +24,13 @@ impl Controller for ServiceController {
     }
 
     async fn reconcile(&self, resource: Value, ctx: Context) -> Result<()> {
-        service_core::reconcile_service_with_nodeport(
+        service_core::reconcile_service_with_nodeport_at(
             ctx.service_store(),
             ctx.pod_query(),
             &resource,
             &self.service_ipam,
             &self.nodeport_alloc,
+            ctx.reconcile_time(),
         )
         .await?;
         ctx.network().service_router().request_services_sync()?;

@@ -267,7 +267,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let ca_path = crate::paths::ca_cert_path(&config.containerd_namespace);
             let file_process =
                 klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref());
-            let ca_exists = crate::utils::path_exists_async(&file_process, &ca_path)
+            let ca_exists = crate::runtime_fs::exists_async(&file_process, &ca_path)
                 .await
                 .context("Failed to inspect control-plane CA certificate path")?;
             let (ca_cert_path, skip_ca) = if ca_exists {
@@ -752,6 +752,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                                 join_resource_query.as_ref(),
                                                 join_resource_commands.as_ref(),
                                                 &node_name,
+                                                crate::version::GIT_COMMIT_SHORT,
                                             )
                                             .await
                                         {

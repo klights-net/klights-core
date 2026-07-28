@@ -272,6 +272,7 @@ pub(crate) async fn run_node_lifecycle_controller(
                                     as &dyn NodeLostPodLifecycleSink,
                             ),
                             &event,
+                            chrono::Utc::now(),
                         )
                         .await
                         {

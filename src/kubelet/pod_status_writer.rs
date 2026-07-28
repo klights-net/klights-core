@@ -169,7 +169,7 @@ pub async fn update_pod_status(
             }
         }
 
-        let now = crate::utils::k8s_timestamp();
+        let now = crate::k8s_time::now_legacy_timestamp();
         let all_containers_ready = if container_statuses.is_empty() {
             phase == "Running"
         } else {

@@ -230,7 +230,7 @@ impl Datastore {
                     &mut patched,
                 );
                 if zero_grace_pod_delete {
-                    let transition_time = crate::utils::k8s_timestamp();
+                    let transition_time = crate::k8s_time::now_legacy_timestamp();
                     klights_types::mark_terminating_pod_unready_at(&mut patched, &transition_time);
                 }
                 preserve_server_metadata_fields_from_existing(&mut patched, &current.data);
@@ -245,7 +245,7 @@ impl Datastore {
                     })?
                     .to_string();
 
-                if crate::utils::resource_bodies_equal_ignoring_metadata_field(
+                if klights_cluster_core::resource_bodies_equal_ignoring_metadata_field(
                     &current.data,
                     &patched,
                     "resourceVersion",

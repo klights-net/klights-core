@@ -50,9 +50,10 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
     file_process: &klights_supervisor::FileProcessExecutor,
     store: &S,
     ca_cert_path: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     // Read CA cert once (will be used for all namespaces)
-    let ca_cert_pem = crate::utils::read_utf8_file_async(file_process, ca_cert_path)
+    let ca_cert_pem = crate::runtime_fs::read_utf8_async(file_process, ca_cert_path)
         .await
         .ok();
 
@@ -65,7 +66,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
                 metadata: ObjectMeta {
                     name: Some(ns_name.to_string()),
                     creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-                        k8s_openapi::chrono::Utc::now(),
+                        now,
                     )),
                     uid: Some(uuid::Uuid::new_v4().to_string()),
                     ..Default::default()
@@ -85,7 +86,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
             tracing::info!("Created default namespace: {}", ns_name);
 
             // Create default ServiceAccount in the namespace
-            create_default_service_account(store, ns_name).await?;
+            create_default_service_account_at(store, ns_name, now).await?;
         }
 
         // Create kube-root-ca.crt ConfigMap in the namespace (whether new or existing)
@@ -97,7 +98,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
                 .is_some();
 
             if !cm_exists
-                && let Err(e) = create_kube_root_ca_configmap(store, ns_name, ca_pem).await
+                && let Err(e) = create_kube_root_ca_configmap_at(store, ns_name, ca_pem, now).await
             {
                 tracing::warn!(
                     "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
@@ -109,7 +110,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
             // The aggregator auth ConfigMap is expected in kube-system for extension API servers.
             if ns_name == "kube-system"
                 && let Err(e) =
-                    reconcile_extension_apiserver_authentication_configmap(store, ca_pem).await
+                    reconcile_extension_apiserver_authentication_configmap(store, ca_pem, now).await
             {
                 tracing::warn!(
                     "Failed to reconcile extension-apiserver-authentication ConfigMap: {:#}",
@@ -134,12 +135,14 @@ pub async fn init_default_namespaces<S: NamespaceBootstrapStore + ?Sized>(
 ) -> Result<()> {
     let namespace = crate::paths::runtime_namespace();
     let ca_cert_path = crate::paths::ca_cert_path(&namespace);
-    init_default_namespaces_with_ca_path(file_process, store, &ca_cert_path).await
+    init_default_namespaces_with_ca_path(file_process, store, &ca_cert_path, chrono::Utc::now())
+        .await
 }
 
-pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
+pub async fn create_default_service_account_at<S: NamespaceBootstrapStore + ?Sized>(
     store: &S,
     namespace: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let sa = serde_json::json!({
         "apiVersion": "v1",
@@ -147,7 +150,7 @@ pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>
         "metadata": {
             "name": "default",
             "namespace": namespace,
-            "creationTimestamp": crate::utils::k8s_time_now(),
+            "creationTimestamp": crate::k8s_time::format_time(now),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "secrets": []
@@ -159,14 +162,23 @@ pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>
     Ok(())
 }
 
+#[cfg(test)]
+pub async fn create_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
+    namespace: &str,
+) -> Result<()> {
+    create_default_service_account_at(store, namespace, chrono::Utc::now()).await
+}
+
 /// Reconcile the default ServiceAccount in a namespace.
 ///
 /// This is event-driven maintenance for active namespaces only. It deliberately
 /// skips missing or terminating namespaces so namespace finalization can delete
 /// ServiceAccounts without racing a recreate.
-pub async fn reconcile_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
+pub async fn reconcile_default_service_account_at<S: NamespaceBootstrapStore + ?Sized>(
     store: &S,
     namespace: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
@@ -178,13 +190,22 @@ pub async fn reconcile_default_service_account<S: NamespaceBootstrapStore + ?Siz
     {
         return Ok(());
     }
-    create_default_service_account(store, namespace).await
+    create_default_service_account_at(store, namespace, now).await
 }
 
-pub async fn create_kube_root_ca_configmap<S: NamespaceBootstrapStore + ?Sized>(
+#[cfg(test)]
+pub async fn reconcile_default_service_account<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
+    namespace: &str,
+) -> Result<()> {
+    reconcile_default_service_account_at(store, namespace, chrono::Utc::now()).await
+}
+
+pub async fn create_kube_root_ca_configmap_at<S: NamespaceBootstrapStore + ?Sized>(
     store: &S,
     namespace: &str,
     ca_cert_pem: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let cm = serde_json::json!({
         "apiVersion": "v1",
@@ -192,7 +213,7 @@ pub async fn create_kube_root_ca_configmap<S: NamespaceBootstrapStore + ?Sized>(
         "metadata": {
             "name": "kube-root-ca.crt",
             "namespace": namespace,
-            "creationTimestamp": crate::utils::k8s_time_now(),
+            "creationTimestamp": crate::k8s_time::format_time(now),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "data": {
@@ -209,6 +230,15 @@ pub async fn create_kube_root_ca_configmap<S: NamespaceBootstrapStore + ?Sized>(
         namespace
     );
     Ok(())
+}
+
+#[cfg(test)]
+pub async fn create_kube_root_ca_configmap<S: NamespaceBootstrapStore + ?Sized>(
+    store: &S,
+    namespace: &str,
+    ca_cert_pem: &str,
+) -> Result<()> {
+    create_kube_root_ca_configmap_at(store, namespace, ca_cert_pem, chrono::Utc::now()).await
 }
 
 /// Check if a namespace is absent or terminating.
@@ -234,6 +264,7 @@ pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Size
     store: &S,
     namespace: &str,
     ca_cert_path: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
@@ -249,7 +280,7 @@ pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Size
     }
 
     // Read the CA cert from the bootstrap file
-    let ca_pem = match crate::utils::read_utf8_file_async(file_process, ca_cert_path).await {
+    let ca_pem = match crate::runtime_fs::read_utf8_async(file_process, ca_cert_path).await {
         Ok(pem) => pem,
         Err(e) => {
             tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
@@ -257,7 +288,7 @@ pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Size
         }
     };
 
-    create_kube_root_ca_configmap(store, namespace, &ca_pem).await
+    create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now).await
 }
 
 #[cfg(test)]
@@ -268,7 +299,14 @@ pub async fn reconcile_kube_root_ca<S: NamespaceBootstrapStore + ?Sized>(
 ) -> Result<()> {
     let runtime_namespace = crate::paths::runtime_namespace();
     let ca_cert_path = crate::paths::ca_cert_path(&runtime_namespace);
-    reconcile_kube_root_ca_with_path(file_process, store, namespace, &ca_cert_path).await
+    reconcile_kube_root_ca_with_path(
+        file_process,
+        store,
+        namespace,
+        &ca_cert_path,
+        chrono::Utc::now(),
+    )
+    .await
 }
 
 /// Reconcile `kube-root-ca.crt` data in a namespace: read the CA from
@@ -280,13 +318,14 @@ pub async fn reconcile_kube_root_ca_data_with_path<S: NamespaceBootstrapStore + 
     store: &S,
     namespace: &str,
     ca_cert_path: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     if namespace_absent_or_terminating(store, namespace).await? {
         return Ok(());
     }
 
     // Read the CA cert from the bootstrap file
-    let ca_pem = match crate::utils::read_utf8_file_async(file_process, ca_cert_path).await {
+    let ca_pem = match crate::runtime_fs::read_utf8_async(file_process, ca_cert_path).await {
         Ok(pem) => pem,
         Err(e) => {
             tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
@@ -297,7 +336,7 @@ pub async fn reconcile_kube_root_ca_data_with_path<S: NamespaceBootstrapStore + 
     // Get current CM and update its data
     let Some(cm) = store.get_configmap(namespace, "kube-root-ca.crt").await? else {
         // CM doesn't exist, use the create path
-        return create_kube_root_ca_configmap(store, namespace, &ca_pem).await;
+        return create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now).await;
     };
 
     // Check if data already matches
@@ -334,16 +373,24 @@ pub async fn reconcile_kube_root_ca_data<S: NamespaceBootstrapStore + ?Sized>(
 ) -> Result<()> {
     let runtime_namespace = crate::paths::runtime_namespace();
     let ca_cert_path = crate::paths::ca_cert_path(&runtime_namespace);
-    reconcile_kube_root_ca_data_with_path(file_process, store, namespace, &ca_cert_path).await
+    reconcile_kube_root_ca_data_with_path(
+        file_process,
+        store,
+        namespace,
+        &ca_cert_path,
+        chrono::Utc::now(),
+    )
+    .await
 }
 
-pub async fn create_extension_apiserver_authentication_configmap<
+pub async fn create_extension_apiserver_authentication_configmap_at<
     S: NamespaceBootstrapStore + ?Sized,
 >(
     store: &S,
     ca_cert_pem: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
-    let cm = extension_apiserver_authentication_configmap(ca_cert_pem);
+    let cm = extension_apiserver_authentication_configmap(ca_cert_pem, now);
 
     store
         .create_configmap("kube-system", "extension-apiserver-authentication", cm)
@@ -353,13 +400,25 @@ pub async fn create_extension_apiserver_authentication_configmap<
     Ok(())
 }
 
-async fn reconcile_extension_apiserver_authentication_configmap<
+#[cfg(test)]
+pub async fn create_extension_apiserver_authentication_configmap<
     S: NamespaceBootstrapStore + ?Sized,
 >(
     store: &S,
     ca_cert_pem: &str,
 ) -> Result<()> {
-    let desired = extension_apiserver_authentication_configmap(ca_cert_pem);
+    create_extension_apiserver_authentication_configmap_at(store, ca_cert_pem, chrono::Utc::now())
+        .await
+}
+
+async fn reconcile_extension_apiserver_authentication_configmap<
+    S: NamespaceBootstrapStore + ?Sized,
+>(
+    store: &S,
+    ca_cert_pem: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let desired = extension_apiserver_authentication_configmap(ca_cert_pem, now);
     let desired_data = desired["data"].clone();
     let Some(existing) = store
         .get_configmap("kube-system", "extension-apiserver-authentication")
@@ -392,14 +451,17 @@ async fn reconcile_extension_apiserver_authentication_configmap<
     Ok(())
 }
 
-fn extension_apiserver_authentication_configmap(ca_cert_pem: &str) -> serde_json::Value {
+fn extension_apiserver_authentication_configmap(
+    ca_cert_pem: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {
             "name": "extension-apiserver-authentication",
             "namespace": "kube-system",
-            "creationTimestamp": crate::utils::k8s_time_now(),
+            "creationTimestamp": crate::k8s_time::format_time(now),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "data": {
@@ -851,7 +913,7 @@ mod tests {
                     "name": "extension-apiserver-authentication",
                     "namespace": "kube-system",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": crate::utils::k8s_time_now()
+                    "creationTimestamp": crate::k8s_time::now_time()
                 },
                 "data": {
                     "client-ca-file": ca_pem,

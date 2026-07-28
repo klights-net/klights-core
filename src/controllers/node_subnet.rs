@@ -507,7 +507,7 @@ async fn wait_for_peer_watch_reconnect(
         _ = cancel.cancelled() => false,
         result = supervisor.sleep(
             "focused_node_peer_watch_reconnect",
-            crate::utils::watch_reconnect_delay(attempt),
+            crate::reconnect_backoff::delay(attempt),
         ) => result.is_ok(),
     }
 }
@@ -2933,7 +2933,7 @@ mod tests {
                 "metadata": {
                     "name": "worker-node",
                     "annotations": {
-                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT
+                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: "test-commit"
                     }
                 },
                 "status": {

@@ -171,7 +171,7 @@ fn pod_watch_reconnect_future(
             let _ = task_supervisor
                 .sleep(
                     "pod_manager_watch_reconnect",
-                    crate::utils::watch_reconnect_delay(attempt - 1),
+                    crate::reconnect_backoff::delay(attempt - 1),
                 )
                 .await;
         }

@@ -9,7 +9,7 @@ use serde_json::Value;
 #[cfg(test)]
 pub fn cri_timestamp_from_ns(ns: i64) -> String {
     if ns <= 0 {
-        return crate::utils::k8s_timestamp();
+        return crate::k8s_time::now_legacy_timestamp();
     }
     let secs = ns / 1_000_000_000;
     let sub_ns = (ns % 1_000_000_000) as u32;
@@ -17,7 +17,7 @@ pub fn cri_timestamp_from_ns(ns: i64) -> String {
     // detect no-change and avoid infinite write-loops.
     chrono::DateTime::from_timestamp(secs, sub_ns)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%fZ").to_string())
-        .unwrap_or_else(crate::utils::k8s_timestamp)
+        .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
 }
 
 /// Build status object for completed init container
@@ -506,7 +506,7 @@ pub fn build_failed_init_container_statuses(
         return vec![];
     };
 
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
     let mut statuses = Vec::new();
     for c in init_containers {
         let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("unknown");
@@ -563,7 +563,7 @@ pub fn build_retrying_init_container_statuses(
         return vec![];
     };
 
-    let now = crate::utils::k8s_timestamp();
+    let now = crate::k8s_time::now_legacy_timestamp();
     let mut statuses = Vec::new();
     let mut saw_failed = false;
     for c in init_containers {

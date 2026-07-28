@@ -36,7 +36,7 @@ async fn test_projected_volume_with_service_account_token() {
     .await
     .unwrap();
 
-    let token_content = crate::utils::read_utf8_file(format!("{}/token", path)).unwrap();
+    let token_content = crate::runtime_fs::read_utf8(format!("{}/token", path)).unwrap();
     assert_eq!(token_content, "test-token-value");
 }
 
@@ -128,7 +128,7 @@ async fn test_projected_volume_with_configmap_source() {
     .await
     .unwrap();
 
-    let ca_content = crate::utils::read_utf8_file(format!("{}/ca.crt", path)).unwrap();
+    let ca_content = crate::runtime_fs::read_utf8(format!("{}/ca.crt", path)).unwrap();
     assert_eq!(
         ca_content,
         "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----"
@@ -171,7 +171,7 @@ async fn test_projected_volume_with_downward_api_source() {
     .await
     .unwrap();
 
-    let namespace_content = crate::utils::read_utf8_file(format!("{}/namespace", path)).unwrap();
+    let namespace_content = crate::runtime_fs::read_utf8(format!("{}/namespace", path)).unwrap();
     assert_eq!(namespace_content, "default");
 }
 
@@ -230,9 +230,9 @@ async fn test_projected_volume_combines_multiple_sources() {
     assert!(std::path::Path::new(&format!("{}/ca.crt", path)).exists());
     assert!(std::path::Path::new(&format!("{}/namespace", path)).exists());
 
-    let token = crate::utils::read_utf8_file(format!("{}/token", path)).unwrap();
-    let ca = crate::utils::read_utf8_file(format!("{}/ca.crt", path)).unwrap();
-    let ns = crate::utils::read_utf8_file(format!("{}/namespace", path)).unwrap();
+    let token = crate::runtime_fs::read_utf8(format!("{}/token", path)).unwrap();
+    let ca = crate::runtime_fs::read_utf8(format!("{}/ca.crt", path)).unwrap();
+    let ns = crate::runtime_fs::read_utf8(format!("{}/namespace", path)).unwrap();
 
     assert_eq!(token, "projected-token");
     assert_eq!(ca, "ca-cert-data");
@@ -497,7 +497,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
     // Verify initial file content
     let volume_path = format!("{}/{pod_dir_id}/volumes/downward-api/podinfo", volumes_root);
     let annotations_path = format!("{}/annotations", volume_path);
-    let initial_content = crate::utils::read_utf8_file(&annotations_path).unwrap();
+    let initial_content = crate::runtime_fs::read_utf8(&annotations_path).unwrap();
     assert!(
         initial_content.contains("key1=\"initial-value\""),
         "Initial annotation should be present"
@@ -553,7 +553,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
     .unwrap();
 
     // Verify file content updated
-    let updated_content = crate::utils::read_utf8_file(&annotations_path).unwrap();
+    let updated_content = crate::runtime_fs::read_utf8(&annotations_path).unwrap();
     assert!(
         updated_content.contains("key1=\"updated-value\""),
         "Annotation should be updated"
@@ -696,7 +696,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
     std::fs::write(format!("{}/labels", vol_dir), "app=\"initial\"\n").unwrap();
 
     // Verify initial content
-    let content = crate::utils::read_utf8_file(format!("{}/labels", vol_dir)).unwrap();
+    let content = crate::runtime_fs::read_utf8(format!("{}/labels", vol_dir)).unwrap();
     assert!(content.contains("app=\"initial\""));
 
     // Update pod labels in the database
@@ -737,7 +737,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
     .unwrap();
 
     // Verify labels file updated at the correct projected path
-    let updated_content = crate::utils::read_utf8_file(format!("{}/labels", vol_dir)).unwrap();
+    let updated_content = crate::runtime_fs::read_utf8(format!("{}/labels", vol_dir)).unwrap();
     assert!(
         updated_content.contains("app=\"updated\""),
         "Label should be updated, got: {}",
@@ -820,7 +820,7 @@ async fn test_projected_volume_configmap_writes_files() {
     );
 
     // Verify content
-    let content = crate::utils::read_utf8_file(&ca_cert_path).unwrap();
+    let content = crate::runtime_fs::read_utf8(&ca_cert_path).unwrap();
     assert!(
         content.contains("BEGIN CERTIFICATE"),
         "ca.crt content should contain certificate data, got: {}",
@@ -876,7 +876,7 @@ async fn test_projected_volume_configmap_with_items() {
 
     // app.yaml should exist (renamed from config.yaml)
     assert!(std::path::Path::new(&format!("{}/app.yaml", path)).exists());
-    let content = crate::utils::read_utf8_file(format!("{}/app.yaml", path)).unwrap();
+    let content = crate::runtime_fs::read_utf8(format!("{}/app.yaml", path)).unwrap();
     assert_eq!(content, "server: localhost\nport: 8080\n");
 
     // logging.conf should NOT exist (not in items list)

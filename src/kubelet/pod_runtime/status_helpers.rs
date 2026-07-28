@@ -187,7 +187,7 @@ pub fn restarted_running_container_status(
         "lastState": last_state.clone(),
         "state": {
             "running": {
-                "startedAt": crate::utils::k8s_timestamp()
+                "startedAt": crate::k8s_time::now_legacy_timestamp()
             }
         },
         "image": image,
@@ -292,13 +292,13 @@ pub(super) fn build_ephemeral_container_status(
 
 pub(super) fn cri_timestamp_from_ns(ns: i64) -> String {
     if ns <= 0 {
-        return crate::utils::k8s_timestamp();
+        return crate::k8s_time::now_legacy_timestamp();
     }
     let secs = ns / 1_000_000_000;
     let sub_ns = (ns % 1_000_000_000) as u32;
     chrono::DateTime::from_timestamp(secs, sub_ns)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%fZ").to_string())
-        .unwrap_or_else(crate::utils::k8s_timestamp)
+        .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
 }
 
 #[cfg(test)]

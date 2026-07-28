@@ -114,7 +114,7 @@ async fn provision_pv_for_pvc<S: PvcStore + ?Sized>(
         .join(pvc_name)
         .to_string_lossy()
         .into_owned();
-    crate::utils::create_dir_all_async(file_process, &host_path)
+    crate::runtime_fs::create_dir_all_async(file_process, &host_path)
         .await
         .with_context(|| format!("Failed to create directory {}", host_path))?;
 
@@ -473,7 +473,7 @@ pub(crate) async fn reconcile_pvc<S: PvcStore + ?Sized>(
         let pv_metadata = updated_pv
             .get("metadata")
             .ok_or_else(|| anyhow::anyhow!("PV missing metadata"))?;
-        let pv_rv = crate::utils::extract_resource_version(pv_metadata);
+        let pv_rv = crate::resource_metadata::resource_version(pv_metadata);
         let pv_preconditions = ResourcePreconditions::from_metadata(pv_metadata, pv_rv)?;
 
         store

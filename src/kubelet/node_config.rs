@@ -10,7 +10,7 @@ pub(crate) struct NodeRegistrationProfile {
     peer_mode: klights_network_api::NodePeerMode,
     role: KubeletNodeRole,
     publish_external_ip: bool,
-    kubelet_version: String,
+    build_identity: klights_types::BuildIdentity,
 }
 
 impl NodeRegistrationProfile {
@@ -18,13 +18,13 @@ impl NodeRegistrationProfile {
         peer_mode: klights_network_api::NodePeerMode,
         role: KubeletNodeRole,
         publish_external_ip: bool,
-        kubelet_version: String,
+        build_identity: klights_types::BuildIdentity,
     ) -> Self {
         Self {
             peer_mode,
             role,
             publish_external_ip,
-            kubelet_version,
+            build_identity,
         }
     }
 
@@ -41,7 +41,11 @@ impl NodeRegistrationProfile {
     }
 
     pub(crate) fn kubelet_version(&self) -> &str {
-        &self.kubelet_version
+        self.build_identity.kubelet_version()
+    }
+
+    pub(crate) fn git_commit(&self) -> &str {
+        self.build_identity.git_commit()
     }
 }
 
@@ -55,7 +59,7 @@ mod tests {
             klights_network_api::NodePeerMode::Rootless,
             KubeletNodeRole::Controlplane { as_learner: true },
             true,
-            "v1.34.6+klights0.9.14".to_string(),
+            klights_types::BuildIdentity::new("v1.34.6+klights0.9.14", "abcdef12"),
         );
 
         assert_eq!(
@@ -68,5 +72,6 @@ mod tests {
         );
         assert!(profile.publish_external_ip());
         assert_eq!(profile.kubelet_version(), "v1.34.6+klights0.9.14");
+        assert_eq!(profile.git_commit(), "abcdef12");
     }
 }

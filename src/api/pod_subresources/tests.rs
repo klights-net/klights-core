@@ -1682,17 +1682,17 @@ fn test_format_websocket_error_payload_is_json_for_v4_channel() {
 
 #[tokio::test]
 async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
+    use super::spdy_framing::{SpdyConnection, SpdyFrame, StreamType};
     use crate::api::pod_subresources::exec_spdy::{
         SpdyExecStreamRequest, collect_spdy_client_streams, write_spdy_exec_channel_frame,
     };
-    use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     let (mut server_io, mut client_io) = tokio::io::duplex(4096);
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
 
     let server = tokio::spawn(async move {
-        let mut server_spdy = SpdyExec::new();
+        let mut server_spdy = SpdyConnection::new();
         let streams = collect_spdy_client_streams(
             &mut server_spdy,
             &mut server_io,
@@ -1740,7 +1740,7 @@ async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
         .unwrap();
     });
 
-    let mut client_spdy = SpdyExec::new();
+    let mut client_spdy = SpdyConnection::new();
     client_spdy
         .write_syn_stream(&mut client_io, 1, StreamType::Stdout)
         .await
@@ -1798,17 +1798,17 @@ async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
 
 #[tokio::test]
 async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() {
+    use super::spdy_framing::{SpdyConnection, SpdyFrame, StreamType};
     use crate::api::pod_subresources::exec_spdy::{
         SpdyExecStreamRequest, collect_spdy_client_streams,
     };
-    use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     let (mut server_io, mut client_io) = tokio::io::duplex(4096);
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
 
     let server = tokio::spawn(async move {
-        let mut server_spdy = SpdyExec::new();
+        let mut server_spdy = SpdyConnection::new();
         collect_spdy_client_streams(
             &mut server_spdy,
             &mut server_io,
@@ -1824,7 +1824,7 @@ async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() 
         .await
     });
 
-    let mut client_spdy = SpdyExec::new();
+    let mut client_spdy = SpdyConnection::new();
     client_spdy
         .write_syn_stream(&mut client_io, 1, StreamType::Stdout)
         .await
@@ -1840,56 +1840,6 @@ async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() 
         .expect("stdout-only SPDY negotiation should not wait for an error stream")
         .unwrap()
         .unwrap();
-}
-
-#[test]
-fn test_containerd_spdy_bridge_waits_for_container_close_when_stdout_was_requested() {
-    use crate::api::pod_subresources::exec_spdy::{
-        ContainerdSpdyBridgeState, SpdyExecStreamRequest,
-    };
-
-    let mut state = ContainerdSpdyBridgeState::new(SpdyExecStreamRequest {
-        stdin: false,
-        stdout: true,
-        stderr: false,
-        tty: false,
-        attach: false,
-    });
-    let status = exec_exit_status(0).to_string();
-
-    assert!(
-        !state.observe_data_frame(7, status.as_bytes(), true),
-        "terminal error/status must not complete the bridge while requested stdout is still open"
-    );
-    assert!(
-        !state.observe_data_frame(3, b"", true),
-        "stdout FIN is not sufficient; the bridge must drain until containerd closes"
-    );
-    assert!(
-        state.terminal_error_seen(),
-        "terminal status should be tracked so EOF can complete the bridge"
-    );
-}
-
-#[test]
-fn test_containerd_spdy_bridge_completes_terminal_status_when_no_output_requested() {
-    use crate::api::pod_subresources::exec_spdy::{
-        ContainerdSpdyBridgeState, SpdyExecStreamRequest,
-    };
-
-    let mut state = ContainerdSpdyBridgeState::new(SpdyExecStreamRequest {
-        stdin: false,
-        stdout: false,
-        stderr: false,
-        tty: false,
-        attach: false,
-    });
-    let status = exec_exit_status(0).to_string();
-
-    assert!(
-        state.observe_data_frame(7, status.as_bytes(), true),
-        "status can complete immediately when no output stream was requested"
-    );
 }
 
 #[tokio::test]

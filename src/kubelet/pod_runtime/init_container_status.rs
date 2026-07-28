@@ -84,7 +84,7 @@ pub(super) fn build_completed_init_container_status(
     let timestamp_from_seconds = |seconds: i64| {
         chrono::DateTime::from_timestamp(seconds, 0)
             .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(crate::utils::k8s_timestamp)
+            .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
     };
     serde_json::json!({
         "name": name,
@@ -107,7 +107,7 @@ pub(super) fn build_completed_init_container_status(
 fn init_failure_timestamp_from_seconds(seconds: i64) -> String {
     chrono::DateTime::from_timestamp(seconds, 0)
         .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(crate::utils::k8s_timestamp)
+        .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
 }
 
 /// Build the `terminated` state object for a failed init container.
@@ -257,8 +257,8 @@ pub(super) fn build_retrying_init_container_statuses(
                     "terminated": {
                         "exitCode": 0,
                         "reason": "Completed",
-                        "startedAt": crate::utils::k8s_timestamp(),
-                        "finishedAt": crate::utils::k8s_timestamp()
+                        "startedAt": crate::k8s_time::now_legacy_timestamp(),
+                        "finishedAt": crate::k8s_time::now_legacy_timestamp()
                     }
                 }
             }));
@@ -320,8 +320,8 @@ pub(super) fn build_failed_init_container_statuses(
                 "terminated": {
                     "exitCode": 0,
                     "reason": "Completed",
-                    "startedAt": crate::utils::k8s_timestamp(),
-                    "finishedAt": crate::utils::k8s_timestamp()
+                    "startedAt": crate::k8s_time::now_legacy_timestamp(),
+                    "finishedAt": crate::k8s_time::now_legacy_timestamp()
                 }
             }
         }));

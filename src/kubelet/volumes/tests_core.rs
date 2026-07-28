@@ -148,7 +148,7 @@ fn test_create_empty_dir_memory_medium() {
 
     // Verify it's a tmpfs mount
     // Read /proc/mounts to check if path is mounted as tmpfs
-    let mounts = crate::utils::read_utf8_file("/proc/mounts").unwrap();
+    let mounts = crate::runtime_fs::read_utf8("/proc/mounts").unwrap();
     assert!(
         mounts.contains(&format!("{} tmpfs", path)),
         "Path should be mounted as tmpfs"
@@ -170,7 +170,7 @@ fn test_create_empty_dir_memory_medium_with_size_limit() {
     );
 
     // Verify tmpfs mount exists with size limit
-    let mounts = crate::utils::read_utf8_file("/proc/mounts").unwrap();
+    let mounts = crate::runtime_fs::read_utf8("/proc/mounts").unwrap();
     assert!(
         mounts.contains(&format!("{} tmpfs", path)),
         "Path should be mounted as tmpfs"
@@ -400,7 +400,7 @@ async fn test_configmap_volume_items_renames_files() {
         "Renamed file should exist"
     );
 
-    let content = crate::utils::read_utf8_file(format!("{}/renamed-file", path)).unwrap();
+    let content = crate::runtime_fs::read_utf8(format!("{}/renamed-file", path)).unwrap();
     assert_eq!(content, "content");
 }
 
@@ -508,7 +508,7 @@ async fn test_configmap_volume_replaces_stale_directory() {
     );
     assert!(!corefile.is_dir(), "Corefile must NOT be a directory");
 
-    let content = crate::utils::read_utf8_file(&corefile_str).unwrap();
+    let content = crate::runtime_fs::read_utf8(&corefile_str).unwrap();
     assert!(
         content.contains("health"),
         "Corefile should have correct content"
@@ -567,7 +567,7 @@ async fn test_configmap_volume_corefile_is_file_not_directory() {
     assert!(!corefile.is_dir(), "Corefile must NOT be a directory");
 
     // Verify content
-    let content = crate::utils::read_utf8_file(&corefile_path).unwrap();
+    let content = crate::runtime_fs::read_utf8(&corefile_path).unwrap();
     assert!(
         content.contains("health"),
         "Corefile should contain health directive"
@@ -653,7 +653,7 @@ async fn test_configmap_volume_binary_data_and_data_combined() {
     .unwrap();
 
     // text file
-    let text = crate::utils::read_utf8_file(format!("{}/text.txt", path)).unwrap();
+    let text = crate::runtime_fs::read_utf8(format!("{}/text.txt", path)).unwrap();
     assert_eq!(text, "hello world");
 
     // binary file
@@ -850,7 +850,7 @@ async fn test_secret_volume_items_filters_and_renames() {
         "db-password (renamed) should exist"
     );
 
-    let content = crate::utils::read_utf8_file(format!("{}/db-password", path)).unwrap();
+    let content = crate::runtime_fs::read_utf8(format!("{}/db-password", path)).unwrap();
     assert_eq!(content, "secret", "Content should be base64-decoded");
 }
 

@@ -161,7 +161,7 @@ async fn read_optional_auth_pem(
     let path_buf = std::path::PathBuf::from(path);
     let key = path_buf.to_string_lossy().into_owned();
     let pem = supervisor
-        .run_blocking_file_keyed(label, key, move || crate::utils::read_utf8_file(path_buf))
+        .run_blocking_file_keyed(label, key, move || crate::runtime_fs::read_utf8(path_buf))
         .await
         .with_context(|| format!("failed to join {description} read"))?
         .with_context(|| format!("failed to read {description} {path}"))?;
@@ -368,6 +368,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             &klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             db,
             &api_runtime_paths.ca_cert,
+            chrono::Utc::now(),
         )
         .await
         .context("Failed to initialize default namespaces")?;
@@ -540,10 +541,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let pod_slot_adapter =
         crate::bootstrap::kubelet_ports::DatastorePodSlotAdapter::new(node_local.clone());
     let kubelet_file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
+    let registration_profile =
+        crate::bootstrap::node_registration_profile::build(node_mode, &cli.role);
     let kubelet_capacity =
         crate::kubelet::node_registration::NodeRegistrationHostFacts::capture_local(
             &kubelet_file_process,
-            crate::version::GIT_VERSION,
+            &registration_profile,
         )
         .await
         .node_capacity();
@@ -680,6 +683,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
     );
     let controller_dependencies = crate::controllers::ControllerRuntimeDependencies {
+        wall_time: chrono::Utc::now,
         resource_query: controller_leader_ports.clone(),
         deployment_store: controller_leader_ports.clone(),
         replicaset_store: controller_leader_ports.clone(),
@@ -788,7 +792,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let cluster_ca_pem = supervisor
         .run_blocking_file_keyed("proxy_read_ca_cert", ca_cert_path.display().to_string(), {
             let p = ca_cert_path.clone();
-            move || crate::utils::read_utf8_file(&p)
+            move || crate::runtime_fs::read_utf8(&p)
         })
         .await
         .ok()

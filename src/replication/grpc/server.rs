@@ -3848,10 +3848,10 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-07T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let past_100 = crate::utils::k8s_time_format(now - chrono::Duration::seconds(100));
-        let future_100 = crate::utils::k8s_time_format(now + chrono::Duration::seconds(100));
-        let past_101 = crate::utils::k8s_time_format(now - chrono::Duration::seconds(101));
-        let future_101 = crate::utils::k8s_time_format(now + chrono::Duration::seconds(101));
+        let past_100 = crate::k8s_time::format_time(now - chrono::Duration::seconds(100));
+        let future_100 = crate::k8s_time::format_time(now + chrono::Duration::seconds(100));
+        let past_101 = crate::k8s_time::format_time(now - chrono::Duration::seconds(101));
+        let future_101 = crate::k8s_time::format_time(now + chrono::Duration::seconds(101));
 
         super::validate_node_lease_renew_time_skew(&past_100, now)
             .expect("100s past skew is accepted at boundary");
@@ -5993,7 +5993,7 @@ mod tests {
                 .renew_node_lease(request_with_node_client_cert(
                     klights_internal_protobuf::RenewNodeLeaseRequest {
                         node_name: "worker-1".to_string(),
-                        renew_time: crate::utils::k8s_time_format(chrono::Utc::now()),
+                        renew_time: crate::k8s_time::format_time(chrono::Utc::now()),
                         lease_duration_seconds: duration,
                     },
                     "worker-1",
@@ -6581,7 +6581,7 @@ mod tests {
         );
 
         let skewed =
-            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::seconds(101));
+            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::seconds(101));
         let status = grpc
             .renew_node_lease(request_with_node_client_cert(
                 klights_internal_protobuf::RenewNodeLeaseRequest {
@@ -6791,7 +6791,7 @@ mod tests {
             klights_network_api::NodePeerMode::Root,
             crate::kubelet::node_config::KubeletNodeRole::Leader,
             false,
-            crate::version::git_version(),
+            klights_types::BuildIdentity::new(crate::version::git_version(), "test-commit"),
         );
         crate::kubelet::node::register_node_at_addresses(
             &crate::kubelet::file_blocking::test_file_process_executor(),
@@ -7087,7 +7087,7 @@ mod tests {
             tracker.clone(),
         );
 
-        let renew_time = crate::utils::k8s_time_format(chrono::Utc::now());
+        let renew_time = crate::k8s_time::format_time(chrono::Utc::now());
         grpc.renew_node_lease(request_with_node_client_cert(
             klights_internal_protobuf::RenewNodeLeaseRequest {
                 node_name: "worker-1".to_string(),

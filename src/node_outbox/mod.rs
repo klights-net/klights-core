@@ -987,7 +987,7 @@ fn normalize_bound_pod_scheduled_condition(
             serde_json::json!({
                 "type": "PodScheduled",
                 "status": "True",
-                "lastTransitionTime": crate::utils::k8s_timestamp(),
+                "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
             })
         });
 
@@ -3944,7 +3944,7 @@ mod tests {
             klights_network_api::NodePeerMode::Root,
             crate::kubelet::node_config::KubeletNodeRole::Worker,
             true,
-            "v1.34.6+klights-test".to_string(),
+            klights_types::BuildIdentity::new("v1.34.6+klights-test", "test-commit"),
         );
         crate::kubelet::node::register_node_with_outbox(
             &crate::kubelet::file_blocking::test_file_process_executor(),

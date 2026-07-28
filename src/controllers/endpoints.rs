@@ -1065,9 +1065,10 @@ pub async fn reconcile_service_endpoints_batch(
 /// K8s has an endpointslice-mirroring-controller that watches for Endpoints
 /// (not created by a Service) and creates matching EndpointSlices.
 /// This enables EndpointSlice consumers to work with manually-created Endpoints.
-pub async fn mirror_endpoints_to_endpointslice(
+pub async fn mirror_endpoints_to_endpointslice_at(
     db: &(impl EndpointReconcileStore + ?Sized),
     endpoints: &Value,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let input_metadata = endpoints
         .get("metadata")
@@ -1098,6 +1099,7 @@ pub async fn mirror_endpoints_to_endpointslice(
     let endpoints = crate::controllers::resource_projection::with_resource_version(
         live_endpoints.data,
         live_endpoints.resource_version,
+        now,
     );
     let metadata = endpoints
         .get("metadata")
@@ -1360,6 +1362,14 @@ pub async fn mirror_endpoints_to_endpointslice(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub async fn mirror_endpoints_to_endpointslice(
+    db: &(impl EndpointReconcileStore + ?Sized),
+    endpoints: &Value,
+) -> Result<()> {
+    mirror_endpoints_to_endpointslice_at(db, endpoints, chrono::Utc::now()).await
 }
 
 pub async fn delete_mirrored_endpointslice_for_endpoints(

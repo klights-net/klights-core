@@ -1,15 +1,27 @@
 //! `Controller` impl for `APIService`. Registered in `ControllerDispatcher`.
 
 use crate::controllers::apiservice as apiservice_core;
-use crate::controllers::controller_wrapper;
+pub struct APIServiceController;
 
-controller_wrapper!(
-    APIServiceController,
-    "apiservice",
-    apiservice_core::reconcile_apiservice,
-    no_node,
-    store = apiservice_store
-);
+#[async_trait::async_trait]
+impl crate::controllers::Controller for APIServiceController {
+    fn name(&self) -> &'static str {
+        "apiservice"
+    }
+
+    async fn reconcile(
+        &self,
+        resource: serde_json::Value,
+        ctx: crate::controllers::Context,
+    ) -> anyhow::Result<()> {
+        apiservice_core::reconcile_apiservice(
+            ctx.apiservice_store(),
+            &resource,
+            ctx.reconcile_time(),
+        )
+        .await
+    }
+}
 
 #[cfg(test)]
 mod tests {

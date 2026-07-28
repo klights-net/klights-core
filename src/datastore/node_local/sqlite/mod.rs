@@ -2466,7 +2466,7 @@ fn reserve_ip_and_insert_network_in_conn(
 
     for offset in 0..usable_count {
         let candidate = start + ((next_after_max - start + offset) % usable_count);
-        let ip_addr = crate::utils::ip_u32_to_string(candidate);
+        let ip_addr = klights_types::ipv4_from_u32(candidate);
         let inserted = conn.execute(
             "INSERT INTO pod_networks \
              (sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
@@ -2489,7 +2489,7 @@ fn reserve_ip_and_insert_network_in_conn(
         )?;
         if inserted > 0 {
             return Ok(PodNetworkReservationOutcome::Reserved(
-                crate::utils::ip_u32_to_string(candidate),
+                klights_types::ipv4_from_u32(candidate),
                 candidate,
             ));
         }

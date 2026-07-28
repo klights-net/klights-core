@@ -945,7 +945,7 @@ mod tests {
         .await;
 
         let refreshed =
-            crate::utils::read_utf8_file(format!("{volume_path}/data-1")).expect("read refresh");
+            crate::runtime_fs::read_utf8(format!("{volume_path}/data-1")).expect("read refresh");
         assert_eq!(refreshed, "value-2");
     }
 }

@@ -1,4 +1,4 @@
-use crate::utils::k8s_time_now;
+use crate::k8s_time::now_time as k8s_time_now;
 
 /// The two network-related Node conditions (`Ready` + `NetworkUnavailable`)
 /// derived from the local dataplane health. Shared by initial registration and
@@ -136,7 +136,7 @@ pub fn set_node_dataplane_annotations(
 }
 
 #[cfg(test)]
-pub(super) fn stamp_current_git_commit_annotation(node: &mut serde_json::Value) -> bool {
+pub(super) fn stamp_git_commit_annotation(node: &mut serde_json::Value, git_commit: &str) -> bool {
     use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
 
     let Some(node_object) = node.as_object_mut() else {
@@ -163,12 +163,12 @@ pub(super) fn stamp_current_git_commit_annotation(node: &mut serde_json::Value) 
     let current = annotations_object
         .get(GIT_COMMIT_ANNOTATION)
         .and_then(|value| value.as_str());
-    if current == Some(crate::version::GIT_COMMIT_SHORT) {
+    if current == Some(git_commit) {
         return false;
     }
     annotations_object.insert(
         GIT_COMMIT_ANNOTATION.to_string(),
-        serde_json::json!(crate::version::GIT_COMMIT_SHORT),
+        serde_json::json!(git_commit),
     );
     true
 }
@@ -318,12 +318,12 @@ mod tests {
             }
         });
 
-        assert!(stamp_current_git_commit_annotation(&mut node));
+        assert!(stamp_git_commit_annotation(&mut node, "abcdef12"));
         assert_eq!(
             node.pointer("/metadata/annotations/klights.io~1git-commit")
                 .and_then(|value| value.as_str()),
-            Some(crate::version::GIT_COMMIT_SHORT)
+            Some("abcdef12")
         );
-        assert!(!stamp_current_git_commit_annotation(&mut node));
+        assert!(!stamp_git_commit_annotation(&mut node, "abcdef12"));
     }
 }

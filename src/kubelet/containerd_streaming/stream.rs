@@ -268,6 +268,7 @@ impl SpdyExec {
     }
 
     /// Write a SYN_REPLY frame
+    #[allow(dead_code)] // Kept with the private bidirectional codec for protocol tests.
     pub async fn write_syn_reply<S>(&mut self, stream: &mut S, stream_id: u32) -> anyhow::Result<()>
     where
         S: AsyncWrite + Unpin,

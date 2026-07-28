@@ -33,7 +33,7 @@ impl SideEffect for DefaultServiceAccountEffect {
 #[async_trait]
 impl DefaultServiceAccountPort for dyn DatastoreBackend + '_ {
     async fn ensure_default_service_account(&self, namespace: &str) -> Result<()> {
-        namespace::reconcile_default_service_account(self, namespace).await
+        namespace::reconcile_default_service_account_at(self, namespace, chrono::Utc::now()).await
     }
 }
 

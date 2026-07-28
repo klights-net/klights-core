@@ -281,9 +281,10 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
 impl NamespaceBootstrapSink for PodReconcileAdapter {
     fn create_default_service_account(&self, namespace: String) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::controllers::namespace::create_default_service_account(
+            crate::controllers::namespace::create_default_service_account_at(
                 self.db.as_ref(),
                 &namespace,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
@@ -296,10 +297,11 @@ impl NamespaceBootstrapSink for PodReconcileAdapter {
         ca_certificate: String,
     ) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
-            crate::controllers::namespace::create_kube_root_ca_configmap(
+            crate::controllers::namespace::create_kube_root_ca_configmap_at(
                 self.db.as_ref(),
                 &namespace,
                 &ca_certificate,
+                chrono::Utc::now(),
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))
@@ -371,10 +373,12 @@ impl PodGcReconcileSink for PodReconcileAdapter {
 impl PodPdbReconcileSink for PodReconcileAdapter {
     fn reconcile_namespace_pdbs(&self, namespace: String) -> ReconcileSinkFuture<'_> {
         Box::pin(async move {
+            let now = chrono::Utc::now();
             crate::controllers::pdb::reconcile_pdbs_for_namespace(
                 self.db.as_ref(),
                 self.pod_reader.as_ref(),
                 &namespace,
+                now,
             )
             .await;
             Ok(())
@@ -388,6 +392,7 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
         request: PodEvictionAdmissionRequest,
     ) -> PodEvictionAdmissionFuture<'_> {
         Box::pin(async move {
+            let now = chrono::Utc::now();
             let namespace = request.pod.namespace.as_deref().ok_or_else(|| {
                 ReconcileSinkError::unavailable("stored Pod is missing metadata.namespace")
             })?;
@@ -395,13 +400,15 @@ impl PodEvictionAdmissionSink for PodReconcileAdapter {
                 self.db.as_ref(),
                 self.pod_reader.as_ref(),
                 namespace,
+                now,
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))?;
-            crate::controllers::pdb::admit_pod_eviction(
+            crate::controllers::pdb::admit_pod_eviction_at(
                 self.db.as_ref(),
                 &request.pod,
                 request.dry_run,
+                now,
             )
             .await
             .map_err(|error| ReconcileSinkError::unavailable(error.to_string()))

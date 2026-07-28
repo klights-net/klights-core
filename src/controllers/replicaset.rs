@@ -102,6 +102,7 @@ pub(crate) async fn reconcile_replicaset(
     let live_replicaset = crate::controllers::resource_projection::with_resource_version(
         live_resource.data,
         live_resource.resource_version,
+        reconcile_context.wall_time,
     );
 
     let metadata = live_replicaset

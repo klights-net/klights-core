@@ -357,8 +357,8 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
             ca_cert_path.display().to_string(),
             move || -> Result<(String, String)> {
                 Ok((
-                    crate::utils::read_utf8_file(&ca_cert_path_for_task)?,
-                    crate::utils::read_utf8_file(&ca_key_path_for_task)?,
+                    crate::runtime_fs::read_utf8(&ca_cert_path_for_task)?,
+                    crate::runtime_fs::read_utf8(&ca_key_path_for_task)?,
                 ))
             },
         )

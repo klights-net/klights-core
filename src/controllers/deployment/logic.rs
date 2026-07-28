@@ -258,6 +258,7 @@ struct ZeroReplicaOldReplicaSetRedrive<'a, S: ?Sized, R: ?Sized, W: ?Sized> {
     deployment_uid: &'a str,
     current_template: &'a Value,
     node_name: &'a str,
+    wall_time: chrono::DateTime<chrono::Utc>,
 }
 
 async fn redrive_zero_replica_old_replicasets_with_live_pods(
@@ -304,6 +305,7 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
         let rs_with_metadata = crate::controllers::resource_projection::with_resource_version(
             rs.data.clone(),
             rs.resource_version,
+            ctx.wall_time,
         );
         crate::controllers::replicaset::reconcile_replicaset(
             ctx.db,
@@ -312,7 +314,11 @@ async fn redrive_zero_replica_old_replicasets_with_live_pods(
             ctx.pod_delete_sink,
             ctx.non_pod_finalization,
             &rs_with_metadata,
-            crate::controllers::ControllerReconcileContext::new(ctx.coordination, ctx.node_name),
+            crate::controllers::ControllerReconcileContext::at(
+                ctx.coordination,
+                ctx.node_name,
+                ctx.wall_time,
+            ),
         )
         .await?;
     }
@@ -594,6 +600,7 @@ pub(crate) async fn reconcile_deployment(
     let live_deployment = crate::controllers::resource_projection::with_resource_version(
         live_deployment_resource.data.clone(),
         live_deployment_resource.resource_version,
+        reconcile_context.wall_time,
     );
     let deployment = &live_deployment;
     let metadata = deployment
@@ -621,7 +628,7 @@ pub(crate) async fn reconcile_deployment(
     let selector = match spec.get("selector") {
         Some(s) => s,
         None => {
-            let now = crate::utils::k8s_timestamp();
+            let now = crate::k8s_time::format_legacy_timestamp(reconcile_context.wall_time);
             let failure_condition = json!({
                 "type": "ReplicaFailure",
                 "status": "True",
@@ -651,7 +658,7 @@ pub(crate) async fn reconcile_deployment(
     let template = match spec.get("template") {
         Some(t) => t,
         None => {
-            let now = crate::utils::k8s_timestamp();
+            let now = crate::k8s_time::format_legacy_timestamp(reconcile_context.wall_time);
             let failure_condition = json!({
                 "type": "ReplicaFailure",
                 "status": "True",
@@ -882,7 +889,7 @@ pub(crate) async fn reconcile_deployment(
             }
 
             // Update the deployment
-            let current_rv = crate::utils::extract_resource_version(metadata);
+            let current_rv = crate::resource_metadata::resource_version(metadata);
             db.update_resource_with_preconditions(
                 "apps/v1",
                 "Deployment",
@@ -961,6 +968,7 @@ pub(crate) async fn reconcile_deployment(
                         crate::controllers::resource_projection::with_resource_version(
                             updated.data,
                             updated.resource_version,
+                            reconcile_context.wall_time,
                         );
                     crate::controllers::replicaset::reconcile_replicaset(
                         db,
@@ -1013,6 +1021,7 @@ pub(crate) async fn reconcile_deployment(
                     crate::controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
+                        reconcile_context.wall_time,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
@@ -1154,6 +1163,7 @@ pub(crate) async fn reconcile_deployment(
                     crate::controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
+                        reconcile_context.wall_time,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
@@ -1192,6 +1202,7 @@ pub(crate) async fn reconcile_deployment(
                     crate::controllers::resource_projection::with_resource_version(
                         old_rs.data.clone(),
                         old_rs.resource_version,
+                        reconcile_context.wall_time,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
@@ -1225,6 +1236,7 @@ pub(crate) async fn reconcile_deployment(
                     crate::controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
+                        reconcile_context.wall_time,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
@@ -1275,6 +1287,7 @@ pub(crate) async fn reconcile_deployment(
                         crate::controllers::resource_projection::with_resource_version(
                             updated.data,
                             updated.resource_version,
+                            reconcile_context.wall_time,
                         );
                     crate::controllers::replicaset::reconcile_replicaset(
                         db,
@@ -1384,6 +1397,7 @@ pub(crate) async fn reconcile_deployment(
                     crate::controllers::resource_projection::with_resource_version(
                         updated.data,
                         updated.resource_version,
+                        reconcile_context.wall_time,
                     );
                 crate::controllers::replicaset::reconcile_replicaset(
                     db,
@@ -1548,6 +1562,7 @@ pub(crate) async fn reconcile_deployment(
         let rs_with_metadata = crate::controllers::resource_projection::with_resource_version(
             created_rs.data,
             created_rs.resource_version,
+            reconcile_context.wall_time,
         );
         crate::controllers::replicaset::reconcile_replicaset(
             db,
@@ -1580,6 +1595,7 @@ pub(crate) async fn reconcile_deployment(
             deployment_uid: uid,
             current_template: template,
             node_name,
+            wall_time: reconcile_context.wall_time,
         },
         &fresh_owned_rs_list,
     )
@@ -1597,6 +1613,7 @@ pub(crate) async fn reconcile_deployment(
         &matching_rs,
         next_revision,
         deployment.get("status"),
+        reconcile_context.wall_time,
     );
 
     // Write revision annotation FIRST — metadata mutation bumps RV once.

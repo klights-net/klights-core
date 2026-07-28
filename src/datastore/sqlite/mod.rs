@@ -1129,7 +1129,7 @@ impl Datastore {
                 {
                     metadata.insert(
                         "deletionTimestamp".to_string(),
-                        serde_json::Value::String(crate::utils::k8s_timestamp()),
+                        serde_json::Value::String(crate::k8s_time::now_legacy_timestamp()),
                     );
                 }
                 metadata
@@ -1315,7 +1315,7 @@ impl Datastore {
                             &kind,
                             &patch,
                         )
-                        .then(crate::utils::k8s_timestamp);
+                        .then(crate::k8s_time::now_legacy_timestamp);
                     return Ok((
                         Self::author_live_commit_from_cluster_mutations(
                             rv,

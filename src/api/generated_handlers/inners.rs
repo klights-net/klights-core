@@ -1180,7 +1180,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     &patch,
                     &apply_manager,
                     api_version,
-                    &crate::utils::k8s_time_now(),
+                    &crate::k8s_time::now_time(),
                     apply_force,
                 )
                 .map_err(|conflicts| AppError::Conflict(conflicts.message()))?;
@@ -1274,7 +1274,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     &patch,
                     &apply_manager,
                     api_version,
-                    &crate::utils::k8s_time_now(),
+                    &crate::k8s_time::now_time(),
                     apply_force,
                 )
                 .map_err(|conflicts| AppError::Conflict(conflicts.message()))?

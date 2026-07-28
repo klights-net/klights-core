@@ -63,7 +63,7 @@ pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name:
     {
         meta_obj.insert(
             "creationTimestamp".to_string(),
-            Value::String(crate::utils::k8s_time_now()),
+            Value::String(crate::k8s_time::now_time()),
         );
     }
     let r#gen = meta_obj
@@ -99,22 +99,22 @@ pub fn apply_pod_create_defaults(body: &mut Value) {
                 {
                     "type": "Initialized",
                     "status": "True",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                 },
                 {
                     "type": "Ready",
                     "status": "False",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                 },
                 {
                     "type": "ContainersReady",
                     "status": "False",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                 },
                 {
                     "type": "PodScheduled",
                     "status": "True",
-                    "lastTransitionTime": crate::utils::k8s_timestamp(),
+                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
                 }
             ],
             "containerStatuses": [],
@@ -352,7 +352,7 @@ pub fn set_deletion_timestamp(body: &mut Value) {
     };
     meta.insert(
         "deletionTimestamp".to_string(),
-        Value::String(crate::utils::k8s_timestamp()),
+        Value::String(crate::k8s_time::now_legacy_timestamp()),
     );
     meta.insert(
         "deletionGracePeriodSeconds".to_string(),

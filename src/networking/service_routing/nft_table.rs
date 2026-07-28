@@ -6,7 +6,7 @@ use super::network_policy::{
 use super::prelude::*;
 use super::service_rules::select_authoritative_service_spec;
 use super::*;
-use crate::utils::lock_recover;
+use crate::sync_lock::lock_recover;
 use nftnl::expr::Expression;
 use nftnl::nftnl_sys as sys;
 use std::ptr;

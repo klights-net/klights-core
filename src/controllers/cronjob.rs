@@ -46,20 +46,32 @@ pub(crate) trait CronJobStore: ControllerStatusStore {
     ) -> ControllerStoreResult<()>;
 }
 
+pub(crate) async fn reconcile_cronjob_one_at<S: CronJobStore + ?Sized>(
+    store: &S,
+    dispatcher: Option<&dyn klights_reconcile_api::ControllerDispatcherPort>,
+    cj: &Value,
+    rv: i64,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    reconcile_cronjob_inner_at(store, dispatcher, cj, rv, now).await
+}
+
+#[cfg(test)]
 pub(crate) async fn reconcile_cronjob_one<S: CronJobStore + ?Sized>(
     store: &S,
     dispatcher: Option<&dyn klights_reconcile_api::ControllerDispatcherPort>,
     cj: &Value,
     rv: i64,
 ) -> Result<()> {
-    reconcile_cronjob_inner(store, dispatcher, cj, rv).await
+    reconcile_cronjob_one_at(store, dispatcher, cj, rv, Utc::now()).await
 }
 
-async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
+async fn reconcile_cronjob_inner_at<S: CronJobStore + ?Sized>(
     store: &S,
     dispatcher: Option<&dyn klights_reconcile_api::ControllerDispatcherPort>,
     cj: &Value,
     _rv: i64,
+    now: DateTime<Utc>,
 ) -> Result<()> {
     let input_metadata = cj
         .get("metadata")
@@ -106,7 +118,6 @@ async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
         .unwrap_or("Allow");
 
     // Parse the cron schedule and determine the next scheduled time since last run.
-    let now = chrono::Utc::now();
     let schedule = match parse_cron_schedule(schedule_str) {
         Ok(s) => s,
         Err(e) => {
@@ -123,7 +134,7 @@ async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
 
     let Some(scheduled_time) = most_recent_cronjob_schedule_time(cj, now, &schedule, true)? else {
         // Not yet due — just sync active list and clean up old jobs, then return.
-        sync_active_status(store, &live_cj, None).await?;
+        sync_active_status_at(store, &live_cj, None, now).await?;
         cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
         return Ok(());
     };
@@ -139,7 +150,7 @@ async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
                 name,
                 active_jobs.len()
             );
-            sync_active_status(store, &live_cj, None).await?;
+            sync_active_status_at(store, &live_cj, None, now).await?;
             cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
             return Ok(());
         }
@@ -163,12 +174,22 @@ async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
     if let (Some(dispatcher), Some(job)) = (dispatcher, created_job.as_ref()) {
         dispatcher.enqueue(&job.data).await;
     }
-    sync_active_status(store, &live_cj, Some(scheduled_time)).await?;
+    sync_active_status_at(store, &live_cj, Some(scheduled_time), now).await?;
 
     // Clean up old completed/failed Jobs that exceed history limits
     cleanup_old_jobs_by_history_limit(store, cj, namespace, uid).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+async fn reconcile_cronjob_inner<S: CronJobStore + ?Sized>(
+    store: &S,
+    dispatcher: Option<&dyn klights_reconcile_api::ControllerDispatcherPort>,
+    cj: &Value,
+    rv: i64,
+) -> Result<()> {
+    reconcile_cronjob_inner_at(store, dispatcher, cj, rv, Utc::now()).await
 }
 
 pub fn expand_cron_schedule(schedule_str: &str) -> String {
@@ -500,10 +521,11 @@ async fn list_active_jobs<S: CronJobStore + ?Sized>(
 }
 
 /// Sync the CronJob's status.lastScheduleTime and status.active list.
-async fn sync_active_status<S: CronJobStore + ?Sized>(
+async fn sync_active_status_at<S: CronJobStore + ?Sized>(
     store: &S,
     cj_resource: &Resource,
     new_scheduled: Option<chrono::DateTime<chrono::Utc>>,
+    now: DateTime<Utc>,
 ) -> Result<()> {
     let cj = cj_resource.data.as_ref();
     let namespace = cj_resource.namespace.as_deref().unwrap_or("default");
@@ -522,7 +544,7 @@ async fn sync_active_status<S: CronJobStore + ?Sized>(
         })
         .collect();
 
-    let now_str = crate::utils::k8s_time_now();
+    let now_str = crate::k8s_time::format_time(now);
     let mut status = cj.get("status").cloned().unwrap_or_else(|| json!({}));
     if !status.is_object() {
         status = json!({});
@@ -532,7 +554,7 @@ async fn sync_active_status<S: CronJobStore + ?Sized>(
         if let Some(t) = new_scheduled {
             s.insert(
                 "lastScheduleTime".to_string(),
-                json!(crate::utils::k8s_time_format(t)),
+                json!(crate::k8s_time::format_time(t)),
             );
         }
         s.insert(
@@ -560,6 +582,15 @@ async fn sync_active_status<S: CronJobStore + ?Sized>(
     crate::controllers::common::write_status_for_resource(store, cj_resource, &status).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+async fn sync_active_status<S: CronJobStore + ?Sized>(
+    store: &S,
+    cronjob: &Resource,
+    scheduled_time: Option<DateTime<Utc>>,
+) -> Result<()> {
+    sync_active_status_at(store, cronjob, scheduled_time, Utc::now()).await
 }
 
 #[cfg(test)]
@@ -659,7 +690,7 @@ mod tests {
         .await
         .unwrap();
         let old_creation =
-            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::minutes(2));
+            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
 
         // CronJob with every-minute schedule and no lastScheduleTime
         // (so it's immediately due)
@@ -732,7 +763,7 @@ mod tests {
         .await
         .unwrap();
         let old_creation =
-            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::minutes(2));
+            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
 
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -803,7 +834,7 @@ mod tests {
     async fn test_cronjob_reconcile_persists_last_schedule_time_through_raft_status_path() {
         let db = make_raft_cronjob_datastore().await;
         let old_creation =
-            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::minutes(2));
+            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
 
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -1032,7 +1063,7 @@ mod tests {
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;
         let old_creation =
-            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::minutes(2));
+            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
 
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -1243,7 +1274,7 @@ mod tests {
         .await
         .unwrap();
 
-        let creation_timestamp = crate::utils::k8s_time_format(chrono::Utc::now());
+        let creation_timestamp = crate::k8s_time::format_time(chrono::Utc::now());
         let cj = json!({
             "apiVersion": "batch/v1",
             "kind": "CronJob",
@@ -1616,7 +1647,7 @@ mod tests {
         // observedGeneration=metadata.generation, and a pre-set lastSuccessfulTime
         // (the `or_insert_with` keeps an existing value).
         let generation = 1_i64;
-        let now_str = crate::utils::k8s_time_now();
+        let now_str = crate::k8s_time::now_time();
         let matching_status = json!({
             "active": [],
             "observedGeneration": generation,
@@ -1630,7 +1661,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "cj-sync-uid",
                 "generation": generation,
-                "creationTimestamp": crate::utils::k8s_time_now(),
+                "creationTimestamp": crate::k8s_time::now_time(),
             },
             "spec": {
                 "schedule": "* * * * *",
@@ -1681,7 +1712,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "cj-stale-status-uid",
                 "generation": 1,
-                "creationTimestamp": crate::utils::k8s_time_now(),
+                "creationTimestamp": crate::k8s_time::now_time(),
             },
             "spec": {
                 "schedule": "* * * * *",

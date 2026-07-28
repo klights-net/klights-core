@@ -103,7 +103,7 @@ impl RootBoundPodFinalization {
             patch_kind: klights_cluster_core::PatchKind::Merge,
             patch: serde_json::json!({
                 "metadata": {
-                    "deletionTimestamp": crate::utils::k8s_timestamp(),
+                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
                     "deletionGracePeriodSeconds": grace_period_seconds,
                 }
             }),

@@ -20,7 +20,7 @@ pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
         "spec": {
             "holderIdentity": node_name,
             "leaseDurationSeconds": klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS,
-            "renewTime": crate::utils::k8s_microtime_now()
+            "renewTime": crate::k8s_time::now_microtime()
         }
     })
 }

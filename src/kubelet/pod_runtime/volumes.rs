@@ -131,7 +131,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         let pod_volumes_path = pod_volumes_dir.to_string_lossy().into_owned();
         crate::kubelet::volumes::unmount_volume_mounts_under(&self.file_process, &pod_volumes_path)
             .await?;
-        crate::utils::remove_dir_all_if_exists_async(&self.file_process, &pod_volumes_dir)
+        crate::runtime_fs::remove_dir_all_if_exists_async(&self.file_process, &pod_volumes_dir)
             .await
             .map(|_| ())
             .map_err(|e| {

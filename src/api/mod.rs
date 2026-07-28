@@ -481,7 +481,7 @@ pub fn resolve_resource_name(body: &mut serde_json::Value) -> Result<String, App
         .and_then(|m| m.get("generateName"))
         .and_then(|n| n.as_str())
     {
-        let generated_name = crate::utils::generate_name(prefix);
+        let generated_name = crate::resource_name::generate(prefix);
 
         // Inject generated name into body's metadata.name
         if let Some(obj) = body.as_object_mut()

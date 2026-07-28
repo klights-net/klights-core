@@ -54,6 +54,7 @@ pub(crate) async fn reconcile_hpa_with_runtime(
     hpa: &Value,
     node_name: &str,
     metrics_provider: &dyn MetricsProvider,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let api_version = hpa
         .get("apiVersion")
@@ -90,7 +91,7 @@ pub(crate) async fn reconcile_hpa_with_runtime(
                 .await?;
         }
 
-        let status = build_status(&current.data, &decision);
+        let status = build_status(&current.data, &decision, now);
         if current.data.get("status") == Some(&status) {
             return Ok(());
         }
@@ -534,12 +535,12 @@ fn desired_from_ratio(current_replicas: i64, current_value: i64, target_value: i
     ((current_replicas.max(0) * current_value.max(0)) + target_value - 1) / target_value
 }
 
-fn build_status(hpa: &Value, decision: &HpaDecision) -> Value {
+fn build_status(hpa: &Value, decision: &HpaDecision, now: chrono::DateTime<chrono::Utc>) -> Value {
     let mut status = json!({
         "currentReplicas": decision.current_replicas,
         "desiredReplicas": decision.desired_replicas,
         "observedGeneration": hpa.pointer("/metadata/generation").and_then(|v| v.as_i64()).unwrap_or(1),
-        "conditions": build_conditions(hpa, decision)
+        "conditions": build_conditions(hpa, decision, now)
     });
 
     if hpa.get("apiVersion").and_then(|v| v.as_str()) == Some("autoscaling/v1") {
@@ -553,7 +554,11 @@ fn build_status(hpa: &Value, decision: &HpaDecision) -> Value {
     status
 }
 
-fn build_conditions(hpa: &Value, decision: &HpaDecision) -> Value {
+fn build_conditions(
+    hpa: &Value,
+    decision: &HpaDecision,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
     let able_status = if decision.target.is_some() {
         "True"
     } else {
@@ -592,6 +597,7 @@ fn build_conditions(hpa: &Value, decision: &HpaDecision) -> Value {
             } else {
                 "the HPA controller was unable to get the target's current scale"
             },
+            now,
         ),
         condition(
             hpa,
@@ -603,6 +609,7 @@ fn build_conditions(hpa: &Value, decision: &HpaDecision) -> Value {
             } else {
                 "the HPA controller was unable to calculate replica count from resource metrics"
             },
+            now,
         ),
         condition(
             hpa,
@@ -614,6 +621,7 @@ fn build_conditions(hpa: &Value, decision: &HpaDecision) -> Value {
             } else {
                 "the desired replica count is within the acceptable range"
             },
+            now,
         )
     ])
 }
@@ -624,6 +632,7 @@ fn condition(
     status: &str,
     reason: &str,
     message: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     json!({
         "type": condition_type,
@@ -631,7 +640,7 @@ fn condition(
         "reason": reason,
         "message": message,
         "lastTransitionTime": existing_transition_time(hpa, condition_type, status, reason)
-            .unwrap_or_else(crate::utils::k8s_timestamp)
+            .unwrap_or_else(|| crate::k8s_time::format_legacy_timestamp(now))
     })
 }
 
@@ -707,6 +716,7 @@ mod tests {
             hpa,
             node_name,
             metrics_provider,
+            chrono::Utc::now(),
         )
         .await
     }
@@ -812,7 +822,7 @@ mod tests {
         let runtime = missing_target_runtime(1);
         let hpa = (*runtime.current.lock().unwrap().data).clone();
         let metrics = crate::metrics::FallbackOnlyMetricsProvider;
-        reconcile_hpa_with_runtime(&runtime, &hpa, "node-a", &metrics)
+        reconcile_hpa_with_runtime(&runtime, &hpa, "node-a", &metrics, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(runtime.successful_updates.load(Ordering::Relaxed), 1);
@@ -828,7 +838,7 @@ mod tests {
         );
 
         let current = (*runtime.current.lock().unwrap().data).clone();
-        reconcile_hpa_with_runtime(&runtime, &current, "node-a", &metrics)
+        reconcile_hpa_with_runtime(&runtime, &current, "node-a", &metrics, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(

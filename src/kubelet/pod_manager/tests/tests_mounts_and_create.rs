@@ -500,7 +500,7 @@ async fn test_update_pod_status_triggers_endpoint_reconciliation() {
                 "ready": true,
                 "started": true,
                 "restartCount": 0,
-                "state": {"running": {"startedAt": crate::utils::k8s_timestamp()}},
+                "state": {"running": {"startedAt": crate::k8s_time::now_legacy_timestamp()}},
                 "image": "nginx",
                 "imageID": "docker.io/library/nginx"
             })],
@@ -633,7 +633,7 @@ async fn test_update_pod_status_preserves_restart_count_and_last_state() {
                 "ready": true,
                 "started": true,
                 "restartCount": 0,
-                "state": {"running": {"startedAt": crate::utils::k8s_timestamp()}},
+                "state": {"running": {"startedAt": crate::k8s_time::now_legacy_timestamp()}},
                 "image": "nginx",
                 "imageID": "docker.io/library/nginx"
             })],

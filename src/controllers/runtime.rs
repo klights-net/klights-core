@@ -24,6 +24,7 @@ use super::ControllerRuntimeDependencies;
 #[derive(Clone)]
 pub(crate) struct Context {
     dependencies: ControllerRuntimeDependencies,
+    reconcile_time: chrono::DateTime<chrono::Utc>,
     #[cfg(test)]
     db_handle: crate::datastore::DatastoreHandle,
     #[cfg(test)]
@@ -36,8 +37,14 @@ pub(crate) struct Context {
 
 impl Context {
     #[cfg(not(test))]
-    pub(crate) fn new(dependencies: ControllerRuntimeDependencies) -> Self {
-        Self { dependencies }
+    pub(crate) fn new(
+        dependencies: ControllerRuntimeDependencies,
+        reconcile_time: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            dependencies,
+            reconcile_time,
+        }
     }
 
     #[cfg(test)]
@@ -88,6 +95,7 @@ impl Context {
         );
         Self {
             dependencies: ControllerRuntimeDependencies {
+                wall_time: chrono::Utc::now,
                 resource_query: leader_ports.clone(),
                 deployment_store: leader_ports.clone(),
                 replicaset_store: leader_ports.clone(),
@@ -129,6 +137,7 @@ impl Context {
                 coordination: Arc::new(super::ControllerCoordination::new()),
                 node_name: Arc::from(node_name),
             },
+            reconcile_time: chrono::Utc::now(),
             db_handle,
             pod_repository: Some(repository),
             non_pod_finalization: Some(non_pod_finalization),
@@ -351,6 +360,10 @@ impl Context {
     pub(crate) fn node_name(&self) -> &str {
         &self.dependencies.node_name
     }
+
+    pub(crate) fn reconcile_time(&self) -> chrono::DateTime<chrono::Utc> {
+        self.reconcile_time
+    }
 }
 
 impl Debug for Context {
@@ -496,9 +509,10 @@ macro_rules! controller_wrapper {
                     ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
-                    $crate::controllers::ControllerReconcileContext::new(
+                    $crate::controllers::ControllerReconcileContext::at(
                         ctx.coordination(),
                         ctx.node_name(),
+                        ctx.reconcile_time(),
                     ),
                 )
                 .await
@@ -574,6 +588,7 @@ macro_rules! controller_wrapper {
                     ctx.reconcile_port().non_pod_finalization(),
                     ctx.coordination(),
                     &resource,
+                    ctx.reconcile_time(),
                 )
                 .await
             }
@@ -623,9 +638,10 @@ macro_rules! controller_wrapper {
                     ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
-                    $crate::controllers::ControllerReconcileContext::new(
+                    $crate::controllers::ControllerReconcileContext::at(
                         ctx.coordination(),
                         ctx.node_name(),
+                        ctx.reconcile_time(),
                     ),
                 )
                 .await

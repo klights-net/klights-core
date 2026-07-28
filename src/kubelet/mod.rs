@@ -1,6 +1,7 @@
 pub mod cgroup_cleanup;
 pub mod cni_readiness;
 pub mod containerd_manager;
+mod containerd_streaming;
 pub mod context;
 pub mod cri;
 pub mod cri_events;

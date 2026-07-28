@@ -454,7 +454,7 @@ mod tests {
             );
         let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
             "cp-1",
-            crate::utils::k8s_time_format(chrono::Utc::now()),
+            crate::k8s_time::format_time(chrono::Utc::now()),
             30,
         )
         .expect("valid renewal");
@@ -475,7 +475,7 @@ mod tests {
             crate::control_plane::client::remote::RemoteApiClient::new_for_tests("worker-1");
         let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
             "worker-2",
-            crate::utils::k8s_time_format(chrono::Utc::now()),
+            crate::k8s_time::format_time(chrono::Utc::now()),
             30,
         )
         .expect("valid renewal shape");
@@ -499,7 +499,7 @@ mod tests {
         let before_rv = db.get_current_resource_version().await.expect("read RV");
         let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
             "cp-1",
-            crate::utils::k8s_time_format(chrono::Utc::now()),
+            crate::k8s_time::format_time(chrono::Utc::now()),
             30,
         )
         .expect("valid renewal");

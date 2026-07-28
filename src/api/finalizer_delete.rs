@@ -54,7 +54,7 @@ pub fn ensure_deletion_timestamp(data: &mut Value, grace_seconds: i64) {
     {
         meta.insert(
             "deletionTimestamp".to_string(),
-            Value::String(crate::utils::k8s_timestamp()),
+            Value::String(crate::k8s_time::now_legacy_timestamp()),
         );
     }
     meta.entry("deletionGracePeriodSeconds".to_string())
