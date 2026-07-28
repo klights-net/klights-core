@@ -11,6 +11,7 @@ use klights_node_store::{
 };
 
 use super::NodeLocalHandle;
+use super::types as legacy;
 
 /// Root-owned adapter from the concrete node database to focused node ports.
 #[derive(Clone)]
@@ -51,7 +52,7 @@ fn runtime_error(error: anyhow::Error) -> RuntimeWorkError {
 }
 
 fn network_endpoint(
-    row: crate::datastore::PodNetworkEndpoint,
+    row: legacy::PodNetworkEndpoint,
 ) -> Result<PodNetworkEndpoint, CacheNetworkError> {
     PodNetworkEndpoint::try_new(row.ip_addr, row.veth_host, row.netns_path)
         .map_err(|error| CacheNetworkError::corrupt_data(error.to_string()))
@@ -94,15 +95,13 @@ fn runtime_record(row: super::PodRuntimeRow) -> Result<PodRuntimeRecord, Runtime
     .map_err(|error| RuntimeWorkError::corrupt_data(error.to_string()))
 }
 
-fn endpoint_record(
-    row: crate::datastore::PodEndpointRow,
-) -> Result<PodEndpointRecord, CacheNetworkError> {
+fn endpoint_record(row: legacy::PodEndpointRow) -> Result<PodEndpointRecord, CacheNetworkError> {
     PodEndpointRecord::try_from_persisted(
         klights_types::PodIdentity::new(&row.namespace, &row.pod_name, &row.pod_uid),
         row.node_name,
         match row.mode {
-            crate::datastore::PodEndpointMode::EncryptedDirect => PodEndpointMode::EncryptedDirect,
-            crate::datastore::PodEndpointMode::Hostport => PodEndpointMode::Hostport,
+            legacy::PodEndpointMode::EncryptedDirect => PodEndpointMode::EncryptedDirect,
+            legacy::PodEndpointMode::Hostport => PodEndpointMode::Hostport,
         },
         row.pod_ip,
         row.node_ip,
@@ -113,17 +112,17 @@ fn endpoint_record(
     )
 }
 
-fn endpoint_row(record: PodEndpointRecord) -> crate::datastore::PodEndpointRow {
+fn endpoint_row(record: PodEndpointRecord) -> legacy::PodEndpointRow {
     let (pod, node_name, mode, pod_ip, node_ip, tcp, udp, generation, updated_at_ms) =
         record.into_parts();
-    crate::datastore::PodEndpointRow {
+    legacy::PodEndpointRow {
         pod_uid: pod.uid,
         namespace: pod.namespace,
         pod_name: pod.name,
         node_name,
         mode: match mode {
-            PodEndpointMode::EncryptedDirect => crate::datastore::PodEndpointMode::EncryptedDirect,
-            PodEndpointMode::Hostport => crate::datastore::PodEndpointMode::Hostport,
+            PodEndpointMode::EncryptedDirect => legacy::PodEndpointMode::EncryptedDirect,
+            PodEndpointMode::Hostport => legacy::PodEndpointMode::Hostport,
         },
         pod_ip,
         node_ip,
@@ -216,18 +215,12 @@ impl PodNetworkCache for NodeLocalNetworkAdapter {
             let (sandbox_id, pod, subnet_base, subnet_size, veth_host, netns_path) =
                 request.into_parts();
             self.backend
-                .delete_network_assignment_if_matches(
-                    crate::datastore::PodNetworkAllocationRequest::new(
-                        &sandbox_id,
-                        crate::datastore::PodNetworkAllocationPod::new(
-                            &pod.namespace,
-                            &pod.name,
-                            &pod.uid,
-                        ),
-                        crate::datastore::PodNetworkAllocationSubnet::new(subnet_base, subnet_size),
-                        crate::datastore::PodNetworkAllocationLink::new(&veth_host, &netns_path),
-                    ),
-                )
+                .delete_network_assignment_if_matches(legacy::PodNetworkAllocationRequest::new(
+                    &sandbox_id,
+                    legacy::PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
+                    legacy::PodNetworkAllocationSubnet::new(subnet_base, subnet_size),
+                    legacy::PodNetworkAllocationLink::new(&veth_host, &netns_path),
+                ))
                 .await
                 .map_err(cache_error)
         })
@@ -258,15 +251,11 @@ impl PodIpamStore for NodeLocalNetworkAdapter {
                 request.into_parts();
             let allocation = self
                 .backend
-                .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
+                .reserve_network_assignment(legacy::PodNetworkAllocationRequest::new(
                     &sandbox_id,
-                    crate::datastore::PodNetworkAllocationPod::new(
-                        &pod.namespace,
-                        &pod.name,
-                        &pod.uid,
-                    ),
-                    crate::datastore::PodNetworkAllocationSubnet::new(subnet_base, subnet_size),
-                    crate::datastore::PodNetworkAllocationLink::new(&veth_host, &netns_path),
+                    legacy::PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
+                    legacy::PodNetworkAllocationSubnet::new(subnet_base, subnet_size),
+                    legacy::PodNetworkAllocationLink::new(&veth_host, &netns_path),
                 ))
                 .await
                 .map_err(reservation_error)?;
@@ -403,11 +392,11 @@ impl PodEndpointStoreEventSource for NodeLocalNetworkAdapter {
                     }
                     let mut receiver = receiver?;
                     match receiver.recv().await {
-                        Ok(crate::datastore::PodEndpointEvent::Upsert(row)) => Some((
+                        Ok(legacy::PodEndpointEvent::Upsert(row)) => Some((
                             endpoint_record(row).map(PodEndpointStoreEvent::Upsert),
                             (None, Some(receiver), backend),
                         )),
-                        Ok(crate::datastore::PodEndpointEvent::Delete { pod_ip, .. }) => Some((
+                        Ok(legacy::PodEndpointEvent::Delete { pod_ip, .. }) => Some((
                             Ok(PodEndpointStoreEvent::Delete { pod_ip }),
                             (None, Some(receiver), backend),
                         )),

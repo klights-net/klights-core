@@ -315,4 +315,8 @@ sqlite = []
 redb = []
 linux-network = []
 containerd = []
-sqlcipher = ["sqlite", "rusqlite/bundled-sqlcipher-vendored-openssl"]
+sqlcipher = [
+    "sqlite",
+    "rusqlite/bundled-sqlcipher-vendored-openssl",
+    "klights-supervisor/sqlcipher",
+]

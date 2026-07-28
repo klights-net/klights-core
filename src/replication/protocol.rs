@@ -5,7 +5,9 @@
 //! equivalents in the `klights-internal-protobuf` replication schema.
 
 #[cfg(test)]
-use crate::datastore::types::{NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState};
+use crate::datastore::node_local::{PodSlotAdmissionResult, PodSlotAdmissionState};
+#[cfg(test)]
+use crate::datastore::types::NodeSubnet;
 #[cfg(test)]
 use anyhow::{Context, Result, anyhow};
 use klights_cluster_core::{ClusterMetadata, CommandMeta, Resource, StorageCommand};

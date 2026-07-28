@@ -1013,7 +1013,7 @@ mod tests {
             klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = crate::datastore::sqlite::open::open_with_opts(
-            crate::sqlite_open::OpenOpts::in_memory(),
+            klights_supervisor::OpenOpts::in_memory(),
             supervisor,
             "snapshot-rollback-failure",
         )

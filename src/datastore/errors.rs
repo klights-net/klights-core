@@ -52,15 +52,6 @@ pub enum OpenError {
     /// is readable/writable by non-root users.
     #[error("parent directory {0} has permissions wider than 0700")]
     ParentPermissionsTooWide(PathBuf),
-
-    /// Raft mode was requested but the selected backend does not implement
-    /// DatastoreSnapshotter.
-    #[error(
-        "ReplicationMode::Raft requires a snapshot-capable backend. \
-         Backend '{backend}' does not support snapshot/restore. \
-         See DatastoreSnapshotter (DSB-R-09a)."
-    )]
-    RaftRequiresSnapshotter { backend: String },
 }
 
 impl OpenError {
@@ -71,8 +62,24 @@ impl OpenError {
             OpenError::Corrupt { path, .. } => path.clone(),
             OpenError::Filesystem { path, .. } => path.display().to_string(),
             OpenError::ParentPermissionsTooWide(p) => p.display().to_string(),
-            OpenError::RaftRequiresSnapshotter { .. } => String::new(),
         }
+    }
+}
+
+impl From<klights_supervisor::SqliteOpenError> for OpenError {
+    fn from(error: klights_supervisor::SqliteOpenError) -> Self {
+        match error {
+            klights_supervisor::SqliteOpenError::Corrupt { path, details } => {
+                Self::Corrupt { path, details }
+            }
+        }
+    }
+}
+
+/// Bridge private datastore adapter errors into the supervised DB call result.
+impl From<OpenError> for tokio_rusqlite::Error {
+    fn from(error: OpenError) -> Self {
+        Self::Other(Box::new(error))
     }
 }
 

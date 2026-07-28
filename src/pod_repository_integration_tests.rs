@@ -6691,12 +6691,19 @@ async fn read_pod_network_assignment_returns_assigned_ip() {
     );
 
     node_local
-        .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
-            "sandbox-net-1",
-            crate::datastore::PodNetworkAllocationPod::new("default", "p-net", "uid-1"),
-            crate::datastore::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
-            crate::datastore::PodNetworkAllocationLink::new("vethXYZ", "/var/run/netns/cni-1"),
-        ))
+        .reserve_network_assignment(
+            crate::datastore::node_local::PodNetworkAllocationRequest::new(
+                "sandbox-net-1",
+                crate::datastore::node_local::PodNetworkAllocationPod::new(
+                    "default", "p-net", "uid-1",
+                ),
+                crate::datastore::node_local::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
+                crate::datastore::node_local::PodNetworkAllocationLink::new(
+                    "vethXYZ",
+                    "/var/run/netns/cni-1",
+                ),
+            ),
+        )
         .await
         .unwrap();
     let assignment = repo
@@ -6883,12 +6890,21 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
 
     registered.changed().await.unwrap();
     node_local
-        .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
-            "sandbox-net-late",
-            crate::datastore::PodNetworkAllocationPod::new("default", "p-net-late", "uid-late"),
-            crate::datastore::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
-            crate::datastore::PodNetworkAllocationLink::new("vethL", "/var/run/netns/cni-late"),
-        ))
+        .reserve_network_assignment(
+            crate::datastore::node_local::PodNetworkAllocationRequest::new(
+                "sandbox-net-late",
+                crate::datastore::node_local::PodNetworkAllocationPod::new(
+                    "default",
+                    "p-net-late",
+                    "uid-late",
+                ),
+                crate::datastore::node_local::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
+                crate::datastore::node_local::PodNetworkAllocationLink::new(
+                    "vethL",
+                    "/var/run/netns/cni-late",
+                ),
+            ),
+        )
         .await
         .unwrap();
     events.publish_assignment(&key);
@@ -7076,19 +7092,21 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     // stay parked on the event rather than burning retry sleeps.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     node_local
-        .reserve_network_assignment(crate::datastore::PodNetworkAllocationRequest::new(
-            "sandbox-net-backlogged",
-            crate::datastore::PodNetworkAllocationPod::new(
-                "default",
-                "p-net-backlogged",
-                "uid-backlogged",
+        .reserve_network_assignment(
+            crate::datastore::node_local::PodNetworkAllocationRequest::new(
+                "sandbox-net-backlogged",
+                crate::datastore::node_local::PodNetworkAllocationPod::new(
+                    "default",
+                    "p-net-backlogged",
+                    "uid-backlogged",
+                ),
+                crate::datastore::node_local::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
+                crate::datastore::node_local::PodNetworkAllocationLink::new(
+                    "vethB",
+                    "/var/run/netns/cni-backlogged",
+                ),
             ),
-            crate::datastore::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
-            crate::datastore::PodNetworkAllocationLink::new(
-                "vethB",
-                "/var/run/netns/cni-backlogged",
-            ),
-        ))
+        )
         .await
         .unwrap();
     events.publish_assignment(&key);
@@ -12503,7 +12521,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
     for _ in 0..(CHILDREN * 4) {
         match node_local.claim_workqueue_due(i64::MAX).await.unwrap() {
             Some(entry)
-                if entry.kind == crate::datastore::types::PodWorkqueueKind::Pod
+                if entry.kind == crate::datastore::node_local::PodWorkqueueKind::Pod
                     && entry.namespace == ns =>
             {
                 enqueued_uids.insert(entry.uid);
@@ -12586,7 +12604,10 @@ async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
         .await
         .unwrap()
         .expect("GC mark must create a UID-bound pod_workqueue row");
-    assert_eq!(row.kind, crate::datastore::types::PodWorkqueueKind::Pod);
+    assert_eq!(
+        row.kind,
+        crate::datastore::node_local::PodWorkqueueKind::Pod
+    );
     assert_eq!(row.namespace, ns);
     assert_eq!(row.name, "picked-up");
     assert_eq!(row.uid, "uid-gc");

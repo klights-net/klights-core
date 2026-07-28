@@ -2377,3 +2377,16 @@ async fn wait_for_bool(flag: &AtomicBool, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+#[test]
+fn sqlite_open_error_converts_inside_the_supervisor_boundary() {
+    let error = crate::SqliteOpenError::Corrupt {
+        path: "state.db".to_string(),
+        details: "orphaned WAL".to_string(),
+    };
+    let converted: tokio_rusqlite::Error = error.into();
+    assert!(
+        converted.to_string().contains("orphaned WAL"),
+        "the schema-neutral opener error must stay observable after crossing the DB executor"
+    );
+}

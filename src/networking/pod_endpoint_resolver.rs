@@ -184,8 +184,8 @@ mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
     use crate::datastore::node_local::{NodeLocalHandle, selector};
+    use crate::datastore::node_local::{PodEndpointMode, PodEndpointRow};
     use crate::datastore::sqlite::Datastore;
-    use crate::datastore::{PodEndpointMode, PodEndpointRow};
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::Arc;
     use tokio::time::Duration;

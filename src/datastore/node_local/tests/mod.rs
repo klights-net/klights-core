@@ -5,7 +5,7 @@ use crate::datastore::node_local::{
     NodeLocalBackend, NodeLocalDb, NodeLocalHandle, OutboxFailureDisposition, OutboxInsert,
     SqliteNodeLocalDb, selector,
 };
-use crate::datastore::{
+use crate::datastore::node_local::{
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
     PodSlotMutationResult,
 };
@@ -1007,12 +1007,12 @@ async fn endpoint_handoff_queues_mutation_after_authoritative_snapshot() {
         std::task::Poll::Pending
     ));
 
-    let row = crate::datastore::PodEndpointRow {
+    let row = crate::datastore::node_local::PodEndpointRow {
         pod_uid: "handoff-uid".into(),
         namespace: "default".into(),
         pod_name: "handoff-pod".into(),
         node_name: "node-a".into(),
-        mode: crate::datastore::PodEndpointMode::EncryptedDirect,
+        mode: crate::datastore::node_local::PodEndpointMode::EncryptedDirect,
         pod_ip: "10.42.0.9".parse().unwrap(),
         node_ip: "192.0.2.9".parse().unwrap(),
         host_port_tcp: None,
@@ -1035,7 +1035,7 @@ async fn endpoint_handoff_queues_mutation_after_authoritative_snapshot() {
     upsert.await.expect("queued endpoint upsert");
     assert_eq!(
         events.recv().await.expect("post-snapshot event"),
-        crate::datastore::PodEndpointEvent::Upsert(row)
+        crate::datastore::node_local::PodEndpointEvent::Upsert(row)
     );
 }
 

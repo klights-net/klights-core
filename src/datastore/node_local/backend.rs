@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::datastore::{
+use super::types::{
     PodEndpointEvent, PodEndpointRow, PodNetworkAllocationRequest, PodNetworkEndpoint,
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult, PodSlotMutationResult,
     PodWorkqueueEntry, PodWorkqueueKind,

@@ -91,8 +91,6 @@ pub mod shutdown;
 mod side_effect_registry_composition;
 pub mod side_effects;
 mod signing_key_state_adapter;
-pub(crate) mod sqlite_boundary;
-pub(crate) mod sqlite_open;
 mod statefulset_store_adapter;
 pub(crate) mod sync_lock;
 pub mod version;

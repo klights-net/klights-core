@@ -146,7 +146,7 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
                 .map_err(|error| {
                     klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
                 })?
-                .map(|row| crate::datastore::PodNetworkEndpoint {
+                .map(|row| crate::datastore::node_local::PodNetworkEndpoint {
                     ip_addr: row.ip_addr,
                     veth_host: row.veth_host,
                     netns_path: row.netns_path,
@@ -210,18 +210,18 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
             let Some(node_local) = &self.node_local else {
                 return Ok(false);
             };
-            let legacy = crate::datastore::PodNetworkAllocationRequest::new(
+            let legacy = crate::datastore::node_local::PodNetworkAllocationRequest::new(
                 request.sandbox_id(),
-                crate::datastore::PodNetworkAllocationPod::new(
+                crate::datastore::node_local::PodNetworkAllocationPod::new(
                     &request.pod().namespace,
                     &request.pod().name,
                     &request.pod().uid,
                 ),
-                crate::datastore::PodNetworkAllocationSubnet::new(
+                crate::datastore::node_local::PodNetworkAllocationSubnet::new(
                     request.subnet_base_int(),
                     request.subnet_size(),
                 ),
-                crate::datastore::PodNetworkAllocationLink::new(
+                crate::datastore::node_local::PodNetworkAllocationLink::new(
                     request.veth_host(),
                     request.netns_path(),
                 ),
@@ -247,7 +247,7 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
 
 #[cfg(test)]
 fn test_network_endpoint(
-    row: crate::datastore::PodNetworkEndpoint,
+    row: crate::datastore::node_local::PodNetworkEndpoint,
 ) -> Result<klights_node_store::PodNetworkEndpoint, klights_node_store::CacheNetworkError> {
     klights_node_store::PodNetworkEndpoint::try_new(row.ip_addr, row.veth_host, row.netns_path)
         .map_err(|error| klights_node_store::CacheNetworkError::corrupt_data(error.to_string()))

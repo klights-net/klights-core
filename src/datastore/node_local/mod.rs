@@ -16,8 +16,13 @@ pub use sqlite::SqliteNodeLocalDb;
 pub use types::DeadLetterTestInsert;
 pub use types::{
     DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
-    PodNetworkAssignmentRow, PodNetworkReservationError, PodRuntimeOwnershipError, PodRuntimeRow,
-    PodStatusCheckpoint, ProbeStateRow, ReplicationCheckpoint,
+    OwnedPodNetworkAllocationRequest, PodEndpointEvent, PodEndpointMode, PodEndpointRow,
+    PodNetworkAllocationLink, PodNetworkAllocationPod, PodNetworkAllocationRequest,
+    PodNetworkAllocationSubnet, PodNetworkAssignmentRow, PodNetworkEndpoint,
+    PodNetworkReservationError, PodRuntimeOwnershipError, PodRuntimeRow, PodSlotAdmissionEvent,
+    PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult,
+    PodStatusCheckpoint, PodWorkqueueEntry, PodWorkqueueKind, ProbeStateRow, ReplicationCheckpoint,
+    SandboxRef,
 };
 
 #[cfg(test)]

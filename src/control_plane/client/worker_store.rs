@@ -3469,7 +3469,7 @@ mod tests {
         let pod = klights_types::PodIdentity::new("default", "stuck", "uid-stuck");
         node_local
             .enqueue_workqueue(
-                crate::datastore::PodWorkqueueKind::Pod,
+                crate::datastore::node_local::PodWorkqueueKind::Pod,
                 &pod,
                 serde_json::json!({"source": "test"}),
                 3,
@@ -3503,7 +3503,10 @@ mod tests {
             .await
             .expect("claim retried workqueue row")
             .expect("failure must requeue worker-local pod delete work");
-        assert_eq!(retried.kind, crate::datastore::PodWorkqueueKind::Pod);
+        assert_eq!(
+            retried.kind,
+            crate::datastore::node_local::PodWorkqueueKind::Pod
+        );
         assert_eq!(retried.namespace, "default");
         assert_eq!(retried.name, "stuck");
         assert_eq!(retried.uid, "uid-stuck");

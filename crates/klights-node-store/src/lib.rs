@@ -2,6 +2,7 @@
 
 mod cache_network;
 mod delivery;
+mod open;
 mod raft_durability;
 mod runtime_work;
 
@@ -25,6 +26,7 @@ pub use delivery::{
     PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
     RuntimeObservationGeneration, TerminalDeleteClassification,
 };
+pub use open::NodeStoreOpenError;
 pub use raft_durability::{
     EncodedRaftAppliedState, EncodedRaftLogEntry, EncodedRaftLogState, OpaqueRaftBytes,
     RaftAppliedStateDurability, RaftAppliedStateWrite, RaftDurabilityError, RaftDurabilityFuture,
@@ -39,3 +41,21 @@ pub use runtime_work::{
     ProbeResult, ProbeState, ProbeStateStore, RuntimeNamespace, RuntimePodUid, RuntimeWorkError,
     RuntimeWorkFuture, WorkItemId,
 };
+
+#[cfg(test)]
+mod open_error_contract {
+    #[test]
+    fn node_open_error_keeps_schema_mismatch_actionable() {
+        let error = super::NodeStoreOpenError::SchemaMismatch {
+            path: "node.db".to_string(),
+            expected: "new".to_string(),
+            actual: "old".to_string(),
+            hint: "wipe node state".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("node.db"));
+        assert!(message.contains("new"));
+        assert!(message.contains("old"));
+        assert!(message.contains("wipe node state"));
+    }
+}

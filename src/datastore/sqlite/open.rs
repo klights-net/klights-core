@@ -5,8 +5,8 @@ use anyhow::Result;
 use klights_supervisor::TaskSupervisor;
 
 use crate::datastore::errors::OpenError;
-use crate::sqlite_boundary::DbExecutor;
-use crate::sqlite_open::{self, OpenOpts, OpenPath};
+use klights_supervisor::DbExecutor;
+use klights_supervisor::sqlite_open::{self, OpenOpts, OpenPath};
 
 fn display_path(opts: &OpenOpts) -> String {
     match &opts.path {

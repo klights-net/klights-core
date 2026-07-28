@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::datastore::errors::OpenError;
+use klights_node_store::NodeStoreOpenError;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
@@ -501,10 +501,12 @@ fn migrate_pod_endpoint_encrypted_direct_mode(
 pub fn check_or_init_fingerprint(
     conn: &rusqlite::Connection,
     db_path: &Path,
-) -> Result<(), OpenError> {
-    let current = compute_fingerprint(conn).map_err(|e| OpenError::Corrupt {
-        path: db_path.display().to_string(),
-        details: format!("failed to compute node schema fingerprint: {e}"),
+) -> Result<(), NodeStoreOpenError> {
+    let current = compute_fingerprint(conn).map_err(|e| {
+        NodeStoreOpenError::corrupt(
+            db_path.display().to_string(),
+            format!("failed to compute node schema fingerprint: {e}"),
+        )
     })?;
     let stored: Option<String> = conn
         .query_row(
@@ -513,9 +515,11 @@ pub fn check_or_init_fingerprint(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|e| OpenError::Corrupt {
-            path: db_path.display().to_string(),
-            details: format!("failed to read node schema_fingerprint: {e}"),
+        .map_err(|e| {
+            NodeStoreOpenError::corrupt(
+                db_path.display().to_string(),
+                format!("failed to read node schema_fingerprint: {e}"),
+            )
         })?;
 
     match stored {
@@ -524,14 +528,16 @@ pub fn check_or_init_fingerprint(
                 "INSERT INTO _node_meta (key, value) VALUES ('schema_fingerprint', ?1)",
                 [&current],
             )
-            .map_err(|e| OpenError::Corrupt {
-                path: db_path.display().to_string(),
-                details: format!("failed to write node schema_fingerprint: {e}"),
+            .map_err(|e| {
+                NodeStoreOpenError::corrupt(
+                    db_path.display().to_string(),
+                    format!("failed to write node schema_fingerprint: {e}"),
+                )
             })?;
             Ok(())
         }
         Some(actual) if actual == current => Ok(()),
-        Some(actual) => Err(OpenError::SchemaMismatch {
+        Some(actual) => Err(NodeStoreOpenError::SchemaMismatch {
             path: db_path.display().to_string(),
             expected: current,
             actual,

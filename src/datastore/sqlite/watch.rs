@@ -1,4 +1,5 @@
 use serde_json::Value;
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 #[cfg(test)]
@@ -8,10 +9,7 @@ use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_pay
 #[cfg(test)]
 use klights_watch::WatchTopic;
 
-use super::{
-    CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
-    RawWatchEvent,
-};
+use super::{CatchUpResource, Datastore, PendingWatchEvent, RawWatchEvent};
 #[cfg(test)]
 use super::{CommitObservation, CommitObservationSink};
 use klights_cluster_core::Resource;
@@ -220,25 +218,6 @@ impl Datastore {
     #[cfg(test)]
     pub fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
         self.publish_watch_event(pending);
-    }
-
-    /// Subscribe to internal `pod_endpoints` table events. Used by Phase 2
-    /// reconcilers; root-only Phase 1 has no consumers but the channel is
-    /// always present so subscriber wiring is uniform across modes.
-    pub fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        self.pod_endpoint_tx.subscribe()
-    }
-
-    pub fn pod_endpoint_sender(&self) -> broadcast::Sender<PodEndpointEvent> {
-        self.pod_endpoint_tx.clone()
-    }
-
-    pub fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
-        self.pod_slot_admission_tx.subscribe()
-    }
-
-    pub fn pod_slot_admission_sender(&self) -> broadcast::Sender<PodSlotAdmissionEvent> {
-        self.pod_slot_admission_tx.clone()
     }
 }
 

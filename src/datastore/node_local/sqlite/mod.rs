@@ -9,12 +9,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
-use crate::datastore::{
+use super::types::{
     PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkAllocationRequest,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
     PodSlotClearResult, PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind,
 };
-use crate::sqlite_boundary::DbExecutor;
+#[cfg(test)]
+use super::types::{PodNetworkAllocationLink, PodNetworkAllocationPod, PodNetworkAllocationSubnet};
+use klights_supervisor::DbExecutor;
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 
@@ -2690,13 +2692,9 @@ mod pod_network_reservation_tests {
             &connection,
             PodNetworkAllocationRequest::new(
                 "sandbox-legacy",
-                crate::datastore::PodNetworkAllocationPod::new(
-                    "default",
-                    "pod-legacy",
-                    "uid-legacy",
-                ),
-                crate::datastore::PodNetworkAllocationSubnet::new(base, 256),
-                crate::datastore::PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
+                PodNetworkAllocationPod::new("default", "pod-legacy", "uid-legacy"),
+                PodNetworkAllocationSubnet::new(base, 256),
+                PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
             ),
             2,
         )
@@ -2776,9 +2774,9 @@ mod pod_network_reservation_tests {
                 &connection,
                 PodNetworkAllocationRequest::new(
                     "sandbox-legacy",
-                    crate::datastore::PodNetworkAllocationPod::new(namespace, name, uid),
-                    crate::datastore::PodNetworkAllocationSubnet::new(requested_base, 256),
-                    crate::datastore::PodNetworkAllocationLink::new(veth, netns),
+                    PodNetworkAllocationPod::new(namespace, name, uid),
+                    PodNetworkAllocationSubnet::new(requested_base, 256),
+                    PodNetworkAllocationLink::new(veth, netns),
                 ),
                 2,
             )
@@ -2805,13 +2803,9 @@ mod pod_network_reservation_tests {
             &connection,
             PodNetworkAllocationRequest::new(
                 "sandbox-legacy",
-                crate::datastore::PodNetworkAllocationPod::new(
-                    "default",
-                    "pod-legacy",
-                    "uid-legacy",
-                ),
-                crate::datastore::PodNetworkAllocationSubnet::new(base, 256),
-                crate::datastore::PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
+                PodNetworkAllocationPod::new("default", "pod-legacy", "uid-legacy"),
+                PodNetworkAllocationSubnet::new(base, 256),
+                PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
             ),
             2,
         )

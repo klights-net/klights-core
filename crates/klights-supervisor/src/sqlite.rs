@@ -1,24 +1,14 @@
 use std::cell::Cell;
+use std::fmt;
 use std::sync::Arc;
 
 #[cfg(test)]
-use klights_supervisor::TaskCategoryConfig;
-use klights_supervisor::{TaskCategory, TaskSupervisor};
-use thiserror::Error;
+use crate::TaskCategoryConfig;
+use crate::{TaskCategory, TaskSupervisor};
 use tokio_rusqlite::Connection;
 
-use crate::datastore::errors::OpenError;
 use crate::sqlite_open as opener;
 use crate::sqlite_open::{OpenOpts, OpenPath, apply_pragmas, apply_read_pragmas, ensure_root_only};
-
-/// Allow `OpenError` to convert to `tokio_rusqlite::Error` for use in
-/// the supervised DB call path.  This is the SQLite-specific error bridge;
-/// other backends bring their own conversion.
-impl From<OpenError> for tokio_rusqlite::Error {
-    fn from(err: OpenError) -> Self {
-        tokio_rusqlite::Error::Other(Box::new(err))
-    }
-}
 
 thread_local! {
     static DB_CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -37,11 +27,23 @@ struct DbExecutorInner {
     reopen_opts: Option<OpenOpts>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum DbError {
-    #[error("reentrant db call rejected before enqueue: query_name={query_name}")]
     ReentrantCall { query_name: String },
 }
+
+impl fmt::Display for DbError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReentrantCall { query_name } => write!(
+                formatter,
+                "reentrant db call rejected before enqueue: query_name={query_name}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DbError {}
 
 pub struct DbCallGuard;
 
@@ -257,7 +259,7 @@ impl DbExecutor {
         self.inner.task_supervisor.clone()
     }
 
-    pub(super) fn snapshot_open_opts(&self) -> Option<OpenOpts> {
+    pub fn snapshot_open_opts(&self) -> Option<OpenOpts> {
         self.inner.reopen_opts.clone()
     }
 
@@ -355,7 +357,7 @@ impl DbExecutor {
 #[cfg(test)]
 mod tests {
     use super::{DbError, DbExecutor, OpenOpts};
-    use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
+    use crate::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;

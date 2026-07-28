@@ -161,39 +161,6 @@ fn corrupt_main_db_fails_open_with_path_and_sqlite_error() {
 }
 
 #[test]
-fn wal_present_but_main_missing_fails_open() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("state.db");
-
-    // Create a WAL file without a main DB
-    {
-        use std::io::Write;
-        let wal_path = path.with_extension("db-wal");
-        let mut f = std::fs::File::create(&wal_path).expect("create wal");
-        f.write_all(b"this is a wal file without main db")
-            .expect("write wal");
-    }
-
-    // The opener should detect the orphaned WAL and refuse to open.
-    // SQLite would silently create a new empty DB, masking potential data loss.
-    let err = opener::check_orphaned_wal_for_test(&path).expect_err("should detect orphaned WAL");
-    let OpenError::Corrupt { path: p, details } = err else {
-        panic!("expected Corrupt, got: {:?}", err);
-    };
-    assert_eq!(p, path.display().to_string());
-    assert!(
-        details.contains("orphaned WAL"),
-        "details should mention orphaned WAL: {}",
-        details
-    );
-    assert!(
-        details.contains("missing"),
-        "details should mention missing main DB: {}",
-        details
-    );
-}
-
-#[test]
 fn schema_domain_map_is_deferred_to_dsb_ha_00() {
     // Marker: DSB-HA-00 complete (left for historical reference).
 }

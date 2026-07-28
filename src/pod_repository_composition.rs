@@ -106,7 +106,7 @@ pub(crate) struct RootPodRepositoryParts {
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
     node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
-    test_rows: Arc<std::sync::Mutex<Vec<crate::datastore::PodWorkqueueEntry>>>,
+    test_rows: Arc<std::sync::Mutex<Vec<crate::datastore::node_local::PodWorkqueueEntry>>>,
     test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
 
@@ -782,27 +782,27 @@ impl crate::kubelet::pod_repository::store::PodPersistence for RootPodPersistenc
 
 fn legacy_workqueue_kind(
     kind: crate::kubelet::pod_repository::workqueue::PodWorkqueueKind,
-) -> crate::datastore::PodWorkqueueKind {
+) -> crate::datastore::node_local::PodWorkqueueKind {
     match kind {
         crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod => {
-            crate::datastore::PodWorkqueueKind::Pod
+            crate::datastore::node_local::PodWorkqueueKind::Pod
         }
         crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace => {
-            crate::datastore::PodWorkqueueKind::Namespace
+            crate::datastore::node_local::PodWorkqueueKind::Namespace
         }
     }
 }
 
 fn focused_workqueue_entry(
-    row: crate::datastore::PodWorkqueueEntry,
+    row: crate::datastore::node_local::PodWorkqueueEntry,
 ) -> crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
     crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry {
         id: row.id,
         kind: match row.kind {
-            crate::datastore::PodWorkqueueKind::Pod => {
+            crate::datastore::node_local::PodWorkqueueKind::Pod => {
                 crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
             }
-            crate::datastore::PodWorkqueueKind::Namespace => {
+            crate::datastore::node_local::PodWorkqueueKind::Namespace => {
                 crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
             }
         },
@@ -817,8 +817,8 @@ fn focused_workqueue_entry(
 
 fn legacy_workqueue_entry(
     row: crate::kubelet::pod_repository::workqueue::PodWorkqueueEntry,
-) -> crate::datastore::PodWorkqueueEntry {
-    crate::datastore::PodWorkqueueEntry {
+) -> crate::datastore::node_local::PodWorkqueueEntry {
+    crate::datastore::node_local::PodWorkqueueEntry {
         id: row.id,
         kind: legacy_workqueue_kind(row.kind),
         namespace: row.namespace,
@@ -865,7 +865,7 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         self.test_rows
             .lock()
             .unwrap()
-            .push(crate::datastore::PodWorkqueueEntry {
+            .push(crate::datastore::node_local::PodWorkqueueEntry {
                 id,
                 kind: legacy_workqueue_kind(kind),
                 namespace: pod.namespace.clone(),
@@ -930,10 +930,10 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
         self.enqueue(
             match row.kind {
-                crate::datastore::PodWorkqueueKind::Pod => {
+                crate::datastore::node_local::PodWorkqueueKind::Pod => {
                     crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Pod
                 }
-                crate::datastore::PodWorkqueueKind::Namespace => {
+                crate::datastore::node_local::PodWorkqueueKind::Namespace => {
                     crate::kubelet::pod_repository::workqueue::PodWorkqueueKind::Namespace
                 }
             },

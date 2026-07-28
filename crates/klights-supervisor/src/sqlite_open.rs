@@ -12,11 +12,38 @@
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow};
 
-use crate::datastore::errors::OpenError;
-use klights_supervisor::TaskSupervisor;
+use crate::TaskSupervisor;
+
+/// Schema-neutral failures detected while opening or validating SQLite.
+#[derive(Debug)]
+pub enum SqliteOpenError {
+    Corrupt { path: String, details: String },
+}
+
+impl std::fmt::Display for SqliteOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Corrupt { path, details } => {
+                write!(
+                    formatter,
+                    "database corruption detected at {path}: {details}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SqliteOpenError {}
+
+impl From<SqliteOpenError> for tokio_rusqlite::Error {
+    fn from(error: SqliteOpenError) -> Self {
+        Self::Other(Box::new(error))
+    }
+}
 
 const PRAGMA_JOURNAL_MODE: &str = "journal_mode";
 const PRAGMA_SYNCHRONOUS: &str = "synchronous";
@@ -129,9 +156,11 @@ impl OpenOpts {
 }
 
 fn shared_memory_uri(scope: &str) -> PathBuf {
+    static NEXT_SHARED_MEMORY_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_SHARED_MEMORY_ID.fetch_add(1, Ordering::Relaxed);
     PathBuf::from(format!(
-        "file:klights-{scope}-{}?mode=memory&cache=shared",
-        uuid::Uuid::new_v4()
+        "file:klights-{scope}-{}-{id}?mode=memory&cache=shared",
+        std::process::id()
     ))
 }
 
@@ -398,7 +427,7 @@ pub async fn check_orphaned_wal(supervisor: &Arc<TaskSupervisor>, db_path: &Path
     Ok(())
 }
 
-fn check_orphaned_wal_blocking(db_path: &Path) -> Result<(), OpenError> {
+fn check_orphaned_wal_blocking(db_path: &Path) -> Result<(), SqliteOpenError> {
     let wal_path = {
         let mut s = db_path.as_os_str().to_owned();
         s.push("-wal");
@@ -407,7 +436,7 @@ fn check_orphaned_wal_blocking(db_path: &Path) -> Result<(), OpenError> {
 
     // If WAL exists but main DB does not, this is an orphaned WAL.
     if wal_path.exists() && !db_path.exists() {
-        return Err(OpenError::Corrupt {
+        return Err(SqliteOpenError::Corrupt {
             path: db_path.display().to_string(),
             details: format!(
                 "orphaned WAL file {} exists but main DB {} is missing — possible data loss",
@@ -442,21 +471,16 @@ pub async fn persistent_datastore_sizes(
         .map_err(|error| anyhow!("persistent_datastore_sizes supervisor error: {error}"))
 }
 
-#[cfg(test)]
-pub fn check_orphaned_wal_for_test(db_path: &Path) -> Result<(), OpenError> {
-    check_orphaned_wal_blocking(db_path)
-}
-
 /// Run the schema-neutral SQLite integrity check.
-pub fn check_integrity(conn: &rusqlite::Connection, db_path: &Path) -> Result<(), OpenError> {
+pub fn check_integrity(conn: &rusqlite::Connection, db_path: &Path) -> Result<(), SqliteOpenError> {
     let result: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|error| OpenError::Corrupt {
+        .map_err(|error| SqliteOpenError::Corrupt {
             path: db_path.display().to_string(),
             details: format!("integrity_check query failed: {error}"),
         })?;
     if result != "ok" {
-        return Err(OpenError::Corrupt {
+        return Err(SqliteOpenError::Corrupt {
             path: db_path.display().to_string(),
             details: format!("integrity_check returned: {result}"),
         });
@@ -467,13 +491,14 @@ pub fn check_integrity(conn: &rusqlite::Connection, db_path: &Path) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use klights_supervisor::TaskCategoryConfig;
+    use crate::TaskCategoryConfig;
     use std::sync::Arc;
 
     fn supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
     }
 
+    #[cfg(not(feature = "sqlcipher"))]
     fn open_temp_conn() -> rusqlite::Connection {
         rusqlite::Connection::open_in_memory().expect("open in-memory")
     }
@@ -533,6 +558,7 @@ mod tests {
         assert_eq!(pragma_int(&conn, "cache_size"), cache_before);
     }
 
+    #[cfg(not(feature = "sqlcipher"))]
     #[test]
     fn apply_pragmas_rejects_encrypted_profile_without_sqlcipher_feature() {
         let conn = open_temp_conn();
@@ -620,6 +646,23 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_wal_is_rejected_before_sqlite_can_create_a_new_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let wal_path = path.with_extension("db-wal");
+        std::fs::write(&wal_path, b"wal without a main database").expect("write WAL");
+
+        let error = check_orphaned_wal_blocking(&path).expect_err("reject orphaned WAL");
+        let SqliteOpenError::Corrupt {
+            path: actual,
+            details,
+        } = error;
+        assert_eq!(actual, path.display().to_string());
+        assert!(details.contains("orphaned WAL"));
+        assert!(details.contains("missing"));
+    }
+
+    #[test]
     fn check_integrity_detects_corruption() {
         use std::io::{Seek, Write};
 
@@ -652,9 +695,7 @@ mod tests {
         .expect("open may succeed");
 
         let err = check_integrity(&conn, &path).expect_err("should detect corruption");
-        let OpenError::Corrupt { path: p, details } = err else {
-            panic!("expected Corrupt, got: {:?}", err);
-        };
+        let SqliteOpenError::Corrupt { path: p, details } = err;
         assert_eq!(p, path.display().to_string());
         assert!(
             details.contains("integrity_check") || details.contains("corrupt"),

@@ -7,7 +7,6 @@ mod cases {
     #![allow(clippy::await_holding_lock)]
     use super::super::*;
     use crate::datastore::backend::DatastoreBackend;
-    use crate::datastore::errors::OpenError;
     use async_trait::async_trait;
     use klights_cluster_core::command::{COMMAND_CODEC_VERSION, CommandId};
     use klights_cluster_core::{
@@ -2820,25 +2819,6 @@ mod cases {
             updated.data.pointer("/status/availableReplicas"),
             Some(&json!(1)),
             "raft-routed patch must preserve live status"
-        );
-    }
-
-    /// DSB-R-09a: RaftRequiresSnapshotter error is constructive.
-    #[test]
-    fn raft_requires_snapshotter_error_has_actionable_message() {
-        let err = OpenError::RaftRequiresSnapshotter {
-            backend: "redb".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("Raft"), "error must mention Raft: {msg}");
-        assert!(
-            msg.contains("snapshot"),
-            "error must mention snapshot: {msg}"
-        );
-        assert!(msg.contains("redb"), "error must name the backend: {msg}");
-        assert!(
-            msg.contains("DSB-R-09a"),
-            "error must reference DSB-R-09a: {msg}"
         );
     }
 

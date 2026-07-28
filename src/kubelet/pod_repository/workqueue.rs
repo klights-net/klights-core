@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
 #[cfg(test)]
-use crate::datastore::PodWorkqueueEntry as LegacyPodWorkqueueEntry;
+use crate::datastore::node_local::PodWorkqueueEntry as LegacyPodWorkqueueEntry;
 use klights_reconcile_api::ReconcileFailureMetrics;
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
@@ -74,10 +74,10 @@ pub(crate) trait PodWorkqueuePersistence: Send + Sync {
 }
 
 #[cfg(test)]
-fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::PodWorkqueueKind {
+fn legacy_kind(kind: PodWorkqueueKind) -> crate::datastore::node_local::PodWorkqueueKind {
     match kind {
-        PodWorkqueueKind::Pod => crate::datastore::PodWorkqueueKind::Pod,
-        PodWorkqueueKind::Namespace => crate::datastore::PodWorkqueueKind::Namespace,
+        PodWorkqueueKind::Pod => crate::datastore::node_local::PodWorkqueueKind::Pod,
+        PodWorkqueueKind::Namespace => crate::datastore::node_local::PodWorkqueueKind::Namespace,
     }
 }
 
@@ -86,8 +86,10 @@ fn focused_entry(row: LegacyPodWorkqueueEntry) -> PodWorkqueueEntry {
     PodWorkqueueEntry {
         id: row.id,
         kind: match row.kind {
-            crate::datastore::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
-            crate::datastore::PodWorkqueueKind::Namespace => PodWorkqueueKind::Namespace,
+            crate::datastore::node_local::PodWorkqueueKind::Pod => PodWorkqueueKind::Pod,
+            crate::datastore::node_local::PodWorkqueueKind::Namespace => {
+                PodWorkqueueKind::Namespace
+            }
         },
         namespace: row.namespace,
         name: row.name,
@@ -2252,7 +2254,10 @@ mod tests {
             "deferred delete should not be due before the requested delay"
         );
         let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
-        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
+        assert_eq!(
+            row.kind,
+            crate::datastore::node_local::PodWorkqueueKind::Pod
+        );
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
         assert_eq!(row.uid, "uid-old");
@@ -2294,7 +2299,10 @@ mod tests {
             "deferred delete should not be due before the requested delay"
         );
         let row = _node_local.claim_workqueue_due(due).await.unwrap().unwrap();
-        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
+        assert_eq!(
+            row.kind,
+            crate::datastore::node_local::PodWorkqueueKind::Pod
+        );
         assert_eq!(row.namespace, "default");
         assert_eq!(row.name, "same-name");
         assert_eq!(row.uid, "uid-old");
@@ -2334,7 +2342,7 @@ mod tests {
 
         _node_local
             .enqueue_workqueue(
-                crate::datastore::PodWorkqueueKind::Pod,
+                crate::datastore::node_local::PodWorkqueueKind::Pod,
                 &klights_types::PodIdentity::new("default", "remote-pod", "uid-old"),
                 json!({"target_node": "node-b"}),
                 0,
@@ -2402,7 +2410,7 @@ mod tests {
 
         _node_local
             .enqueue_workqueue(
-                crate::datastore::PodWorkqueueKind::Pod,
+                crate::datastore::node_local::PodWorkqueueKind::Pod,
                 &klights_types::PodIdentity::new("default", "worker-pod", "uid-old"),
                 json!({"target_node": "node-b"}),
                 0,
@@ -2563,7 +2571,10 @@ mod tests {
             .await
             .unwrap()
             .expect("namespace termination must enqueue actor-owned Pod delete work");
-        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
+        assert_eq!(
+            row.kind,
+            crate::datastore::node_local::PodWorkqueueKind::Pod
+        );
         assert_eq!(row.namespace, "terminating-ns");
         assert_eq!(row.name, "unscheduled");
         assert_eq!(row.uid, "pod-uid");
@@ -2619,7 +2630,7 @@ mod tests {
         // Enqueue as if namespace termination did it.
         _node_local
             .enqueue_workqueue(
-                crate::datastore::PodWorkqueueKind::Pod,
+                crate::datastore::node_local::PodWorkqueueKind::Pod,
                 &klights_types::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
                 json!({"target_node": "node-b"}),
                 0,

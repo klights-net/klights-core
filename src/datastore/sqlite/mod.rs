@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use std::net::Ipv4Addr;
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use crate::datastore::WatchReplayRead;
@@ -67,12 +68,10 @@ pub use super::backend::{
 pub use super::types::CommitObservation;
 pub use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent, PodEndpointEvent,
-    PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
-    PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult,
-    PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplay, PositionedWatchReplayRead,
-    RawWatchEvent, ReplicatedCreateOptions, ReplicatedMembershipState, ReplicatedSnapshotMetadata,
-    ResourceList, ResourceListQuery, SandboxRef, SnapshotAtRv, WatchTarget, WatchTargetScope,
+    ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent, PositionedWatchReplay,
+    PositionedWatchReplayRead, RawWatchEvent, ReplicatedCreateOptions, ReplicatedMembershipState,
+    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchTarget,
+    WatchTargetScope,
 };
 use klights_cluster_core::{
     PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
@@ -88,8 +87,8 @@ struct AppliedOutboxLedgerInput<'a> {
     terminal_error: Option<&'a klights_cluster_core::OutboxApplyError>,
 }
 
-use crate::sqlite_boundary::DbExecutor;
-use crate::sqlite_open as opener;
+use klights_supervisor::DbExecutor;
+use klights_supervisor::sqlite_open as opener;
 pub use watch::create_pending_watch_event;
 #[cfg(test)]
 pub use watch::publish_pending;
@@ -114,12 +113,6 @@ use resource_shape::{
     warn_uid_precondition_mismatch,
 };
 use scope::use_namespaced_table;
-
-/// Bound for the internal pod_endpoints broadcast channel. Generous because
-/// every Phase 2 rootless reconciler subscribes here and watch lag must not
-/// drop events on a healthy node.
-const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
-const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,8 +155,6 @@ pub struct Datastore {
     #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
-    pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
-    pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
     snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
     #[cfg(test)]
@@ -3434,8 +3425,6 @@ impl Datastore {
         #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
-        let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
-        let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
         // Schema + fingerprint are applied by the cluster-owned open adapter.
         Ok(Self {
             executor,
@@ -3443,8 +3432,6 @@ impl Datastore {
             #[cfg(test)]
             commit_sink,
             outbox_codec,
-            pod_endpoint_tx,
-            pod_slot_admission_tx,
             snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             snapshot_factory,
             #[cfg(test)]

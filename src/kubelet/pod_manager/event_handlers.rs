@@ -843,7 +843,10 @@ mod tests {
             .await
             .expect("claim pod workqueue row")
             .expect("namespace termination event must enqueue local actor delete work");
-        assert_eq!(row.kind, crate::datastore::PodWorkqueueKind::Pod);
+        assert_eq!(
+            row.kind,
+            crate::datastore::node_local::PodWorkqueueKind::Pod
+        );
         assert_eq!(row.namespace, "terminating-ns");
         assert_eq!(row.name, "left-behind");
         assert_eq!(row.uid, "uid-left-behind");

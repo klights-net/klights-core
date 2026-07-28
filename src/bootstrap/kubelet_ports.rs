@@ -162,13 +162,13 @@ impl DatastorePodSlotAdapter {
 }
 
 fn slot_state(
-    state: crate::datastore::PodSlotAdmissionState,
+    state: crate::datastore::node_local::PodSlotAdmissionState,
 ) -> klights_node_store::PodSlotAdmissionState {
     match state {
-        crate::datastore::PodSlotAdmissionState::Admitted => {
+        crate::datastore::node_local::PodSlotAdmissionState::Admitted => {
             klights_node_store::PodSlotAdmissionState::Admitted
         }
-        crate::datastore::PodSlotAdmissionState::Terminating => {
+        crate::datastore::node_local::PodSlotAdmissionState::Terminating => {
             klights_node_store::PodSlotAdmissionState::Terminating
         }
     }
@@ -195,12 +195,12 @@ impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
                 .map_err(|error| {
                     klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())
                 })? {
-                crate::datastore::PodSlotAdmissionResult::Admitted { resource_version } => {
-                    Ok(klights_node_store::PodSlotAdmissionResult::Admitted {
-                        observed_pod_version: observed_pod_version(resource_version)?,
-                    })
-                }
-                crate::datastore::PodSlotAdmissionResult::Blocked {
+                crate::datastore::node_local::PodSlotAdmissionResult::Admitted {
+                    resource_version,
+                } => Ok(klights_node_store::PodSlotAdmissionResult::Admitted {
+                    observed_pod_version: observed_pod_version(resource_version)?,
+                }),
+                crate::datastore::node_local::PodSlotAdmissionResult::Blocked {
                     blocking_uid,
                     blocking_node,
                     state,
@@ -229,16 +229,16 @@ impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
                     klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())
                 })?;
             match result {
-                crate::datastore::PodSlotMutationResult::Changed { resource_version } => {
-                    Ok(klights_node_store::PodSlotMutationResult::Changed {
-                        observed_pod_version: observed_pod_version(resource_version)?,
-                    })
-                }
-                crate::datastore::PodSlotMutationResult::Unchanged { resource_version } => {
-                    Ok(klights_node_store::PodSlotMutationResult::Unchanged {
-                        observed_pod_version: observed_pod_version(resource_version)?,
-                    })
-                }
+                crate::datastore::node_local::PodSlotMutationResult::Changed {
+                    resource_version,
+                } => Ok(klights_node_store::PodSlotMutationResult::Changed {
+                    observed_pod_version: observed_pod_version(resource_version)?,
+                }),
+                crate::datastore::node_local::PodSlotMutationResult::Unchanged {
+                    resource_version,
+                } => Ok(klights_node_store::PodSlotMutationResult::Unchanged {
+                    observed_pod_version: observed_pod_version(resource_version)?,
+                }),
             }
         })
     }
@@ -257,15 +257,15 @@ impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
                     klights_node_store::RuntimeWorkError::persistence_failed(error.to_string())
                 })?;
             match result {
-                crate::datastore::PodSlotClearResult::Cleared { resource_version } => {
+                crate::datastore::node_local::PodSlotClearResult::Cleared { resource_version } => {
                     Ok(klights_node_store::PodSlotClearResult::Cleared {
                         observed_pod_version: observed_pod_version(resource_version)?,
                     })
                 }
-                crate::datastore::PodSlotClearResult::NotFound => {
+                crate::datastore::node_local::PodSlotClearResult::NotFound => {
                     Ok(klights_node_store::PodSlotClearResult::NotFound)
                 }
-                crate::datastore::PodSlotClearResult::UidMismatch {
+                crate::datastore::node_local::PodSlotClearResult::UidMismatch {
                     blocking_uid,
                     blocking_node,
                     state,
@@ -282,7 +282,7 @@ impl klights_node_store::PodSlotAdmissionStore for DatastorePodSlotAdapter {
 }
 
 struct DatastorePodSlotSubscription {
-    receiver: tokio::sync::broadcast::Receiver<crate::datastore::PodSlotAdmissionEvent>,
+    receiver: tokio::sync::broadcast::Receiver<crate::datastore::node_local::PodSlotAdmissionEvent>,
 }
 
 impl klights_node_store::PodSlotEventSubscription for DatastorePodSlotSubscription {
@@ -301,7 +301,7 @@ impl klights_node_store::PodSlotEventSubscription for DatastorePodSlotSubscripti
                 }
             };
             let event = match event {
-                crate::datastore::PodSlotAdmissionEvent::Changed {
+                crate::datastore::node_local::PodSlotAdmissionEvent::Changed {
                     namespace,
                     pod_name,
                     pod_uid,
@@ -312,7 +312,7 @@ impl klights_node_store::PodSlotEventSubscription for DatastorePodSlotSubscripti
                     state: slot_state(state),
                     observed_pod_version: observed_pod_version(resource_version)?,
                 },
-                crate::datastore::PodSlotAdmissionEvent::Cleared {
+                crate::datastore::node_local::PodSlotAdmissionEvent::Cleared {
                     namespace,
                     pod_name,
                     pod_uid,
