@@ -789,7 +789,7 @@ pub async fn allocate_service_fields_for_api_write(
     if metadata.get("deletionTimestamp").is_some() {
         return Ok(None);
     }
-    let current_rv = crate::resource_metadata::resource_version(metadata);
+    let current_rv = klights_types::resource_metadata::resource_version(metadata);
     let update_preconditions = ResourcePreconditions::from_metadata(metadata, current_rv)?;
 
     let mut updated_service = service.clone();

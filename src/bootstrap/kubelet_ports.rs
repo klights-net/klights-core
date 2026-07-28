@@ -1,52 +1,10 @@
 use std::sync::Arc;
 
-use crate::datastore::{CurrentResourceVersionStore, WatchStore};
-use crate::datastore_watch_replay_adapter::DatastoreWatchReplaySource;
 use crate::kubelet::node_heartbeat::{
     NodeHeartbeatClock, NodeHeartbeatEvent, NodeHeartbeatEventFuture, NodeHeartbeatEventSource,
 };
 use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
-use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WindowPolicy,
-};
-use klights_watch::WatchTopic;
-
-struct BoxedWatchReplaySource {
-    inner: Arc<dyn crate::watch::WatchReplaySource>,
-}
-
-impl BoxedWatchReplaySource {
-    fn new(inner: Arc<dyn crate::watch::WatchReplaySource>) -> Self {
-        Self { inner }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::watch::WatchReplaySource for BoxedWatchReplaySource {
-    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<crate::watch::WatchEvent>> {
-        self.inner.replay_since(since_rv).await
-    }
-
-    async fn replay_since_checked(
-        &self,
-        since_rv: i64,
-        limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<klights_watch::WatchReplayRead<crate::watch::WatchEvent>> {
-        self.inner.replay_since_checked(since_rv, limit).await
-    }
-
-    async fn replay_after_checked(
-        &self,
-        position: klights_watch::WatchReplayPosition,
-        limit: std::num::NonZeroUsize,
-    ) -> anyhow::Result<klights_watch::PositionedWatchReplayRead<crate::watch::WatchEvent>> {
-        self.inner.replay_after_checked(position, limit).await
-    }
-
-    async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
-        self.inner.earliest_retained_rv().await
-    }
-}
+use futures::StreamExt as _;
 
 pub struct SystemNodeHeartbeatClock;
 
@@ -336,40 +294,21 @@ impl klights_node_store::PodSlotAdmissionEventSource for DatastorePodSlotAdapter
 }
 
 pub struct DatastorePodWatchSource {
-    watch_store: Arc<dyn WatchStore>,
-    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-    resource_versions: Arc<dyn CurrentResourceVersionStore>,
     leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
-    heartbeat_cursor: tokio::sync::Mutex<Option<SignalWatchCursor<BoxedWatchReplaySource>>>,
+    heartbeat_watch: tokio::sync::Mutex<HeartbeatWatchState>,
+}
+
+#[derive(Default)]
+struct HeartbeatWatchState {
+    stream: Option<klights_leader_api::WatchStream>,
+    cursor: Option<klights_leader_api::WatchResumeCursor>,
 }
 
 impl DatastorePodWatchSource {
-    pub fn new<T>(store: Arc<T>) -> Self
-    where
-        T: WatchStore + CurrentResourceVersionStore + klights_leader_api::LeaderWatch + 'static,
-        T: klights_watch::WatchSignalSubscribe,
-    {
+    pub fn new(leader_watch: Arc<dyn klights_leader_api::LeaderWatch>) -> Self {
         Self {
-            watch_store: store.clone(),
-            watch_signals: store.clone(),
-            resource_versions: store.clone(),
-            leader_watch: store,
-            heartbeat_cursor: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    pub fn new_with_ports(
-        watch_store: Arc<dyn WatchStore>,
-        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-        resource_versions: Arc<dyn CurrentResourceVersionStore>,
-        leader_watch: Arc<dyn klights_leader_api::LeaderWatch>,
-    ) -> Self {
-        Self {
-            watch_store,
-            watch_signals,
-            resource_versions,
             leader_watch,
-            heartbeat_cursor: tokio::sync::Mutex::new(None),
+            heartbeat_watch: tokio::sync::Mutex::new(HeartbeatWatchState::default()),
         }
     }
 }
@@ -496,58 +435,70 @@ impl crate::api::pod_subresources::logs::PodLogFollowWatchPort for DatastorePodW
 impl NodeHeartbeatEventSource for DatastorePodWatchSource {
     fn next_node_event(&self) -> NodeHeartbeatEventFuture<'_> {
         Box::pin(async move {
-            let mut cursor = self.heartbeat_cursor.lock().await;
-            if cursor.is_none() {
-                let topic = WatchTopic::new("v1", "Node");
-                let replay =
-                    BoxedWatchReplaySource::new(Arc::new(DatastoreWatchReplaySource::new(
-                        self.watch_store.clone(),
-                        vec![crate::datastore::WatchTarget::cluster("v1", "Node")],
-                    )));
-                let mut next = SignalWatchCursor::new(
-                    self.watch_signals.subscribe(topic.clone()),
-                    replay,
-                    topic,
-                    WatchDeliveryScope::Cluster,
-                    self.resource_versions
-                        .get_current_resource_version()
-                        .await
-                        .unwrap_or(0),
-                    WindowPolicy::default_watch_delivery(),
-                );
-                if let Err(error) = next.prime_replay_or_expired().await {
-                    tracing::warn!(?error, "Node heartbeat initial replay failed");
+            let mut heartbeat = self.heartbeat_watch.lock().await;
+            if heartbeat.stream.is_none() {
+                let request = klights_leader_api::WatchRequest::try_new(
+                    "v1", "Node", None, None, None, None, None,
+                )
+                .expect("Node heartbeat watch identity is valid");
+                let request = if let Some(cursor) = heartbeat.cursor {
+                    request.with_resume_cursor(cursor)?
+                } else {
+                    request
+                };
+                match self.leader_watch.watch_resources(request).await {
+                    Ok(stream) => {
+                        if let Some(cursor) = stream.accepted_cursor() {
+                            heartbeat.cursor = Some(cursor);
+                        }
+                        heartbeat.stream = Some(stream);
+                    }
+                    Err(klights_leader_api::LeaderWatchError::ReplayExpired { .. }) => {
+                        heartbeat.cursor = None;
+                        return Ok(NodeHeartbeatEvent::ReplayExpired);
+                    }
+                    Err(error) => return Err(anyhow::Error::from(error)),
                 }
-                *cursor = Some(next);
             }
-            let event = cursor
+            let event = heartbeat
+                .stream
                 .as_mut()
-                .expect("heartbeat cursor initialized")
-                .next_event()
+                .expect("heartbeat stream initialized")
+                .next()
                 .await;
             match event {
-                Ok(event)
-                    if !matches!(event.event_type, EventType::Bookmark | EventType::Deleted)
-                        && event.object.get("kind").and_then(|kind| kind.as_str())
-                            == Some("Node") =>
-                {
-                    let Some(node_name) = event
-                        .object
-                        .pointer("/metadata/name")
-                        .and_then(|name| name.as_str())
-                    else {
+                Some(Ok(event)) => {
+                    let cursor = heartbeat.cursor.get_or_insert_default();
+                    cursor.advance_after_apply(&event)?;
+                    if matches!(
+                        event.event_type(),
+                        klights_leader_api::WatchEventType::Bookmark
+                            | klights_leader_api::WatchEventType::Deleted
+                    ) || event.resource().kind != "Node"
+                    {
                         return Ok(NodeHeartbeatEvent::Other);
-                    };
+                    }
+                    let node_name = event.resource().name.as_str();
+                    if node_name.is_empty() {
+                        return Ok(NodeHeartbeatEvent::Other);
+                    }
                     Ok(NodeHeartbeatEvent::NodeChanged {
                         node_name: node_name.to_string(),
                     })
                 }
-                Ok(_) => Ok(NodeHeartbeatEvent::Other),
-                Err(WatchCursorError::Expired) => Ok(NodeHeartbeatEvent::ReplayExpired),
-                Err(WatchCursorError::Closed) => {
-                    anyhow::bail!("Node heartbeat watch signal channel closed")
+                Some(Err(klights_leader_api::LeaderWatchError::ReplayExpired { .. })) => {
+                    heartbeat.stream = None;
+                    heartbeat.cursor = None;
+                    Ok(NodeHeartbeatEvent::ReplayExpired)
                 }
-                Err(WatchCursorError::Replay(error)) => Err(error),
+                Some(Err(error)) => {
+                    heartbeat.stream = None;
+                    Err(anyhow::Error::from(error))
+                }
+                None => {
+                    heartbeat.stream = None;
+                    anyhow::bail!("Node heartbeat positioned watch stream closed")
+                }
             }
         })
     }
@@ -656,5 +607,92 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
             crate::kubelet::pod_runtime::events::PodEventSinkError::unavailable(error.to_string())
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod positioned_watch_boundary_tests {
+    use super::*;
+    use klights_leader_api::{
+        LeaderWatch, LeaderWatchFuture, ResourceEvent, WatchEventType, WatchRequest, WatchStream,
+    };
+    use std::sync::Mutex as StdMutex;
+
+    struct RecordingLeaderWatch {
+        requests: StdMutex<Vec<WatchRequest>>,
+        events: StdMutex<Option<Vec<ResourceEvent>>>,
+    }
+
+    impl RecordingLeaderWatch {
+        fn with_events(events: Vec<ResourceEvent>) -> Arc<Self> {
+            Arc::new(Self {
+                requests: StdMutex::new(Vec::new()),
+                events: StdMutex::new(Some(events)),
+            })
+        }
+    }
+
+    impl LeaderWatch for RecordingLeaderWatch {
+        fn watch_resources(&self, request: WatchRequest) -> LeaderWatchFuture<'_> {
+            self.requests
+                .lock()
+                .expect("watch request mutex")
+                .push(request);
+            let events = self
+                .events
+                .lock()
+                .expect("watch event mutex")
+                .take()
+                .expect("heartbeat must establish only one stream");
+            Box::pin(async move {
+                Ok(WatchStream::unpositioned_test_stream(
+                    futures::stream::iter(events.into_iter().map(Ok)),
+                ))
+            })
+        }
+    }
+
+    fn node_event(name: &str, resource_version: i64) -> ResourceEvent {
+        let resource = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": name,
+                "resourceVersion": resource_version.to_string(),
+            }
+        })))
+        .expect("valid Node resource");
+        ResourceEvent::try_new(WatchEventType::Modified, resource, None)
+            .expect("valid Node watch event")
+    }
+
+    #[tokio::test]
+    async fn heartbeat_retains_one_positioned_leader_watch_stream() {
+        let leader = RecordingLeaderWatch::with_events(vec![
+            node_event("node-a", 11),
+            node_event("node-b", 12),
+        ]);
+        let source = DatastorePodWatchSource::new(leader.clone());
+
+        assert_eq!(
+            source.next_node_event().await.expect("first Node event"),
+            NodeHeartbeatEvent::NodeChanged {
+                node_name: "node-a".to_string()
+            }
+        );
+        assert_eq!(
+            source.next_node_event().await.expect("second Node event"),
+            NodeHeartbeatEvent::NodeChanged {
+                node_name: "node-b".to_string()
+            }
+        );
+
+        let requests = leader.requests.lock().expect("watch request mutex");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].api_version(), "v1");
+        assert_eq!(requests[0].kind(), "Node");
+        assert_eq!(requests[0].namespace(), None);
+        assert_eq!(requests[0].start_resource_version(), None);
+        assert_eq!(requests[0].start_watch_replay_position(), None);
     }
 }

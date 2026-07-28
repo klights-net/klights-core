@@ -7,7 +7,6 @@ mod framing;
 mod negotiation;
 mod protobuf;
 mod resource;
-mod utils;
 
 #[cfg(test)]
 mod codec_table_tests;

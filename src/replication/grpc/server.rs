@@ -3881,10 +3881,14 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-07-07T00:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let past_100 = crate::k8s_time::format_time(now - chrono::Duration::seconds(100));
-        let future_100 = crate::k8s_time::format_time(now + chrono::Duration::seconds(100));
-        let past_101 = crate::k8s_time::format_time(now - chrono::Duration::seconds(101));
-        let future_101 = crate::k8s_time::format_time(now + chrono::Duration::seconds(101));
+        let past_100 =
+            klights_cluster_core::k8s_time::format_time(now - chrono::Duration::seconds(100));
+        let future_100 =
+            klights_cluster_core::k8s_time::format_time(now + chrono::Duration::seconds(100));
+        let past_101 =
+            klights_cluster_core::k8s_time::format_time(now - chrono::Duration::seconds(101));
+        let future_101 =
+            klights_cluster_core::k8s_time::format_time(now + chrono::Duration::seconds(101));
 
         super::validate_node_lease_renew_time_skew(&past_100, now)
             .expect("100s past skew is accepted at boundary");
@@ -6026,7 +6030,7 @@ mod tests {
                 .renew_node_lease(request_with_node_client_cert(
                     klights_internal_protobuf::RenewNodeLeaseRequest {
                         node_name: "worker-1".to_string(),
-                        renew_time: crate::k8s_time::format_time(chrono::Utc::now()),
+                        renew_time: klights_cluster_core::k8s_time::format_time(chrono::Utc::now()),
                         lease_duration_seconds: duration,
                     },
                     "worker-1",
@@ -6617,7 +6621,8 @@ mod tests {
         )
         .with_wall_clock(Arc::new(move || wall_time));
 
-        let skewed = crate::k8s_time::format_time(wall_time - chrono::Duration::seconds(101));
+        let skewed =
+            klights_cluster_core::k8s_time::format_time(wall_time - chrono::Duration::seconds(101));
         let status = grpc
             .renew_node_lease(request_with_node_client_cert(
                 klights_internal_protobuf::RenewNodeLeaseRequest {
@@ -7125,7 +7130,7 @@ mod tests {
         )
         .with_wall_clock(Arc::new(move || wall_time));
 
-        let renew_time = crate::k8s_time::format_time(wall_time);
+        let renew_time = klights_cluster_core::k8s_time::format_time(wall_time);
         grpc.renew_node_lease(request_with_node_client_cert(
             klights_internal_protobuf::RenewNodeLeaseRequest {
                 node_name: "worker-1".to_string(),

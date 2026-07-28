@@ -1018,19 +1018,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     services.clone(),
                 ),
             ),
-            {
-                let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    db_handle.clone(),
-                ));
-                crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
-                        durable_watch.clone(),
-                        watch_signals.clone(),
-                        durable_watch,
-                        leader_ports.watch.clone(),
-                    ),
-                ))
-            },
+            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                    leader_ports.watch.clone(),
+                ),
+            )),
             None,
             node_metrics.clone(),
             node_port_forward,
@@ -1429,14 +1421,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     ),
                 )
             } else {
-                let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    db_handle.clone(),
-                ));
                 Arc::new(
-                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
-                        durable_watch.clone(),
-                        watch_signals.clone(),
-                        durable_watch,
+                    crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
                         leader_ports.watch.clone(),
                     ),
                 )
@@ -1477,14 +1463,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Heartbeat
     let heartbeat_handle = {
-        let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-            db_handle.clone(),
-        ));
         let watch_source = Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
-                durable_watch.clone(),
-                watch_signals.clone(),
-                durable_watch,
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
                 leader_ports.watch.clone(),
             ),
         );
@@ -1719,19 +1699,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::new(
             crate::bootstrap::network_adapters::ApiServiceRoutingSyncAdapter::new(services.clone()),
         ),
-        {
-            let durable_watch = Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                db_handle.clone(),
-            ));
-            crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
-                crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
-                    durable_watch.clone(),
-                    watch_signals.clone(),
-                    durable_watch,
-                    leader_ports.watch.clone(),
-                ),
-            ))
-        },
+        crate::api::pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                leader_ports.watch.clone(),
+            ),
+        )),
         local_node_exec,
         node_metrics.clone(),
         node_port_forward,

@@ -49,26 +49,6 @@ pub(crate) enum ReconstructedMembership {
     Items(Vec<Resource>),
 }
 
-/// Whether an event's post-state is already represented by `position`.
-///
-/// A partially consumed composite cursor represents both the rows explicitly
-/// consumed through `event_id` and the rows at/below its RV filter through the
-/// establishment anchor. This is the exact complement of positioned replay.
-pub(crate) fn position_represents(
-    position: WatchReplayPosition,
-    event_id: i64,
-    resource_version: i64,
-) -> bool {
-    if event_id <= position.event_id {
-        return true;
-    }
-    if position.resource_version_filter_through_event_id > 0 {
-        return event_id <= position.resource_version_filter_through_event_id
-            && resource_version <= position.resource_version;
-    }
-    position.event_id == 0 && resource_version <= position.resource_version
-}
-
 /// Reverse current materialized state to the state represented by `position`.
 /// `history` must contain all retained rows for the requested targets in
 /// ascending event-id order. A MODIFIED row requires its immediately preceding
@@ -120,11 +100,10 @@ impl MembershipReconstructor {
             }
             self.state.insert(key.clone(), event.resource.clone());
         }
-        if position_represents(
-            self.position,
-            event.event_id,
-            event.resource.resource_version,
-        ) {
+        if self
+            .position
+            .represents_event(event.event_id, event.resource.resource_version)
+        {
             return;
         }
         match event.event_type.as_str() {

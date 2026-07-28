@@ -544,7 +544,7 @@ async fn sync_active_status_at<S: CronJobStore + ?Sized>(
         })
         .collect();
 
-    let now_str = crate::k8s_time::format_time(now);
+    let now_str = klights_cluster_core::k8s_time::format_time(now);
     let mut status = cj.get("status").cloned().unwrap_or_else(|| json!({}));
     if !status.is_object() {
         status = json!({});
@@ -554,7 +554,7 @@ async fn sync_active_status_at<S: CronJobStore + ?Sized>(
         if let Some(t) = new_scheduled {
             s.insert(
                 "lastScheduleTime".to_string(),
-                json!(crate::k8s_time::format_time(t)),
+                json!(klights_cluster_core::k8s_time::format_time(t)),
             );
         }
         s.insert(
@@ -689,8 +689,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let old_creation =
-            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
+        let old_creation = klights_cluster_core::k8s_time::format_time(
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        );
 
         // CronJob with every-minute schedule and no lastScheduleTime
         // (so it's immediately due)
@@ -762,8 +763,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let old_creation =
-            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
+        let old_creation = klights_cluster_core::k8s_time::format_time(
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        );
 
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -833,8 +835,9 @@ mod tests {
     #[tokio::test]
     async fn test_cronjob_reconcile_persists_last_schedule_time_through_raft_status_path() {
         let db = make_raft_cronjob_datastore().await;
-        let old_creation =
-            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
+        let old_creation = klights_cluster_core::k8s_time::format_time(
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        );
 
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -1062,8 +1065,9 @@ mod tests {
         dispatcher
             .set_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db))
             .await;
-        let old_creation =
-            crate::k8s_time::format_time(chrono::Utc::now() - chrono::Duration::minutes(2));
+        let old_creation = klights_cluster_core::k8s_time::format_time(
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        );
 
         let cj = json!({
             "apiVersion": "batch/v1",
@@ -1274,7 +1278,7 @@ mod tests {
         .await
         .unwrap();
 
-        let creation_timestamp = crate::k8s_time::format_time(chrono::Utc::now());
+        let creation_timestamp = klights_cluster_core::k8s_time::format_time(chrono::Utc::now());
         let cj = json!({
             "apiVersion": "batch/v1",
             "kind": "CronJob",

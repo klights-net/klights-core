@@ -205,7 +205,11 @@ pb_decode!(
         {
             let ts =
                 chrono::DateTime::from_timestamp(seconds, event_time.nanos.unwrap_or(0) as u32)
-                    .map(|dt| crate::utils::k8s_microtime_format(dt.with_timezone(&chrono::Utc)))
+                    .map(|dt| {
+                        klights_cluster_core::k8s_time::format_microtime(
+                            dt.with_timezone(&chrono::Utc),
+                        )
+                    })
                     .unwrap_or_default();
             obj["eventTime"] = json!(ts);
         }
@@ -221,7 +225,9 @@ pb_decode!(
                     seconds,
                     last_observed_time.nanos.unwrap_or(0) as u32,
                 )
-                .map(|dt| crate::utils::k8s_microtime_format(dt.with_timezone(&chrono::Utc)))
+                .map(|dt| {
+                    klights_cluster_core::k8s_time::format_microtime(dt.with_timezone(&chrono::Utc))
+                })
                 .unwrap_or_default();
                 series_obj["lastObservedTime"] = json!(ts);
             }
@@ -281,7 +287,11 @@ pb_decode!(
         {
             let ts =
                 chrono::DateTime::from_timestamp(seconds, event_time.nanos.unwrap_or(0) as u32)
-                    .map(|dt| crate::utils::k8s_microtime_format(dt.with_timezone(&chrono::Utc)))
+                    .map(|dt| {
+                        klights_cluster_core::k8s_time::format_microtime(
+                            dt.with_timezone(&chrono::Utc),
+                        )
+                    })
                     .unwrap_or_default();
             obj["eventTime"] = json!(ts);
         }
@@ -297,7 +307,9 @@ pb_decode!(
                     seconds,
                     last_observed_time.nanos.unwrap_or(0) as u32,
                 )
-                .map(|dt| crate::utils::k8s_microtime_format(dt.with_timezone(&chrono::Utc)))
+                .map(|dt| {
+                    klights_cluster_core::k8s_time::format_microtime(dt.with_timezone(&chrono::Utc))
+                })
                 .unwrap_or_default();
                 series_obj["lastObservedTime"] = json!(ts);
             }
@@ -914,7 +926,7 @@ pb_decode!(
                     seconds,
                     acquire_time.nanos.unwrap_or(0) as u32,
                 )
-                .map(crate::utils::k8s_microtime_format)
+                .map(klights_cluster_core::k8s_time::format_microtime)
                 .unwrap_or_default();
                 spec_obj["acquireTime"] = json!(ts);
             }
@@ -923,7 +935,7 @@ pb_decode!(
             {
                 let ts =
                     chrono::DateTime::from_timestamp(seconds, renew_time.nanos.unwrap_or(0) as u32)
-                        .map(crate::utils::k8s_microtime_format)
+                        .map(klights_cluster_core::k8s_time::format_microtime)
                         .unwrap_or_default();
                 spec_obj["renewTime"] = json!(ts);
             }

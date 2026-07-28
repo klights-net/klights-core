@@ -188,25 +188,6 @@ impl PodWatchEvent {
     }
 }
 
-#[cfg(test)]
-impl From<crate::watch::WatchEvent> for PodWatchEvent {
-    fn from(event: crate::watch::WatchEvent) -> Self {
-        let event_type = match event.event_type {
-            crate::watch::EventType::Added => WatchEventType::Added,
-            crate::watch::EventType::Modified => WatchEventType::Modified,
-            crate::watch::EventType::Deleted => WatchEventType::Deleted,
-            crate::watch::EventType::Bookmark => WatchEventType::Bookmark,
-            crate::watch::EventType::Error => WatchEventType::Error,
-        };
-        Self {
-            scope: PodWatchScope::Pod,
-            event_type,
-            object: event.object,
-            resume_position: None,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct PodWatchStreamError {
     pub scope: PodWatchScope,

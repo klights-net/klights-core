@@ -12,7 +12,6 @@ use tokio::sync::broadcast;
 use crate::control_plane::client::{
     legacy_dataplane, legacy_list_response, legacy_node_subnet, legacy_watch_event,
 };
-use crate::datastore::replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 use crate::datastore::{
     CatchUpResource, ListPageRequest, PodCleanupIntent, PositionedWatchEvent,
     PositionedWatchReplay, PositionedWatchReplayRead, Resource, ResourceList,
@@ -23,6 +22,7 @@ use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::watch::{EventType, WatchBus, WatchEvent};
 #[cfg(test)]
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
+use klights_cluster_store::{ReplayAvailability, ReplayRetentionBoundary};
 use klights_leader_api::{
     LeaderWatch, LeaderWatchError, NodeDataplaneQuery, NodeSubnetAllocationRequest,
     NodeSubnetQuery, PeerSubnetsQuery, PodCleanupIntentAckRequest, PodCleanupIntentListRequest,
@@ -978,13 +978,9 @@ fn worker_replay_event_follows_position(
     event_id: i64,
     event: &WatchEvent,
 ) -> bool {
-    event.resource_version().is_some_and(|resource_version| {
-        !crate::datastore::position_membership::position_represents(
-            position,
-            event_id,
-            resource_version,
-        )
-    })
+    event
+        .resource_version()
+        .is_some_and(|resource_version| !position.represents_event(event_id, resource_version))
 }
 
 fn catchup_resource_from_watch_event(event: &WatchEvent) -> Option<CatchUpResource> {

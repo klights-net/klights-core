@@ -1,6 +1,6 @@
 use super::queries;
-use crate::datastore::replay_retention::ReplayRetentionBoundary;
 use crate::datastore::{WatchTarget, WatchTargetScope};
+use klights_cluster_store::ReplayRetentionBoundary;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const LEGACY_WILDCARD: (&str, &str, &str) = ("*", "*", "*");

@@ -338,14 +338,8 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
                         >
                 })
                 .unwrap_or_else(|| {
-                    let durable_watch = std::sync::Arc::new(
-                        crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
-                    );
                     std::sync::Arc::new(
-                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new_with_ports(
-                            durable_watch.clone(),
-                            watch_signals.clone(),
-                            durable_watch,
+                        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
                             leader_ports.watch.clone(),
                         ),
                     )

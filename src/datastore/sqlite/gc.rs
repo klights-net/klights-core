@@ -930,10 +930,10 @@ fn watch_replay_expired_for_targets(
     }
 
     for target in targets {
-        if crate::datastore::replay_retention::ReplayRetentionBoundary::classify_all(
+        if klights_cluster_store::ReplayRetentionBoundary::classify_all(
             super::replay_floor::target_replay_boundaries(conn, target)?,
             WatchReplayPosition::from_resource_version(since_rv),
-        ) == crate::datastore::replay_retention::ReplayAvailability::Expired
+        ) == klights_cluster_store::ReplayAvailability::Expired
         {
             return Ok(true);
         }
@@ -947,10 +947,10 @@ fn watch_position_expired_for_targets(
     position: WatchReplayPosition,
 ) -> rusqlite::Result<bool> {
     for target in targets {
-        if crate::datastore::replay_retention::ReplayRetentionBoundary::classify_all(
+        if klights_cluster_store::ReplayRetentionBoundary::classify_all(
             super::replay_floor::target_replay_boundaries(conn, target)?,
             position,
-        ) == crate::datastore::replay_retention::ReplayAvailability::Expired
+        ) == klights_cluster_store::ReplayAvailability::Expired
         {
             return Ok(true);
         }

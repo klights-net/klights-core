@@ -32,7 +32,7 @@ pub(crate) fn with_resource_version(
         if metadata.get("creationTimestamp").is_none_or(Value::is_null) {
             metadata.insert(
                 "creationTimestamp".to_string(),
-                Value::String(crate::k8s_time::format_time(now)),
+                Value::String(klights_cluster_core::k8s_time::format_time(now)),
             );
         }
     }

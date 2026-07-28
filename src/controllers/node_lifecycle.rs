@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::k8s_time::format_time as k8s_time_format;
 use crate::node_lease_tracker::{
     DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseObservation, NodeLeaseTracker,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use klights_cluster_core::k8s_time::format_time as k8s_time_format;
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
 use klights_leader_api::{ResourceEvent, WatchEventType};
 use klights_reconcile_api::ControllerStoreResult;

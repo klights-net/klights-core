@@ -735,7 +735,7 @@ fn watch_event_object_identity(object: &serde_json::Value) -> Result<(&str, &str
         .pointer("/metadata/name")
         .and_then(|value| value.as_str())
         .context("service routing watch event missing metadata.name")?;
-    let resource_version = crate::resource_metadata::object_resource_version(object);
+    let resource_version = klights_types::resource_metadata::object_resource_version(object);
     if resource_version <= 0 {
         anyhow::bail!("service routing watch event missing metadata.resourceVersion");
     }

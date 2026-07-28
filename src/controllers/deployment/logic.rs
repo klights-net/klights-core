@@ -628,7 +628,9 @@ pub(crate) async fn reconcile_deployment(
     let selector = match spec.get("selector") {
         Some(s) => s,
         None => {
-            let now = crate::k8s_time::format_legacy_timestamp(reconcile_context.wall_time);
+            let now = klights_cluster_core::k8s_time::format_legacy_timestamp(
+                reconcile_context.wall_time,
+            );
             let failure_condition = json!({
                 "type": "ReplicaFailure",
                 "status": "True",
@@ -658,7 +660,9 @@ pub(crate) async fn reconcile_deployment(
     let template = match spec.get("template") {
         Some(t) => t,
         None => {
-            let now = crate::k8s_time::format_legacy_timestamp(reconcile_context.wall_time);
+            let now = klights_cluster_core::k8s_time::format_legacy_timestamp(
+                reconcile_context.wall_time,
+            );
             let failure_condition = json!({
                 "type": "ReplicaFailure",
                 "status": "True",
@@ -889,7 +893,7 @@ pub(crate) async fn reconcile_deployment(
             }
 
             // Update the deployment
-            let current_rv = crate::resource_metadata::resource_version(metadata);
+            let current_rv = klights_types::resource_metadata::resource_version(metadata);
             db.update_resource_with_preconditions(
                 "apps/v1",
                 "Deployment",

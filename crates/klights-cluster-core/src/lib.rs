@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub mod command;
+pub mod k8s_time;
 pub mod log_apply;
 pub mod membership;
 pub mod node_projection;

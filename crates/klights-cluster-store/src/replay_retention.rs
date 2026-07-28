@@ -4,7 +4,7 @@
 //! event cursor. Legacy databases cannot prove that an arbitrary positioned
 //! cursor is reconstructable, so that combination fails closed.
 
-use crate::datastore::WatchReplayPosition;
+use klights_cluster_core::WatchReplayPosition;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayRetentionBoundary {
@@ -114,5 +114,109 @@ impl ReplayRetentionBoundary {
         if highest_event_id != highest_resource_version {
             boundaries.push(Self::Exact(highest_event_id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_and_legacy_retention_boundaries_classify_positions() {
+        let exact = ReplayRetentionBoundary::Exact(WatchReplayPosition {
+            resource_version: 10,
+            event_id: 40,
+            resource_version_filter_through_event_id: 0,
+        });
+        let legacy = ReplayRetentionBoundary::LegacyRvOnly {
+            resource_version: 10,
+        };
+
+        let cases = [
+            (
+                exact,
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 39,
+                    resource_version_filter_through_event_id: 0,
+                },
+                ReplayAvailability::Expired,
+            ),
+            (
+                exact,
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 40,
+                    resource_version_filter_through_event_id: 0,
+                },
+                ReplayAvailability::Available,
+            ),
+            (
+                exact,
+                WatchReplayPosition::from_resource_version(10),
+                ReplayAvailability::Available,
+            ),
+            (
+                legacy,
+                WatchReplayPosition::from_resource_version(9),
+                ReplayAvailability::Expired,
+            ),
+            (
+                legacy,
+                WatchReplayPosition::from_resource_version(10),
+                ReplayAvailability::Available,
+            ),
+            (
+                legacy,
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 40,
+                    resource_version_filter_through_event_id: 0,
+                },
+                ReplayAvailability::Expired,
+            ),
+            (
+                exact,
+                WatchReplayPosition::from_resource_version_through_event_id(9, 100),
+                ReplayAvailability::Expired,
+            ),
+            (
+                exact,
+                WatchReplayPosition::from_resource_version_through_event_id(10, 39),
+                ReplayAvailability::Expired,
+            ),
+            (
+                exact,
+                WatchReplayPosition::from_resource_version_through_event_id(10, 40),
+                ReplayAvailability::Available,
+            ),
+        ];
+
+        for (boundary, cursor, expected) in cases {
+            assert_eq!(boundary.classify(cursor), expected);
+        }
+
+        let newer_rv = ReplayRetentionBoundary::Exact(WatchReplayPosition {
+            resource_version: 20,
+            event_id: 5,
+            resource_version_filter_through_event_id: 0,
+        });
+        let newer_event = ReplayRetentionBoundary::Exact(WatchReplayPosition {
+            resource_version: 10,
+            event_id: 40,
+            resource_version_filter_through_event_id: 0,
+        });
+        assert_eq!(
+            ReplayRetentionBoundary::classify_all(
+                [newer_rv, newer_event],
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 10,
+                    resource_version_filter_through_event_id: 0,
+                },
+            ),
+            ReplayAvailability::Expired,
+            "scope composition must keep real boundaries instead of pairing max RV with max event ID"
+        );
     }
 }

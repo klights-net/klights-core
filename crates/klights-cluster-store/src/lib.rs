@@ -12,6 +12,7 @@ mod ownership;
 mod pod_uid_precondition;
 mod raw_watch_history;
 mod read_validation;
+mod replay_retention;
 mod resource_read;
 mod resource_scope;
 mod topology;
@@ -50,6 +51,7 @@ pub use raw_watch_history::{
     PositionedRawWatchHistoryRead, RawWatchEventsAfterPositionRequest, RawWatchEventsSinceRequest,
     RawWatchHistoryFuture, RawWatchHistoryPage, RawWatchHistoryRead,
 };
+pub use replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 pub use resource_read::{
     ClusterResourceRead, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
     ResourceGetRequest, ResourceListPage, ResourceListQuery, ResourceListRead, ResourceListRequest,

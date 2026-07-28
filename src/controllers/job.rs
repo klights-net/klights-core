@@ -213,7 +213,7 @@ async fn mark_job_foreground_deleting(
     {
         metadata.insert(
             "deletionTimestamp".to_string(),
-            json!(crate::k8s_time::format_legacy_timestamp(now)),
+            json!(klights_cluster_core::k8s_time::format_legacy_timestamp(now)),
         );
     }
     let finalizers = metadata
@@ -719,7 +719,7 @@ pub fn derive_job_status_from_owned_pods_at(
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let condition_now = crate::k8s_time::format_legacy_timestamp(now);
+    let condition_now = klights_cluster_core::k8s_time::format_legacy_timestamp(now);
     let mut conditions = Vec::new();
 
     let success_policy_ready_for_complete =
@@ -810,7 +810,7 @@ pub fn derive_job_status_from_owned_pods_at(
         .get("creationTimestamp")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(|| crate::k8s_time::format_time(now));
+        .unwrap_or_else(|| klights_cluster_core::k8s_time::format_time(now));
     let mut status = json!({
         "active": active_count,
         "ready": ready_count,
@@ -834,7 +834,7 @@ pub fn derive_job_status_from_owned_pods_at(
         let completion_time = job
             .pointer("/status/completionTime")
             .cloned()
-            .unwrap_or_else(|| json!(crate::k8s_time::format_time(now)));
+            .unwrap_or_else(|| json!(klights_cluster_core::k8s_time::format_time(now)));
         s.insert("completionTime".into(), completion_time);
     }
 

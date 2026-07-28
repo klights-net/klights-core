@@ -33,6 +33,23 @@ impl WatchReplayPosition {
         }
     }
 
+    /// Whether an event's post-state is already represented by this cursor.
+    ///
+    /// A partially consumed composite cursor represents both rows explicitly
+    /// consumed through `event_id` and rows at or below its resourceVersion
+    /// filter through the establishment anchor. This is the exact complement
+    /// of positioned replay.
+    pub const fn represents_event(self, event_id: i64, resource_version: i64) -> bool {
+        if event_id <= self.event_id {
+            return true;
+        }
+        if self.resource_version_filter_through_event_id > 0 {
+            return event_id <= self.resource_version_filter_through_event_id
+                && resource_version <= self.resource_version;
+        }
+        self.event_id == 0 && resource_version <= self.resource_version
+    }
+
     /// Validate the canonical composite cursor representation.
     pub fn validate(self) -> Result<(), String> {
         if self.resource_version < 0
@@ -239,6 +256,33 @@ mod tests {
                 case.expected,
                 "{}",
                 case.name
+            );
+        }
+    }
+
+    #[test]
+    fn represented_event_shapes_are_table_driven() {
+        let exact = WatchReplayPosition {
+            resource_version: 50,
+            event_id: 10,
+            resource_version_filter_through_event_id: 0,
+        };
+        let composite = WatchReplayPosition::from_resource_version_through_event_id(50, 10);
+        let scalar = WatchReplayPosition::from_resource_version(50);
+        let cases = [
+            ("exact consumed event", exact, 10, 50, true),
+            ("exact later lower RV", exact, 11, 40, false),
+            ("composite filtered lower RV", composite, 10, 40, true),
+            ("composite later lower RV", composite, 11, 40, false),
+            ("scalar equal RV", scalar, 11, 50, true),
+            ("scalar later RV", scalar, 11, 51, false),
+        ];
+
+        for (name, position, event_id, resource_version, expected) in cases {
+            assert_eq!(
+                position.represents_event(event_id, resource_version),
+                expected,
+                "{name}"
             );
         }
     }

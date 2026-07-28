@@ -197,7 +197,7 @@ fn build_pdb_status(
         .and_then(|conditions| {
             crate::controllers::common::condition_by_type(conditions, "SufficientPods")
         });
-    let now = crate::k8s_time::format_legacy_timestamp(now);
+    let now = klights_cluster_core::k8s_time::format_legacy_timestamp(now);
     crate::controllers::common::preserve_condition_transition_time(&mut condition, previous, &now);
 
     let mut status = json!({
@@ -411,7 +411,8 @@ pub(crate) async fn admit_pod_eviction_at<Store: PdbStore + ?Sized>(
         if !status.get("disruptedPods").is_some_and(Value::is_object) {
             status["disruptedPods"] = json!({});
         }
-        status["disruptedPods"][pod_name] = json!(crate::k8s_time::format_legacy_timestamp(now));
+        status["disruptedPods"][pod_name] =
+            json!(klights_cluster_core::k8s_time::format_legacy_timestamp(now));
 
         match store
             .update_status(

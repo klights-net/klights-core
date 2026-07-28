@@ -14,7 +14,6 @@ pub mod pod_serviceaccount;
 pub(crate) mod position_membership;
 pub mod raft;
 pub mod redb;
-pub(crate) mod replay_retention;
 pub(crate) mod selector;
 pub mod snapshot;
 pub(crate) mod snapshot_export;

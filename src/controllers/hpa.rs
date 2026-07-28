@@ -786,7 +786,7 @@ fn condition(
         "reason": reason,
         "message": message,
         "lastTransitionTime": existing_transition_time(hpa, condition_type, status, reason)
-            .unwrap_or_else(|| crate::k8s_time::format_legacy_timestamp(now))
+            .unwrap_or_else(|| klights_cluster_core::k8s_time::format_legacy_timestamp(now))
     })
 }
 

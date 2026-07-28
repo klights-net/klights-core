@@ -9,6 +9,7 @@ pub mod network;
 pub mod operation;
 pub mod pod_status_merge;
 pub mod quantity;
+pub mod resource_metadata;
 pub mod resource_semantics;
 pub mod rtt_estimator;
 

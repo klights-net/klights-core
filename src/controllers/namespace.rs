@@ -150,7 +150,7 @@ pub async fn create_default_service_account_at<S: NamespaceBootstrapStore + ?Siz
         "metadata": {
             "name": "default",
             "namespace": namespace,
-            "creationTimestamp": crate::k8s_time::format_time(now),
+            "creationTimestamp": klights_cluster_core::k8s_time::format_time(now),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "secrets": []
@@ -213,7 +213,7 @@ pub async fn create_kube_root_ca_configmap_at<S: NamespaceBootstrapStore + ?Size
         "metadata": {
             "name": "kube-root-ca.crt",
             "namespace": namespace,
-            "creationTimestamp": crate::k8s_time::format_time(now),
+            "creationTimestamp": klights_cluster_core::k8s_time::format_time(now),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "data": {
@@ -461,7 +461,7 @@ fn extension_apiserver_authentication_configmap(
         "metadata": {
             "name": "extension-apiserver-authentication",
             "namespace": "kube-system",
-            "creationTimestamp": crate::k8s_time::format_time(now),
+            "creationTimestamp": klights_cluster_core::k8s_time::format_time(now),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "data": {

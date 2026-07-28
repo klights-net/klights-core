@@ -473,7 +473,7 @@ pub(crate) async fn reconcile_pvc<S: PvcStore + ?Sized>(
         let pv_metadata = updated_pv
             .get("metadata")
             .ok_or_else(|| anyhow::anyhow!("PV missing metadata"))?;
-        let pv_rv = crate::resource_metadata::resource_version(pv_metadata);
+        let pv_rv = klights_types::resource_metadata::resource_version(pv_metadata);
         let pv_preconditions = ResourcePreconditions::from_metadata(pv_metadata, pv_rv)?;
 
         store

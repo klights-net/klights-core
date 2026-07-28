@@ -224,7 +224,7 @@ fn status_with_available(
         .filter(|condition| condition.get("type").and_then(|v| v.as_str()) != Some("Available"))
         .collect::<Vec<_>>();
     let last_transition_time = existing_available_transition_time(apiservice, status)
-        .unwrap_or_else(|| crate::k8s_time::format_legacy_timestamp(now));
+        .unwrap_or_else(|| klights_cluster_core::k8s_time::format_legacy_timestamp(now));
     conditions.push(json!({
         "type": "Available",
         "status": status,

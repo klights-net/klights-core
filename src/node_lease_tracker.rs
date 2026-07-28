@@ -6,7 +6,7 @@ use klights_cluster_core::StorageCommand;
 use serde_json::Value;
 use tokio::sync::{Notify, RwLock};
 
-use crate::k8s_time::format_time as k8s_time_format;
+use klights_cluster_core::k8s_time::format_time as k8s_time_format;
 
 pub use klights_cluster_core::DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS;
 use klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS;

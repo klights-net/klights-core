@@ -735,7 +735,7 @@ pub use klights_types::preserve_status_subresource_on_main_update;
 
 pub fn normalize_resource_for_storage(api_version: &str, kind: &str, body: &mut Value) {
     if api_version == "events.k8s.io/v1" && kind == "Event" {
-        crate::k8s_time::normalize_event_microtime_fields(body);
+        klights_cluster_core::k8s_time::normalize_event_microtime_fields(body);
     }
     if api_version == "apps/v1" && kind == "Deployment" {
         apply_deployment_strategy_defaults(body);

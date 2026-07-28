@@ -83,7 +83,7 @@ pub fn wrap_protobuf_resource_envelope(
 }
 
 pub fn normalize_event_microtime_fields(value: &mut Value) {
-    crate::utils::normalize_event_microtime_fields(value);
+    klights_cluster_core::k8s_time::normalize_event_microtime_fields(value);
 }
 
 /// Encode JSON Value to K8s protobuf format.
