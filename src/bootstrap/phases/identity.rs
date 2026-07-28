@@ -18,7 +18,9 @@ pub async fn setup_leader(
     node_ip: &str,
     role: &crate::bootstrap::NodeRole,
 ) -> Result<IdentityPhase> {
-    use crate::auth;
+    use crate::bootstrap::certificate_bootstrap::{
+        CertInitResult, InitCertificateRequest, init_certificates,
+    };
     use crate::bootstrap::init::dataplane::local_join_dataplane_metadata;
 
     let local_dataplane = local_join_dataplane_metadata(
@@ -30,13 +32,13 @@ pub async fn setup_leader(
     .await
     .context("failed to prepare leader dataplane metadata")?;
 
-    let cert_result = auth::init_certificates(
-        auth::InitCertificateRequest {
+    let cert_result = init_certificates(
+        InitCertificateRequest {
             tls_port: cfg.config.tls_port,
             context_name: &cfg.config.containerd_namespace,
             service_cidr: &cfg.config.service_cidr,
             pod_subnet: &cfg.config.pod_subnet,
-            etc_dir_path: &cfg.etc_dir,
+            etc_dir: std::path::Path::new(&cfg.etc_dir),
             node_name: &cfg.config.node_name,
             host_ip: Some(api_host_for_certificates(&cfg.config, node_ip)),
             api_fqdn: cfg.config.api_fqdn.as_deref(),
@@ -51,8 +53,8 @@ pub async fn setup_leader(
     let grpc_ca_cert_path = Some(std::path::Path::new(&cfg.etc_dir).join("ca.crt"));
 
     match cert_result {
-        auth::CertInitResult::Complete(_paths) => {}
-        auth::CertInitResult::NeedsCsrSign(pending) => {
+        CertInitResult::Complete => {}
+        CertInitResult::NeedsCsrSign(pending) => {
             resolve_csr_via_rpc(cfg, role, &pending, &local_dataplane)
                 .await
                 .context("Failed to resolve server cert CSR via leader RPC")?;
@@ -82,7 +84,7 @@ pub async fn setup_leader(
 async fn resolve_csr_via_rpc(
     cfg: &ConfigPhase,
     role: &crate::bootstrap::NodeRole,
-    pending: &crate::auth::PendingCsr,
+    pending: &crate::bootstrap::certificate_bootstrap::PendingCsr,
     local_dataplane: &crate::replication::grpc::client::JoinDataplaneMetadata,
 ) -> Result<()> {
     use crate::bootstrap::NodeRole;
@@ -217,13 +219,13 @@ async fn resolve_csr_via_rpc(
     // Re-run cert init now that ca.crt + ca.key + server.crt exist.
     // It will load the existing CA and server cert, then generate the local
     // admin cert and kubeconfig. The follower API proxy must not use that cert.
-    let second_pass = crate::auth::init_certificates(
-        crate::auth::InitCertificateRequest {
+    let second_pass = crate::bootstrap::certificate_bootstrap::init_certificates(
+        crate::bootstrap::certificate_bootstrap::InitCertificateRequest {
             tls_port: cfg.config.tls_port,
             context_name: &cfg.config.containerd_namespace,
             service_cidr: &cfg.config.service_cidr,
             pod_subnet: &cfg.config.pod_subnet,
-            etc_dir_path: &cfg.etc_dir,
+            etc_dir: std::path::Path::new(&cfg.etc_dir),
             node_name: &cfg.config.node_name,
             host_ip: Some(api_host_for_certificates(
                 &cfg.config,
@@ -239,8 +241,8 @@ async fn resolve_csr_via_rpc(
     .context("Failed to finalize certificates after CSR resolution")?;
 
     match second_pass {
-        crate::auth::CertInitResult::Complete(_) => Ok(()),
-        crate::auth::CertInitResult::NeedsCsrSign(_) => Err(anyhow!(
+        crate::bootstrap::certificate_bootstrap::CertInitResult::Complete => Ok(()),
+        crate::bootstrap::certificate_bootstrap::CertInitResult::NeedsCsrSign(_) => Err(anyhow!(
             "cert init returned NeedsCsrSign after CSR was resolved — this is a bug"
         )),
     }

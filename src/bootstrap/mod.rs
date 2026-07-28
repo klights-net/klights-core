@@ -1,5 +1,6 @@
 pub(crate) mod auth_adapters;
 pub mod bootstrap_token;
+pub(crate) mod certificate_bootstrap;
 pub mod cluster_meta;
 pub mod config;
 pub mod controlplane_discovery;

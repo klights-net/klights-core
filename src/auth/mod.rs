@@ -7,14 +7,14 @@
 //! - User identity extraction from client certificates
 
 pub use self::cert::{
-    API_PROXY_COMMON_NAME_PREFIX, APISERVICE_PROXY_GROUP, CONTROLPLANE_NODES_GROUP, CertInitResult,
-    CertPaths, InitCertificateRequest, NODES_GROUP, PendingCsr, api_proxy_common_name,
-    generate_api_proxy_cert, generate_apiservice_proxy_cert, generate_server_csr,
-    init_certificates,
+    API_PROXY_COMMON_NAME_PREFIX, APISERVICE_PROXY_GROUP, CONTROLPLANE_NODES_GROUP, NODES_GROUP,
+    api_proxy_common_name, generate_api_proxy_cert, generate_apiservice_proxy_cert,
+    generate_server_csr,
 };
 #[cfg(test)]
 pub use self::cert::{generate_admin_cert, generate_ca_full, generate_server_cert};
 pub use self::identity::AuthenticatedIdentity;
+pub(crate) use self::kubeconfig::{KubeconfigParams, generate_kubeconfig};
 pub use self::middleware::{BoundTokenSubjectLookup, validate_sa_token_bindings};
 pub use self::token::{
     BoundServiceAccountToken, ServiceAccountTokenRequest,
@@ -35,7 +35,7 @@ pub use self::user::verify_client_cert_signed_by_ca;
 pub mod authorizer;
 pub mod bootstrap_authorizer;
 pub mod ca_transport;
-mod cert;
+pub(crate) mod cert;
 pub mod clock;
 pub mod csr_policy;
 pub mod csr_signer;
