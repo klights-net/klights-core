@@ -2,13 +2,18 @@ use crate::controllers::common::{condition_from_status, preserve_condition_times
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 
 use super::helpers::templates_match;
 
 #[async_trait]
 pub trait DeploymentFinalizeStore: Send + Sync {
-    async fn get_deployment(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn get_deployment(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
 
     async fn patch_deployment_revision(
         &self,
@@ -16,14 +21,14 @@ pub trait DeploymentFinalizeStore: Send + Sync {
         name: &str,
         revision: String,
         expected_uid: String,
-    ) -> Result<()>;
+    ) -> ControllerStoreResult<()>;
 
     async fn delete_replicaset(
         &self,
         namespace: &str,
         name: &str,
         expected_uid: String,
-    ) -> Result<()>;
+    ) -> ControllerStoreResult<()>;
 }
 
 pub fn build_conditions_and_revision(

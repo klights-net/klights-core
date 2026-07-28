@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use klights_leader_api::{ControllerCoordination, ControllerScope};
+use klights_leader_api::{ControllerCoordination, ControllerLease, ControllerScope};
 use tokio_util::sync::CancellationToken;
 
 pub async fn run_under_lease<F, Fut>(
@@ -16,7 +16,7 @@ pub async fn run_under_lease<F, Fut>(
     shutdown: CancellationToken,
     on_leader: F,
 ) where
-    F: Fn(ControllerScope, CancellationToken) -> Fut + Send + Sync + 'static,
+    F: Fn(ControllerScope, ControllerLease, CancellationToken) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     loop {
@@ -38,7 +38,11 @@ pub async fn run_under_lease<F, Fut>(
         }
 
         let lease_cancel = shutdown.child_token();
-        let startup = on_leader(scope.clone(), lease_cancel.clone());
+        let startup = klights_leader_api::scope_controller_lease(
+            coordination.clone(),
+            lease.clone(),
+            on_leader(scope.clone(), lease.clone(), lease_cancel.clone()),
+        );
         tokio::pin!(startup);
         let revocation = coordination.wait_for_revocation(&lease);
         tokio::pin!(revocation);
@@ -187,7 +191,7 @@ mod tests {
                 coordination,
                 ControllerScope::Cluster,
                 shutdown_for_task,
-                move |_scope, _cancel| {
+                move |_scope, _lease, _cancel| {
                     let calls = calls_for_task.clone();
                     let started = started_for_task.clone();
                     async move {
@@ -225,7 +229,7 @@ mod tests {
                 coordination,
                 ControllerScope::Cluster,
                 shutdown_for_task,
-                move |_scope, cancel| {
+                move |_scope, _lease, cancel| {
                     let calls = calls_for_task.clone();
                     let lease_tx = lease_tx.clone();
                     async move {
@@ -270,7 +274,7 @@ mod tests {
                 coordination,
                 ControllerScope::Cluster,
                 shutdown_for_task,
-                move |_scope, _cancel| {
+                move |_scope, _lease, _cancel| {
                     let calls = calls_for_task.clone();
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);

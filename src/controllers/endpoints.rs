@@ -4,24 +4,28 @@ use klights_cluster_core::{
     Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
 };
 use klights_pod_api::{PodListRequest, PodQuery};
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[async_trait]
 pub trait EndpointReconcileStore: Send + Sync {
-    async fn endpoint_namespace_is_terminating(&self, namespace: &str) -> Result<bool>;
+    async fn endpoint_namespace_is_terminating(
+        &self,
+        namespace: &str,
+    ) -> ControllerStoreResult<bool>;
     async fn get_resource(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn list_service_endpoint_slices(
         &self,
         namespace: &str,
         service_name: &str,
-    ) -> Result<Vec<Resource>>;
+    ) -> ControllerStoreResult<Vec<Resource>>;
     async fn create_resource(
         &self,
         api_version: &str,
@@ -29,7 +33,7 @@ pub trait EndpointReconcileStore: Send + Sync {
         namespace: Option<&str>,
         name: &str,
         data: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn update_resource_with_preconditions(
         &self,
         api_version: &str,
@@ -38,7 +42,7 @@ pub trait EndpointReconcileStore: Send + Sync {
         name: &str,
         data: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn delete_resource_with_preconditions(
         &self,
         api_version: &str,
@@ -46,10 +50,17 @@ pub trait EndpointReconcileStore: Send + Sync {
         namespace: Option<&str>,
         name: &str,
         preconditions: ResourcePreconditions,
-    ) -> Result<()>;
-    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()>;
-    fn endpoint_store_error_is_conflict(&self, error: &anyhow::Error) -> bool;
-    fn endpoint_store_error_is_already_exists(&self, error: &anyhow::Error) -> bool;
+    ) -> ControllerStoreResult<()>;
+    async fn apply_resource_batch(
+        &self,
+        operations: Vec<ResourceBatchOperation>,
+    ) -> ControllerStoreResult<()>;
+    fn endpoint_store_error_is_conflict(&self, error: &ControllerStoreError) -> bool {
+        error.is_conflict()
+    }
+    fn endpoint_store_error_is_already_exists(&self, error: &ControllerStoreError) -> bool {
+        error.is_already_exists()
+    }
 }
 
 /// Resolve a service port's targetPort to the numeric container port.
@@ -571,7 +582,7 @@ async fn update_endpoints_with_retry(
                         {
                             continue;
                         }
-                        Err(create_err) => return Err(create_err),
+                        Err(create_err) => return Err(create_err.into()),
                     }
                 };
                 if endpoints_desired_state_matches(&resource.data, &endpoints) {
@@ -592,7 +603,7 @@ async fn update_endpoints_with_retry(
                     e
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -647,7 +658,7 @@ async fn update_endpointslice_with_retry(
                         {
                             continue;
                         }
-                        Err(create_err) => return Err(create_err),
+                        Err(create_err) => return Err(create_err.into()),
                     }
                 };
                 if endpointslice_desired_state_matches(&resource.data, &endpointslice) {
@@ -670,7 +681,7 @@ async fn update_endpointslice_with_retry(
                     e
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
@@ -694,7 +705,10 @@ async fn create_or_update_endpointslice(
         .await
     {
         Ok(_) => Ok(()),
-        Err(create_err) if db.endpoint_store_error_is_conflict(&create_err) => {
+        Err(create_err)
+            if db.endpoint_store_error_is_conflict(&create_err)
+                || db.endpoint_store_error_is_already_exists(&create_err) =>
+        {
             let refreshed = db
                 .get_resource(
                     "discovery.k8s.io/v1",
@@ -704,7 +718,7 @@ async fn create_or_update_endpointslice(
                 )
                 .await?;
             let Some(refreshed_resource) = refreshed else {
-                return Err(create_err);
+                return Err(create_err.into());
             };
 
             if endpointslice_desired_state_matches(&refreshed_resource.data, &endpointslice) {
@@ -727,7 +741,7 @@ async fn create_or_update_endpointslice(
             )
             .await
         }
-        Err(create_err) => Err(create_err),
+        Err(create_err) => Err(create_err.into()),
     }
 }
 
@@ -807,7 +821,7 @@ pub async fn reconcile_endpoints(
                         .await?;
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -1042,7 +1056,9 @@ pub async fn reconcile_service_endpoints_batch(
     if operations.is_empty() {
         return Ok(());
     }
-    db.apply_resource_batch(operations).await
+    db.apply_resource_batch(operations)
+        .await
+        .map_err(Into::into)
 }
 
 /// Mirror manually-created Endpoints to EndpointSlice.
@@ -1293,7 +1309,7 @@ pub async fn mirror_endpoints_to_endpointslice(
                     }
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e.into()),
             }
         }
         if let Some(conflict) = last_conflict {
@@ -1339,7 +1355,7 @@ pub async fn mirror_endpoints_to_endpointslice(
                         .await;
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 

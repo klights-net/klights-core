@@ -3,12 +3,13 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 pub use klights_leader_api::{CrdRegistry, CrdResourceInfo};
 use klights_leader_api::{LeaderWatchError, ResourceEvent, WatchEventType, WatchStream};
+use klights_reconcile_api::ControllerStoreResult;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 pub trait CrdRegistryReader: Send + Sync {
-    async fn list_crd_values(&self) -> Result<Vec<serde_json::Value>>;
+    async fn list_crd_values(&self) -> ControllerStoreResult<Vec<serde_json::Value>>;
 }
 
 pub struct CrdRegistryWatchSession {

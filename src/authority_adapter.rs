@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use klights_leader_api::{
-    AuthorityAcquireFuture, AuthorityError, AuthorityPermit, AuthorityRevocationFuture,
-    AuthorityRoute, LeaderAuthority, NodeRoleProjection,
+    AuthorityAcquireFuture, AuthorityError, AuthorityPermit, AuthorityPermitIssuer,
+    AuthorityRevocationFuture, AuthorityRoute, LeaderAuthority, NodeRoleProjection,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,6 +29,7 @@ impl AuthorityPublisher {
 
 pub(crate) struct WatchLeaderAuthority {
     receiver: tokio::sync::watch::Receiver<AuthorityState>,
+    issuer: AuthorityPermitIssuer,
 }
 
 impl WatchLeaderAuthority {
@@ -41,7 +42,13 @@ impl WatchLeaderAuthority {
             local,
             endpoint,
         });
-        (Arc::new(Self { receiver }), AuthorityPublisher { sender })
+        (
+            Arc::new(Self {
+                receiver,
+                issuer: AuthorityPermitIssuer::new(),
+            }),
+            AuthorityPublisher { sender },
+        )
     }
 }
 
@@ -49,7 +56,7 @@ impl LeaderAuthority for WatchLeaderAuthority {
     fn route(&self) -> AuthorityRoute {
         let state = self.receiver.borrow();
         if state.local {
-            AuthorityRoute::Local(AuthorityPermit::issue(state.generation))
+            AuthorityRoute::Local(self.issuer.issue(state.generation))
         } else if let Some(endpoint) = state.endpoint.clone() {
             AuthorityRoute::Forward { endpoint }
         } else {
@@ -61,10 +68,8 @@ impl LeaderAuthority for WatchLeaderAuthority {
         let state = self.receiver.borrow();
         if !state.local {
             Err(AuthorityError::NotAuthoritative)
-        } else if state.generation != permit.generation() {
-            Err(AuthorityError::StalePermit)
         } else {
-            Ok(())
+            self.issuer.validate(permit, state.generation)
         }
     }
 
@@ -74,7 +79,7 @@ impl LeaderAuthority for WatchLeaderAuthority {
             loop {
                 let state = receiver.borrow_and_update().clone();
                 if state.local {
-                    return Ok(AuthorityPermit::issue(state.generation));
+                    return Ok(self.issuer.issue(state.generation));
                 }
                 receiver
                     .changed()
@@ -89,12 +94,12 @@ impl LeaderAuthority for WatchLeaderAuthority {
         permit: &'a AuthorityPermit,
     ) -> AuthorityRevocationFuture<'a> {
         let mut receiver = self.receiver.clone();
-        let generation = permit.generation();
+        let permit = permit.clone();
         Box::pin(async move {
             loop {
                 let revoked = {
                     let state = receiver.borrow();
-                    !state.local || state.generation != generation
+                    !state.local || self.issuer.validate(&permit, state.generation).is_err()
                 };
                 if revoked || receiver.changed().await.is_err() {
                     return;
@@ -108,6 +113,7 @@ impl LeaderAuthority for WatchLeaderAuthority {
 pub(crate) struct TestBooleanWatchAuthority {
     receiver: std::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
     generation: std::sync::atomic::AtomicU64,
+    issuer: AuthorityPermitIssuer,
 }
 
 #[cfg(test)]
@@ -116,6 +122,7 @@ impl TestBooleanWatchAuthority {
         Arc::new(Self {
             receiver: std::sync::Mutex::new(receiver),
             generation: std::sync::atomic::AtomicU64::new(0),
+            issuer: AuthorityPermitIssuer::new(),
         })
     }
 
@@ -132,7 +139,7 @@ impl LeaderAuthority for TestBooleanWatchAuthority {
     fn route(&self) -> AuthorityRoute {
         let (generation, local) = self.issue();
         if local {
-            AuthorityRoute::Local(AuthorityPermit::issue(generation))
+            AuthorityRoute::Local(self.issuer.issue(generation))
         } else {
             AuthorityRoute::Unavailable
         }
@@ -145,10 +152,10 @@ impl LeaderAuthority for TestBooleanWatchAuthority {
         let generation = self.generation.load(Ordering::Acquire);
         if !local {
             Err(AuthorityError::NotAuthoritative)
-        } else if receiver.has_changed().unwrap_or(true) || generation != permit.generation() {
+        } else if receiver.has_changed().unwrap_or(true) {
             Err(AuthorityError::StalePermit)
         } else {
-            Ok(())
+            self.issuer.validate(permit, generation)
         }
     }
 

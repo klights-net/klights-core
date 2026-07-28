@@ -38,11 +38,14 @@ async fn node_proxy_inner(
     let node_name = node_name_from_param(name_param);
 
     // Verify the node exists
-    let node = state
-        .resource_mutation()
-        .db
-        .get_resource("v1", "Node", None, node_name)
-        .await?;
+    let node = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Node",
+        None,
+        node_name,
+    )
+    .await?;
     if node.is_none() {
         return Err(AppError::NotFound(format!("Node {} not found", node_name)));
     }

@@ -7,19 +7,19 @@ use crate::controllers::common::ControllerStatusStore;
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
-use klights_reconcile_api::PodEvictionAdmissionOutcome;
+use klights_reconcile_api::{ControllerStoreResult, PodEvictionAdmissionOutcome};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
 /// Reconcile a PodDisruptionBudget — update its status fields.
 #[async_trait]
 pub(crate) trait PdbStore: ControllerStatusStore {
-    async fn list_pdbs(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn list_pdbs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
 }
 
 #[async_trait]
 pub(crate) trait PdbPodReader: Send + Sync {
-    async fn list_namespace_pods(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
 }
 
 pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader + ?Sized>(
@@ -142,10 +142,10 @@ pub(crate) async fn reconcile_pdb<Store: PdbStore + ?Sized, Pods: PdbPodReader +
         {
             Ok(_) => return Ok(()),
             Err(err) if store.is_conflict(&err) => {
-                last_conflict = Some(err);
+                last_conflict = Some(err.into());
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -424,7 +424,7 @@ pub(crate) async fn admit_pod_eviction<Store: PdbStore + ?Sized>(
                     .await?
                     .context("PDB disappeared during eviction admission")?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
 

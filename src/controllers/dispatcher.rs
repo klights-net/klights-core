@@ -103,7 +103,7 @@ impl ControllerDispatcher {
 
     #[cfg(not(test))]
     pub(crate) fn pod_delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
-        self.dependencies.pods.delete_sink()
+        self.dependencies.pod_delete_sink.as_ref()
     }
 
     /// Create a new controller dispatcher with all available controllers
@@ -664,7 +664,7 @@ impl ControllerDispatcher {
     async fn dispatch_key(&self, key: &Key) {
         let resource = match self
             .dependencies
-            .leader
+            .resource_query
             .get_reconcile_resource(key.api_version(), key.kind(), key.namespace(), key.name())
             .await
         {
@@ -741,7 +741,7 @@ impl ControllerDispatcher {
         }
         let Some(resource) = self
             .dependencies
-            .leader
+            .resource_query
             .get_reconcile_resource(key.api_version(), key.kind(), key.namespace(), key.name())
             .await?
         else {
@@ -900,7 +900,7 @@ impl ControllerDispatcher {
             .filter(|namespace| !namespace.is_empty())
             && self
                 .dependencies
-                .leader
+                .resource_query
                 .namespace_is_terminating(namespace)
                 .await?
         {

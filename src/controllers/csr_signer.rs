@@ -11,6 +11,7 @@
 use crate::controllers::{Context, Controller};
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -65,7 +66,7 @@ pub trait CsrIssuer: Send + Sync {
 
 #[async_trait]
 pub(crate) trait CsrStatusStore: Send + Sync {
-    async fn get_csr(&self, name: &str) -> anyhow::Result<Option<Resource>>;
+    async fn get_csr(&self, name: &str) -> ControllerStoreResult<Option<Resource>>;
 
     async fn update_csr_status(
         &self,
@@ -73,7 +74,7 @@ pub(crate) trait CsrStatusStore: Send + Sync {
         uid: &str,
         resource_version: i64,
         status: Value,
-    ) -> anyhow::Result<()>;
+    ) -> ControllerStoreResult<()>;
 }
 
 /// CSR signer controller that validates and signs kubelet client CSRs.
@@ -98,7 +99,7 @@ impl Controller for CsrSignerController {
 
     async fn reconcile(&self, resource: Value, ctx: Context) -> anyhow::Result<()> {
         let csr_name = extract_name(&resource);
-        let live_resource = match ctx.leader().csr_status_store().get_csr(&csr_name).await? {
+        let live_resource = match ctx.csr_status_store().get_csr(&csr_name).await? {
             Some(resource) => resource,
             None => return Ok(()),
         };
@@ -150,7 +151,7 @@ impl Controller for CsrSignerController {
 
         // Update CSR status with certificate and approval
         update_csr_with_certificate(
-            ctx.leader().csr_status_store(),
+            ctx.csr_status_store(),
             &csr_name,
             &uid,
             resource_version,

@@ -9,24 +9,32 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+#[cfg(test)]
 use crate::datastore::CommitObservationSink;
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::key_codec::{lex_next, resource_key, resource_prefix};
 use crate::datastore::redb::tables;
-use crate::datastore::sqlite::{create_pending_watch_event, publish_pending};
+use crate::datastore::sqlite::create_pending_watch_event;
+#[cfg(test)]
+use crate::datastore::sqlite::publish_pending;
 use crate::datastore::types::*;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
+    #[cfg(test)]
     commit_sink: Arc<dyn CommitObservationSink>,
 }
 
 impl RedbResourceStore {
-    pub fn new(accessor: Arc<RedbAccessor>, commit_sink: Arc<dyn CommitObservationSink>) -> Self {
+    pub fn new(
+        accessor: Arc<RedbAccessor>,
+        #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
+    ) -> Self {
         Self {
             accessor,
+            #[cfg(test)]
             commit_sink,
         }
     }
@@ -48,6 +56,9 @@ impl RedbResourceStore {
             + 'static,
     {
         let (result, pending) = self.accessor.call(label, f).await?;
+        #[cfg(not(test))]
+        let _ = pending;
+        #[cfg(test)]
         if let Some(pending) = pending {
             publish_pending(pending, self.commit_sink.as_ref());
         }
@@ -177,6 +188,7 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|value| value.to_string());
         let name_owned = name.to_string();
+        #[cfg(test)]
         let watch_bus = self.commit_sink.clone();
         let incoming_uid_for_db = incoming_uid.clone();
         let av_for_db = av_owned.clone();
@@ -382,6 +394,7 @@ impl RedbResourceStore {
                 })
             }
             ApplyCreateResult::Inserted => {
+                #[cfg(test)]
                 publish_pending(
                     create_pending_watch_event(
                         &av_owned,
@@ -406,6 +419,7 @@ impl RedbResourceStore {
                 })
             }
             ApplyCreateResult::UpdatedSameUid => {
+                #[cfg(test)]
                 publish_pending(
                     create_pending_watch_event(
                         &av_owned,
@@ -433,7 +447,9 @@ impl RedbResourceStore {
                 old_data,
                 deleted_rv,
             } => {
+                #[cfg(test)]
                 let old_object: Value = serde_json::from_slice(&old_data).unwrap_or(Value::Null);
+                #[cfg(test)]
                 publish_pending(
                     create_pending_watch_event(
                         &av_owned,
@@ -446,6 +462,7 @@ impl RedbResourceStore {
                     ),
                     watch_bus.as_ref(),
                 );
+                #[cfg(test)]
                 publish_pending(
                     create_pending_watch_event(
                         &av_owned,

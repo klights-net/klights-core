@@ -7,6 +7,12 @@ mod cases {
 
     use serde_json::json;
 
+    fn is_controller_conflict(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<klights_reconcile_api::ControllerStoreError>()
+            .is_some_and(klights_reconcile_api::ControllerStoreError::is_conflict)
+    }
+
     // --- build_owner_ref tests ---
 
     #[test]
@@ -315,7 +321,7 @@ mod cases {
         let err = stale_write
             .expect_err("old UID status writer must not write deletion-marked replacement");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            is_controller_conflict(&err),
             "expected conflict from stale UID write, got {err:#}"
         );
 
@@ -827,7 +833,7 @@ mod cases {
         let err =
             stale_write.expect_err("stale status-only overlap must not overwrite live status");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            is_controller_conflict(&err),
             "expected status conflict, got {err:#}"
         );
 
@@ -878,7 +884,7 @@ mod cases {
         let err =
             stale_write.expect_err("stale status-only overlap must not overwrite live status");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            is_controller_conflict(&err),
             "expected status conflict, got {err:#}"
         );
 
@@ -944,7 +950,7 @@ mod cases {
         .await;
         let err = stale_write.expect_err("old UID status writer must not mutate replacement");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            is_controller_conflict(&err),
             "expected conflict from stale UID write, got {err:#}"
         );
 
@@ -1000,7 +1006,7 @@ mod cases {
         let err = stale_write
             .expect_err("stale unchanged snapshot status must not overwrite live status");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            is_controller_conflict(&err),
             "expected status conflict, got {err:#}"
         );
 
@@ -1056,7 +1062,7 @@ mod cases {
         let err = stale_write
             .expect_err("stale unchanged resource status must not overwrite live status");
         assert!(
-            crate::datastore::errors::is_conflict_error(&err),
+            is_controller_conflict(&err),
             "expected status conflict, got {err:#}"
         );
 
@@ -1122,10 +1128,7 @@ mod cases {
         )
         .await;
         let err = stale_write.expect_err("stale spec snapshot must not retry");
-        assert!(
-            format!("{err:#}").contains("409"),
-            "expected 409, got {err:#}"
-        );
+        assert!(is_controller_conflict(&err), "expected 409, got {err:#}");
     }
 
     // --- append_owner_reference / remove_owner_reference_by_uid tests ---

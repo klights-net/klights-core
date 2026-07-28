@@ -112,6 +112,7 @@ impl HttpAuthorityRouter {
 #[cfg(test)]
 struct TestWatchAuthority {
     state: std::sync::Mutex<TestWatchAuthorityState>,
+    issuer: klights_leader_api::AuthorityPermitIssuer,
 }
 
 #[cfg(test)]
@@ -129,6 +130,7 @@ impl TestWatchAuthority {
         leader_addr: tokio::sync::watch::Receiver<Option<String>>,
     ) -> Self {
         Self {
+            issuer: klights_leader_api::AuthorityPermitIssuer::new(),
             state: std::sync::Mutex::new(TestWatchAuthorityState {
                 is_leader,
                 leader_addr,
@@ -157,9 +159,7 @@ impl klights_leader_api::LeaderAuthority for TestWatchAuthority {
     fn route(&self) -> klights_leader_api::AuthorityRoute {
         let (generation, local, endpoint) = self.snapshot();
         if local {
-            klights_leader_api::AuthorityRoute::Local(klights_leader_api::AuthorityPermit::issue(
-                generation,
-            ))
+            klights_leader_api::AuthorityRoute::Local(self.issuer.issue(generation))
         } else if let Some(endpoint) = endpoint {
             klights_leader_api::AuthorityRoute::Forward { endpoint }
         } else {
@@ -174,10 +174,8 @@ impl klights_leader_api::LeaderAuthority for TestWatchAuthority {
         let (generation, local, _) = self.snapshot();
         if !local {
             Err(klights_leader_api::AuthorityError::NotAuthoritative)
-        } else if generation != permit.generation() {
-            Err(klights_leader_api::AuthorityError::StalePermit)
         } else {
-            Ok(())
+            self.issuer.validate(permit, generation)
         }
     }
 
@@ -306,7 +304,8 @@ pub(in crate::api) async fn leader_proxy_middleware(
         klights_leader_api::AuthorityRoute::Local(permit)
             if router.authority.validate(&permit).is_ok() =>
         {
-            next.run(request).await
+            klights_leader_api::scope_authority(router.authority.clone(), permit, next.run(request))
+                .await
         }
         klights_leader_api::AuthorityRoute::Forward { endpoint } => {
             follower_handle(request, &router, &endpoint).await

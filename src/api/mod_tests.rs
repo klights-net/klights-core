@@ -5230,6 +5230,10 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
             data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
+    state.operational_mut().signing_keys =
+        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
+            signing_key_pem.clone(),
+        );
 
     // Phase 2B: SA must exist for UID validation.
     // Create the ServiceAccount before generating the token.

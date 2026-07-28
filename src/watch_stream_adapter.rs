@@ -50,7 +50,10 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
                     namespace,
                     ResourceListQuery::new(label_selector, field_selector, limit, None),
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    klights_leader_api::ResourceQueryError::query_failed(error.to_string())
+                })?;
             klights_leader_api::ResourceListResult::try_new(
                 list.items,
                 list.resource_version,
@@ -58,7 +61,6 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
                 list.continue_token,
                 list.remaining_item_count,
             )
-            .map_err(crate::api::AppError::from)
         })
     }
 

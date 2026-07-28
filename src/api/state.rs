@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ApiResourceMutationServices {
-    #[cfg(not(test))]
-    pub(crate) db: Arc<dyn crate::api::state_ports::ApiResourceStore>,
     #[cfg(test)]
     pub(crate) db: crate::datastore::DatastoreHandle,
+    pub(crate) watch_stream: Arc<dyn crate::api::watch_stream::WatchStreamSource>,
+    pub(crate) namespace_termination: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
     pub(crate) resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     pub(crate) resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     pub(crate) finalizer_lifecycle: Arc<dyn klights_reconcile_api::FinalizerLifecyclePort>,
@@ -230,7 +230,6 @@ pub(crate) struct ApiOperationalConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApiRuntimePaths {
     pub(crate) ca_cert: std::path::PathBuf,
-    pub(crate) service_account_signing_key: std::path::PathBuf,
     pub(crate) api_proxy_cert: std::path::PathBuf,
     pub(crate) api_proxy_key: std::path::PathBuf,
     pub(crate) apiservice_proxy_cert: std::path::PathBuf,
@@ -248,7 +247,6 @@ impl ApiRuntimePaths {
         let etc = data_root.join("etc");
         Ok(Self {
             ca_cert: etc.join("ca.crt"),
-            service_account_signing_key: etc.join("service-account-signing.key"),
             api_proxy_cert: etc.join("api-proxy.crt"),
             api_proxy_key: etc.join("api-proxy.key"),
             apiservice_proxy_cert: etc.join("apiservice-proxy.crt"),
@@ -343,6 +341,7 @@ pub(crate) struct ApiOperationalServices {
     pub(crate) cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     pub(crate) task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) file_process: klights_supervisor::FileProcessExecutor,
+    pub(crate) signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
     pub(crate) authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
 }
 
@@ -355,6 +354,7 @@ impl ApiOperationalServices {
         cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         file_process: klights_supervisor::FileProcessExecutor,
+        signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
         authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
     ) -> Self {
         Self {
@@ -364,6 +364,7 @@ impl ApiOperationalServices {
             cluster_status,
             task_supervisor,
             file_process,
+            signing_keys,
             authority_router,
         }
     }
@@ -399,7 +400,8 @@ pub(crate) fn build_router_from_root(
     oidc: Option<Arc<dyn crate::auth::oidc::OidcValidator>>,
     webhook: Option<Arc<dyn crate::auth::webhook_auth::WebhookAuthenticator>>,
     cluster_ca_pem: Option<Arc<String>>,
-    db: Arc<dyn crate::api::state_ports::ApiResourceStore>,
+    watch_stream: Arc<dyn crate::api::watch_stream::WatchStreamSource>,
+    namespace_termination: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
     resource_command: Arc<dyn klights_leader_api::LeaderResourceCommand>,
     finalizer_lifecycle: Arc<dyn klights_reconcile_api::FinalizerLifecyclePort>,
@@ -438,6 +440,7 @@ pub(crate) fn build_router_from_root(
     runtime_inputs: ApiRuntimeInputs,
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
     authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
 ) -> axum::Router {
     let role = match role {
@@ -463,7 +466,8 @@ pub(crate) fn build_router_from_root(
             cluster_ca_pem,
         ),
         ApiResourceMutationServices {
-            db,
+            watch_stream,
+            namespace_termination,
             resource_query,
             resource_command,
             finalizer_lifecycle,
@@ -511,6 +515,7 @@ pub(crate) fn build_router_from_root(
             cluster_status,
             task_supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            signing_keys,
             authority_router,
         ),
     );
@@ -645,10 +650,6 @@ mod runtime_input_tests {
         assert_eq!(
             paths.ca_cert,
             std::path::PathBuf::from("/srv/klights/etc/ca.crt")
-        );
-        assert_eq!(
-            paths.service_account_signing_key,
-            std::path::PathBuf::from("/srv/klights/etc/service-account-signing.key")
         );
         assert_eq!(
             paths.api_proxy_cert,

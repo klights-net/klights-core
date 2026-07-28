@@ -571,7 +571,7 @@ impl Datastore {
 
         match result {
             Ok((id, new_rv, data)) => {
-                let pending = create_pending_watch_event(
+                let _pending = create_pending_watch_event(
                     api_version,
                     kind,
                     namespace,
@@ -580,7 +580,8 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
-                self.publish_watch_event(pending);
+                #[cfg(test)]
+                self.publish_watch_event(_pending);
 
                 Ok(Resource {
                     id,
@@ -820,7 +821,7 @@ impl Datastore {
                     .context("deserialize merged status payload")?;
 
                 if outcome.changed {
-                    let pending = create_pending_watch_event(
+                    let _pending = create_pending_watch_event(
                         api_version,
                         kind,
                         namespace,
@@ -829,7 +830,8 @@ impl Datastore {
                         "MODIFIED",
                         data.clone(),
                     );
-                    self.publish_watch_event(pending);
+                    #[cfg(test)]
+                    self.publish_watch_event(_pending);
                 };
 
                 Ok(Resource {

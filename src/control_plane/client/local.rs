@@ -204,6 +204,7 @@ pub struct LocalApiClient {
     /// fires for remote-worker forwarded writes.
     controller_dispatcher: Arc<OnceCell<Arc<ControllerDispatcher>>>,
     non_pod_finalization: Arc<OnceCell<Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>>>,
+    namespace_termination: Arc<OnceCell<Arc<dyn klights_reconcile_api::NamespaceTerminationSink>>>,
     /// T6 step 1 inner gate: every mutation method on this client first
     /// reads `*is_leader_rx.borrow()`. When false (this node is not the
     /// elected raft leader) the call is refused with
@@ -263,7 +264,7 @@ impl LocalApiClient {
             if let Some(probe) = projected_token_issue_test_probe(&self.containerd_namespace) {
                 (probe.async_boundary)().await;
             }
-            let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+            let signing_key_pem = crate::signing_key_state_adapter::read_with_executor(
                 &self.service_account_signing_key_path,
                 &self.file_process,
             )
@@ -426,6 +427,7 @@ impl LocalApiClient {
             node_lease_tracker,
             controller_dispatcher: Arc::new(OnceCell::new()),
             non_pod_finalization: Arc::new(OnceCell::new()),
+            namespace_termination: Arc::new(OnceCell::new()),
             is_leader_rx,
         }
     }
@@ -480,6 +482,13 @@ impl LocalApiClient {
         port: Arc<dyn klights_reconcile_api::GcNonPodFinalizationPort>,
     ) {
         let _ = self.non_pod_finalization.set(port);
+    }
+
+    pub fn set_namespace_termination(
+        &self,
+        port: Arc<dyn klights_reconcile_api::NamespaceTerminationSink>,
+    ) {
+        let _ = self.namespace_termination.set(port);
     }
 
     #[cfg(test)]
@@ -733,6 +742,27 @@ pub(crate) async fn submit_resource_command_to_store(
                 message: format!("{api_version}/{kind}/{name} not found"),
             })?,
         ),
+        StorageCommand::UpdateStatus {
+            api_version,
+            kind,
+            namespace,
+            name,
+            status,
+            expected_rv: _,
+            preconditions,
+            observed_status_stamp: _,
+        } => ResourceCommandResult::Resource(
+            db.update_status_only_with_preconditions(
+                &api_version,
+                &kind,
+                namespace.as_deref(),
+                &name,
+                status,
+                preconditions,
+            )
+            .await
+            .map_err(resource_command_store_error)?,
+        ),
         StorageCommand::DeleteResource {
             api_version,
             kind,
@@ -771,6 +801,31 @@ pub(crate) async fn submit_resource_command_to_store(
             .await
             .map_err(resource_command_store_error)?,
         ),
+        StorageCommand::CreateNamespace { name, data } => ResourceCommandResult::Resource(
+            db.create_namespace(&name, data)
+                .await
+                .map_err(resource_command_store_error)?,
+        ),
+        StorageCommand::UpdateNamespace {
+            name,
+            data,
+            expected_rv,
+        } => ResourceCommandResult::Resource(
+            db.update_namespace(&name, data, expected_rv)
+                .await
+                .map_err(resource_command_store_error)?,
+        ),
+        StorageCommand::DeleteNamespace { name } => {
+            db.delete_namespace(&name)
+                .await
+                .map_err(resource_command_store_error)?;
+            ResourceCommandResult::Ack {
+                resource_version: db
+                    .get_current_resource_version()
+                    .await
+                    .map_err(resource_command_store_error)?,
+            }
+        }
         command => {
             return Err(ResourceCommandError::UnsupportedCommand {
                 command: command.variant_name(),
@@ -800,15 +855,18 @@ fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
             }
         };
     }
+    let lower = format!("{error:#}").to_ascii_lowercase();
+    if lower.contains("already exists") {
+        return ResourceCommandError::AlreadyExists {
+            message: error.to_string(),
+        };
+    }
     if crate::datastore::errors::is_conflict_error(&error) {
         return ResourceCommandError::Conflict {
             message: error.to_string(),
         };
     }
-    if format!("{error:#}")
-        .to_ascii_lowercase()
-        .contains("not found")
-    {
+    if lower.contains("not found") {
         return ResourceCommandError::NotFound {
             message: error.to_string(),
         };
@@ -825,6 +883,13 @@ impl LeaderResourceCommand for LocalApiClient {
             if !*self.is_leader_rx.borrow() {
                 return Err(ResourceCommandError::NotLeader);
             }
+            klights_leader_api::validate_authority_if_scoped()
+                .map_err(|_| ResourceCommandError::NotLeader)?;
+            klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+                ResourceCommandError::retryable(format!(
+                    "controller authority rejected resource command: {error}"
+                ))
+            })?;
             submit_resource_command_to_store(&self.db, request).await
         })
     }
@@ -1335,6 +1400,7 @@ impl LocalApiClient {
                     #[cfg(test)]
                     pod_delete: gc_pod_delete_sink.as_deref(),
                     non_pod_finalization: self.non_pod_finalization.get().map(Arc::as_ref),
+                    namespace_termination: self.namespace_termination.get().map(Arc::as_ref),
                     gc_coordination: controller_dispatcher.gc_coordination(),
                 },
                 command,

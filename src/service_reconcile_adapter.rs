@@ -1,8 +1,9 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::ControllerStoreResult as Result;
 use serde_json::Value;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::service::ServiceReconcileStore;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 
@@ -14,12 +15,15 @@ where
     async fn list_services(&self) -> Result<Vec<Resource>> {
         Ok(self
             .list_resources("v1", "Service", None, ResourceListQuery::all())
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
     async fn get_service(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, "v1", "Service", Some(namespace), name).await
+        DatastoreBackend::get_resource(self, "v1", "Service", Some(namespace), name)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_service(
@@ -39,9 +43,6 @@ where
             preconditions,
         )
         .await
-    }
-
-    fn service_store_error_is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::datastore::errors::is_conflict_error(error)
+        .map_err(map_controller_store_error)
     }
 }

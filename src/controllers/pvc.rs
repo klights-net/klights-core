@@ -2,6 +2,7 @@ use crate::controllers::common::ControllerStatusStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::ControllerStoreResult;
 use klights_types::LabelSelector;
 use serde_json::{Value, json};
 
@@ -26,16 +27,21 @@ fn status_with_updates<const N: usize>(resource: &Value, updates: [(&str, Value)
 
 #[async_trait]
 pub(crate) trait PvcStore: ControllerStatusStore {
-    async fn get_pvc(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
-    async fn list_persistent_volumes(&self) -> Result<Vec<Resource>>;
-    async fn get_persistent_volume(&self, name: &str) -> Result<Option<Resource>>;
-    async fn create_persistent_volume(&self, name: &str, value: Value) -> Result<Resource>;
+    async fn get_pvc(&self, namespace: &str, name: &str)
+    -> ControllerStoreResult<Option<Resource>>;
+    async fn list_persistent_volumes(&self) -> ControllerStoreResult<Vec<Resource>>;
+    async fn get_persistent_volume(&self, name: &str) -> ControllerStoreResult<Option<Resource>>;
+    async fn create_persistent_volume(
+        &self,
+        name: &str,
+        value: Value,
+    ) -> ControllerStoreResult<Resource>;
     async fn update_persistent_volume(
         &self,
         name: &str,
         value: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 async fn write_pvc_status<S: PvcStore + ?Sized>(

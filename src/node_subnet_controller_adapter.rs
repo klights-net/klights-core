@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::node_subnet::{
     NodeReadinessPublishFuture, NodeReadinessPublishResult, NodeReadinessPublisher,
     PeerDataplaneHealth, PeerSyncOutcome, PeerTopologyProjection, PeerTopologyProjectionFuture,
@@ -50,7 +51,10 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
 
             match event.event_type() {
                 klights_leader_api::WatchEventType::Deleted => {
-                    self.db.delete_node_subnet(peer_name).await?;
+                    self.db
+                        .delete_node_subnet(peer_name)
+                        .await
+                        .map_err(map_controller_store_error)?;
                 }
                 klights_leader_api::WatchEventType::Added
                 | klights_leader_api::WatchEventType::Modified => {
@@ -60,19 +64,24 @@ impl PeerTopologyProjection for DatastorePeerTopologyProjection {
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|timestamp| !timestamp.is_empty())
                     {
-                        self.db.delete_node_subnet(peer_name).await?;
+                        self.db
+                            .delete_node_subnet(peer_name)
+                            .await
+                            .map_err(map_controller_store_error)?;
                         return Ok(());
                     }
                     if let Some(node_ip) = crate::controllers::node_subnet::node_dataplane_ip(node)
                     {
                         self.db
                             .allocate_node_subnet(peer_name, &self.cluster_cidr, &node_ip)
-                            .await?;
+                            .await
+                            .map_err(map_controller_store_error)?;
                         let (mode, hostport_range) =
                             crate::controllers::node_subnet::project_node_peer_attributes(node);
                         self.db
                             .update_node_peer_attributes(peer_name, mode, hostport_range)
-                            .await?;
+                            .await
+                            .map_err(map_controller_store_error)?;
                     }
                 }
                 klights_leader_api::WatchEventType::Bookmark
@@ -127,7 +136,12 @@ impl NodeReadinessPublisher for KubeletNodeReadinessPublisher {
                 node_name,
                 health,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::unavailable(format!(
+                    "publish Node readiness failed: {error}"
+                ))
+            })?;
             Ok(match result {
                 crate::kubelet::node::NodeNetworkRefreshResult::Updated => {
                     NodeReadinessPublishResult::Updated

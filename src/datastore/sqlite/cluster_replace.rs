@@ -76,6 +76,7 @@ impl Datastore {
         watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
+        #[cfg(test)]
         let watch_bus = self.commit_sink.clone();
         let outbox_codec = self.outbox_codec.clone();
         #[cfg(test)]
@@ -96,9 +97,12 @@ impl Datastore {
                 Ok(((), pending))
             },
             move |pending| {
+                #[cfg(not(test))]
+                let _ = pending;
                 #[cfg(test)]
                 let published =
                     pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
+                #[cfg(test)]
                 super::watch::publish_pending_batch(pending, watch_bus.as_ref());
                 #[cfg(test)]
                 if let Some(published) = published {
@@ -395,7 +399,7 @@ fn restore_created_rv_from_watch_history(
 impl Datastore {
     pub async fn apply_log_apply_commit(&self, commit: LogApplyCommit) -> Result<()> {
         let outbox_codec = self.outbox_codec.clone();
-        let pending = self
+        let _pending = self
             .db_call("apply_log_apply_commit", move |conn| {
                 let context = super::outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction()?;
@@ -406,7 +410,8 @@ impl Datastore {
             .await
             .map_err(|err| anyhow!("failed to apply log_apply commit: {err}"))?;
 
-        self.publish_watch_events(pending);
+        #[cfg(test)]
+        self.publish_watch_events(_pending);
         Ok(())
     }
 
@@ -434,6 +439,7 @@ impl Datastore {
         &self,
         commit: LogApplyCommit,
     ) -> Result<RaftLogApplyCommitted> {
+        #[cfg(test)]
         let watch_bus = self.commit_sink.clone();
         let outbox_codec = self.outbox_codec.clone();
         #[cfg(test)]
@@ -456,9 +462,12 @@ impl Datastore {
                     ))
                 },
                 move |pending| {
+                    #[cfg(not(test))]
+                    let _ = pending;
                     #[cfg(test)]
                     let published =
                         pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
+                    #[cfg(test)]
                     super::watch::publish_pending_batch(pending, watch_bus.as_ref());
                     #[cfg(test)]
                     if let Some(published) = published {

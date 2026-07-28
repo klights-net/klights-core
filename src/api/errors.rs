@@ -150,6 +150,25 @@ impl From<klights_reconcile_api::FinalizerLifecycleError> for AppError {
     }
 }
 
+impl From<klights_reconcile_api::NamespaceLifecycleError> for AppError {
+    fn from(error: klights_reconcile_api::NamespaceLifecycleError) -> Self {
+        match error {
+            klights_reconcile_api::NamespaceLifecycleError::NotFound { message } => {
+                Self::NotFound(message)
+            }
+            klights_reconcile_api::NamespaceLifecycleError::Conflict { message } => {
+                Self::Conflict(message)
+            }
+            klights_reconcile_api::NamespaceLifecycleError::Unavailable { message } => {
+                Self::ServiceUnavailable(message)
+            }
+            klights_reconcile_api::NamespaceLifecycleError::Internal { message } => {
+                Self::Internal(message)
+            }
+        }
+    }
+}
+
 impl From<ResourcePreconditionError> for AppError {
     fn from(error: ResourcePreconditionError) -> Self {
         Self::Conflict(error.to_string())
@@ -274,13 +293,6 @@ impl From<anyhow::Error> for AppError {
             AppError::Internal(msg)
         }
     }
-}
-
-pub(crate) fn is_conflict_error(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("409 conflict")
-        || message.contains("version conflict")
-        || message.contains("rv conflict")
 }
 
 impl IntoResponse for AppError {

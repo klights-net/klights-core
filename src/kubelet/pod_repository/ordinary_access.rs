@@ -446,6 +446,21 @@ impl PodApiMutation for PodRepository {
             .await
         })
     }
+
+    fn bind_pod(&self, request: klights_pod_api::PodBindingRequest) -> PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            super::PodApiPort::bind(
+                self.test_api
+                    .as_deref()
+                    .expect("test bind requires the root Pod API adapter"),
+                &request.namespace,
+                &request.name,
+                request.binding,
+                request.dry_run,
+            )
+            .await
+        })
+    }
 }
 
 impl PodSnapshotQuery for PodRepository {

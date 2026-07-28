@@ -327,6 +327,8 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         is_leader_rx,
     } = args;
     use crate::{api, controllers, kubelet};
+    #[cfg(not(test))]
+    let service_account_signing_key_path = runtime_paths.service_account_signing_key();
     let api_runtime_paths = crate::api::ApiRuntimePaths::from_data_root(config.data_root.clone())
         .context("invalid API runtime path layout")?;
     let api_runtime_inputs =
@@ -452,6 +454,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ));
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
+    #[cfg(not(test))]
+    let namespace_lifecycle_store =
+        crate::api_state_adapter::RootNamespaceTerminationStore::new(db_handle.clone());
+    #[cfg(not(test))]
+    local_api_client.set_namespace_termination(
+        crate::api_state_adapter::RootNamespaceTerminationReconciler::new(
+            namespace_lifecycle_store.clone(),
+            metrics.clone(),
+        ),
+    );
     let side_effects = Arc::new(crate::side_effect_registry_composition::default_registry(
         metrics.clone(),
         Some(services.clone()),
@@ -664,11 +676,32 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             pod_subresource_service.clone(),
         ),
     );
+    let controller_leader_ports = Arc::new(
+        crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
+    );
     let controller_dependencies = crate::controllers::ControllerRuntimeDependencies {
-        leader: Arc::new(
-            crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
-        ),
-        pods: controller_pod_port.clone(),
+        resource_query: controller_leader_ports.clone(),
+        deployment_store: controller_leader_ports.clone(),
+        replicaset_store: controller_leader_ports.clone(),
+        statefulset_store: controller_leader_ports.clone(),
+        daemonset_store: controller_leader_ports.clone(),
+        job_store: controller_leader_ports.clone(),
+        service_store: controller_leader_ports.clone(),
+        pvc_store: controller_leader_ports.clone(),
+        pdb_store: controller_leader_ports.clone(),
+        replicationcontroller_store: controller_leader_ports.clone(),
+        apiservice_store: controller_leader_ports.clone(),
+        csr_status_store: controller_leader_ports,
+        pod_query: api_pod_repository.clone(),
+        pdb_pod_reader: api_pod_repository.clone(),
+        deployment_pod_reader: api_pod_repository.clone(),
+        deployment_pod_mutation: controller_pod_port.clone(),
+        replicaset_pod_mutation: controller_pod_port.clone(),
+        statefulset_pod_mutation: controller_pod_port.clone(),
+        daemonset_pod_mutation: controller_pod_port.clone(),
+        job_pod_mutation: controller_pod_port.clone(),
+        replicationcontroller_pod_mutation: controller_pod_port.clone(),
+        pod_delete_sink: api_pod_repository.clone(),
         reconcile: Arc::new(
             crate::controller_runtime_adapter::RootControllerReconcilePort::new(
                 non_pod_finalization.clone(),
@@ -877,13 +910,23 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cluster_ca_pem.map(std::sync::Arc::new),
         ),
         crate::api::ApiResourceMutationServices {
-            #[cfg(not(test))]
-            db: crate::api_state_adapter::RootApiResourceStore::new(
-                db_handle.clone(),
-                watch_signals.clone(),
-            ),
             #[cfg(test)]
             db: db_handle.clone(),
+            watch_stream: Arc::new(
+                crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                    db_handle.clone(),
+                    watch_signals.clone(),
+                ),
+            ),
+            #[cfg(not(test))]
+            namespace_termination: crate::api_state_adapter::RootNamespaceTerminationStore::new(
+                db_handle.clone(),
+            ),
+            #[cfg(test)]
+            namespace_termination:
+                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(
+                    db_handle.clone(),
+                ),
             resource_query: leader_ports.resource_query.clone(),
             resource_command: local_api_client.clone(),
             finalizer_lifecycle,
@@ -984,6 +1027,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ),
             supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             authority_router.clone(),
         ),
     ));
@@ -1299,7 +1343,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     if leader_lease.is_some() {
         crate::coredns_bootstrap_adapter::bootstrap_coredns(
             db,
+            api_pod_repository.clone(),
             controller_pod_port.clone(),
+            api_pod_repository.clone(),
             &crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(db_handle.clone()),
             controller_coordination.as_ref(),
             crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
@@ -1578,6 +1624,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         )
     });
     #[cfg(not(test))]
+    let api_signing_keys =
+        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::load(
+            &service_account_signing_key_path,
+            supervisor.as_ref(),
+        )
+        .await
+        .context("load root-owned ServiceAccount signing state")?;
+    #[cfg(not(test))]
     let api_router = api::build_router_from_root(
         Arc::new(
             crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
@@ -1594,10 +1648,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         oidc_authenticator,
         webhook_authenticator,
         cluster_ca_pem.map(Arc::new),
-        crate::api_state_adapter::RootApiResourceStore::new(
-            db_handle.clone(),
-            watch_signals.clone(),
+        Arc::new(
+            crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
+                db_handle.clone(),
+                watch_signals.clone(),
+            ),
         ),
+        namespace_lifecycle_store,
         leader_ports.resource_query.clone(),
         local_api_client.clone(),
         finalizer_lifecycle,
@@ -1664,6 +1721,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         api_runtime_inputs,
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
+        api_signing_keys,
         authority_router,
     );
     #[cfg(test)]
@@ -1715,7 +1773,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             );
             crate::replication::grpc::server::mount_service_full_production(
                 api_router,
-                crate::replication::grpc::runtime_adapter::GrpcReplicationRuntimeAdapter::new(rs),
+                crate::replication::grpc::server::GrpcReplicationRuntimePorts::from_shared(
+                    crate::replication::grpc::runtime_adapter::GrpcReplicationRuntimeAdapter::new(
+                        rs,
+                    ),
+                ),
                 grpc_ports,
                 Arc::new(
                     crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(

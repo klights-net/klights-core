@@ -35,8 +35,12 @@ pub type WatchSourceWaitFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 pub type WatchSourceListFuture<'a> = std::pin::Pin<
     Box<
-        dyn std::future::Future<Output = Result<klights_leader_api::ResourceListResult, AppError>>
-            + Send
+        dyn std::future::Future<
+                Output = Result<
+                    klights_leader_api::ResourceListResult,
+                    klights_leader_api::ResourceQueryError,
+                >,
+            > + Send
             + 'a,
     >,
 >;
@@ -700,7 +704,7 @@ pub async fn recv_watch_timeout(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
 }
 
 pub struct LabelSelectorWatchStreamRequest<'a, S: WatchStreamSource> {
-    pub db: S,
+    pub source: S,
     pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub api_version: &'a str,
     pub kind: String,
@@ -783,7 +787,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
     request: LabelSelectorWatchStreamRequest<'_, S>,
 ) -> Body {
     let LabelSelectorWatchStreamRequest {
-        db,
+        source,
         task_supervisor,
         api_version,
         kind,
@@ -799,7 +803,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
         emit_initial_state_for_resource_version_zero,
     } = request;
     let api_version = api_version.to_string();
-    wait_until_datastore_fresh(&db, requested_rv, &api_version, &kind, &task_supervisor).await;
+    wait_until_datastore_fresh(&source, requested_rv, &api_version, &kind, &task_supervisor).await;
 
     let has_selector = label_selector
         .as_deref()
@@ -813,7 +817,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
     let mut last_delivered_rv = requested_rv;
     let mut initial_frames = Vec::new();
     if emit_baseline {
-        let list = match db
+        let list = match source
             .list_watch_resources(
                 &api_version,
                 &kind,
@@ -890,7 +894,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
             ));
         }
     };
-    let mut positioned_stream = match db.watch_resources(watch_request).await {
+    let mut positioned_stream = match source.watch_resources(watch_request).await {
         Ok(stream) => stream,
         Err(error) => {
             return single_watch_frame_body(serialize_positioned_watch_error_for_stream(
@@ -947,7 +951,7 @@ pub async fn build_label_selector_watch_stream<S: WatchStreamSource + 'static>(
                 }
                 Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
                     let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
-                        db: &db,
+                        db: &source,
                         api_version: &api_version,
                         kind: &kind,
                         watch_namespace: watch_namespace.as_deref(),

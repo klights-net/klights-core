@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{PodOwnerListRequest, PodQuery};
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use tracing;
@@ -23,21 +24,25 @@ pub trait DeploymentStore:
     + Send
     + Sync
 {
-    async fn list_replicasets(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn list_replicasets(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
     async fn create_replicaset(
         &self,
         namespace: &str,
         name: &str,
         replicaset: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn patch_replicaset_scale(
         &self,
         namespace: &str,
         name: &str,
         patch: Value,
         expected_uid: String,
-    ) -> Result<Option<Resource>>;
-    async fn update_deployment_status(&self, resource: &Resource, status: Value) -> Result<()>;
+    ) -> ControllerStoreResult<Option<Resource>>;
+    async fn update_deployment_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()>;
 }
 
 #[async_trait]
@@ -47,7 +52,7 @@ pub trait DeploymentPodMutation: Send + Sync {
         namespace: &str,
         name: &str,
         labels: Vec<(String, String)>,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 fn is_rolling_update_strategy(spec: &Value) -> bool {

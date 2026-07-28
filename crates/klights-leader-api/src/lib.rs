@@ -6,6 +6,7 @@ pub use crd_registry::{CrdRegistry, CrdResourceInfo, resource_infos_from_value};
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,22 +19,74 @@ use klights_types::ResourceKey;
 /// Opaque generation fence proving that one operation sampled current
 /// control-plane authority. Consumers must return it to [`LeaderAuthority`]
 /// before performing or completing leader-owned work.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone)]
 pub struct AuthorityPermit {
+    issuer: Arc<AuthorityPermitIssuerIdentity>,
     generation: u64,
 }
 
-impl AuthorityPermit {
-    /// Issue a permit for one adapter-owned authority generation.
-    ///
-    /// Production call sites are restricted to root-composed authority
-    /// adapters; feature owners may only receive and validate permits.
-    pub const fn issue(generation: u64) -> Self {
-        Self { generation }
+struct AuthorityPermitIssuerIdentity;
+
+impl fmt::Debug for AuthorityPermit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorityPermit(<opaque>)")
+    }
+}
+
+impl PartialEq for AuthorityPermit {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.issuer, &other.issuer) && self.generation == other.generation
+    }
+}
+
+impl Eq for AuthorityPermit {}
+
+impl Hash for AuthorityPermit {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.issuer).hash(state);
+        self.generation.hash(state);
+    }
+}
+
+/// Adapter-owned issuer for opaque authority permits.
+///
+/// A permit from another issuer is rejected even when it carries the same
+/// generation, so ordinary consumers cannot manufacture current authority.
+#[derive(Clone)]
+pub struct AuthorityPermitIssuer {
+    identity: Arc<AuthorityPermitIssuerIdentity>,
+}
+
+impl AuthorityPermitIssuer {
+    pub fn new() -> Self {
+        Self {
+            identity: Arc::new(AuthorityPermitIssuerIdentity),
+        }
     }
 
-    pub const fn generation(&self) -> u64 {
-        self.generation
+    pub fn issue(&self, generation: u64) -> AuthorityPermit {
+        AuthorityPermit {
+            issuer: self.identity.clone(),
+            generation,
+        }
+    }
+
+    pub fn validate(
+        &self,
+        permit: &AuthorityPermit,
+        current_generation: u64,
+    ) -> Result<(), AuthorityError> {
+        if Arc::ptr_eq(&self.identity, &permit.issuer) && permit.generation == current_generation {
+            Ok(())
+        } else {
+            Err(AuthorityError::StalePermit)
+        }
+    }
+}
+
+impl Default for AuthorityPermitIssuer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -79,6 +132,46 @@ pub trait LeaderAuthority: Send + Sync {
         &'a self,
         permit: &'a AuthorityPermit,
     ) -> AuthorityRevocationFuture<'a>;
+}
+
+struct AuthorityExecutionScope {
+    authority: Arc<dyn LeaderAuthority>,
+    permit: AuthorityPermit,
+}
+
+tokio::task_local! {
+    static AUTHORITY_EXECUTION_SCOPE: AuthorityExecutionScope;
+}
+
+/// Run one operation with the sampled authority permit attached to its async
+/// execution context. Root-composed effect adapters validate the scope again
+/// immediately before a leader-owned mutation.
+pub async fn scope_authority<F>(
+    authority: Arc<dyn LeaderAuthority>,
+    permit: AuthorityPermit,
+    operation: F,
+) -> F::Output
+where
+    F: Future,
+{
+    AUTHORITY_EXECUTION_SCOPE
+        .scope(AuthorityExecutionScope { authority, permit }, operation)
+        .await
+}
+
+/// Validate the authority attached to the current operation.
+pub fn validate_scoped_authority() -> Result<(), AuthorityError> {
+    AUTHORITY_EXECUTION_SCOPE
+        .try_with(|scope| scope.authority.validate(&scope.permit))
+        .unwrap_or(Err(AuthorityError::NotAuthoritative))
+}
+
+/// Validate current authority when the caller is inside an authority-scoped
+/// operation. Unscoped bootstrap and single-node effects remain unaffected.
+pub fn validate_authority_if_scoped() -> Result<(), AuthorityError> {
+    AUTHORITY_EXECUTION_SCOPE
+        .try_with(|scope| scope.authority.validate(&scope.permit))
+        .unwrap_or(Ok(()))
 }
 
 /// Scope protected by a controller coordination lease.
@@ -168,6 +261,100 @@ pub trait ControllerCoordination: Send + Sync {
         &'a self,
         lease: &'a ControllerLease,
     ) -> ControllerRevocationFuture<'a>;
+}
+
+struct ControllerExecutionScope {
+    coordination: Arc<dyn ControllerCoordination>,
+    lease: ControllerLease,
+}
+
+tokio::task_local! {
+    static CONTROLLER_EXECUTION_SCOPE: ControllerExecutionScope;
+}
+
+/// Run controller work with its opaque coordination lease attached to the
+/// async execution context.
+pub async fn scope_controller_lease<F>(
+    coordination: Arc<dyn ControllerCoordination>,
+    lease: ControllerLease,
+    operation: F,
+) -> F::Output
+where
+    F: Future,
+{
+    CONTROLLER_EXECUTION_SCOPE
+        .scope(
+            ControllerExecutionScope {
+                coordination,
+                lease,
+            },
+            operation,
+        )
+        .await
+}
+
+/// Validate the controller lease attached to the current operation.
+pub fn validate_scoped_controller_lease() -> Result<(), ControllerCoordinationError> {
+    CONTROLLER_EXECUTION_SCOPE
+        .try_with(|scope| scope.coordination.validate(&scope.lease))
+        .unwrap_or(Err(ControllerCoordinationError::Unavailable))
+}
+
+/// Validate a controller lease when the current operation is scoped by the
+/// leader lease loop. Non-controller operations are unaffected.
+pub fn validate_controller_lease_if_scoped() -> Result<(), ControllerCoordinationError> {
+    CONTROLLER_EXECUTION_SCOPE
+        .try_with(|scope| scope.coordination.validate(&scope.lease))
+        .unwrap_or(Ok(()))
+}
+
+/// Backend-neutral description of one durable resource-version advance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PostCommitAdvance {
+    api_version: String,
+    kind: String,
+    namespace: Option<String>,
+    resource_version: i64,
+}
+
+impl PostCommitAdvance {
+    pub fn new(
+        api_version: impl Into<String>,
+        kind: impl Into<String>,
+        namespace: Option<String>,
+        resource_version: i64,
+    ) -> Self {
+        Self {
+            api_version: api_version.into(),
+            kind: kind.into(),
+            namespace,
+            resource_version,
+        }
+    }
+
+    pub fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    pub const fn resource_version(&self) -> i64 {
+        self.resource_version
+    }
+}
+
+/// Nonblocking wakeup capability invoked by root engine composition after a
+/// durable commit. Embedded apply, remote notification transports, and fake
+/// external engines can share this seam without exposing persistence.
+pub trait PostCommitWakeup: Send + Sync {
+    fn wake(&self, advances: &[PostCommitAdvance]);
+    fn wake_namespace_contents(&self, namespace: &str, resource_version: i64);
 }
 
 /// Backend-neutral role projection consumed by kubelet Node registration.
@@ -640,6 +827,15 @@ pub struct ResourceCommandRequest {
 
 impl ResourceCommandRequest {
     pub fn try_new(command: StorageCommand) -> Result<Self, ResourceCommandError> {
+        match &command {
+            StorageCommand::CreateNamespace { name, .. }
+            | StorageCommand::UpdateNamespace { name, .. }
+            | StorageCommand::DeleteNamespace { name } => {
+                validate_command_identity("v1", "Namespace", None, name)?;
+                return Ok(Self { command });
+            }
+            _ => {}
+        }
         let (api_version, kind, namespace, name) = match &command {
             StorageCommand::CreateResource {
                 api_version,
@@ -656,6 +852,13 @@ impl ResourceCommandRequest {
                 ..
             }
             | StorageCommand::PatchResource {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            }
+            | StorageCommand::UpdateStatus {
                 api_version,
                 kind,
                 namespace,

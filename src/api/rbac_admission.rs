@@ -198,24 +198,30 @@ async fn referenced_role_rules(
 ) -> Vec<PolicyRule> {
     let api_version = format!("{RBAC_GROUP}/v1");
     let resource = match ref_kind {
-        "ClusterRole" => state
-            .resource_mutation()
-            .db
-            .get_resource(&api_version, "ClusterRole", None, ref_name)
-            .await
-            .ok()
-            .flatten(),
+        "ClusterRole" => crate::api::resource_query_ports::get_resource(
+            state.resource_mutation().resource_query.as_ref(),
+            &api_version,
+            "ClusterRole",
+            None,
+            ref_name,
+        )
+        .await
+        .ok()
+        .flatten(),
         "Role" => {
             let Some(ns) = binding_namespace else {
                 return Vec::new();
             };
-            state
-                .resource_mutation()
-                .db
-                .get_resource(&api_version, "Role", Some(ns), ref_name)
-                .await
-                .ok()
-                .flatten()
+            crate::api::resource_query_ports::get_resource(
+                state.resource_mutation().resource_query.as_ref(),
+                &api_version,
+                "Role",
+                Some(ns),
+                ref_name,
+            )
+            .await
+            .ok()
+            .flatten()
         }
         _ => None,
     };

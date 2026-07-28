@@ -128,7 +128,6 @@ pub async fn init_certificates(
     let server_key_path = etc_dir.join("server.key");
     let admin_cert_path = etc_dir.join("admin.crt");
     let admin_key_path = etc_dir.join("admin.key");
-    let service_account_signing_key_path = etc_dir.join("service-account-signing.key");
 
     // Load or generate CA
     let ca_cert_exists =
@@ -229,13 +228,6 @@ pub async fn init_certificates(
             std::sync::Arc::new(key),
         )
     };
-
-    ensure_service_account_signing_key(
-        task_supervisor,
-        &service_account_signing_key_path,
-        allow_local_ca_generation,
-    )
-    .await?;
 
     // host_ip supplied by caller — discovered once at bootstrap and
     // shared with NetworkPlane.
@@ -523,93 +515,6 @@ async fn write_file_keyed(
                 std::fs::set_permissions(&path_buf, PermissionsExt::from_mode(0o600))?;
             }
             std::io::Result::Ok(())
-        })
-        .await??;
-    Ok(())
-}
-
-async fn ensure_service_account_signing_key(
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    path: &Path,
-    allow_local_generation: bool,
-) -> Result<()> {
-    let exists = path_exists_keyed(task_supervisor, path, "cert_check_sa_signing_key").await?;
-    if exists {
-        let pem = read_utf8_file_keyed(task_supervisor, path, "cert_read_sa_signing_key").await?;
-        let path_for_validation = path.to_path_buf();
-        task_supervisor
-            .run_blocking(
-                klights_supervisor::TaskCategory::Others,
-                "validate-service-account-signing-key",
-                move || validate_service_account_signing_key(&path_for_validation, &pem),
-            )
-            .await??;
-        set_key_permissions_keyed(task_supervisor, path, "cert_chmod_sa_signing_key").await?;
-        return Ok(());
-    }
-
-    if !allow_local_generation {
-        anyhow::bail!(
-            "ServiceAccount signing key {} is missing; joining controlplanes and replicas must receive it from the leader during CSR bootstrap",
-            path.display()
-        );
-    }
-
-    tracing::info!(
-        path = %path.display(),
-        "Generating dedicated ServiceAccount signing key"
-    );
-    let pem = task_supervisor
-        .run_blocking(
-            klights_supervisor::TaskCategory::Others,
-            "generate-service-account-signing-key",
-            generate_service_account_signing_key_pem,
-        )
-        .await??;
-    write_file_keyed(task_supervisor, path, pem, "cert_write_sa_signing_key").await
-}
-
-fn validate_service_account_signing_key(path: &Path, pem: &str) -> Result<()> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
-
-    if pem.trim().is_empty() {
-        anyhow::bail!(
-            "ServiceAccount signing key {} is invalid: file is empty. delete this file to allow klights leader bootstrap to regenerate it",
-            path.display()
-        );
-    }
-
-    RsaPrivateKey::from_pkcs8_pem(pem)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
-        .map(|_| ())
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "ServiceAccount signing key {} is invalid: {err}. delete this file to allow klights leader bootstrap to regenerate it",
-                path.display()
-            )
-        })
-}
-
-fn generate_service_account_signing_key_pem() -> Result<String> {
-    let private_key = RsaPrivateKey::new(&mut OsRng, 2048)
-        .map_err(|e| anyhow::anyhow!("ServiceAccount RSA key generation failed: {}", e))?;
-    Ok(private_key
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("ServiceAccount PKCS#8 serialization failed: {}", e))?
-        .to_string())
-}
-
-async fn set_key_permissions_keyed(
-    task_supervisor: &klights_supervisor::TaskSupervisor,
-    path: &Path,
-    label: &'static str,
-) -> Result<()> {
-    let path_buf = path.to_path_buf();
-    let key = path.to_string_lossy().into_owned();
-    task_supervisor
-        .run_blocking_file_keyed(label, key, move || {
-            std::fs::set_permissions(&path_buf, PermissionsExt::from_mode(0o600))
         })
         .await??;
     Ok(())
@@ -1521,7 +1426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_certificates_generates_dedicated_service_account_signing_key_for_seed_leader() {
+    async fn root_signing_state_generates_dedicated_key_for_seed_leader() {
         use rsa::pkcs8::DecodePrivateKey;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1547,6 +1452,9 @@ mod tests {
         .unwrap();
 
         let signer_path = etc_dir.join("service-account-signing.key");
+        crate::signing_key_state_adapter::ensure(&signer_path, true, &supervisor)
+            .await
+            .unwrap();
         let signer_pem = std::fs::read_to_string(&signer_path)
             .expect("seed leader bootstrap must generate dedicated SA signing key");
         RsaPrivateKey::from_pkcs8_pem(&signer_pem)
@@ -1560,7 +1468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_certificates_repairs_missing_service_account_signing_key_with_existing_ca() {
+    async fn root_signing_state_repairs_missing_key_with_existing_ca() {
         use rsa::pkcs8::DecodePrivateKey;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1589,6 +1497,13 @@ mod tests {
         .await
         .unwrap();
 
+        crate::signing_key_state_adapter::ensure(
+            &etc_dir.join("service-account-signing.key"),
+            true,
+            &supervisor,
+        )
+        .await
+        .unwrap();
         let signer_pem = std::fs::read_to_string(etc_dir.join("service-account-signing.key"))
             .expect("leader startup must repair a missing dedicated SA signing key");
         RsaPrivateKey::from_pkcs8_pem(&signer_pem)
@@ -1596,7 +1511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_certificates_hard_fails_invalid_existing_service_account_signing_key() {
+    async fn root_signing_state_hard_fails_invalid_existing_key() {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
         std::fs::create_dir_all(&etc_dir).unwrap();
@@ -1607,7 +1522,7 @@ mod tests {
         std::fs::write(&signer_path, "not a private key").unwrap();
 
         let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
-        let err = init_certificates(
+        init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
                 context_name: "klights-sa-signer-invalid-test",
@@ -1623,7 +1538,10 @@ mod tests {
             &supervisor,
         )
         .await
-        .expect_err("invalid existing SA signing key must hard fail");
+        .unwrap();
+        let err = crate::signing_key_state_adapter::ensure(&signer_path, true, &supervisor)
+            .await
+            .expect_err("invalid existing SA signing key must hard fail");
 
         let msg = format!("{err:#}");
         assert!(
@@ -1637,8 +1555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_certificates_requires_downloaded_service_account_signing_key_when_generation_disabled()
-     {
+    async fn root_signing_state_requires_downloaded_key_when_generation_disabled() {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
         std::fs::create_dir_all(&etc_dir).unwrap();
@@ -1648,7 +1565,7 @@ mod tests {
         let signer_path = etc_dir.join("service-account-signing.key");
 
         let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
-        let err = init_certificates(
+        init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
                 context_name: "klights-sa-signer-joiner-test",
@@ -1664,7 +1581,10 @@ mod tests {
             &supervisor,
         )
         .await
-        .expect_err("joining controlplanes must receive the SA signer from the leader");
+        .unwrap();
+        let err = crate::signing_key_state_adapter::ensure(&signer_path, false, &supervisor)
+            .await
+            .expect_err("joining controlplanes must receive the SA signer from the leader");
 
         let msg = format!("{err:#}");
         assert!(

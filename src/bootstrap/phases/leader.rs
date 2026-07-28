@@ -93,15 +93,22 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
             klights_supervisor::TaskCategory::Background,
             "runtime_leader_controller_lease_loop",
             async move {
+                let scoped_coordination = coordination.clone();
                 crate::leader_election::run_under_lease(
                     coordination,
                     ControllerScope::Cluster,
                     shutdown_token,
-                    move |_scope, lease_cancel| {
+                    move |_scope, lease, lease_cancel| {
                         let leader_context = leader_context.clone();
+                        let coordination = scoped_coordination.clone();
                         async move {
-                            if let Err(err) =
-                                start_leader_scoped_tasks(leader_context, lease_cancel).await
+                            if let Err(err) = start_leader_scoped_tasks(
+                                leader_context,
+                                coordination,
+                                lease,
+                                lease_cancel,
+                            )
+                            .await
                             {
                                 tracing::warn!("leader-scoped controller startup failed: {err:#}");
                             }
@@ -187,6 +194,8 @@ mod tests {
 
 async fn start_leader_scoped_tasks(
     context: LeaderScopedTaskContext,
+    coordination: Arc<dyn ControllerCoordination>,
+    lease: klights_leader_api::ControllerLease,
     lease_cancel: CancellationToken,
 ) -> Result<()> {
     let LeaderScopedTaskContext {
@@ -221,13 +230,15 @@ async fn start_leader_scoped_tasks(
     }
     let wls = scheduler.clone();
     let wlc = lease_cancel.child_token();
+    let cron_coordination = coordination.clone();
+    let cron_lease = lease.clone();
     if let Err(err) = task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Background,
             "runtime_cronjob_scheduler_watch",
-            async move {
+            klights_leader_api::scope_controller_lease(cron_coordination, cron_lease, async move {
                 wls.run_watch_loop(wlc).await;
-            },
+            }),
         )
         .await
     {
@@ -240,17 +251,23 @@ async fn start_leader_scoped_tasks(
     #[cfg(test)]
     let nn = config.node_name.clone();
     let c = lease_cancel.child_token();
+    let worker_coordination = coordination.clone();
+    let worker_lease = lease.clone();
     if let Err(e) = task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Background,
             "runtime_controller_workqueue_worker",
-            async move {
-                #[cfg(test)]
-                d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, dhw, nn, c)
-                    .await;
-                #[cfg(not(test))]
-                d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, c).await;
-            },
+            klights_leader_api::scope_controller_lease(
+                worker_coordination,
+                worker_lease,
+                async move {
+                    #[cfg(test)]
+                    d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, dhw, nn, c)
+                        .await;
+                    #[cfg(not(test))]
+                    d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, c).await;
+                },
+            ),
         )
         .await
     {
@@ -269,17 +286,23 @@ async fn start_leader_scoped_tasks(
         ),
     );
     let scheduler_cancel = lease_cancel.child_token();
+    let scheduler_coordination = coordination.clone();
+    let scheduler_lease = lease.clone();
     if let Err(e) = task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Background,
             "runtime_scheduler_controller",
-            async move {
-                crate::controllers::scheduler::run_scheduler_watch(
-                    scheduler_runtime,
-                    scheduler_cancel,
-                )
-                .await;
-            },
+            klights_leader_api::scope_controller_lease(
+                scheduler_coordination,
+                scheduler_lease,
+                async move {
+                    crate::controllers::scheduler::run_scheduler_watch(
+                        scheduler_runtime,
+                        scheduler_cancel,
+                    )
+                    .await;
+                },
+            ),
         )
         .await
     {
@@ -305,13 +328,15 @@ async fn start_leader_scoped_tasks(
 
     let cancel = lease_cancel.child_token();
     let ts = task_supervisor.clone();
+    let gc_coordination = coordination;
+    let gc_lease = lease;
     if let Err(e) = task_supervisor
         .spawn_async(
             klights_supervisor::TaskCategory::Background,
             "runtime_gc_scheduler",
-            async move {
+            klights_leader_api::scope_controller_lease(gc_coordination, gc_lease, async move {
                 sched.run(ts, cancel).await;
-            },
+            }),
         )
         .await
     {
@@ -326,11 +351,17 @@ async fn reconcile_kubernetes_service_for_leader(
     db_handle: &DatastoreHandle,
     datapath: &dyn klights_network_api::Datapath,
 ) -> Result<()> {
+    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+        anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
+    })?;
     crate::controllers::kube_service::bootstrap_default_service_cidr(
         db_handle.as_ref(),
         &config.service_cidr,
     )
     .await?;
+    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+        anyhow::anyhow!("controller authority rejected Service bootstrap: {error}")
+    })?;
     crate::controllers::kube_service::bootstrap_kubernetes_service(
         db_handle.as_ref(),
         &config.service_cidr,

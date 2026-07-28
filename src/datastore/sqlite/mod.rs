@@ -56,14 +56,18 @@ impl std::fmt::Debug for Datastore {
 
 // Re-export types and trait surface so `use super::*;` in submodules picks
 // them up the same way the legacy `db/mod.rs` exposed them.
+#[cfg(test)]
+pub use super::backend::CommitObservationSink;
 pub use super::backend::{
-    CommitObservationSink, DatastoreBackend, DatastoreHandle, NamespaceStore, OutboxResponseCodec,
-    ResourceStore, WatchStore,
+    DatastoreBackend, DatastoreHandle, NamespaceStore, OutboxResponseCodec, ResourceStore,
+    WatchStore,
 };
+#[cfg(test)]
+pub use super::types::CommitObservation;
 pub use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, CommitObservation,
-    DurableAllocatorObservation, ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent,
-    PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
+    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
+    ListPageRequest, NodeSubnet, PendingWatchEvent, PodCleanupIntent, PodEndpointEvent,
+    PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
     PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult, PodSlotMutationResult,
     PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplay, PositionedWatchReplayRead,
     RawWatchEvent, ReplicatedCreateOptions, ReplicatedMembershipState, ReplicatedSnapshotMetadata,
@@ -86,6 +90,7 @@ struct AppliedOutboxLedgerInput<'a> {
 use crate::sqlite_boundary::DbExecutor;
 use crate::sqlite_open as opener;
 pub use watch::create_pending_watch_event;
+#[cfg(test)]
 pub use watch::publish_pending;
 
 use crate::datastore::pod_serviceaccount::{
@@ -153,6 +158,7 @@ struct ResourceMutationPauseRegistration {
 pub struct Datastore {
     executor: DbExecutor,
     read_executor: DbExecutor,
+    #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
@@ -1815,7 +1821,7 @@ impl Datastore {
         // Build + apply in one IMMEDIATE transaction. The builder authors only
         // an RV-zero template; committed apply allocates the public RV in the
         // same transaction that writes the rows.
-        let pending = self
+        let _pending = self
             .db_call("db_apply_resource_batch", move |conn| {
                 let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1835,7 +1841,8 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("apply resource batch failed: {e}"))?;
-        self.publish_watch_events(pending);
+        #[cfg(test)]
+        self.publish_watch_events(_pending);
         Ok(())
     }
 
@@ -1856,7 +1863,7 @@ impl Datastore {
         };
         let authoring_node = node_name.to_string();
         let outbox_codec = self.outbox_codec.clone();
-        let pending = self
+        let _pending = self
             .db_call("db_move_pod_to_cleanup_intent", move |conn| {
                 let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1876,7 +1883,8 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("move pod to cleanup intent failed: {e}"))?;
-        self.publish_watch_events(pending);
+        #[cfg(test)]
+        self.publish_watch_events(_pending);
         Ok(())
     }
 
@@ -1950,7 +1958,7 @@ impl Datastore {
     ) -> Result<()> {
         let authoring_node = authoring_node.to_string();
         let outbox_codec = self.outbox_codec.clone();
-        let pending = self
+        let _pending = self
             .db_call("db_apply_cluster_maintenance_command", move |conn| {
                 let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1970,7 +1978,8 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("apply cluster maintenance command failed: {e}"))?;
-        self.publish_watch_events(pending);
+        #[cfg(test)]
+        self.publish_watch_events(_pending);
         Ok(())
     }
 
@@ -2537,8 +2546,9 @@ impl Datastore {
                 pod_endpoint_effect,
                 committed_resource,
             } => {
-                if let Some(pending) = pending {
-                    self.publish_watch_event(pending);
+                if let Some(_pending) = pending {
+                    #[cfg(test)]
+                    self.publish_watch_event(_pending);
                 }
                 Ok(crate::datastore::CommittedOutboxApply::new(
                     klights_cluster_core::OutboxApplyOutcome::Applied { applied_rv },
@@ -3420,7 +3430,7 @@ impl Datastore {
         executor: DbExecutor,
         read_executor: DbExecutor,
         snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
-        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
@@ -3429,6 +3439,7 @@ impl Datastore {
         Ok(Self {
             executor,
             read_executor,
+            #[cfg(test)]
             commit_sink,
             outbox_codec,
             pod_endpoint_tx,
@@ -3450,7 +3461,7 @@ impl Datastore {
 
     async fn from_executor(
         executor: DbExecutor,
-        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
         let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
@@ -3461,6 +3472,7 @@ impl Datastore {
             executor,
             read_executor,
             snapshot_factory,
+            #[cfg(test)]
             commit_sink,
             outbox_codec,
         )
@@ -3477,7 +3489,7 @@ impl Datastore {
         cluster_db_path: &std::path::Path,
         supervisor: std::sync::Arc<TaskSupervisor>,
         key_file: Option<&std::path::Path>,
-        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
         let db_path = cluster_db_path.to_path_buf();
@@ -3518,6 +3530,7 @@ impl Datastore {
             executor,
             read_executor,
             Some(snapshot_factory),
+            #[cfg(test)]
             commit_sink,
             outbox_codec,
         )
@@ -3594,10 +3607,16 @@ impl Datastore {
     /// `DbExecutor` is already available (in-memory or persistent).
     pub async fn new_in_memory_with_watch_and_executor_with_sink(
         executor: DbExecutor,
-        commit_sink: std::sync::Arc<dyn CommitObservationSink>,
+        #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     ) -> Result<Self> {
-        Self::from_executor(executor, commit_sink, outbox_codec).await
+        Self::from_executor(
+            executor,
+            #[cfg(test)]
+            commit_sink,
+            outbox_codec,
+        )
+        .await
     }
 
     #[cfg(test)]

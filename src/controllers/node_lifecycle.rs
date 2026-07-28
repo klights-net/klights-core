@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use klights_cluster_core::{Resource, ResourcePreconditions, StorageCommand};
 use klights_leader_api::{ResourceEvent, WatchEventType};
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 
 #[cfg(test)]
@@ -20,19 +21,26 @@ const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
 
 #[async_trait]
 pub trait NodeLifecycleStore: Send + Sync {
-    async fn list_nodes(&self) -> Result<Vec<Resource>>;
-    async fn list_node_leases(&self) -> Result<Vec<Resource>>;
+    async fn list_nodes(&self) -> ControllerStoreResult<Vec<Resource>>;
+    async fn list_node_leases(&self) -> ControllerStoreResult<Vec<Resource>>;
 }
 
 #[async_trait]
 pub trait NodeLifecyclePodStore: Send + Sync {
-    async fn list_pods_bound_to_node(&self, node_name: &str) -> Result<Vec<Resource>>;
-    async fn replace_pod_status_for_uid(&self, pod: &Resource, status: Value) -> Result<Resource>;
+    async fn list_pods_bound_to_node(
+        &self,
+        node_name: &str,
+    ) -> ControllerStoreResult<Vec<Resource>>;
+    async fn replace_pod_status_for_uid(
+        &self,
+        pod: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<Resource>;
 }
 
 #[async_trait]
 pub trait NodeLostPodLifecycleSink: Send + Sync {
-    async fn enqueue_node_lost_cleanup(&self, pod: Resource) -> Result<()>;
+    async fn enqueue_node_lost_cleanup(&self, pod: Resource) -> ControllerStoreResult<()>;
 }
 
 #[cfg(test)]

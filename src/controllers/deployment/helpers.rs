@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -9,12 +10,12 @@ pub trait DeploymentPodReader: Send + Sync {
         &self,
         namespace: &str,
         owner_uid: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>>;
+    ) -> ControllerStoreResult<Vec<klights_cluster_core::Resource>>;
 
     async fn list_namespace_pods(
         &self,
         namespace: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>>;
+    ) -> ControllerStoreResult<Vec<klights_cluster_core::Resource>>;
 }
 
 /// Compute a deterministic pod-template-hash from the pod template spec.

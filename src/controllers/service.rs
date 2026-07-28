@@ -1,22 +1,29 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 #[async_trait]
 pub trait ServiceReconcileStore: Send + Sync {
-    async fn list_services(&self) -> Result<Vec<Resource>>;
-    async fn get_service(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn list_services(&self) -> ControllerStoreResult<Vec<Resource>>;
+    async fn get_service(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn update_service(
         &self,
         namespace: &str,
         name: &str,
         data: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
-    fn service_store_error_is_conflict(&self, error: &anyhow::Error) -> bool;
+    ) -> ControllerStoreResult<Resource>;
+    fn service_store_error_is_conflict(&self, error: &ControllerStoreError) -> bool {
+        error.is_conflict()
+    }
 }
 
 pub trait ServiceControllerStore:
@@ -616,7 +623,10 @@ pub async fn reconcile_service_with_nodeport(
                 return Ok(service.clone());
             }
             Err(err) if attempt + 1 < SERVICE_ALLOC_MAX_ATTEMPTS => {
-                if db.service_store_error_is_conflict(&err) {
+                if err
+                    .downcast_ref::<ControllerStoreError>()
+                    .is_some_and(ControllerStoreError::is_conflict)
+                {
                     // Transient RV race: `allocate_service_fields_for_api_write`
                     // re-reads fresh Service state (current RV) on the next
                     // attempt, so retry immediately without a delay (matches
@@ -772,7 +782,7 @@ pub async fn allocate_service_fields_for_api_write(
             Ok(updated) => (updated.data, updated.resource_version),
             Err(err) => {
                 pending.release(service_ipam, nodeport_alloc);
-                return Err(err);
+                return Err(err.into());
             }
         }
     } else {

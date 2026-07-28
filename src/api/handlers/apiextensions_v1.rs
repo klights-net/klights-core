@@ -72,13 +72,30 @@ pub async fn delete_custom_resources_for_crd(
     let mut targets = Vec::<(String, Option<String>, String)>::new();
     for version in &versions {
         let api_version = format!("{group}/{version}");
-        let keys = state
+        let target = if namespaced {
+            crate::api::custom_resource_ports::CustomResourceWatchTarget::namespaced(
+                &api_version,
+                kind,
+            )
+        } else {
+            crate::api::custom_resource_ports::CustomResourceWatchTarget::cluster(
+                &api_version,
+                kind,
+            )
+        };
+        let resources = state
             .resource_mutation()
-            .db
-            .list_resource_keys_for_scope(api_version.clone(), kind.to_string(), namespaced)
+            .custom_resource_reads
+            .list_resources_for_watch_targets(vec![target], None)
             .await?;
-        for (namespace, name) in keys {
-            targets.push((api_version.clone(), namespace, name));
+        for resource in resources.into_items() {
+            if namespaced == resource.namespace.is_some() {
+                targets.push((
+                    api_version.clone(),
+                    resource.namespace.clone(),
+                    resource.name.clone(),
+                ));
+            }
         }
     }
     targets.sort_by(|a, b| {
@@ -89,11 +106,15 @@ pub async fn delete_custom_resources_for_crd(
     targets.dedup();
 
     for (api_version, namespace, name) in targets {
-        state
-            .resource_mutation()
-            .db
-            .delete_resource(&api_version, kind, namespace.as_deref(), &name)
-            .await?;
+        crate::api::resource_command_ports::delete_non_pod_resource(
+            state.resource_mutation().resource_command.as_ref(),
+            &api_version,
+            kind,
+            namespace.as_deref(),
+            &name,
+            klights_cluster_core::ResourcePreconditions::default(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -103,17 +124,15 @@ pub async fn delete_crd_with_deregistration(
     Path(name): Path<String>,
     Query(query): Query<CreateUpdateQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let resource = state
-        .resource_mutation()
-        .db
-        .get_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
 
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
     if dry_run.is_all() {
@@ -157,30 +176,27 @@ pub async fn delete_crd_with_deregistration(
             serde_json::Value::String(crate::utils::k8s_timestamp()),
         );
     }
-    let _ = state
-        .resource_mutation()
-        .db
-        .update_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-            del_data,
-            resource.resource_version,
-        )
-        .await;
+    let _ = crate::api::resource_command_ports::update_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+        del_data,
+        resource.resource_version,
+    )
+    .await;
 
     // hard-delete
-    state
-        .resource_mutation()
-        .db
-        .delete_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-        )
-        .await?;
+    crate::api::resource_command_ports::delete_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+        klights_cluster_core::ResourcePreconditions::default(),
+    )
+    .await?;
 
     Ok(Json(std::sync::Arc::unwrap_or_clone(resource.data)))
 }
@@ -229,16 +245,15 @@ pub async fn delete_collection_customresourcedefinitions(
             }
         }
         delete_custom_resources_for_crd(&state, &resource.data).await?;
-        let _ = state
-            .resource_mutation()
-            .db
-            .delete_resource(
-                "apiextensions.k8s.io/v1",
-                "CustomResourceDefinition",
-                None,
-                &resource.name.clone(),
-            )
-            .await;
+        let _ = crate::api::resource_command_ports::delete_non_pod_resource(
+            state.resource_mutation().resource_command.as_ref(),
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            &resource.name,
+            klights_cluster_core::ResourcePreconditions::default(),
+        )
+        .await;
     }
     Ok(Json(
         crate::api::mutation::response::delete_collection_success_status(),
@@ -432,17 +447,15 @@ async fn create_crd_with_registration(
     // Create the CRD first WITHOUT the Established condition (matches real K8s behavior).
     // Real K8s creates the CRD first, then the CRD controller updates status,
     // causing a MODIFIED event. Tests watch for this MODIFIED event.
-    let resource = state
-        .resource_mutation()
-        .db
-        .create_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-            admitted.clone(),
-        )
-        .await?;
+    let resource = crate::api::resource_command_ports::create_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+        admitted.clone(),
+    )
+    .await?;
 
     // Register the CRD in the registry immediately (so API routes are ready)
     let body_with_status = add_crd_established_condition(body.clone());
@@ -459,23 +472,21 @@ async fn create_crd_with_registration(
     // This mimics the K8s CRD controller updating the status after creation.
     // Return the latest RV in the create response so watch catch-up from this RV
     // does not replay this intermediate MODIFIED event before DELETE.
-    let updated = state
-        .resource_mutation()
-        .db
-        .update_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-            body_with_status,
-            resource.resource_version,
-        )
-        .await;
+    let updated = crate::api::resource_command_ports::update_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+        body_with_status,
+        resource.resource_version,
+    )
+    .await;
 
     let response_resource = match updated {
         Ok(updated) => updated,
         Err(e) => {
-            tracing::warn!("Failed to set CRD Established status after create: {}", e);
+            tracing::warn!("Failed to set CRD Established status after create: {:?}", e);
             resource
         }
     };
@@ -489,17 +500,15 @@ async fn update_crd_with_registration(
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(mut body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let current = state
-        .resource_mutation()
-        .db
-        .get_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
+    let current = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
 
     // Validate api-approved.kubernetes.io annotation for protected groups
     let group = body
@@ -588,18 +597,16 @@ async fn update_crd_with_registration(
         status.insert("storedVersions".to_string(), merged);
     }
 
-    let resource = state
-        .resource_mutation()
-        .db
-        .update_resource(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            &name,
-            body.clone(),
-            current.resource_version,
-        )
-        .await?;
+    let resource = crate::api::resource_command_ports::update_non_pod_resource(
+        state.resource_mutation().resource_command.as_ref(),
+        "apiextensions.k8s.io/v1",
+        "CustomResourceDefinition",
+        None,
+        &name,
+        body.clone(),
+        current.resource_version,
+    )
+    .await?;
 
     // Re-register with new spec
     if let Err(e) = crate::api::discovery::register_crd_from_value(
@@ -638,17 +645,15 @@ async fn patch_crd_with_registration(
 
     // Server-side apply PATCH is create-or-update for CRDs.
     if content_type == Some("application/apply-patch+yaml") {
-        let exists = state
-            .resource_mutation()
-            .db
-            .get_resource(
-                "apiextensions.k8s.io/v1",
-                "CustomResourceDefinition",
-                None,
-                &name,
-            )
-            .await?
-            .is_some();
+        let exists = crate::api::resource_query_ports::get_resource(
+            state.resource_mutation().resource_query.as_ref(),
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            &name,
+        )
+        .await?
+        .is_some();
         if !exists {
             let mut create_body = patch.clone();
             if create_body.get("metadata").is_none_or(|v| !v.is_object()) {
@@ -683,17 +688,15 @@ async fn patch_crd_with_registration(
                 return Ok(Json(admitted));
             }
 
-            let resource = state
-                .resource_mutation()
-                .db
-                .create_resource(
-                    "apiextensions.k8s.io/v1",
-                    "CustomResourceDefinition",
-                    None,
-                    &name,
-                    admitted.clone(),
-                )
-                .await?;
+            let resource = crate::api::resource_command_ports::create_non_pod_resource(
+                state.resource_mutation().resource_command.as_ref(),
+                "apiextensions.k8s.io/v1",
+                "CustomResourceDefinition",
+                None,
+                &name,
+                admitted.clone(),
+            )
+            .await?;
 
             let body_with_status = add_crd_established_condition(admitted);
             if let Err(e) = crate::api::discovery::register_crd_from_value(
@@ -705,10 +708,9 @@ async fn patch_crd_with_registration(
                 tracing::error!("Failed to register CRD from apply PATCH create: {}", e);
             }
 
-            let response_resource = match state
-                .resource_mutation()
-                .db
-                .update_resource(
+            let response_resource =
+                match crate::api::resource_command_ports::update_non_pod_resource(
+                    state.resource_mutation().resource_command.as_ref(),
                     "apiextensions.k8s.io/v1",
                     "CustomResourceDefinition",
                     None,
@@ -717,16 +719,16 @@ async fn patch_crd_with_registration(
                     resource.resource_version,
                 )
                 .await
-            {
-                Ok(updated) => updated,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to set CRD Established status after apply PATCH create: {}",
-                        e
-                    );
-                    resource
-                }
-            };
+                {
+                    Ok(updated) => updated,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to set CRD Established status after apply PATCH create: {:?}",
+                            e
+                        );
+                        resource
+                    }
+                };
             let data =
                 inject_resource_version(response_resource.data, response_resource.resource_version);
             return Ok(Json(data));
@@ -735,17 +737,15 @@ async fn patch_crd_with_registration(
 
     let max_retries = 5;
     for attempt in 0..max_retries {
-        let current = state
-            .resource_mutation()
-            .db
-            .get_resource(
-                "apiextensions.k8s.io/v1",
-                "CustomResourceDefinition",
-                None,
-                &name,
-            )
-            .await?
-            .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
+        let current = crate::api::resource_query_ports::get_resource(
+            state.resource_mutation().resource_query.as_ref(),
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            &name,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
 
         let patched = apply_patch(&current.data, &patch, content_type)?;
         let patched = run_admission_for_request(
@@ -769,18 +769,16 @@ async fn patch_crd_with_registration(
             return Ok(Json(patched));
         }
 
-        match state
-            .resource_mutation()
-            .db
-            .update_resource(
-                "apiextensions.k8s.io/v1",
-                "CustomResourceDefinition",
-                None,
-                &name,
-                patched.clone(),
-                current.resource_version,
-            )
-            .await
+        match crate::api::resource_command_ports::update_non_pod_resource(
+            state.resource_mutation().resource_command.as_ref(),
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            &name,
+            patched.clone(),
+            current.resource_version,
+        )
+        .await
         {
             Ok(resource) => {
                 // Remove old versions from registry
@@ -820,7 +818,7 @@ async fn patch_crd_with_registration(
                 }
                 return Ok(Json(std::sync::Arc::unwrap_or_clone(resource.data)));
             }
-            Err(e) if attempt < max_retries - 1 && crate::api::errors::is_conflict_error(&e) => {
+            Err(AppError::Conflict(_)) if attempt < max_retries - 1 => {
                 tracing::debug!(
                     "PATCH CRD {}: conflict on attempt {}, retrying",
                     name,
@@ -828,7 +826,7 @@ async fn patch_crd_with_registration(
                 );
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
 

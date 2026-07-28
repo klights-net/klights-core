@@ -2,14 +2,22 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_pod_api::{PodGetRequest, PodOwnerListRequest, PodQuery};
-use klights_reconcile_api::compute_statefulset_update_revision;
+use klights_reconcile_api::{ControllerStoreResult, compute_statefulset_update_revision};
 use serde_json::{Value, json};
 
 #[async_trait]
 pub trait StatefulSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
-    async fn get_statefulset(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn get_statefulset(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
 
-    async fn update_statefulset_status(&self, resource: &Resource, status: Value) -> Result<()>;
+    async fn update_statefulset_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()>;
 }
 
 #[async_trait]
@@ -20,7 +28,7 @@ pub trait StatefulSetPodMutation: Send + Sync {
         name: &str,
         node_name: &str,
         pod: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 fn derive_current_revision_from_pods(

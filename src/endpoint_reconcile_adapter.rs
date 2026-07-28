@@ -1,8 +1,9 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditions};
+use klights_reconcile_api::ControllerStoreResult as Result;
 use serde_json::Value;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::endpoints::EndpointReconcileStore;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 
@@ -12,7 +13,11 @@ where
     T: DatastoreBackend + Send + Sync + ?Sized,
 {
     async fn endpoint_namespace_is_terminating(&self, namespace: &str) -> Result<bool> {
-        let Some(resource) = self.get_namespace(namespace).await? else {
+        let Some(resource) = self
+            .get_namespace(namespace)
+            .await
+            .map_err(map_controller_store_error)?
+        else {
             return Ok(false);
         };
         Ok(resource
@@ -29,7 +34,9 @@ where
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, api_version, kind, namespace, name).await
+        DatastoreBackend::get_resource(self, api_version, kind, namespace, name)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn list_service_endpoint_slices(
@@ -49,7 +56,8 @@ where
                     None,
                 ),
             )
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
@@ -61,7 +69,9 @@ where
         name: &str,
         data: Value,
     ) -> Result<Resource> {
-        DatastoreBackend::create_resource(self, api_version, kind, namespace, name, data).await
+        DatastoreBackend::create_resource(self, api_version, kind, namespace, name, data)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_resource_with_preconditions(
@@ -83,6 +93,7 @@ where
             preconditions,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
     async fn delete_resource_with_preconditions(
@@ -102,17 +113,12 @@ where
             preconditions,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
-        DatastoreBackend::apply_resource_batch(self, operations).await
-    }
-
-    fn endpoint_store_error_is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::datastore::errors::is_conflict_error(error)
-    }
-
-    fn endpoint_store_error_is_already_exists(&self, error: &anyhow::Error) -> bool {
-        crate::datastore::errors::is_conflict_error(error) || error.to_string().contains("exists")
+        DatastoreBackend::apply_resource_batch(self, operations)
+            .await
+            .map_err(map_controller_store_error)
     }
 }

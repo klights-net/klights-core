@@ -38,48 +38,39 @@ impl ApiAuthResources<'_> {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<String>, AuthenticationError> {
-        self.state
-            .resource_mutation()
-            .db
-            .get_resource(api_version, kind, namespace, name)
-            .await
-            .map_err(|error| {
-                AuthenticationError::dependency_failure(format!(
-                    "credential subject lookup failed: {error}"
-                ))
+        crate::api::resource_query_ports::get_resource(
+            self.state.resource_mutation().resource_query.as_ref(),
+            api_version,
+            kind,
+            namespace,
+            name,
+        )
+        .await
+        .map_err(|error| {
+            AuthenticationError::dependency_failure(format!(
+                "credential subject lookup failed: {error:?}"
+            ))
+        })
+        .map(|resource| {
+            resource.and_then(|resource| {
+                resource
+                    .data
+                    .pointer("/metadata/uid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
             })
-            .map(|resource| {
-                resource.and_then(|resource| {
-                    resource
-                        .data
-                        .pointer("/metadata/uid")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-            })
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl ServiceAccountSigningKeyProvider for ApiAuthResources<'_> {
     async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
-        let signing_key_path = &self
-            .state
+        self.state
             .operational()
-            .config
-            .runtime
-            .paths
-            .service_account_signing_key;
-        crate::auth::read_service_account_signing_key_supervised(
-            signing_key_path,
-            self.state.operational().task_supervisor.as_ref(),
-        )
-        .await
-        .map_err(|error| {
-            AuthenticationError::dependency_failure(format!(
-                "serviceaccount signing key unavailable: {error}"
-            ))
-        })
+            .signing_keys
+            .service_account_signing_key_pem()
+            .await
     }
 }
 

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::crd::{CrdRegistryReader, CrdRegistryRuntime, CrdRegistryWatchSession};
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
@@ -17,7 +17,9 @@ impl<T> CrdRegistryReader for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn list_crd_values(&self) -> Result<Vec<serde_json::Value>> {
+    async fn list_crd_values(
+        &self,
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<serde_json::Value>> {
         self.list_resources(
             "apiextensions.k8s.io/v1",
             "CustomResourceDefinition",
@@ -32,12 +34,15 @@ where
                 .map(|resource| Arc::unwrap_or_clone(resource.data))
                 .collect()
         })
+        .map_err(map_controller_store_error)
     }
 }
 
 #[async_trait]
 impl CrdRegistryReader for LeaderCrdRegistryRuntime {
-    async fn list_crd_values(&self) -> Result<Vec<serde_json::Value>> {
+    async fn list_crd_values(
+        &self,
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<serde_json::Value>> {
         CrdRegistryReader::list_crd_values(self.db.as_ref()).await
     }
 }

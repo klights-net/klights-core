@@ -2,13 +2,19 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 use std::time::Duration;
 
 #[async_trait]
 pub trait JobStore: crate::controllers::gc::GcResourceStore + Send + Sync {
-    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
-    async fn update_job_status(&self, resource: &Resource, status: Value) -> Result<Resource>;
+    async fn get_job(&self, namespace: &str, name: &str)
+    -> ControllerStoreResult<Option<Resource>>;
+    async fn update_job_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<Resource>;
 }
 
 #[async_trait]
@@ -19,13 +25,13 @@ pub trait JobPodMutation: Send + Sync {
         name: &str,
         node_name: &str,
         pod: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn replace_job_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
         owner_references: Vec<Value>,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 /// Parse a succeededIndexes string like "0,2,4-6" into a set of individual indexes.
@@ -233,6 +239,7 @@ async fn mark_job_foreground_deleting(
         ResourcePreconditions::from_resource(resource),
     )
     .await
+    .map_err(Into::into)
 }
 
 async fn delete_finished_job_for_ttl(

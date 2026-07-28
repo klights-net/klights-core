@@ -178,7 +178,7 @@ impl Datastore {
         match result {
             Ok(DeleteAttempt::Deleted(rv, data_bytes)) => {
                 if let Ok(data) = serde_json::from_slice::<Value>(&data_bytes) {
-                    let pending = create_pending_watch_event(
+                    let _pending = create_pending_watch_event(
                         api_version,
                         kind,
                         namespace,
@@ -187,7 +187,8 @@ impl Datastore {
                         "DELETED",
                         data,
                     );
-                    self.publish_watch_event(pending);
+                    #[cfg(test)]
+                    self.publish_watch_event(_pending);
                 }
                 Ok(rv)
             }

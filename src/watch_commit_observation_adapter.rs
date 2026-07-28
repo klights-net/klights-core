@@ -1,25 +1,40 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::datastore::{CommitObservation, CommitObservationSink};
 #[cfg(test)]
 use crate::watch::WatchBus;
 
 pub(crate) struct WatchCommitWiring {
+    #[cfg(test)]
     pub(crate) sink: Arc<dyn CommitObservationSink>,
     pub(crate) signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    pub(crate) wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
 }
 
 pub(crate) fn new_wiring() -> WatchCommitWiring {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
-    let sink = Arc::new(WatchCommitObservationSink::new(hub.clone(), hub.clone()));
-    WatchCommitWiring { sink, signals: hub }
+    let wakeups: Arc<dyn klights_leader_api::PostCommitWakeup> =
+        Arc::new(WatchPostCommitWakeup::new(hub.clone()));
+    WatchCommitWiring {
+        #[cfg(test)]
+        sink: Arc::new(WatchCommitObservationSink::new(
+            wakeups.clone(),
+            hub.clone(),
+        )),
+        signals: hub,
+        wakeups,
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn new_sink() -> Arc<WatchCommitObservationSink> {
     let hub = Arc::new(klights_watch::WatchSignalHub::new(1024));
-    Arc::new(WatchCommitObservationSink::new(hub.clone(), hub))
+    Arc::new(WatchCommitObservationSink::new(
+        Arc::new(WatchPostCommitWakeup::new(hub.clone())),
+        hub,
+    ))
 }
 
 #[cfg(test)]
@@ -60,23 +75,25 @@ pub(crate) fn subscribe_from_sink(
         .subscribe(topic)
 }
 
+#[cfg(test)]
 pub(crate) struct WatchCommitObservationSink {
-    publisher: Arc<dyn klights_watch::WatchSignalPublish>,
+    wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
     #[cfg(test)]
     signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     #[cfg(test)]
     bus: WatchBus,
 }
 
+#[cfg(test)]
 impl WatchCommitObservationSink {
     fn new(
-        publisher: Arc<dyn klights_watch::WatchSignalPublish>,
+        wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
         signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     ) -> Self {
         #[cfg(not(test))]
         let _ = signals;
         Self {
-            publisher,
+            wakeups,
             #[cfg(test)]
             signals,
             #[cfg(test)]
@@ -90,22 +107,59 @@ impl WatchCommitObservationSink {
     }
 }
 
+#[cfg(test)]
 impl CommitObservationSink for WatchCommitObservationSink {
     fn observe(&self, observations: &[CommitObservation]) {
+        let advances = observations
+            .iter()
+            .map(|observation| {
+                klights_leader_api::PostCommitAdvance::new(
+                    &observation.api_version,
+                    &observation.kind,
+                    observation.namespace.clone(),
+                    observation.resource_version,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.wakeups.wake(&advances);
+    }
+
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+pub(crate) struct WatchPostCommitWakeup {
+    publisher: Arc<klights_watch::WatchSignalHub>,
+}
+
+impl WatchPostCommitWakeup {
+    fn new(publisher: Arc<klights_watch::WatchSignalHub>) -> Self {
+        Self { publisher }
+    }
+}
+
+impl klights_leader_api::PostCommitWakeup for WatchPostCommitWakeup {
+    fn wake(&self, observations: &[klights_leader_api::PostCommitAdvance]) {
         let mut grouped: HashMap<klights_watch::WatchTopic, HashMap<Option<String>, (i64, i64)>> =
             HashMap::new();
         for observation in observations {
-            if observation.resource_version <= 0 {
+            if observation.resource_version() <= 0 {
                 continue;
             }
-            let topic = klights_watch::WatchTopic::new(&observation.api_version, &observation.kind);
+            let topic =
+                klights_watch::WatchTopic::new(observation.api_version(), observation.kind());
             let entry = grouped
                 .entry(topic)
                 .or_default()
-                .entry(observation.namespace.clone())
-                .or_insert((observation.resource_version, observation.resource_version));
-            entry.0 = entry.0.min(observation.resource_version);
-            entry.1 = entry.1.max(observation.resource_version);
+                .entry(observation.namespace().map(str::to_string))
+                .or_insert((
+                    observation.resource_version(),
+                    observation.resource_version(),
+                ));
+            entry.0 = entry.0.min(observation.resource_version());
+            entry.1 = entry.1.max(observation.resource_version());
         }
         let mut signals = Vec::new();
         for (topic, namespace_rvs) in grouped {
@@ -136,9 +190,9 @@ impl CommitObservationSink for WatchCommitObservationSink {
         }
     }
 
-    #[cfg(test)]
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn wake_namespace_contents(&self, namespace: &str, resource_version: i64) {
+        self.publisher
+            .publish_namespace_advance(namespace, resource_version);
     }
 }
 
@@ -264,5 +318,90 @@ mod tests {
         .await
         .unwrap();
         assert_success_only(&store, sink.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn distinct_external_engine_endpoint_wakes_local_watch_over_transport() {
+        enum TransportWakeup {
+            Advances(Vec<klights_leader_api::PostCommitAdvance>),
+            NamespaceContents(String, i64),
+        }
+        struct RemoteWakeupEndpoint {
+            sender: tokio::sync::mpsc::UnboundedSender<TransportWakeup>,
+        }
+        impl klights_leader_api::PostCommitWakeup for RemoteWakeupEndpoint {
+            fn wake(&self, advances: &[klights_leader_api::PostCommitAdvance]) {
+                self.sender
+                    .send(TransportWakeup::Advances(advances.to_vec()))
+                    .expect("local transport endpoint must remain connected");
+            }
+
+            fn wake_namespace_contents(&self, namespace: &str, resource_version: i64) {
+                self.sender
+                    .send(TransportWakeup::NamespaceContents(
+                        namespace.to_string(),
+                        resource_version,
+                    ))
+                    .expect("local transport endpoint must remain connected");
+            }
+        }
+        struct SimulatedExternalEngine {
+            wakeups: Arc<dyn klights_leader_api::PostCommitWakeup>,
+        }
+        impl SimulatedExternalEngine {
+            fn commit_config_map(&self) {
+                self.wakeups
+                    .wake(&[klights_leader_api::PostCommitAdvance::new(
+                        "v1",
+                        "ConfigMap",
+                        Some("default".to_string()),
+                        41,
+                    )]);
+            }
+        }
+
+        let hub = Arc::new(klights_watch::WatchSignalHub::new(4));
+        let local_wakeup = WatchPostCommitWakeup::new(hub.clone());
+        let topic = klights_watch::WatchTopic::new("v1", "ConfigMap");
+        let mut local_watch = hub.subscribe(topic.clone());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let external_engine = SimulatedExternalEngine {
+            wakeups: Arc::new(RemoteWakeupEndpoint { sender }),
+        };
+
+        let bridge = async {
+            let wakeup = receiver
+                .recv()
+                .await
+                .expect("external endpoint must deliver one commit");
+            match wakeup {
+                TransportWakeup::Advances(advances) => {
+                    klights_leader_api::PostCommitWakeup::wake(&local_wakeup, &advances);
+                }
+                TransportWakeup::NamespaceContents(namespace, resource_version) => {
+                    klights_leader_api::PostCommitWakeup::wake_namespace_contents(
+                        &local_wakeup,
+                        &namespace,
+                        resource_version,
+                    );
+                }
+            }
+        };
+        let remote_commit = async {
+            external_engine.commit_config_map();
+        };
+        tokio::join!(bridge, remote_commit);
+
+        assert_eq!(
+            local_watch.recv().await,
+            Ok(klights_watch::WatchSignal {
+                topic,
+                advances: vec![klights_watch::WatchAdvance {
+                    namespace: Some("default".to_string()),
+                    low_rv: 41,
+                    high_rv: 41,
+                }],
+            })
+        );
     }
 }

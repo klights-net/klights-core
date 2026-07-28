@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference as K8sOwnerReference;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -33,7 +34,7 @@ pub(crate) trait ControllerStatusStore: Send + Sync {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Option<Resource>>;
 
     async fn update_status(
         &self,
@@ -43,11 +44,15 @@ pub(crate) trait ControllerStatusStore: Send + Sync {
         name: &str,
         status: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 
-    fn is_conflict(&self, error: &anyhow::Error) -> bool;
+    fn is_conflict(&self, error: &ControllerStoreError) -> bool {
+        error.is_conflict()
+    }
 
-    fn conflict_error(&self, message: &'static str) -> anyhow::Error;
+    fn conflict_error(&self, message: &'static str) -> ControllerStoreError {
+        ControllerStoreError::conflict(message)
+    }
 
     fn log_noop_status_write(
         &self,
@@ -468,9 +473,9 @@ pub(crate) async fn write_status<S: Serialize, Store: ControllerStatusStore + ?S
                 "write_status: resource spec or generation changed before status fast path"
             ));
         }
-        return Err(
-            store.conflict_error("write_status: resource status changed before status fast path")
-        );
+        return Err(store
+            .conflict_error("write_status: resource status changed before status fast path")
+            .into());
     }
     write_status_with_retry(
         store,
@@ -525,9 +530,11 @@ pub(crate) async fn write_status_for_resource<
                 "write_status_for_resource: resource spec or generation changed before status fast path"
             ));
         }
-        return Err(store.conflict_error(
-            "write_status_for_resource: resource status changed before status fast path",
-        ));
+        return Err(store
+            .conflict_error(
+                "write_status_for_resource: resource status changed before status fast path",
+            )
+            .into());
     }
     write_status_with_retry(
         store,
@@ -589,9 +596,11 @@ async fn write_status_with_retry<Store: ControllerStatusStore + ?Sized>(
             if let Some(observed_uid) = observed_uid.as_deref()
                 && observed_uid != current.uid
             {
-                return Err(store.conflict_error(
-                    "write_status: resource uid mismatch while resource is deleting",
-                ));
+                return Err(store
+                    .conflict_error(
+                        "write_status: resource uid mismatch while resource is deleting",
+                    )
+                    .into());
             }
             return Ok(current);
         }
@@ -645,13 +654,14 @@ async fn write_status_with_retry<Store: ControllerStatusStore + ?Sized>(
                 expected_rv = Some(current.resource_version);
                 last_err = Some(err);
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 
-    Err(last_err
-        .unwrap_or_else(|| anyhow!("status CAS retry exhausted without captured conflict"))
-        .context("write_status: CAS retries exhausted"))
+    let exhausted = last_err.unwrap_or_else(|| {
+        ControllerStoreError::conflict("status CAS retry exhausted without captured conflict")
+    });
+    Err(anyhow::Error::new(exhausted).context("write_status: CAS retries exhausted"))
 }
 
 fn same_status_retry_identity(original: &Value, current: &Value) -> bool {

@@ -26,12 +26,14 @@ use klights_reconcile_api::{
     ControllerReconcileSink, GcForegroundDeleteCoordination, GcNonPodFinalizationPort,
     GcPodDeleteSink, ReconcileKey, ServiceReconcileKey, ServiceReconcileSink,
 };
+use klights_reconcile_api::{NamespaceTerminationRequest, NamespaceTerminationSink};
 
 pub struct PodSideEffectSinks<'a> {
     pub controller: Option<&'a dyn ControllerReconcileSink>,
     pub service: Option<&'a dyn ServiceReconcileSink>,
     pub pod_delete: Option<&'a dyn GcPodDeleteSink>,
     pub non_pod_finalization: Option<&'a dyn GcNonPodFinalizationPort>,
+    pub namespace_termination: Option<&'a dyn NamespaceTerminationSink>,
     pub gc_coordination: &'a dyn GcForegroundDeleteCoordination,
 }
 
@@ -88,7 +90,7 @@ pub async fn handle_applied_pod_side_effects(
         db,
     )
     .await;
-    reconcile_namespace_after_pod_delete(command, resource, db).await;
+    reconcile_namespace_after_pod_delete(command, resource, sinks.namespace_termination).await;
     Ok(())
 }
 
@@ -346,8 +348,11 @@ async fn cascade_dependents_after_actor_pod_delete(
 async fn reconcile_namespace_after_pod_delete(
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
-    db: &dyn DatastoreBackend,
+    sink: Option<&dyn NamespaceTerminationSink>,
 ) {
+    let Some(sink) = sink else {
+        return;
+    };
     let namespace = match command {
         StorageCommand::DeleteResource {
             api_version,
@@ -368,8 +373,13 @@ async fn reconcile_namespace_after_pod_delete(
         return;
     }
 
-    let metrics = crate::side_effects::SideEffectMetrics::new();
-    if let Err(err) = crate::api::reconcile_namespace_termination(db, namespace, &metrics).await {
+    if let Err(err) = sink
+        .reconcile_namespace_termination(NamespaceTerminationRequest {
+            namespace: namespace.to_string(),
+            expected_uid: None,
+        })
+        .await
+    {
         tracing::warn!(
             namespace,
             error = ?err,
@@ -617,6 +627,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                namespace_termination: None,
                 gc_coordination: gc_coordination(),
             },
             &command,
@@ -636,6 +647,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                namespace_termination: None,
                 gc_coordination: gc_coordination(),
             },
             &command,
@@ -653,6 +665,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                namespace_termination: None,
                 gc_coordination: gc_coordination(),
             },
             &command,
@@ -732,6 +745,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                namespace_termination: None,
                 gc_coordination: gc_coordination(),
             },
             &command,
@@ -751,6 +765,7 @@ mod tests {
                 non_pod_finalization: Some(
                     crate::controllers::test_utils::non_pod_finalization_port_for_test(),
                 ),
+                namespace_termination: None,
                 gc_coordination: gc_coordination(),
             },
             &command,

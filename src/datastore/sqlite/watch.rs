@@ -9,9 +9,11 @@ use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_pay
 use klights_watch::WatchTopic;
 
 use super::{
-    CatchUpResource, CommitObservation, CommitObservationSink, Datastore, PendingWatchEvent,
-    PodEndpointEvent, PodSlotAdmissionEvent, RawWatchEvent,
+    CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
+    RawWatchEvent,
 };
+#[cfg(test)]
+use super::{CommitObservation, CommitObservationSink};
 use klights_cluster_core::Resource;
 
 /// Free function to publish a pending watch event after DB commit.
@@ -25,10 +27,12 @@ use klights_cluster_core::Resource;
 /// Per HA contract bullet #4, request handlers must never call the
 /// watch bus directly — they hand a `PendingWatchEvent` back
 /// and this function publishes it. tests/source_guard_tests.py enforces this.
+#[cfg(test)]
 pub fn publish_pending(pending: PendingWatchEvent, sink: &dyn CommitObservationSink) {
     publish_pending_batch(std::iter::once(pending), sink);
 }
 
+#[cfg(test)]
 pub fn publish_pending_batch(
     pending: impl IntoIterator<Item = PendingWatchEvent>,
     sink: &dyn CommitObservationSink,
@@ -199,6 +203,7 @@ impl Datastore {
     /// Delegates to the free function `publish_pending` so the broadcast
     /// path is identical whether called from CRUD methods or a future
     /// Raft FSM apply hook.
+    #[cfg(test)]
     pub fn publish_watch_event(&self, pending: PendingWatchEvent) {
         publish_pending(pending, self.commit_sink.as_ref());
     }
@@ -207,6 +212,7 @@ impl Datastore {
     /// committed. Multi-event apply paths (raft/cluster replace) use this so
     /// the post-commit signals are grouped per `(topic, namespace)` through
     /// `publish_pending_batch` instead of emitting one signal per event.
+    #[cfg(test)]
     pub fn publish_watch_events(&self, pending: impl IntoIterator<Item = PendingWatchEvent>) {
         publish_pending_batch(pending, self.commit_sink.as_ref());
     }

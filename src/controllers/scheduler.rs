@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use klights_leader_api::{LeaderWatchError, ResourceEvent, WatchEventType, WatchStream};
+use klights_reconcile_api::ControllerStoreResult;
 use tokio_util::sync::CancellationToken;
 
 /// Focused runtime port used by the event-driven scheduler.
@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 pub trait SchedulerRuntime: Send + Sync {
     async fn open_watch_sessions(&self) -> std::result::Result<Vec<WatchStream>, LeaderWatchError>;
 
-    async fn schedule_all_unbound_pods(&self) -> Result<()>;
+    async fn schedule_all_unbound_pods(&self) -> ControllerStoreResult<()>;
 }
 
 /// Scheduler controller configuration.

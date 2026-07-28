@@ -374,6 +374,20 @@ pub trait PodApiMutation: Send + Sync {
         &self,
         request: PodApiDeleteCollectionRequest,
     ) -> PodRepositoryFuture<'_, ()>;
+
+    fn bind_pod(&self, request: PodBindingRequest) -> PodRepositoryFuture<'_, ()>;
+}
+
+/// Canonical Kubernetes Binding object plus its URL target and dry-run mode.
+///
+/// The complete JSON value is intentional here: Binding admission and
+/// annotation propagation consume the Kubernetes object as a whole.
+#[derive(Clone, Debug)]
+pub struct PodBindingRequest {
+    pub namespace: String,
+    pub name: String,
+    pub binding: serde_json::Value,
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug)]

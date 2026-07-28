@@ -163,12 +163,15 @@ pub(in crate::api) async fn get_namespace_status(
 ) -> Result<Json<Value>, AppError> {
     // Namespaces are stored in the dedicated `namespaces` table (not `cluster_resources`),
     // so we must use get_namespace rather than the generic get_cluster_status_subresource.
-    let resource = state
-        .resource_mutation()
-        .db
-        .get_namespace(&name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Namespace",
+        None,
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
     let mut data: Value = std::sync::Arc::unwrap_or_clone(resource.data);
     ensure_namespace_status_phase_active(&mut data);
     let result = inject_resource_version(data, resource.resource_version);

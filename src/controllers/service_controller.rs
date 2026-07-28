@@ -25,8 +25,8 @@ impl Controller for ServiceController {
 
     async fn reconcile(&self, resource: Value, ctx: Context) -> Result<()> {
         service_core::reconcile_service_with_nodeport(
-            ctx.leader().service_store(),
-            ctx.pods().query(),
+            ctx.service_store(),
+            ctx.pod_query(),
             &resource,
             &self.service_ipam,
             &self.nodeport_alloc,

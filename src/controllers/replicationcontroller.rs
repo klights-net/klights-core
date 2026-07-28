@@ -9,6 +9,7 @@ use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use futures::future::{poll_fn, select_all};
 use klights_pod_api::{PodListRequest, PodQuery};
+use klights_reconcile_api::ControllerStoreResult;
 use klights_types::LabelSelector;
 use serde_json::{Value, json};
 use std::future::Future;
@@ -23,16 +24,16 @@ pub trait ReplicationControllerStore:
         &self,
         namespace: &str,
         name: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>>;
+    ) -> ControllerStoreResult<Option<klights_cluster_core::Resource>>;
     async fn list_resource_quotas(
         &self,
         namespace: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>>;
+    ) -> ControllerStoreResult<Vec<klights_cluster_core::Resource>>;
     async fn update_replication_controller_status(
         &self,
         resource: &klights_cluster_core::Resource,
         status: Value,
-    ) -> Result<()>;
+    ) -> ControllerStoreResult<()>;
 }
 
 #[async_trait]
@@ -43,13 +44,13 @@ pub trait ReplicationControllerPodMutation: Send + Sync {
         name: &str,
         node_name: &str,
         pod: Value,
-    ) -> Result<klights_cluster_core::Resource>;
+    ) -> ControllerStoreResult<klights_cluster_core::Resource>;
     async fn replace_replication_controller_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
         owner_references: Vec<Value>,
-    ) -> Result<klights_cluster_core::Resource>;
+    ) -> ControllerStoreResult<klights_cluster_core::Resource>;
 }
 
 type PodCreateFuture<'a> =

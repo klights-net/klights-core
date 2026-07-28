@@ -194,6 +194,11 @@ impl UnscheduledPodDeletion for LeaderDeferredUnscheduledPodDeletion {
         request: UnscheduledPodDeletionRequest,
     ) -> UnscheduledPodDeletionFuture<'_> {
         Box::pin(async move {
+            klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+                UnscheduledPodDeletionError::unavailable(format!(
+                    "controller authority rejected unscheduled Pod deletion: {error}"
+                ))
+            })?;
             let (identity, observed_resource_version) = request.into_parts();
             let outcome = self
                 .store
@@ -592,21 +597,39 @@ impl PodWorkqueue {
             .and_then(|value| value.as_str())
             .map(ToString::to_string);
         let retry_now_ms = now_ms();
-        let result = match row.kind {
-            PodWorkqueueKind::Pod => {
-                self.run_pod_delete_full_with_target_node_and_payload(
-                    row.namespace.clone(),
-                    row.name.clone(),
-                    row.uid.clone(),
-                    target_node,
-                    &mut row.payload,
-                    retry_now_ms,
-                )
-                .await
-            }
-            PodWorkqueueKind::Namespace => {
-                self.run_namespace_termination(row.name.clone(), row.uid.clone())
+        let result = {
+            let operation = async {
+                match row.kind {
+                    PodWorkqueueKind::Pod => {
+                        self.run_pod_delete_full_with_target_node_and_payload(
+                            row.namespace.clone(),
+                            row.name.clone(),
+                            row.uid.clone(),
+                            target_node,
+                            &mut row.payload,
+                            retry_now_ms,
+                        )
+                        .await
+                    }
+                    PodWorkqueueKind::Namespace => {
+                        self.run_namespace_termination(row.name.clone(), row.uid.clone())
+                            .await
+                    }
+                }
+            };
+            match (&self.leader_coordination, leader_lease.clone()) {
+                (Some(coordination), Some(lease)) => {
+                    klights_leader_api::scope_controller_lease(
+                        coordination.clone(),
+                        lease,
+                        operation,
+                    )
                     .await
+                }
+                (None, None) => operation.await,
+                _ => Err(anyhow::anyhow!(
+                    "deferred delete lacks a matching controller lease"
+                )),
             }
         };
 
@@ -1505,6 +1528,71 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "unscheduled terminating Pod row must be removed so its namespace can finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_lease_cannot_delete_unscheduled_pod_after_demote_promote_aba() {
+        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let store = Arc::new(PodStore::new(db.clone()));
+        let deletion = LeaderDeferredUnscheduledPodDeletion {
+            store: store.clone(),
+        };
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "aba-unscheduled",
+                unscheduled_pod_with_uid("aba-unscheduled", "uid-aba", true),
+            )
+            .await
+            .unwrap();
+        let (coordination, publisher) = test_coordination(true);
+        let lease = coordination
+            .try_acquire(ControllerScope::Cluster)
+            .expect("initial leader lease");
+        let reached_effect_boundary = Arc::new(tokio::sync::Notify::new());
+        let resume_effect = Arc::new(tokio::sync::Notify::new());
+        let request = UnscheduledPodDeletionRequest::try_new(
+            PodIdentity::new("default", "aba-unscheduled", "uid-aba"),
+            created.resource_version,
+        )
+        .unwrap();
+
+        let operation = klights_leader_api::scope_controller_lease(coordination, lease, {
+            let reached_effect_boundary = reached_effect_boundary.clone();
+            let resume_effect = resume_effect.clone();
+            async move {
+                reached_effect_boundary.notify_one();
+                resume_effect.notified().await;
+                deletion.delete_unscheduled_pod(request).await
+            }
+        });
+        let transition = async {
+            reached_effect_boundary.notified().await;
+            publisher.send_replace(TestCoordinationState {
+                local: false,
+                generation: 2,
+            });
+            publisher.send_replace(TestCoordinationState {
+                local: true,
+                generation: 3,
+            });
+            resume_effect.notify_one();
+        };
+        let (result, ()) = tokio::join!(operation, transition);
+
+        assert!(matches!(
+            result,
+            Err(UnscheduledPodDeletionError::Unavailable { .. })
+        ));
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "aba-unscheduled")
+                .await
+                .unwrap()
+                .is_some(),
+            "a stale leader lease must not reach the UID/RV delete CAS"
         );
     }
 

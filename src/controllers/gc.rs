@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use klights_reconcile_api::{GcForegroundDeleteCoordination, GcPodDeleteRequest, GcPodDeleteSink};
 #[cfg(test)]
 use klights_reconcile_api::{GcPodDeleteError, GcPodDeleteFuture};
@@ -10,14 +11,14 @@ use std::collections::HashSet;
 
 #[async_trait]
 pub trait GcResourceStore: Send + Sync {
-    async fn list_custom_resource_definitions(&self) -> Result<Vec<Resource>>;
+    async fn list_custom_resource_definitions(&self) -> ControllerStoreResult<Vec<Resource>>;
     async fn get_resource(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn update_resource_with_preconditions(
         &self,
         api_version: &str,
@@ -26,20 +27,22 @@ pub trait GcResourceStore: Send + Sync {
         name: &str,
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn find_owned_resources(
         &self,
         owner_uid: &str,
         namespace: Option<&str>,
-    ) -> Result<Vec<Resource>>;
+    ) -> ControllerStoreResult<Vec<Resource>>;
     async fn find_owned_by_name_kind_empty_uid(
         &self,
         owner_api_version: &str,
         owner_name: &str,
         owner_kind: &str,
         namespace: Option<&str>,
-    ) -> Result<Vec<Resource>>;
-    fn gc_store_error_is_conflict(&self, error: &anyhow::Error) -> bool;
+    ) -> ControllerStoreResult<Vec<Resource>>;
+    fn gc_store_error_is_conflict(&self, error: &ControllerStoreError) -> bool {
+        error.is_conflict()
+    }
 }
 
 const OWNER_REF_UPDATE_MAX_CONFLICT_RETRIES: usize = 8;
@@ -549,7 +552,7 @@ async fn remove_owner_ref_from_resource(
                 }
                 current = live;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -619,7 +622,7 @@ async fn remove_owner_refs_from_resource(
                 }
                 current = live;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 

@@ -30,18 +30,22 @@ impl crate::controllers::pdb::PdbPodReader for BoundPdbPort<'_> {
     async fn list_namespace_pods(
         &self,
         namespace: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<klights_cluster_core::Resource>> {
+        let request = PodListRequest::try_new(Some(namespace.to_string()), None, None, None, None)
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::internal(format!(
+                    "invalid PDB Pod list request: {error}"
+                ))
+            })?;
         self.pod_query
-            .list_pods(PodListRequest::try_new(
-                Some(namespace.to_string()),
-                None,
-                None,
-                None,
-                None,
-            )?)
+            .list_pods(request)
             .await
             .map(|listing| listing.into_parts().0)
-            .map_err(Into::into)
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::unavailable(format!(
+                    "PDB Pod list failed: {error}"
+                ))
+            })
     }
 }
 

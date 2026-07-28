@@ -1,7 +1,8 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult as Result;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::daemonset::{DaemonSetPodMutation, DaemonSetStore};
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use crate::kubelet::pod_repository::PodObjectWriter;
@@ -18,7 +19,9 @@ where
         node_name: &str,
         pod: serde_json::Value,
     ) -> Result<Resource> {
-        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod).await
+        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+            .await
+            .map_err(map_controller_store_error)
     }
 }
 
@@ -35,7 +38,8 @@ where
                 Some(namespace),
                 ResourceListQuery::all(),
             )
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
@@ -53,12 +57,14 @@ where
             revision,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
     async fn list_nodes(&self) -> Result<Vec<Resource>> {
         Ok(self
             .list_resources("v1", "Node", None, ResourceListQuery::all())
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
@@ -70,5 +76,6 @@ where
         crate::controllers::common::write_status_for_resource(self, resource, &status)
             .await
             .map(|_| ())
+            .map_err(map_controller_store_error)
     }
 }

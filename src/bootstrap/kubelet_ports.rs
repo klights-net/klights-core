@@ -576,7 +576,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
         message: &str,
         reporting_component: &str,
         node_name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::kubelet::pod_runtime::events::PodEventSinkError> {
         let pod = serde_json::json!({
             "metadata": {
                 "namespace": key.namespace,
@@ -596,7 +596,10 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
                 reporting_instance: node_name,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            crate::kubelet::pod_runtime::events::PodEventSinkError::unavailable(error.to_string())
+        })?;
         Ok(())
     }
 }
@@ -628,7 +631,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
         message: &str,
         reporting_component: &str,
         node_name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::kubelet::pod_runtime::events::PodEventSinkError> {
         let pod = serde_json::json!({
             "metadata": {
                 "namespace": key.namespace,
@@ -648,7 +651,10 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
                 reporting_instance: node_name,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            crate::kubelet::pod_runtime::events::PodEventSinkError::unavailable(error.to_string())
+        })?;
         Ok(())
     }
 }

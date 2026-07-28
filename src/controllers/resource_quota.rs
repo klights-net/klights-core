@@ -7,6 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 
 #[async_trait]
@@ -16,9 +17,13 @@ pub(crate) trait ResourceQuotaRuntime: Send + Sync {
         api_version: &str,
         kind: &str,
         namespace: &str,
-    ) -> Result<Vec<Resource>>;
-    async fn list_namespace_pods(&self, namespace: &str) -> Result<Vec<Resource>>;
-    async fn write_resource_quota_status(&self, resource: &Resource, status: &Value) -> Result<()>;
+    ) -> ControllerStoreResult<Vec<Resource>>;
+    async fn list_namespace_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
+    async fn write_resource_quota_status(
+        &self,
+        resource: &Resource,
+        status: &Value,
+    ) -> ControllerStoreResult<()>;
 }
 
 /// Map from K8s quota resource name to (apiVersion, kind) for counting.

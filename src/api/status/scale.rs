@@ -61,12 +61,15 @@ pub(in crate::api) async fn get_replicaset_scale(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let rs = state
-        .resource_mutation()
-        .db
-        .get_resource("apps/v1", "ReplicaSet", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicaset {} not found", name)))?;
+    let rs = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "apps/v1",
+        "ReplicaSet",
+        Some(&namespace),
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("replicaset {} not found", name)))?;
 
     let replicas = rs
         .data
@@ -105,12 +108,15 @@ async fn get_apps_v1_scale(
     namespace: String,
     name: String,
 ) -> Result<Json<Value>, AppError> {
-    let resource = state
-        .resource_mutation()
-        .db
-        .get_resource("apps/v1", kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "apps/v1",
+        kind,
+        Some(&namespace),
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
 
     let replicas = resource
         .data
@@ -247,12 +253,15 @@ pub(in crate::api) async fn get_replicationcontroller_scale(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let rc = state
-        .resource_mutation()
-        .db
-        .get_resource("v1", "ReplicationController", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
+    let rc = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "ReplicationController",
+        Some(&namespace),
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
 
     let replicas = rc
         .data

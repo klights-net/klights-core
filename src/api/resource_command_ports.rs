@@ -1,4 +1,4 @@
-use klights_cluster_core::{ResourcePreconditions, StorageCommand};
+use klights_cluster_core::{ResourcePatchRequest, ResourcePreconditions, StorageCommand};
 use klights_leader_api::{LeaderResourceCommand, ResourceCommandRequest, ResourceCommandResult};
 
 use crate::api::AppError;
@@ -12,6 +12,59 @@ fn resource_result(
         ResourceCommandResult::Ack { .. } => Err(AppError::InternalError(format!(
             "{operation} returned an acknowledgement without a resource"
         ))),
+    }
+}
+
+pub(crate) async fn create_namespace(
+    command: &dyn LeaderResourceCommand,
+    name: &str,
+    data: serde_json::Value,
+) -> Result<klights_cluster_core::Resource, AppError> {
+    let request = ResourceCommandRequest::try_new(StorageCommand::CreateNamespace {
+        name: name.to_string(),
+        data,
+    })?;
+    let result = command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?;
+    resource_result(result, "namespace create")
+}
+
+pub(crate) async fn update_namespace(
+    command: &dyn LeaderResourceCommand,
+    name: &str,
+    data: serde_json::Value,
+    expected_resource_version: i64,
+) -> Result<klights_cluster_core::Resource, AppError> {
+    let request = ResourceCommandRequest::try_new(StorageCommand::UpdateNamespace {
+        name: name.to_string(),
+        data,
+        expected_rv: expected_resource_version,
+    })?;
+    let result = command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?;
+    resource_result(result, "namespace update")
+}
+
+pub(crate) async fn delete_namespace(
+    command: &dyn LeaderResourceCommand,
+    name: &str,
+) -> Result<(), AppError> {
+    let request = ResourceCommandRequest::try_new(StorageCommand::DeleteNamespace {
+        name: name.to_string(),
+    })?;
+    match command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?
+    {
+        ResourceCommandResult::Ack { .. } => Ok(()),
+        ResourceCommandResult::Resource(_) => Err(AppError::InternalError(
+            "namespace delete returned a resource instead of an acknowledgement".to_string(),
+        )),
     }
 }
 
@@ -69,6 +122,68 @@ pub(crate) async fn update_non_pod_resource(
         .await
         .map_err(AppError::from)?;
     resource_result(result, "resource update")
+}
+
+pub(crate) async fn update_resource_status(
+    command: &dyn LeaderResourceCommand,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    status: serde_json::Value,
+    preconditions: ResourcePreconditions,
+) -> Result<klights_cluster_core::Resource, AppError> {
+    let request = ResourceCommandRequest::try_new(StorageCommand::UpdateStatus {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.map(str::to_string),
+        name: name.to_string(),
+        status,
+        expected_rv: preconditions.resource_version,
+        preconditions,
+        observed_status_stamp: None,
+    })?;
+    let result = command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?;
+    resource_result(result, "resource status update")
+}
+
+pub(crate) async fn patch_non_pod_resource(
+    command: &dyn LeaderResourceCommand,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    request: ResourcePatchRequest,
+) -> Result<klights_cluster_core::Resource, AppError> {
+    if api_version == "v1" && kind == "Pod" {
+        return Err(AppError::Forbidden(
+            "generic Pod patch is forbidden; use the Pod API repository path".to_string(),
+        ));
+    }
+    let ResourcePatchRequest {
+        patch_kind,
+        patch,
+        preconditions,
+        strict_resource_version,
+    } = request;
+    let request = ResourceCommandRequest::try_new(StorageCommand::PatchResource {
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace: namespace.map(str::to_string),
+        name: name.to_string(),
+        patch_kind,
+        patch,
+        preconditions,
+        strict_resource_version,
+    })?;
+    let result = command
+        .submit_resource_command(request)
+        .await
+        .map_err(AppError::from)?;
+    resource_result(result, "resource patch")
 }
 
 pub(crate) async fn delete_non_pod_resource(

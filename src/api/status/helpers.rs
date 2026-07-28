@@ -208,12 +208,15 @@ pub(in crate::api) async fn get_namespaced_status_subresource(
     name: String,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    let resource = state
-        .resource_mutation()
-        .db
-        .get_resource(&api_version, &kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        &api_version,
+        &kind,
+        Some(&namespace),
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     Ok(K8sResponse::new(data, &headers))
@@ -227,12 +230,15 @@ pub(in crate::api) async fn get_cluster_status_subresource(
     name: String,
     headers: HeaderMap,
 ) -> Result<K8sResponse, AppError> {
-    let resource = state
-        .resource_mutation()
-        .db
-        .get_resource(&api_version, &kind, None, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
+    let resource = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        &api_version,
+        &kind,
+        None,
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
     let result = inject_resource_version(resource.data, resource.resource_version);
     Ok(K8sResponse::new(result, &headers))
 }

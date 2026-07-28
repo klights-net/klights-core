@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 #[cfg(not(test))]
@@ -22,41 +21,19 @@ use super::{
 
 #[async_trait]
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) trait ControllerLeaderPort: Send + Sync {
+pub(crate) trait ControllerResourceQuery: Send + Sync {
     async fn get_reconcile_resource(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> Result<Option<Resource>, klights_leader_api::ResourceQueryError>;
 
-    async fn namespace_is_terminating(&self, namespace: &str) -> Result<bool>;
-
-    fn deployment_store(&self) -> &dyn DeploymentStore;
-    fn replicaset_store(&self) -> &dyn ReplicaSetStore;
-    fn statefulset_store(&self) -> &dyn StatefulSetStore;
-    fn daemonset_store(&self) -> &dyn DaemonSetStore;
-    fn job_store(&self) -> &dyn JobStore;
-    fn service_store(&self) -> &dyn ServiceControllerStore;
-    fn pvc_store(&self) -> &dyn PvcStore;
-    fn pdb_store(&self) -> &dyn PdbStore;
-    fn replicationcontroller_store(&self) -> &dyn ReplicationControllerStore;
-    fn apiservice_store(&self) -> &dyn ApiServiceStore;
-    fn csr_status_store(&self) -> &dyn CsrStatusStore;
-}
-
-pub(crate) trait ControllerPodPort: Send + Sync {
-    fn query(&self) -> &dyn klights_pod_api::PodQuery;
-    fn pdb_reader(&self) -> &dyn super::pdb::PdbPodReader;
-    fn deployment_reader(&self) -> &dyn DeploymentControllerPodReader;
-    fn deployment_mutation(&self) -> &dyn DeploymentControllerPodMutation;
-    fn replicaset_mutation(&self) -> &dyn ReplicaSetPodMutation;
-    fn statefulset_mutation(&self) -> &dyn StatefulSetPodMutation;
-    fn daemonset_mutation(&self) -> &dyn DaemonSetPodMutation;
-    fn job_mutation(&self) -> &dyn JobPodMutation;
-    fn replicationcontroller_mutation(&self) -> &dyn ReplicationControllerPodMutation;
-    fn delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink;
+    async fn namespace_is_terminating(
+        &self,
+        namespace: &str,
+    ) -> Result<bool, klights_leader_api::ResourceQueryError>;
 }
 
 pub(crate) trait DeploymentControllerPodMutation:
@@ -93,9 +70,30 @@ pub(crate) trait ControllerEffectPort: Send + Sync {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct ControllerRuntimeDependencies {
-    pub(crate) leader: Arc<dyn ControllerLeaderPort>,
-    pub(crate) pods: Arc<dyn ControllerPodPort>,
+    pub(crate) resource_query: Arc<dyn ControllerResourceQuery>,
+    pub(crate) deployment_store: Arc<dyn DeploymentStore>,
+    pub(crate) replicaset_store: Arc<dyn ReplicaSetStore>,
+    pub(crate) statefulset_store: Arc<dyn StatefulSetStore>,
+    pub(crate) daemonset_store: Arc<dyn DaemonSetStore>,
+    pub(crate) job_store: Arc<dyn JobStore>,
+    pub(crate) service_store: Arc<dyn ServiceControllerStore>,
+    pub(crate) pvc_store: Arc<dyn PvcStore>,
+    pub(crate) pdb_store: Arc<dyn PdbStore>,
+    pub(crate) replicationcontroller_store: Arc<dyn ReplicationControllerStore>,
+    pub(crate) apiservice_store: Arc<dyn ApiServiceStore>,
+    pub(crate) csr_status_store: Arc<dyn CsrStatusStore>,
+    pub(crate) pod_query: Arc<dyn klights_pod_api::PodQuery>,
+    pub(crate) pdb_pod_reader: Arc<dyn super::pdb::PdbPodReader>,
+    pub(crate) deployment_pod_reader: Arc<dyn DeploymentControllerPodReader>,
+    pub(crate) deployment_pod_mutation: Arc<dyn DeploymentControllerPodMutation>,
+    pub(crate) replicaset_pod_mutation: Arc<dyn ReplicaSetPodMutation>,
+    pub(crate) statefulset_pod_mutation: Arc<dyn StatefulSetPodMutation>,
+    pub(crate) daemonset_pod_mutation: Arc<dyn DaemonSetPodMutation>,
+    pub(crate) job_pod_mutation: Arc<dyn JobPodMutation>,
+    pub(crate) replicationcontroller_pod_mutation: Arc<dyn ReplicationControllerPodMutation>,
+    pub(crate) pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink>,
     pub(crate) reconcile: Arc<dyn ControllerReconcilePort>,
     pub(crate) network: Arc<dyn ControllerNetworkPort>,
     pub(crate) effects: Arc<dyn ControllerEffectPort>,
@@ -119,16 +117,39 @@ mod tests {
     use super::*;
 
     fn compose_fake_api(
-        leader: Arc<dyn ControllerLeaderPort>,
-        pods: Arc<dyn ControllerPodPort>,
+        resource_query: Arc<dyn ControllerResourceQuery>,
+        stores: Arc<crate::controller_runtime_adapter::RootControllerLeaderPort>,
+        pod_query: Arc<dyn klights_pod_api::PodQuery>,
+        pod_mutations: Arc<crate::controller_runtime_adapter::RootControllerPodPort>,
+        pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
         reconcile: Arc<dyn ControllerReconcilePort>,
         network: Arc<dyn ControllerNetworkPort>,
         effects: Arc<dyn ControllerEffectPort>,
         coordination: Arc<crate::controllers::ControllerCoordination>,
     ) -> ControllerRuntimeDependencies {
         ControllerRuntimeDependencies {
-            leader,
-            pods,
+            resource_query,
+            deployment_store: stores.clone(),
+            replicaset_store: stores.clone(),
+            statefulset_store: stores.clone(),
+            daemonset_store: stores.clone(),
+            job_store: stores.clone(),
+            service_store: stores.clone(),
+            pvc_store: stores.clone(),
+            pdb_store: stores.clone(),
+            replicationcontroller_store: stores.clone(),
+            apiservice_store: stores.clone(),
+            csr_status_store: stores,
+            pod_query,
+            pdb_pod_reader: pod_repository.clone(),
+            deployment_pod_reader: pod_repository.clone(),
+            deployment_pod_mutation: pod_mutations.clone(),
+            replicaset_pod_mutation: pod_mutations.clone(),
+            statefulset_pod_mutation: pod_mutations.clone(),
+            daemonset_pod_mutation: pod_mutations.clone(),
+            job_pod_mutation: pod_mutations.clone(),
+            replicationcontroller_pod_mutation: pod_mutations,
+            pod_delete_sink: pod_repository,
             reconcile,
             network,
             effects,
@@ -139,14 +160,12 @@ mod tests {
 
     #[test]
     fn controller_ports_are_object_safe_and_fake_composable() {
-        fn assert_object_safe(_: Option<Arc<dyn ControllerLeaderPort>>) {}
-        fn assert_pod_object_safe(_: Option<Arc<dyn ControllerPodPort>>) {}
+        fn assert_object_safe(_: Option<Arc<dyn ControllerResourceQuery>>) {}
         fn assert_reconcile_object_safe(_: Option<Arc<dyn ControllerReconcilePort>>) {}
         fn assert_network_object_safe(_: Option<Arc<dyn ControllerNetworkPort>>) {}
         fn assert_effect_object_safe(_: Option<Arc<dyn ControllerEffectPort>>) {}
 
         assert_object_safe(None);
-        assert_pod_object_safe(None);
         assert_reconcile_object_safe(None);
         assert_network_object_safe(None);
         assert_effect_object_safe(None);

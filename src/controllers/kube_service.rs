@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 
 #[async_trait]
@@ -11,7 +12,7 @@ pub(crate) trait KubernetesBootstrapStore: Send + Sync {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Option<Resource>>;
 
     async fn create_bootstrap_resource(
         &self,
@@ -20,7 +21,7 @@ pub(crate) trait KubernetesBootstrapStore: Send + Sync {
         namespace: Option<&str>,
         name: &str,
         value: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 
     async fn update_bootstrap_resource(
         &self,
@@ -30,7 +31,7 @@ pub(crate) trait KubernetesBootstrapStore: Send + Sync {
         name: &str,
         value: Value,
         expected_resource_version: i64,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 /// Derive the kubernetes service ClusterIP from the service CIDR.
@@ -228,7 +229,8 @@ async fn create_or_reconcile_bootstrap_resource<S: KubernetesBootstrapStore + ?S
     else {
         return store
             .create_bootstrap_resource(api_version, kind, namespace, name, desired)
-            .await;
+            .await
+            .map_err(Into::into);
     };
 
     let mut updated = (*existing.data).clone();
@@ -259,6 +261,7 @@ async fn create_or_reconcile_bootstrap_resource<S: KubernetesBootstrapStore + ?S
             existing.resource_version,
         )
         .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

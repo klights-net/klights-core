@@ -16,9 +16,6 @@ pub use self::cert::{
 pub use self::cert::{generate_admin_cert, generate_ca_full, generate_server_cert};
 pub use self::identity::AuthenticatedIdentity;
 pub use self::middleware::{BoundTokenSubjectLookup, validate_sa_token_bindings};
-pub use self::token::persist_service_account_signing_key;
-pub use self::token::read_service_account_signing_key_async;
-pub use self::token::read_service_account_signing_key_supervised;
 pub use self::token::{
     BoundServiceAccountToken, ServiceAccountTokenRequest,
     generate_sa_token_with_bound_pod_and_clock, generate_sa_token_with_bound_pod_at,

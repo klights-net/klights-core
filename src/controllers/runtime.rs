@@ -78,18 +78,38 @@ impl Context {
             Arc::new(crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
                 db_handle.clone(),
             ));
+        let leader_ports = Arc::new(
+            crate::controller_runtime_adapter::RootControllerLeaderPort::new(db_handle.clone()),
+        );
+        let pod_ports = Arc::new(
+            crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
+                repository.clone(),
+            ),
+        );
         Self {
             dependencies: ControllerRuntimeDependencies {
-                leader: Arc::new(
-                    crate::controller_runtime_adapter::RootControllerLeaderPort::new(
-                        db_handle.clone(),
-                    ),
-                ),
-                pods: Arc::new(
-                    crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
-                        repository.clone(),
-                    ),
-                ),
+                resource_query: leader_ports.clone(),
+                deployment_store: leader_ports.clone(),
+                replicaset_store: leader_ports.clone(),
+                statefulset_store: leader_ports.clone(),
+                daemonset_store: leader_ports.clone(),
+                job_store: leader_ports.clone(),
+                service_store: leader_ports.clone(),
+                pvc_store: leader_ports.clone(),
+                pdb_store: leader_ports.clone(),
+                replicationcontroller_store: leader_ports.clone(),
+                apiservice_store: leader_ports.clone(),
+                csr_status_store: leader_ports,
+                pod_query: repository.clone(),
+                pdb_pod_reader: repository.clone(),
+                deployment_pod_reader: repository.clone(),
+                deployment_pod_mutation: pod_ports.clone(),
+                replicaset_pod_mutation: pod_ports.clone(),
+                statefulset_pod_mutation: pod_ports.clone(),
+                daemonset_pod_mutation: pod_ports.clone(),
+                job_pod_mutation: pod_ports.clone(),
+                replicationcontroller_pod_mutation: pod_ports,
+                pod_delete_sink: repository.clone(),
                 reconcile: Arc::new(
                     crate::controller_runtime_adapter::RootControllerReconcilePort::new(
                         non_pod_finalization.clone(),
@@ -156,11 +176,21 @@ impl Context {
         mut self,
         repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     ) -> Self {
-        self.dependencies.pods = Arc::new(
+        let pod_ports = Arc::new(
             crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
                 repository.clone(),
             ),
         );
+        self.dependencies.pod_query = repository.clone();
+        self.dependencies.pdb_pod_reader = repository.clone();
+        self.dependencies.deployment_pod_reader = repository.clone();
+        self.dependencies.deployment_pod_mutation = pod_ports.clone();
+        self.dependencies.replicaset_pod_mutation = pod_ports.clone();
+        self.dependencies.statefulset_pod_mutation = pod_ports.clone();
+        self.dependencies.daemonset_pod_mutation = pod_ports.clone();
+        self.dependencies.job_pod_mutation = pod_ports.clone();
+        self.dependencies.replicationcontroller_pod_mutation = pod_ports;
+        self.dependencies.pod_delete_sink = repository.clone();
         self.pod_repository = Some(repository);
         self
     }
@@ -212,12 +242,94 @@ impl Context {
         self.metrics_provider.as_ref()
     }
 
-    pub(crate) fn leader(&self) -> &dyn super::ControllerLeaderPort {
-        self.dependencies.leader.as_ref()
+    pub(crate) fn deployment_store(&self) -> &dyn super::deployment::DeploymentStore {
+        self.dependencies.deployment_store.as_ref()
     }
 
-    pub(crate) fn pods(&self) -> &dyn super::ControllerPodPort {
-        self.dependencies.pods.as_ref()
+    pub(crate) fn replicaset_store(&self) -> &dyn super::replicaset::ReplicaSetStore {
+        self.dependencies.replicaset_store.as_ref()
+    }
+
+    pub(crate) fn statefulset_store(&self) -> &dyn super::statefulset::StatefulSetStore {
+        self.dependencies.statefulset_store.as_ref()
+    }
+
+    pub(crate) fn daemonset_store(&self) -> &dyn super::daemonset::DaemonSetStore {
+        self.dependencies.daemonset_store.as_ref()
+    }
+
+    pub(crate) fn job_store(&self) -> &dyn super::job::JobStore {
+        self.dependencies.job_store.as_ref()
+    }
+
+    pub(crate) fn service_store(&self) -> &dyn super::service::ServiceControllerStore {
+        self.dependencies.service_store.as_ref()
+    }
+
+    pub(crate) fn pvc_store(&self) -> &dyn super::pvc::PvcStore {
+        self.dependencies.pvc_store.as_ref()
+    }
+
+    pub(crate) fn pdb_store(&self) -> &dyn super::pdb::PdbStore {
+        self.dependencies.pdb_store.as_ref()
+    }
+
+    pub(crate) fn replicationcontroller_store(
+        &self,
+    ) -> &dyn super::replicationcontroller::ReplicationControllerStore {
+        self.dependencies.replicationcontroller_store.as_ref()
+    }
+
+    pub(crate) fn apiservice_store(&self) -> &dyn super::apiservice::ApiServiceStore {
+        self.dependencies.apiservice_store.as_ref()
+    }
+
+    pub(crate) fn csr_status_store(&self) -> &dyn super::csr_signer::CsrStatusStore {
+        self.dependencies.csr_status_store.as_ref()
+    }
+
+    pub(crate) fn pod_query(&self) -> &dyn klights_pod_api::PodQuery {
+        self.dependencies.pod_query.as_ref()
+    }
+
+    pub(crate) fn pdb_reader(&self) -> &dyn super::pdb::PdbPodReader {
+        self.dependencies.pdb_pod_reader.as_ref()
+    }
+
+    pub(crate) fn deployment_reader(&self) -> &dyn super::DeploymentControllerPodReader {
+        self.dependencies.deployment_pod_reader.as_ref()
+    }
+
+    pub(crate) fn deployment_mutation(&self) -> &dyn super::DeploymentControllerPodMutation {
+        self.dependencies.deployment_pod_mutation.as_ref()
+    }
+
+    pub(crate) fn replicaset_mutation(&self) -> &dyn super::replicaset::ReplicaSetPodMutation {
+        self.dependencies.replicaset_pod_mutation.as_ref()
+    }
+
+    pub(crate) fn statefulset_mutation(&self) -> &dyn super::statefulset::StatefulSetPodMutation {
+        self.dependencies.statefulset_pod_mutation.as_ref()
+    }
+
+    pub(crate) fn daemonset_mutation(&self) -> &dyn super::daemonset::DaemonSetPodMutation {
+        self.dependencies.daemonset_pod_mutation.as_ref()
+    }
+
+    pub(crate) fn job_mutation(&self) -> &dyn super::job::JobPodMutation {
+        self.dependencies.job_pod_mutation.as_ref()
+    }
+
+    pub(crate) fn replicationcontroller_mutation(
+        &self,
+    ) -> &dyn super::replicationcontroller::ReplicationControllerPodMutation {
+        self.dependencies
+            .replicationcontroller_pod_mutation
+            .as_ref()
+    }
+
+    pub(crate) fn pod_delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
+        self.dependencies.pod_delete_sink.as_ref()
     }
 
     pub(crate) fn reconcile_port(&self) -> &dyn super::ControllerReconcilePort {
@@ -378,10 +490,10 @@ macro_rules! controller_wrapper {
                 ctx: $crate::controllers::Context,
             ) -> ::anyhow::Result<()> {
                 $core_fn(
-                    ctx.leader().$store(),
-                    ctx.pods().$reader(),
-                    ctx.pods().$mutation(),
-                    ctx.pods().delete_sink(),
+                    ctx.$store(),
+                    ctx.$reader(),
+                    ctx.$mutation(),
+                    ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
                     $crate::controllers::ControllerReconcileContext::new(
@@ -406,7 +518,7 @@ macro_rules! controller_wrapper {
                 resource: ::serde_json::Value,
                 ctx: $crate::controllers::Context,
             ) -> ::anyhow::Result<()> {
-                $core_fn(ctx.leader().$store(), &resource).await
+                $core_fn(ctx.$store(), &resource).await
             }
         }
     };
@@ -429,7 +541,7 @@ macro_rules! controller_wrapper {
                 $core_fn(
                     ctx.effects().file_process(),
                     ctx.effects().local_path_provisioner_root(),
-                    ctx.leader().$store(),
+                    ctx.$store(),
                     &resource,
                 )
                 .await
@@ -455,10 +567,10 @@ macro_rules! controller_wrapper {
                 ctx: $crate::controllers::Context,
             ) -> ::anyhow::Result<()> {
                 $core_fn(
-                    ctx.leader().$store(),
-                    ctx.pods().query(),
-                    ctx.pods().$mutation(),
-                    ctx.pods().delete_sink(),
+                    ctx.$store(),
+                    ctx.pod_query(),
+                    ctx.$mutation(),
+                    ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     ctx.coordination(),
                     &resource,
@@ -483,7 +595,7 @@ macro_rules! controller_wrapper {
                 resource: ::serde_json::Value,
                 ctx: $crate::controllers::Context,
             ) -> ::anyhow::Result<()> {
-                $core_fn(ctx.leader().$store(), ctx.pods().$reader(), &resource).await
+                $core_fn(ctx.$store(), ctx.$reader(), &resource).await
             }
         }
     };
@@ -505,10 +617,10 @@ macro_rules! controller_wrapper {
                 ctx: $crate::controllers::Context,
             ) -> ::anyhow::Result<()> {
                 $core_fn(
-                    ctx.leader().$store(),
-                    ctx.pods().query(),
-                    ctx.pods().$mutation(),
-                    ctx.pods().delete_sink(),
+                    ctx.$store(),
+                    ctx.pod_query(),
+                    ctx.$mutation(),
+                    ctx.pod_delete_sink(),
                     ctx.reconcile_port().non_pod_finalization(),
                     &resource,
                     $crate::controllers::ControllerReconcileContext::new(

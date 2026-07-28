@@ -1050,6 +1050,14 @@ mod tests {
             "worker-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
+        client.set_namespace_termination(
+            crate::api_state_adapter_test_owner::RootNamespaceTerminationReconciler::new(
+                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(Arc::new(
+                    db.clone(),
+                )),
+                crate::side_effects::SideEffectMetrics::new(),
+            ),
+        );
         client.set_non_pod_finalization(Arc::new(
             crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone())),
         ));

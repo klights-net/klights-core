@@ -1,6 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 
 const COREDNS_KUBECONFIG_PORT_ANNOTATION: &str = "klights.dev/kubeconfig-port";
@@ -18,23 +19,26 @@ pub(crate) enum CoreDnsResourceKind {
 
 #[async_trait]
 pub(crate) trait CoreDnsBootstrapStore: Send + Sync {
-    async fn get_coredns_resource(&self, kind: CoreDnsResourceKind) -> Result<Option<Resource>>;
+    async fn get_coredns_resource(
+        &self,
+        kind: CoreDnsResourceKind,
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn create_coredns_resource(
         &self,
         kind: CoreDnsResourceKind,
         value: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn update_coredns_resource(
         &self,
         kind: CoreDnsResourceKind,
         value: Value,
         expected_resource_version: i64,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn reconcile_coredns_deployment(
         &self,
         deployment: Resource,
         node_name: &str,
-    ) -> Result<()>;
+    ) -> ControllerStoreResult<()>;
 }
 
 /// Derive the DNS service ClusterIP from the service CIDR.
@@ -487,11 +491,15 @@ mod tests {
         node_name: &str,
     ) -> anyhow::Result<()> {
         let controller_pods = std::sync::Arc::new(
-            crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(pod_repository),
+            crate::controller_runtime_adapter::RootControllerPodPort::new_for_test(
+                pod_repository.clone(),
+            ),
         );
         bootstrap_coredns_root(
             db,
+            pod_repository.clone(),
             controller_pods,
+            pod_repository,
             crate::controllers::test_utils::non_pod_finalization_port_for_test(),
             &crate::controllers::ControllerCoordination::new(),
             crate::coredns_bootstrap_adapter::CoreDnsBootstrapConfig {
@@ -515,7 +523,7 @@ mod tests {
         async fn get_coredns_resource(
             &self,
             _kind: CoreDnsResourceKind,
-        ) -> Result<Option<Resource>> {
+        ) -> ControllerStoreResult<Option<Resource>> {
             Ok(None)
         }
 
@@ -523,9 +531,11 @@ mod tests {
             &self,
             kind: CoreDnsResourceKind,
             value: Value,
-        ) -> Result<Resource> {
+        ) -> ControllerStoreResult<Resource> {
             self.created.lock().unwrap().push(kind);
-            Ok(Resource::try_from_data(std::sync::Arc::new(value))?)
+            Resource::try_from_data(std::sync::Arc::new(value)).map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::internal(error.to_string())
+            })
         }
 
         async fn update_coredns_resource(
@@ -533,7 +543,7 @@ mod tests {
             _kind: CoreDnsResourceKind,
             _value: Value,
             _expected_resource_version: i64,
-        ) -> Result<Resource> {
+        ) -> ControllerStoreResult<Resource> {
             unreachable!("empty fake store never updates")
         }
 
@@ -541,7 +551,7 @@ mod tests {
             &self,
             _deployment: Resource,
             _node_name: &str,
-        ) -> Result<()> {
+        ) -> ControllerStoreResult<()> {
             *self.reconciled_deployments.lock().unwrap() += 1;
             Ok(())
         }

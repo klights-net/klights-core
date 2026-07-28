@@ -1,8 +1,9 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::{Value, json};
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::hpa::{
     HpaRuntime, ScaleTarget, ScaleTargetKind, reconcile_hpa_with_runtime,
 };
@@ -139,7 +140,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         api_version: &str,
         namespace: &str,
         name: &str,
-    ) -> Result<Option<Resource>> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Option<Resource>> {
         self.db
             .get_resource(
                 api_version,
@@ -148,6 +149,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                 name,
             )
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn get_scale_target(
@@ -156,20 +158,30 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         kind: &str,
         namespace: &str,
         name: &str,
-    ) -> Result<Option<Resource>> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Option<Resource>> {
         self.db
             .get_resource(api_version, kind, Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn list_pods(&self, namespace: &str) -> Result<Vec<Resource>> {
+    async fn list_pods(
+        &self,
+        namespace: &str,
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         PodReader::list_pods(self.pod_repository, Some(namespace), None, None, None, None)
             .await
             .map(|listing| listing.items)
+            .map_err(map_controller_store_error)
     }
 
-    async fn patch_scale_target(&self, target: &ScaleTarget, replicas: i64) -> Result<Resource> {
-        self.db
+    async fn patch_scale_target(
+        &self,
+        target: &ScaleTarget,
+        replicas: i64,
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
+        let patched = self
+            .db
             .patch_resource_latest_with_preconditions(
                 target.api_version,
                 target.kind,
@@ -181,14 +193,14 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     ResourcePreconditions::uid(target.uid.clone()),
                 ),
             )
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "{} {} disappeared during HPA scale",
-                    target.kind,
-                    target.name
-                )
-            })
+            .await
+            .map_err(map_controller_store_error)?;
+        patched.ok_or_else(|| {
+            klights_reconcile_api::ControllerStoreError::not_found(format!(
+                "{} {} disappeared during HPA scale",
+                target.kind, target.name
+            ))
+        })
     }
 
     async fn reconcile_scaled_target(
@@ -196,54 +208,42 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
         target: &ScaleTarget,
         resource: &Value,
         node_name: &str,
-    ) -> Result<()> {
+    ) -> klights_reconcile_api::ControllerStoreResult<()> {
         let pods = self.pod_repository;
         match target.kind_tag {
-            ScaleTargetKind::Deployment => {
-                crate::controllers::deployment::reconcile_deployment(
-                    self.db,
-                    pods,
-                    pods,
-                    pods,
-                    self.non_pod_finalization,
-                    resource,
-                    crate::controllers::ControllerReconcileContext::new(
-                        self.coordination,
-                        node_name,
-                    ),
-                )
-                .await
-            }
-            ScaleTargetKind::ReplicaSet => {
-                crate::controllers::replicaset::reconcile_replicaset(
-                    self.db,
-                    pods,
-                    pods,
-                    pods,
-                    self.non_pod_finalization,
-                    resource,
-                    crate::controllers::ControllerReconcileContext::new(
-                        self.coordination,
-                        node_name,
-                    ),
-                )
-                .await
-            }
-            ScaleTargetKind::StatefulSet => {
-                crate::controllers::statefulset::reconcile_statefulset(
-                    self.db,
-                    pods,
-                    pods,
-                    pods,
-                    self.non_pod_finalization,
-                    resource,
-                    crate::controllers::ControllerReconcileContext::new(
-                        self.coordination,
-                        node_name,
-                    ),
-                )
-                .await
-            }
+            ScaleTargetKind::Deployment => crate::controllers::deployment::reconcile_deployment(
+                self.db,
+                pods,
+                pods,
+                pods,
+                self.non_pod_finalization,
+                resource,
+                crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+            )
+            .await
+            .map_err(map_controller_store_error),
+            ScaleTargetKind::ReplicaSet => crate::controllers::replicaset::reconcile_replicaset(
+                self.db,
+                pods,
+                pods,
+                pods,
+                self.non_pod_finalization,
+                resource,
+                crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+            )
+            .await
+            .map_err(map_controller_store_error),
+            ScaleTargetKind::StatefulSet => crate::controllers::statefulset::reconcile_statefulset(
+                self.db,
+                pods,
+                pods,
+                pods,
+                self.non_pod_finalization,
+                resource,
+                crate::controllers::ControllerReconcileContext::new(self.coordination, node_name),
+            )
+            .await
+            .map_err(map_controller_store_error),
             ScaleTargetKind::ReplicationController => {
                 crate::controllers::replicationcontroller::reconcile_replicationcontroller(
                     self.db,
@@ -258,11 +258,16 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
                     ),
                 )
                 .await
+                .map_err(map_controller_store_error)
             }
         }
     }
 
-    async fn update_hpa_status(&self, current: &Resource, status: Value) -> Result<()> {
+    async fn update_hpa_status(
+        &self,
+        current: &Resource,
+        status: Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<()> {
         self.db
             .update_status_only_with_preconditions(
                 &current.api_version,
@@ -274,10 +279,7 @@ impl HpaRuntime for HpaControllerAdapter<'_> {
             )
             .await
             .map(|_| ())
-    }
-
-    fn is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::datastore::errors::is_conflict_error(error)
+            .map_err(map_controller_store_error)
     }
 }
 

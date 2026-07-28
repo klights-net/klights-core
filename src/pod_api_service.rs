@@ -2351,6 +2351,24 @@ impl klights_pod_api::PodApiMutation for PodApiService {
             .map_err(|error| map_api_error_to_pod_repository(error, &request.namespace, ""))
         })
     }
+
+    fn bind_pod(
+        &self,
+        request: klights_pod_api::PodBindingRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            self.bind_pod_from_api(
+                &request.namespace,
+                &request.name,
+                request.binding,
+                request.dry_run,
+            )
+            .await
+            .map_err(|error| {
+                map_api_error_to_pod_repository(error, &request.namespace, &request.name)
+            })
+        })
+    }
 }
 
 #[cfg(test)]

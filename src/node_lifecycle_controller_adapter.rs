@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt as _;
@@ -10,6 +9,7 @@ use klights_leader_api::{
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::node_lifecycle::{
     NodeLifecyclePodStore, NodeLifecycleStore, NodeLostPodLifecycleSink,
 };
@@ -26,14 +26,17 @@ impl<T> NodeLifecycleStore for T
 where
     T: DatastoreBackend + Send + Sync + ?Sized,
 {
-    async fn list_nodes(&self) -> Result<Vec<Resource>> {
+    async fn list_nodes(&self) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         Ok(self
             .list_resources("v1", "Node", None, ResourceListQuery::all())
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
-    async fn list_node_leases(&self) -> Result<Vec<Resource>> {
+    async fn list_node_leases(
+        &self,
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         Ok(self
             .list_resources(
                 "coordination.k8s.io/v1",
@@ -41,7 +44,8 @@ where
                 Some("kube-node-lease"),
                 ResourceListQuery::all(),
             )
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 }
@@ -51,11 +55,15 @@ impl<T> NodeLifecyclePodStore for T
 where
     T: PodReader + PodSubresourceWriter + Send + Sync + ?Sized,
 {
-    async fn list_pods_bound_to_node(&self, node_name: &str) -> Result<Vec<Resource>> {
+    async fn list_pods_bound_to_node(
+        &self,
+        node_name: &str,
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         let field_selector = format!("spec.nodeName={node_name}");
         Ok(
             PodReader::list_pods(self, None, None, Some(&field_selector), None, None)
-                .await?
+                .await
+                .map_err(map_controller_store_error)?
                 .items,
         )
     }
@@ -64,7 +72,7 @@ where
         &self,
         pod: &Resource,
         status: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Resource> {
         PodSubresourceWriter::replace_status_from_api_for_uid(
             self,
             pod.namespace.as_deref().unwrap_or("default"),
@@ -74,12 +82,16 @@ where
             pod.resource_version,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 }
 
 #[async_trait]
 impl NodeLostPodLifecycleSink for PodLifecycleRouter {
-    async fn enqueue_node_lost_cleanup(&self, pod: Resource) -> Result<()> {
+    async fn enqueue_node_lost_cleanup(
+        &self,
+        pod: Resource,
+    ) -> klights_reconcile_api::ControllerStoreResult<()> {
         let namespace = pod.namespace.as_deref().unwrap_or("default");
         enqueue_orphan_finalize(
             self,
@@ -87,7 +99,9 @@ impl NodeLostPodLifecycleSink for PodLifecycleRouter {
             OrphanReason::NodeLost,
         )
         .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map_err(|error| {
+            klights_reconcile_api::ControllerStoreError::unavailable(error.to_string())
+        })
     }
 }
 

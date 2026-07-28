@@ -151,11 +151,14 @@ pub(in crate::api) async fn maybe_reconcile_service_after_controller_endpointsli
         return Ok(());
     };
 
-    let Some(service) = state
-        .resource_mutation()
-        .db
-        .get_resource("v1", "Service", Some(namespace), service_name)
-        .await?
+    let Some(service) = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Service",
+        Some(namespace),
+        service_name,
+    )
+    .await?
     else {
         return Ok(());
     };

@@ -1,280 +1,243 @@
 use std::sync::Arc;
 
-use klights_cluster_core::{Resource, ResourcePatchRequest, ResourcePreconditions};
+use klights_cluster_core::Resource;
 use serde_json::Value;
 
 use crate::api::state_ports::{
     ApiFailureEntry, ApiFailureMetrics, ApiNodeLeaseObservations, ApiNodeLeaseObservedFuture,
-    ApiPodRepository, ApiResourceStore,
+    ApiPodRepository,
 };
-use crate::api::{AppError, NamespaceTerminationStore};
 use crate::datastore::DatastoreHandle;
 
-pub(crate) struct RootApiResourceStore {
-    inner: DatastoreHandle,
-    watch: crate::watch_stream_adapter::DatastoreWatchStreamAdapter,
+fn validate_effect_authority() -> anyhow::Result<()> {
+    klights_leader_api::validate_authority_if_scoped()
+        .map_err(|error| anyhow::anyhow!("leader authority rejected effect: {error}"))?;
+    klights_leader_api::validate_controller_lease_if_scoped()
+        .map_err(|error| anyhow::anyhow!("controller authority rejected effect: {error}"))
 }
 
-impl RootApiResourceStore {
-    pub(crate) fn new(
-        inner: DatastoreHandle,
-        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            watch: crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
-                inner.clone(),
-                watch_signals,
-            ),
-            inner,
+fn validate_pod_effect_authority() -> Result<(), klights_pod_api::PodRepositoryError> {
+    klights_leader_api::validate_authority_if_scoped().map_err(|error| {
+        klights_pod_api::PodRepositoryError::unavailable(format!(
+            "leader authority rejected Pod effect: {error}"
+        ))
+    })?;
+    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+        klights_pod_api::PodRepositoryError::unavailable(format!(
+            "controller authority rejected Pod effect: {error}"
+        ))
+    })
+}
+
+pub(crate) struct RootNamespaceTerminationStore {
+    inner: DatastoreHandle,
+}
+
+impl RootNamespaceTerminationStore {
+    pub(crate) fn new(inner: DatastoreHandle) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+fn map_namespace_lifecycle_error(
+    error: anyhow::Error,
+) -> klights_reconcile_api::NamespaceLifecycleError {
+    let message = error.to_string();
+    if message.to_ascii_lowercase().contains("not found") {
+        klights_reconcile_api::NamespaceLifecycleError::NotFound { message }
+    } else if crate::datastore::errors::is_conflict_error(&error) {
+        klights_reconcile_api::NamespaceLifecycleError::Conflict { message }
+    } else {
+        klights_reconcile_api::NamespaceLifecycleError::Internal { message }
+    }
+}
+
+impl klights_reconcile_api::NamespaceLifecycleStore for RootNamespaceTerminationStore {
+    fn get_terminating_namespace(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            self.inner
+                .get_namespace(&namespace)
+                .await
+                .map_err(map_namespace_lifecycle_error)
+        })
+    }
+
+    fn list_namespace_pods(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
+        Box::pin(async move {
+            self.inner
+                .list_namespace_resources_of_kind(&namespace, "Pod")
+                .await
+                .map_err(map_namespace_lifecycle_error)
+        })
+    }
+
+    fn mark_namespace_pod_terminating(
+        &self,
+        pod: Resource,
+        namespace: String,
+        body: Value,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            validate_effect_authority().map_err(|error| {
+                klights_reconcile_api::NamespaceLifecycleError::Unavailable {
+                    message: error.to_string(),
+                }
+            })?;
+            self.inner
+                .update_resource_with_preconditions(
+                    &pod.api_version,
+                    &pod.kind,
+                    Some(&namespace),
+                    &pod.name,
+                    body,
+                    klights_cluster_core::ResourcePreconditions::from_resource(&pod),
+                )
+                .await
+                .map_err(map_namespace_lifecycle_error)?;
+            Ok(())
+        })
+    }
+
+    fn update_terminating_namespace(
+        &self,
+        namespace: String,
+        body: Value,
+        expected_resource_version: i64,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Resource> {
+        Box::pin(async move {
+            validate_effect_authority().map_err(|error| {
+                klights_reconcile_api::NamespaceLifecycleError::Unavailable {
+                    message: error.to_string(),
+                }
+            })?;
+            self.inner
+                .update_namespace(&namespace, body, expected_resource_version)
+                .await
+                .map_err(map_namespace_lifecycle_error)
+        })
+    }
+
+    fn list_namespace_non_pod_resources(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, Vec<Resource>> {
+        Box::pin(async move {
+            self.inner
+                .list_namespace_resources_excluding_kind(&namespace, "Pod")
+                .await
+                .map_err(map_namespace_lifecycle_error)
+        })
+    }
+
+    fn delete_namespace_non_pod_resource(
+        &self,
+        resource: Resource,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            validate_effect_authority().map_err(|error| {
+                klights_reconcile_api::NamespaceLifecycleError::Unavailable {
+                    message: error.to_string(),
+                }
+            })?;
+            self.inner
+                .delete_resource(
+                    &resource.api_version,
+                    &resource.kind,
+                    Some(&namespace),
+                    &resource.name,
+                )
+                .await
+                .map_err(map_namespace_lifecycle_error)
+        })
+    }
+
+    fn count_namespace_resources(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, i64> {
+        Box::pin(async move {
+            self.inner
+                .count_namespace_resources(&namespace)
+                .await
+                .map_err(map_namespace_lifecycle_error)
+        })
+    }
+
+    fn delete_terminating_namespace(
+        &self,
+        namespace: String,
+    ) -> klights_reconcile_api::NamespaceLifecycleFuture<'_, ()> {
+        Box::pin(async move {
+            validate_effect_authority().map_err(|error| {
+                klights_reconcile_api::NamespaceLifecycleError::Unavailable {
+                    message: error.to_string(),
+                }
+            })?;
+            self.inner
+                .delete_namespace(&namespace)
+                .await
+                .map_err(map_namespace_lifecycle_error)
         })
     }
 }
 
-impl crate::api::watch_stream::WatchStreamSource for RootApiResourceStore {
-    fn wait_until_fresh<'a>(
-        &'a self,
-        target_rv: i64,
-        api_version: &'a str,
-        kind: &'a str,
-        task_supervisor: &'a klights_supervisor::TaskSupervisor,
-    ) -> crate::api::watch_stream::WatchSourceWaitFuture<'a> {
-        crate::api::watch_stream::WatchStreamSource::wait_until_fresh(
-            &self.watch,
-            target_rv,
-            api_version,
-            kind,
-            task_supervisor,
-        )
-    }
+pub(crate) struct RootNamespaceTerminationReconciler {
+    store: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
+    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+}
 
-    fn list_watch_resources<'a>(
-        &'a self,
-        api_version: &'a str,
-        kind: &'a str,
-        namespace: Option<&'a str>,
-        label_selector: Option<&'a str>,
-        field_selector: Option<&'a str>,
-        limit: Option<i64>,
-    ) -> crate::api::watch_stream::WatchSourceListFuture<'a> {
-        crate::api::watch_stream::WatchStreamSource::list_watch_resources(
-            &self.watch,
-            api_version,
-            kind,
-            namespace,
-            label_selector,
-            field_selector,
-            limit,
-        )
-    }
-
-    fn watch_resources(
-        &self,
-        request: klights_leader_api::WatchRequest,
-    ) -> klights_leader_api::LeaderWatchFuture<'_> {
-        crate::api::watch_stream::WatchStreamSource::watch_resources(&self.watch, request)
+impl RootNamespaceTerminationReconciler {
+    pub(crate) fn new(
+        store: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
+        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    ) -> Arc<Self> {
+        Arc::new(Self { store, metrics })
     }
 }
 
-#[async_trait::async_trait]
-impl NamespaceTerminationStore for RootApiResourceStore {
-    async fn get_terminating_namespace(
+impl klights_reconcile_api::NamespaceTerminationSink for RootNamespaceTerminationReconciler {
+    fn reconcile_namespace_termination(
         &self,
-        namespace: &str,
-    ) -> Result<Option<Resource>, AppError> {
-        NamespaceTerminationStore::get_terminating_namespace(self.inner.as_ref(), namespace).await
-    }
-
-    async fn list_namespace_pods(&self, namespace: &str) -> Result<Vec<Resource>, AppError> {
-        NamespaceTerminationStore::list_namespace_pods(self.inner.as_ref(), namespace).await
-    }
-
-    async fn mark_namespace_pod_terminating(
-        &self,
-        pod: &Resource,
-        namespace: &str,
-        body: Value,
-    ) -> Result<(), AppError> {
-        NamespaceTerminationStore::mark_namespace_pod_terminating(
-            self.inner.as_ref(),
-            pod,
-            namespace,
-            body,
-        )
-        .await
-    }
-
-    async fn update_terminating_namespace(
-        &self,
-        namespace: &str,
-        body: Value,
-        expected_resource_version: i64,
-    ) -> Result<Resource, AppError> {
-        NamespaceTerminationStore::update_terminating_namespace(
-            self.inner.as_ref(),
-            namespace,
-            body,
-            expected_resource_version,
-        )
-        .await
-    }
-
-    async fn list_namespace_non_pod_resources(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<Resource>, AppError> {
-        NamespaceTerminationStore::list_namespace_non_pod_resources(self.inner.as_ref(), namespace)
-            .await
-    }
-
-    async fn delete_namespace_non_pod_resource(
-        &self,
-        resource: &Resource,
-        namespace: &str,
-    ) -> Result<(), AppError> {
-        NamespaceTerminationStore::delete_namespace_non_pod_resource(
-            self.inner.as_ref(),
-            resource,
-            namespace,
-        )
-        .await
-    }
-
-    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64, AppError> {
-        NamespaceTerminationStore::count_namespace_resources(self.inner.as_ref(), namespace).await
-    }
-
-    async fn delete_terminating_namespace(&self, namespace: &str) -> anyhow::Result<()> {
-        NamespaceTerminationStore::delete_terminating_namespace(self.inner.as_ref(), namespace)
-            .await
-    }
-}
-
-#[async_trait::async_trait]
-impl ApiResourceStore for RootApiResourceStore {
-    async fn create_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-    ) -> anyhow::Result<Resource> {
-        self.inner
-            .create_resource(api_version, kind, namespace, name, data)
-            .await
-    }
-
-    async fn get_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> anyhow::Result<Option<Resource>> {
-        self.inner
-            .get_resource(api_version, kind, namespace, name)
-            .await
-    }
-
-    async fn update_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<Resource> {
-        self.inner
-            .update_resource(
-                api_version,
-                kind,
-                namespace,
-                name,
-                data,
-                expected_resource_version,
-            )
-            .await
-    }
-
-    async fn update_status_only_with_preconditions(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        preconditions: ResourcePreconditions,
-    ) -> anyhow::Result<Resource> {
-        self.inner
-            .update_status_only_with_preconditions(
-                api_version,
-                kind,
-                namespace,
-                name,
-                status,
-                preconditions,
-            )
-            .await
-    }
-
-    async fn patch_resource_latest_with_preconditions(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        request: ResourcePatchRequest,
-    ) -> anyhow::Result<Option<Resource>> {
-        self.inner
-            .patch_resource_latest_with_preconditions(api_version, kind, namespace, name, request)
-            .await
-    }
-
-    async fn delete_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .delete_resource(api_version, kind, namespace, name)
-            .await
-    }
-
-    async fn list_resource_keys_for_scope(
-        &self,
-        api_version: String,
-        kind: String,
-        namespaced: bool,
-    ) -> anyhow::Result<Vec<(Option<String>, String)>> {
-        self.inner
-            .list_resource_keys_for_scope(api_version, kind, namespaced)
-            .await
-    }
-
-    async fn create_namespace(&self, name: &str, data: Value) -> anyhow::Result<Resource> {
-        self.inner.create_namespace(name, data).await
-    }
-
-    async fn get_namespace(&self, name: &str) -> anyhow::Result<Option<Resource>> {
-        self.inner.get_namespace(name).await
-    }
-
-    async fn update_namespace(
-        &self,
-        name: &str,
-        data: Value,
-        expected_resource_version: i64,
-    ) -> anyhow::Result<Resource> {
-        self.inner
-            .update_namespace(name, data, expected_resource_version)
-            .await
-    }
-
-    async fn delete_namespace(&self, name: &str) -> anyhow::Result<()> {
-        self.inner.delete_namespace(name).await
+        request: klights_reconcile_api::NamespaceTerminationRequest,
+    ) -> klights_reconcile_api::NamespaceTerminationFuture<'_> {
+        Box::pin(async move {
+            let outcome = match request.expected_uid {
+                Some(uid) => {
+                    crate::api::reconcile_namespace_termination_for_uid_with_outcome(
+                        self.store.as_ref(),
+                        &request.namespace,
+                        &uid,
+                        self.metrics.as_ref(),
+                    )
+                    .await
+                }
+                None => crate::api::reconcile_namespace_termination(
+                    self.store.as_ref(),
+                    &request.namespace,
+                    self.metrics.as_ref(),
+                )
+                .await
+                .map(|()| crate::api::NamespaceTerminationOutcome::Finalized),
+            }
+            .map_err(|error| {
+                klights_reconcile_api::ReconcileSinkError::unavailable(format!("{error:?}"))
+            })?;
+            Ok(match outcome {
+                crate::api::NamespaceTerminationOutcome::Finalized => {
+                    klights_reconcile_api::NamespaceTerminationOutcome::Finalized
+                }
+                crate::api::NamespaceTerminationOutcome::StillPending => {
+                    klights_reconcile_api::NamespaceTerminationOutcome::StillPending
+                }
+            })
+        })
     }
 }
 
@@ -285,6 +248,7 @@ pub(crate) struct RootApiPodRepository {
 }
 
 impl RootApiPodRepository {
+    #[cfg(not(test))]
     pub(crate) fn new(
         inner: Arc<crate::kubelet::pod_repository::PodRepository>,
         api: Arc<crate::pod_api_service::PodApiService>,
@@ -335,35 +299,61 @@ impl klights_pod_api::PodApiMutation for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodApiCreateRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiCreateResult> {
-        klights_pod_api::PodApiMutation::create_pod(self.api.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodApiMutation::create_pod(self.api.as_ref(), request).await
+        })
     }
 
     fn update_pod(
         &self,
         request: klights_pod_api::PodApiUpdateRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
-        klights_pod_api::PodApiMutation::update_pod(self.api.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodApiMutation::update_pod(self.api.as_ref(), request).await
+        })
     }
 
     fn patch_pod(
         &self,
         request: klights_pod_api::PodApiPatchRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiWriteOutcome> {
-        klights_pod_api::PodApiMutation::patch_pod(self.api.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodApiMutation::patch_pod(self.api.as_ref(), request).await
+        })
     }
 
     fn delete_pod(
         &self,
         request: klights_pod_api::PodApiDeleteRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodApiDeleteOutcome> {
-        klights_pod_api::PodApiMutation::delete_pod(self.api.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodApiMutation::delete_pod(self.api.as_ref(), request).await
+        })
     }
 
     fn delete_collection_pods(
         &self,
         request: klights_pod_api::PodApiDeleteCollectionRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
-        klights_pod_api::PodApiMutation::delete_collection_pods(self.api.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodApiMutation::delete_collection_pods(self.api.as_ref(), request)
+                .await
+        })
+    }
+
+    fn bind_pod(
+        &self,
+        request: klights_pod_api::PodBindingRequest,
+    ) -> klights_pod_api::PodRepositoryFuture<'_, ()> {
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodApiMutation::bind_pod(self.api.as_ref(), request).await
+        })
     }
 }
 
@@ -372,24 +362,42 @@ impl klights_pod_api::PodSubresourceMutation for RootApiPodRepository {
         &self,
         request: klights_pod_api::PodStatusReplaceRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        klights_pod_api::PodSubresourceMutation::replace_status(self.subresource.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodSubresourceMutation::replace_status(
+                self.subresource.as_ref(),
+                request,
+            )
+            .await
+        })
     }
 
     fn patch_status(
         &self,
         request: klights_pod_api::PodStatusPatchRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        klights_pod_api::PodSubresourceMutation::patch_status(self.subresource.as_ref(), request)
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodSubresourceMutation::patch_status(
+                self.subresource.as_ref(),
+                request,
+            )
+            .await
+        })
     }
 
     fn update_ephemeral_containers(
         &self,
         request: klights_pod_api::PodEphemeralContainersRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, Resource> {
-        klights_pod_api::PodSubresourceMutation::update_ephemeral_containers(
-            self.subresource.as_ref(),
-            request,
-        )
+        Box::pin(async move {
+            validate_pod_effect_authority()?;
+            klights_pod_api::PodSubresourceMutation::update_ephemeral_containers(
+                self.subresource.as_ref(),
+                request,
+            )
+            .await
+        })
     }
 }
 
@@ -399,6 +407,7 @@ impl klights_pod_api::PodEvictionDelete for RootApiPodRepository {
         request: klights_pod_api::PodEvictionDeleteRequest,
     ) -> klights_pod_api::PodRepositoryFuture<'_, klights_pod_api::PodEvictionDeleteOutcome> {
         Box::pin(async move {
+            validate_pod_effect_authority()?;
             let (namespace, name, options, dry_run) = request.into_parts();
             let outcome = self
                 .api
@@ -451,23 +460,6 @@ impl ApiPodRepository for RootApiPodRepository {
     fn namespace_bootstrap_port(&self) -> Arc<dyn klights_reconcile_api::NamespaceBootstrapSink> {
         self.inner.namespace_bootstrap_port()
     }
-
-    fn bind_pod_from_api(
-        &self,
-        namespace: &str,
-        name: &str,
-        binding: Value,
-        dry_run: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
-        let namespace = namespace.to_owned();
-        let name = name.to_owned();
-        Box::pin(async move {
-            self.api
-                .bind_pod_from_api(&namespace, &name, binding, dry_run)
-                .await
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-        })
-    }
 }
 
 pub(crate) struct RootApiFailureMetrics {
@@ -475,6 +467,7 @@ pub(crate) struct RootApiFailureMetrics {
 }
 
 impl RootApiFailureMetrics {
+    #[cfg(not(test))]
     pub(crate) fn new(inner: Arc<crate::side_effects::SideEffectMetrics>) -> Arc<Self> {
         Arc::new(Self { inner })
     }
@@ -529,6 +522,7 @@ pub(crate) struct RootApiNodeLeaseObservations {
 }
 
 impl RootApiNodeLeaseObservations {
+    #[cfg(not(test))]
     pub(crate) fn new(inner: Arc<crate::node_lease_tracker::NodeLeaseTracker>) -> Arc<Self> {
         Arc::new(Self { inner })
     }
@@ -542,5 +536,62 @@ impl ApiNodeLeaseObservations for RootApiNodeLeaseObservations {
                 .await
                 .map(|observation| observation.renew_time_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use klights_leader_api::{AuthorityRoute, LeaderAuthority};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn stale_http_authority_scope_rejects_write_after_demote_promote_aba() {
+        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let store = RootNamespaceTerminationStore::new(db.clone());
+        let (authority, publisher) =
+            crate::authority_adapter::WatchLeaderAuthority::channel(true, None);
+        let AuthorityRoute::Local(permit) = authority.route() else {
+            panic!("test authority must begin local");
+        };
+        let reached_effect_boundary = Arc::new(tokio::sync::Notify::new());
+        let resume_effect = Arc::new(tokio::sync::Notify::new());
+        let operation = klights_leader_api::scope_authority(authority, permit, {
+            let reached_effect_boundary = reached_effect_boundary.clone();
+            let resume_effect = resume_effect.clone();
+            async move {
+                reached_effect_boundary.notify_one();
+                resume_effect.notified().await;
+                klights_reconcile_api::NamespaceLifecycleStore::update_terminating_namespace(
+                    store.as_ref(),
+                    "stale-http-write".to_string(),
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": "stale-http-write"
+                        }
+                    }),
+                    1,
+                )
+                .await
+            }
+        });
+        let transition = async {
+            reached_effect_boundary.notified().await;
+            publisher.publish(false, None);
+            publisher.publish(true, None);
+            resume_effect.notify_one();
+        };
+        let (result, ()) = tokio::join!(operation, transition);
+
+        let error = result.expect_err("stale HTTP permit must reject the write");
+        assert!(format!("{error:?}").contains("leader authority rejected effect"));
+        assert!(
+            db.get_namespace("stale-http-write")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -51,14 +51,39 @@ use super::ca_files::ReplicationRuntimeFiles;
 /// The transport owns no concrete replication application service. This
 /// contract moves with the transport in Phase 12A; the embedded replication
 /// adapter remains the implementation owner.
-#[async_trait::async_trait]
-pub(crate) trait GrpcReplicationRuntime: Send + Sync {
+pub(crate) trait GrpcRuntimeSupervision: Send + Sync {
     fn task_supervisor(&self) -> Arc<klights_supervisor::TaskSupervisor>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait GrpcBootstrapRuntime: Send + Sync {
     async fn validate_controlplane_bootstrap_token(
         &self,
         token: &str,
     ) -> Result<(), klights_leader_api::BootstrapTokenValidationError>;
     async fn handle_authenticated_join(&self, request: JoinRequest) -> JoinResponse;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum GrpcRuntimeError {
+    #[error("{operation} unavailable: {message}")]
+    Unavailable {
+        operation: &'static str,
+        message: String,
+    },
+}
+
+impl GrpcRuntimeError {
+    pub(crate) fn unavailable(operation: &'static str, message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            operation,
+            message: message.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait GrpcFollowerSessionRuntime: Send + Sync {
     async fn register_follower(
         &self,
         dataplane: klights_leader_api::NetworkDataplane,
@@ -67,32 +92,69 @@ pub(crate) trait GrpcReplicationRuntime: Send + Sync {
         &self,
         node_name: String,
         session_id: u64,
-    ) -> Result<tokio::sync::mpsc::Receiver<ReplicationEntry>>;
+    ) -> std::result::Result<tokio::sync::mpsc::Receiver<ReplicationEntry>, GrpcRuntimeError>;
     async fn update_follower_ack(&self, node_name: &str, applied_rv: i64);
+    async fn unregister_follower(&self, node_name: &str, session_id: u64);
+}
+
+#[async_trait::async_trait]
+pub(crate) trait GrpcFollowerCompletionRuntime: Send + Sync {
     async fn complete_node_exec_sync(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeExecSyncResponse,
-    ) -> Result<()>;
+    ) -> std::result::Result<(), GrpcRuntimeError>;
     async fn complete_node_log_event(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeLogEvent,
-    ) -> Result<()>;
+    ) -> std::result::Result<(), GrpcRuntimeError>;
     async fn complete_node_metrics(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeMetricsResponse,
-    ) -> Result<()>;
+    ) -> std::result::Result<(), GrpcRuntimeError>;
     async fn complete_node_exec_stream_frame(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeExecFrame,
-    ) -> Result<()>;
-    async fn unregister_follower(&self, node_name: &str, session_id: u64);
+    ) -> std::result::Result<(), GrpcRuntimeError>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait GrpcMetadataRuntime: Send + Sync {
     async fn handle_metadata(&self) -> MetadataResponse;
     async fn record_observed_peer_endpoint(&self, node_name: &str, endpoint: String);
     async fn observed_peer_endpoint(&self, node_name: &str) -> Option<String>;
+}
+
+#[derive(Clone)]
+pub(crate) struct GrpcReplicationRuntimePorts {
+    supervision: Arc<dyn GrpcRuntimeSupervision>,
+    bootstrap: Arc<dyn GrpcBootstrapRuntime>,
+    follower_sessions: Arc<dyn GrpcFollowerSessionRuntime>,
+    follower_completions: Arc<dyn GrpcFollowerCompletionRuntime>,
+    metadata: Arc<dyn GrpcMetadataRuntime>,
+}
+
+impl GrpcReplicationRuntimePorts {
+    pub(crate) fn from_shared<T>(shared: Arc<T>) -> Self
+    where
+        T: GrpcRuntimeSupervision
+            + GrpcBootstrapRuntime
+            + GrpcFollowerSessionRuntime
+            + GrpcFollowerCompletionRuntime
+            + GrpcMetadataRuntime
+            + 'static,
+    {
+        Self {
+            supervision: shared.clone(),
+            bootstrap: shared.clone(),
+            follower_sessions: shared.clone(),
+            follower_completions: shared.clone(),
+            metadata: shared,
+        }
+    }
 }
 
 const MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS: i64 = 100;
@@ -465,7 +527,7 @@ impl ReplicationServerPorts {
 }
 
 pub struct GrpcReplicationServer {
-    runtime: Arc<dyn GrpcReplicationRuntime>,
+    runtime: GrpcReplicationRuntimePorts,
     ports: ReplicationServerPorts,
     #[cfg(test)]
     db: Option<DatastoreHandle>,
@@ -496,13 +558,13 @@ pub struct GrpcReplicationServer {
 
 impl GrpcReplicationServer {
     fn from_parts(
-        runtime: Arc<dyn GrpcReplicationRuntime>,
+        runtime: GrpcReplicationRuntimePorts,
         ports: ReplicationServerPorts,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
         #[cfg(test)] db: Option<DatastoreHandle>,
     ) -> Self {
-        let controlplane_ca_files = ControlplaneCaFiles::new(runtime.task_supervisor());
+        let controlplane_ca_files = ControlplaneCaFiles::new(runtime.supervision.task_supervisor());
         Self {
             runtime,
             ports,
@@ -554,7 +616,7 @@ impl GrpcReplicationServer {
     }
 
     pub(crate) fn new_with_ports(
-        runtime: Arc<dyn GrpcReplicationRuntime>,
+        runtime: GrpcReplicationRuntimePorts,
         ports: ReplicationServerPorts,
         peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
         credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
@@ -641,7 +703,7 @@ impl GrpcReplicationServer {
         let ports = ReplicationServerPorts::from_shared(local, projected_token);
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
         Self::from_parts(
-            GrpcReplicationRuntimeAdapter::new(service),
+            GrpcReplicationRuntimePorts::from_shared(GrpcReplicationRuntimeAdapter::new(service)),
             ports,
             Arc::new(
                 crate::bootstrap::auth_adapters::AuthReplicationPeerAuthenticator::new(
@@ -831,6 +893,7 @@ impl GrpcReplicationServer {
             .to_str()
             .map_err(|_| Status::unauthenticated("invalid replication bootstrap token metadata"))?;
         self.runtime
+            .bootstrap
             .validate_controlplane_bootstrap_token(supplied)
             .await
         .map_err(|err| {
@@ -1228,7 +1291,7 @@ pub fn mount_service_full_with_policy(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mount_service_full_production(
     app: axum::Router,
-    runtime: Arc<dyn GrpcReplicationRuntime>,
+    runtime: GrpcReplicationRuntimePorts,
     ports: ReplicationServerPorts,
     peer_authenticator: Arc<dyn ReplicationPeerAuthenticator>,
     credential_issuer: Arc<dyn ControlplaneCredentialIssuer>,
@@ -1346,6 +1409,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         {
             Ok(Some(())) => {
                 self.runtime
+                    .bootstrap
                     .handle_authenticated_join(crate::replication::protocol::JoinRequest {
                         token: String::new(),
                         node_name,
@@ -1379,20 +1443,25 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         }
         let joined_node_name = dataplane.node_name().to_string();
         let (mut control_rx, follower_session) = if accepted {
-            let (rx, session) = self.runtime.register_follower(dataplane.clone()).await;
+            let (rx, session) = self
+                .runtime
+                .follower_sessions
+                .register_follower(dataplane.clone())
+                .await;
             (Some(rx), Some(session))
         } else {
             (None, None)
         };
         let first_response =
             join_response_to_proto(self.ports.topology_query.as_ref(), response).await?;
-        let runtime = self.runtime.clone();
+        let follower_sessions = self.runtime.follower_sessions.clone();
+        let follower_completions = self.runtime.follower_completions.clone();
         let local_node_name_for_observed_endpoint = self.local_node_name.clone();
         let node_self_query_for_observed_endpoint = self.node_self_query.clone();
         let node_self_status_for_observed_endpoint = self.node_self_status.clone();
         let mut entries = if accepted {
             Some(
-                runtime
+                follower_sessions
                     .register_stream_follower(
                         joined_node_name.clone(),
                         follower_session.expect("session must be set when accepted"),
@@ -1456,10 +1525,10 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                 // T6: legacy `Forward` payload removed. Workers now
                                 // route writes through outbox -> ApplyOutbox RPC.
                                 Some(klights_internal_protobuf::follower_message::Payload::Ack(ack)) => {
-                                    runtime.update_follower_ack(&joined_node_name, ack.applied_rv).await;
+                                    follower_sessions.update_follower_ack(&joined_node_name, ack.applied_rv).await;
                                 }
                                 Some(klights_internal_protobuf::follower_message::Payload::NodeExecSyncResponse(response)) => {
-                                    if let Err(err) = runtime.complete_node_exec_sync(
+                                    if let Err(err) = follower_completions.complete_node_exec_sync(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
                                             follower_session.expect("accepted stream has a follower session"),
@@ -1471,7 +1540,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                     }
                                 }
                                 Some(klights_internal_protobuf::follower_message::Payload::PodLogResponse(response)) => {
-                                    if let Err(err) = runtime.complete_node_log_event(
+                                    if let Err(err) = follower_completions.complete_node_log_event(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
                                             follower_session.expect("accepted stream has a follower session"),
@@ -1483,7 +1552,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                     }
                                 }
                                 Some(klights_internal_protobuf::follower_message::Payload::NodeMetricsResponse(response)) => {
-                                    if let Err(err) = runtime.complete_node_metrics(
+                                    if let Err(err) = follower_completions.complete_node_metrics(
                                         FollowerCompletionContext::new(
                                             &joined_node_name,
                                             follower_session.expect("accepted stream has a follower session"),
@@ -1497,7 +1566,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                                 Some(klights_internal_protobuf::follower_message::Payload::NodeExecStreamFrame(frame)) => {
                                     match node_exec_stream_frame_from_proto(frame) {
                                         Ok(frame) => {
-                                            if let Err(err) = runtime.complete_node_exec_stream_frame(
+                                            if let Err(err) = follower_completions.complete_node_exec_stream_frame(
                                                 FollowerCompletionContext::new(
                                                     &joined_node_name,
                                                     follower_session.expect("accepted stream has a follower session"),
@@ -1608,7 +1677,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                     }
                 }
                 if let Some(session) = follower_session {
-                    runtime.unregister_follower(&joined_node_name, session).await;
+                    follower_sessions.unregister_follower(&joined_node_name, session).await;
                 }
             }
         };
@@ -1620,7 +1689,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         request: Request<klights_internal_protobuf::MetadataRequest>,
     ) -> std::result::Result<Response<klights_internal_protobuf::MetadataResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
-        let metadata = self.runtime.handle_metadata().await;
+        let metadata = self.runtime.metadata.handle_metadata().await;
         Ok(Response::new(klights_internal_protobuf::MetadataResponse {
             cluster_id: metadata.cluster_id,
             leader_epoch: metadata.leader_epoch,
@@ -1770,7 +1839,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
                 Status::internal("local positioned watch omitted its accepted session cursor")
             })?;
             self.require_raft_leadership_unchanged(leadership_rx.as_ref())?;
-            let supervisor = self.runtime.task_supervisor();
+            let supervisor = self.runtime.supervision.task_supervisor();
             let heartbeat_interval = self.watch_heartbeat_interval;
             let authority = self.authority.clone();
             let leader_permit = leadership_rx;
@@ -1888,7 +1957,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
             );
             let scope: crate::watch::WatchDeliveryScope =
                 watch_delivery_scope_for_request(&req, resource_scope);
-            let supervisor = self.runtime.task_supervisor();
+            let supervisor = self.runtime.supervision.task_supervisor();
             let heartbeat_interval = self.watch_heartbeat_interval;
             // Clone the leadership signal into the stream so the loop can race it
             // against the broadcast recv and terminate promptly on a leadership
@@ -2265,6 +2334,7 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
 
         if let Some(endpoint) = observed_endpoint {
             self.runtime
+                .metadata
                 .record_observed_peer_endpoint(&req.node_name, endpoint.clone())
                 .await;
             return Ok(Response::new(
@@ -2276,7 +2346,12 @@ impl klights_internal_protobuf::replication_server::Replication for GrpcReplicat
         }
 
         Ok(Response::new(
-            match self.runtime.observed_peer_endpoint(&req.node_name).await {
+            match self
+                .runtime
+                .metadata
+                .observed_peer_endpoint(&req.node_name)
+                .await
+            {
                 Some(endpoint) => klights_internal_protobuf::ObservePeerEndpointResponse {
                     found: true,
                     endpoint,

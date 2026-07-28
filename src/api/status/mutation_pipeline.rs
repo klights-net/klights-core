@@ -231,19 +231,19 @@ impl StatusMutationMergePolicy for ApiSubresourceStatusMergePolicy {
 
 #[async_trait]
 pub trait StatusMutationWriter: Send + Sync {
-    async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>>;
+    async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>, AppError>;
     async fn write_status(
         &self,
         target: &StatusMutationTarget,
         status: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<()>;
+    ) -> Result<(), AppError>;
     async fn patch_metadata(
         &self,
         target: &StatusMutationTarget,
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<()>;
+    ) -> Result<(), AppError>;
 }
 
 pub struct DatastoreStatusMutationWriter {
@@ -258,17 +258,15 @@ impl DatastoreStatusMutationWriter {
 
 #[async_trait]
 impl StatusMutationWriter for DatastoreStatusMutationWriter {
-    async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>> {
-        self.state
-            .resource_mutation()
-            .db
-            .get_resource(
-                &target.api_version,
-                &target.kind,
-                target.namespace.as_deref(),
-                &target.name,
-            )
-            .await
+    async fn get(&self, target: &StatusMutationTarget) -> Result<Option<Resource>, AppError> {
+        crate::api::resource_query_ports::get_resource(
+            self.state.resource_mutation().resource_query.as_ref(),
+            &target.api_version,
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+        )
+        .await
     }
 
     async fn write_status(
@@ -276,19 +274,17 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         target: &StatusMutationTarget,
         status: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<()> {
-        self.state
-            .resource_mutation()
-            .db
-            .update_status_only_with_preconditions(
-                &target.api_version,
-                &target.kind,
-                target.namespace.as_deref(),
-                &target.name,
-                status,
-                preconditions,
-            )
-            .await?;
+    ) -> Result<(), AppError> {
+        crate::api::resource_command_ports::update_resource_status(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &target.api_version,
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+            status,
+            preconditions,
+        )
+        .await?;
         Ok(())
     }
 
@@ -297,18 +293,16 @@ impl StatusMutationWriter for DatastoreStatusMutationWriter {
         target: &StatusMutationTarget,
         metadata_patch: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<()> {
-        self.state
-            .resource_mutation()
-            .db
-            .patch_resource_latest_with_preconditions(
-                &target.api_version,
-                &target.kind,
-                target.namespace.as_deref(),
-                &target.name,
-                ResourcePatchRequest::new(PatchKind::Merge, metadata_patch, preconditions),
-            )
-            .await?;
+    ) -> Result<(), AppError> {
+        crate::api::resource_command_ports::patch_non_pod_resource(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &target.api_version,
+            &target.kind,
+            target.namespace.as_deref(),
+            &target.name,
+            ResourcePatchRequest::new(PatchKind::Merge, metadata_patch, preconditions),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -565,16 +559,15 @@ impl DatastoreScaleMutationWriter {
 #[async_trait]
 impl ScaleMutationWriter for DatastoreScaleMutationWriter {
     async fn get(&self, target: &ScaleMutationTarget) -> Result<Option<Resource>> {
-        self.state
-            .resource_mutation()
-            .db
-            .get_resource(
-                &target.api_version,
-                &target.kind,
-                Some(&target.namespace),
-                &target.name,
-            )
-            .await
+        crate::api::resource_query_ports::get_resource(
+            self.state.resource_mutation().resource_query.as_ref(),
+            &target.api_version,
+            &target.kind,
+            Some(&target.namespace),
+            &target.name,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     async fn write_replicas(
@@ -594,17 +587,17 @@ impl ScaleMutationWriter for DatastoreScaleMutationWriter {
         } else {
             request
         };
-        self.state
-            .resource_mutation()
-            .db
-            .patch_resource_latest_with_preconditions(
-                &target.api_version,
-                &target.kind,
-                Some(&target.namespace),
-                &target.name,
-                request,
-            )
-            .await
+        crate::api::resource_command_ports::patch_non_pod_resource(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &target.api_version,
+            &target.kind,
+            Some(&target.namespace),
+            &target.name,
+            request,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     async fn enqueue_reconcile(&self, resource: &Resource) {
@@ -858,11 +851,15 @@ impl DatastoreNamespaceStatusMutationWriter {
 #[async_trait]
 impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
     async fn get(&self, target: &NamespaceStatusMutationTarget) -> Result<Option<Resource>> {
-        self.state
-            .resource_mutation()
-            .db
-            .get_namespace(&target.name)
-            .await
+        crate::api::resource_query_ports::get_resource(
+            self.state.resource_mutation().resource_query.as_ref(),
+            "v1",
+            "Namespace",
+            None,
+            &target.name,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 
     async fn update(
@@ -871,11 +868,14 @@ impl NamespaceStatusMutationWriter for DatastoreNamespaceStatusMutationWriter {
         body: Value,
         expected_rv: i64,
     ) -> Result<Resource> {
-        self.state
-            .resource_mutation()
-            .db
-            .update_namespace(&target.name, body, expected_rv)
-            .await
+        crate::api::resource_command_ports::update_namespace(
+            self.state.resource_mutation().resource_command.as_ref(),
+            &target.name,
+            body,
+            expected_rv,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
     }
 }
 

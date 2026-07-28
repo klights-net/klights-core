@@ -126,6 +126,11 @@ pub(crate) async fn build_test_app_state_with_db(
         ),
         crate::api::ApiResourceMutationServices {
             db: db_handle.clone(),
+            watch_stream: Arc::new(db_handle.clone()),
+            namespace_termination:
+                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(
+                    db_handle.clone(),
+                ),
             resource_query,
             resource_command,
             finalizer_lifecycle,
@@ -198,6 +203,7 @@ pub(crate) async fn build_test_app_state_with_db(
             ),
             task_supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
         ),
     )

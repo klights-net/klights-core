@@ -78,9 +78,9 @@ pub(in crate::api) async fn list_pods(
         // K8s watch semantics: default watch does NOT replay initial objects.
         // Initial list+watch replay is only enabled when sendInitialEvents=true.
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let db = state.resource_mutation().db.clone();
+        let watch_stream = state.resource_mutation().watch_stream.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
-            db,
+            source: watch_stream,
             task_supervisor: state.operational().task_supervisor.clone(),
             api_version: "v1",
             kind,
@@ -494,9 +494,9 @@ pub(in crate::api) async fn list_all_pods(
             .is_some_and(|rv| rv.trim() == "0");
 
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let db = state.resource_mutation().db.clone();
+        let watch_stream = state.resource_mutation().watch_stream.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
-            db,
+            source: watch_stream,
             task_supervisor: state.operational().task_supervisor.clone(),
             api_version: "v1",
             kind,

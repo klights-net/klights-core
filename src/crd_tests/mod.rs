@@ -129,6 +129,11 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         ),
         crate::api::ApiResourceMutationServices {
             db: db_handle.clone(),
+            watch_stream: std::sync::Arc::new(db_handle.clone()),
+            namespace_termination:
+                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(
+                    db_handle.clone(),
+                ),
             resource_query,
             resource_command,
             finalizer_lifecycle,
@@ -204,6 +209,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
             ),
             task_supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(task_supervisor),
+            crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
             None,
         ),
     )

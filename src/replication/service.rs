@@ -1848,13 +1848,10 @@ mod tests {
         let namespace_dir = tempfile::tempdir().unwrap();
         let namespace = namespace_dir.path().to_string_lossy().to_string();
         let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
-        crate::auth::persist_service_account_signing_key(
-            &signing_key_path,
-            "signing-key",
-            &supervisor,
-        )
-        .await
-        .unwrap();
+        let signing_key = crate::auth::generate_ca_full().unwrap().3;
+        crate::signing_key_state_adapter::persist(&signing_key_path, &signing_key, &supervisor)
+            .await
+            .unwrap();
         let service = ReplicationService::new_with_containerd_namespace(db, supervisor, namespace);
 
         let worker_resp = service

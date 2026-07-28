@@ -2,13 +2,21 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
 use klights_pod_api::{PodListRequest, PodOwnerListRequest, PodQuery};
-use klights_reconcile_api::GcPodDeleteSink;
+use klights_reconcile_api::{ControllerStoreResult, GcPodDeleteSink};
 use serde_json::{Value, json};
 
 #[async_trait]
 pub trait ReplicaSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
-    async fn get_replicaset(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
-    async fn update_replicaset_status(&self, resource: &Resource, status: Value) -> Result<()>;
+    async fn get_replicaset(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
+    async fn update_replicaset_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()>;
 }
 
 #[async_trait]
@@ -19,13 +27,13 @@ pub trait ReplicaSetPodMutation: Send + Sync {
         name: &str,
         node_name: &str,
         pod: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn replace_replicaset_pod_owner_references(
         &self,
         namespace: &str,
         name: &str,
         owner_references: Vec<Value>,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 pub(crate) async fn reconcile_replicaset(

@@ -10,7 +10,7 @@ controller_wrapper!(
     with_node,
     with_pod_repository,
     store = statefulset_store,
-    reader = query,
+    reader = pod_query,
     mutation = statefulset_mutation
 );
 

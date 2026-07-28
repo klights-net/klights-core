@@ -3,12 +3,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::datastore::{DatastoreBackend, DatastoreHandle};
+use crate::datastore::DatastoreHandle;
 use crate::side_effects::SideEffect;
 use crate::side_effects::SideEffectMetrics;
 
 struct NamespaceTerminationEffect {
-    db: DatastoreHandle,
+    store: Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
     metrics: Arc<SideEffectMetrics>,
 }
 
@@ -26,20 +26,24 @@ impl SideEffect for NamespaceTerminationEffect {
         if namespace.is_empty() {
             return Ok(());
         }
-        reconcile(self.db.as_ref(), namespace, &self.metrics).await
+        reconcile(self.store.as_ref(), namespace, &self.metrics).await
     }
 }
 
 pub(crate) fn effect(db: DatastoreHandle, metrics: Arc<SideEffectMetrics>) -> Arc<dyn SideEffect> {
-    Arc::new(NamespaceTerminationEffect { db, metrics })
+    #[cfg(not(test))]
+    let store = crate::api_state_adapter::RootNamespaceTerminationStore::new(db);
+    #[cfg(test)]
+    let store = crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(db);
+    Arc::new(NamespaceTerminationEffect { store, metrics })
 }
 
 pub(crate) async fn reconcile(
-    db: &dyn DatastoreBackend,
+    store: &dyn klights_reconcile_api::NamespaceLifecycleStore,
     namespace: &str,
     metrics: &SideEffectMetrics,
 ) -> Result<()> {
-    crate::api::reconcile_namespace_termination(db, namespace, metrics)
+    crate::api::reconcile_namespace_termination(store, namespace, metrics)
         .await
         .map_err(|error| anyhow::anyhow!("namespace termination failed: {error:?}"))
 }

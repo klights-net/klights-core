@@ -4,6 +4,7 @@ use klights_cluster_core::Resource;
 use klights_pod_api::{PodListRequest, PodQuery};
 use serde_json::Value;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::resource_quota::{
     ResourceQuotaRuntime, reconcile_resource_quotas_with_runtime,
 };
@@ -21,31 +22,44 @@ impl ResourceQuotaRuntime for ResourceQuotaControllerAdapter<'_> {
         api_version: &str,
         kind: &str,
         namespace: &str,
-    ) -> Result<Vec<Resource>> {
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
         self.db
             .list_resources(api_version, kind, Some(namespace), ResourceListQuery::all())
             .await
             .map(|listing| listing.items)
+            .map_err(map_controller_store_error)
     }
 
-    async fn list_namespace_pods(&self, namespace: &str) -> Result<Vec<Resource>> {
+    async fn list_namespace_pods(
+        &self,
+        namespace: &str,
+    ) -> klights_reconcile_api::ControllerStoreResult<Vec<Resource>> {
+        let request = PodListRequest::try_new(Some(namespace.to_string()), None, None, None, None)
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::internal(format!(
+                    "invalid ResourceQuota Pod list request: {error}"
+                ))
+            })?;
         self.pod_query
-            .list_pods(PodListRequest::try_new(
-                Some(namespace.to_string()),
-                None,
-                None,
-                None,
-                None,
-            )?)
+            .list_pods(request)
             .await
             .map(|listing| listing.into_parts().0)
-            .map_err(Into::into)
+            .map_err(|error| {
+                klights_reconcile_api::ControllerStoreError::unavailable(format!(
+                    "ResourceQuota Pod list failed: {error}"
+                ))
+            })
     }
 
-    async fn write_resource_quota_status(&self, resource: &Resource, status: &Value) -> Result<()> {
+    async fn write_resource_quota_status(
+        &self,
+        resource: &Resource,
+        status: &Value,
+    ) -> klights_reconcile_api::ControllerStoreResult<()> {
         crate::controllers::common::write_status_for_resource(self.db, resource, status)
             .await
             .map(|_| ())
+            .map_err(map_controller_store_error)
     }
 }
 

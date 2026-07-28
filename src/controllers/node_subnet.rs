@@ -133,7 +133,12 @@ pub enum NodeReadinessPublishResult {
 }
 
 pub type NodeReadinessPublishFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<NodeReadinessPublishResult>> + Send + 'a>,
+    Box<
+        dyn std::future::Future<
+                Output = klights_reconcile_api::ControllerStoreResult<NodeReadinessPublishResult>,
+            > + Send
+            + 'a,
+    >,
 >;
 
 pub trait NodeReadinessPublisher: Send + Sync {
@@ -274,8 +279,13 @@ pub async fn ensure_local_node_subnet(
     Ok(subnet)
 }
 
-pub type PeerTopologyProjectionFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+pub type PeerTopologyProjectionFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = klights_reconcile_api::ControllerStoreResult<()>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Leader-only mutation edge that projects Node lifecycle events into the
 /// canonical subnet topology. Workers receive no implementation of this port.
@@ -1478,7 +1488,9 @@ mod tests {
             Box::pin(async move {
                 let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if call == 0 {
-                    anyhow::bail!("injected projection failure");
+                    return Err(klights_reconcile_api::ControllerStoreError::unavailable(
+                        "injected projection failure",
+                    ));
                 }
                 self.replayed.notify_waiters();
                 Ok(())

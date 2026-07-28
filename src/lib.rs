@@ -4,6 +4,9 @@ pub mod api;
 mod api_helpers_adapter;
 #[cfg(not(test))]
 mod api_state_adapter;
+#[cfg(test)]
+#[path = "api_state_adapter.rs"]
+mod api_state_adapter_test_owner;
 mod apiservice_side_effect_adapter;
 pub mod audit;
 pub mod auth;
@@ -14,6 +17,7 @@ pub mod control_plane;
 mod controller_pod_adapters;
 mod controller_runtime_adapter;
 mod controller_store_adapters;
+mod controller_store_error_adapter;
 pub mod controllers;
 mod coredns_bootstrap_adapter;
 pub(crate) mod crd_registry_adapter;
@@ -81,6 +85,7 @@ mod service_reconcile_adapter;
 pub mod shutdown;
 mod side_effect_registry_composition;
 pub mod side_effects;
+mod signing_key_state_adapter;
 pub mod spdy;
 pub(crate) mod sqlite_boundary;
 pub(crate) mod sqlite_open;

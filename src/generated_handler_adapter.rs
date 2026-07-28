@@ -260,7 +260,7 @@ impl GeneratedWatchPort for GeneratedHandlerAdapter {
         Box::pin(async move {
             crate::api::watch_stream::build_label_selector_watch_stream(
                 crate::api::watch_stream::LabelSelectorWatchStreamRequest {
-                    db: self.watch_source.clone(),
+                    source: self.watch_source.clone(),
                     task_supervisor: self.task_supervisor.clone(),
                     api_version: &request.api_version,
                     kind: request.kind,

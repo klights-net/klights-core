@@ -4227,6 +4227,10 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
             data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
+    state.operational_mut().signing_keys =
+        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
+            ca_key_pem.clone(),
+        );
     let sa_uid = "sa-uid-jwt-test";
     state
         .resource_mutation()
@@ -4411,7 +4415,7 @@ async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     let signing_key = crate::auth::generate_ca_full().unwrap().3;
     let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
-    crate::auth::persist_service_account_signing_key(
+    crate::signing_key_state_adapter::persist(
         &signing_key_path,
         &signing_key,
         state.operational().task_supervisor.as_ref(),
@@ -4562,6 +4566,10 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
             data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
+    state.operational_mut().signing_keys =
+        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
+            ca_key_pem.clone(),
+        );
 
     let pod_name = "pod-service-account-test";
     let pod_uid = "3e4f1b0f-d09c-4b14-a2cc-a5fd867eb5b1";
@@ -5065,12 +5073,24 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
             )))
         }
     }
+    struct MissingSigningKey;
+    #[async_trait::async_trait]
+    impl crate::auth::middleware::ServiceAccountSigningKeyProvider for MissingSigningKey {
+        async fn service_account_signing_key_pem(
+            &self,
+        ) -> Result<String, klights_auth::AuthenticationError> {
+            Err(klights_auth::AuthenticationError::dependency_failure(
+                "ServiceAccount signing key is unavailable",
+            ))
+        }
+    }
 
     let mut state = build_test_app_state().await;
     let namespace = format!("tokenreview-missing-key-{}", uuid::Uuid::new_v4());
     let mut config = crate::KlightsConfig::test_default();
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
+    state.operational_mut().signing_keys = Arc::new(MissingSigningKey);
     state.oidc_authenticator = Some(Arc::new(RejectingOidc));
     state.webhook_authenticator = Some(Arc::new(RejectingWebhook));
     let app = crate::api::build_router(state);
@@ -5227,7 +5247,7 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     let signing_key = crate::auth::generate_ca_full().unwrap().3;
     let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
-    crate::auth::persist_service_account_signing_key(
+    crate::signing_key_state_adapter::persist(
         &signing_key_path,
         &signing_key,
         state.operational().task_supervisor.as_ref(),
@@ -5312,6 +5332,10 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
             data_root: crate::paths::data_root_path(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
+    state.operational_mut().signing_keys =
+        crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::from_pem(
+            ca_key_pem.clone(),
+        );
 
     let node_name = "dallas-vm-1.us-south1-a.c.klights.internal";
     let pod_name = "pod-service-account-test";

@@ -40,7 +40,7 @@ pub(crate) enum PassiveStoreOpenRequest<'a> {
 pub(crate) async fn open_with_sink(
     request: PassiveStoreOpenRequest<'_>,
     supervisor: Arc<TaskSupervisor>,
-    commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
+    #[cfg(test)] commit_sink: Arc<dyn crate::datastore::CommitObservationSink>,
     outbox_codec: Arc<dyn crate::datastore::OutboxResponseCodec>,
 ) -> Result<DatastoreHandle> {
     match request {
@@ -53,6 +53,7 @@ pub(crate) async fn open_with_sink(
             .await?;
             let ds = sqlite::Datastore::new_in_memory_with_watch_and_executor_with_sink(
                 executor,
+                #[cfg(test)]
                 commit_sink,
                 outbox_codec,
             )
@@ -68,6 +69,7 @@ pub(crate) async fn open_with_sink(
                 cluster_db_path,
                 supervisor,
                 db_key_file,
+                #[cfg(test)]
                 commit_sink,
                 outbox_codec,
             )
@@ -78,6 +80,7 @@ pub(crate) async fn open_with_sink(
             tracing::info!(backend = "redb", mode = "in-memory", "opening datastore");
             let ds = crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor_and_sink(
                 supervisor,
+                #[cfg(test)]
                 commit_sink,
             )
             .await?;
@@ -88,6 +91,7 @@ pub(crate) async fn open_with_sink(
             let ds = crate::datastore::redb::RedbDatastore::new_persistent_with_sink(
                 cluster_db_path,
                 supervisor,
+                #[cfg(test)]
                 commit_sink,
             )
             .await?;

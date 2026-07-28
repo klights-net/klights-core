@@ -51,9 +51,8 @@ pub(crate) use coordination::{
 };
 pub(crate) use dispatcher::ControllerDispatcher;
 pub(crate) use ports::{
-    ControllerEffectPort, ControllerLeaderPort, ControllerNetworkPort, ControllerPodPort,
-    ControllerReconcilePort, ControllerRuntimeDependencies, DeploymentControllerPodMutation,
-    DeploymentControllerPodReader,
+    ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
+    ControllerRuntimeDependencies, DeploymentControllerPodMutation, DeploymentControllerPodReader,
 };
 pub(crate) use runtime::{Context, Controller, controller_wrapper};
 

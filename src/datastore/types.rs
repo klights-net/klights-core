@@ -393,6 +393,7 @@ impl RawWatchEvent {
 /// Neutral post-commit notification emitted by persistence after a resource
 /// mutation is durable. Root composition owns delivery channels and watch
 /// signal projection.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitObservation {
     pub api_version: String,
@@ -401,6 +402,7 @@ pub struct CommitObservation {
     pub resource_version: i64,
 }
 
+#[cfg(test)]
 impl From<&PendingWatchEvent> for CommitObservation {
     fn from(pending: &PendingWatchEvent) -> Self {
         Self {

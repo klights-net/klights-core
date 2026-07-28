@@ -1,7 +1,8 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
+use klights_reconcile_api::ControllerStoreResult as Result;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::gc::GcResourceStore;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 
@@ -18,7 +19,8 @@ where
                 None,
                 ResourceListQuery::all(),
             )
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
@@ -29,7 +31,9 @@ where
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, api_version, kind, namespace, name).await
+        DatastoreBackend::get_resource(self, api_version, kind, namespace, name)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_resource_with_preconditions(
@@ -51,6 +55,7 @@ where
             preconditions,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
     async fn find_owned_resources(
@@ -58,7 +63,9 @@ where
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        DatastoreBackend::find_owned_resources(self, owner_uid, namespace).await
+        DatastoreBackend::find_owned_resources(self, owner_uid, namespace)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn find_owned_by_name_kind_empty_uid(
@@ -76,9 +83,6 @@ where
             namespace,
         )
         .await
-    }
-
-    fn gc_store_error_is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::datastore::errors::is_conflict_error(error)
+        .map_err(map_controller_store_error)
     }
 }

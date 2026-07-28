@@ -8,6 +8,65 @@ use std::pin::Pin;
 use klights_cluster_core::Resource;
 use klights_cluster_core::ResourcePreconditions;
 
+/// Storage failure exposed to controller reconciliation contracts.
+///
+/// Concrete datastore and transport errors are classified by root adapters so
+/// controller crates remain independent of their eventual storage mechanism.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControllerStoreError {
+    NotFound(String),
+    AlreadyExists(String),
+    Conflict(String),
+    Unavailable(String),
+    Internal(String),
+}
+
+impl ControllerStoreError {
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    pub fn already_exists(message: impl Into<String>) -> Self {
+        Self::AlreadyExists(message.into())
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    pub const fn is_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(_))
+    }
+
+    pub const fn is_already_exists(&self) -> bool {
+        matches!(self, Self::AlreadyExists(_))
+    }
+}
+
+impl fmt::Display for ControllerStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(message)
+            | Self::AlreadyExists(message)
+            | Self::Conflict(message)
+            | Self::Unavailable(message)
+            | Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for ControllerStoreError {}
+
+pub type ControllerStoreResult<T> = Result<T, ControllerStoreError>;
+
 pub fn compute_statefulset_update_revision(name: &str, template: &serde_json::Value) -> String {
     let canonical = serde_json::to_string(template).unwrap_or_default();
     use std::hash::{Hash, Hasher};
@@ -794,6 +853,72 @@ pub trait NamespaceTerminationSink: Send + Sync {
         &self,
         request: NamespaceTerminationRequest,
     ) -> NamespaceTerminationFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespaceLifecycleError {
+    NotFound { message: String },
+    Conflict { message: String },
+    Unavailable { message: String },
+    Internal { message: String },
+}
+
+impl fmt::Display for NamespaceLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound { message }
+            | Self::Conflict { message }
+            | Self::Unavailable { message }
+            | Self::Internal { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for NamespaceLifecycleError {}
+
+pub type NamespaceLifecycleFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, NamespaceLifecycleError>> + Send + 'a>>;
+
+/// Focused persistence effects required by namespace finalization.
+///
+/// Generic API CRUD and watch operations are deliberately absent.
+pub trait NamespaceLifecycleStore: Send + Sync {
+    fn get_terminating_namespace(
+        &self,
+        namespace: String,
+    ) -> NamespaceLifecycleFuture<'_, Option<Resource>>;
+
+    fn list_namespace_pods(&self, namespace: String)
+    -> NamespaceLifecycleFuture<'_, Vec<Resource>>;
+
+    fn mark_namespace_pod_terminating(
+        &self,
+        pod: Resource,
+        namespace: String,
+        body: serde_json::Value,
+    ) -> NamespaceLifecycleFuture<'_, ()>;
+
+    fn update_terminating_namespace(
+        &self,
+        namespace: String,
+        body: serde_json::Value,
+        expected_resource_version: i64,
+    ) -> NamespaceLifecycleFuture<'_, Resource>;
+
+    fn list_namespace_non_pod_resources(
+        &self,
+        namespace: String,
+    ) -> NamespaceLifecycleFuture<'_, Vec<Resource>>;
+
+    fn delete_namespace_non_pod_resource(
+        &self,
+        resource: Resource,
+        namespace: String,
+    ) -> NamespaceLifecycleFuture<'_, ()>;
+
+    fn count_namespace_resources(&self, namespace: String) -> NamespaceLifecycleFuture<'_, i64>;
+
+    fn delete_terminating_namespace(&self, namespace: String) -> NamespaceLifecycleFuture<'_, ()>;
 }
 
 pub trait NamespaceTerminationQueueSink: Send + Sync {

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use anyhow::Result;
-
-use crate::replication::grpc::server::GrpcReplicationRuntime;
+use crate::replication::grpc::server::{
+    GrpcBootstrapRuntime, GrpcFollowerCompletionRuntime, GrpcFollowerSessionRuntime,
+    GrpcMetadataRuntime, GrpcRuntimeError, GrpcRuntimeSupervision,
+};
 use crate::replication::protocol::{
     FollowerCompletionContext, FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse,
     ReplicationEntry, RoutedNodeExecFrame, RoutedNodeExecSyncResponse, RoutedNodeLogEvent,
@@ -11,7 +12,7 @@ use crate::replication::protocol::{
 use crate::replication::service::ReplicationService;
 
 /// Embedded replication application adapter for the reusable authenticated
-/// gRPC transport contract.
+/// gRPC transport contracts.
 pub(crate) struct GrpcReplicationRuntimeAdapter {
     service: Arc<ReplicationService>,
 }
@@ -22,12 +23,14 @@ impl GrpcReplicationRuntimeAdapter {
     }
 }
 
-#[async_trait::async_trait]
-impl GrpcReplicationRuntime for GrpcReplicationRuntimeAdapter {
+impl GrpcRuntimeSupervision for GrpcReplicationRuntimeAdapter {
     fn task_supervisor(&self) -> Arc<klights_supervisor::TaskSupervisor> {
         self.service.task_supervisor()
     }
+}
 
+#[async_trait::async_trait]
+impl GrpcBootstrapRuntime for GrpcReplicationRuntimeAdapter {
     async fn validate_controlplane_bootstrap_token(
         &self,
         token: &str,
@@ -40,7 +43,10 @@ impl GrpcReplicationRuntime for GrpcReplicationRuntimeAdapter {
     async fn handle_authenticated_join(&self, request: JoinRequest) -> JoinResponse {
         self.service.handle_authenticated_join(request).await
     }
+}
 
+#[async_trait::async_trait]
+impl GrpcFollowerSessionRuntime for GrpcReplicationRuntimeAdapter {
     async fn register_follower(
         &self,
         dataplane: klights_leader_api::NetworkDataplane,
@@ -52,10 +58,13 @@ impl GrpcReplicationRuntime for GrpcReplicationRuntimeAdapter {
         &self,
         node_name: String,
         session_id: u64,
-    ) -> Result<tokio::sync::mpsc::Receiver<ReplicationEntry>> {
+    ) -> Result<tokio::sync::mpsc::Receiver<ReplicationEntry>, GrpcRuntimeError> {
         self.service
             .register_stream_follower(node_name, session_id)
             .await
+            .map_err(|error| {
+                GrpcRuntimeError::unavailable("register follower stream", error.to_string())
+            })
     }
 
     async fn update_follower_ack(&self, node_name: &str, applied_rv: i64) {
@@ -64,50 +73,70 @@ impl GrpcReplicationRuntime for GrpcReplicationRuntimeAdapter {
             .await;
     }
 
+    async fn unregister_follower(&self, node_name: &str, session_id: u64) {
+        self.service
+            .unregister_follower(node_name, session_id)
+            .await;
+    }
+}
+
+#[async_trait::async_trait]
+impl GrpcFollowerCompletionRuntime for GrpcReplicationRuntimeAdapter {
     async fn complete_node_exec_sync(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeExecSyncResponse,
-    ) -> Result<()> {
+    ) -> Result<(), GrpcRuntimeError> {
         self.service
             .complete_node_exec_sync(context, response)
             .await
+            .map_err(|error| {
+                GrpcRuntimeError::unavailable("complete node exec sync", error.to_string())
+            })
     }
 
     async fn complete_node_log_event(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeLogEvent,
-    ) -> Result<()> {
+    ) -> Result<(), GrpcRuntimeError> {
         self.service
             .complete_node_log_event(context, response)
             .await
+            .map_err(|error| {
+                GrpcRuntimeError::unavailable("complete node log event", error.to_string())
+            })
     }
 
     async fn complete_node_metrics(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeMetricsResponse,
-    ) -> Result<()> {
-        self.service.complete_node_metrics(context, response).await
+    ) -> Result<(), GrpcRuntimeError> {
+        self.service
+            .complete_node_metrics(context, response)
+            .await
+            .map_err(|error| {
+                GrpcRuntimeError::unavailable("complete node metrics", error.to_string())
+            })
     }
 
     async fn complete_node_exec_stream_frame(
         &self,
         context: FollowerCompletionContext<'_>,
         response: RoutedNodeExecFrame,
-    ) -> Result<()> {
+    ) -> Result<(), GrpcRuntimeError> {
         self.service
             .complete_node_exec_stream_frame(context, response)
             .await
+            .map_err(|error| {
+                GrpcRuntimeError::unavailable("complete node exec stream frame", error.to_string())
+            })
     }
+}
 
-    async fn unregister_follower(&self, node_name: &str, session_id: u64) {
-        self.service
-            .unregister_follower(node_name, session_id)
-            .await;
-    }
-
+#[async_trait::async_trait]
+impl GrpcMetadataRuntime for GrpcReplicationRuntimeAdapter {
     async fn handle_metadata(&self) -> MetadataResponse {
         self.service.handle_metadata().await
     }

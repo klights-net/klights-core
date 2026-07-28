@@ -125,14 +125,16 @@ use klights_cluster_core::command::StorageCommand;
 use klights_watch::WatchTopic;
 
 #[cfg(test)]
+use super::types::CommitObservation;
+#[cfg(test)]
 use super::types::PendingWatchEvent;
 #[cfg(test)]
 use super::types::ReplicatedCreateOptions;
 use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, CommitObservation,
-    DurableAllocatorObservation, ListPageRequest, NodeSubnet, PodCleanupIntent,
-    PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata, ResourceList,
-    ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
+    ListPageRequest, NodeSubnet, PodCleanupIntent, PositionedWatchReplayRead, RawWatchEvent,
+    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor,
+    WatchReplayRead, WatchTarget,
 };
 #[cfg(test)]
 use klights_cluster_core::command::CommandMeta;
@@ -161,6 +163,7 @@ pub struct SnapshotMutationFence {
 
 /// Synchronous, nonblocking post-commit observation port. Implementations are
 /// injected by root composition and must not perform datastore work.
+#[cfg(test)]
 pub trait CommitObservationSink: Send + Sync {
     fn observe(&self, observations: &[CommitObservation]);
     #[cfg(test)]

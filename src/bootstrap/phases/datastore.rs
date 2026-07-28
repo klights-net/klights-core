@@ -137,6 +137,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let passive_backend = crate::datastore::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
+        #[cfg(test)]
         watch_commit_wiring.sink,
         crate::outbox_response_codec_adapter::new_codec(),
     )
@@ -324,6 +325,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
                             passive_backend.clone(),
                             crate::datastore::raft::committed_apply(),
+                            watch_commit_wiring.wakeups.clone(),
                         ),
                     ),
                     Arc::new(

@@ -5,33 +5,45 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Namespace, NamespaceSpec, NamespaceStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 
 const DEFAULT_NAMESPACES: [&str; 4] = ["default", "kube-system", "kube-public", "kube-node-lease"];
 
 #[async_trait]
 pub trait NamespaceBootstrapStore: Send + Sync {
-    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;
-    async fn create_namespace(&self, name: &str, value: serde_json::Value) -> Result<Resource>;
-    async fn get_default_service_account(&self, namespace: &str) -> Result<Option<Resource>>;
+    async fn get_namespace(&self, name: &str) -> ControllerStoreResult<Option<Resource>>;
+    async fn create_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> ControllerStoreResult<Resource>;
+    async fn get_default_service_account(
+        &self,
+        namespace: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn create_default_service_account(
         &self,
         namespace: &str,
         value: serde_json::Value,
-    ) -> Result<Resource>;
-    async fn get_configmap(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Resource>;
+    async fn get_configmap(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn create_configmap(
         &self,
         namespace: &str,
         name: &str,
         value: serde_json::Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
     async fn update_configmap(
         &self,
         namespace: &str,
         name: &str,
         value: serde_json::Value,
         expected_resource_version: i64,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?Sized>(

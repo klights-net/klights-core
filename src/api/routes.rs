@@ -561,18 +561,14 @@ async fn openid_configuration(State(_state): State<Arc<ApiState>>) -> Json<Value
 }
 
 async fn openid_jwks(State(state): State<Arc<ApiState>>) -> Result<Json<Value>, AppError> {
-    let signing_key_path = &state
+    let signing_key_pem = state
         .operational()
-        .config
-        .runtime
-        .paths
-        .service_account_signing_key;
-    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-        signing_key_path,
-        &state.operational().file_process,
-    )
-    .await
-    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+        .signing_keys
+        .service_account_signing_key_pem()
+        .await
+        .map_err(|error| {
+            AppError::InternalError(format!("ServiceAccount signing key unavailable: {error}"))
+        })?;
     let crypto =
         klights_supervisor::CryptoExecutor::new(state.operational().task_supervisor.clone());
     let jwks = crypto

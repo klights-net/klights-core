@@ -653,12 +653,15 @@ async fn create_serviceaccount_token(
 ) -> Result<Json<Value>, AppError> {
     use crate::auth::clock::Clock;
 
-    let sa = state
-        .resource_mutation()
-        .db
-        .get_resource("v1", "ServiceAccount", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("ServiceAccount {} not found", name)))?;
+    let sa = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "ServiceAccount",
+        Some(&namespace),
+        &name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("ServiceAccount {} not found", name)))?;
 
     let audiences: Vec<String> = body
         .get("spec")
@@ -742,14 +745,15 @@ async fn create_serviceaccount_token(
                 bound.pod_uid = Some(&bound_pod_uid);
             }
             "Secret" => {
-                let secret = state
-                    .resource_mutation()
-                    .db
-                    .get_resource("v1", "Secret", Some(&namespace), ref_name)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::NotFound(format!("secrets \"{}\" not found", ref_name))
-                    })?;
+                let secret = crate::api::resource_query_ports::get_resource(
+                    state.resource_mutation().resource_query.as_ref(),
+                    "v1",
+                    "Secret",
+                    Some(&namespace),
+                    ref_name,
+                )
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("secrets \"{}\" not found", ref_name)))?;
                 let secret_uid = secret
                     .data
                     .pointer("/metadata/uid")
@@ -778,18 +782,14 @@ async fn create_serviceaccount_token(
         }
     }
 
-    let signing_key_path = &state
+    let signing_key_pem = state
         .operational()
-        .config
-        .runtime
-        .paths
-        .service_account_signing_key;
-    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
-        signing_key_path,
-        &state.operational().file_process,
-    )
-    .await
-    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+        .signing_keys
+        .service_account_signing_key_pem()
+        .await
+        .map_err(|error| {
+            AppError::InternalError(format!("ServiceAccount signing key unavailable: {error}"))
+        })?;
 
     let sa_uid = sa
         .data

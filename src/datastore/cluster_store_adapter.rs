@@ -1,5 +1,6 @@
 //! Temporary root adapters from the legacy datastore to cluster-store ports.
 
+use klights_cluster_core::{CommittedApplyOutcome, LogApplyCommit, LogApplyMutation};
 use klights_cluster_store::{
     AllocatorStateError, AllocatorStateFuture, AppliedOutboxLookup, AuthoritativeSnapshot,
     AuthoritativeSnapshotCapture, AuthoritativeSnapshotPersistence, ClusterMetadataFuture,
@@ -396,29 +397,55 @@ fn port_page(
 /// cluster-store ports directly after physical extraction.
 pub(crate) struct DatastoreCommittedRaftApply {
     db: DatastoreHandle,
+    wakeups: Option<std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>>,
 }
 
 impl DatastoreCommittedRaftApply {
     pub(crate) fn new(
         db: DatastoreHandle,
         _authority: crate::datastore::raft::CommittedApplyAuthority,
+        wakeups: std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>,
     ) -> Self {
-        Self { db }
+        Self {
+            db,
+            wakeups: Some(wakeups),
+        }
     }
 
     #[cfg(test)]
     fn new_for_test(db: DatastoreHandle) -> Self {
-        Self { db }
+        Self { db, wakeups: None }
+    }
+
+    fn publish_visible_commit(&self, commit: &LogApplyCommit, resource_version: i64) {
+        let Some(wakeups) = &self.wakeups else {
+            return;
+        };
+        let advances = post_commit_advances(commit, resource_version);
+        wakeups.wake(&advances);
+        for mutation in commit.mutations() {
+            if let LogApplyMutation::DeleteNamespaceContents { name } = mutation {
+                wakeups.wake_namespace_contents(name, resource_version);
+            }
+        }
     }
 
     pub(crate) async fn apply_committed_raft_result(
         &self,
         request: CommittedRaftApplyRequest,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult, CommittedApplyError> {
-        self.db
-            .apply_raft_log_apply_commit(request.into_commit())
+        let commit = request.into_commit();
+        let result = self
+            .db
+            .apply_raft_log_apply_commit(commit.clone())
             .await
-            .map_err(map_committed_apply_error)
+            .map_err(map_committed_apply_error)?;
+        if result.public_resource_changed
+            && let Some(resource_version) = result.applied_rv
+        {
+            self.publish_visible_commit(&commit, resource_version);
+        }
+        Ok(result)
     }
 }
 
@@ -446,12 +473,67 @@ impl PrivilegedCommittedRaftApply for DatastoreCommittedRaftApply {
             let commit = request.into_commit();
             let outcome = self
                 .db
-                .apply_raft_log_apply_commit_outcome(commit)
+                .apply_raft_log_apply_commit_outcome(commit.clone())
                 .await
                 .map_err(map_committed_apply_error)?;
+            if let CommittedApplyOutcome::Visible {
+                resource_version, ..
+            } = &outcome
+            {
+                self.publish_visible_commit(&commit, *resource_version);
+            }
             Ok(CommittedRaftApplyReceipt::new(outcome))
         })
     }
+}
+
+fn post_commit_advances(
+    commit: &LogApplyCommit,
+    resource_version: i64,
+) -> Vec<klights_leader_api::PostCommitAdvance> {
+    commit
+        .mutations()
+        .iter()
+        .filter_map(|mutation| {
+            let (api_version, kind, namespace) = match mutation {
+                LogApplyMutation::PutResource(row) => {
+                    (&row.api_version, &row.kind, row.namespace.clone())
+                }
+                LogApplyMutation::PatchResourceLatest(row) => {
+                    (&row.api_version, &row.kind, row.namespace.clone())
+                }
+                LogApplyMutation::DeleteResource(row) => {
+                    (&row.api_version, &row.kind, row.namespace.clone())
+                }
+                LogApplyMutation::FinalizeBoundPod(row) => {
+                    return Some(klights_leader_api::PostCommitAdvance::new(
+                        "v1",
+                        "Pod",
+                        Some(row.namespace.clone()),
+                        resource_version,
+                    ));
+                }
+                LogApplyMutation::PutNamespace(_) | LogApplyMutation::DeleteNamespace { .. } => {
+                    return Some(klights_leader_api::PostCommitAdvance::new(
+                        "v1",
+                        "Namespace",
+                        None,
+                        resource_version,
+                    ));
+                }
+                LogApplyMutation::PutWatchEvent(row) => {
+                    (&row.api_version, &row.kind, row.namespace.clone())
+                }
+                _ => return None,
+            };
+            Some(klights_leader_api::PostCommitAdvance::new(
+                api_version,
+                kind,
+                namespace,
+                resource_version,
+            ))
+        })
+        .collect()
 }
 
 impl DurableApplyLedgerRead for DatastoreCommittedRaftApply {

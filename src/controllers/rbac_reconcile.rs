@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Map, Value};
 
 #[cfg(test)]
@@ -19,7 +20,7 @@ pub(crate) trait RbacPolicyStore: Send + Sync {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Option<Resource>>;
 
     async fn create_rbac_object(
         &self,
@@ -27,7 +28,7 @@ pub(crate) trait RbacPolicyStore: Send + Sync {
         namespace: Option<&str>,
         name: &str,
         value: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 
     async fn update_rbac_object(
         &self,
@@ -36,9 +37,9 @@ pub(crate) trait RbacPolicyStore: Send + Sync {
         name: &str,
         value: Value,
         expected_resource_version: i64,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 
-    async fn list_cluster_roles(&self) -> Result<Vec<Resource>>;
+    async fn list_cluster_roles(&self) -> ControllerStoreResult<Vec<Resource>>;
 }
 
 pub(crate) async fn reconcile_default_rbac_objects<S: RbacPolicyStore + ?Sized>(

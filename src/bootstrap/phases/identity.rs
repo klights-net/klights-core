@@ -58,6 +58,13 @@ pub async fn setup_leader(
                 .context("Failed to resolve server cert CSR via leader RPC")?;
         }
     }
+    crate::signing_key_state_adapter::ensure(
+        &std::path::Path::new(&cfg.etc_dir).join("service-account-signing.key"),
+        role_allows_local_ca_generation(role),
+        cfg.supervisor.as_ref(),
+    )
+    .await
+    .context("Failed to initialize root-owned ServiceAccount signing state")?;
 
     ensure_local_node_client_certificate(cfg)
         .await
@@ -182,7 +189,7 @@ async fn resolve_csr_via_rpc(
         let service_account_signing_key_pem = String::from_utf8(service_account_signing_key_bytes)
             .context("ServiceAccount signing key from CSR response is not UTF-8 PEM")?;
         let service_account_signing_key_path = pending.etc_dir.join("service-account-signing.key");
-        crate::auth::persist_service_account_signing_key(
+        crate::signing_key_state_adapter::persist(
             &service_account_signing_key_path,
             &service_account_signing_key_pem,
             cfg.supervisor.as_ref(),

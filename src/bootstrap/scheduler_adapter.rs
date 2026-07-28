@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 
 use crate::controllers::scheduler::SchedulerRuntime;
 use crate::datastore::DatastoreHandle;
@@ -40,10 +40,19 @@ impl SchedulerRuntime for LeaderSchedulerRuntime {
         Ok(sessions)
     }
 
-    async fn schedule_all_unbound_pods(&self) -> Result<()> {
+    async fn schedule_all_unbound_pods(&self) -> ControllerStoreResult<()> {
+        klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+            ControllerStoreError::unavailable(format!(
+                "controller authority rejected effect: {error}"
+            ))
+        })?;
         self.pods
             .schedule_all_unbound_pods()
             .await
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .map_err(|error| {
+                ControllerStoreError::unavailable(format!(
+                    "schedule unbound Pods failed: {error:?}"
+                ))
+            })
     }
 }

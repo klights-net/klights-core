@@ -1,9 +1,9 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
 use serde_json::json;
 
-use crate::controllers::apiservice::{ApiServiceStatusWriteError, ApiServiceStore};
+use crate::controller_store_error_adapter::map_controller_store_error;
+use crate::controllers::apiservice::ApiServiceStore;
 use crate::controllers::common::ControllerStatusStore;
 use crate::controllers::cronjob::CronJobStore;
 use crate::controllers::csr_signer::CsrStatusStore;
@@ -14,28 +14,31 @@ use crate::controllers::pdb::PdbStore;
 use crate::controllers::pvc::PvcStore;
 use crate::controllers::rbac_reconcile::RbacPolicyStore;
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
+use klights_reconcile_api::ControllerStoreResult;
 
 #[async_trait]
 impl<T> ApiServiceStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn get_apiservice(&self, name: &str) -> Result<Option<Resource>> {
+    async fn get_apiservice(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("apiregistration.k8s.io/v1", "APIService", None, name)
             .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn service_exists(&self, namespace: &str, name: &str) -> Result<bool> {
+    async fn service_exists(&self, namespace: &str, name: &str) -> ControllerStoreResult<bool> {
         self.get_resource("v1", "Service", Some(namespace), name)
             .await
             .map(|service| service.is_some())
+            .map_err(map_controller_store_error)
     }
 
     async fn list_endpoint_slices(
         &self,
         namespace: &str,
         service_name: &str,
-    ) -> Result<Vec<Resource>> {
+    ) -> ControllerStoreResult<Vec<Resource>> {
         let selector = format!("kubernetes.io/service-name={service_name}");
         self.list_resources(
             "discovery.k8s.io/v1",
@@ -45,18 +48,24 @@ where
         )
         .await
         .map(|listing| listing.items)
+        .map_err(map_controller_store_error)
     }
 
-    async fn get_endpoints(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+    async fn get_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("v1", "Endpoints", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_apiservice_status(
         &self,
         current: &Resource,
         status: serde_json::Value,
-    ) -> std::result::Result<(), ApiServiceStatusWriteError> {
+    ) -> ControllerStoreResult<()> {
         self.update_status_only_with_preconditions(
             "apiregistration.k8s.io/v1",
             "APIService",
@@ -67,13 +76,7 @@ where
         )
         .await
         .map(|_| ())
-        .map_err(|error| {
-            if crate::datastore::errors::is_conflict_error(&error) {
-                ApiServiceStatusWriteError::Conflict(error)
-            } else {
-                ApiServiceStatusWriteError::Other(error)
-            }
-        })
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -82,9 +85,14 @@ impl<T> DeploymentFinalizeStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn get_deployment(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+    async fn get_deployment(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("apps/v1", "Deployment", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn patch_deployment_revision(
@@ -93,7 +101,7 @@ where
         name: &str,
         revision: String,
         expected_uid: String,
-    ) -> Result<()> {
+    ) -> ControllerStoreResult<()> {
         self.patch_resource_latest_with_preconditions(
             "apps/v1",
             "Deployment",
@@ -113,6 +121,7 @@ where
         )
         .await
         .map(|_| ())
+        .map_err(map_controller_store_error)
     }
 
     async fn delete_replicaset(
@@ -120,7 +129,7 @@ where
         namespace: &str,
         name: &str,
         expected_uid: String,
-    ) -> Result<()> {
+    ) -> ControllerStoreResult<()> {
         self.delete_resource_with_preconditions(
             "apps/v1",
             "ReplicaSet",
@@ -130,6 +139,7 @@ where
         )
         .await
         .map(|_| ())
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -144,8 +154,10 @@ where
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>> {
-        self.get_resource(api_version, kind, namespace, name).await
+    ) -> ControllerStoreResult<Option<Resource>> {
+        self.get_resource(api_version, kind, namespace, name)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn create_bootstrap_resource(
@@ -155,9 +167,10 @@ where
         namespace: Option<&str>,
         name: &str,
         value: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.create_resource(api_version, kind, namespace, name, value)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_bootstrap_resource(
@@ -168,7 +181,7 @@ where
         name: &str,
         value: serde_json::Value,
         expected_resource_version: i64,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.update_resource(
             api_version,
             kind,
@@ -178,6 +191,7 @@ where
             expected_resource_version,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -186,7 +200,7 @@ impl<T> CsrStatusStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn get_csr(&self, name: &str) -> Result<Option<Resource>> {
+    async fn get_csr(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource(
             "certificates.k8s.io/v1",
             "CertificateSigningRequest",
@@ -194,6 +208,7 @@ where
             name,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
     async fn update_csr_status(
@@ -202,7 +217,7 @@ where
         uid: &str,
         resource_version: i64,
         status: serde_json::Value,
-    ) -> Result<()> {
+    ) -> ControllerStoreResult<()> {
         self.update_status_only_with_preconditions(
             "certificates.k8s.io/v1",
             "CertificateSigningRequest",
@@ -216,6 +231,7 @@ where
         )
         .await
         .map(|_| ())
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -230,8 +246,10 @@ where
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>> {
-        self.get_resource(api_version, kind, namespace, name).await
+    ) -> ControllerStoreResult<Option<Resource>> {
+        self.get_resource(api_version, kind, namespace, name)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_status(
@@ -242,7 +260,7 @@ where
         name: &str,
         status: serde_json::Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.update_status_only_with_preconditions(
             api_version,
             kind,
@@ -252,14 +270,7 @@ where
             preconditions,
         )
         .await
-    }
-
-    fn is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::datastore::errors::is_conflict_error(error)
-    }
-
-    fn conflict_error(&self, message: &'static str) -> anyhow::Error {
-        crate::datastore::errors::DatastoreError::conflict(message).into()
+        .map_err(map_controller_store_error)
     }
 
     fn log_noop_status_write(
@@ -293,9 +304,10 @@ where
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>> {
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("rbac.authorization.k8s.io/v1", kind, namespace, name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn create_rbac_object(
@@ -304,9 +316,10 @@ where
         namespace: Option<&str>,
         name: &str,
         value: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.create_resource("rbac.authorization.k8s.io/v1", kind, namespace, name, value)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_rbac_object(
@@ -316,7 +329,7 @@ where
         name: &str,
         value: serde_json::Value,
         expected_resource_version: i64,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.update_resource(
             "rbac.authorization.k8s.io/v1",
             kind,
@@ -326,9 +339,10 @@ where
             expected_resource_version,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
-    async fn list_cluster_roles(&self) -> Result<Vec<Resource>> {
+    async fn list_cluster_roles(&self) -> ControllerStoreResult<Vec<Resource>> {
         self.list_resources_page(
             "rbac.authorization.k8s.io/v1",
             "ClusterRole",
@@ -339,6 +353,7 @@ where
         )
         .await
         .map(|listing| listing.items)
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -347,31 +362,49 @@ impl<T> NamespaceBootstrapStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        DatastoreBackend::get_namespace(self, name).await
+    async fn get_namespace(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
+        DatastoreBackend::get_namespace(self, name)
+            .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn create_namespace(&self, name: &str, value: serde_json::Value) -> Result<Resource> {
-        DatastoreBackend::create_namespace(self, name, value).await
+    async fn create_namespace(
+        &self,
+        name: &str,
+        value: serde_json::Value,
+    ) -> ControllerStoreResult<Resource> {
+        DatastoreBackend::create_namespace(self, name, value)
+            .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn get_default_service_account(&self, namespace: &str) -> Result<Option<Resource>> {
+    async fn get_default_service_account(
+        &self,
+        namespace: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("v1", "ServiceAccount", Some(namespace), "default")
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn create_default_service_account(
         &self,
         namespace: &str,
         value: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.create_resource("v1", "ServiceAccount", Some(namespace), "default", value)
             .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn get_configmap(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+    async fn get_configmap(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("v1", "ConfigMap", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn create_configmap(
@@ -379,9 +412,10 @@ where
         namespace: &str,
         name: &str,
         value: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.create_resource("v1", "ConfigMap", Some(namespace), name, value)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_configmap(
@@ -390,7 +424,7 @@ where
         name: &str,
         value: serde_json::Value,
         expected_resource_version: i64,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.update_resource(
             "v1",
             "ConfigMap",
@@ -400,6 +434,7 @@ where
             expected_resource_version,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -408,14 +443,24 @@ impl<T> CronJobStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn get_cronjob(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+    async fn get_cronjob(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("batch/v1", "CronJob", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+    async fn get_job(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("batch/v1", "Job", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn create_job(
@@ -423,18 +468,25 @@ where
         namespace: &str,
         name: &str,
         value: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.create_resource("batch/v1", "Job", Some(namespace), name, value)
             .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>> {
+    async fn list_jobs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
         self.list_resources("batch/v1", "Job", Some(namespace), ResourceListQuery::all())
             .await
             .map(|listing| listing.items)
+            .map_err(map_controller_store_error)
     }
 
-    async fn delete_job(&self, namespace: &str, name: &str, uid: String) -> Result<()> {
+    async fn delete_job(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: String,
+    ) -> ControllerStoreResult<()> {
         self.delete_resource_with_preconditions(
             "batch/v1",
             "Job",
@@ -444,6 +496,7 @@ where
         )
         .await
         .map(|_| ())
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -452,29 +505,37 @@ impl<T> PvcStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn get_pvc(&self, namespace: &str, name: &str) -> Result<Option<Resource>> {
+    async fn get_pvc(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("v1", "PersistentVolumeClaim", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
-    async fn list_persistent_volumes(&self) -> Result<Vec<Resource>> {
+    async fn list_persistent_volumes(&self) -> ControllerStoreResult<Vec<Resource>> {
         self.list_resources("v1", "PersistentVolume", None, ResourceListQuery::all())
             .await
             .map(|listing| listing.items)
+            .map_err(map_controller_store_error)
     }
 
-    async fn get_persistent_volume(&self, name: &str) -> Result<Option<Resource>> {
+    async fn get_persistent_volume(&self, name: &str) -> ControllerStoreResult<Option<Resource>> {
         self.get_resource("v1", "PersistentVolume", None, name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn create_persistent_volume(
         &self,
         name: &str,
         value: serde_json::Value,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.create_resource("v1", "PersistentVolume", None, name, value)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn update_persistent_volume(
@@ -482,7 +543,7 @@ where
         name: &str,
         value: serde_json::Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
+    ) -> ControllerStoreResult<Resource> {
         self.update_resource_with_preconditions(
             "v1",
             "PersistentVolume",
@@ -492,6 +553,7 @@ where
             preconditions,
         )
         .await
+        .map_err(map_controller_store_error)
     }
 }
 
@@ -500,7 +562,7 @@ impl<T> PdbStore for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn list_pdbs(&self, namespace: &str) -> Result<Vec<Resource>> {
+    async fn list_pdbs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
         self.list_resources(
             "policy/v1",
             "PodDisruptionBudget",
@@ -509,5 +571,6 @@ where
         )
         .await
         .map(|listing| listing.items)
+        .map_err(map_controller_store_error)
     }
 }

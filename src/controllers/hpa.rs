@@ -7,6 +7,7 @@ use crate::metrics::{
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 
 const MAX_RETRIES: u32 = 5;
@@ -18,24 +19,34 @@ pub(crate) trait HpaRuntime: Send + Sync {
         api_version: &str,
         namespace: &str,
         name: &str,
-    ) -> Result<Option<Resource>>;
+    ) -> ControllerStoreResult<Option<Resource>>;
     async fn get_scale_target(
         &self,
         api_version: &str,
         kind: &str,
         namespace: &str,
         name: &str,
-    ) -> Result<Option<Resource>>;
-    async fn list_pods(&self, namespace: &str) -> Result<Vec<Resource>>;
-    async fn patch_scale_target(&self, target: &ScaleTarget, replicas: i64) -> Result<Resource>;
+    ) -> ControllerStoreResult<Option<Resource>>;
+    async fn list_pods(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
+    async fn patch_scale_target(
+        &self,
+        target: &ScaleTarget,
+        replicas: i64,
+    ) -> ControllerStoreResult<Resource>;
     async fn reconcile_scaled_target(
         &self,
         target: &ScaleTarget,
         resource: &Value,
         node_name: &str,
-    ) -> Result<()>;
-    async fn update_hpa_status(&self, current: &Resource, status: Value) -> Result<()>;
-    fn is_conflict(&self, error: &anyhow::Error) -> bool;
+    ) -> ControllerStoreResult<()>;
+    async fn update_hpa_status(
+        &self,
+        current: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()>;
+    fn is_conflict(&self, error: &ControllerStoreError) -> bool {
+        error.is_conflict()
+    }
 }
 
 pub(crate) async fn reconcile_hpa_with_runtime(
@@ -90,7 +101,7 @@ pub(crate) async fn reconcile_hpa_with_runtime(
                 last_conflict = Some(err);
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -713,7 +724,7 @@ mod tests {
             _api_version: &str,
             _namespace: &str,
             _name: &str,
-        ) -> Result<Option<Resource>> {
+        ) -> ControllerStoreResult<Option<Resource>> {
             Ok(Some(self.current.lock().unwrap().clone()))
         }
 
@@ -723,11 +734,11 @@ mod tests {
             _kind: &str,
             _namespace: &str,
             _name: &str,
-        ) -> Result<Option<Resource>> {
+        ) -> ControllerStoreResult<Option<Resource>> {
             Ok(None)
         }
 
-        async fn list_pods(&self, _namespace: &str) -> Result<Vec<Resource>> {
+        async fn list_pods(&self, _namespace: &str) -> ControllerStoreResult<Vec<Resource>> {
             unreachable!("missing target never lists Pods")
         }
 
@@ -735,7 +746,7 @@ mod tests {
             &self,
             _target: &ScaleTarget,
             _replicas: i64,
-        ) -> Result<Resource> {
+        ) -> ControllerStoreResult<Resource> {
             unreachable!("missing target never scales")
         }
 
@@ -744,11 +755,15 @@ mod tests {
             _target: &ScaleTarget,
             _resource: &Value,
             _node_name: &str,
-        ) -> Result<()> {
+        ) -> ControllerStoreResult<()> {
             unreachable!("missing target never reconciles")
         }
 
-        async fn update_hpa_status(&self, _current: &Resource, status: Value) -> Result<()> {
+        async fn update_hpa_status(
+            &self,
+            _current: &Resource,
+            status: Value,
+        ) -> ControllerStoreResult<()> {
             if self
                 .conflict_updates_remaining
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
@@ -756,16 +771,12 @@ mod tests {
                 })
                 .is_ok()
             {
-                anyhow::bail!("synthetic HPA conflict")
+                return Err(ControllerStoreError::conflict("synthetic HPA conflict"));
             }
             let mut current = self.current.lock().unwrap();
             std::sync::Arc::make_mut(&mut current.data)["status"] = status;
             self.successful_updates.fetch_add(1, Ordering::Relaxed);
             Ok(())
-        }
-
-        fn is_conflict(&self, error: &anyhow::Error) -> bool {
-            error.to_string().contains("HPA conflict")
         }
     }
 

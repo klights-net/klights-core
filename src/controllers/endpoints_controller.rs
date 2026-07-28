@@ -55,8 +55,8 @@ impl Controller for EndpointsController {
                 .unwrap_or(false);
 
         endpoints_core::reconcile_endpoints(
-            ctx.leader().service_store(),
-            ctx.pods().query(),
+            ctx.service_store(),
+            ctx.pod_query(),
             name,
             namespace,
             selector,

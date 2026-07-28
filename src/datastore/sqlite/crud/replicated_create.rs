@@ -396,6 +396,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
+                #[cfg(test)]
                 self.publish_watch_event(pending);
                 id
             }
@@ -409,6 +410,7 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
+                #[cfg(test)]
                 self.publish_watch_event(pending);
                 id
             }
@@ -439,6 +441,7 @@ impl Datastore {
                         "DELETED",
                         old_data,
                     );
+                    #[cfg(test)]
                     self.publish_watch_event(pending_delete);
                 }
                 let pending_add = create_pending_watch_event(
@@ -450,6 +453,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
+                #[cfg(test)]
                 self.publish_watch_event(pending_add);
                 id
             }

@@ -46,11 +46,16 @@ pub(in crate::api) async fn pod_binding(
         admission_context,
     )
     .await?;
-    state
-        .resource_mutation()
-        .pod_repository
-        .bind_pod_from_api(&namespace, &name, binding, dry_run)
-        .await?;
+    klights_pod_api::PodApiMutation::bind_pod(
+        state.resource_mutation().pod_repository.as_ref(),
+        klights_pod_api::PodBindingRequest {
+            namespace,
+            name,
+            binding,
+            dry_run,
+        },
+    )
+    .await?;
 
     Ok((
         StatusCode::CREATED,

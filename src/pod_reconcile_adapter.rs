@@ -20,6 +20,7 @@ use crate::side_effects::ControllerDispatcherSlot;
 
 pub(crate) struct PodReconcileAdapter {
     db: DatastoreHandle,
+    namespace_lifecycle: std::sync::Arc<dyn klights_reconcile_api::NamespaceLifecycleStore>,
     dispatcher: ControllerDispatcherSlot,
     metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics>,
     side_effects: std::sync::Arc<crate::side_effects::SideEffectRegistry>,
@@ -59,6 +60,13 @@ impl PodReconcileAdapter {
             non_pod_finalization: crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(
                 db.clone(),
             ),
+            #[cfg(not(test))]
+            namespace_lifecycle: crate::api_state_adapter::RootNamespaceTerminationStore::new(
+                db.clone(),
+            ),
+            #[cfg(test)]
+            namespace_lifecycle:
+                crate::api_state_adapter_test_owner::RootNamespaceTerminationStore::new(db.clone()),
             db,
             dispatcher,
             metrics,
@@ -243,7 +251,7 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
         Box::pin(async move {
             let outcome = match request.expected_uid {
                 Some(uid) => crate::api::reconcile_namespace_termination_for_uid_with_outcome(
-                    self.db.as_ref(),
+                    self.namespace_lifecycle.as_ref(),
                     &request.namespace,
                     &uid,
                     self.metrics.as_ref(),
@@ -258,7 +266,7 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
                     }
                 }),
                 None => crate::api::reconcile_namespace_termination(
-                    self.db.as_ref(),
+                    self.namespace_lifecycle.as_ref(),
                     &request.namespace,
                     self.metrics.as_ref(),
                 )

@@ -1485,7 +1485,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for MockPodEventSink {
         message: &str,
         reporting_component: &str,
         node_name: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), crate::kubelet::pod_runtime::events::PodEventSinkError> {
         self.events.lock().unwrap().push(MockPodEvent {
             namespace: key.namespace.clone(),
             name: key.name.clone(),

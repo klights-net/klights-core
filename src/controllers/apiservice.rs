@@ -7,34 +7,34 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
 
 const MAX_RETRIES: u32 = 5;
 
-pub(crate) enum ApiServiceStatusWriteError {
-    Conflict(anyhow::Error),
-    Other(anyhow::Error),
-}
-
 #[async_trait]
 pub(crate) trait ApiServiceStore: Send + Sync {
-    async fn get_apiservice(&self, name: &str) -> Result<Option<Resource>>;
+    async fn get_apiservice(&self, name: &str) -> ControllerStoreResult<Option<Resource>>;
 
-    async fn service_exists(&self, namespace: &str, name: &str) -> Result<bool>;
+    async fn service_exists(&self, namespace: &str, name: &str) -> ControllerStoreResult<bool>;
 
     async fn list_endpoint_slices(
         &self,
         namespace: &str,
         service_name: &str,
-    ) -> Result<Vec<Resource>>;
+    ) -> ControllerStoreResult<Vec<Resource>>;
 
-    async fn get_endpoints(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
+    async fn get_endpoints(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
 
     async fn update_apiservice_status(
         &self,
         current: &Resource,
         status: Value,
-    ) -> std::result::Result<(), ApiServiceStatusWriteError>;
+    ) -> ControllerStoreResult<()>;
 }
 
 pub(crate) async fn reconcile_apiservice<S: ApiServiceStore + ?Sized>(
@@ -59,11 +59,11 @@ pub(crate) async fn reconcile_apiservice<S: ApiServiceStore + ?Sized>(
 
         match store.update_apiservice_status(&current, status).await {
             Ok(_) => return Ok(()),
-            Err(ApiServiceStatusWriteError::Conflict(err)) => {
+            Err(err @ ControllerStoreError::Conflict(_)) => {
                 last_conflict = Some(err);
                 continue;
             }
-            Err(ApiServiceStatusWriteError::Other(err)) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     }
 

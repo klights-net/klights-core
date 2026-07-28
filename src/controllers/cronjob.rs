@@ -10,6 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 
 // `reconcile_all_cronjobs_and_enqueue_jobs` (the periodic-scan entry
@@ -23,11 +24,26 @@ use serde_json::{Value, json};
 /// status updates, and history cleanup stay consistent.
 #[async_trait]
 pub(crate) trait CronJobStore: ControllerStatusStore {
-    async fn get_cronjob(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
-    async fn get_job(&self, namespace: &str, name: &str) -> Result<Option<Resource>>;
-    async fn create_job(&self, namespace: &str, name: &str, value: Value) -> Result<Resource>;
-    async fn list_jobs(&self, namespace: &str) -> Result<Vec<Resource>>;
-    async fn delete_job(&self, namespace: &str, name: &str, uid: String) -> Result<()>;
+    async fn get_cronjob(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>>;
+    async fn get_job(&self, namespace: &str, name: &str)
+    -> ControllerStoreResult<Option<Resource>>;
+    async fn create_job(
+        &self,
+        namespace: &str,
+        name: &str,
+        value: Value,
+    ) -> ControllerStoreResult<Resource>;
+    async fn list_jobs(&self, namespace: &str) -> ControllerStoreResult<Vec<Resource>>;
+    async fn delete_job(
+        &self,
+        namespace: &str,
+        name: &str,
+        uid: String,
+    ) -> ControllerStoreResult<()>;
 }
 
 pub(crate) async fn reconcile_cronjob_one<S: CronJobStore + ?Sized>(

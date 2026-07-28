@@ -3,41 +3,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::cmp::Ordering;
 
-#[async_trait::async_trait]
-pub trait NamespaceTerminationStore: Send + Sync {
-    async fn get_terminating_namespace(
-        &self,
-        namespace: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>, AppError>;
-    async fn list_namespace_pods(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>, AppError>;
-    async fn mark_namespace_pod_terminating(
-        &self,
-        pod: &klights_cluster_core::Resource,
-        namespace: &str,
-        body: Value,
-    ) -> Result<(), AppError>;
-    async fn update_terminating_namespace(
-        &self,
-        namespace: &str,
-        body: Value,
-        expected_resource_version: i64,
-    ) -> Result<klights_cluster_core::Resource, AppError>;
-    async fn list_namespace_non_pod_resources(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<klights_cluster_core::Resource>, AppError>;
-    async fn delete_namespace_non_pod_resource(
-        &self,
-        resource: &klights_cluster_core::Resource,
-        namespace: &str,
-    ) -> Result<(), AppError>;
-    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64, AppError>;
-    async fn delete_terminating_namespace(&self, namespace: &str) -> anyhow::Result<()>;
-}
-
 pub trait NamespaceTerminationMetrics: Send + Sync {
     fn record_namespace_delete_failure(&self);
 }
@@ -50,13 +15,13 @@ pub trait AdmissionResourceStore: Send + Sync {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<klights_cluster_core::Resource>, AppError>;
+    ) -> Result<Option<klights_cluster_core::Resource>, klights_leader_api::ResourceQueryError>;
     async fn list_admission_resources(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-    ) -> Result<Vec<klights_cluster_core::Resource>, AppError>;
+    ) -> Result<Vec<klights_cluster_core::Resource>, klights_leader_api::ResourceQueryError>;
 }
 
 pub fn ensure_namespace_status_phase_active(data: &mut Value) {
@@ -183,7 +148,7 @@ pub fn set_namespace_terminating_status(
 }
 
 pub async fn reconcile_namespace_termination(
-    db: &(impl NamespaceTerminationStore + ?Sized),
+    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<(), AppError> {
@@ -215,7 +180,7 @@ pub enum NamespaceTerminationOutcome {
 /// have to perform its own forbidden DB query (the
 /// tests/source_guard_tests.py restricts it to workqueue CRUD only).
 pub async fn reconcile_namespace_termination_for_uid_with_outcome(
-    db: &(impl NamespaceTerminationStore + ?Sized),
+    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     expected_uid: &str,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
@@ -226,7 +191,7 @@ pub async fn reconcile_namespace_termination_for_uid_with_outcome(
     // Whether the inner reconcile returned Ok or a transient Err, look at
     // the post-state to decide whether the workqueue should schedule a
     // delayed retry.
-    let outcome = match db.get_terminating_namespace(namespace).await {
+    let outcome = match db.get_terminating_namespace(namespace.to_string()).await {
         Ok(Some(ns)) => {
             let same_uid = ns
                 .data
@@ -256,7 +221,7 @@ pub async fn reconcile_namespace_termination_for_uid_with_outcome(
 }
 
 async fn reconcile_namespace_termination_inner(
-    db: &(impl NamespaceTerminationStore + ?Sized),
+    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     expected_uid: Option<&str>,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
@@ -281,12 +246,12 @@ async fn reconcile_namespace_termination_inner(
 }
 
 async fn reconcile_namespace_termination_once(
-    db: &(impl NamespaceTerminationStore + ?Sized),
+    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     expected_uid: Option<&str>,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<(), AppError> {
-    let Some(current_ns) = db.get_terminating_namespace(namespace).await? else {
+    let Some(current_ns) = db.get_terminating_namespace(namespace.to_string()).await? else {
         return Ok(());
     };
     if let Some(expected_uid) = expected_uid {
@@ -315,7 +280,7 @@ async fn reconcile_namespace_termination_once(
         return Ok(());
     }
 
-    let pods = db.list_namespace_pods(namespace).await?;
+    let pods = db.list_namespace_pods(namespace.to_string()).await?;
     let mut pod_blockers = false;
 
     for resource in &pods {
@@ -338,7 +303,7 @@ async fn reconcile_namespace_termination_once(
                     serde_json::json!(0),
                 );
             }
-            db.mark_namespace_pod_terminating(resource, namespace, pod)
+            db.mark_namespace_pod_terminating(resource.clone(), namespace.to_string(), pod)
                 .await?;
         }
     }
@@ -346,21 +311,29 @@ async fn reconcile_namespace_termination_once(
     let mut namespace_data: Value = (*current_ns.data).clone();
     set_namespace_terminating_status(&mut namespace_data, pod_blockers);
     let updated_ns = db
-        .update_terminating_namespace(namespace, namespace_data, current_ns.resource_version)
+        .update_terminating_namespace(
+            namespace.to_string(),
+            namespace_data,
+            current_ns.resource_version,
+        )
         .await?;
 
     if pod_blockers {
         return Ok(());
     }
 
-    let resources_after_pods = db.list_namespace_non_pod_resources(namespace).await?;
+    let resources_after_pods = db
+        .list_namespace_non_pod_resources(namespace.to_string())
+        .await?;
     for resource in &resources_after_pods {
-        db.delete_namespace_non_pod_resource(resource, namespace)
+        db.delete_namespace_non_pod_resource(resource.clone(), namespace.to_string())
             .await?;
     }
 
-    if db.count_namespace_resources(namespace).await? == 0
-        && let Err(e) = db.delete_terminating_namespace(&updated_ns.name).await
+    if db.count_namespace_resources(namespace.to_string()).await? == 0
+        && let Err(e) = db
+            .delete_terminating_namespace(updated_ns.name.clone())
+            .await
     {
         // A concurrent reconcile may have already deleted the namespace;
         // surface NotFound so the outer retry loop returns Ok.

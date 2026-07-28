@@ -1,7 +1,8 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
+use klights_reconcile_api::ControllerStoreResult as Result;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::replicationcontroller::{
     ReplicationControllerPodMutation, ReplicationControllerStore,
 };
@@ -20,7 +21,9 @@ where
         node_name: &str,
         pod: serde_json::Value,
     ) -> Result<Resource> {
-        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod).await
+        PodObjectWriter::create_controller_pod(self, namespace, name, node_name, pod)
+            .await
+            .map_err(map_controller_store_error)
     }
 
     async fn replace_replication_controller_pod_owner_references(
@@ -29,7 +32,9 @@ where
         name: &str,
         owner_references: Vec<serde_json::Value>,
     ) -> Result<Resource> {
-        PodObjectWriter::update_pod_owner_references(self, namespace, name, owner_references).await
+        PodObjectWriter::update_pod_owner_references(self, namespace, name, owner_references)
+            .await
+            .map_err(map_controller_store_error)
     }
 }
 
@@ -45,6 +50,7 @@ where
     ) -> Result<Option<Resource>> {
         DatastoreBackend::get_resource(self, "v1", "ReplicationController", Some(namespace), name)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn list_resource_quotas(&self, namespace: &str) -> Result<Vec<Resource>> {
@@ -55,7 +61,8 @@ where
                 Some(namespace),
                 ResourceListQuery::all(),
             )
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
@@ -67,5 +74,6 @@ where
         crate::controllers::common::write_status_for_resource(self, resource, &status)
             .await
             .map(|_| ())
+            .map_err(map_controller_store_error)
     }
 }

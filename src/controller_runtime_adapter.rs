@@ -1,15 +1,20 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourceBatchOperation, ResourcePreconditions};
+use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult as Result};
 
 use crate::controllers::{
-    ControllerEffectPort, ControllerLeaderPort, ControllerNetworkPort, ControllerPodPort,
-    ControllerReconcilePort,
+    ControllerEffectPort, ControllerNetworkPort, ControllerReconcilePort, ControllerResourceQuery,
 };
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::PodRepository;
+
+fn validate_controller_effect() -> Result<()> {
+    klights_leader_api::validate_controller_lease_if_scoped().map_err(|error| {
+        ControllerStoreError::unavailable(format!("controller authority rejected effect: {error}"))
+    })
+}
 
 pub(crate) struct RootControllerLeaderPort {
     store: DatastoreHandle,
@@ -22,24 +27,37 @@ impl RootControllerLeaderPort {
 }
 
 #[async_trait]
-impl ControllerLeaderPort for RootControllerLeaderPort {
+impl ControllerResourceQuery for RootControllerLeaderPort {
     async fn get_reconcile_resource(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-    ) -> Result<Option<Resource>> {
+    ) -> std::result::Result<Option<Resource>, klights_leader_api::ResourceQueryError> {
         self.store
             .get_resource(api_version, kind, namespace, name)
             .await
+            .map_err(|error| {
+                klights_leader_api::ResourceQueryError::retryable(format!(
+                    "controller resource query failed: {error}"
+                ))
+            })
     }
 
-    async fn namespace_is_terminating(&self, namespace: &str) -> Result<bool> {
+    async fn namespace_is_terminating(
+        &self,
+        namespace: &str,
+    ) -> std::result::Result<bool, klights_leader_api::ResourceQueryError> {
         Ok(self
             .store
             .get_namespace(namespace)
-            .await?
+            .await
+            .map_err(|error| {
+                klights_leader_api::ResourceQueryError::retryable(format!(
+                    "controller namespace query failed: {error}"
+                ))
+            })?
             .is_some_and(|resource| {
                 resource
                     .data
@@ -47,52 +65,6 @@ impl ControllerLeaderPort for RootControllerLeaderPort {
                     .and_then(serde_json::Value::as_str)
                     .is_some()
             }))
-    }
-
-    fn deployment_store(&self) -> &dyn crate::controllers::deployment::DeploymentStore {
-        self
-    }
-
-    fn replicaset_store(&self) -> &dyn crate::controllers::replicaset::ReplicaSetStore {
-        self
-    }
-
-    fn statefulset_store(&self) -> &dyn crate::controllers::statefulset::StatefulSetStore {
-        self
-    }
-
-    fn daemonset_store(&self) -> &dyn crate::controllers::daemonset::DaemonSetStore {
-        self
-    }
-
-    fn job_store(&self) -> &dyn crate::controllers::job::JobStore {
-        self
-    }
-
-    fn service_store(&self) -> &dyn crate::controllers::service::ServiceControllerStore {
-        self
-    }
-
-    fn pvc_store(&self) -> &dyn crate::controllers::pvc::PvcStore {
-        self
-    }
-
-    fn pdb_store(&self) -> &dyn crate::controllers::pdb::PdbStore {
-        self
-    }
-
-    fn replicationcontroller_store(
-        &self,
-    ) -> &dyn crate::controllers::replicationcontroller::ReplicationControllerStore {
-        self
-    }
-
-    fn apiservice_store(&self) -> &dyn crate::controllers::apiservice::ApiServiceStore {
-        self
-    }
-
-    fn csr_status_store(&self) -> &dyn crate::controllers::csr_signer::CsrStatusStore {
-        self
     }
 }
 
@@ -131,6 +103,7 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::gc::GcResourceStore::update_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
@@ -172,13 +145,6 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         )
         .await
     }
-
-    fn gc_store_error_is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::controllers::gc::GcResourceStore::gc_store_error_is_conflict(
-            self.store.as_ref(),
-            error,
-        )
-    }
 }
 
 #[async_trait]
@@ -197,6 +163,7 @@ impl crate::controllers::replicaset::ReplicaSetStore for RootControllerLeaderPor
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::replicaset::ReplicaSetStore::update_replicaset_status(
             self.store.as_ref(),
             resource,
@@ -224,6 +191,7 @@ impl crate::controllers::deployment::DeploymentFinalizeStore for RootControllerL
         revision: String,
         expected_uid: String,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::deployment::DeploymentFinalizeStore::patch_deployment_revision(
             self.store.as_ref(),
             namespace,
@@ -240,6 +208,7 @@ impl crate::controllers::deployment::DeploymentFinalizeStore for RootControllerL
         name: &str,
         expected_uid: String,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::deployment::DeploymentFinalizeStore::delete_replicaset(
             self.store.as_ref(),
             namespace,
@@ -266,6 +235,7 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
         name: &str,
         replicaset: serde_json::Value,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::deployment::DeploymentStore::create_replicaset(
             self.store.as_ref(),
             namespace,
@@ -282,6 +252,7 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
         patch: serde_json::Value,
         expected_uid: String,
     ) -> Result<Option<Resource>> {
+        validate_controller_effect()?;
         crate::controllers::deployment::DeploymentStore::patch_replicaset_scale(
             self.store.as_ref(),
             namespace,
@@ -297,6 +268,7 @@ impl crate::controllers::deployment::DeploymentStore for RootControllerLeaderPor
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::deployment::DeploymentStore::update_deployment_status(
             self.store.as_ref(),
             resource,
@@ -322,6 +294,7 @@ impl crate::controllers::statefulset::StatefulSetStore for RootControllerLeaderP
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::statefulset::StatefulSetStore::update_statefulset_status(
             self.store.as_ref(),
             resource,
@@ -347,6 +320,7 @@ impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort 
         name: &str,
         revision: serde_json::Value,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::daemonset::DaemonSetStore::create_controller_revision(
             self.store.as_ref(),
             namespace,
@@ -365,6 +339,7 @@ impl crate::controllers::daemonset::DaemonSetStore for RootControllerLeaderPort 
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::daemonset::DaemonSetStore::update_daemonset_status(
             self.store.as_ref(),
             resource,
@@ -385,6 +360,7 @@ impl crate::controllers::job::JobStore for RootControllerLeaderPort {
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::job::JobStore::update_job_status(self.store.as_ref(), resource, status)
             .await
     }
@@ -412,6 +388,7 @@ impl crate::controllers::service::ServiceReconcileStore for RootControllerLeader
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::service::ServiceReconcileStore::update_service(
             self.store.as_ref(),
             namespace,
@@ -420,13 +397,6 @@ impl crate::controllers::service::ServiceReconcileStore for RootControllerLeader
             preconditions,
         )
         .await
-    }
-
-    fn service_store_error_is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::controllers::service::ServiceReconcileStore::service_store_error_is_conflict(
-            self.store.as_ref(),
-            error,
-        )
     }
 }
 
@@ -478,6 +448,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         name: &str,
         data: serde_json::Value,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::endpoints::EndpointReconcileStore::create_resource(
             self.store.as_ref(),
             api_version,
@@ -498,6 +469,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::endpoints::EndpointReconcileStore::update_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
@@ -518,6 +490,7 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
         name: &str,
         preconditions: ResourcePreconditions,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::endpoints::EndpointReconcileStore::delete_resource_with_preconditions(
             self.store.as_ref(),
             api_version,
@@ -530,25 +503,12 @@ impl crate::controllers::endpoints::EndpointReconcileStore for RootControllerLea
     }
 
     async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::endpoints::EndpointReconcileStore::apply_resource_batch(
             self.store.as_ref(),
             operations,
         )
         .await
-    }
-
-    fn endpoint_store_error_is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::controllers::endpoints::EndpointReconcileStore::endpoint_store_error_is_conflict(
-            self.store.as_ref(),
-            error,
-        )
-    }
-
-    fn endpoint_store_error_is_already_exists(&self, error: &anyhow::Error) -> bool {
-        crate::controllers::endpoints::EndpointReconcileStore::endpoint_store_error_is_already_exists(
-            self.store.as_ref(),
-            error,
-        )
     }
 }
 
@@ -580,6 +540,7 @@ impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderP
         status: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::common::ControllerStatusStore::update_status(
             self.store.as_ref(),
             api_version,
@@ -590,17 +551,6 @@ impl crate::controllers::common::ControllerStatusStore for RootControllerLeaderP
             preconditions,
         )
         .await
-    }
-
-    fn is_conflict(&self, error: &anyhow::Error) -> bool {
-        crate::controllers::common::ControllerStatusStore::is_conflict(self.store.as_ref(), error)
-    }
-
-    fn conflict_error(&self, message: &'static str) -> anyhow::Error {
-        crate::controllers::common::ControllerStatusStore::conflict_error(
-            self.store.as_ref(),
-            message,
-        )
     }
 
     fn log_noop_status_write(
@@ -637,6 +587,7 @@ impl crate::controllers::pvc::PvcStore for RootControllerLeaderPort {
         name: &str,
         value: serde_json::Value,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::pvc::PvcStore::create_persistent_volume(
             self.store.as_ref(),
             name,
@@ -651,6 +602,7 @@ impl crate::controllers::pvc::PvcStore for RootControllerLeaderPort {
         value: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
+        validate_controller_effect()?;
         crate::controllers::pvc::PvcStore::update_persistent_volume(
             self.store.as_ref(),
             name,
@@ -698,6 +650,7 @@ impl crate::controllers::replicationcontroller::ReplicationControllerStore
         resource: &Resource,
         status: serde_json::Value,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::replicationcontroller::ReplicationControllerStore::update_replication_controller_status(
             self.store.as_ref(),
             resource,
@@ -749,7 +702,8 @@ impl crate::controllers::apiservice::ApiServiceStore for RootControllerLeaderPor
         &self,
         current: &Resource,
         status: serde_json::Value,
-    ) -> std::result::Result<(), crate::controllers::apiservice::ApiServiceStatusWriteError> {
+    ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::apiservice::ApiServiceStore::update_apiservice_status(
             self.store.as_ref(),
             current,
@@ -772,6 +726,7 @@ impl crate::controllers::csr_signer::CsrStatusStore for RootControllerLeaderPort
         resource_version: i64,
         status: serde_json::Value,
     ) -> Result<()> {
+        validate_controller_effect()?;
         crate::controllers::csr_signer::CsrStatusStore::update_csr_status(
             self.store.as_ref(),
             name,
@@ -809,50 +764,6 @@ impl RootControllerPodPort {
     }
 }
 
-impl ControllerPodPort for RootControllerPodPort {
-    fn query(&self) -> &dyn klights_pod_api::PodQuery {
-        self.repository.as_ref()
-    }
-
-    fn pdb_reader(&self) -> &dyn crate::controllers::pdb::PdbPodReader {
-        self.repository.as_ref()
-    }
-
-    fn deployment_reader(&self) -> &dyn crate::controllers::DeploymentControllerPodReader {
-        self.repository.as_ref()
-    }
-
-    fn deployment_mutation(&self) -> &dyn crate::controllers::DeploymentControllerPodMutation {
-        self
-    }
-
-    fn replicaset_mutation(&self) -> &dyn crate::controllers::replicaset::ReplicaSetPodMutation {
-        self
-    }
-
-    fn statefulset_mutation(&self) -> &dyn crate::controllers::statefulset::StatefulSetPodMutation {
-        self
-    }
-
-    fn daemonset_mutation(&self) -> &dyn crate::controllers::daemonset::DaemonSetPodMutation {
-        self
-    }
-
-    fn job_mutation(&self) -> &dyn crate::controllers::job::JobPodMutation {
-        self
-    }
-
-    fn replicationcontroller_mutation(
-        &self,
-    ) -> &dyn crate::controllers::replicationcontroller::ReplicationControllerPodMutation {
-        self
-    }
-
-    fn delete_sink(&self) -> &dyn klights_reconcile_api::GcPodDeleteSink {
-        self.repository.as_ref()
-    }
-}
-
 #[async_trait]
 impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
     async fn create_controller_pod(
@@ -862,6 +773,7 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
         _node_name: &str,
         pod: serde_json::Value,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         let result = klights_pod_api::PodApiMutation::create_pod(
             self.api.as_ref(),
             klights_pod_api::PodApiCreateRequest {
@@ -878,6 +790,7 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
     }
 
     async fn delete_pod(&self, namespace: &str, name: &str) -> anyhow::Result<()> {
+        validate_controller_effect()?;
         crate::kubelet::pod_repository::PodObjectWriter::delete_pod(
             self.repository.as_ref(),
             namespace,
@@ -892,6 +805,7 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
         name: &str,
         owner_refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references(
             self.repository.as_ref(),
             namespace,
@@ -908,6 +822,7 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
         expected_uid: &str,
         owner_refs: Vec<serde_json::Value>,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         crate::kubelet::pod_repository::PodObjectWriter::update_pod_owner_references_for_uid(
             self.repository.as_ref(),
             namespace,
@@ -924,6 +839,7 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
         name: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels(
             self.repository.as_ref(),
             namespace,
@@ -940,6 +856,7 @@ impl crate::kubelet::pod_repository::PodObjectWriter for RootControllerPodPort {
         expected_uid: &str,
         labels: Vec<(String, String)>,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         crate::kubelet::pod_repository::PodObjectWriter::merge_pod_labels_for_uid(
             self.repository.as_ref(),
             namespace,
@@ -960,6 +877,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
         status: serde_json::Value,
         expected_resource_version: i64,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         self.subresource
             .replace_status_from_api_checked(
                 namespace,
@@ -979,6 +897,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
         status: serde_json::Value,
         expected_resource_version: i64,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         self.subresource
             .replace_status_from_api_checked(
                 namespace,
@@ -998,6 +917,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
         patch_type: crate::kubelet::pod_repository::PodStatusPatchType,
         expected_resource_version: i64,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         self.subresource
             .patch_status_from_api(
                 namespace,
@@ -1016,6 +936,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
         containers: Vec<serde_json::Value>,
         expected_resource_version: i64,
     ) -> anyhow::Result<Resource> {
+        validate_controller_effect()?;
         self.subresource
             .update_ephemeral_containers(namespace, name, containers, expected_resource_version)
             .await
@@ -1024,7 +945,7 @@ impl crate::kubelet::pod_repository::PodSubresourceWriter for RootControllerPodP
 
 #[async_trait]
 impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControllerPodPort {
-    async fn list_pods_bound_to_node(&self, node_name: &str) -> anyhow::Result<Vec<Resource>> {
+    async fn list_pods_bound_to_node(&self, node_name: &str) -> Result<Vec<Resource>> {
         let field_selector = format!("spec.nodeName={node_name}");
         Ok(crate::kubelet::pod_repository::PodReader::list_pods(
             self.repository.as_ref(),
@@ -1034,7 +955,8 @@ impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControlle
             None,
             None,
         )
-        .await?
+        .await
+        .map_err(crate::controller_store_error_adapter::map_controller_store_error)?
         .items)
     }
 
@@ -1042,7 +964,8 @@ impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControlle
         &self,
         pod: &Resource,
         status: serde_json::Value,
-    ) -> anyhow::Result<Resource> {
+    ) -> Result<Resource> {
+        validate_controller_effect()?;
         self.subresource
             .replace_status_from_api_checked(
                 pod.namespace.as_deref().unwrap_or("default"),
@@ -1052,6 +975,7 @@ impl crate::controllers::node_lifecycle::NodeLifecyclePodStore for RootControlle
                 pod.resource_version,
             )
             .await
+            .map_err(crate::controller_store_error_adapter::map_controller_store_error)
     }
 }
 

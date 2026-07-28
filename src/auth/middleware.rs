@@ -623,6 +623,7 @@ mod tests {
     struct RejectBootstrap;
     struct AcceptBootstrap;
     struct RejectSigningKey;
+    struct StaticSigningKey(String);
     struct StaticWebhookReviewer {
         status: TokenReviewStatus,
     }
@@ -664,6 +665,13 @@ mod tests {
             Err(AuthenticationError::dependency_failure(
                 "signing key unavailable",
             ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServiceAccountSigningKeyProvider for StaticSigningKey {
+        async fn service_account_signing_key_pem(&self) -> Result<String, AuthenticationError> {
+            Ok(self.0.clone())
         }
     }
 
@@ -728,6 +736,44 @@ mod tests {
                 .get(&(namespace.to_string(), name.to_string()))
                 .cloned())
         }
+    }
+
+    #[tokio::test]
+    async fn service_account_authentication_uses_injected_signer_without_host_state() {
+        let signing_key = crate::auth::generate_ca_full().unwrap().3;
+        let token = crate::auth::generate_sa_token_with_sa_uid(
+            &signing_key,
+            "default",
+            "default",
+            &["https://kubernetes.default.svc.cluster.local"],
+            3600,
+            "sa-uid",
+        )
+        .unwrap();
+        let mut subjects = Subjects::default();
+        subjects.service_accounts.insert(
+            ("default".to_string(), "default".to_string()),
+            "sa-uid".to_string(),
+        );
+        let supervisor = TaskSupervisor::new(Default::default());
+        let signing_keys = StaticSigningKey(signing_key);
+        let runtime = AuthnRuntime::new(
+            &RejectBootstrap,
+            &signing_keys,
+            &subjects,
+            None,
+            None,
+            &crate::auth::clock::SystemClock,
+            &supervisor,
+            false,
+        );
+
+        let identity = authenticate_bearer_token(&runtime, &token)
+            .await
+            .expect("injected signer must authenticate a ServiceAccount token");
+
+        assert_eq!(identity.username, "system:serviceaccount:default:default");
+        supervisor.shutdown(Duration::from_secs(1)).await;
     }
 
     fn claims(value: serde_json::Value) -> crate::auth::SaTokenClaims {

@@ -6,22 +6,30 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+#[cfg(test)]
 use crate::datastore::CommitObservationSink;
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
-use crate::datastore::sqlite::{create_pending_watch_event, publish_pending};
+use crate::datastore::sqlite::create_pending_watch_event;
+#[cfg(test)]
+use crate::datastore::sqlite::publish_pending;
 use klights_cluster_core::Resource;
 
 pub struct RedbNamespaceStore {
     pub accessor: Arc<RedbAccessor>,
+    #[cfg(test)]
     pub commit_sink: Arc<dyn CommitObservationSink>,
 }
 
 impl RedbNamespaceStore {
-    pub fn new(accessor: Arc<RedbAccessor>, commit_sink: Arc<dyn CommitObservationSink>) -> Self {
+    pub fn new(
+        accessor: Arc<RedbAccessor>,
+        #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
+    ) -> Self {
         Self {
             accessor,
+            #[cfg(test)]
             commit_sink,
         }
     }
@@ -42,6 +50,9 @@ impl RedbNamespaceStore {
             + 'static,
     {
         let (result, pending) = self.accessor.call(label, f).await?;
+        #[cfg(not(test))]
+        let _ = pending;
+        #[cfg(test)]
         if let Some(pending) = pending {
             publish_pending(pending, self.commit_sink.as_ref());
         }

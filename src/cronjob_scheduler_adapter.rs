@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::controllers::ControllerDispatcher;
 use crate::controllers::cronjob_scheduler::{
-    CronJobScheduler, CronJobSchedulerRuntime, CronJobWatchSession,
+    CronJobScheduler, CronJobSchedulerRuntime, CronJobSchedulerRuntimeError, CronJobWatchSession,
 };
 use crate::datastore::DatastoreHandle;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest};
@@ -19,7 +18,10 @@ struct LeaderCronJobSchedulerRuntime {
 
 #[async_trait]
 impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
-    async fn list_cronjobs(&self) -> Result<Vec<klights_cluster_core::Resource>> {
+    async fn list_cronjobs(
+        &self,
+    ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>
+    {
         self.db
             .list_resources(
                 "batch/v1",
@@ -29,9 +31,15 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
             )
             .await
             .map(|listing| listing.items)
+            .map_err(|error| CronJobSchedulerRuntimeError::query_unavailable(error.to_string()))
     }
 
-    async fn reconcile_cronjob(&self, resource: &klights_cluster_core::Resource) -> Result<()> {
+    async fn reconcile_cronjob(
+        &self,
+        resource: &klights_cluster_core::Resource,
+    ) -> std::result::Result<(), CronJobSchedulerRuntimeError> {
+        klights_leader_api::validate_controller_lease_if_scoped()
+            .map_err(|error| CronJobSchedulerRuntimeError::reconcile_failed(error.to_string()))?;
         crate::controllers::cronjob::reconcile_cronjob_one(
             self.db.as_ref(),
             Some(self.dispatcher.as_ref()),
@@ -39,6 +47,7 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
             resource.resource_version,
         )
         .await
+        .map_err(|error| CronJobSchedulerRuntimeError::reconcile_failed(error.to_string()))
     }
 
     async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError> {

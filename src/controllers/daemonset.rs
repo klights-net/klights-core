@@ -2,21 +2,29 @@ use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_pod_api::{PodOwnerListRequest, PodQuery};
+use klights_reconcile_api::ControllerStoreResult;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing;
 
 #[async_trait]
 pub trait DaemonSetStore: crate::controllers::gc::GcResourceStore + Send + Sync {
-    async fn list_controller_revisions(&self, namespace: &str) -> Result<Vec<Resource>>;
+    async fn list_controller_revisions(
+        &self,
+        namespace: &str,
+    ) -> ControllerStoreResult<Vec<Resource>>;
     async fn create_controller_revision(
         &self,
         namespace: &str,
         name: &str,
         revision: Value,
-    ) -> Result<Resource>;
-    async fn list_nodes(&self) -> Result<Vec<Resource>>;
-    async fn update_daemonset_status(&self, resource: &Resource, status: Value) -> Result<()>;
+    ) -> ControllerStoreResult<Resource>;
+    async fn list_nodes(&self) -> ControllerStoreResult<Vec<Resource>>;
+    async fn update_daemonset_status(
+        &self,
+        resource: &Resource,
+        status: Value,
+    ) -> ControllerStoreResult<()>;
 }
 
 #[async_trait]
@@ -27,7 +35,7 @@ pub trait DaemonSetPodMutation: Send + Sync {
         name: &str,
         node_name: &str,
         pod: Value,
-    ) -> Result<Resource>;
+    ) -> ControllerStoreResult<Resource>;
 }
 
 /// Compute a deterministic hash of the pod template for change detection.
@@ -499,7 +507,7 @@ async fn ensure_controller_revision(
                         error = %e,
                         "ControllerRevision create FAILED"
                     );
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }

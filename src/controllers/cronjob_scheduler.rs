@@ -44,11 +44,38 @@ pub struct CronJobWatchSession {
     pub events: WatchStream,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CronJobSchedulerRuntimeError {
+    #[error("CronJob query unavailable: {message}")]
+    QueryUnavailable { message: String },
+    #[error("CronJob reconcile failed: {message}")]
+    ReconcileFailed { message: String },
+}
+
+impl CronJobSchedulerRuntimeError {
+    pub fn query_unavailable(message: impl Into<String>) -> Self {
+        Self::QueryUnavailable {
+            message: message.into(),
+        }
+    }
+
+    pub fn reconcile_failed(message: impl Into<String>) -> Self {
+        Self::ReconcileFailed {
+            message: message.into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait CronJobSchedulerRuntime: Send + Sync {
-    async fn list_cronjobs(&self) -> Result<Vec<klights_cluster_core::Resource>>;
+    async fn list_cronjobs(
+        &self,
+    ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>;
 
-    async fn reconcile_cronjob(&self, resource: &klights_cluster_core::Resource) -> Result<()>;
+    async fn reconcile_cronjob(
+        &self,
+        resource: &klights_cluster_core::Resource,
+    ) -> std::result::Result<(), CronJobSchedulerRuntimeError>;
 
     async fn open_watch(&self) -> std::result::Result<CronJobWatchSession, LeaderWatchError>;
 }
@@ -431,14 +458,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CronJobSchedulerRuntime for ReplayExpiryRuntime {
-        async fn list_cronjobs(&self) -> Result<Vec<klights_cluster_core::Resource>> {
+        async fn list_cronjobs(
+            &self,
+        ) -> std::result::Result<Vec<klights_cluster_core::Resource>, CronJobSchedulerRuntimeError>
+        {
             Ok(Vec::new())
         }
 
         async fn reconcile_cronjob(
             &self,
             _resource: &klights_cluster_core::Resource,
-        ) -> Result<()> {
+        ) -> std::result::Result<(), CronJobSchedulerRuntimeError> {
             Ok(())
         }
 

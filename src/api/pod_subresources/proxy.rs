@@ -973,14 +973,15 @@ pub(in crate::api) async fn service_proxy_inner(
     let effective_port_override = port_override.or(parsed.port_num);
 
     // Look up the service
-    let service = state
-        .resource_mutation()
-        .db
-        .get_resource("v1", "Service", Some(namespace), name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("Service {}/{} not found", namespace, name_param))
-        })?;
+    let service = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Service",
+        Some(namespace),
+        name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("Service {}/{} not found", namespace, name_param)))?;
 
     // Get service spec
     let spec = service
@@ -1018,12 +1019,15 @@ pub(in crate::api) async fn service_proxy_inner(
     })?;
 
     // Get Endpoints for this service
-    let endpoints = state
-        .resource_mutation()
-        .db
-        .get_resource("v1", "Endpoints", Some(namespace), name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Endpoints {}/{} not found", namespace, name)))?;
+    let endpoints = crate::api::resource_query_ports::get_resource(
+        state.resource_mutation().resource_query.as_ref(),
+        "v1",
+        "Endpoints",
+        Some(namespace),
+        name,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("Endpoints {}/{} not found", namespace, name)))?;
 
     // Resolve the requested service port to its name/number once; each
     // endpoint's concrete target port is resolved from its own subset below.

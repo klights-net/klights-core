@@ -1,7 +1,8 @@
-use anyhow::Result;
 use async_trait::async_trait;
 use klights_cluster_core::{PatchKind, Resource, ResourcePreconditions};
+use klights_reconcile_api::ControllerStoreResult as Result;
 
+use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::deployment::{DeploymentPodMutation, DeploymentStore};
 use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePatchRequest};
 use crate::kubelet::pod_repository::PodObjectWriter;
@@ -17,7 +18,9 @@ where
         name: &str,
         labels: Vec<(String, String)>,
     ) -> Result<Resource> {
-        PodObjectWriter::merge_pod_labels(self, namespace, name, labels).await
+        PodObjectWriter::merge_pod_labels(self, namespace, name, labels)
+            .await
+            .map_err(map_controller_store_error)
     }
 }
 
@@ -34,7 +37,8 @@ where
                 Some(namespace),
                 ResourceListQuery::all(),
             )
-            .await?
+            .await
+            .map_err(map_controller_store_error)?
             .items)
     }
 
@@ -46,6 +50,7 @@ where
     ) -> Result<Resource> {
         self.create_resource("apps/v1", "ReplicaSet", Some(namespace), name, replicaset)
             .await
+            .map_err(map_controller_store_error)
     }
 
     async fn patch_replicaset_scale(
@@ -67,6 +72,7 @@ where
             ),
         )
         .await
+        .map_err(map_controller_store_error)
     }
 
     async fn update_deployment_status(
@@ -77,5 +83,6 @@ where
         crate::controllers::common::write_status_for_resource(self, resource, &status)
             .await
             .map(|_| ())
+            .map_err(map_controller_store_error)
     }
 }

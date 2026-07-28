@@ -10,7 +10,7 @@ controller_wrapper!(
     with_node,
     with_pod_repository,
     store = replicaset_store,
-    reader = query,
+    reader = pod_query,
     mutation = replicaset_mutation
 );
 
