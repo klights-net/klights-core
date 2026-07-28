@@ -79,43 +79,20 @@ pub fn git_tree_state() -> &'static str {
     }
 }
 
-/// K8s-style version info for /version endpoint
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VersionInfo {
-    pub major: String,
-    pub minor: String,
-    pub git_version: String,
-    pub git_commit: String,
-    pub git_tree_state: String,
-    pub build_date: String,
-    pub go_version: String,
-    pub compiler: String,
-    pub platform: String,
-}
-
-impl Default for VersionInfo {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl VersionInfo {
-    pub fn new() -> Self {
-        let (major, minor) = k8s_major_minor_version();
-
-        VersionInfo {
-            major: major.to_string(),
-            minor: minor.to_string(),
-            git_version: git_version(),
-            git_commit: git_commit_hash().to_string(),
-            git_tree_state: git_tree_state().to_string(),
-            build_date: build_date().to_string(),
-            go_version: "go1.22.5".to_string(), // For K8s API compatibility
-            compiler: format!("rustc {}", rustc_version()),
-            platform: target_triple().to_string(),
-        }
-    }
+/// Construct the HTTP adapter's Kubernetes `/version` payload from root-owned
+/// build inputs.
+pub(crate) fn api_version_info() -> crate::api::version::VersionInfo {
+    let (major, minor) = k8s_major_minor_version();
+    crate::api::version::VersionInfo::new(
+        major,
+        minor,
+        git_version(),
+        git_commit_hash(),
+        git_tree_state(),
+        build_date(),
+        format!("rustc {}", rustc_version()),
+        target_triple(),
+    )
 }
 
 #[cfg(test)]
@@ -163,14 +140,14 @@ mod tests {
 
     #[test]
     fn test_version_info_serialization() {
-        let info = VersionInfo::new();
+        let info = api_version_info();
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("gitVersion"));
     }
 
     #[test]
     fn test_version_info_k8s_compatible_fields() {
-        let info = VersionInfo::new();
+        let info = api_version_info();
         // Ensure all K8s required fields exist
         assert!(!info.major.is_empty());
         assert!(!info.minor.is_empty());

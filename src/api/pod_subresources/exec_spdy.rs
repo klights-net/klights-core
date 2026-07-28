@@ -146,7 +146,9 @@ where
                 );
             }
             frame = client_spdy.read_frame(client_stream) => {
-                match frame? {
+                let frame = frame?;
+                frame.trace_control_metadata();
+                match frame {
                     SpdyFrame::SynStream { stream_id, headers } => {
                         if let Some(stream_type) = spdy_stream_type_from_headers(&headers) {
                             streams.insert(stream_id, stream_type);

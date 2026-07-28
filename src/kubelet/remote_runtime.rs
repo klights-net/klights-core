@@ -235,7 +235,9 @@ async fn run_cri_node_exec_stream(
                 }
             }
             frame = containerd_spdy.read_frame(&mut containerd_stream) => {
-                match frame? {
+                let frame = frame?;
+                frame.trace_control_metadata();
+                match frame {
                     SpdyFrame::Data { stream_id, data, fin } => {
                         let channel = match stream_id {
                             3 => Some(ExecStreamChannel::Stdout),

@@ -3,7 +3,7 @@
 //! External SPDY (kubectl-facing) has been removed. This module provides SPDY client
 //! functionality used internally to bridge WebSocket requests to containerd.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 /// SPDY/3.1 header compression dictionary (full 1423-byte version)
 /// From the SPDY/3 spec: https://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3-1/
@@ -26,20 +26,16 @@ pub const SPDY_VERSION: u16 = 3;
 
 /// Stream type as identified by K8s remotecommand headers
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // The client codec retains the complete Kubernetes stream vocabulary.
 pub enum StreamType {
     Stdin,
     Stdout,
     Stderr,
     Error,
     Resize,
-    /// Port-forward data stream (bidirectional)
-    Data,
 }
 
 /// Parsed SPDY frame
 #[derive(Debug)]
-#[allow(dead_code)] // Parsed peer frame fields are retained for protocol completeness.
 pub enum SpdyFrame {
     SynStream {
         stream_id: u32,
@@ -67,12 +63,32 @@ pub enum SpdyFrame {
     Unknown,
 }
 
+impl SpdyFrame {
+    pub(crate) fn trace_control_metadata(&self) {
+        match self {
+            Self::SynStream { stream_id, headers } => {
+                tracing::trace!(
+                    stream_id,
+                    header_count = headers.len(),
+                    "received containerd SPDY SYN_STREAM"
+                );
+            }
+            Self::SynReply { stream_id } => {
+                tracing::trace!(stream_id, "received containerd SPDY SYN_REPLY");
+            }
+            Self::RstStream { stream_id } => {
+                tracing::trace!(stream_id, "received containerd SPDY RST_STREAM");
+            }
+            Self::WindowUpdate { stream_id } => {
+                tracing::trace!(stream_id, "received containerd SPDY WINDOW_UPDATE");
+            }
+            _ => {}
+        }
+    }
+}
+
 /// SPDY connection handler for K8s exec
-#[allow(dead_code)] // Stream bookkeeping is exercised by the codec's protocol tests.
 pub struct SpdyExec {
-    pub streams: HashMap<u32, StreamType>,
-    /// Frames read while negotiating streams that must be processed by the caller.
-    pub pending_frames: VecDeque<SpdyFrame>,
     /// Zlib decompressor for headers (must persist across frames)
     pub decompressor: flate2::Decompress,
     /// Zlib compressor for headers (must persist across frames)
@@ -88,8 +104,6 @@ impl SpdyExec {
             .expect("Failed to set SPDY dictionary");
 
         Self {
-            streams: HashMap::new(),
-            pending_frames: VecDeque::new(),
             decompressor,
             compressor,
         }

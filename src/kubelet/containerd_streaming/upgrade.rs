@@ -1,6 +1,6 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::frame::{PING, SPDY_VERSION, SpdyExec, StreamType};
+use super::frame::{PING, SPDY_VERSION, SpdyExec};
 
 impl SpdyExec {
     /// Connect to containerd streaming URL and perform SPDY/3.1 upgrade
@@ -62,13 +62,5 @@ impl SpdyExec {
         stream.flush().await?;
 
         Ok(())
-    }
-
-    #[allow(dead_code)] // Used by the private codec's stream-negotiation tests.
-    pub fn stream_id_for(&self, stream_type: StreamType) -> Option<u32> {
-        self.streams
-            .iter()
-            .find(|(_, t)| **t == stream_type)
-            .map(|(id, _)| *id)
     }
 }

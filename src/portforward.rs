@@ -15,49 +15,6 @@ const PORT_FORWARD_FRAME_CAPACITY: usize = 64;
 const PORT_FORWARD_BYTE_CAPACITY: usize = 256 * 1024;
 const PORT_FORWARD_READ_BUFFER_SIZE: usize = 4096;
 
-/// Parse ports from query string (e.g., "ports=8080&ports=9090")
-pub fn parse_ports_query(query: &str) -> Vec<u16> {
-    let mut ports = Vec::new();
-
-    // Parse manually: split by & and then by =
-    for pair in query.split('&') {
-        let parts: Vec<&str> = pair.split('=').collect();
-        if parts.len() == 2
-            && parts[0] == "ports"
-            && let Ok(port) = parts[1].parse::<u16>()
-        {
-            ports.push(port);
-        }
-    }
-
-    ports
-}
-
-/// Calculate channel ID for portforward protocol
-/// Each port gets 2 channels: data (even) and error (odd)
-/// Port index 0: data=0, error=1
-/// Port index 1: data=2, error=3
-/// etc.
-pub fn port_channel_id(port_index: usize, is_error: bool) -> Option<u8> {
-    port_index
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(usize::from(is_error)))
-        .and_then(|value| u8::try_from(value).ok())
-}
-
-/// Recover the semantic request index and channel half from a Kubernetes
-/// WebSocket channel ID.
-pub(crate) fn port_channel_from_id(channel_id: u8) -> (usize, NodePortForwardChannel) {
-    (
-        usize::from(channel_id / 2),
-        if channel_id.is_multiple_of(2) {
-            NodePortForwardChannel::Data
-        } else {
-            NodePortForwardChannel::Error
-        },
-    )
-}
-
 /// Build the local control-plane port from its private TCP runtime adapter.
 pub(crate) fn local_node_port_forward(
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -506,80 +463,6 @@ mod tests {
     use klights_node_api::NodePortForwardTarget;
     use std::time::Duration;
 
-    /// Test parsing ports from query string
-    #[test]
-    fn test_parse_ports_single() {
-        let query = "ports=8080";
-        let ports = parse_ports_query(query);
-        assert_eq!(ports, vec![8080]);
-    }
-
-    #[test]
-    fn test_parse_ports_multiple() {
-        let query = "ports=8080&ports=9090&ports=3000";
-        let ports = parse_ports_query(query);
-        assert_eq!(ports, vec![8080, 9090, 3000]);
-    }
-
-    #[test]
-    fn test_parse_ports_empty() {
-        let query = "";
-        let ports = parse_ports_query(query);
-        assert_eq!(ports, Vec::<u16>::new());
-    }
-
-    #[test]
-    fn test_parse_ports_invalid() {
-        let query = "ports=invalid&ports=8080";
-        let ports = parse_ports_query(query);
-        // Should skip invalid and return valid ones
-        assert_eq!(ports, vec![8080]);
-    }
-
-    /// Test channel ID mapping for portforward protocol
-    #[test]
-    fn test_channel_id_data_port0() {
-        // Port index 0, data stream = channel 0
-        let channel_id = port_channel_id(0, false);
-        assert_eq!(channel_id, Some(0));
-    }
-
-    #[test]
-    fn test_channel_id_error_port0() {
-        // Port index 0, error stream = channel 1
-        let channel_id = port_channel_id(0, true);
-        assert_eq!(channel_id, Some(1));
-    }
-
-    #[test]
-    fn test_channel_id_data_port1() {
-        // Port index 1, data stream = channel 2
-        let channel_id = port_channel_id(1, false);
-        assert_eq!(channel_id, Some(2));
-    }
-
-    #[test]
-    fn test_channel_id_error_port1() {
-        // Port index 1, error stream = channel 3
-        let channel_id = port_channel_id(1, true);
-        assert_eq!(channel_id, Some(3));
-    }
-
-    #[test]
-    fn test_channel_id_round_trip() {
-        for (channel_id, expected_index, expected_channel) in [
-            (0, 0, NodePortForwardChannel::Data),
-            (1, 0, NodePortForwardChannel::Error),
-            (2, 1, NodePortForwardChannel::Data),
-            (3, 1, NodePortForwardChannel::Error),
-        ] {
-            assert_eq!(
-                port_channel_from_id(channel_id),
-                (expected_index, expected_channel)
-            );
-        }
-    }
-
     #[tokio::test]
     async fn sixty_five_failed_connects_return_a_session_without_setup_backpressure_deadlock() {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -615,11 +498,6 @@ mod tests {
             assert_eq!(frame.channel(), NodePortForwardChannel::Error);
         }
         assert!(session.recv_frame().await.unwrap().is_none());
-        assert_eq!(port_channel_id(127, false), Some(254));
-        assert_eq!(port_channel_id(127, true), Some(255));
-        assert_eq!(port_channel_id(128, false), None);
-        assert_eq!(port_channel_id(usize::MAX, true), None);
-
         let _ = supervisor.shutdown(Duration::from_secs(1)).await;
     }
 

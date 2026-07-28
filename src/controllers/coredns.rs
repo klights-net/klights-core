@@ -44,7 +44,7 @@ pub(crate) trait CoreDnsBootstrapStore: Send + Sync {
 /// Derive the DNS service ClusterIP from the service CIDR.
 /// Returns network address + 10 (e.g., "10.43.128.0/17" -> "10.43.128.10").
 pub fn derive_dns_service_ip(service_cidr: &str) -> String {
-    crate::service_ips::dns_service_ip(service_cidr)
+    klights_types::dns_service_ipv4(service_cidr)
 }
 
 pub(crate) async fn bootstrap_coredns_with_store(

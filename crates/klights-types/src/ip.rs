@@ -11,6 +11,24 @@ pub fn first_usable_ipv4(cidr: &str) -> String {
         .unwrap_or_else(|| Ipv4Addr::UNSPECIFIED.to_string())
 }
 
+/// Derive the cluster DNS Service IP (network address plus ten).
+///
+/// The service CIDR is validated by root configuration before feature
+/// construction, so malformed input remains a bootstrap programming error.
+pub fn dns_service_ipv4(cidr: &str) -> String {
+    let network_addr = cidr.split_once('/').map_or(cidr, |(address, _)| address);
+    let mut octets = network_addr.split('.');
+    let first = octets.next().expect("service CIDR has first octet");
+    let second = octets.next().expect("service CIDR has second octet");
+    let third = octets.next().expect("service CIDR has third octet");
+    let fourth = octets
+        .next()
+        .expect("service CIDR has fourth octet")
+        .parse::<u8>()
+        .expect("service CIDR fourth octet is numeric");
+    format!("{first}.{second}.{third}.{}", fourth + 10)
+}
+
 /// Convert a network-order `u32` IPv4 address to dotted-quad form.
 pub fn ipv4_from_u32(ip: u32) -> String {
     Ipv4Addr::from(ip).to_string()
@@ -33,7 +51,7 @@ fn parse_network(cidr: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_usable_ipv4, ipv4_from_u32};
+    use super::{dns_service_ipv4, first_usable_ipv4, ipv4_from_u32};
 
     #[test]
     fn first_usable_ipv4_preserves_legacy_cidr_derivation() {
@@ -57,5 +75,10 @@ mod tests {
             ipv4_from_u32((192 << 24) | (168 << 16) | (1 << 8) | 1),
             "192.168.1.1"
         );
+    }
+
+    #[test]
+    fn derives_cluster_dns_service_address() {
+        assert_eq!(dns_service_ipv4("10.43.0.0/16"), "10.43.0.10");
     }
 }

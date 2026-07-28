@@ -84,7 +84,6 @@ mod resource_quota_side_effect_adapter;
 pub(crate) mod runtime_fs;
 pub mod scheduler;
 mod service_account_defaults_side_effect_adapter;
-mod service_ips;
 mod service_pod_side_effect_adapter;
 mod service_reconcile_adapter;
 pub mod shutdown;

@@ -37,7 +37,7 @@ pub(crate) trait KubernetesBootstrapStore: Send + Sync {
 /// Derive the kubernetes service ClusterIP from the service CIDR.
 /// Returns the first usable IP (network + 1), e.g. "10.43.128.0/17" -> "10.43.128.1".
 pub fn derive_kubernetes_service_ip(service_cidr: &str) -> String {
-    crate::service_ips::kubernetes_service_ip(service_cidr)
+    klights_types::first_usable_ipv4(service_cidr)
 }
 
 /// Bootstrap the default ServiceCIDR object expected by conformance tests.

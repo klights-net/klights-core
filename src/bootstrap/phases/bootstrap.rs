@@ -867,6 +867,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         config.node_name.clone(),
         config.anonymous_auth,
         api_runtime_inputs.clone(),
+        crate::version::api_version_info(),
     ));
     let finalizer_lifecycle =
         crate::bootstrap::finalizer_lifecycle_adapter::DatastoreFinalizerLifecycleAdapter::new_with_coordination(
@@ -1731,6 +1732,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         config.node_name.clone(),
         config.anonymous_auth,
         api_runtime_inputs,
+        crate::version::api_version_info(),
         Arc::new(crate::auth::clock::SystemClock),
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),

@@ -6,6 +6,7 @@ pub mod ip;
 pub mod json_patch;
 pub mod label_selector;
 pub mod network;
+pub mod operation;
 pub mod pod_status_merge;
 pub mod quantity;
 pub mod resource_semantics;
@@ -41,7 +42,7 @@ pub use field_selector::{
     FieldRequirement, FieldSelector, FieldSelectorOperator, FieldSelectorParseError,
     default_field_value, resolve_field_value,
 };
-pub use ip::{first_usable_ipv4, ipv4_from_u32};
+pub use ip::{dns_service_ipv4, first_usable_ipv4, ipv4_from_u32};
 pub use json_patch::apply_merge_patch;
 pub use label_selector::{
     LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,
@@ -52,6 +53,10 @@ pub use network::{
     HostPortRange, NodeName, NodePeerMode, NodePeerModeParseError, PodHostPortProtocol,
     PodHostPortSpec, PodSubnet, parse_node_peer_mode, pod_host_port_specs,
     set_node_dataplane_annotations,
+};
+pub use operation::{
+    AttemptIdentity, FallbackFamilyId, MigrationState, OperationId, OperationKind,
+    OperationMetadata, OperationSelection, PolicyProfileId,
 };
 pub use pod_status_merge::{
     PodStatusOwner, PodStatusPatch, merge_owned_and_preserved_conditions,

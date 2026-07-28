@@ -579,6 +579,7 @@ async fn live_daemonset_active(
 
 /// Reconcile a DaemonSet by ensuring one pod exists per node.
 /// Phase 1 (single-node): creates exactly one pod for the local node.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_daemonset(
     db: &(impl DaemonSetStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),

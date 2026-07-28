@@ -225,6 +225,7 @@ pub(crate) struct ApiOperationalConfig {
     pub(crate) node_name: String,
     pub(crate) anonymous_auth: bool,
     pub(crate) runtime: ApiRuntimeInputs,
+    pub(crate) version_info: crate::api::version::VersionInfo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,11 +290,17 @@ impl ApiRuntimeInputs {
 }
 
 impl ApiOperationalConfig {
-    pub(crate) fn new(node_name: String, anonymous_auth: bool, runtime: ApiRuntimeInputs) -> Self {
+    pub(crate) fn new(
+        node_name: String,
+        anonymous_auth: bool,
+        runtime: ApiRuntimeInputs,
+        version_info: crate::api::version::VersionInfo,
+    ) -> Self {
         Self {
             node_name,
             anonymous_auth,
             runtime,
+            version_info,
         }
     }
 
@@ -303,7 +310,12 @@ impl ApiOperationalConfig {
             .expect("test API data root must be absolute");
         let runtime = ApiRuntimeInputs::new(paths, config.api_slow_log_threshold)
             .expect("test API slow-log threshold must be positive");
-        Arc::new(Self::new(config.node_name, config.anonymous_auth, runtime))
+        Arc::new(Self::new(
+            config.node_name,
+            config.anonymous_auth,
+            runtime,
+            crate::version::api_version_info(),
+        ))
     }
 }
 
@@ -441,6 +453,7 @@ pub(crate) fn build_router_from_root(
     node_name: String,
     anonymous_auth: bool,
     runtime_inputs: ApiRuntimeInputs,
+    version_info: crate::api::version::VersionInfo,
     clock: Arc<dyn crate::auth::clock::Clock>,
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -515,6 +528,7 @@ pub(crate) fn build_router_from_root(
                 node_name,
                 anonymous_auth,
                 runtime_inputs,
+                version_info,
             )),
             clock,
             cluster_status,

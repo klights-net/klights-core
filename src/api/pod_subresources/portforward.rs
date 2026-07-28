@@ -5,6 +5,36 @@ use klights_node_api::{
     NodePortForwardRequest, NodePortForwardSession, NodePortForwardTarget,
 };
 
+fn parse_ports_query(query: &str) -> Vec<u16> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter_map(|(key, value)| {
+            (key == "ports")
+                .then(|| value.parse::<u16>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+fn port_channel_id(port_index: usize, is_error: bool) -> Option<u8> {
+    port_index
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(usize::from(is_error)))
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+fn port_channel_from_id(channel_id: u8) -> (usize, NodePortForwardChannel) {
+    (
+        usize::from(channel_id / 2),
+        if channel_id.is_multiple_of(2) {
+            NodePortForwardChannel::Data
+        } else {
+            NodePortForwardChannel::Error
+        },
+    )
+}
+
 pub(in crate::api) async fn pod_portforward(
     State(state): State<Arc<ApiState>>,
     Path((namespace, name)): Path<(String, String)>,
@@ -13,7 +43,7 @@ pub(in crate::api) async fn pod_portforward(
 ) -> Result<Response, AppError> {
     // Parse ports from query string
     let query_str = query.unwrap_or_default();
-    let ports = crate::portforward::parse_ports_query(&query_str);
+    let ports = parse_ports_query(&query_str);
 
     if ports.is_empty() {
         return Err(AppError::BadRequest(
@@ -250,7 +280,7 @@ async fn handle_portforward_websocket<IO>(
                         break;
                     }
                 };
-                let Some(channel_id) = crate::portforward::port_channel_id(
+                let Some(channel_id) = port_channel_id(
                     frame.port_index(),
                     frame.channel() == NodePortForwardChannel::Error,
                 ) else {
@@ -285,8 +315,7 @@ async fn handle_portforward_websocket<IO>(
                     continue;
                 }
                 let channel_id = data[0];
-                let (port_index, channel) =
-                    crate::portforward::port_channel_from_id(channel_id);
+                let (port_index, channel) = port_channel_from_id(channel_id);
                 if port_index >= port_count {
                     tracing::debug!(channel_id, port_index, port_count, "ignored port-forward frame for unopened channel");
                     continue;
@@ -338,6 +367,32 @@ mod cancellation_tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn kubernetes_port_query_and_channels_are_bounded_and_round_trip() {
+        assert_eq!(parse_ports_query("ports=8080"), vec![8080]);
+        assert_eq!(
+            parse_ports_query("ports=8080&ports=invalid&ports=9090"),
+            vec![8080, 9090]
+        );
+        assert!(parse_ports_query("").is_empty());
+
+        for (channel_id, expected_index, expected_channel) in [
+            (0, 0, NodePortForwardChannel::Data),
+            (1, 0, NodePortForwardChannel::Error),
+            (2, 1, NodePortForwardChannel::Data),
+            (3, 1, NodePortForwardChannel::Error),
+        ] {
+            assert_eq!(
+                port_channel_from_id(channel_id),
+                (expected_index, expected_channel)
+            );
+        }
+        assert_eq!(port_channel_id(127, false), Some(254));
+        assert_eq!(port_channel_id(127, true), Some(255));
+        assert_eq!(port_channel_id(128, false), None);
+        assert_eq!(port_channel_id(usize::MAX, true), None);
+    }
 
     struct BlockingSession {
         cancelled: AtomicBool,

@@ -32,7 +32,6 @@ pub(super) enum StreamType {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Parsed peer frame fields are retained for protocol completeness.
 pub(super) enum SpdyFrame {
     SynStream {
         stream_id: u32,
@@ -58,6 +57,23 @@ pub(super) enum SpdyFrame {
         stream_id: u32,
     },
     Unknown,
+}
+
+impl SpdyFrame {
+    pub(super) fn trace_control_metadata(&self) {
+        match self {
+            Self::SynReply { stream_id } => {
+                tracing::trace!(stream_id, "received SPDY SYN_REPLY");
+            }
+            Self::RstStream { stream_id } => {
+                tracing::trace!(stream_id, "received SPDY RST_STREAM");
+            }
+            Self::WindowUpdate { stream_id } => {
+                tracing::trace!(stream_id, "received SPDY WINDOW_UPDATE");
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(super) struct SpdyConnection {

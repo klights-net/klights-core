@@ -129,11 +129,11 @@ mod coordinator_tests {
     use super::ControlplaneJoinCoordinator;
     use klights_leader_api::{
         ControlplaneJoinAdmission, ControlplaneJoinAdmissionFuture,
-        ControlplaneJoinAdmissionOutcome, ControlplaneJoinAuthority, ControlplaneJoinError,
-        ControlplaneJoinHandler, ControlplaneJoinMetadata, ControlplaneJoinMetadataFuture,
-        ControlplaneJoinOutcome, ControlplaneJoinRegistration, ControlplaneJoinRegistrationFuture,
-        ControlplaneJoinRequest, ControlplaneJoinRoute, ControlplaneMemberQuery,
-        ControlplaneMemberQueryFuture, RaftStorageAttestation,
+        ControlplaneJoinAdmissionOutcome, ControlplaneJoinAuthority, ControlplaneJoinHandler,
+        ControlplaneJoinMetadata, ControlplaneJoinMetadataFuture, ControlplaneJoinOutcome,
+        ControlplaneJoinRegistration, ControlplaneJoinRegistrationFuture, ControlplaneJoinRequest,
+        ControlplaneJoinRoute, ControlplaneMemberQuery, ControlplaneMemberQueryFuture,
+        RaftStorageAttestation,
     };
 
     struct FakeAuthority {
@@ -328,10 +328,5 @@ mod coordinator_tests {
         assert_eq!(admission.calls.load(Ordering::SeqCst), 0);
         assert_eq!(registration.calls.load(Ordering::SeqCst), 0);
         assert_eq!(metadata.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[allow(dead_code)]
-    fn error_contract_is_transport_neutral(error: ControlplaneJoinError) -> String {
-        error.to_string()
     }
 }

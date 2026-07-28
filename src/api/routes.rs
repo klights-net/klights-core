@@ -544,8 +544,8 @@ async fn metrics_handler(State(state): State<Arc<ApiState>>) -> String {
     state.controller_reconcile().metrics.render_prometheus()
 }
 
-async fn version() -> Json<crate::version::VersionInfo> {
-    Json(crate::version::VersionInfo::new())
+async fn version(State(state): State<Arc<ApiState>>) -> Json<crate::api::version::VersionInfo> {
+    Json(state.operational().config.version_info.clone())
 }
 
 async fn openid_configuration(State(_state): State<Arc<ApiState>>) -> Json<Value> {

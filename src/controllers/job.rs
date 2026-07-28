@@ -848,6 +848,7 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
 
 /// Reconcile a Job: manage pod creation/deletion against `completions`,
 /// `parallelism`, and `backoffLimit`. Returns the updated Job resource.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reconcile_job(
     db: &(impl JobStore + ?Sized),
     pod_reader: &(impl PodQuery + ?Sized),

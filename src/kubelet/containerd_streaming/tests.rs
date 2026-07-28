@@ -60,19 +60,6 @@ fn test_stream_type_eq() {
 }
 
 #[test]
-fn test_stream_id_for() {
-    let mut spdy = SpdyExec::new();
-    spdy.streams.insert(1, StreamType::Stdin);
-    spdy.streams.insert(2, StreamType::Stdout);
-    spdy.streams.insert(3, StreamType::Stderr);
-    spdy.streams.insert(4, StreamType::Error);
-
-    assert_eq!(spdy.stream_id_for(StreamType::Stdout), Some(2));
-    assert_eq!(spdy.stream_id_for(StreamType::Error), Some(4));
-    assert_eq!(spdy.stream_id_for(StreamType::Resize), None);
-}
-
-#[test]
 fn test_data_frame_format() {
     // Verify data frame is correctly formatted
     let stream_id: u32 = 5;
@@ -166,32 +153,6 @@ fn test_compress_headers_multiple_calls_succeed() {
     // Third call for good measure
     let result3 = spdy.compress_headers(&[("content-type", "text/plain")]);
     assert!(result3.is_ok(), "Third compress_headers should succeed");
-}
-
-#[tokio::test]
-async fn test_spdy_negotiate_multiple_syn_replies() {
-    // Simulate multiple SYN_REPLY frames (stream negotiation)
-    let mut spdy = SpdyExec::new();
-    let mut buffer = Vec::new();
-
-    // First SYN_REPLY (stdout stream)
-    let result1 = spdy.write_syn_reply(&mut buffer, 1).await;
-    assert!(result1.is_ok(), "First SYN_REPLY should succeed");
-
-    // Second SYN_REPLY (stderr stream) — this was failing before the fix
-    let result2 = spdy.write_syn_reply(&mut buffer, 3).await;
-    assert!(
-        result2.is_ok(),
-        "Second SYN_REPLY should succeed: {:?}",
-        result2.err()
-    );
-
-    // Third SYN_REPLY (error stream)
-    let result3 = spdy.write_syn_reply(&mut buffer, 5).await;
-    assert!(result3.is_ok(), "Third SYN_REPLY should succeed");
-
-    // Verify buffer contains data from all three SYN_REPLY frames
-    assert!(!buffer.is_empty(), "Buffer should contain SYN_REPLY frames");
 }
 
 #[tokio::test]

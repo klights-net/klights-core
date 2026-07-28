@@ -13,10 +13,6 @@ impl SpdyExec {
     where
         S: AsyncRead + Unpin,
     {
-        if let Some(frame) = self.pending_frames.pop_front() {
-            return Ok(frame);
-        }
-
         // Read 8-byte frame header
         let mut header = [0u8; 8];
         stream.read_exact(&mut header).await?;
@@ -267,38 +263,6 @@ impl SpdyExec {
         Ok(compressed)
     }
 
-    /// Write a SYN_REPLY frame
-    #[allow(dead_code)] // Kept with the private bidirectional codec for protocol tests.
-    pub async fn write_syn_reply<S>(&mut self, stream: &mut S, stream_id: u32) -> anyhow::Result<()>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        // SYN_REPLY: stream_id (4 bytes) + compressed headers
-        let headers = self.compress_headers(&[])?;
-
-        let payload_len = 4 + headers.len();
-        let mut frame = Vec::with_capacity(8 + payload_len);
-
-        // Control frame header
-        frame.push(0x80); // Control bit + version high byte
-        frame.push(SPDY_VERSION as u8); // Version low byte
-        frame.extend_from_slice(&SYN_REPLY.to_be_bytes()); // Type
-        frame.push(0); // Flags
-        let len_bytes = (payload_len as u32).to_be_bytes();
-        frame.extend_from_slice(&len_bytes[1..4]); // 24-bit length
-
-        // Stream ID
-        frame.extend_from_slice(&stream_id.to_be_bytes());
-
-        // Compressed headers (empty for SYN_REPLY to exec streams)
-        frame.extend_from_slice(&headers);
-
-        stream.write_all(&frame).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
     /// Write a DATA frame
     pub async fn write_data_frame<S>(
         &self,
@@ -349,7 +313,6 @@ impl SpdyExec {
             StreamType::Stderr => "stderr",
             StreamType::Error => "error",
             StreamType::Resize => "resize",
-            StreamType::Data => "data",
         };
 
         let headers = self.compress_headers(&[("streamtype", stream_type_str)])?;

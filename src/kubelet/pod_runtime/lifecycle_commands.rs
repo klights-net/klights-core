@@ -144,9 +144,9 @@ pub(super) async fn handle_lifecycle_command(
                 );
                 return Ok(());
             };
-            let dns_ip = crate::service_ips::dns_service_ip(&service.config.service_cidr);
+            let dns_ip = klights_types::dns_service_ipv4(&service.config.service_cidr);
             let kubernetes_service_ip =
-                crate::service_ips::kubernetes_service_ip(&service.config.service_cidr);
+                klights_types::first_usable_ipv4(&service.config.service_cidr);
             let container_config = service
                 .build_container_config_with_env(ContainerConfigBuildRequest {
                     key: &key,

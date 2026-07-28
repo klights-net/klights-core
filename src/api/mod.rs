@@ -72,6 +72,7 @@ mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
 mod validation;
+pub(crate) mod version;
 mod watch_event;
 #[cfg(test)]
 mod watch_session;

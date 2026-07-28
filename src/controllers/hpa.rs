@@ -3,13 +3,92 @@
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use klights_cluster_core::Resource;
-use klights_node_api::{
-    NodeMetrics, NodeMetricsRequest, NodeMetricsResult, NodeMetricsSnapshot, NodeMetricsTarget,
-};
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 const MAX_RETRIES: u32 = 5;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HpaMetricUsage {
+    cpu_nanos: u64,
+    memory_bytes: u64,
+}
+
+impl HpaMetricUsage {
+    pub(crate) const fn new(cpu_nanos: u64, memory_bytes: u64) -> Self {
+        Self {
+            cpu_nanos,
+            memory_bytes,
+        }
+    }
+
+    fn resource_value(self, resource: &str) -> Option<u64> {
+        match resource {
+            "cpu" => Some(self.cpu_nanos),
+            "memory" => Some(self.memory_bytes),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HpaMetricsSnapshot {
+    containers: BTreeMap<(String, String, String, String), HpaMetricUsage>,
+}
+
+impl HpaMetricsSnapshot {
+    pub(crate) fn insert_container(
+        &mut self,
+        uid: impl Into<String>,
+        namespace: impl Into<String>,
+        pod_name: impl Into<String>,
+        container_name: impl Into<String>,
+        usage: HpaMetricUsage,
+    ) {
+        self.containers.insert(
+            (
+                uid.into(),
+                namespace.into(),
+                pod_name.into(),
+                container_name.into(),
+            ),
+            usage,
+        );
+    }
+
+    fn container_usage(
+        &self,
+        uid: &str,
+        namespace: &str,
+        pod_name: &str,
+        container_name: &str,
+    ) -> Option<HpaMetricUsage> {
+        self.containers
+            .get(&(
+                uid.to_string(),
+                namespace.to_string(),
+                pod_name.to_string(),
+                container_name.to_string(),
+            ))
+            .copied()
+            .or_else(|| {
+                self.containers
+                    .get(&(
+                        String::new(),
+                        namespace.to_string(),
+                        pod_name.to_string(),
+                        container_name.to_string(),
+                    ))
+                    .copied()
+            })
+    }
+}
+
+#[async_trait]
+pub(crate) trait HpaMetrics: Send + Sync {
+    async fn snapshot(&self, pods: &[Resource]) -> HpaMetricsSnapshot;
+}
 
 #[async_trait]
 pub(crate) trait HpaRuntime: Send + Sync {
@@ -52,7 +131,7 @@ pub(crate) async fn reconcile_hpa_with_runtime(
     runtime: &dyn HpaRuntime,
     hpa: &Value,
     node_name: &str,
-    node_metrics: &dyn NodeMetrics,
+    node_metrics: &dyn HpaMetrics,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let api_version = hpa
@@ -152,7 +231,7 @@ struct HpaDecision {
 
 async fn evaluate_hpa(
     runtime: &dyn HpaRuntime,
-    node_metrics: &dyn NodeMetrics,
+    node_metrics: &dyn HpaMetrics,
     hpa: &Value,
     namespace: &str,
 ) -> Result<HpaDecision> {
@@ -316,7 +395,7 @@ async fn get_scale_target(
 
 async fn observe_metrics(
     runtime: &dyn HpaRuntime,
-    node_metrics: &dyn NodeMetrics,
+    node_metrics: &dyn HpaMetrics,
     hpa: &Value,
     spec: &Value,
     target: &ScaleTarget,
@@ -335,7 +414,7 @@ async fn observe_metrics(
     if matching_ready_pods.is_empty() {
         return Ok(Vec::new());
     }
-    let snapshot = collect_metrics_snapshot(node_metrics, &matching_ready_pods).await;
+    let snapshot = node_metrics.snapshot(&matching_ready_pods).await;
 
     if hpa.get("apiVersion").and_then(|v| v.as_str()) == Some("autoscaling/v1") {
         if let Some(target_utilization) = spec
@@ -420,7 +499,7 @@ fn observe_resource_metric(
     target_value: i64,
     target: &ScaleTarget,
     pods: &[Resource],
-    snapshot: &NodeMetricsSnapshot,
+    snapshot: &HpaMetricsSnapshot,
 ) -> Option<MetricObservation> {
     let summary = ResourceMetricSummary::from_pods(name, pods, snapshot)?;
     let target_value = u64::try_from(target_value).ok()?;
@@ -462,11 +541,7 @@ struct ResourceMetricSummary {
 }
 
 impl ResourceMetricSummary {
-    fn from_pods(
-        resource: &str,
-        pods: &[Resource],
-        snapshot: &NodeMetricsSnapshot,
-    ) -> Option<Self> {
+    fn from_pods(resource: &str, pods: &[Resource], snapshot: &HpaMetricsSnapshot) -> Option<Self> {
         let mut pod_count = 0_u64;
         let mut total_usage = 0_u64;
         let mut total_request = 0_u64;
@@ -501,37 +576,9 @@ impl ResourceMetricSummary {
     }
 }
 
-async fn collect_metrics_snapshot(
-    node_metrics: &dyn NodeMetrics,
-    pods: &[Resource],
-) -> NodeMetricsSnapshot {
-    let nodes = pods
-        .iter()
-        .filter_map(|pod| {
-            pod.data
-                .pointer("/spec/nodeName")
-                .and_then(Value::as_str)
-                .filter(|node| !node.is_empty())
-                .map(str::to_string)
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let results = futures::future::join_all(nodes.into_iter().map(|node_name| async move {
-        let request = NodeMetricsTarget::try_new(node_name)
-            .map(|target| NodeMetricsRequest::new(target, Vec::new()));
-        match request {
-            Ok(request) => node_metrics.collect_metrics(request).await,
-            Err(error) => Err(error),
-        }
-    }))
-    .await;
-    NodeMetricsSnapshot::from_results(results.into_iter().filter_map(
-        |result: Result<NodeMetricsResult, klights_node_api::NodeMetricsError>| result.ok(),
-    ))
-}
-
 fn pod_usage_for_resource(
     pod: &Resource,
-    snapshot: &NodeMetricsSnapshot,
+    snapshot: &HpaMetricsSnapshot,
     resource: &str,
 ) -> Option<u64> {
     let namespace = pod
@@ -778,7 +825,8 @@ mod tests {
         reconcile_hpa_with_metrics as reconcile_hpa_with_metrics_root,
     };
     use klights_node_api::{
-        NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResult, NodeMetricsTarget,
+        NodeMetrics, NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResult,
+        NodeMetricsTarget,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -916,11 +964,20 @@ mod tests {
         }
     }
 
+    struct EmptyHpaMetrics;
+
+    #[async_trait]
+    impl HpaMetrics for EmptyHpaMetrics {
+        async fn snapshot(&self, _pods: &[Resource]) -> HpaMetricsSnapshot {
+            HpaMetricsSnapshot::default()
+        }
+    }
+
     #[tokio::test]
     async fn missing_target_retries_status_conflict_and_then_stabilizes_as_noop() {
         let runtime = missing_target_runtime(1);
         let hpa = (*runtime.current.lock().unwrap().data).clone();
-        let metrics = crate::node_metrics_adapter::UnavailableNodeMetrics;
+        let metrics = EmptyHpaMetrics;
         reconcile_hpa_with_runtime(&runtime, &hpa, "node-a", &metrics, chrono::Utc::now())
             .await
             .unwrap();

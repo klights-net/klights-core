@@ -5,12 +5,86 @@ use serde_json::{Value, json};
 
 use crate::controller_store_error_adapter::map_controller_store_error;
 use crate::controllers::hpa::{
-    HpaRuntime, ScaleTarget, ScaleTargetKind, reconcile_hpa_with_runtime,
+    HpaMetricUsage, HpaMetrics, HpaMetricsSnapshot, HpaRuntime, ScaleTarget, ScaleTargetKind,
+    reconcile_hpa_with_runtime,
 };
 use crate::controllers::{Context, Controller};
 use crate::datastore::{DatastoreBackend, ResourcePatchRequest};
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
 use klights_node_api::NodeMetrics;
+
+struct NodeApiHpaMetrics<'a> {
+    node_metrics: &'a dyn NodeMetrics,
+}
+
+#[async_trait]
+impl HpaMetrics for NodeApiHpaMetrics<'_> {
+    async fn snapshot(&self, pods: &[Resource]) -> HpaMetricsSnapshot {
+        let nodes = pods
+            .iter()
+            .filter_map(|pod| {
+                pod.data
+                    .pointer("/spec/nodeName")
+                    .and_then(Value::as_str)
+                    .filter(|node| !node.is_empty())
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let results = futures::future::join_all(nodes.into_iter().map(|node_name| async move {
+            let request = klights_node_api::NodeMetricsTarget::try_new(node_name)
+                .map(|target| klights_node_api::NodeMetricsRequest::new(target, Vec::new()));
+            match request {
+                Ok(request) => self.node_metrics.collect_metrics(request).await,
+                Err(error) => Err(error),
+            }
+        }))
+        .await;
+        let node_snapshot = klights_node_api::NodeMetricsSnapshot::from_results(
+            results.into_iter().filter_map(Result::ok),
+        );
+        let mut snapshot = HpaMetricsSnapshot::default();
+        for pod in pods {
+            let namespace = pod
+                .namespace
+                .as_deref()
+                .or_else(|| {
+                    pod.data
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_default();
+            let uid = if pod.uid.is_empty() {
+                pod.data
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            } else {
+                &pod.uid
+            };
+            for container_name in pod
+                .data
+                .pointer("/spec/containers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|container| container.get("name").and_then(Value::as_str))
+            {
+                if let Some(usage) =
+                    node_snapshot.container_usage(uid, namespace, &pod.name, container_name)
+                {
+                    snapshot.insert_container(
+                        uid,
+                        namespace,
+                        &pod.name,
+                        container_name,
+                        HpaMetricUsage::new(usage.cpu_nanos(), usage.memory_bytes()),
+                    );
+                }
+            }
+        }
+        snapshot
+    }
+}
 
 #[cfg(test)]
 pub struct HpaController;
@@ -319,6 +393,7 @@ pub async fn reconcile_hpa(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_hpa_with_metrics(
     db: &dyn DatastoreBackend,
     pod_repository: &PodRepository,
@@ -338,7 +413,7 @@ pub async fn reconcile_hpa_with_metrics(
         },
         hpa,
         node_name,
-        node_metrics,
+        &NodeApiHpaMetrics { node_metrics },
         now,
     )
     .await

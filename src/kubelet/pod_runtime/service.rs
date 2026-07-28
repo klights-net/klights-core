@@ -427,9 +427,8 @@ impl RealPodRuntimeService {
                 key.name
             );
         };
-        let dns_ip = crate::service_ips::dns_service_ip(&self.config.service_cidr);
-        let kubernetes_service_ip =
-            crate::service_ips::kubernetes_service_ip(&self.config.service_cidr);
+        let dns_ip = klights_types::dns_service_ipv4(&self.config.service_cidr);
+        let kubernetes_service_ip = klights_types::first_usable_ipv4(&self.config.service_cidr);
         let container_config = self
             .build_container_config_with_env(ContainerConfigBuildRequest {
                 key,
@@ -1129,7 +1128,7 @@ impl PodRuntimeService for RealPodRuntimeService {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let dns_ip = crate::service_ips::dns_service_ip(&self.config.service_cidr);
+        let dns_ip = klights_types::dns_service_ipv4(&self.config.service_cidr);
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
         let sandbox_config = build_sandbox_config_with_runtime_inputs(
@@ -1146,8 +1145,7 @@ impl PodRuntimeService for RealPodRuntimeService {
             &self.config.paths,
         );
         let container_sandbox_config = sandbox_config.clone();
-        let kubernetes_service_ip =
-            crate::service_ips::kubernetes_service_ip(&self.config.service_cidr);
+        let kubernetes_service_ip = klights_types::first_usable_ipv4(&self.config.service_cidr);
 
         let sandbox_id = match self.store.get_sandbox_id(&key).await {
             Ok(Some(existing)) if !existing.trim().is_empty() => existing,
@@ -2456,9 +2454,8 @@ impl PodRuntimeService for RealPodRuntimeService {
             .pointer("/status/podIP")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let dns_ip = crate::service_ips::dns_service_ip(&self.config.service_cidr);
-        let kubernetes_service_ip =
-            crate::service_ips::kubernetes_service_ip(&self.config.service_cidr);
+        let dns_ip = klights_types::dns_service_ipv4(&self.config.service_cidr);
+        let kubernetes_service_ip = klights_types::first_usable_ipv4(&self.config.service_cidr);
         let default_spec = serde_json::json!({});
         let pod_spec = pod.get("spec").unwrap_or(&default_spec);
         let sandbox_config = build_sandbox_config_with_runtime_inputs(

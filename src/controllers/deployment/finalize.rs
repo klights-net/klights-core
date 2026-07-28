@@ -31,6 +31,7 @@ pub trait DeploymentFinalizeStore: Send + Sync {
     ) -> ControllerStoreResult<()>;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_conditions_and_revision(
     available_pods: i64,
     updated_pods: i64,
