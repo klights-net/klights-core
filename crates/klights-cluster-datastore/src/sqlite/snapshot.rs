@@ -35,28 +35,15 @@ struct NameHistory {
     earliest_gt_n_type: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct SnapshotKey {
+    namespace: Option<String>,
     name: String,
 }
 
 impl SnapshotKey {
-    fn new(_namespace: Option<String>, name: String) -> Self {
-        Self { name }
-    }
-}
-
-impl PartialEq for SnapshotKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-
-impl Eq for SnapshotKey {}
-
-impl std::hash::Hash for SnapshotKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&self.name, state);
+    fn new(namespace: Option<String>, name: String) -> Self {
+        Self { namespace, name }
     }
 }
 
@@ -65,13 +52,13 @@ impl std::hash::Hash for SnapshotKey {
 /// snapshot items sorted by name.
 enum RawSnapshot {
     Current,
-    Expired,
+    Expired { oldest_available: i64 },
     Items(Vec<Resource>, klights_cluster_core::WatchReplayPosition),
 }
 
 pub enum ExactSnapshotRead {
     Current,
-    Expired,
+    Expired { oldest_available: i64 },
     List(ResourceListPage),
 }
 
@@ -119,6 +106,7 @@ impl SqliteReadStore {
         let k = kind.to_string();
         let ns_owned = namespace.map(str::to_string);
         let namespaced = use_namespaced_table(api_version, kind, &namespace);
+        let all_namespaces = namespaced && ns_owned.is_none();
         // Namespaces are cluster-scoped but persist in their own `namespaces`
         // table rather than the generic cluster_resources table.
         let is_namespace = api_version == "v1" && kind == "Namespace";
@@ -139,10 +127,17 @@ impl SqliteReadStore {
                 let earliest: Option<i64> = tx
                     .query_row(queries::WATCH_EVENTS_MIN_RV, [], |r| r.get(0))
                     .optional()?;
-                match earliest {
-                    Some(e) if n + 1 >= e => {}
-                    _ => return Ok(RawSnapshot::Expired),
-                }
+                let earliest_available = match earliest {
+                    Some(earliest) if n + 1 >= earliest => earliest,
+                    Some(oldest_available) => {
+                        return Ok(RawSnapshot::Expired { oldest_available });
+                    }
+                    None => {
+                        return Ok(RawSnapshot::Expired {
+                            oldest_available: current_rv,
+                        });
+                    }
+                };
 
                 // 1. Live rows for the target (with created_rv to tell apart
                 //    "existed at N" from "created after N"). Namespaces live in
@@ -297,14 +292,14 @@ impl SqliteReadStore {
                 }
 
                 // 3. Decide each key's state at N.
-                let mut result: BTreeMap<String, Resource> = BTreeMap::new();
+                let mut result: BTreeMap<SnapshotKey, Resource> = BTreeMap::new();
                 let mut to_apply: Vec<(SnapshotKey, i64)> = Vec::new();
                 let mut expired = false;
 
                 for (key, (rv, created_rv, res)) in &current {
                     if *rv <= n {
                         // Unchanged since rv <= N: live row is the state at N.
-                        result.insert(key.name.clone(), res.clone());
+                        result.insert(key.clone(), res.clone());
                         continue;
                     }
                     // Changed after N — rebuild from the latest event <= N.
@@ -365,7 +360,9 @@ impl SqliteReadStore {
                 }
 
                 if expired {
-                    return Ok(RawSnapshot::Expired);
+                    return Ok(RawSnapshot::Expired {
+                        oldest_available: earliest_available,
+                    });
                 }
 
                 // 4. Fetch object bytes for the rebuilt keys. A raft/etcd-style
@@ -420,7 +417,7 @@ impl SqliteReadStore {
                     for (key, le_rv) in &to_apply {
                         if let Some(data) = data_by_key_rv.get(&(key.clone(), *le_rv)) {
                             result.insert(
-                                key.name.clone(),
+                                key.clone(),
                                 resource_from_event(
                                     &av,
                                     &k,
@@ -453,12 +450,17 @@ impl SqliteReadStore {
 
         let (items, position) = match raw {
             RawSnapshot::Current => return Ok(ExactSnapshotRead::Current),
-            RawSnapshot::Expired => return Ok(ExactSnapshotRead::Expired),
+            RawSnapshot::Expired { oldest_available } => {
+                return Ok(ExactSnapshotRead::Expired { oldest_available });
+            }
             RawSnapshot::Items(items, position) => (items, position),
         };
 
         Ok(ExactSnapshotRead::List(paginate_snapshot(
-            items, &query, position,
+            items,
+            &query,
+            position,
+            all_namespaces,
         )?))
     }
 }
@@ -470,6 +472,7 @@ fn paginate_snapshot(
     items: Vec<Resource>,
     query: &ResourceListQuery,
     position: klights_cluster_core::WatchReplayPosition,
+    all_namespaces: bool,
 ) -> Result<ResourceListPage> {
     let parsed_label = match query
         .label_selector()
@@ -495,10 +498,35 @@ fn paginate_snapshot(
                 })
         })
         .collect();
-    filtered.sort_by(|left, right| left.name.cmp(&right.name));
+    filtered.sort_by(|left, right| {
+        if all_namespaces {
+            (
+                left.namespace.as_deref().unwrap_or_default(),
+                left.name.as_str(),
+            )
+                .cmp(&(
+                    right.namespace.as_deref().unwrap_or_default(),
+                    right.name.as_str(),
+                ))
+        } else {
+            left.name.cmp(&right.name)
+        }
+    });
 
     if let Some(continuation) = query.continuation() {
-        filtered.retain(|resource| resource.name.as_str() > continuation.after().name());
+        filtered.retain(|resource| {
+            if all_namespaces && continuation.after().namespace().is_some() {
+                (
+                    resource.namespace.as_deref().unwrap_or_default(),
+                    resource.name.as_str(),
+                ) > (
+                    continuation.after().namespace().unwrap_or_default(),
+                    continuation.after().name(),
+                )
+            } else {
+                resource.name.as_str() > continuation.after().name()
+            }
+        });
     }
 
     let total = filtered.len() as i64;

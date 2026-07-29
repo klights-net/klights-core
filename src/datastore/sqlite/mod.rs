@@ -172,7 +172,7 @@ impl Datastore {
             klights_cluster_datastore::sqlite::ExactSnapshotRead::Current => {
                 Ok(SnapshotAtRv::Current)
             }
-            klights_cluster_datastore::sqlite::ExactSnapshotRead::Expired => {
+            klights_cluster_datastore::sqlite::ExactSnapshotRead::Expired { .. } => {
                 Ok(SnapshotAtRv::Expired)
             }
             klights_cluster_datastore::sqlite::ExactSnapshotRead::List(page) => {
@@ -290,14 +290,14 @@ pub struct Datastore {
     live_committed_apply: std::sync::Arc<
         klights_cluster_datastore::sqlite::live_apply::SqliteLiveCommittedApplyStore,
     >,
+    focused_recovery:
+        std::sync::Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore>,
     #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
     snapshot_factory: Option<klights_cluster_datastore::sqlite::recovery::SqliteSnapshotFactory>,
-    #[cfg(test)]
-    fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     post_commit_publish_pause:
         std::sync::Arc<std::sync::Mutex<Option<cluster_replace::PostCommitPublishPause>>>,
@@ -3546,7 +3546,7 @@ impl Datastore {
         #[cfg(test)]
         let focused_reads = std::sync::Arc::new(SqliteReadStore::new_with_test_instrumentation(
             read_executor.clone(),
-            fail_next_watch_position_observation.clone(),
+            fail_next_watch_position_observation,
             resource_get_call_count.clone(),
         ));
         #[cfg(not(test))]
@@ -3557,19 +3557,28 @@ impl Datastore {
                 outbox_codec.clone(),
             ),
         );
+        let snapshot_fence = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let focused_recovery = std::sync::Arc::new(
+            klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore::new(
+                executor.clone(),
+                read_executor.clone(),
+                snapshot_factory.clone(),
+                snapshot_fence.clone(),
+                outbox_codec.clone(),
+            ),
+        );
         Ok(Self {
             executor,
             read_executor,
             focused_reads,
             live_committed_apply,
+            focused_recovery,
             #[cfg(test)]
             commit_sink,
             outbox_codec,
             wall_clock,
-            snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            snapshot_fence,
             snapshot_factory,
-            #[cfg(test)]
-            fail_next_watch_position_observation,
             #[cfg(test)]
             post_commit_publish_pause: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -3585,6 +3594,12 @@ impl Datastore {
         &self,
     ) -> std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply> {
         self.live_committed_apply.clone()
+    }
+
+    pub(crate) fn focused_recovery_store(
+        &self,
+    ) -> std::sync::Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore> {
+        self.focused_recovery.clone()
     }
 
     async fn from_executor(

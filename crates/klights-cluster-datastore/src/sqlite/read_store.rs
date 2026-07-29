@@ -958,6 +958,7 @@ fn sqlite_filter_and_page(
     kind: &str,
     query: &klights_cluster_store::ResourceListQuery,
     boundary: WatchReplayPosition,
+    all_namespaces: bool,
 ) -> Result<ResourceListPage> {
     let labels = query
         .label_selector()
@@ -980,8 +981,38 @@ fn sqlite_filter_and_page(
                 selector.matches_resource_with_identity(api_version, kind, resource.data.as_ref())
             })
     });
+    if all_namespaces {
+        items.sort_by(|left, right| {
+            (
+                left.namespace.as_deref().unwrap_or_default(),
+                left.name.as_str(),
+            )
+                .cmp(&(
+                    right.namespace.as_deref().unwrap_or_default(),
+                    right.name.as_str(),
+                ))
+        });
+    } else {
+        items.sort_by(|left, right| left.name.cmp(&right.name));
+    }
     if let Some(cursor) = query.continuation() {
-        items.retain(|item| item.name.as_str() > cursor.after().name());
+        if all_namespaces && cursor.after().namespace().is_some() {
+            let after = (
+                cursor.after().namespace().unwrap_or_default(),
+                cursor.after().name(),
+            );
+            items.retain(|item| {
+                (
+                    item.namespace.as_deref().unwrap_or_default(),
+                    item.name.as_str(),
+                ) > after
+            });
+        } else {
+            // Legacy public continue tokens carry only the final name. Keep
+            // their established name-only resume semantics while native
+            // focused-port cursors retain the composite namespace/name key.
+            items.retain(|item| item.name.as_str() > cursor.after().name());
+        }
     }
     let limit = query.limit().and_then(|value| usize::try_from(value).ok());
     let has_more = limit.is_some_and(|value| items.len() > value);
@@ -1012,14 +1043,31 @@ fn normalize_legacy_collection_page(
     all_namespaces: bool,
 ) {
     if all_namespaces {
-        page.items.sort_by(|left, right| left.name.cmp(&right.name));
+        page.items.sort_by(|left, right| {
+            (
+                left.namespace.as_deref().unwrap_or_default(),
+                left.name.as_str(),
+            )
+                .cmp(&(
+                    right.namespace.as_deref().unwrap_or_default(),
+                    right.name.as_str(),
+                ))
+        });
     } else {
         page.items.sort_by(|left, right| left.name.cmp(&right.name));
     }
     if let Some(cursor) = continuation {
-        if all_namespaces {
-            page.items
-                .retain(|item| item.name.as_str() > cursor.after().name());
+        if all_namespaces && cursor.after().namespace().is_some() {
+            let after = (
+                cursor.after().namespace().unwrap_or_default(),
+                cursor.after().name(),
+            );
+            page.items.retain(|item| {
+                (
+                    item.namespace.as_deref().unwrap_or_default(),
+                    item.name.as_str(),
+                ) > after
+            });
         } else {
             page.items
                 .retain(|item| item.name.as_str() > cursor.after().name());
@@ -1597,10 +1645,10 @@ impl SqliteReadStore {
                             query.limit(),
                         )?))
                     }
-                    super::snapshot::ExactSnapshotRead::Expired => {
-                        Err(ResourceReadError::Expired {
+                    super::snapshot::ExactSnapshotRead::Expired { oldest_available } => {
+                        Ok(ResourceListRead::Expired {
                             requested,
-                            oldest_available: 0,
+                            oldest_available,
                         })
                     }
                     super::snapshot::ExactSnapshotRead::List(page) => {
@@ -1659,6 +1707,7 @@ impl SqliteReadStore {
                     request.kind(),
                     &query,
                     position,
+                    matches!(request.scope(), ResourceCollectionScope::AllNamespaces),
                 )
                 .map_err(map_resource_error)?;
                 Ok(ResourceListRead::Historical(page))

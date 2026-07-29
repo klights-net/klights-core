@@ -99,7 +99,7 @@ impl PrivilegedCommittedRaftApply for SqliteLiveCommittedApplyStore {
     }
 }
 
-fn map_committed_apply_error(error: anyhow::Error) -> CommittedApplyError {
+pub(crate) fn map_committed_apply_error(error: anyhow::Error) -> CommittedApplyError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
     if lower.contains("unsupported")

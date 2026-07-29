@@ -147,6 +147,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let passive_backend = opened_passive.backend;
     let passive_read_ports = opened_passive.read_ports;
     let committed_apply = opened_passive.committed_apply;
+    let sqlite_recovery = opened_passive
+        .sqlite_recovery
+        .context("Raft-enabled SQLite datastore did not provide its recovery port")?;
 
     // T1.6: joining controlplanes get their initial cluster.db
     // contents from raft (install_snapshot or AppendEntries from index 0
@@ -337,10 +340,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                         ),
                     ),
                     Arc::new(
-                        crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new(
-                            passive_backend.clone(),
-                            recovery.clone(),
-                            lifecycle.clone(),
+                        crate::datastore::cluster_store_adapter::SqliteRaftSnapshotRestore::new(
+                            sqlite_recovery.clone(),
                             crate::datastore::raft::snapshot_install(),
                         ),
                     ),
@@ -848,11 +849,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         leader_proxy.clone();
     let node_lease_renewal_client: Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal> =
         leader_proxy.clone();
-    let replication_metadata = Arc::new(
-        crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(
-            db_handle.clone(),
-        ),
-    );
+    let replication_metadata: Arc<dyn klights_cluster_store::ClusterMetadataRead> = sqlite_recovery;
     let replication_bootstrap_tokens = Arc::new(
         crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(
             db_handle.clone(),

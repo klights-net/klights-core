@@ -1,5 +1,6 @@
 //! SQLite cluster schema and explicit open adapters.
 
+mod apply_ledger;
 pub mod filters;
 mod fingerprint;
 pub mod live_apply;
@@ -24,6 +25,7 @@ pub mod selector_index;
 mod snapshot;
 pub mod transaction_primitives;
 
+pub use apply_ledger::SqliteApplyLedgerRead;
 pub use fingerprint::{META_INSERT, META_SELECT};
 pub use open::{
     check_db_health, init_schema, open_in_memory, open_read_only_with_opts, open_with_opts,

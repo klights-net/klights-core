@@ -60,14 +60,14 @@ impl PassiveReadPorts {
     #[cfg(test)]
     pub(crate) fn for_test(db: DatastoreHandle) -> Self {
         use crate::datastore::cluster_store_adapter::{
-            DatastoreClusterResourceRead, DatastoreDurableAllocatorRead,
-            DatastoreDurableWatchHistory,
+            LegacyTestClusterResourceRead, LegacyTestDurableAllocatorRead,
+            LegacyTestDurableWatchHistory,
         };
 
         Self::new(
-            Arc::new(DatastoreClusterResourceRead::new(db.clone())),
-            Arc::new(DatastoreDurableWatchHistory::new(db.clone())),
-            Arc::new(DatastoreDurableAllocatorRead::new(db)),
+            Arc::new(LegacyTestClusterResourceRead::new(db.clone())),
+            Arc::new(LegacyTestDurableWatchHistory::new(db.clone())),
+            Arc::new(LegacyTestDurableAllocatorRead::new(db)),
         )
     }
 
@@ -92,6 +92,8 @@ pub(crate) struct OpenedPassiveStore {
     pub(crate) backend: DatastoreHandle,
     pub(crate) read_ports: PassiveReadPorts,
     pub(crate) committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
+    pub(crate) sqlite_recovery:
+        Option<Arc<klights_cluster_datastore::sqlite::recovery::SqliteRecoveryStore>>,
 }
 
 /// Open the already-selected passive cluster datastore adapter.
@@ -122,9 +124,11 @@ pub(crate) async fn open_with_sink(
             .await?;
             let focused_reads = ds.focused_read_store();
             let committed_apply = ds.focused_committed_apply();
+            let sqlite_recovery = ds.focused_recovery_store();
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
                 committed_apply,
+                sqlite_recovery: Some(sqlite_recovery),
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),
@@ -149,9 +153,11 @@ pub(crate) async fn open_with_sink(
             .await?;
             let focused_reads = ds.focused_read_store();
             let committed_apply = ds.focused_committed_apply();
+            let sqlite_recovery = ds.focused_recovery_store();
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
                 committed_apply,
+                sqlite_recovery: Some(sqlite_recovery),
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),
@@ -173,6 +179,7 @@ pub(crate) async fn open_with_sink(
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
                 committed_apply,
+                sqlite_recovery: None,
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),
@@ -195,6 +202,7 @@ pub(crate) async fn open_with_sink(
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
                 committed_apply,
+                sqlite_recovery: None,
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),

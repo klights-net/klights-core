@@ -266,12 +266,6 @@ impl Datastore {
             .map_err(anyhow::Error::new)
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_watch_position_observation(&self) {
-        self.fail_next_watch_position_observation
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-
     pub async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],

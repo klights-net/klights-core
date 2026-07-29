@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use crate::datastore::sqlite::Datastore;
     use crate::datastore::{ResourceList, ResourceListQuery, SnapshotAtRv};
     use klights_cluster_store::{
@@ -59,7 +57,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_namespace_current_and_exact_preserve_legacy_name_page_oracle() {
+    async fn all_namespace_current_and_exact_use_composite_namespace_name_pages() {
         let db = Datastore::new_in_memory().await.unwrap();
         put_in_namespace(&db, "ns-a", "a").await;
         put_in_namespace(&db, "ns-a", "same").await;
@@ -82,49 +80,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Independent copies of the pre-extraction SQLite semantics:
-        // current all-namespace LIST scans ORDER BY name and retains ties;
-        // Exact scans without ordering and materializes a name-keyed BTreeMap,
-        // so equal names collapse to the last row observed.
-        let (current_oracle, exact_oracle) = db
-            .read_db_call("legacy-list-oracle", |connection| {
-                let mut current_stmt = connection.prepare(
-                    "SELECT namespace, name FROM namespaced_resources \
-                     WHERE api_version = 'v1' AND kind = 'ConfigMap' ORDER BY name",
-                )?;
-                let current_oracle = current_stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<Vec<(Option<String>, String)>>>()?;
-
-                let mut exact_stmt = connection.prepare(
-                    "SELECT namespace, name FROM namespaced_resources \
-                     WHERE api_version = 'v1' AND kind = 'ConfigMap'",
-                )?;
-                let mut exact_by_name = BTreeMap::new();
-                for row in exact_stmt.query_map([], |row| {
-                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
-                })? {
-                    let identity = row?;
-                    exact_by_name.insert(identity.1.clone(), identity);
-                }
-                Ok((
-                    current_oracle,
-                    exact_by_name.into_values().collect::<Vec<_>>(),
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(current_oracle.len(), 4);
-        assert_eq!(
-            exact_oracle.len(),
-            3,
-            "the legacy Exact name map collapses equal names across namespaces"
-        );
+        let expected = vec![
+            (Some("ns-a".to_string()), "a".to_string()),
+            (Some("ns-a".to_string()), "same".to_string()),
+            (Some("ns-b".to_string()), "same".to_string()),
+            (Some("ns-z".to_string()), "z".to_string()),
+        ];
 
         let store = db.focused_read_store();
-        for (mode, oracle) in [
-            (ResourceVersionMatch::Any, current_oracle),
-            (ResourceVersionMatch::Exact(exact_rv), exact_oracle),
+        for mode in [
+            ResourceVersionMatch::Any,
+            ResourceVersionMatch::Exact(exact_rv),
         ] {
             let first = klights_cluster_store::ClusterResourceRead::list_resources(
                 store.as_ref(),
@@ -144,20 +110,13 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(lower_identities(&first), oracle[..2]);
+            assert_eq!(lower_identities(&first), expected[..2]);
             let continuation = first
                 .continuation()
                 .cloned()
-                .expect("legacy first page has a name continuation");
-            assert_eq!(continuation.after().name(), oracle[1].1);
-
-            let after = continuation.after().name().to_string();
-            let second_expected = oracle
-                .iter()
-                .filter(|(_, name)| name > &after)
-                .take(2)
-                .cloned()
-                .collect::<Vec<_>>();
+                .expect("first page has a composite continuation");
+            assert_eq!(continuation.after().namespace(), Some("ns-a"));
+            assert_eq!(continuation.after().name(), "same");
             let second = klights_cluster_store::ClusterResourceRead::list_resources(
                 store.as_ref(),
                 ResourceListRequest::new(
@@ -176,7 +135,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(lower_identities(&second), second_expected);
+            assert_eq!(lower_identities(&second), expected[2..]);
         }
     }
 

@@ -393,7 +393,7 @@ impl ReplicationService {
     #[cfg(test)]
     pub fn new(db: Arc<dyn DatastoreBackend>, supervisor: Arc<TaskSupervisor>) -> Self {
         let metadata = Arc::new(
-            crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(db.clone()),
+            crate::datastore::cluster_store_adapter::LegacyTestClusterMetadataRead::new(db.clone()),
         );
         let bootstrap_tokens = Arc::new(
             crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db.clone()),
@@ -410,7 +410,7 @@ impl ReplicationService {
         containerd_namespace: String,
     ) -> Self {
         let metadata = Arc::new(
-            crate::datastore::cluster_store_adapter::DatastoreClusterMetadataRead::new(db.clone()),
+            crate::datastore::cluster_store_adapter::LegacyTestClusterMetadataRead::new(db.clone()),
         );
         let bootstrap_tokens = Arc::new(
             crate::bootstrap::bootstrap_token::DatastoreBootstrapTokenValidation::new(db.clone()),
