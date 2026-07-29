@@ -83,7 +83,7 @@ pub async fn serve(args: ServeArgs<'_>) -> Result<()> {
         serve_https(
             app,
             &addr,
-            &config.containerd_namespace,
+            &config.data_root,
             supervisor.clone(),
             grpc_transport_policy,
             shutdown_signal,

@@ -542,6 +542,70 @@ pub enum CommandError {
     Internal { message: String },
 }
 
+/// Stable semantic classification for a rejected Kubernetes storage mutation.
+///
+/// This value is owned below both persistence adapters and embedded
+/// replication. Concrete SQLite/Redb errors are translated into it at the
+/// persistence/root adapter boundary, so consensus code never needs to inspect
+/// a concrete datastore error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageCommandRejectionCode {
+    AlreadyExists,
+    NotFound,
+    Conflict,
+    InvalidCommit,
+}
+
+/// Adapter-neutral error returned while authoring or submitting one storage
+/// mutation.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageMutationError {
+    Rejected {
+        code: StorageCommandRejectionCode,
+        message: String,
+    },
+    Persistence {
+        message: String,
+    },
+}
+
+impl StorageMutationError {
+    pub fn rejected(code: StorageCommandRejectionCode, message: impl Into<String>) -> Self {
+        Self::Rejected {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn persistence(message: impl Into<String>) -> Self {
+        Self::Persistence {
+            message: message.into(),
+        }
+    }
+
+    pub const fn rejection_code(&self) -> Option<StorageCommandRejectionCode> {
+        match self {
+            Self::Rejected { code, .. } => Some(*code),
+            Self::Persistence { .. } => None,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Rejected { message, .. } | Self::Persistence { message } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for StorageMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for StorageMutationError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseRenewCommandError {
     NotLeaseMutation,
@@ -625,6 +689,11 @@ pub mod serde_bytes_base64 {
         serde::Deserialize::deserialize(deserializer)
     }
 }
+
+/// Kubernetes' default node lease duration used by authored Lease objects and
+/// admission freshness checks.
+pub const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 = 30;
+pub const DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS: i64 = 8;
 
 #[cfg(test)]
 mod tests {
@@ -772,8 +841,44 @@ mod tests {
         let command_id = CommandId("test-123".to_string());
         assert_eq!(command_id.to_string(), "test-123");
     }
+
+    #[test]
+    fn storage_mutation_errors_keep_rejection_identity_below_persistence_and_raft() {
+        let cases = [
+            (
+                StorageMutationError::rejected(
+                    StorageCommandRejectionCode::AlreadyExists,
+                    "pods \"web\" already exists (409 Conflict)",
+                ),
+                Some(StorageCommandRejectionCode::AlreadyExists),
+                "pods \"web\" already exists (409 Conflict)",
+            ),
+            (
+                StorageMutationError::rejected(
+                    StorageCommandRejectionCode::NotFound,
+                    "pods \"web\" not found",
+                ),
+                Some(StorageCommandRejectionCode::NotFound),
+                "pods \"web\" not found",
+            ),
+            (
+                StorageMutationError::rejected(
+                    StorageCommandRejectionCode::Conflict,
+                    "resourceVersion precondition failed (409 Conflict)",
+                ),
+                Some(StorageCommandRejectionCode::Conflict),
+                "resourceVersion precondition failed (409 Conflict)",
+            ),
+            (
+                StorageMutationError::persistence("database unavailable"),
+                None,
+                "database unavailable",
+            ),
+        ];
+
+        for (error, expected_code, expected_display) in cases {
+            assert_eq!(error.rejection_code(), expected_code);
+            assert_eq!(error.to_string(), expected_display);
+        }
+    }
 }
-/// Kubernetes' default node lease duration used by authored Lease objects and
-/// admission freshness checks.
-pub const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 = 30;
-pub const DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS: i64 = 8;

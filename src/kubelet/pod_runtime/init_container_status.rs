@@ -18,6 +18,7 @@ pub(super) struct InitContainerStop {
 /// Returns `None` unless the container is in the `ContainerExited` state.
 pub(super) fn init_container_stop_from_status(
     status: &k8s_cri::v1::ContainerStatusResponse,
+    fallback_now_seconds: i64,
 ) -> Option<InitContainerStop> {
     let status = status.status.as_ref()?;
     if status.state != k8s_cri::v1::ContainerState::ContainerExited as i32 {
@@ -25,18 +26,15 @@ pub(super) fn init_container_stop_from_status(
     }
     Some(InitContainerStop {
         exit_code: status.exit_code,
-        finished_at: unix_seconds_from_cri_ns(status.finished_at),
+        finished_at: unix_seconds_from_cri_ns(status.finished_at, fallback_now_seconds),
     })
 }
 
-fn unix_seconds_from_cri_ns(ns: i64) -> i64 {
+fn unix_seconds_from_cri_ns(ns: i64, fallback_now_seconds: i64) -> i64 {
     if ns > 0 {
         ns / 1_000_000_000
     } else {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
+        fallback_now_seconds
     }
 }
 
@@ -80,11 +78,14 @@ pub(super) fn build_completed_init_container_status(
     exit_code: i32,
     started_at: i64,
     finished_at: i64,
+    fallback_now: chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     let timestamp_from_seconds = |seconds: i64| {
         chrono::DateTime::from_timestamp(seconds, 0)
             .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
+            .unwrap_or_else(|| {
+                klights_cluster_core::k8s_time::format_legacy_timestamp(fallback_now)
+            })
     };
     serde_json::json!({
         "name": name,
@@ -104,10 +105,13 @@ pub(super) fn build_completed_init_container_status(
     })
 }
 
-fn init_failure_timestamp_from_seconds(seconds: i64) -> String {
+fn init_failure_timestamp_from_seconds(
+    seconds: i64,
+    fallback_now: chrono::DateTime<chrono::Utc>,
+) -> String {
     chrono::DateTime::from_timestamp(seconds, 0)
         .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
+        .unwrap_or_else(|| klights_cluster_core::k8s_time::format_legacy_timestamp(fallback_now))
 }
 
 /// Build the `terminated` state object for a failed init container.
@@ -115,12 +119,13 @@ pub(super) fn build_init_failure_terminated_state(
     exit_code: i32,
     started_at: i64,
     finished_at: i64,
+    fallback_now: chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     serde_json::json!({
         "exitCode": exit_code,
         "reason": if exit_code == 0 { "Completed" } else { "Error" },
-        "startedAt": init_failure_timestamp_from_seconds(started_at),
-        "finishedAt": init_failure_timestamp_from_seconds(finished_at),
+        "startedAt": init_failure_timestamp_from_seconds(started_at, fallback_now),
+        "finishedAt": init_failure_timestamp_from_seconds(finished_at, fallback_now),
     })
 }
 
@@ -172,6 +177,7 @@ pub(super) fn build_retrying_init_container_statuses(
     failed_name: &str,
     existing_statuses: &[serde_json::Value],
     fallback_terminated: serde_json::Value,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<serde_json::Value> {
     let Some(init_containers) = pod
         .pointer("/spec/initContainers")
@@ -257,8 +263,8 @@ pub(super) fn build_retrying_init_container_statuses(
                     "terminated": {
                         "exitCode": 0,
                         "reason": "Completed",
-                        "startedAt": crate::k8s_time::now_legacy_timestamp(),
-                        "finishedAt": crate::k8s_time::now_legacy_timestamp()
+                        "startedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
+                        "finishedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now)
                     }
                 }
             }));
@@ -275,6 +281,7 @@ pub(super) fn build_failed_init_container_statuses(
     exit_code: i32,
     started_at: i64,
     finished_at: i64,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<serde_json::Value> {
     let Some(init_containers) = pod
         .pointer("/spec/initContainers")
@@ -305,6 +312,7 @@ pub(super) fn build_failed_init_container_statuses(
                         exit_code,
                         started_at,
                         finished_at,
+                        operation_now,
                     )
                 }
             }));
@@ -320,8 +328,8 @@ pub(super) fn build_failed_init_container_statuses(
                 "terminated": {
                     "exitCode": 0,
                     "reason": "Completed",
-                    "startedAt": crate::k8s_time::now_legacy_timestamp(),
-                    "finishedAt": crate::k8s_time::now_legacy_timestamp()
+                    "startedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
+                    "finishedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now)
                 }
             }
         }));

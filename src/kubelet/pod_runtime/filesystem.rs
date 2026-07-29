@@ -204,14 +204,18 @@ impl PodFilesystem for RealPodFilesystem {
         let pod_dir_id = key.volume_dir_id();
         let pod_root = self.paths.volumes_root().join(&pod_dir_id);
         let pod_log_dir = self.paths.pod_log_dir(&key.namespace, &key.name, &key.uid);
-        crate::runtime_fs::remove_dir_all_if_exists_async(&self.file_process, &pod_root)
-            .await
-            .with_context(|| {
-                format!("failed to remove pod filesystem dir {}", pod_root.display())
-            })?;
-        crate::runtime_fs::remove_dir_all_if_exists_async(&self.file_process, &pod_log_dir)
-            .await
-            .with_context(|| format!("failed to remove pod log dir {}", pod_log_dir.display()))?;
+        klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(
+            &self.file_process,
+            &pod_root,
+        )
+        .await
+        .with_context(|| format!("failed to remove pod filesystem dir {}", pod_root.display()))?;
+        klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(
+            &self.file_process,
+            &pod_log_dir,
+        )
+        .await
+        .with_context(|| format!("failed to remove pod log dir {}", pod_log_dir.display()))?;
         Ok(())
     }
 }

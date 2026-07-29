@@ -77,10 +77,37 @@ fn is_pod_log_follow_request(path: &str, query: &str) -> bool {
             .any(|pair| matches!(pair, "follow=true" | "follow=1"))
 }
 
-pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
+pub(crate) struct NativeApiOuterLayers {
+    state: Arc<ApiState>,
+    slow_log_threshold: Duration,
+}
+
+impl NativeApiOuterLayers {
+    pub(crate) fn finish(self, router: Router) -> Router {
+        router
+            .layer({
+                let auth_state = self.state;
+                middleware::from_fn(move |request: Request, next: Next| {
+                    let auth_state = auth_state.clone();
+                    async move {
+                        crate::api::auth_middleware::authenticate_request(auth_state, request, next)
+                            .await
+                    }
+                })
+            })
+            .layer(middleware::from_fn(move |request: Request, next: Next| {
+                log_request(self.slow_log_threshold, request, next)
+            }))
+            // Outermost: content-negotiate error Status bodies to protobuf.
+            // This also wraps a fail-closed 503 from the authority shell.
+            .layer(middleware::from_fn(negotiate_error_protobuf))
+    }
+}
+
+pub(in crate::api) fn build_router_parts(state: ApiState) -> (Router, NativeApiOuterLayers) {
     let state = Arc::new(state);
     let slow_log_threshold = state.operational().config.runtime.slow_log_threshold;
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(health_check))
         .route("/livez", get(health_check))
         .route("/readyz", get(health_check))
@@ -440,27 +467,20 @@ pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
                 }
             })
         })
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            crate::api::authority_routing::leader_proxy_middleware,
-        ))
-        .layer({
-            let auth_state = state.clone();
-            middleware::from_fn(move |request: Request, next: Next| {
-                let auth_state = auth_state.clone();
-                async move {
-                    crate::api::auth_middleware::authenticate_request(auth_state, request, next)
-                        .await
-                }
-            })
-        })
-        .layer(middleware::from_fn(move |request: Request, next: Next| {
-            log_request(slow_log_threshold, request, next)
-        }))
-        // Outermost: content-negotiate error Status bodies to protobuf. Added
-        // last so it wraps every route, layer, and fallback.
-        .layer(middleware::from_fn(negotiate_error_protobuf))
-        .with_state(state)
+        .with_state(state.clone());
+    (
+        router,
+        NativeApiOuterLayers {
+            state,
+            slow_log_threshold,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(in crate::api) fn build_router_inner(state: ApiState) -> Router {
+    let (router, outer_layers) = build_router_parts(state);
+    outer_layers.finish(router)
 }
 
 #[cfg(test)]

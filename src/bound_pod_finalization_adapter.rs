@@ -26,6 +26,7 @@ pub(crate) struct RootBoundPodFinalization {
     store: Arc<PodStore>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 impl RootBoundPodFinalization {
@@ -33,11 +34,13 @@ impl RootBoundPodFinalization {
         store: Arc<PodStore>,
         cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
         outbox: Option<Arc<Outbox>>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             cluster_api,
             outbox,
+            wall_clock,
         })
     }
 
@@ -79,7 +82,7 @@ impl RootBoundPodFinalization {
             },
             pod_uid: uid.to_string(),
             command,
-            now_ms: crate::kubelet::pod_repository::current_epoch_millis(),
+            now_ms: self.wall_clock.now_ms(),
         }
     }
 
@@ -88,6 +91,7 @@ impl RootBoundPodFinalization {
         name: &str,
         uid: &str,
         live: &klights_cluster_core::Resource,
+        operation_now: chrono::DateTime<chrono::Utc>,
     ) -> StorageCommand {
         let grace_period_seconds = live
             .data
@@ -103,7 +107,7 @@ impl RootBoundPodFinalization {
             patch_kind: klights_cluster_core::PatchKind::Merge,
             patch: serde_json::json!({
                 "metadata": {
-                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
+                    "deletionTimestamp": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
                     "deletionGracePeriodSeconds": grace_period_seconds,
                 }
             }),
@@ -120,8 +124,9 @@ pub(crate) fn new_for_root(
     store: Arc<PodStore>,
     cluster_api: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     outbox: Option<Arc<Outbox>>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 ) -> Arc<dyn BoundPodFinalization> {
-    RootBoundPodFinalization::new(store, cluster_api, outbox)
+    RootBoundPodFinalization::new(store, cluster_api, outbox, wall_clock)
 }
 
 impl BoundPodFinalization for RootBoundPodFinalization {
@@ -245,6 +250,7 @@ impl GcPodDeleteSink for RootBoundPodFinalization {
                 &identity.name,
                 &identity.uid,
                 &live,
+                self.wall_clock.now_utc(),
             );
             OutboxSendPlanner::new(Some(outbox.as_ref()))
                 .route(self.outbox_command(

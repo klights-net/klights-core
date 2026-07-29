@@ -162,7 +162,9 @@ async fn read_optional_auth_pem(
     let path_buf = std::path::PathBuf::from(path);
     let key = path_buf.to_string_lossy().into_owned();
     let pem = supervisor
-        .run_blocking_file_keyed(label, key, move || crate::runtime_fs::read_utf8(path_buf))
+        .run_blocking_file_keyed(label, key, move || {
+            klights_supervisor::runtime_fs::read_utf8(path_buf)
+        })
         .await
         .with_context(|| format!("failed to join {description} read"))?
         .with_context(|| format!("failed to read {description} {path}"))?;
@@ -609,6 +611,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
                 ),
             ),
+            wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
                     pod_slot_adapter.clone(),
@@ -620,11 +623,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 Arc::new(crate::bootstrap::kubelet_ports::WorkerPodEventSink::new(
                     outbox_runtime.clone(),
                     leader_ports.resource_query.clone(),
+                    Arc::new(klights_supervisor::SystemWallClock),
                 ))
             } else {
                 Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
                     Some(outbox_runtime.clone()),
                     db_handle.clone(),
+                    Arc::new(klights_supervisor::SystemWallClock),
                 ))
             },
         },
@@ -812,21 +817,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let cluster_ca_pem = supervisor
         .run_blocking_file_keyed("proxy_read_ca_cert", ca_cert_path.display().to_string(), {
             let p = ca_cert_path.clone();
-            move || crate::runtime_fs::read_utf8(&p)
+            move || klights_supervisor::runtime_fs::read_utf8(&p)
         })
         .await
         .ok()
         .and_then(|r| r.ok());
     let authority_router = if raft_node.is_some() {
         let ca_cert_pem = cluster_ca_pem.clone();
-        let proxy_client_identity = crate::api::authority_routing::load_proxy_client_identity(
+        let proxy_client_identity = crate::api_server_shell::load_proxy_client_identity(
             &api_runtime_paths.api_proxy_cert,
             &api_runtime_paths.api_proxy_key,
             supervisor.as_ref(),
         )
         .await;
         Some(std::sync::Arc::new(
-            crate::api::authority_routing::HttpAuthorityRouter::from_authority(
+            crate::api_server_shell::HttpAuthorityRouter::from_authority(
                 leader_authority.clone(),
                 ca_cert_pem,
             )
@@ -835,6 +840,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     } else {
         None
     };
+    let api_authority = authority_router
+        .as_ref()
+        .map(|_| leader_authority.clone() as Arc<dyn klights_leader_api::LeaderAuthority>);
 
     let rbac_policy_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore> =
         std::sync::Arc::new(
@@ -1046,7 +1054,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             crate::signing_key_state_adapter::RootServiceAccountSigningKeyState::for_test(),
-            authority_router.clone(),
+            api_authority.clone(),
         ),
     ));
     let kubelet_config = crate::kubelet::context::KubeletConfig::try_new(
@@ -1140,6 +1148,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.node_name.clone(),
                 endpoint_query.clone(),
                 outbox_runtime.clone(),
+                Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             ));
         match crate::bootstrap::observed_endpoint::start_leader_peer_endpoint_observer(
             db_handle.clone(),
@@ -1480,7 +1489,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     kubelet::node::run_heartbeat_with_lease_client(
                         watch_source,
                         lease_client,
-                        Arc::new(crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock),
+                        Arc::new(
+                            crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock::new(
+                                Arc::new(klights_supervisor::SystemWallClock),
+                            ),
+                        ),
                         cfg.node_name.clone(),
                         cancel,
                         s,
@@ -1511,6 +1524,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.node_name.clone(),
                 query.clone(),
                 kubelet_services.status_delivery().outbox.clone(),
+                Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             ));
         let readiness_publisher =
             crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
@@ -1639,7 +1653,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .await
         .context("load root-owned ServiceAccount signing state")?;
     #[cfg(not(test))]
-    let api_router = api::build_router_from_root(
+    let (api_router, api_outer_layers) = api::build_router_from_root(
         Arc::new(
             crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
                 rbac_policy_store.clone(),
@@ -1723,14 +1737,18 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::bootstrap::operational_adapters::ApiClusterStatusMetadata::new(db_handle.clone()),
         supervisor.clone(),
         api_signing_keys,
-        authority_router,
+        api_authority,
     );
     #[cfg(test)]
     let state_with_cri = (*watcher_state)
         .clone()
         .with_local_node_exec(local_node_exec);
     #[cfg(test)]
-    let api_router = api::build_router(state_with_cri);
+    let (api_router, api_outer_layers) = api::build_router_parts(state_with_cri);
+    let api_router = api_outer_layers.finish(crate::api_server_shell::wrap_authority_router(
+        api_router,
+        authority_router,
+    ));
     let app = if let Some(rs) = replication_service_for_router {
         // P3-11c: if raft mode is active on this leader-class boot,
         // wire the RaftNode-backed Raft RPC dispatcher and the
@@ -1759,6 +1777,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 config.node_name.clone(),
                 grpc_node_query.clone(),
                 outbox_runtime.clone(),
+                Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             ));
         {
             let authenticated_projected_token = Arc::new(

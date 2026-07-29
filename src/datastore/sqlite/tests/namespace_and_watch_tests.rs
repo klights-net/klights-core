@@ -1122,7 +1122,7 @@ async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
         },
     });
 
-    let commit = crate::replication::log_apply_wire::test_live_commit(
+    let commit = crate::datastore::test_support::test_live_commit(
         51,
         vec![klights_cluster_core::LogApplyMutation::PutNamespace(
             klights_cluster_core::LogApplyNamespaceRow {
@@ -1195,7 +1195,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let put_commit = crate::replication::log_apply_wire::test_live_commit(
+    let put_commit = crate::datastore::test_support::test_live_commit(
         51,
         vec![klights_cluster_core::LogApplyMutation::PutNamespace(
             klights_cluster_core::LogApplyNamespaceRow {
@@ -1223,7 +1223,7 @@ async fn raft_namespace_delete_replays_identical_watch_payloads() {
         .await
         .expect("follower namespace seed PUT must apply");
 
-    let delete_commit = crate::replication::log_apply_wire::test_live_commit(
+    let delete_commit = crate::datastore::test_support::test_live_commit(
         52,
         vec![klights_cluster_core::LogApplyMutation::DeleteNamespace {
             name: "deterministic-ns".to_string(),
@@ -1292,7 +1292,7 @@ async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
     committed_payload["object"]["metadata"]["resourceVersion"] = json!("1");
     let committed_bytes = serde_json::to_vec(&committed_payload).unwrap();
 
-    let commit = crate::replication::log_apply_wire::test_live_commit(
+    let commit = crate::datastore::test_support::test_live_commit(
         10_024,
         vec![klights_cluster_core::LogApplyMutation::PutWatchEvent(
             klights_cluster_core::LogApplyWatchEventRow {
@@ -1370,7 +1370,7 @@ async fn raft_watch_gc_replays_identically() {
 
     for resource_version in [10_i64, 20, 30] {
         let name = format!("watch-gc-{resource_version}");
-        let commit = crate::replication::log_apply_wire::test_live_commit(
+        let commit = crate::datastore::test_support::test_live_commit(
             resource_version,
             vec![klights_cluster_core::LogApplyMutation::PutWatchEvent(
                 klights_cluster_core::LogApplyWatchEventRow {
@@ -1396,7 +1396,7 @@ async fn raft_watch_gc_replays_identically() {
             .expect("follower watch GC seed must apply");
     }
 
-    let gc_commit = crate::replication::log_apply_wire::test_live_commit(
+    let gc_commit = crate::datastore::test_support::test_live_commit(
         40,
         vec![klights_cluster_core::LogApplyMutation::GcWatchEvents {
             max_rows: 1,

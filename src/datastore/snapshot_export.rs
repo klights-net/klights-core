@@ -536,20 +536,39 @@ pub(crate) fn cluster_pod_cleanup_mutation_from_intent(
 mod tests {
     use super::*;
     use klights_cluster_core::LogApplyCommit;
+    use tokio::sync::mpsc;
+
+    struct TestSnapshotCommitSink {
+        tx: Option<mpsc::Sender<anyhow::Result<SnapshotRestoreOperation>>>,
+    }
+
+    impl TestSnapshotCommitSink {
+        fn new(tx: mpsc::Sender<anyhow::Result<SnapshotRestoreOperation>>) -> Self {
+            Self { tx: Some(tx) }
+        }
+    }
+
+    impl SnapshotCommitSink for TestSnapshotCommitSink {
+        async fn push(&mut self, operation: SnapshotRestoreOperation) -> anyhow::Result<()> {
+            let Some(tx) = self.tx.as_ref() else {
+                return Ok(());
+            };
+            tx.send(Ok(operation))
+                .await
+                .map_err(|error| anyhow::anyhow!("snapshot test receiver dropped: {error}"))
+        }
+
+        fn finish(&mut self) -> anyhow::Result<()> {
+            self.tx.take();
+            Ok(())
+        }
+    }
 
     // ---- Snapshot generation tests ----
 
     #[tokio::test]
     async fn snapshot_generates_entries() {
         let db = crate::datastore::test_support::in_memory().await;
-
-        // Init default namespace
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &db,
-        )
-        .await
-        .unwrap();
 
         // Create some resources
         db.create_resource(
@@ -582,13 +601,6 @@ mod tests {
     async fn snapshot_after_current_rv_still_contains_authoritative_state() {
         let db = crate::datastore::test_support::in_memory().await;
 
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &db,
-        )
-        .await
-        .unwrap();
-
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -619,13 +631,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_replays_resource_deletes_since_rv() {
         let db = crate::datastore::test_support::in_memory().await;
-
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &db,
-        )
-        .await
-        .unwrap();
 
         let created = db
             .create_resource(
@@ -667,13 +672,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restore_preserves_durable_watch_history() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &leader,
-        )
-        .await
-        .unwrap();
-
         let current = leader
             .create_resource(
                 "v1",
@@ -1000,12 +998,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restore_preserves_rv_counter_for_next_raft_apply() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &leader,
-        )
-        .await
-        .unwrap();
         leader
             .create_resource(
                 "v1",
@@ -1235,13 +1227,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_after_rv_is_still_authoritative_for_destructive_restore() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &leader,
-        )
-        .await
-        .unwrap();
-
         let baseline = leader
             .create_resource(
                 "v1",
@@ -1492,13 +1477,6 @@ mod tests {
     async fn staging_restore_successful() {
         let db = crate::datastore::test_support::in_memory().await;
 
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &db,
-        )
-        .await
-        .unwrap();
-
         // Create a resource (simulating leader state)
         db.create_resource(
             "v1",
@@ -1581,13 +1559,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_emits_complete_watch_history_across_page_boundaries() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(
-            &crate::kubelet::file_blocking::test_file_process_executor(),
-            &leader,
-        )
-        .await
-        .unwrap();
-
         // Insert strictly more watch_events than SNAPSHOT_EMIT_PAGE_SIZE so the
         // emitter's paged loop crosses at least one boundary.
         let n = super::SNAPSHOT_EMIT_PAGE_SIZE + 2;
@@ -1640,9 +1611,6 @@ mod tests {
     // through both codepaths and compares the SnapshotRestoreOperation sequence.
     #[tokio::test]
     async fn streamed_snapshot_matches_vec_path_across_fixture_table() {
-        use crate::replication::test_proto_channel_sink::TestProtoChannelSink;
-        use tokio::sync::mpsc;
-
         for (case, n_resources, n_outbox) in [
             ("empty", 0, 0),
             ("resources-only", 3, 0),
@@ -1651,12 +1619,6 @@ mod tests {
             ("mixed", 5, 7),
         ] {
             let leader = crate::datastore::test_support::in_memory().await;
-            crate::controllers::namespace::init_default_namespaces(
-                &crate::kubelet::file_blocking::test_file_process_executor(),
-                &leader,
-            )
-            .await
-            .unwrap();
             for i in 0..n_resources {
                 leader
                     .create_resource(
@@ -1697,11 +1659,11 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(64);
             let mut streamed_commits = Vec::new();
             let producer = async {
-                let mut sink = TestProtoChannelSink::new(tx);
+                let mut sink = TestSnapshotCommitSink::new(tx);
                 crate::datastore::snapshot_export::stream_snapshot_commits(&leader, 0, &mut sink)
                     .await
                     .unwrap();
-                sink.finish();
+                SnapshotCommitSink::finish(&mut sink).unwrap();
             };
             let consumer = async {
                 while let Some(item) = rx.recv().await {

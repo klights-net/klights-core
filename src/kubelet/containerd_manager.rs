@@ -28,7 +28,7 @@ fn ensure_inotify_limits() -> Result<()> {
     const MINIMUM_INSTANCES: u32 = 1024;
 
     // Read current value
-    let current_str = crate::runtime_fs::read_utf8(INOTIFY_PATH)
+    let current_str = klights_supervisor::runtime_fs::read_utf8(INOTIFY_PATH)
         .context("Failed to read /proc/sys/fs/inotify/max_user_instances")?;
     let current = parse_inotify_value(&current_str)?;
 
@@ -663,7 +663,7 @@ state = "{state_dir}"
         image_pull_response_timeout: Duration,
         paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
-        if !crate::runtime_fs::exists_async(file_process, socket_path).await? {
+        if !klights_supervisor::runtime_fs::exists_async(file_process, socket_path).await? {
             return Ok(false);
         }
 
@@ -714,7 +714,7 @@ state = "{state_dir}"
         paths: &crate::kubelet::runtime_paths::KubeletRuntimePaths,
     ) -> Result<bool> {
         let socket_path = paths.containerd_socket().to_string_lossy().into_owned();
-        if !crate::runtime_fs::exists_async(file_process, &socket_path).await? {
+        if !klights_supervisor::runtime_fs::exists_async(file_process, &socket_path).await? {
             return Ok(false);
         }
         Self::socket_is_reusable(
@@ -1162,16 +1162,19 @@ mod tests {
     use super::*;
 
     /// Per-process unique test root under /tmp, shared by all tests in
-    /// this module (and across all test modules that call
-    /// `paths::test_data_root_path`).
+    /// this module.
     fn test_root(ns: &str) -> String {
-        crate::paths::test_data_root_path(ns)
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(ns)
+            .data_root()
+            .to_path_buf()
             .to_string_lossy()
             .into_owned()
     }
 
     fn test_cni_conf_dir(ns: &str) -> String {
-        let root = crate::paths::test_data_root_path(ns);
+        let root = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(ns)
+            .data_root()
+            .to_path_buf();
         root.join("cni")
             .join("net.d")
             .join(ns)
@@ -1857,11 +1860,14 @@ mod tests {
     async fn test_write_cni_config_provides_node_local_subnet() {
         let dir = tempfile::tempdir().unwrap();
         let cni_dir = dir.path().to_string_lossy().into_owned();
+        let rpc_socket =
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights-test")
+                .cni_rpc_socket();
 
         ContainerdManager::write_cni_config(
             &crate::kubelet::file_blocking::test_file_process_executor(),
             &cni_dir,
-            &crate::paths::cni_rpc_socket_path("klights-test"),
+            &rpc_socket,
             "klights-test",
             "10.43.0.0/24",
             crate::networking::wireguard::WIREGUARD_MTU,
@@ -1870,7 +1876,7 @@ mod tests {
         .unwrap();
 
         let config_path = dir.path().join("10-klights-test.conf");
-        let raw = crate::runtime_fs::read_utf8(config_path).unwrap();
+        let raw = klights_supervisor::runtime_fs::read_utf8(config_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         assert_eq!(parsed["type"], "klights-cni");
@@ -1879,9 +1885,7 @@ mod tests {
         assert_eq!(parsed["mtu"], crate::networking::wireguard::WIREGUARD_MTU);
         assert_eq!(
             parsed["rpcSocket"],
-            crate::paths::cni_rpc_socket_path("klights-test")
-                .to_string_lossy()
-                .into_owned()
+            rpc_socket.to_string_lossy().into_owned()
         );
         assert!(parsed.get("mode").is_none());
     }

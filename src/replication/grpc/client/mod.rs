@@ -262,45 +262,9 @@ pub struct GrpcClientConfig {
     // would only confuse callers; struct shape simplified.
 }
 
-pub(crate) trait RegistrationSnapshotView {
-    fn remote_snapshot(&self) -> klights_leader_api::RemoteNodeRegistrationSnapshot;
-}
-
-impl RegistrationSnapshotView for klights_leader_api::RemoteNodeRegistrationSnapshot {
-    fn remote_snapshot(&self) -> klights_leader_api::RemoteNodeRegistrationSnapshot {
-        self.clone()
-    }
-}
-
-#[cfg(test)]
-impl RegistrationSnapshotView for crate::kubelet::node::NodeRegistrationSnapshot {
-    fn remote_snapshot(&self) -> klights_leader_api::RemoteNodeRegistrationSnapshot {
-        klights_leader_api::RemoteNodeRegistrationSnapshot {
-            node_mode: match self.node_mode {
-                klights_network_api::NodePeerMode::Root => klights_leader_api::RemoteNodeMode::Root,
-                klights_network_api::NodePeerMode::Rootless => {
-                    klights_leader_api::RemoteNodeMode::Rootless
-                }
-            },
-            host: klights_leader_api::RemoteNodeHostFacts {
-                cpu_count: self.host.cpu_count,
-                memory_ki: self.host.memory_ki,
-                architecture: self.host.architecture.clone(),
-                operating_system: self.host.operating_system.clone(),
-                os_image: self.host.os_image.clone(),
-                kernel_version: self.host.kernel_version.clone(),
-                container_runtime_version: self.host.container_runtime_version.clone(),
-                kubelet_version: self.host.kubelet_version.clone(),
-                git_commit: self.host.git_commit.clone(),
-            },
-        }
-    }
-}
-
 pub(crate) fn node_registration_to_proto(
-    registration: &impl RegistrationSnapshotView,
+    registration: &klights_leader_api::RemoteNodeRegistrationSnapshot,
 ) -> klights_internal_protobuf::NodeRegistrationSnapshot {
-    let registration = registration.remote_snapshot();
     let node_mode = match &registration.node_mode {
         klights_leader_api::RemoteNodeMode::Root => "root",
         klights_leader_api::RemoteNodeMode::Rootless => "rootless",
@@ -2085,7 +2049,7 @@ impl ReplicationGrpcClient {
         // T2 step 5: use the current (possibly overridden) leader
         // endpoint so the reconnect loop's endpoint cycling takes
         // effect on the next connection attempt.
-        let endpoint = normalized_endpoint(current)?;
+        let endpoint = connector_endpoint(current)?;
         // bug-grpc A1: all dial tunables come from the injected policy.
         let mut builder = self.policy.configure_endpoint(
             Endpoint::from_shared(endpoint.clone())?,
@@ -2177,12 +2141,6 @@ impl ReplicationGrpcClient {
     #[cfg(test)]
     pub(crate) fn dataplane_for_test(&self) -> JoinDataplaneMetadata {
         self.config.dataplane.clone()
-    }
-
-    #[cfg(test)]
-    fn add_join_token<T>(&self, request: &mut tonic::Request<T>) -> Result<()> {
-        let _ = request;
-        Ok(())
     }
 
     /// Attach the controlplane bootstrap token to a `JoinAsControlplane` request.
@@ -3552,9 +3510,7 @@ fn normalized_endpoint(endpoint: &str) -> Result<String> {
         return Err(anyhow!("leader endpoint is empty"));
     }
     if trimmed.contains("://") {
-        if trimmed.starts_with("https://")
-            || (allow_plaintext_leader_endpoint_for_tests() && trimmed.starts_with("http://"))
-        {
+        if trimmed.starts_with("https://") {
             Ok(trimmed.to_string())
         } else {
             Err(anyhow!(
@@ -3567,14 +3523,19 @@ fn normalized_endpoint(endpoint: &str) -> Result<String> {
     }
 }
 
-#[cfg(test)]
-fn allow_plaintext_leader_endpoint_for_tests() -> bool {
-    true
+#[cfg(not(test))]
+fn connector_endpoint(endpoint: &str) -> Result<String> {
+    normalized_endpoint(endpoint)
 }
 
-#[cfg(not(test))]
-fn allow_plaintext_leader_endpoint_for_tests() -> bool {
-    false
+#[cfg(test)]
+fn connector_endpoint(endpoint: &str) -> Result<String> {
+    let trimmed = endpoint.trim();
+    if trimmed.starts_with("http://") {
+        Ok(trimmed.to_string())
+    } else {
+        normalized_endpoint(endpoint)
+    }
 }
 
 fn endpoint_host(endpoint: &str) -> Result<String> {

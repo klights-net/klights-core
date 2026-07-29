@@ -152,6 +152,7 @@ pub struct Datastore {
     #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+    wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
     snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
     #[cfg(test)]
@@ -491,6 +492,7 @@ impl Datastore {
         operation: &str,
         authoring_node: &str,
         resource_version_hint: Option<i64>,
+        operation_now: chrono::DateTime<chrono::Utc>,
     ) -> tokio_rusqlite::Result<(klights_cluster_core::LogApplyCommit, i64)> {
         use crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error;
         use crate::datastore::sqlite::resource_shape::{
@@ -527,7 +529,7 @@ impl Datastore {
             } => {
                 ensure_resource_type_meta(&mut data, &api_version, &kind);
                 ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
-                ensure_metadata_create_defaults(&mut data);
+                ensure_metadata_create_defaults(&mut data, operation_now);
                 ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
                 if operation == klights_cluster_core::OutboxOperation::NodeRegistration.as_str()
                     && api_version == "v1"
@@ -907,7 +909,7 @@ impl Datastore {
                             ensure_resource_type_meta(&mut data, &api_version, &kind);
                             ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
                             if mode == ResourceBatchPutMode::Create {
-                                ensure_metadata_create_defaults(&mut data);
+                                ensure_metadata_create_defaults(&mut data, operation_now);
                             }
                             ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
                             let uid = ensure_metadata_uid(&mut data);
@@ -1117,7 +1119,9 @@ impl Datastore {
                 {
                     metadata.insert(
                         "deletionTimestamp".to_string(),
-                        serde_json::Value::String(crate::k8s_time::now_legacy_timestamp()),
+                        serde_json::Value::String(
+                            klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
+                        ),
                     );
                 }
                 metadata
@@ -1303,7 +1307,9 @@ impl Datastore {
                             &kind,
                             &patch,
                         )
-                        .then(crate::k8s_time::now_legacy_timestamp);
+                        .then(|| {
+                            klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now)
+                        });
                     return Ok((
                         Self::author_live_commit_from_cluster_mutations(
                             rv,
@@ -1429,10 +1435,7 @@ impl Datastore {
                         rusqlite::Error::QueryReturnedNoRows,
                     ));
                 }
-                let created_at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64;
+                let created_at_ms = operation_now.timestamp_millis();
                 Self::author_live_commit_from_cluster_mutations(
                     rv,
                     vec![ClusterMutation::PodCleanup(
@@ -1807,6 +1810,7 @@ impl Datastore {
         let command =
             klights_cluster_core::command::StorageCommand::ApplyResourceBatch { operations };
         let outbox_codec = self.outbox_codec.clone();
+        let operation_now = self.wall_clock.now_utc();
         // Build + apply in one IMMEDIATE transaction. The builder authors only
         // an RV-zero template; committed apply allocates the public RV in the
         // same transaction that writes the rows.
@@ -1820,6 +1824,7 @@ impl Datastore {
                     "ResourceBatch",
                     "",
                     None,
+                    operation_now,
                 )?;
                 let pending =
                     crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
@@ -1852,6 +1857,7 @@ impl Datastore {
         };
         let authoring_node = node_name.to_string();
         let outbox_codec = self.outbox_codec.clone();
+        let operation_now = self.wall_clock.now_utc();
         let _pending = self
             .db_call("db_move_pod_to_cleanup_intent", move |conn| {
                 let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
@@ -1862,6 +1868,7 @@ impl Datastore {
                     "ClusterMaintenance",
                     &authoring_node,
                     None,
+                    operation_now,
                 )?;
                 let pending =
                     crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
@@ -1947,6 +1954,7 @@ impl Datastore {
     ) -> Result<()> {
         let authoring_node = authoring_node.to_string();
         let outbox_codec = self.outbox_codec.clone();
+        let operation_now = self.wall_clock.now_utc();
         let _pending = self
             .db_call("db_apply_cluster_maintenance_command", move |conn| {
                 let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
@@ -1957,6 +1965,7 @@ impl Datastore {
                     "ClusterMaintenance",
                     &authoring_node,
                     None,
+                    operation_now,
                 )?;
                 let pending =
                     crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
@@ -1986,6 +1995,7 @@ impl Datastore {
     ) -> Result<klights_cluster_core::LogApplyCommit> {
         let operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
+        let operation_now = self.wall_clock.now_utc();
 
         self.db_call("db_build_log_apply_commit_for_command", move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1997,6 +2007,7 @@ impl Datastore {
                 &operation,
                 &authoring_node_owned,
                 resource_version_hint,
+                operation_now,
             )?;
             tx.commit()?;
             Ok(commit)
@@ -2027,10 +2038,8 @@ impl Datastore {
         }
         let subject_key = subject_key_for_command(&command);
         let status_stamp = Self::pod_status_stamp_of(&command);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let operation_now = self.wall_clock.now_utc();
+        let now = operation_now.timestamp_millis();
         let claim_key = idempotency_key.to_string();
         let claim_operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
@@ -2055,6 +2064,7 @@ impl Datastore {
                     &claim_operation,
                     &authoring_node_owned,
                     resource_version_hint,
+                    operation_now,
                 )?;
                 let _ledger_only =
                     Self::normalize_ledger_only_outbox_commit_in_tx(&tx, &commit, &mut rv)?;
@@ -2140,10 +2150,8 @@ impl Datastore {
         }
         let subject_key = subject_key_for_command(&command);
         let status_stamp = Self::pod_status_stamp_of(&command);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let operation_now = self.wall_clock.now_utc();
+        let now = operation_now.timestamp_millis();
         let claim_key = idempotency_key.to_string();
         let claim_operation = operation.to_string();
         let authoring_node_owned = authoring_node.to_string();
@@ -2264,6 +2272,7 @@ impl Datastore {
                     &claim_operation,
                     &authoring_node_owned,
                     resource_version_hint,
+                    operation_now,
                 ) {
                     Ok(built) => built,
                     Err(error) if error.to_string().contains("409 Conflict") => {
@@ -2394,10 +2403,8 @@ impl Datastore {
         let is_pod_status = pod_target.is_some();
         let subject_key = subject_key_for_command(&command);
         let status_stamp = Self::pod_status_stamp_of(&command);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let operation_now = self.wall_clock.now_utc();
+        let now = operation_now.timestamp_millis();
 
         let claim_key = idempotency_key.to_string();
         let claim_operation = operation.to_string();
@@ -2474,6 +2481,7 @@ impl Datastore {
                     &claim_operation,
                     &authoring_node,
                     &context,
+                    operation_now,
                 )?;
                 let pod_after = pod_state(&tx)?;
                 let pod_endpoint_effect = if pod_target.is_none() {
@@ -2585,6 +2593,7 @@ impl Datastore {
         operation: &str,
         authoring_node: &str,
         context: &outbox_codec::TransactionContext<'_>,
+        operation_now: chrono::DateTime<chrono::Utc>,
     ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
         use klights_cluster_core::StorageResponse;
 
@@ -2596,6 +2605,7 @@ impl Datastore {
             operation,
             authoring_node,
             Some(candidate_rv),
+            operation_now,
         )?;
 
         let (applied_rv, pending, applied_mutation) =
@@ -2648,6 +2658,7 @@ impl Datastore {
             operation,
             authoring_node,
             &context,
+            chrono::Utc::now(),
         )
     }
 
@@ -3421,6 +3432,7 @@ impl Datastore {
         snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
         #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         // Schema + fingerprint are applied by the cluster-owned open adapter.
         Ok(Self {
@@ -3429,6 +3441,7 @@ impl Datastore {
             #[cfg(test)]
             commit_sink,
             outbox_codec,
+            wall_clock,
             snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             snapshot_factory,
             #[cfg(test)]
@@ -3448,6 +3461,7 @@ impl Datastore {
         executor: DbExecutor,
         #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
             snapshot_capture::SqliteSnapshotFactory::new(opts, executor.task_supervisor())
@@ -3460,6 +3474,7 @@ impl Datastore {
             #[cfg(test)]
             commit_sink,
             outbox_codec,
+            wall_clock,
         )
         .await
     }
@@ -3476,6 +3491,7 @@ impl Datastore {
         key_file: Option<&std::path::Path>,
         #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         let db_path = cluster_db_path.to_path_buf();
         let opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
@@ -3522,6 +3538,7 @@ impl Datastore {
             #[cfg(test)]
             commit_sink,
             outbox_codec,
+            wall_clock,
         )
         .await?;
 
@@ -3550,6 +3567,7 @@ impl Datastore {
             key_file,
             crate::watch_commit_observation_adapter::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
     }
@@ -3591,6 +3609,7 @@ impl Datastore {
             snapshot_factory,
             crate::watch_commit_observation_adapter::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
     }
@@ -3601,12 +3620,14 @@ impl Datastore {
         executor: DbExecutor,
         #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
+        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         Self::from_executor(
             executor,
             #[cfg(test)]
             commit_sink,
             outbox_codec,
+            wall_clock,
         )
         .await
     }
@@ -3617,6 +3638,7 @@ impl Datastore {
             executor,
             crate::watch_commit_observation_adapter::new_sink(),
             crate::outbox_response_codec_adapter::new_codec(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
     }
@@ -4091,6 +4113,41 @@ impl DatastoreBackend for Datastore {
             grace_seconds,
         )
         .await
+    }
+
+    async fn delete_resource_without_watch_with_tombstone(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Resource> {
+        let marked = Datastore::mark_resource_for_deletion_without_watch(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("SQLite tombstone delete did not mark its target"))?;
+        Datastore::delete_resource_with_preconditions(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            ResourcePreconditions::uid_and_resource_version(
+                marked.uid.clone(),
+                marked.resource_version,
+            ),
+        )
+        .await?;
+        Ok(marked)
     }
 
     async fn delete_resource(

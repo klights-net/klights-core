@@ -314,7 +314,16 @@ impl ApiOperationalConfig {
             config.node_name,
             config.anonymous_auth,
             runtime,
-            crate::version::api_version_info(),
+            crate::api::version::VersionInfo::new(
+                "1",
+                "34",
+                "v1.34.6+klights-test",
+                "test-commit",
+                "clean",
+                "",
+                "rustc test",
+                "test-target",
+            ),
         ))
     }
 }
@@ -355,7 +364,7 @@ pub(crate) struct ApiOperationalServices {
     pub(crate) task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub(crate) file_process: klights_supervisor::FileProcessExecutor,
     pub(crate) signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
-    pub(crate) authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
+    pub(crate) authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
 }
 
 impl ApiOperationalServices {
@@ -369,7 +378,7 @@ impl ApiOperationalServices {
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         file_process: klights_supervisor::FileProcessExecutor,
         signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
-        authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
+        authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
     ) -> Self {
         Self {
             role,
@@ -380,7 +389,7 @@ impl ApiOperationalServices {
             task_supervisor,
             file_process,
             signing_keys,
-            authority_router,
+            authority,
         }
     }
 }
@@ -458,8 +467,8 @@ pub(crate) fn build_router_from_root(
     cluster_status: Arc<dyn klights_leader_api::LeaderClusterStatusMetadata>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     signing_keys: Arc<dyn crate::auth::middleware::ServiceAccountSigningKeyProvider>,
-    authority_router: Option<Arc<crate::api::authority_routing::HttpAuthorityRouter>>,
-) -> axum::Router {
+    authority: Option<Arc<dyn klights_leader_api::LeaderAuthority>>,
+) -> (axum::Router, crate::api::routes::NativeApiOuterLayers) {
     let role = match role {
         RootApiRole::Leader => ApiNodeRole::Leader,
         RootApiRole::Controlplane {
@@ -535,10 +544,10 @@ pub(crate) fn build_router_from_root(
             task_supervisor.clone(),
             klights_supervisor::FileProcessExecutor::new(task_supervisor),
             signing_keys,
-            authority_router,
+            authority,
         ),
     );
-    crate::api::routes::build_router_inner(state)
+    crate::api::routes::build_router_parts(state)
 }
 
 #[derive(Clone)]

@@ -29,7 +29,12 @@ use serde_json::{Map, Value};
 /// UID is generated only when missing, null, or whitespace-only.
 /// `creationTimestamp` and `generation` are added only when absent / null /
 /// (for generation) zero.
-pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name: &str) {
+pub fn inject_create_metadata_at(
+    ns: Option<&str>,
+    body: &mut Value,
+    resource_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };
@@ -63,7 +68,7 @@ pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name:
     {
         meta_obj.insert(
             "creationTimestamp".to_string(),
-            Value::String(crate::k8s_time::now_time()),
+            Value::String(klights_cluster_core::k8s_time::format_time(now)),
         );
     }
     let r#gen = meta_obj
@@ -75,6 +80,11 @@ pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name:
     }
 }
 
+#[cfg(test)]
+pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name: &str) {
+    inject_create_metadata_at(ns, body, resource_name, test_operation_time());
+}
+
 /// Apply Pod-specific create-time defaults: terminationGracePeriodSeconds,
 /// container defaults, and a fresh status with phase=Pending and the
 /// computed QoS class.
@@ -82,7 +92,7 @@ pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name:
 /// Idempotent: existing terminationGracePeriodSeconds is preserved, but
 /// status is unconditionally written (matches the prior inline behavior in
 /// `create_inner`).
-pub fn apply_pod_create_defaults(body: &mut Value) {
+pub fn apply_pod_create_defaults_at(body: &mut Value, now: chrono::DateTime<chrono::Utc>) {
     let qos_class = compute_qos_class(body);
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -99,28 +109,33 @@ pub fn apply_pod_create_defaults(body: &mut Value) {
                 {
                     "type": "Initialized",
                     "status": "True",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": klights_cluster_core::k8s_time::format_legacy_timestamp(now),
                 },
                 {
                     "type": "Ready",
                     "status": "False",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": klights_cluster_core::k8s_time::format_legacy_timestamp(now),
                 },
                 {
                     "type": "ContainersReady",
                     "status": "False",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": klights_cluster_core::k8s_time::format_legacy_timestamp(now),
                 },
                 {
                     "type": "PodScheduled",
                     "status": "True",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": klights_cluster_core::k8s_time::format_legacy_timestamp(now),
                 }
             ],
             "containerStatuses": [],
             "qosClass": qos_class,
         }),
     );
+}
+
+#[cfg(test)]
+pub fn apply_pod_create_defaults(body: &mut Value) {
+    apply_pod_create_defaults_at(body, test_operation_time());
 }
 
 /// Apply create-time defaults that live under `Pod.spec`.
@@ -346,18 +361,29 @@ pub fn increment_generation_if_spec_changed(kind: &str, current: &Value, body: &
 ///
 /// Replaces existing values — callers should clone first if they need to
 /// preserve the originals.
-pub fn set_deletion_timestamp(body: &mut Value) {
+pub fn set_deletion_timestamp_at(body: &mut Value, now: chrono::DateTime<chrono::Utc>) {
     let Some(meta) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
         return;
     };
     meta.insert(
         "deletionTimestamp".to_string(),
-        Value::String(crate::k8s_time::now_legacy_timestamp()),
+        Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(now)),
     );
     meta.insert(
         "deletionGracePeriodSeconds".to_string(),
         serde_json::json!(0),
     );
+}
+
+#[cfg(test)]
+pub fn set_deletion_timestamp(body: &mut Value) {
+    set_deletion_timestamp_at(body, test_operation_time());
+}
+
+#[cfg(test)]
+fn test_operation_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_700_000_000, 123_000_000)
+        .expect("fixed test operation timestamp")
 }
 
 /// Pull `metadata.uid` out of a resource body as an owned `String`.

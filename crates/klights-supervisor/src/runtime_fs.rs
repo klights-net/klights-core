@@ -10,11 +10,6 @@ pub fn create_dir_all(path: impl AsRef<std::path::Path>) -> std::io::Result<()> 
     std::fs::create_dir_all(path)
 }
 
-#[cfg(test)]
-pub fn write(path: impl AsRef<std::path::Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    std::fs::write(path, contents)
-}
-
 pub fn open_append(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
@@ -23,7 +18,7 @@ pub fn open_append(path: impl AsRef<std::path::Path>) -> std::io::Result<std::fs
 }
 
 pub async fn read_utf8_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> std::io::Result<String> {
     let path = path.as_ref().to_path_buf();
@@ -43,7 +38,7 @@ pub async fn read_utf8_async(
 }
 
 pub async fn create_dir_all_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<()> {
     let path = path.as_ref().to_path_buf();
@@ -56,7 +51,7 @@ pub async fn create_dir_all_async(
 }
 
 pub async fn write_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
     contents: impl AsRef<[u8]>,
 ) -> anyhow::Result<()> {
@@ -71,7 +66,7 @@ pub async fn write_async(
 }
 
 pub async fn exists_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<bool> {
     let path = path.as_ref().to_path_buf();
@@ -88,7 +83,7 @@ pub async fn exists_async(
 }
 
 pub async fn canonicalize_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<std::path::PathBuf> {
     let path = path.as_ref().to_path_buf();
@@ -101,7 +96,7 @@ pub async fn canonicalize_async(
 }
 
 pub async fn remove_file_if_exists_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<bool> {
     remove_if_exists(
@@ -114,7 +109,7 @@ pub async fn remove_file_if_exists_async(
 }
 
 pub async fn remove_dir_if_exists_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<bool> {
     remove_if_exists(
@@ -127,7 +122,7 @@ pub async fn remove_dir_if_exists_async(
 }
 
 pub async fn remove_dir_all_if_exists_async(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<bool> {
     remove_if_exists(
@@ -140,7 +135,7 @@ pub async fn remove_dir_all_if_exists_async(
 }
 
 async fn remove_if_exists(
-    file_process: &klights_supervisor::FileProcessExecutor,
+    file_process: &crate::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
     label: &'static str,
     remove: fn(std::path::PathBuf) -> std::io::Result<()>,
@@ -154,4 +149,63 @@ async fn remove_if_exists(
             Err(error) => Err(anyhow::Error::from(error)),
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{FileProcessExecutor, TaskCategoryConfig, TaskSupervisor};
+
+    fn executor() -> (Arc<TaskSupervisor>, FileProcessExecutor) {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let file_process = FileProcessExecutor::new(supervisor.clone());
+        (supervisor, file_process)
+    }
+
+    #[tokio::test]
+    async fn supervised_primitives_preserve_utf8_and_missing_path_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = temp.path().join("nested").join("value");
+        let missing = temp.path().join("missing");
+        let (supervisor, file_process) = executor();
+
+        create_dir_all_async(&file_process, text.parent().unwrap())
+            .await
+            .unwrap();
+        write_async(&file_process, &text, b"klights").await.unwrap();
+        assert_eq!(
+            read_utf8_async(&file_process, &text).await.unwrap(),
+            "klights"
+        );
+        assert!(exists_async(&file_process, &text).await.unwrap());
+        assert!(!exists_async(&file_process, &missing).await.unwrap());
+        assert!(
+            !remove_file_if_exists_async(&file_process, &missing)
+                .await
+                .unwrap()
+        );
+        assert!(
+            remove_file_if_exists_async(&file_process, &text)
+                .await
+                .unwrap()
+        );
+
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn supervised_utf8_read_preserves_invalid_data_error_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("invalid");
+        std::fs::write(&path, [0xff]).unwrap();
+        let (supervisor, file_process) = executor();
+
+        let error = read_utf8_async(&file_process, path).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+    }
 }

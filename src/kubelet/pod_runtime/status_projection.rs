@@ -43,6 +43,7 @@ pub(crate) async fn reconcile_container_statuses_from_pod_spec(
     key: &PodRuntimeKey,
     pod: &serde_json::Value,
     observed: &[(String, ContainerRuntimeState)],
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> (String, Vec<serde_json::Value>) {
     let spec_containers = pod
         .pointer("/spec/containers")
@@ -178,8 +179,12 @@ pub(crate) async fn reconcile_container_statuses_from_pod_spec(
         }
     }
 
-    let container_statuses =
-        build_reconciled_container_statuses(&spec_containers, &existing_statuses, &infos_by_name);
+    let container_statuses = build_reconciled_container_statuses(
+        &spec_containers,
+        &existing_statuses,
+        &infos_by_name,
+        operation_now,
+    );
     let phase = compute_reconciled_phase(&spec_containers, &infos_by_name, pod);
     (phase, container_statuses)
 }
@@ -202,6 +207,7 @@ fn build_reconciled_container_statuses(
     spec_containers: &[serde_json::Value],
     existing_statuses: &[serde_json::Value],
     infos_by_name: &std::collections::HashMap<String, ReconcileContainerInfo>,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<serde_json::Value> {
     spec_containers
         .iter()
@@ -230,13 +236,17 @@ fn build_reconciled_container_statuses(
             let state_obj = match info {
                 Some(info) if info.state == ContainerRuntimeState::Running => {
                     let started_at = if info.started_at > 0 {
-                        cri_timestamp_from_ns(info.started_at)
+                        cri_timestamp_from_ns(info.started_at, operation_now)
                     } else {
                         existing
                             .and_then(|status| status.pointer("/state/running/startedAt"))
                             .and_then(|value| value.as_str())
                             .map(ToString::to_string)
-                            .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
+                            .unwrap_or_else(|| {
+                                klights_cluster_core::k8s_time::format_legacy_timestamp(
+                                    operation_now,
+                                )
+                            })
                     };
                     serde_json::json!({ "running": { "startedAt": started_at } })
                 }
@@ -244,8 +254,8 @@ fn build_reconciled_container_statuses(
                     let mut terminated = serde_json::json!({
                         "exitCode": info.exit_code,
                         "reason": if info.exit_code == 0 { "Completed" } else { "Error" },
-                        "startedAt": cri_timestamp_from_ns(info.started_at),
-                        "finishedAt": cri_timestamp_from_ns(info.finished_at),
+                        "startedAt": cri_timestamp_from_ns(info.started_at, operation_now),
+                        "finishedAt": cri_timestamp_from_ns(info.finished_at, operation_now),
                     });
                     if !info.termination_message.is_empty() {
                         terminated["message"] = serde_json::json!(info.termination_message.clone());
@@ -559,6 +569,8 @@ mod tests {
             &spec_containers,
             &existing_statuses,
             &infos_by_name,
+            chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("fixed status projection test timestamp"),
         );
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].get("ready"), Some(&serde_json::json!(false)));

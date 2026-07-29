@@ -609,7 +609,7 @@ impl NetworkCleanup {
     async fn cleanup_cni_netns(&self, netns_name: &str) {
         let netns_path = netns_runtime_path(netns_name);
         if !matches!(
-            crate::runtime_fs::exists_async(&self.file_process, &netns_path).await,
+            klights_supervisor::runtime_fs::exists_async(&self.file_process, &netns_path).await,
             Ok(true)
         ) {
             return;

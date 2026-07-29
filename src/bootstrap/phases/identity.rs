@@ -145,15 +145,13 @@ async fn resolve_csr_via_rpc(
     let credential_store =
         crate::bootstrap::credential_store::SupervisedBootstrapCredentialStore::new(
             cfg.supervisor.clone(),
+            &cfg.etc_dir,
         );
     let server_cert_path = pending.etc_dir.join("server.crt");
 
     if !response.ca_cert_pem.is_empty() {
         credential_store
-            .install_ca_certificate(
-                &cfg.config.containerd_namespace,
-                response.ca_cert_pem.into_bytes(),
-            )
+            .install_ca_certificate(response.ca_cert_pem.into_bytes())
             .await
             .context("failed to write ca.crt from CSR response")?;
     }
@@ -171,7 +169,7 @@ async fn resolve_csr_via_rpc(
         )
         .context("failed to decrypt ca.key from CSR response")?;
         credential_store
-            .install_ca_key(&cfg.config.containerd_namespace, ca_key_bytes)
+            .install_ca_key(ca_key_bytes)
             .await
             .context("failed to write ca.key from CSR response")?;
     }
@@ -357,8 +355,8 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
             ca_cert_path.display().to_string(),
             move || -> Result<(String, String)> {
                 Ok((
-                    crate::runtime_fs::read_utf8(&ca_cert_path_for_task)?,
-                    crate::runtime_fs::read_utf8(&ca_key_path_for_task)?,
+                    klights_supervisor::runtime_fs::read_utf8(&ca_cert_path_for_task)?,
+                    klights_supervisor::runtime_fs::read_utf8(&ca_key_path_for_task)?,
                 ))
             },
         )
@@ -448,9 +446,8 @@ pub async fn setup_worker(cfg: &ConfigPhase, node_ip: &str) -> Result<IdentityPh
 mod tests {
     use super::*;
     use crate::bootstrap::NodeRole;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct EnvVarGuard {
         name: &'static str,
@@ -520,9 +517,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn csr_signing_ca_cert_path_prefers_leader_ca_for_controlplane_join() {
-        let _lock = ENV_LOCK.lock().unwrap();
+    #[tokio::test]
+    async fn csr_signing_ca_cert_path_prefers_leader_ca_for_controlplane_join() {
+        let _lock = ENV_LOCK.lock().await;
         let _leader_ca = EnvVarGuard::set("KLIGHTS_LEADER_CA_CERT", "/tmp/seed-ca.crt");
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = "joiner-local-ca".to_string();
@@ -646,8 +643,13 @@ mod tests {
 
     #[tokio::test]
     async fn controlplane_token_join_persists_node_client_cert_from_leader_ca() {
+        let _lock = ENV_LOCK.lock().await;
         let leader_namespace = format!("cp-leader-ca-{}", uuid::Uuid::new_v4());
         let joiner_namespace = format!("cp-join-node-cert-{}", uuid::Uuid::new_v4());
+        let leader_fixture = crate::paths::test_data_root_fixture(&leader_namespace);
+        let joiner_fixture = crate::paths::test_data_root_fixture(&joiner_namespace);
+        let leader_data_root = leader_fixture.path().to_path_buf();
+        let joiner_data_root = joiner_fixture.path().to_path_buf();
         let db: crate::datastore::DatastoreHandle =
             std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
@@ -659,13 +661,22 @@ mod tests {
                 .unwrap();
 
         let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) = crate::auth::generate_ca_full().unwrap();
+        let (server_cert_pem, server_key_pem) =
+            crate::auth::generate_server_cert(&ca_cert, &ca_key).unwrap();
         drop((ca_cert, ca_key));
-        let leader_ca_cert_path = crate::paths::ca_cert_path(&leader_namespace);
-        let leader_etc_dir = leader_ca_cert_path.parent().unwrap().to_path_buf();
-        let leader_data_root = leader_etc_dir.parent().unwrap().to_path_buf();
+        let leader_etc_dir = leader_data_root.join("etc");
+        let leader_ca_cert_path = leader_etc_dir.join("ca.crt");
         std::fs::create_dir_all(&leader_etc_dir).unwrap();
         std::fs::write(&leader_ca_cert_path, ca_cert_pem).unwrap();
         std::fs::write(leader_etc_dir.join("ca.key"), ca_key_pem).unwrap();
+        std::fs::write(leader_etc_dir.join("server.crt"), server_cert_pem).unwrap();
+        std::fs::write(leader_etc_dir.join("server.key"), server_key_pem).unwrap();
+        let _leader_ca = EnvVarGuard::set(
+            "KLIGHTS_LEADER_CA_CERT",
+            leader_ca_cert_path
+                .to_str()
+                .expect("leader CA fixture path must be valid UTF-8"),
+        );
         let leader_service_account_signing_key = test_service_account_signing_key();
         std::fs::write(
             leader_etc_dir.join("service-account-signing.key"),
@@ -688,7 +699,9 @@ mod tests {
             None,
             None,
             None,
-            &leader_namespace,
+            leader_data_root
+                .to_str()
+                .expect("leader fixture root must be valid UTF-8"),
             None,
             None,
             None,
@@ -696,46 +709,48 @@ mod tests {
             None,
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = format!("https://localhost:{}", addr.port());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server_supervisor = leader_supervisor.clone();
+        let server_data_root = leader_data_root.clone();
         let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            crate::bootstrap::init::tls::serve_https(
+                app,
+                &addr.to_string(),
+                &server_data_root,
+                server_supervisor,
+                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+                server_shutdown.cancelled_owned(),
+            )
+            .await
         });
+        let listener_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < listener_deadline,
+                "control-plane CSR TLS fixture did not start on {addr}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let mut config = crate::KlightsConfig::test_default();
         config.containerd_namespace = joiner_namespace.clone();
+        config.data_root = joiner_data_root.clone();
         config.node_name = "mn-controlplane2".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
         config.external_endpoint = Some("10.99.0.14".to_string());
-        let config = std::sync::Arc::new(config);
-        let node_mode = crate::bootstrap::NodeMode::Root;
         let joiner_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let file_process = klights_supervisor::FileProcessExecutor::new(joiner_supervisor.clone());
-        let joiner_etc_dir = crate::paths::etc_dir_path(&joiner_namespace);
-        let joiner_data_root = joiner_etc_dir.parent().unwrap().to_path_buf();
-        let cfg = crate::bootstrap::phases::config::ConfigPhase {
-            config: config.clone(),
-            node_mode: node_mode.clone(),
-            supervisor: joiner_supervisor.clone(),
-            file_process: file_process.clone(),
-            grpc_transport_policy:
-                crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(
-                &crate::bootstrap::network_adapters::cleanup_config(&node_mode, &config).unwrap(),
-                file_process,
-            ),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            etc_dir: joiner_etc_dir.to_string_lossy().into_owned(),
-            containerd_state_dir: crate::paths::containerd_state_dir_path(&joiner_namespace)
-                .to_string_lossy()
-                .into_owned(),
-            runtime_paths: crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-                crate::paths::data_root_path(&joiner_namespace),
-            )
-            .unwrap(),
-        };
+        let cfg = test_config_phase(config, &joiner_data_root, joiner_supervisor.clone());
+        let joiner_etc_dir = joiner_data_root.join("etc");
 
         setup_leader(
             &cfg,
@@ -751,8 +766,8 @@ mod tests {
         .expect("controlplane token join should persist node client cert from leader CA");
 
         let store =
-            crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore::for_namespace(
-                &joiner_namespace,
+            crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore::new(
+                joiner_etc_dir.clone(),
                 "mn-controlplane2",
                 joiner_supervisor.clone(),
             );
@@ -772,15 +787,17 @@ mod tests {
                 .expect("joining controlplane must persist the leader ServiceAccount signing key");
         assert_eq!(joined_sa_signer, leader_service_account_signing_key);
 
-        handle.abort();
+        shutdown.cancel();
+        handle
+            .await
+            .expect("control-plane CSR TLS fixture task must join")
+            .expect("control-plane CSR TLS fixture must stop cleanly");
         let _ = joiner_supervisor
             .shutdown(std::time::Duration::from_secs(1))
             .await;
         let _ = leader_supervisor
             .shutdown(std::time::Duration::from_secs(1))
             .await;
-        let _ = std::fs::remove_dir_all(joiner_data_root);
-        let _ = std::fs::remove_dir_all(leader_data_root);
     }
 
     #[tokio::test]

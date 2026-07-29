@@ -223,16 +223,20 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         delivery_store,
     );
     let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
+    let outbox_wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock> =
+        std::sync::Arc::new(klights_supervisor::SystemWallClock);
     let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::compose(
         outbox_stores.clone(),
         outbox_codec.clone(),
         ob_notify.clone(),
+        outbox_wall_clock.clone(),
     ));
     crate::node_outbox::OutboxDispatcher::new(
         outbox_stores,
         outbox_codec,
         remote_api_client.clone(),
         ob_notify,
+        outbox_wall_clock,
     )
     // bug-grpc: pipelined dispatch — keep multiple worker→leader
     // `apply_outbox` round-trips in flight (one per Status channel-lane
@@ -400,6 +404,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             config.node_name.clone(),
             query_for_peer_watch.clone(),
             outbox.clone(),
+            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         ));
         let readiness_publisher =
             crate::node_subnet_controller_adapter::KubeletNodeReadinessPublisher::new(
@@ -512,6 +517,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                     ),
                 ),
             ),
+            wall_clock: std::sync::Arc::new(
+                crate::kubelet::pod_runtime::store::SystemRuntimeClock,
+            ),
             slot_admission: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
                     pod_slot_adapter.clone(),
@@ -523,6 +531,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 crate::bootstrap::kubelet_ports::WorkerPodEventSink::new(
                     outbox.clone(),
                     leader_ports.resource_query.clone(),
+                    std::sync::Arc::new(klights_supervisor::SystemWallClock),
                 ),
             ),
         },
@@ -628,7 +637,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                         watch_source,
                         lease_client,
                         std::sync::Arc::new(
-                            crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock,
+                            crate::bootstrap::kubelet_ports::SystemNodeHeartbeatClock::new(
+                                std::sync::Arc::new(klights_supervisor::SystemWallClock),
+                            ),
                         ),
                         cfc.node_name.clone(),
                         c,

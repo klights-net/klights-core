@@ -211,7 +211,10 @@ mod tests {
         .await
         .unwrap();
 
-        let task = applied_outbox_gc::AppliedOutboxGc::new(db.clone());
+        let task = applied_outbox_gc::AppliedOutboxGc::new(
+            db.clone(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        );
         task.run().await.unwrap();
 
         assert!(

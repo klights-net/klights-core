@@ -28,10 +28,9 @@ pub async fn load_tls_pem_files(
 
 async fn load_client_cert_verifier(
     task_supervisor: &klights_supervisor::TaskSupervisor,
-    containerd_namespace: &str,
+    ca_cert_path: &std::path::Path,
 ) -> anyhow::Result<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>> {
-    let ca_cert_path = crate::paths::ca_cert_path(containerd_namespace);
-    let ca_path_buf = ca_cert_path.clone();
+    let ca_path_buf = ca_cert_path.to_path_buf();
     let ca_key = ca_cert_path.display().to_string();
     let ca_pem = task_supervisor
         .run_blocking_file_keyed("tls_read_client_ca_pem", ca_key, move || {
@@ -135,7 +134,7 @@ pub(crate) async fn serve_https_connection(
 pub async fn serve_https<F>(
     app: axum::Router,
     addr: &str,
-    containerd_namespace: &str,
+    data_root: &std::path::Path,
     task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
     shutdown_signal: F,
@@ -147,8 +146,10 @@ where
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let server_cert_path = crate::paths::server_cert_path(containerd_namespace);
-    let server_key_path = crate::paths::server_key_path(containerd_namespace);
+    let etc_dir = data_root.join("etc");
+    let server_cert_path = etc_dir.join("server.crt");
+    let server_key_path = etc_dir.join("server.key");
+    let ca_cert_path = etc_dir.join("ca.crt");
     let (cert_pem, key_pem) = load_tls_pem_files(
         task_supervisor.as_ref(),
         &server_cert_path,
@@ -164,7 +165,7 @@ where
         .context("failed to parse TLS private key PEM")?
         .context("no private key found in TLS key file")?;
     let client_cert_verifier =
-        load_client_cert_verifier(task_supervisor.as_ref(), containerd_namespace).await?;
+        load_client_cert_verifier(task_supervisor.as_ref(), &ca_cert_path).await?;
 
     let mut server_config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])

@@ -154,16 +154,15 @@ pub(super) const APPLIED_OUTBOX_INSERT: &str = "INSERT OR IGNORE INTO applied_ou
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 pub(super) const APPLIED_OUTBOX_UPSERT_EXACT: &str = "INSERT INTO applied_outbox \
-     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp, reserved_rv) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) \
+     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
      ON CONFLICT(idempotency_key) DO UPDATE SET \
        subject_key = excluded.subject_key, \
        operation = excluded.operation, \
        first_seen_ms = excluded.first_seen_ms, \
        applied_rv = excluded.applied_rv, \
        result_proto = excluded.result_proto, \
-       status_stamp = excluded.status_stamp, \
-       reserved_rv = NULL";
+       status_stamp = excluded.status_stamp";
 
 /// Highest worker-observed status stamp already recorded for a Pod status
 /// subject. The leader compares an incoming status snapshot's stamp against

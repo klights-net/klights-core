@@ -15,11 +15,15 @@ pub const APPLIED_OUTBOX_GC_INTERVAL_SECS: u64 = 60 * 60;
 
 pub struct AppliedOutboxGc {
     db: DatastoreHandle,
+    wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl AppliedOutboxGc {
-    pub fn new(db: DatastoreHandle) -> Self {
-        Self { db }
+    pub fn new(
+        db: DatastoreHandle,
+        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
+    ) -> Self {
+        Self { db, wall_clock }
     }
 }
 
@@ -32,7 +36,10 @@ impl super::GcTask for AppliedOutboxGc {
     async fn run(&self) -> Result<()> {
         let removed = self
             .db
-            .gc_applied_outbox(now_ms(), APPLIED_OUTBOX_GC_TTL_MS)
+            .gc_applied_outbox(
+                wall_clock_epoch_ms(self.wall_clock.as_ref()),
+                APPLIED_OUTBOX_GC_TTL_MS,
+            )
             .await?;
         if removed > 0 {
             tracing::info!(
@@ -46,8 +53,9 @@ impl super::GcTask for AppliedOutboxGc {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
+fn wall_clock_epoch_ms(clock: &dyn klights_supervisor::WallClock) -> i64 {
+    clock
+        .now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()

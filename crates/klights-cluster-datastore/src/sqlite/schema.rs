@@ -1,5 +1,24 @@
 use rusqlite::OptionalExtension;
 
+const APPLIED_OUTBOX_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS applied_outbox (
+    idempotency_key TEXT PRIMARY KEY,
+    subject_key     TEXT NOT NULL,
+    operation       TEXT NOT NULL,
+    first_seen_ms   INTEGER NOT NULL,
+    applied_rv      INTEGER,
+    result_proto    BLOB NOT NULL,
+    status_stamp    INTEGER
+)";
+const APPLIED_OUTBOX_COLUMNS: [&str; 7] = [
+    "idempotency_key",
+    "subject_key",
+    "operation",
+    "first_seen_ms",
+    "applied_rv",
+    "result_proto",
+    "status_stamp",
+];
+
 /// Standalone function that initializes the schema on a raw connection.
 /// Used by the opener in `executor.rs::open_with_opts`.
 pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
@@ -232,29 +251,11 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
     // Applied outbox idempotency ledger. Leader-side outbox apply stores one
     // row in the same cluster datastore that owns the corresponding mutation,
     // so worker retries can replay a stable result without repeating effects.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS applied_outbox (
-            idempotency_key TEXT PRIMARY KEY,
-            subject_key     TEXT NOT NULL,
-            operation       TEXT NOT NULL,
-            first_seen_ms   INTEGER NOT NULL,
-            applied_rv      INTEGER,
-            result_proto    BLOB NOT NULL,
-            status_stamp    INTEGER,
-            reserved_rv     INTEGER
-        )",
-        [],
-    )?;
-    migrate_applied_outbox_reserved_rv(conn)?;
+    conn.execute(APPLIED_OUTBOX_TABLE_DDL, [])?;
+    migrate_applied_outbox_shape(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_applied_outbox_subject
          ON applied_outbox(subject_key, first_seen_ms)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_applied_outbox_pending_reserved
-         ON applied_outbox(subject_key, reserved_rv)
-         WHERE reserved_rv IS NOT NULL AND applied_rv IS NULL AND length(result_proto) = 0",
         [],
     )?;
 
@@ -449,26 +450,48 @@ fn migrate_watch_events_monotonic_id(conn: &mut rusqlite::Connection) -> rusqlit
     tx.commit()
 }
 
-fn migrate_applied_outbox_reserved_rv(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
-    let has_reserved_rv = {
+fn migrate_applied_outbox_shape(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let columns = {
         let mut stmt = conn.prepare("PRAGMA table_info(applied_outbox)")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let mut found = false;
-        for row in rows {
-            if row? == "reserved_rv" {
-                found = true;
-                break;
-            }
-        }
-        found
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    if !has_reserved_rv {
-        conn.execute(
-            "ALTER TABLE applied_outbox ADD COLUMN reserved_rv INTEGER",
-            [],
-        )?;
+    if columns == APPLIED_OUTBOX_COLUMNS {
+        return Ok(());
     }
-    Ok(())
+
+    let is_known_pre_cleanup_shape = columns.len() == APPLIED_OUTBOX_COLUMNS.len() + 1
+        && columns[..APPLIED_OUTBOX_COLUMNS.len()] == APPLIED_OUTBOX_COLUMNS;
+    let stored_fingerprint = conn
+        .query_row(
+            super::fingerprint::META_SELECT,
+            ["schema_fingerprint"],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if !is_known_pre_cleanup_shape
+        || stored_fingerprint.as_deref() != Some(super::fingerprint::PRE_CLEANUP_SCHEMA_FINGERPRINT)
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute(
+        "ALTER TABLE applied_outbox RENAME TO applied_outbox_pre_cleanup",
+        [],
+    )?;
+    tx.execute(APPLIED_OUTBOX_TABLE_DDL, [])?;
+    tx.execute(
+        "INSERT INTO applied_outbox
+         (idempotency_key, subject_key, operation, first_seen_ms,
+          applied_rv, result_proto, status_stamp)
+         SELECT idempotency_key, subject_key, operation, first_seen_ms,
+                applied_rv, result_proto, status_stamp
+         FROM applied_outbox_pre_cleanup",
+        [],
+    )?;
+    tx.execute("DROP TABLE applied_outbox_pre_cleanup", [])?;
+    tx.commit()
 }
 
 fn migrate_watch_replay_floor_event_id(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
@@ -592,6 +615,111 @@ mod tests {
             .expect("query table_info")
             .collect::<rusqlite::Result<Vec<_>>>()
             .expect("collect columns")
+    }
+
+    #[test]
+    fn fresh_applied_outbox_schema_has_only_live_ledger_columns() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        init_schema_in_conn(&mut conn).expect("init schema");
+
+        assert_eq!(
+            table_columns(&conn, "applied_outbox"),
+            [
+                "idempotency_key",
+                "subject_key",
+                "operation",
+                "first_seen_ms",
+                "applied_rv",
+                "result_proto",
+                "status_stamp",
+            ]
+        );
+        assert!(!index_exists(&conn, "idx_applied_outbox_pending_reserved"));
+    }
+
+    #[test]
+    fn upgrades_legacy_applied_outbox_shape_without_losing_ledger_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE applied_outbox (
+                idempotency_key TEXT PRIMARY KEY,
+                subject_key     TEXT NOT NULL,
+                operation       TEXT NOT NULL,
+                first_seen_ms   INTEGER NOT NULL,
+                applied_rv      INTEGER,
+                result_proto    BLOB NOT NULL,
+                status_stamp    INTEGER,
+                reserved_rv     INTEGER
+            );
+            CREATE INDEX idx_applied_outbox_pending_reserved
+                ON applied_outbox(subject_key, reserved_rv)
+                WHERE reserved_rv IS NOT NULL
+                  AND applied_rv IS NULL
+                  AND length(result_proto) = 0;
+            CREATE TABLE _klights_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _klights_meta (key, value)
+            VALUES (
+                'schema_fingerprint',
+                '6f2e17e98d6f0ccd51ba998d0d91b465a75a603d5d8567fb678471dfc9de9d49'
+            );
+            INSERT INTO applied_outbox
+                (idempotency_key, subject_key, operation, first_seen_ms,
+                 applied_rv, result_proto, status_stamp, reserved_rv)
+            VALUES
+                ('request-1', 'v1/Pod/default/web/uid-1', 'PodStatus', 17,
+                 23, x'010203', 29, 31);",
+        )
+        .expect("seed legacy applied_outbox schema");
+
+        init_schema_in_conn(&mut conn).expect("upgrade schema");
+
+        assert_eq!(
+            table_columns(&conn, "applied_outbox"),
+            [
+                "idempotency_key",
+                "subject_key",
+                "operation",
+                "first_seen_ms",
+                "applied_rv",
+                "result_proto",
+                "status_stamp",
+            ]
+        );
+        assert!(!index_exists(&conn, "idx_applied_outbox_pending_reserved"));
+        let row = conn
+            .query_row(
+                "SELECT idempotency_key, subject_key, operation, first_seen_ms,
+                        applied_rv, result_proto, status_stamp
+                 FROM applied_outbox",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .expect("read upgraded ledger row");
+        assert_eq!(
+            row,
+            (
+                "request-1".to_string(),
+                "v1/Pod/default/web/uid-1".to_string(),
+                "PodStatus".to_string(),
+                17,
+                Some(23),
+                vec![1, 2, 3],
+                Some(29),
+            )
+        );
     }
 
     #[test]

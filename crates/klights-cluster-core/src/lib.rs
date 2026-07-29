@@ -22,8 +22,8 @@ pub use apply::{
 pub use command::{
     COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta,
     DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_NODE_LEASE_DURATION_SECONDS,
-    LeaseRenewCommandError, StorageCommand, StorageResponse, supports_command_codec_version,
-    validate_lease_renew_command,
+    LeaseRenewCommandError, StorageCommand, StorageCommandRejectionCode, StorageMutationError,
+    StorageResponse, supports_command_codec_version, validate_lease_renew_command,
 };
 pub use log_apply::{
     ClusterMetaMutation, ClusterMutation, CommittedApplyOutcome, CommittedApplyRejection,

@@ -517,6 +517,7 @@ async fn apply_resource_batch_command_builds_one_commit_with_two_puts() {
                 "ServiceEndpointReconcile",
                 "test-node",
                 None,
+                chrono::DateTime::UNIX_EPOCH,
             )?;
             assert!(rv > 0);
             assert_eq!(commit.resource_version(), 0);
@@ -579,6 +580,7 @@ async fn apply_resource_batch_update_requires_resource_version_precondition() {
                 "ServiceEndpointReconcile",
                 "test-node",
                 None,
+                chrono::DateTime::UNIX_EPOCH,
             );
             tx.rollback()?;
             result.map(|_| ())
@@ -713,6 +715,7 @@ async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
                 "PodTermination",
                 "leader",
                 None,
+                chrono::DateTime::UNIX_EPOCH,
             )?;
             tx.commit()?;
             Ok(commit)
@@ -1051,7 +1054,7 @@ async fn stale_raft_pv_bind_is_rejected_and_preserves_concurrent_user_labels() {
         "uid": "pvc-label-race-uid"
     });
     stale_bind["status"] = json!({"phase": "Bound"});
-    let committed = crate::replication::log_apply_wire::test_live_commit(
+    let committed = crate::datastore::test_support::test_live_commit(
         created.resource_version + 2,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -1833,7 +1836,7 @@ async fn stale_status_only_apply_rejects_incoming_nonterminal_job_condition_valu
         .await
         .unwrap();
 
-    let committed_status = crate::replication::log_apply_wire::test_live_commit(
+    let committed_status = crate::datastore::test_support::test_live_commit(
         0,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -2544,7 +2547,7 @@ async fn stale_status_only_committed_pvc_apply_is_rejected_without_losing_live_c
         .await
         .unwrap();
 
-    let committed_status = crate::replication::log_apply_wire::test_live_commit(
+    let committed_status = crate::datastore::test_support::test_live_commit(
         created.resource_version + 2,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -2667,7 +2670,7 @@ async fn stale_status_only_apply_rejects_and_preserves_newer_pv_and_pvc_conditio
             .await
             .unwrap();
 
-        let committed_status = crate::replication::log_apply_wire::test_live_commit(
+        let committed_status = crate::datastore::test_support::test_live_commit(
             0,
             vec![klights_cluster_core::LogApplyMutation::PutResource(
                 klights_cluster_core::LogApplyResourceRow {
@@ -3348,7 +3351,7 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
         {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"},
         {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"}
     ]);
-    let commit = crate::replication::log_apply_wire::test_live_commit(
+    let commit = crate::datastore::test_support::test_live_commit(
         committed_rv,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -3438,7 +3441,7 @@ async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes()
         },
         "data": {"hello": "derived"},
     });
-    let commit = crate::replication::log_apply_wire::test_live_commit(
+    let commit = crate::datastore::test_support::test_live_commit(
         41,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -3684,6 +3687,7 @@ async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_le
                 "ServiceTest",
                 "test-node",
                 None,
+                chrono::DateTime::UNIX_EPOCH,
             )?;
             tx.commit()?;
             Ok(commit)
@@ -3847,7 +3851,7 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
     );
     assert_eq!(
         rejected.rejection_code,
-        Some(crate::datastore::raft::types::StorageCommandRejectionCode::AlreadyExists)
+        Some(klights_cluster_core::StorageCommandRejectionCode::AlreadyExists)
     );
 
     let retry = db
@@ -3895,7 +3899,7 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
     .unwrap();
     let before_rv = db.get_current_resource_version().await.unwrap();
 
-    let commit = crate::replication::log_apply_wire::test_live_commit(
+    let commit = crate::datastore::test_support::test_live_commit(
         0,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {
@@ -3938,7 +3942,7 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
     );
     assert_eq!(
         rejected.rejection_code,
-        Some(crate::datastore::raft::types::StorageCommandRejectionCode::AlreadyExists)
+        Some(klights_cluster_core::StorageCommandRejectionCode::AlreadyExists)
     );
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
@@ -3998,7 +4002,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let initial_put = crate::replication::log_apply_wire::test_live_commit(
+    let initial_put = crate::datastore::test_support::test_live_commit(
         1,
         vec![
             klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
@@ -4063,7 +4067,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         "initial put rows must match expected snapshot"
     );
 
-    let delete = crate::replication::log_apply_wire::test_live_commit(
+    let delete = crate::datastore::test_support::test_live_commit(
         2,
         vec![
             klights_cluster_core::LogApplyMutation::DeleteAppliedOutbox {
@@ -4091,7 +4095,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
     );
     assert_eq!(leader_rows, after_delete_expected);
 
-    let follow_up_put = crate::replication::log_apply_wire::test_live_commit(
+    let follow_up_put = crate::datastore::test_support::test_live_commit(
         3,
         vec![klights_cluster_core::LogApplyMutation::PutAppliedOutbox(
             klights_cluster_core::LogApplyAppliedOutboxRow {
@@ -4114,7 +4118,7 @@ async fn raft_applied_outbox_replay_is_deterministic() {
         .await
         .unwrap();
 
-    let gc = crate::replication::log_apply_wire::test_live_commit(
+    let gc = crate::datastore::test_support::test_live_commit(
         4,
         vec![klights_cluster_core::LogApplyMutation::GcAppliedOutbox {
             cutoff_ms: 10_000,
@@ -4289,7 +4293,7 @@ async fn pod_cleanup_intents_schema_is_cluster_uid_and_reason_bound() {
 #[tokio::test]
 async fn log_apply_replays_pod_cleanup_intents() {
     let db = Datastore::new_in_memory().await.unwrap();
-    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
+    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
         7,
         vec![klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
             klights_cluster_core::LogApplyPodCleanupIntentRow {
@@ -4324,7 +4328,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
     assert_eq!(rows[0].pod_uid, "lost-uid");
     assert_eq!(rows[0].reason, "NodeLost");
 
-    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
+    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
         8,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntent(
@@ -4349,7 +4353,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
     );
 
     for pod_name in ["lost-pod-a", "lost-pod-b"] {
-        db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
+        db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
             9,
             vec![klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
                 klights_cluster_core::LogApplyPodCleanupIntentRow {
@@ -4385,7 +4389,7 @@ async fn log_apply_replays_pod_cleanup_intents() {
         2
     );
 
-    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
+    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
         10,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntentsForNode {
@@ -4984,13 +4988,12 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
         );
 
         let key = idempotency_key.clone();
-        let (placeholder_count, reserved_rv) = db
+        let placeholder_count = db
             .db_call("test_watermarked_finalize_placeholder", move |conn| {
                 Ok(conn.query_row(
-                    "SELECT COUNT(*), MAX(reserved_rv) FROM applied_outbox \
-                     WHERE idempotency_key = ?1",
+                    "SELECT COUNT(*) FROM applied_outbox WHERE idempotency_key = ?1",
                     [key],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    |row| row.get::<_, i64>(0),
                 )?)
             })
             .await
@@ -4998,7 +5001,6 @@ async fn watermarked_actor_finalize_bound_pod_covers_eligibility() {
 
         assert!(applied_rv > 0);
         assert_eq!(placeholder_count, 0);
-        assert_eq!(reserved_rv, None);
 
         db.apply_raft_log_apply_commit(commit).await.unwrap();
         let live = db
@@ -5142,7 +5144,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     }))
     .unwrap();
 
-    let initial_put = crate::replication::log_apply_wire::test_live_commit(
+    let initial_put = crate::datastore::test_support::test_live_commit(
         11,
         vec![
             klights_cluster_core::LogApplyMutation::PutPodCleanupIntent(
@@ -5228,7 +5230,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, expected_after_put);
 
-    let delete = crate::replication::log_apply_wire::test_live_commit(
+    let delete = crate::datastore::test_support::test_live_commit(
         12,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntent(
@@ -5273,7 +5275,7 @@ async fn raft_pod_cleanup_intent_replay_is_deterministic() {
     assert_eq!(leader_rows, follower_rows);
     assert_eq!(leader_rows, after_delete_expected);
 
-    let delete_node = crate::replication::log_apply_wire::test_live_commit(
+    let delete_node = crate::datastore::test_support::test_live_commit(
         13,
         vec![
             klights_cluster_core::LogApplyMutation::DeletePodCleanupIntentsForNode {
@@ -5309,7 +5311,7 @@ async fn raft_cluster_meta_replay_is_deterministic() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
 
-    let commit = crate::replication::log_apply_wire::test_live_commit(
+    let commit = crate::datastore::test_support::test_live_commit(
         1,
         vec![
             klights_cluster_core::LogApplyMutation::PutKlightsMeta {
@@ -5975,7 +5977,7 @@ async fn test_datastore_backend_advance_rv_via_trait_returns_at_least_min_rv() {
     assert!(advanced > target);
 }
 
-async fn build_reserved_rv_commit(
+async fn build_candidate_rv_commit(
     db: &Datastore,
     idempotency_key: &str,
 ) -> (klights_cluster_core::LogApplyCommit, i64) {
@@ -6009,7 +6011,7 @@ async fn build_reserved_rv_commit(
 async fn rejected_materialized_commit_does_not_reserve_resource_version_or_ledger_row() {
     let db = Datastore::new_in_memory().await.unwrap();
     let before = db.get_current_resource_version().await.unwrap();
-    let (_commit, candidate_rv) = build_reserved_rv_commit(&db, "rejected-rv-1").await;
+    let (_commit, candidate_rv) = build_candidate_rv_commit(&db, "rejected-rv-1").await;
 
     assert_eq!(
         db.get_current_resource_version().await.unwrap(),
@@ -6034,8 +6036,8 @@ async fn rejected_materialized_commit_does_not_reserve_resource_version_or_ledge
 async fn multiple_materialized_commits_do_not_advance_public_resource_version() {
     let db = Datastore::new_in_memory().await.unwrap();
     let before = db.get_current_resource_version().await.unwrap();
-    let (_first_commit, first_rv) = build_reserved_rv_commit(&db, "rejected-rv-first").await;
-    let (_second_commit, second_rv) = build_reserved_rv_commit(&db, "rejected-rv-second").await;
+    let (_first_commit, first_rv) = build_candidate_rv_commit(&db, "rejected-rv-first").await;
+    let (_second_commit, second_rv) = build_candidate_rv_commit(&db, "rejected-rv-second").await;
 
     assert_eq!(first_rv, before + 1);
     assert_eq!(second_rv, before + 1);
@@ -6232,6 +6234,7 @@ async fn raft_allocate_node_subnet_resolves_lowest_free_24_at_apply_time() {
                         "ClusterMaintenance",
                         "mn-controlplane1",
                         None,
+                        chrono::DateTime::UNIX_EPOCH,
                     )?;
                     assert!(
                         commit.resource_version() == 0,
@@ -8585,7 +8588,7 @@ async fn apply_resource_batch_no_partial_visibility_on_failure() {
 /// the batch resources' rv. No extra rv must have been allocated between a
 /// separate "build" and "apply" step.
 #[tokio::test]
-async fn apply_resource_batch_reserved_rv_not_observable_before_apply() {
+async fn apply_resource_batch_candidate_rv_not_observable_before_apply() {
     let db = Datastore::new_in_memory().await.unwrap();
     let rv_before = db.get_current_resource_version().await.unwrap();
     db.apply_resource_batch(vec![
@@ -8660,7 +8663,7 @@ async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit()
 }
 
 /// Fence for atomic build+apply: if the *apply* phase of a batch fails after the
-/// build phase already succeeded, the reserved resourceVersion must be rolled
+/// build phase already succeeded, the candidate resourceVersion must be rolled
 /// back and no rows from the batch may be visible.
 ///
 /// This is the decisive regression guard. The seam is a two-operation batch on
@@ -8672,13 +8675,13 @@ async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit()
 ///      equals the original), but FAILS at apply time because operation (1) has
 ///      already advanced the row's rv past the precondition.
 ///
-/// Under the OLD two-step shape (build commits the reserved rv in one DB call,
+/// Under the OLD two-step shape (build commits the candidate rv in one DB call,
 /// then apply runs in a second step), the build commit would leak the advanced
 /// metadata resourceVersion while the apply step rolls back, leaving rv > before
 /// with no rows changed. Under the current single-IMMEDIATE-transaction shape,
 /// the apply failure rolls back the whole transaction, so the rv is unchanged.
 #[tokio::test]
-async fn apply_resource_batch_rolls_back_reserved_rv_on_apply_failure() {
+async fn apply_resource_batch_rolls_back_candidate_rv_on_apply_failure() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(
         "v1",
@@ -8734,11 +8737,11 @@ async fn apply_resource_batch_rolls_back_reserved_rv_on_apply_failure() {
         "batch must fail at apply time (op 2 rv precondition no longer holds)"
     );
 
-    // The reserved rv must be rolled back: metadata rv unchanged.
+    // The candidate rv must be rolled back: metadata rv unchanged.
     let rv_after = db.get_current_resource_version().await.unwrap();
     assert_eq!(
         rv_before, rv_after,
-        "apply failure must roll back the reserved rv; before={rv_before} after={rv_after}"
+        "apply failure must roll back the candidate rv; before={rv_before} after={rv_after}"
     );
 
     // No batch effect may be visible: the row must be unchanged (still present,

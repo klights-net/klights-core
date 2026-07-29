@@ -127,7 +127,10 @@ pub(super) fn ensure_metadata_uid(data: &mut Value) -> String {
     generated
 }
 
-pub(super) fn ensure_metadata_create_defaults(data: &mut Value) {
+pub(super) fn ensure_metadata_create_defaults(
+    data: &mut Value,
+    authored_at: chrono::DateTime<chrono::Utc>,
+) {
     let Some(obj) = data.as_object_mut() else {
         return;
     };
@@ -154,7 +157,7 @@ pub(super) fn ensure_metadata_create_defaults(data: &mut Value) {
     {
         meta_obj.insert(
             "creationTimestamp".to_string(),
-            serde_json::Value::String(crate::k8s_time::now_time()),
+            serde_json::Value::String(klights_cluster_core::k8s_time::format_time(authored_at)),
         );
     }
 

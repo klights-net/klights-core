@@ -404,7 +404,9 @@ mod tests {
     #[tokio::test]
     #[ignore] // Only run with: cargo test -- --ignored
     async fn test_cri_connect() {
-        let sock = crate::paths::test_data_root_path("klights")
+        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+            .data_root()
+            .to_path_buf()
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
@@ -427,7 +429,9 @@ mod tests {
         // Verify that subscribe_container_events returns a valid stream.
         // The stream blocks until a container event occurs, so we just verify
         // the subscription succeeds (stream is established).
-        let sock = crate::paths::test_data_root_path("klights")
+        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+            .data_root()
+            .to_path_buf()
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
@@ -451,7 +455,9 @@ mod tests {
             return;
         }
 
-        let sock = crate::paths::test_data_root_path("klights")
+        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+            .data_root()
+            .to_path_buf()
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();
@@ -482,7 +488,9 @@ mod tests {
         // This test verifies that CRI Exec() returns an ExecResponse with a streaming URL
         // The URL format should be: http://localhost:PORT/exec/TOKEN
 
-        let sock = crate::paths::test_data_root_path("klights")
+        let sock = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+            .data_root()
+            .to_path_buf()
             .join("containerd.sock")
             .to_string_lossy()
             .into_owned();

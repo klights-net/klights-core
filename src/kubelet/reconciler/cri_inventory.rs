@@ -264,7 +264,8 @@ pub async fn sweep_orphan_pod_artifacts(
             continue;
         }
         if let Err(e) =
-            crate::runtime_fs::remove_dir_all_if_exists_async(file_process, &pod_root).await
+            klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(file_process, &pod_root)
+                .await
         {
             tracing::warn!(dir = %dir_id, "orphan pod artifact sweep: remove failed, skipping: {e:#}");
             continue;

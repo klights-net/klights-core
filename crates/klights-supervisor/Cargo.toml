@@ -14,6 +14,7 @@ sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 rusqlite = "0.32"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = ">=1.51.0, <1.52.0", default-features = false, features = ["io-util", "macros", "process", "rt", "sync", "time"] }

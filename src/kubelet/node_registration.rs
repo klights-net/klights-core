@@ -1,4 +1,3 @@
-use crate::k8s_time::now_time as k8s_time_now;
 use crate::kubelet::node;
 use crate::kubelet::node_config::{KubeletNodeRole, NodeRegistrationProfile};
 use crate::kubelet::outbox::OutboxOperation;
@@ -84,7 +83,7 @@ impl NodeRegistrationHostFacts {
     ) -> Self {
         let (host_info, memory_info) = tokio::join!(
             host_node_info(file_process),
-            crate::runtime_fs::read_utf8_async(file_process, "/proc/meminfo")
+            klights_supervisor::runtime_fs::read_utf8_async(file_process, "/proc/meminfo")
         );
         let memory_ki = memory_info
             .ok()
@@ -286,13 +285,13 @@ struct HostNodeInfo {
 }
 
 async fn host_node_info(file_process: &klights_supervisor::FileProcessExecutor) -> HostNodeInfo {
-    let os_image = crate::runtime_fs::read_utf8_async(file_process, "/etc/os-release")
+    let os_image = klights_supervisor::runtime_fs::read_utf8_async(file_process, "/etc/os-release")
         .await
         .ok()
         .and_then(|content| os_release_pretty_name(&content))
         .unwrap_or_else(|| "Linux".to_string());
     let kernel_version =
-        crate::runtime_fs::read_utf8_async(file_process, "/proc/sys/kernel/osrelease")
+        klights_supervisor::runtime_fs::read_utf8_async(file_process, "/proc/sys/kernel/osrelease")
             .await
             .ok()
             .map(|content| content.trim().to_string())
@@ -455,6 +454,7 @@ pub(crate) async fn register_node_snapshot(
     outbox: Option<&Outbox>,
     dataplane_health: Option<&klights_network_api::DataplaneHealthSnapshot>,
     snapshot: &NodeRegistrationSnapshot,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     use klights_network_api::{
         GIT_COMMIT_ANNOTATION, GRPC_PORT_ANNOTATION, HOSTPORT_RANGE_ANNOTATION,
@@ -466,6 +466,7 @@ pub(crate) async fn register_node_snapshot(
     tracing::info!("Registering node: {}", node_name);
     let host = &snapshot.host;
     let node_ip = snapshot.addresses.internal_ip();
+    let authored_at = klights_cluster_core::k8s_time::format_time(operation_now);
 
     let conditions = node::NodeNetworkConditions::from_health(dataplane_health);
     let node::NodeNetworkConditions {
@@ -496,7 +497,7 @@ pub(crate) async fn register_node_snapshot(
         "kind": "Node",
         "metadata": {
             "name": node_name,
-            "creationTimestamp": k8s_time_now(),
+            "creationTimestamp": &authored_at,
             "labels": {
                 "kubernetes.io/hostname": node_name,
                 "kubernetes.io/os": host.operating_system,
@@ -529,35 +530,35 @@ pub(crate) async fn register_node_snapshot(
                     "status": ready_status,
                     "reason": ready_reason,
                     "message": ready_message,
-                    "lastTransitionTime": k8s_time_now()
+                    "lastTransitionTime": &authored_at
                 },
                 {
                     "type": "MemoryPressure",
                     "status": "False",
                     "reason": "KubeletHasSufficientMemory",
                     "message": "kubelet has sufficient memory available",
-                    "lastTransitionTime": k8s_time_now()
+                    "lastTransitionTime": &authored_at
                 },
                 {
                     "type": "DiskPressure",
                     "status": "False",
                     "reason": "KubeletHasNoDiskPressure",
                     "message": "kubelet has no disk pressure",
-                    "lastTransitionTime": k8s_time_now()
+                    "lastTransitionTime": &authored_at
                 },
                 {
                     "type": "PIDPressure",
                     "status": "False",
                     "reason": "KubeletHasSufficientPID",
                     "message": "kubelet has sufficient PID available",
-                    "lastTransitionTime": k8s_time_now()
+                    "lastTransitionTime": &authored_at
                 },
                 {
                     "type": "NetworkUnavailable",
                     "status": net_unavail_status,
                     "reason": net_unavail_reason,
                     "message": net_unavail_message,
-                    "lastTransitionTime": k8s_time_now()
+                    "lastTransitionTime": &authored_at
                 }
             ],
             "addresses": addresses,
@@ -622,6 +623,7 @@ pub(crate) async fn register_node_snapshot(
                     expected_rv: existing.resource_version,
                     preconditions: ResourcePreconditions::from_resource(&existing),
                 },
+                operation_now.timestamp_millis(),
             )
             .await
             .context("Failed to send Node status refresh")?;
@@ -656,6 +658,7 @@ pub(crate) async fn register_node_snapshot(
             node_name,
             "",
             create_command,
+            operation_now.timestamp_millis(),
         )
         .await
         .context("Failed to send Node registration")?;

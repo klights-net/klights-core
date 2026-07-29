@@ -1,10 +1,11 @@
-//! Backend-neutral follower-to-authority API routing.
+//! Permanent Kubernetes API-server authority routing shell.
 //!
 //! In the klights HA model, all controlplanes bind TCP 7679 but only
-//! the raft leader serves K8s API requests directly. Follower
+//! the current authority serves K8s API requests directly. Follower
 //! controlplanes transparently reverse-proxy K8s API requests to the
-//! current leader. gRPC (raft transport) and health endpoints always go
-//! through locally.
+//! current authority. The transitional Kubernetes-native handler/state
+//! remains below this Axum/Reqwest shell and sees only `LeaderAuthority`.
+//! gRPC and health endpoints always go through locally.
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -88,11 +89,17 @@ impl HttpAuthorityRouter {
         builder.build().unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_local_authority(&self) -> bool {
         let klights_leader_api::AuthorityRoute::Local(permit) = self.authority.route() else {
             return false;
         };
         self.authority.validate(&permit).is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authority_capability(&self) -> Arc<dyn klights_leader_api::LeaderAuthority> {
+        self.authority.clone()
     }
 
     #[cfg(test)]
@@ -276,8 +283,8 @@ async fn read_proxy_client_identity_file(
 /// - `/healthz`, `/livez`, `/readyz` → always pass through
 /// - On leader → pass through to normal handlers
 /// - On follower → reverse-proxy to the leader
-pub(in crate::api) async fn leader_proxy_middleware(
-    State(state): State<Arc<crate::api::ApiState>>,
+async fn leader_proxy_middleware(
+    State(router): State<Arc<HttpAuthorityRouter>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -294,12 +301,6 @@ pub(in crate::api) async fn leader_proxy_middleware(
         return next.run(request).await;
     }
 
-    // Retrieve the proxy state from ApiState
-    let Some(router) = state.operational().authority_router.clone() else {
-        // No authority router configured — single-node or worker.
-        return next.run(request).await;
-    };
-
     match router.authority.route() {
         klights_leader_api::AuthorityRoute::Local(permit)
             if router.authority.validate(&permit).is_ok() =>
@@ -308,13 +309,42 @@ pub(in crate::api) async fn leader_proxy_middleware(
                 .await
         }
         klights_leader_api::AuthorityRoute::Forward { endpoint } => {
-            follower_handle(request, &router, &endpoint).await
+            follower_handle(request, router.as_ref(), &endpoint).await
         }
         klights_leader_api::AuthorityRoute::Local(_)
         | klights_leader_api::AuthorityRoute::Unavailable => {
             service_unavailable("no current cluster authority; retry when a leader is available")
         }
     }
+}
+
+/// Place the permanent authority/proxy shell around the native handler router.
+///
+/// Root composition calls this between the native service's inner policy
+/// layers and its outer authentication/response layers. That preserves the
+/// existing authentication-before-forwarding behavior without making native
+/// state own an Axum/Reqwest authority adapter.
+pub(crate) fn wrap_authority_router(
+    router: axum::Router,
+    authority_router: Option<Arc<HttpAuthorityRouter>>,
+) -> axum::Router {
+    match authority_router {
+        Some(authority_router) => router.layer(axum::middleware::from_fn_with_state(
+            authority_router,
+            leader_proxy_middleware,
+        )),
+        None => router,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn build_router_with_authority(
+    mut state: crate::api::ApiState,
+    authority_router: Arc<HttpAuthorityRouter>,
+) -> axum::Router {
+    state.operational_mut().authority = Some(authority_router.authority_capability());
+    let (router, outer_layers) = crate::api::build_router_parts(state);
+    outer_layers.finish(wrap_authority_router(router, Some(authority_router)))
 }
 
 /// Follower request handler: proxy to leader when available. If no current
@@ -648,9 +678,9 @@ mod tests {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (ca_cert, ca_key, ca_pem, _) = crate::auth::generate_ca_full().unwrap();
+        let (ca_cert, ca_key, ca_pem, _) = crate::auth::cert::generate_ca_full().unwrap();
         let (server_cert_pem, server_key_pem) =
-            crate::auth::generate_server_cert(&ca_cert, &ca_key).unwrap();
+            crate::auth::cert::generate_server_cert(&ca_cert, &ca_key).unwrap();
         let (proxy_cert_pem, proxy_key_pem) = crate::auth::generate_api_proxy_cert(
             &ca_cert,
             &ca_key,
@@ -731,9 +761,9 @@ mod tests {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (ca_cert, ca_key, ca_pem, _) = crate::auth::generate_ca_full().unwrap();
+        let (ca_cert, ca_key, ca_pem, _) = crate::auth::cert::generate_ca_full().unwrap();
         let (server_cert_pem, server_key_pem) =
-            crate::auth::generate_server_cert(&ca_cert, &ca_key).unwrap();
+            crate::auth::cert::generate_server_cert(&ca_cert, &ca_key).unwrap();
 
         let server_certs: Vec<rustls::pki_types::CertificateDer> =
             rustls_pemfile::certs(&mut server_cert_pem.as_bytes())

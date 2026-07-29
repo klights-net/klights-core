@@ -79,11 +79,7 @@ impl ActiveDeadlineEnforcer {
     }
 }
 
-pub(super) fn exceeded_active_deadline_seconds(pod: &Value) -> Option<i64> {
-    exceeded_active_deadline_seconds_at(pod, chrono::Utc::now().timestamp())
-}
-
-fn exceeded_active_deadline_seconds_at(pod: &Value, now: i64) -> Option<i64> {
+pub(super) fn exceeded_active_deadline_seconds_at(pod: &Value, now: i64) -> Option<i64> {
     let deadline_secs = pod
         .pointer("/spec/activeDeadlineSeconds")
         .and_then(|v| v.as_i64())?;

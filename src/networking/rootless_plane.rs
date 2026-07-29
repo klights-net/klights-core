@@ -526,6 +526,7 @@ mod tests {
 
     fn rootless_test_config(node_name: &str) -> KlightsConfig {
         let ns = "klights";
+        let data_root = std::env::temp_dir().join(format!("klights-rootless-plane-{node_name}"));
         KlightsConfig {
             bridge_name: ns.to_string(),
             pod_subnet: "10.42.0.0/16".to_string(),
@@ -544,15 +545,13 @@ mod tests {
             worker_dataplane_no_ingress: false,
             wireguard_device: crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
             wireguard_port: crate::networking::wireguard::DEFAULT_WIREGUARD_PORT,
-            cluster_db_path: crate::paths::test_data_root_path(ns)
+            cluster_db_path: data_root
+                .clone()
                 .join("db")
                 .join("sqlite")
                 .join("cluster.db"),
-            node_db_path: crate::paths::test_data_root_path(ns)
-                .join("db")
-                .join("sqlite")
-                .join("node.db"),
-            data_root: crate::paths::test_data_root_path(ns),
+            node_db_path: data_root.clone().join("db").join("sqlite").join("node.db"),
+            data_root,
             api_slow_log_threshold: std::time::Duration::from_millis(
                 crate::bootstrap::config::DEFAULT_API_SLOW_LOG_MS,
             ),

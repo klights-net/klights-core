@@ -5,20 +5,21 @@ use std::path::PathBuf;
 
 #[cfg(test)]
 pub fn volumes_root() -> String {
-    let runtime_ns = crate::paths::runtime_namespace();
+    let runtime_ns = test_runtime_namespace();
     volumes_root_for_namespace(&runtime_ns)
 }
 
 #[cfg(test)]
 pub fn volumes_root_for_namespace(runtime_ns: &str) -> String {
-    crate::paths::volumes_root_path(runtime_ns)
+    crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_ns)
+        .volumes_root()
         .to_string_lossy()
         .into_owned()
 }
 
 #[cfg(test)]
 pub fn empty_dir_volume_path(pod_name: &str, volume_name: &str) -> String {
-    let runtime_ns = crate::paths::runtime_namespace();
+    let runtime_ns = test_runtime_namespace();
     empty_dir_volume_path_for_namespace(&runtime_ns, pod_name, volume_name)
 }
 
@@ -208,8 +209,13 @@ pub fn create_empty_dir(
     medium: Option<&str>,
     size_limit: Option<&str>,
 ) -> Result<String> {
-    let runtime_ns = crate::paths::runtime_namespace();
+    let runtime_ns = test_runtime_namespace();
     create_empty_dir_for_namespace(&runtime_ns, pod_name, volume_name, medium, size_limit)
+}
+
+#[cfg(test)]
+fn test_runtime_namespace() -> String {
+    std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())
 }
 
 #[cfg(test)]
@@ -402,7 +408,7 @@ pub fn parse_mountinfo_entry(line: &str) -> Option<(&str, &str)> {
 }
 
 fn is_tmpfs_mounted_at_path(path: &str) -> bool {
-    let Ok(mountinfo) = crate::runtime_fs::read_utf8("/proc/self/mountinfo") else {
+    let Ok(mountinfo) = klights_supervisor::runtime_fs::read_utf8("/proc/self/mountinfo") else {
         return false;
     };
     mountinfo.lines().any(|line| {
@@ -475,7 +481,9 @@ pub async fn unmount_volume_mounts_under(
     root: &str,
 ) -> Result<()> {
     let mountinfo =
-        match crate::runtime_fs::read_utf8_async(file_process, "/proc/self/mountinfo").await {
+        match klights_supervisor::runtime_fs::read_utf8_async(file_process, "/proc/self/mountinfo")
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -486,7 +494,7 @@ pub async fn unmount_volume_mounts_under(
                 return Ok(());
             }
         };
-    let canonical_root = crate::runtime_fs::canonicalize_async(file_process, root)
+    let canonical_root = klights_supervisor::runtime_fs::canonicalize_async(file_process, root)
         .await
         .ok()
         .map(|path| path.to_string_lossy().to_string());
@@ -677,9 +685,12 @@ async fn cleanup_volumes_under(volumes_root: &std::path::Path, pod_name: &str) -
     // Best-effort unmount first to prevent recursive tmpfs stacking leaks
     // and remove_dir_all failures when mount points are still attached.
     unmount_volume_mounts_under(&file_process, &pod_volumes_path_string).await?;
-    crate::runtime_fs::remove_dir_all_if_exists_async(&file_process, &pod_volumes_path)
-        .await
-        .with_context(|| format!("Failed to remove volumes at {}", pod_volumes_path.display()))?;
+    klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(
+        &file_process,
+        &pod_volumes_path,
+    )
+    .await
+    .with_context(|| format!("Failed to remove volumes at {}", pod_volumes_path.display()))?;
     Ok(())
 }
 
@@ -692,7 +703,7 @@ mod tests {
     /// remove_dir_all that could block the runtime under load.
     #[tokio::test]
     async fn test_cleanup_volumes_removes_directory_async() {
-        let temp = crate::paths::test_data_root_fixture("cleanup-volumes");
+        let temp = tempfile::tempdir().expect("create kubelet test fixture");
         let volumes_root = temp.path().join("pods");
 
         // Build the directory tree cleanup_volumes expects:
@@ -729,7 +740,7 @@ mod tests {
     /// Idempotent: cleanup on a non-existent path returns Ok, not Err.
     #[tokio::test]
     async fn test_cleanup_volumes_missing_path_is_ok() {
-        let temp = crate::paths::test_data_root_fixture("cleanup-volumes-missing");
+        let temp = tempfile::tempdir().expect("create kubelet test fixture");
         let volumes_root = temp.path().join("pods");
 
         let result = cleanup_volumes_under(&volumes_root, "nonexistent_pod").await;
@@ -744,7 +755,10 @@ mod tests {
     fn test_collect_mount_targets_under_sorts_deepest_first_and_dedupes() {
         let root = format!(
             "{}/pods/default_pod/volumes",
-            crate::paths::test_data_root_path("klights").display()
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+                .data_root()
+                .to_path_buf()
+                .display()
         );
         let mountinfo = format!(
             "10 1 0:1 / {root}/empty-dir/restart-count rw - tmpfs tmpfs rw\n\
@@ -765,7 +779,10 @@ mod tests {
     fn test_collect_mount_targets_under_excludes_similar_prefixes() {
         let root = format!(
             "{}/pods/default_pod/volumes",
-            crate::paths::test_data_root_path("klights").display()
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+                .data_root()
+                .to_path_buf()
+                .display()
         );
         let mountinfo = format!(
             "20 1 0:1 / {root} rw - tmpfs tmpfs rw\n\

@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use klights_cluster_core::{OutboxApplyError, OutboxApplyOutcome, OutboxOperation, StorageCommand};
+use klights_cluster_core::{
+    OutboxApplyError, OutboxApplyOutcome, OutboxOperation, StorageCommand,
+    StorageCommandRejectionCode, StorageMutationError,
+};
 use klights_node_store::{RaftAppliedStateDurability, RaftLogDurability};
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{ChangeMembers, Config, Raft};
@@ -208,33 +211,16 @@ pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
 /// safe range 8..=32.
 pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 32;
 
-#[derive(Debug, thiserror::Error)]
-#[error("raft commit materialization failed: {message}")]
-pub(crate) struct RaftMaterializationError {
-    message: String,
-}
-
-impl RaftMaterializationError {
-    pub(crate) fn persistence(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
 #[async_trait]
 pub(crate) trait RaftCommitMaterializer: Send + Sync {
-    async fn read_raft_metadata(
-        &self,
-        key: &str,
-    ) -> Result<Option<String>, RaftMaterializationError>;
+    async fn read_raft_metadata(&self, key: &str) -> Result<Option<String>, StorageMutationError>;
 
     async fn build_command(
         &self,
         command: StorageCommand,
         operation: &str,
         authoring_node: &str,
-    ) -> std::result::Result<klights_cluster_core::LogApplyCommit, RaftMaterializationError>;
+    ) -> std::result::Result<klights_cluster_core::LogApplyCommit, StorageMutationError>;
 
     async fn build_outbox(
         &self,
@@ -260,23 +246,6 @@ impl RaftStorePorts {
             materializer,
             state_machine,
         }
-    }
-}
-
-pub(crate) trait IntoRaftStorePorts {
-    fn into_raft_store_ports(self) -> RaftStorePorts;
-}
-
-impl IntoRaftStorePorts for RaftStorePorts {
-    fn into_raft_store_ports(self) -> RaftStorePorts {
-        self
-    }
-}
-
-#[cfg(test)]
-impl IntoRaftStorePorts for Arc<dyn super::super::DatastoreBackend> {
-    fn into_raft_store_ports(self) -> RaftStorePorts {
-        super::super::cluster_store_adapter::raft_store_ports_for_test(self)
     }
 }
 
@@ -309,17 +278,14 @@ impl RaftNode {
     /// Single-voter convenience constructor that wires a StubRaftNetwork
     /// (no peer RPCs ever issued).
     #[cfg(test)]
-    pub(crate) async fn start<S>(
+    pub(crate) async fn start(
         node_id: NodeId,
         node_name: String,
-        stores: S,
+        stores: RaftStorePorts,
         log_durability: Arc<dyn RaftLogDurability>,
         applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
-    ) -> Result<Self>
-    where
-        S: IntoRaftStorePorts,
-    {
+    ) -> Result<Self> {
         Self::start_with_network(
             node_id,
             node_name,
@@ -335,10 +301,10 @@ impl RaftNode {
     /// General constructor that accepts a caller-supplied
     /// `RaftNetworkFactory`. Use for multi-voter clusters (Step 6) and
     /// for the gRPC production transport (later).
-    pub(crate) async fn start_with_network<N, S>(
+    pub(crate) async fn start_with_network<N>(
         node_id: NodeId,
         node_name: String,
-        stores: S,
+        stores: RaftStorePorts,
         log_durability: Arc<dyn RaftLogDurability>,
         applied_state_durability: Arc<dyn RaftAppliedStateDurability>,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
@@ -346,9 +312,7 @@ impl RaftNode {
     ) -> Result<Self>
     where
         N: RaftNetworkFactory<TypeConfig>,
-        S: IntoRaftStorePorts,
     {
-        let stores = stores.into_raft_store_ports();
         let storage_incarnation = log_durability
             .load_or_create_storage_incarnation()
             .await
@@ -1295,21 +1259,10 @@ impl super::proposal::RaftProposal for RaftNode {
             Err(err) => return Err(err),
         };
         if let Some(message) = apply_result.error_message {
-            return Err(match apply_result.rejection_code {
-                Some(super::types::StorageCommandRejectionCode::AlreadyExists) => {
-                    klights_cluster_datastore::errors::DatastoreError::already_exists(message)
-                        .into()
-                }
-                Some(super::types::StorageCommandRejectionCode::NotFound) => {
-                    klights_cluster_datastore::errors::DatastoreError::not_found(message).into()
-                }
-                Some(super::types::StorageCommandRejectionCode::Conflict) => {
-                    klights_cluster_datastore::errors::DatastoreError::conflict(message).into()
-                }
-                Some(super::types::StorageCommandRejectionCode::InvalidCommit) | None => {
-                    anyhow::anyhow!(message)
-                }
-            });
+            let code = apply_result
+                .rejection_code
+                .unwrap_or(StorageCommandRejectionCode::InvalidCommit);
+            return Err(StorageMutationError::rejected(code, message).into());
         }
         Ok(apply_result)
     }
@@ -1476,22 +1429,15 @@ impl super::proposal::RaftProposal for RaftNode {
 /// semantic failures inside a database error string; adding anyhow context
 /// directly would hide the nested 409/404 from `AppError::from`, which
 /// intentionally uses the top-level display string.
-fn map_commit_materialization_error(error: RaftMaterializationError) -> anyhow::Error {
-    let error = anyhow::Error::new(error);
-    let contextual = error.context("build log_apply commit for raft propose");
-    let diagnostic = format!("{contextual:#}");
-    let lower = diagnostic.to_ascii_lowercase();
-
-    if lower.contains("already exists")
-        && klights_cluster_datastore::errors::is_conflict_error(&contextual)
-    {
-        klights_cluster_datastore::errors::DatastoreError::already_exists(diagnostic).into()
-    } else if klights_cluster_datastore::errors::is_conflict_error(&contextual) {
-        klights_cluster_datastore::errors::DatastoreError::conflict(diagnostic).into()
-    } else if lower.contains("not found") {
-        klights_cluster_datastore::errors::DatastoreError::not_found(diagnostic).into()
-    } else {
-        contextual
+fn map_commit_materialization_error(error: StorageMutationError) -> anyhow::Error {
+    let rejection_code = error.rejection_code();
+    let diagnostic = format!(
+        "build log_apply commit for raft propose: {}",
+        error.message()
+    );
+    match rejection_code {
+        Some(code) => StorageMutationError::rejected(code, diagnostic).into(),
+        None => StorageMutationError::persistence(diagnostic).into(),
     }
 }
 
@@ -1704,6 +1650,10 @@ mod tests {
     use crate::datastore::DatastoreBackend;
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+    fn raft_store_ports(backend: Arc<dyn DatastoreBackend>) -> RaftStorePorts {
+        crate::datastore::cluster_store_adapter::raft_store_ports_for_test(backend)
+    }
 
     fn storage_attestation(
         log: Option<klights_leader_api::RaftStorageLogAttestation>,
@@ -2033,7 +1983,7 @@ mod tests {
         let raft_node = RaftNode::start(
             node_id,
             format!("n{node_id}"),
-            backend,
+            raft_store_ports(backend),
             node_local.clone(),
             node_local,
             supervisor,
@@ -2158,7 +2108,7 @@ mod tests {
             let n = RaftNode::start_with_network(
                 id,
                 format!("n{id}"),
-                backend.clone(),
+                raft_store_ports(backend.clone()),
                 node_local.clone(),
                 node_local,
                 supervisor,
@@ -2347,7 +2297,7 @@ mod tests {
             let n = RaftNode::start_with_network(
                 id,
                 format!("n{id}"),
-                backend,
+                raft_store_ports(backend),
                 node_local.clone(),
                 node_local,
                 supervisor,
@@ -2437,7 +2387,7 @@ mod tests {
             let node = RaftNode::start_with_network(
                 id,
                 format!("n{id}"),
-                backend.clone(),
+                raft_store_ports(backend.clone()),
                 node_local.clone(),
                 node_local,
                 supervisor,
@@ -2549,7 +2499,7 @@ mod tests {
         let node = RaftNode::start(
             10,
             "n10".to_string(),
-            backend.clone(),
+            raft_store_ports(backend.clone()),
             node_local.clone(),
             node_local,
             supervisor,
@@ -2686,7 +2636,7 @@ mod tests {
         let node = RaftNode::start_with_network(
             id,
             format!("n{id}"),
-            backend.clone(),
+            raft_store_ports(backend.clone()),
             node_local.clone(),
             node_local,
             supervisor,
@@ -2907,8 +2857,11 @@ mod tests {
             .await
             .expect_err("duplicate create must fail before raft overwrites the live row");
         assert!(matches!(
-            err.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>(),
-            Some(klights_cluster_datastore::errors::DatastoreError::AlreadyExists { .. })
+            err.downcast_ref::<klights_cluster_core::StorageMutationError>(),
+            Some(klights_cluster_core::StorageMutationError::Rejected {
+                code: klights_cluster_core::StorageCommandRejectionCode::AlreadyExists,
+                ..
+            })
         ));
         let msg = err.to_string();
         assert!(
@@ -3651,7 +3604,7 @@ mod tests {
             RaftNode::start_with_network(
                 77,
                 "n77".into(),
-                backend,
+                raft_store_ports(backend),
                 node_local.clone(),
                 node_local,
                 supervisor,
@@ -4132,7 +4085,7 @@ mod tests {
         let leader = RaftNode::start_with_network(
             leader_id,
             "n70".into(),
-            be1,
+            raft_store_ports(be1),
             nl1.clone(),
             nl1,
             sup1,
@@ -4166,7 +4119,7 @@ mod tests {
         let voter_node = RaftNode::start_with_network(
             voter_id,
             "n80".into(),
-            be2,
+            raft_store_ports(be2),
             nl2.clone(),
             nl2,
             sup2,

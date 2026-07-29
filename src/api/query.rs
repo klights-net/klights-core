@@ -304,13 +304,9 @@ impl ContinueTokenData {
         self.ts.is_none()
     }
 
-    fn is_expired(&self) -> bool {
+    fn is_expired_at(&self, now_unix_seconds: i64) -> bool {
         if let Some(ts) = self.ts {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            now - ts > CONTINUE_TOKEN_TTL_SECS
+            now_unix_seconds - ts > CONTINUE_TOKEN_TTL_SECS
         } else {
             false
         }
@@ -333,16 +329,12 @@ fn decode_continue_token_data(raw: &str) -> Option<ContinueTokenData> {
     serde_json::from_slice(&decoded).ok()
 }
 
-pub fn encode_continue_token(last_name: &str, session_rv: i64) -> String {
+pub fn encode_continue_token_at(last_name: &str, session_rv: i64, now_unix_seconds: i64) -> String {
     use base64::Engine as _;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
     let data = ContinueTokenData {
         n: last_name.to_string(),
         rv: session_rv,
-        ts: Some(ts),
+        ts: Some(now_unix_seconds),
         session: false,
     };
     let json = serde_json::to_vec(&data).unwrap_or_default();
@@ -373,10 +365,11 @@ pub fn encode_inconsistent_session_continue_token(last_name: &str, session_rv: i
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
 
-pub fn encode_response_continue_token(
+pub fn encode_response_continue_token_at(
     last_name: &str,
     response_rv: i64,
     continue_resource_version: ContinueResourceVersion,
+    now_unix_seconds: i64,
 ) -> String {
     match continue_resource_version {
         ContinueResourceVersion::Inconsistent { .. }
@@ -384,13 +377,14 @@ pub fn encode_response_continue_token(
             encode_inconsistent_session_continue_token(last_name, response_rv)
         }
         ContinueResourceVersion::Current | ContinueResourceVersion::Session(_) => {
-            encode_continue_token(last_name, response_rv)
+            encode_continue_token_at(last_name, response_rv, now_unix_seconds)
         }
     }
 }
 
-pub fn process_continue_token(
+pub fn process_continue_token_at(
     raw: Option<String>,
+    now_unix_seconds: i64,
 ) -> Result<(Option<String>, ContinueResourceVersion), AppError> {
     let raw = match raw {
         None => return Ok((None, ContinueResourceVersion::Current)),
@@ -399,7 +393,7 @@ pub fn process_continue_token(
     };
 
     if let Some(data) = decode_continue_token_data(&raw) {
-        if !data.is_inconsistent() && data.is_expired() {
+        if !data.is_inconsistent() && data.is_expired_at(now_unix_seconds) {
             let inconsistent = encode_inconsistent_continue_token(&data.n, data.rv);
             return Err(AppError::ResourceExpired(inconsistent));
         }
@@ -425,6 +419,32 @@ pub fn process_continue_token(
     }
 
     Ok((Some(raw), ContinueResourceVersion::Current))
+}
+
+#[cfg(test)]
+pub fn encode_continue_token(last_name: &str, session_rv: i64) -> String {
+    encode_continue_token_at(last_name, session_rv, 1_700_000_000)
+}
+
+#[cfg(test)]
+pub fn encode_response_continue_token(
+    last_name: &str,
+    response_rv: i64,
+    continue_resource_version: ContinueResourceVersion,
+) -> String {
+    encode_response_continue_token_at(
+        last_name,
+        response_rv,
+        continue_resource_version,
+        1_700_000_000,
+    )
+}
+
+#[cfg(test)]
+pub fn process_continue_token(
+    raw: Option<String>,
+) -> Result<(Option<String>, ContinueResourceVersion), AppError> {
+    process_continue_token_at(raw, 1_700_000_000)
 }
 
 #[cfg(test)]

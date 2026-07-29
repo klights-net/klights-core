@@ -136,7 +136,7 @@ async fn test_projected_volume_downward_api_per_file_mode() {
     .await
     .unwrap();
 
-    let content = crate::runtime_fs::read_utf8(format!("{}/namespace", path)).unwrap();
+    let content = klights_supervisor::runtime_fs::read_utf8(format!("{}/namespace", path)).unwrap();
     assert_eq!(content, "ns1");
 
     let mode = std::fs::metadata(format!("{}/namespace", path))
@@ -252,7 +252,8 @@ async fn test_secret_volume_refresh_on_update() {
     fs::write(format!("{}/password", vol_path), "initial-password").unwrap();
 
     // Verify initial content
-    let content = crate::runtime_fs::read_utf8(format!("{}/password", vol_path)).unwrap();
+    let content =
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/password", vol_path)).unwrap();
     assert_eq!(content, "initial-password");
 
     // Update the Secret with new data
@@ -302,7 +303,8 @@ async fn test_secret_volume_refresh_on_update() {
     );
 
     // Verify file content updated
-    let updated_content = crate::runtime_fs::read_utf8(format!("{}/password", vol_path)).unwrap();
+    let updated_content =
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/password", vol_path)).unwrap();
     assert_eq!(updated_content, "new-password");
 }
 
@@ -387,7 +389,7 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
     .await
     .unwrap();
 
-    let data_3 = crate::runtime_fs::read_utf8(format!("{}/data-3", vol_path)).unwrap();
+    let data_3 = klights_supervisor::runtime_fs::read_utf8(format!("{}/data-3", vol_path)).unwrap();
     assert_eq!(data_3, "value-3");
 }
 
@@ -691,7 +693,7 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
     .await
     .unwrap();
 
-    let data_3 = crate::runtime_fs::read_utf8(format!("{}/data-3", vol_path)).unwrap();
+    let data_3 = klights_supervisor::runtime_fs::read_utf8(format!("{}/data-3", vol_path)).unwrap();
     assert_eq!(data_3, "value-3");
 }
 
@@ -801,7 +803,8 @@ async fn test_configmap_volume_refresh_on_update() {
     );
 
     // Verify file content updated
-    let updated_content = crate::runtime_fs::read_utf8(format!("{}/app.conf", vol_path)).unwrap();
+    let updated_content =
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/app.conf", vol_path)).unwrap();
     assert_eq!(updated_content, "key=new-value");
 }
 
@@ -902,7 +905,8 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
         !std::path::Path::new(&format!("{}/data-1", vol_path)).exists(),
         "removed key file must be removed from mounted volume"
     );
-    let updated = crate::runtime_fs::read_utf8(format!("{}/data-2", vol_path)).unwrap();
+    let updated =
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/data-2", vol_path)).unwrap();
     assert_eq!(updated, "value-2-new");
 }
 
@@ -1063,7 +1067,7 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
     .await
     .unwrap();
 
-    let content = crate::runtime_fs::read_utf8(format!("{}/key", vol_path)).unwrap();
+    let content = klights_supervisor::runtime_fs::read_utf8(format!("{}/key", vol_path)).unwrap();
     assert_eq!(
         content, "data",
         "terminal API phase must not suppress refresh for an existing mounted Secret volume"

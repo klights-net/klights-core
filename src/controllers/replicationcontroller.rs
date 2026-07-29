@@ -106,6 +106,7 @@ pub(crate) async fn reconcile_replicationcontroller(
 ) -> Result<()> {
     let coordination = reconcile_context.coordination;
     let node_name = reconcile_context.node_name;
+    let reconcile_now = reconcile_context.wall_time;
     let common = crate::controllers::common::controller_common();
     let rc_name = rc["metadata"]["name"].as_str().context("RC missing name")?;
     let namespace = rc["metadata"]["namespace"]
@@ -319,6 +320,7 @@ pub(crate) async fn reconcile_replicationcontroller(
                                 created_in_reconcile: &mut created_in_reconcile,
                                 creation_failure: &mut creation_failure,
                             },
+                            reconcile_now,
                         )
                         .await?;
                         if creation_failure.is_some() {
@@ -419,6 +421,7 @@ pub(crate) async fn reconcile_replicationcontroller(
         namespace,
         &current_owned_pods,
         creation_failure.as_deref(),
+        reconcile_now,
     )
     .await?;
 
@@ -589,6 +592,7 @@ async fn update_replicationcontroller_status_while_polling_creates<'a>(
     namespace: &str,
     status_pods: Vec<klights_cluster_core::Resource>,
     progress: ScaleUpProgress<'_, 'a>,
+    reconcile_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     let ScaleUpProgress {
         in_flight_creates,
@@ -602,6 +606,7 @@ async fn update_replicationcontroller_status_while_polling_creates<'a>(
         namespace,
         &status_pods,
         None,
+        reconcile_now,
     ));
 
     loop {
@@ -654,6 +659,7 @@ async fn update_replicationcontroller_status(
     namespace: &str,
     owned_pods: &[klights_cluster_core::Resource],
     creation_failure: Option<&str>,
+    reconcile_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     // Get current RC first so status update can preserve condition history and
     // report the currently observed generation.
@@ -682,7 +688,7 @@ async fn update_replicationcontroller_status(
         .filter(|c| c["type"] != "ReplicaFailure")
         .collect::<Vec<_>>();
 
-    let now = crate::k8s_time::now_time();
+    let now = klights_cluster_core::k8s_time::format_time(reconcile_now);
     if let Some(msg) = creation_failure {
         conditions.push(json!({
             "type": "ReplicaFailure",

@@ -233,6 +233,7 @@ pub(crate) struct PodWorkqueue {
     persistence: Arc<dyn PodWorkqueuePersistence>,
     supervisor: Arc<TaskSupervisor>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     wake: Arc<Notify>,
     lifecycle_router: std::sync::Mutex<Option<Arc<dyn PodLifecycleWakeup>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
@@ -250,8 +251,17 @@ impl PodWorkqueue {
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Arc<Self> {
-        Self::new_with_unscheduled_deletion(store, persistence, supervisor, metrics, None, None)
+        Self::new_with_unscheduled_deletion(
+            store,
+            persistence,
+            supervisor,
+            metrics,
+            wall_clock,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn new_leader(
@@ -260,6 +270,7 @@ impl PodWorkqueue {
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
         leader_coordination: Arc<dyn ControllerCoordination>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Arc<Self> {
         let unscheduled_deletion: Arc<dyn UnscheduledPodDeletion> =
             Arc::new(LeaderDeferredUnscheduledPodDeletion {
@@ -270,6 +281,7 @@ impl PodWorkqueue {
             persistence,
             supervisor,
             metrics,
+            wall_clock,
             Some(unscheduled_deletion),
             Some(leader_coordination),
         )
@@ -280,6 +292,7 @@ impl PodWorkqueue {
         persistence: impl PodWorkqueuePersistence + 'static,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
         unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
         leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     ) -> Arc<Self> {
@@ -290,6 +303,7 @@ impl PodWorkqueue {
             persistence: Arc::new(persistence),
             supervisor,
             metrics,
+            wall_clock,
             wake: Arc::new(Notify::new()),
             lifecycle_router: std::sync::Mutex::new(None),
             local_node_name: std::sync::Mutex::new(None),
@@ -520,7 +534,7 @@ impl PodWorkqueue {
                     continue;
                 }
                 Some(ts) => {
-                    let now = now_ms();
+                    let now = self.wall_clock.now_ms();
                     if ts > now {
                         let sleep_for = Duration::from_millis((ts - now) as u64);
                         tokio::select! {
@@ -545,7 +559,7 @@ impl PodWorkqueue {
             // runs on Background (unlimited) so a slow ns retry cannot
             // block pod cleanup, and many concurrent ns deletes can each
             // make progress without serializing through the limit.
-            let row = match self.persistence.claim_due(now_ms()).await {
+            let row = match self.persistence.claim_due(self.wall_clock.now_ms()).await {
                 Ok(Some(row)) => row,
                 Ok(None) => continue,
                 Err(e) => {
@@ -598,7 +612,7 @@ impl PodWorkqueue {
             .get(POD_DELETE_TARGET_NODE_PAYLOAD_KEY)
             .and_then(|value| value.as_str())
             .map(ToString::to_string);
-        let retry_now_ms = now_ms();
+        let retry_now_ms = self.wall_clock.now_ms();
         let result = {
             let operation = async {
                 match row.kind {
@@ -735,7 +749,7 @@ impl PodWorkqueue {
             uid,
             target_node,
             &mut payload,
-            now_ms(),
+            self.wall_clock.now_ms(),
         )
         .await
     }
@@ -1068,6 +1082,7 @@ impl PodWorkqueue {
             self.clone(),
             self.supervisor.clone(),
             self.metrics.clone(),
+            self.wall_clock.clone(),
         );
         let mut enqueued_any = false;
         for resource in pods.items {
@@ -1093,8 +1108,9 @@ impl PodWorkqueue {
     }
 }
 
+#[cfg(test)]
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
+    klights_supervisor::SystemWallClock::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
@@ -1335,8 +1351,14 @@ mod tests {
         let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let metrics = SideEffectMetrics::new();
         let (coordination, _publisher) = test_coordination(true);
-        let workqueue =
-            PodWorkqueue::new_leader(store, node_local.clone(), supervisor, metrics, coordination);
+        let workqueue = PodWorkqueue::new_leader(
+            store,
+            node_local.clone(),
+            supervisor,
+            metrics,
+            coordination,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        );
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db, node_local)
     }
@@ -1353,7 +1375,13 @@ mod tests {
         ));
         let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let metrics = SideEffectMetrics::new();
-        let workqueue = PodWorkqueue::new(store, node_local.clone(), supervisor, metrics);
+        let workqueue = PodWorkqueue::new(
+            store,
+            node_local.clone(),
+            supervisor,
+            metrics,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        );
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db, node_local)
     }
@@ -1373,6 +1401,7 @@ mod tests {
             supervisor.clone(),
             SideEffectMetrics::new(),
             coordination,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
         db.create_resource(
             "v1",
@@ -2688,7 +2717,13 @@ mod tests {
         let node_local = super::super::test_node_local_store(supervisor.clone()).await;
         let cancel = supervisor.root_cancellation_token();
         let metrics = SideEffectMetrics::new();
-        let workqueue = PodWorkqueue::new(store, node_local, supervisor.clone(), metrics);
+        let workqueue = PodWorkqueue::new(
+            store,
+            node_local,
+            supervisor.clone(),
+            metrics,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        );
 
         // Enqueue a deferred delete to trigger reconciler start.
         // The reconciler will fail to process it (no lifecycle_router set)

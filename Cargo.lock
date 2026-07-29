@@ -2262,6 +2262,7 @@ name = "klights-supervisor"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "rusqlite",
  "serde",
  "serde_json",

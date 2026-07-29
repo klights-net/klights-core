@@ -293,6 +293,7 @@ mod tests {
                 executor,
                 sink.clone(),
                 crate::outbox_response_codec_adapter::new_codec(),
+                std::sync::Arc::new(klights_supervisor::SystemWallClock),
             )
             .await
             .unwrap();
@@ -306,6 +307,7 @@ mod tests {
         let store = crate::datastore::redb::RedbDatastore::new_in_memory_with_supervisor_and_sink(
             supervisor,
             sink.clone(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
         .unwrap();

@@ -497,7 +497,7 @@ async fn wait_for_peer_watch_reconnect(
         _ = cancel.cancelled() => false,
         result = supervisor.sleep(
             "focused_node_peer_watch_reconnect",
-            crate::reconnect_backoff::delay(attempt),
+            klights_supervisor::reconnect_backoff::delay(attempt),
         ) => result.is_ok(),
     }
 }

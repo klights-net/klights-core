@@ -1888,8 +1888,10 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     )
     .await;
 
-    let local_path_provisioner_root =
-        crate::paths::test_data_root_path("pvc-bind-parity").join("local-path-provisioner");
+    let local_path_provisioner_root = std::env::temp_dir()
+        .join("klights-api-tests")
+        .join("pvc-bind-parity")
+        .join("local-path-provisioner");
     let _ = crate::controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
         &local_path_provisioner_root,

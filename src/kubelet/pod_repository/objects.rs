@@ -26,6 +26,7 @@ pub(super) struct PodObjectService {
     mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 impl PodObjectService {
@@ -34,12 +35,14 @@ impl PodObjectService {
         mutation_reconcile: Arc<dyn PodMutationReconcileSink>,
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self {
             store,
             mutation_reconcile,
             outbox,
             cluster_api,
+            wall_clock,
         }
     }
 
@@ -164,7 +167,7 @@ impl PodObjectService {
                         },
                         strict_resource_version: true,
                     },
-                    now_ms: now_ms(),
+                    now_ms: self.wall_clock.now_ms(),
                 })
                 .await?;
             if enqueued {
@@ -269,7 +272,7 @@ impl PodObjectService {
                     },
                     strict_resource_version: true,
                 },
-                now_ms: now_ms(),
+                now_ms: self.wall_clock.now_ms(),
             })
             .await?;
         if enqueued {
@@ -379,7 +382,7 @@ impl PodObjectService {
                     },
                     strict_resource_version: true,
                 },
-                now_ms: now_ms(),
+                now_ms: self.wall_clock.now_ms(),
             })
             .await?;
         if enqueued {
@@ -394,11 +397,4 @@ fn synthetic_resource(mut current: Resource, body: Value) -> Resource {
     current.uid = Resource::uid_from_data(&body);
     current.data = Arc::new(body);
     current
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
 }

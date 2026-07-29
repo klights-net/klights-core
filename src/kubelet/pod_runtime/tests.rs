@@ -614,23 +614,22 @@ async fn mock_filesystem_records_hosts_logs_cgroups_and_fsgroup() {
 #[tokio::test]
 async fn real_filesystem_handles_termination_log_with_parity() {
     let runtime_namespace = "klights-term-real-fs-test";
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let runtime_paths =
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace);
+    let _ = std::fs::remove_dir_all(runtime_paths.data_root());
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         )),
         runtime_namespace.to_string(),
         "test-node".to_string(),
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
-            runtime_namespace,
-        ))
-        .unwrap(),
+        runtime_paths.clone(),
     );
     let key = PodRuntimeKey::new("ns", "pod", "uid-real-term");
-    let expected_path =
-        crate::paths::containerd_termination_log_path(runtime_namespace, "ns", "pod", "app")
-            .to_string_lossy()
-            .into_owned();
+    let expected_path = runtime_paths
+        .containerd_termination_log("ns", "pod", "app")
+        .to_string_lossy()
+        .into_owned();
 
     let path = fs.ensure_termination_log_file(&key, "app").await;
     std::fs::write(&path, "real-message").unwrap();
@@ -638,13 +637,15 @@ async fn real_filesystem_handles_termination_log_with_parity() {
 
     assert_eq!(path, expected_path);
     assert_eq!(message, "real-message");
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(runtime_paths.data_root());
 }
 
 #[tokio::test]
 async fn real_filesystem_cleanup_removes_entire_pod_root() {
     let runtime_namespace = "klights-pod-root-cleanup-test";
-    let data_root = crate::paths::data_root_path(runtime_namespace);
+    let runtime_paths =
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace);
+    let data_root = runtime_paths.data_root().to_path_buf();
     let _ = std::fs::remove_dir_all(&data_root);
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
         std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
@@ -652,16 +653,13 @@ async fn real_filesystem_cleanup_removes_entire_pod_root() {
         )),
         runtime_namespace.to_string(),
         "test-node".to_string(),
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
-            runtime_namespace,
-        ))
-        .unwrap(),
+        runtime_paths.clone(),
     );
     let key = PodRuntimeKey::new("ns", "pod", "uid-root-cleanup");
-    let pod_root = crate::paths::volumes_root_path(runtime_namespace)
+    let pod_root = runtime_paths
+        .volumes_root()
         .join(format!("{}_{}_{}", key.namespace, key.name, key.uid));
-    let pod_log_dir =
-        crate::paths::pod_log_dir_path(runtime_namespace, &key.namespace, &key.name, &key.uid);
+    let pod_log_dir = runtime_paths.pod_log_dir(&key.namespace, &key.name, &key.uid);
 
     std::fs::create_dir_all(pod_root.join("volumes/empty-dir/cache"))
         .expect("create pod volume dir");
@@ -727,11 +725,14 @@ async fn fs_group_volume_ownership_with_parity() {
         .unwrap()
         .as_nanos();
     let containerd_ns = format!("podfs-fsgroup-test-{suffix}");
-    let data_root = crate::paths::data_root_path(&containerd_ns);
+    let runtime_paths =
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&containerd_ns);
+    let data_root = runtime_paths.data_root().to_path_buf();
     let _ = std::fs::remove_dir_all(&data_root);
 
     let key = PodRuntimeKey::new("projected", "pod-projected-secrets", "uid-fsgroup");
-    let volume_dir = crate::paths::volumes_root_path(&containerd_ns)
+    let volume_dir = runtime_paths
+        .volumes_root()
         .join(format!("{}_{}_{}", key.namespace, key.name, key.uid))
         .join("volumes")
         .join("projected")
@@ -751,10 +752,7 @@ async fn fs_group_volume_ownership_with_parity() {
         )),
         containerd_ns.clone(),
         "test-node".to_string(),
-        crate::kubelet::runtime_paths::KubeletRuntimePaths::new(crate::paths::data_root_path(
-            &containerd_ns,
-        ))
-        .unwrap(),
+        runtime_paths,
     );
     let pod = serde_json::json!({
         "spec": {
@@ -1199,6 +1197,7 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
             container_control,
             network,
             store,
+            clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             slot_admission,
             repository: repo,
             filesystem,
@@ -1512,6 +1511,7 @@ async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_re
             container_control: harness.container_control.clone(),
             network: harness.network.clone(),
             store: harness.store.clone(),
+            clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             slot_admission: harness.slot_admission.clone(),
             repository: Arc::new(SnapshotOnlyStartRepository {
                 inner: harness.repo.clone(),
@@ -3989,6 +3989,7 @@ async fn fixture_runtime_with_node(
                 container_control,
                 network,
                 store,
+                clock: std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
                 slot_admission,
                 repository: repo.clone(),
                 filesystem,
@@ -4181,6 +4182,7 @@ async fn fixture_runtime_with_cluster(
                 container_control,
                 network,
                 store,
+                clock: std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
                 slot_admission,
                 repository: repo.clone(),
                 filesystem,
@@ -9119,7 +9121,11 @@ async fn real_runtime_reconcile_preserves_terminal_container_state_after_stale_r
 #[tokio::test]
 async fn mocked_runtime_does_not_create_termination_log_file_directly() {
     let runtime_namespace = "klights-term-mock-create-test";
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
     let harness = PodRuntimeHarness::new_with_runtime_config(
         crate::kubelet::pod_runtime::service::RuntimeConfig {
             node_name: "test-node".into(),
@@ -9159,12 +9165,13 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
         "termination-message-pod",
         "uid-termination-mock-create",
     );
-    let direct_host_path = crate::paths::containerd_termination_log_path(
-        runtime_namespace,
-        "container-runtime",
-        "termination-message-pod",
-        "termination-message-container",
-    );
+    let direct_host_path =
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .containerd_termination_log(
+                "container-runtime",
+                "termination-message-pod",
+                "termination-message-container",
+            );
 
     harness.create_runtime_pod(pod.clone()).await;
     let start = harness.start_pod_through_runtime(key, pod).await;
@@ -9174,7 +9181,11 @@ async fn mocked_runtime_does_not_create_termination_log_file_directly() {
         "RealPodRuntimeService must not create termination logs outside PodFilesystem"
     );
 
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
 }
 
 #[tokio::test]
@@ -9184,7 +9195,11 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
     use crate::kubelet::pod_runtime::store::PodRuntimeStore;
 
     let runtime_namespace = "klights-term-mock-read-test";
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
     let harness = PodRuntimeHarness::new_with_runtime_config(
         crate::kubelet::pod_runtime::service::RuntimeConfig {
             node_name: "test-node".into(),
@@ -9271,12 +9286,13 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
         .cri
         .set_container_status_state(k8s_cri::v1::ContainerState::ContainerExited as i32);
     harness.cri.set_container_exit_code(0);
-    let direct_host_path = crate::paths::containerd_termination_log_path(
-        runtime_namespace,
-        "container-runtime",
-        "termination-message-pod",
-        "termination-message-container",
-    );
+    let direct_host_path =
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .containerd_termination_log(
+                "container-runtime",
+                "termination-message-pod",
+                "termination-message-container",
+            );
     std::fs::create_dir_all(direct_host_path.parent().unwrap()).unwrap();
     std::fs::write(&direct_host_path, "direct-fs-message").unwrap();
 
@@ -9289,7 +9305,11 @@ async fn mocked_runtime_does_not_read_termination_message_file_directly() {
         "RealPodRuntimeService must read termination messages through PodFilesystem"
     );
 
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
 }
 
 #[tokio::test]
@@ -9361,7 +9381,11 @@ async fn termination_message_mount_path_with_parity() {
         call == "ensure_termination_log:container-runtime/termination-message-pod/uid-termination-mount/termination-message-container"
     }));
 
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
 }
 
 #[tokio::test]
@@ -9433,7 +9457,11 @@ async fn hosts_file_mount_path_with_parity() {
         "managed /etc/hosts must be mounted into containers so HostAliases are visible"
     );
 
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
 }
 
 #[tokio::test]
@@ -9546,7 +9574,11 @@ async fn termination_message_file_handling_with_parity() {
         call == "read_termination_message:container-runtime/termination-message-pod/uid-termination-read/termination-message-container:FallbackToLogsOnError:0"
     }));
 
-    let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
+    let _ = std::fs::remove_dir_all(
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(runtime_namespace)
+            .data_root()
+            .to_path_buf(),
+    );
 }
 
 // --- Task 23.4: Partial-State and Rollback Handling ---
@@ -10337,7 +10369,9 @@ async fn real_runtime_actor_cycle_starts_reconciles_running_and_deletes_pod() {
 
     let mut terminating_pod = running_pod;
     terminating_pod["metadata"]["deletionTimestamp"] =
-        serde_json::Value::String(crate::k8s_time::now_legacy_timestamp());
+        serde_json::Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
+            klights_supervisor::SystemWallClock::now_utc(),
+        ));
     router
         .route(LifecycleMessage::WatchDeleted {
             key: lifecycle_key,
@@ -10556,6 +10590,7 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             container_control: std::sync::Arc::new(MockContainerRuntimeControl::new()),
             network: std::sync::Arc::new(MockPodNetworkRuntime::new()),
             store: std::sync::Arc::new(MockPodRuntimeStore::new()),
+            clock: std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             slot_admission: std::sync::Arc::new(MockPodSlotAdmission::new()),
             repository: repo.clone(),
             filesystem: std::sync::Arc::new(MockPodFilesystem::new()),

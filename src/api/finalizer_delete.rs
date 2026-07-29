@@ -16,6 +16,11 @@ use std::sync::Arc;
 const DELETE_MAX_CONFLICT_RETRIES: usize = 16;
 const ORPHAN_FINALIZER: &str = "orphan";
 
+#[cfg(test)]
+fn finalizer_test_operation_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed finalizer test timestamp")
+}
+
 #[derive(Debug)]
 pub enum DeleteCompletion {
     HardDeleted(Resource),
@@ -43,7 +48,11 @@ pub fn preserve_deletion_timestamp_on_update(current: &Value, updated: &mut Valu
     }
 }
 
-pub fn ensure_deletion_timestamp(data: &mut Value, grace_seconds: i64) {
+pub fn ensure_deletion_timestamp_at(
+    data: &mut Value,
+    grace_seconds: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) {
     let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
         return;
     };
@@ -54,7 +63,7 @@ pub fn ensure_deletion_timestamp(data: &mut Value, grace_seconds: i64) {
     {
         meta.insert(
             "deletionTimestamp".to_string(),
-            Value::String(crate::k8s_time::now_legacy_timestamp()),
+            Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(now)),
         );
     }
     meta.entry("deletionGracePeriodSeconds".to_string())
@@ -120,13 +129,17 @@ fn remove_finalizer(data: &mut Value, finalizer: &str) {
     }
 }
 
-fn apply_orphan_deletion_mark(data: &mut Value, grace_seconds: i64) {
-    ensure_deletion_timestamp(data, grace_seconds);
+fn apply_orphan_deletion_mark(
+    data: &mut Value,
+    grace_seconds: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    ensure_deletion_timestamp_at(data, grace_seconds, now);
     add_finalizer(data, ORPHAN_FINALIZER);
 }
 
-fn apply_foreground_deletion_mark(data: &mut Value) {
-    ensure_deletion_timestamp(data, 0);
+fn apply_foreground_deletion_mark(data: &mut Value, now: chrono::DateTime<chrono::Utc>) {
+    ensure_deletion_timestamp_at(data, 0, now);
     add_finalizer(data, "foregroundDeletion");
 }
 
@@ -143,7 +156,8 @@ struct DeletionMarkRequest<'a> {
     initial_resource: Resource,
     delete_preconditions: ResourcePreconditions,
     grace_seconds: i64,
-    apply_mark: fn(&mut Value, i64),
+    apply_mark: fn(&mut Value, i64, chrono::DateTime<chrono::Utc>),
+    operation_now: chrono::DateTime<chrono::Utc>,
     conflict_label: &'static str,
 }
 
@@ -163,6 +177,7 @@ async fn mark_deletion_with_retry(
         delete_preconditions,
         grace_seconds,
         apply_mark,
+        operation_now,
         conflict_label,
     } = request;
 
@@ -200,7 +215,7 @@ async fn mark_deletion_with_retry(
         }
 
         let mut del_data: Value = (*resource.data).clone();
-        apply_mark(&mut del_data, grace_seconds);
+        apply_mark(&mut del_data, grace_seconds, operation_now);
 
         let update_preconditions = ResourcePreconditions::uid_and_resource_version(
             &expected_uid,
@@ -231,6 +246,7 @@ async fn mark_deletion_with_retry(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn mark_foreground_deletion_with_retry(
     lifecycle: &dyn FinalizerLifecyclePort,
     api_version: &str,
@@ -239,6 +255,7 @@ pub async fn mark_foreground_deletion_with_retry(
     name: &str,
     initial_resource: Resource,
     delete_preconditions: ResourcePreconditions,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Resource, AppError> {
     mark_deletion_with_retry(
         lifecycle,
@@ -252,7 +269,8 @@ pub async fn mark_foreground_deletion_with_retry(
             initial_resource,
             delete_preconditions,
             grace_seconds: 0,
-            apply_mark: |data, _| apply_foreground_deletion_mark(data),
+            apply_mark: |data, _, now| apply_foreground_deletion_mark(data, now),
+            operation_now,
             conflict_label: "foreground delete",
         },
     )
@@ -266,6 +284,7 @@ pub struct NonForegroundDeleteRequest<'a> {
     pub orphan_children_before_completion: bool,
     pub uid_mismatch_is_conflict: bool,
     pub grace_seconds: i64,
+    pub operation_now: chrono::DateTime<chrono::Utc>,
 }
 
 pub async fn complete_non_foreground_delete_with_live_recheck(
@@ -285,6 +304,7 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
         orphan_children_before_completion,
         uid_mismatch_is_conflict,
         grace_seconds,
+        operation_now,
     } = request;
 
     let explicit_rv = delete_preconditions.resource_version;
@@ -326,7 +346,7 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                 || !has_finalizer(&resource.data, ORPHAN_FINALIZER)
             {
                 let mut del_data: Value = (*resource.data).clone();
-                apply_orphan_deletion_mark(&mut del_data, grace_seconds);
+                apply_orphan_deletion_mark(&mut del_data, grace_seconds, operation_now);
                 let update_preconditions = ResourcePreconditions::uid_and_resource_version(
                     expected_uid.clone(),
                     resource.resource_version,
@@ -433,7 +453,7 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
                 return Ok(DeleteCompletion::MarkedTerminating(resource));
             }
             let mut del_data: Value = (*resource.data).clone();
-            ensure_deletion_timestamp(&mut del_data, grace_seconds);
+            ensure_deletion_timestamp_at(&mut del_data, grace_seconds, operation_now);
             let update_preconditions = ResourcePreconditions::uid_and_resource_version(
                 expected_uid.clone(),
                 resource.resource_version,
@@ -704,6 +724,7 @@ mod tests {
             "owned",
             finalizer_test_resource("apps/v1", "Deployment"),
             ResourcePreconditions::uid("owned-uid"),
+            finalizer_test_operation_time(),
         )
         .await
         .expect("foreground deletion mark should update through the port");
@@ -732,6 +753,7 @@ mod tests {
             "owned",
             finalizer_test_resource("v1", "Pod"),
             ResourcePreconditions::uid("owned-uid"),
+            finalizer_test_operation_time(),
         )
         .await
         .expect_err("generic finalizer lifecycle must reject Pods");
@@ -986,6 +1008,7 @@ mod tests {
                 orphan_children_before_completion: true,
                 uid_mismatch_is_conflict: true,
                 grace_seconds: 0,
+                operation_now: finalizer_test_operation_time(),
             },
         )
         .await
@@ -1127,6 +1150,7 @@ mod tests {
                 orphan_children_before_completion: true,
                 uid_mismatch_is_conflict: true,
                 grace_seconds: 0,
+                operation_now: finalizer_test_operation_time(),
             },
         )
         .await
@@ -1268,6 +1292,7 @@ mod tests {
                 orphan_children_before_completion: false,
                 uid_mismatch_is_conflict: true,
                 grace_seconds: 0,
+                operation_now: finalizer_test_operation_time(),
             },
         )
         .await

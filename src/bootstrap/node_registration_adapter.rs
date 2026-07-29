@@ -86,6 +86,7 @@ pub(crate) async fn register_node_snapshot(
         outbox.map(|outbox| outbox as &dyn klights_leader_api::NodeOutbox),
         dataplane_health,
         snapshot,
+        klights_supervisor::SystemWallClock::now_utc(),
     )
     .await
 }
@@ -101,6 +102,7 @@ pub(crate) async fn register_worker_node_snapshot(
         Some(outbox as &dyn klights_leader_api::NodeOutbox),
         dataplane_health,
         snapshot,
+        klights_supervisor::SystemWallClock::now_utc(),
     )
     .await
 }

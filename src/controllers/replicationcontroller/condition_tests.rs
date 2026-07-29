@@ -51,6 +51,7 @@ async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
         "default",
         &[],
         Some("exceeded quota: pods count limit"),
+        chrono::DateTime::UNIX_EPOCH,
     )
     .await
     .unwrap();
@@ -76,9 +77,16 @@ async fn test_rc_publishes_replica_failure_condition_on_create_failure() {
 async fn test_rc_clears_replica_failure_condition_when_healthy() {
     let db = crate::datastore::test_support::in_memory().await;
     setup_db_with_rc(&db, "test-rc-ok").await;
-    update_replicationcontroller_status(&db, "test-rc-ok", "default", &[], None)
-        .await
-        .unwrap();
+    update_replicationcontroller_status(
+        &db,
+        "test-rc-ok",
+        "default",
+        &[],
+        None,
+        chrono::DateTime::UNIX_EPOCH,
+    )
+    .await
+    .unwrap();
     let updated = db
         .get_resource("v1", "ReplicationController", Some("default"), "test-rc-ok")
         .await

@@ -131,15 +131,18 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         let pod_volumes_path = pod_volumes_dir.to_string_lossy().into_owned();
         crate::kubelet::volumes::unmount_volume_mounts_under(&self.file_process, &pod_volumes_path)
             .await?;
-        crate::runtime_fs::remove_dir_all_if_exists_async(&self.file_process, &pod_volumes_dir)
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to remove pod volume dir {}: {e}",
-                    pod_volumes_dir.display()
-                )
-            })?;
+        klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(
+            &self.file_process,
+            &pod_volumes_dir,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to remove pod volume dir {}: {e}",
+                pod_volumes_dir.display()
+            )
+        })?;
         Ok(())
     }
 }
@@ -151,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn real_pod_volume_runtime_cleanup_removes_pod_volumes_directory() {
         let containerd_ns = "rt-volumes-test";
-        let temp = crate::paths::test_data_root_fixture(containerd_ns);
+        let temp = tempfile::tempdir().expect("create kubelet test fixture");
         let runtime_paths =
             crate::kubelet::runtime_paths::KubeletRuntimePaths::new(temp.path().to_path_buf())
                 .unwrap();
@@ -191,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn real_pod_volume_runtime_emptydir_is_uid_qualified_for_same_name_recreate() {
         let containerd_ns = "rt-volumes-uid-test";
-        let temp = crate::paths::test_data_root_fixture(containerd_ns);
+        let temp = tempfile::tempdir().expect("create kubelet test fixture");
 
         let runtime = RealPodVolumeRuntime::new(
             crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),

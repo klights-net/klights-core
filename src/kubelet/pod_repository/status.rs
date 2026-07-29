@@ -31,6 +31,7 @@ pub(super) struct PodStatusService {
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
     host_ip: HostIpState,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     deferred_runtime: DeferredRuntimeReducerHandle,
 }
 
@@ -188,6 +189,7 @@ impl PodStatusService {
         outbox: Option<Arc<Outbox>>,
         cluster_api: Option<Arc<dyn LeaderResourceQuery>>,
         host_ip: HostIpState,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self {
             store,
@@ -196,6 +198,7 @@ impl PodStatusService {
             outbox,
             cluster_api,
             host_ip,
+            wall_clock,
             deferred_runtime: DeferredRuntimeReducerHandle::default(),
         }
     }
@@ -303,7 +306,7 @@ impl PodStatusService {
                 },
                 pod_uid: pod_uid.to_string(),
                 command,
-                now_ms: now_ms(),
+                now_ms: self.wall_clock.now_ms(),
             })
             .await?;
 
@@ -325,7 +328,7 @@ impl PodStatusService {
             );
             if let Some(outbox) = &self.outbox {
                 outbox
-                    .record_pod_status_checkpoint(&synthetic, now_ms())
+                    .record_pod_status_checkpoint(&synthetic, self.wall_clock.now_ms())
                     .await?;
                 tracing::info!(
                     target: "klights::pod_status::trace",
@@ -472,7 +475,9 @@ impl PodStatusService {
             let conditions = if stored_terminal_phase.is_some() {
                 existing_conditions.clone()
             } else {
-                let now = crate::k8s_time::now_legacy_timestamp();
+                let now = klights_cluster_core::k8s_time::format_legacy_timestamp(
+                    self.wall_clock.now_utc(),
+                );
                 let all_containers_ready = if container_statuses.is_empty() {
                     phase == "Running"
                 } else {
@@ -713,6 +718,7 @@ impl PodStatusService {
                         failed_name,
                         exit_code,
                         &existing_init_container_statuses,
+                        self.wall_clock.now_utc(),
                     ),
                 )
             } else if is_image_pull_error_msg(error_message) {
@@ -901,7 +907,10 @@ impl PodStatusService {
                 repair_scalar_and_list_ip_fields(obj, "podIP", "podIPs");
                 repair_scalar_and_list_ip_fields(obj, "hostIP", "hostIPs");
 
-                apply_runtime_readiness_conditions(obj);
+                let readiness_now = klights_cluster_core::k8s_time::format_legacy_timestamp(
+                    self.wall_clock.now_utc(),
+                );
+                apply_runtime_readiness_conditions(obj, &readiness_now);
             }
 
             if phase_override.is_some()
@@ -1324,7 +1333,8 @@ impl PodStatusService {
             } else {
                 "ReadinessProbeFailed"
             };
-            let now = crate::k8s_time::now_legacy_timestamp();
+            let now =
+                klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
 
             let conditions_value = status
                 .as_object_mut()
@@ -1524,7 +1534,8 @@ impl PodStatusService {
         if !status.is_object() {
             status = json!({});
         }
-        let now = crate::k8s_time::now_legacy_timestamp();
+        let now =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
         if let Some(obj) = status.as_object_mut() {
             obj.insert("phase".to_string(), json!("Failed"));
             obj.insert("reason".to_string(), json!("DeadlineExceeded"));
@@ -1641,13 +1652,6 @@ fn synthetic_status_resource(pod_resource: &Resource, status: &Value) -> Resourc
     }
     synthetic.data = Arc::new(data);
     synthetic
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
 }
 
 fn pod_terminal_phase(pod: &Value) -> Option<&str> {
@@ -1845,7 +1849,7 @@ fn can_publish_probe_ready(status: &Value, container_name: &str) -> bool {
     true
 }
 
-fn apply_terminal_readiness_conditions(status: &mut serde_json::Map<String, Value>) {
+fn apply_terminal_readiness_conditions(status: &mut serde_json::Map<String, Value>, now: &str) {
     let Some(phase) = status.get("phase").and_then(|v| v.as_str()) else {
         return;
     };
@@ -1854,7 +1858,6 @@ fn apply_terminal_readiness_conditions(status: &mut serde_json::Map<String, Valu
         "Failed" => "PodFailed",
         _ => return,
     };
-    let now = crate::k8s_time::now_legacy_timestamp();
     let conditions = status
         .entry("conditions".to_string())
         .or_insert_with(|| json!([]));
@@ -1864,16 +1867,16 @@ fn apply_terminal_readiness_conditions(status: &mut serde_json::Map<String, Valu
     let Some(conditions) = conditions.as_array_mut() else {
         return;
     };
-    upsert_terminal_readiness_condition(conditions, "Ready", reason, &now);
-    upsert_terminal_readiness_condition(conditions, "ContainersReady", reason, &now);
+    upsert_terminal_readiness_condition(conditions, "Ready", reason, now);
+    upsert_terminal_readiness_condition(conditions, "ContainersReady", reason, now);
 }
 
-fn apply_runtime_readiness_conditions(status: &mut serde_json::Map<String, Value>) {
+fn apply_runtime_readiness_conditions(status: &mut serde_json::Map<String, Value>, now: &str) {
     let Some(phase) = status.get("phase").and_then(|v| v.as_str()) else {
         return;
     };
     if matches!(phase, "Succeeded" | "Failed") {
-        apply_terminal_readiness_conditions(status);
+        apply_terminal_readiness_conditions(status, now);
         return;
     }
 
@@ -1896,7 +1899,6 @@ fn apply_runtime_readiness_conditions(status: &mut serde_json::Map<String, Value
     } else {
         "False"
     };
-    let now = crate::k8s_time::now_legacy_timestamp();
     let existing_conditions = status
         .get("conditions")
         .and_then(|c| c.as_array())
@@ -1916,14 +1918,14 @@ fn apply_runtime_readiness_conditions(status: &mut serde_json::Map<String, Value
         &existing_conditions,
         "ContainersReady",
         containers_ready_status,
-        &now,
+        now,
     );
     upsert_runtime_readiness_condition(
         conditions,
         &existing_conditions,
         "Ready",
         ready_status,
-        &now,
+        now,
     );
 }
 

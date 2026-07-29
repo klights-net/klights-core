@@ -195,6 +195,7 @@ impl PodLifecycleRouter {
         config: PodLifecycleConcurrencyConfig,
         mode: PodLifecycleRouteMode,
         actor_idle_grace: std::time::Duration,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         let backend: Arc<dyn PodLifecycleRouteBackend> = match mode {
             PodLifecycleRouteMode::Actor => {
@@ -206,6 +207,7 @@ impl PodLifecycleRouter {
                     config,
                     executor_holder.clone(),
                     actor_idle_grace,
+                    wall_clock,
                 ));
                 let backend: Arc<dyn PodLifecycleRouteBackend> = Arc::new(
                     ActorPodLifecycleBackend::new(registry.clone(), executor_holder),
@@ -229,6 +231,7 @@ impl PodLifecycleRouter {
             config,
             PodLifecycleRouteMode::Actor,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         )
     }
 
@@ -345,6 +348,7 @@ mod tests {
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Actor,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Actor);
     }
@@ -356,6 +360,7 @@ mod tests {
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
         assert_eq!(router.mode(), PodLifecycleRouteMode::Multiplex);
     }
@@ -454,6 +459,7 @@ mod tests {
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
 
         let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
@@ -469,6 +475,7 @@ mod tests {
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
 
         let diag = router.diagnostics().await;
@@ -488,6 +495,7 @@ mod tests {
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
 
         // Mode selection works.
@@ -1160,6 +1168,7 @@ mod tests {
             PodLifecycleConcurrencyConfig::production_default(),
             PodLifecycleRouteMode::Multiplex,
             crate::kubelet::pod_lifecycle_actor::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
 
         assert_eq!(mux_router.mode(), PodLifecycleRouteMode::Multiplex);

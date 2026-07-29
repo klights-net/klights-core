@@ -132,6 +132,7 @@ pub struct PodLifecycleRegistry {
     reply_handle: std::sync::Mutex<Option<LifecycleReplyHandle>>,
     idle_grace: Duration,
     runtime_observation_store: Option<Arc<Outbox>>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +161,7 @@ impl PodLifecycleRegistry {
             config,
             executor_holder,
             super::actor::DEFAULT_POD_ACTOR_IDLE_GRACE,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         )
     }
 
@@ -168,6 +170,7 @@ impl PodLifecycleRegistry {
         config: PodLifecycleConcurrencyConfig,
         executor_holder: Arc<std::sync::Mutex<Arc<dyn PodWorkExecutor>>>,
         idle_grace: Duration,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self {
             supervisor,
@@ -179,6 +182,7 @@ impl PodLifecycleRegistry {
             reply_handle: std::sync::Mutex::new(None),
             idle_grace,
             runtime_observation_store: None,
+            wall_clock,
         }
     }
 
@@ -197,7 +201,13 @@ impl PodLifecycleRegistry {
         executor_holder: Arc<std::sync::Mutex<Arc<dyn PodWorkExecutor>>>,
         idle_grace: Duration,
     ) -> Self {
-        Self::new_with_idle_grace(supervisor, config, executor_holder, idle_grace)
+        Self::new_with_idle_grace(
+            supervisor,
+            config,
+            executor_holder,
+            idle_grace,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        )
     }
 
     /// Set the reply handle after the router is constructed (circular dep).
@@ -267,6 +277,7 @@ impl PodLifecycleRegistry {
                     instance,
                     idle_grace: self.idle_grace,
                     runtime_observation_store: self.runtime_observation_store.clone(),
+                    wall_clock: self.wall_clock.clone(),
                 })
                 .run(rx),
             )

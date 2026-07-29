@@ -712,7 +712,7 @@ async fn service_routing_watch_reconnect_delay(
         _ = cancel.cancelled() => false,
         result = task_supervisor.sleep(
             "service_routing_watch_reconnect_backoff",
-            crate::reconnect_backoff::delay(attempt),
+            klights_supervisor::reconnect_backoff::delay(attempt),
         ) => {
             if let Err(err) = result {
                 tracing::warn!(
@@ -1118,7 +1118,7 @@ async fn write_proc_sysctl(
     path: &str,
     value: &str,
 ) -> Result<()> {
-    crate::runtime_fs::write_async(file_process, path, value)
+    klights_supervisor::runtime_fs::write_async(file_process, path, value)
         .await
         .with_context(|| format!("write sysctl {path}={}", value.trim_end()))
 }
@@ -1195,7 +1195,7 @@ async fn ensure_sysctl_value(
     expected: &str,
 ) -> Result<()> {
     write_proc_sysctl(file_process, path, expected).await?;
-    let actual = crate::runtime_fs::read_utf8_async(file_process, path)
+    let actual = klights_supervisor::runtime_fs::read_utf8_async(file_process, path)
         .await
         .with_context(|| format!("read sysctl {path}"))?;
     if actual != expected {

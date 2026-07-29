@@ -156,7 +156,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // through authoritative snapshot installation plus AppendEntries.
     let is_joining_controlplane = role.is_controlplane_join();
 
-    let node_lease_tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+    let node_lease_tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_at(
+        klights_supervisor::SystemWallClock::now_utc(),
+    ));
     // T6 step 4b: prepare the remote arm independently of local persistence.
     // The switching proxy itself is constructed only after the immutable
     // sequenced facade exists.
@@ -267,7 +269,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let ca_path = crate::paths::ca_cert_path(&config.containerd_namespace);
             let file_process =
                 klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref());
-            let ca_exists = crate::runtime_fs::exists_async(&file_process, &ca_path)
+            let ca_exists = klights_supervisor::runtime_fs::exists_async(&file_process, &ca_path)
                 .await
                 .context("Failed to inspect control-plane CA certificate path")?;
             let (ca_cert_path, skip_ca) = if ca_exists {
@@ -373,9 +375,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             }
             let proposal: Arc<dyn crate::datastore::raft::proposal::RaftProposal> = raft.clone();
             let db_handle: DatastoreHandle = Arc::new(
-                crate::bootstrap::sequenced_datastore::SequencedDatastore::new(
+                crate::bootstrap::sequenced_datastore::SequencedDatastore::new_with_clock(
                     passive_backend.clone(),
                     proposal,
+                    Arc::new(klights_supervisor::SystemWallClock),
                 ),
             );
             // The local command client is built only from the fully constructed
@@ -618,6 +621,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 let join_credential_store =
                     crate::bootstrap::credential_store::SupervisedBootstrapCredentialStore::new(
                         join_supervisor.clone(),
+                        config.data_root.join("etc"),
                     );
                 let join_resource_query = leader_ports.resource_query.clone();
                 let join_resource_commands = leader_proxy.clone();
@@ -740,7 +744,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         if !ca_cert_pem.is_empty()
                                             && let Err(e) = join_credential_store
                                                 .install_ca_certificate(
-                                                    &join_namespace,
                                                     ca_cert_pem.into_bytes(),
                                                 )
                                                 .await
@@ -866,10 +869,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             delivery_store,
         );
         let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
+        let outbox_wall_clock: Arc<dyn klights_supervisor::WallClock> =
+            Arc::new(klights_supervisor::SystemWallClock);
         let ob = Arc::new(crate::node_outbox::Outbox::compose(
             outbox_stores.clone(),
             outbox_codec.clone(),
             notify.clone(),
+            outbox_wall_clock.clone(),
         ));
         let apply_client = outbox_delivery_client.clone();
         let outbox_stores_for_retry = outbox_stores.clone();
@@ -878,6 +884,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         let notify_for_retry = notify.clone();
         let apply_client_for_retry = apply_client.clone();
         let shutdown_token_for_retry = shutdown_token.clone();
+        let outbox_wall_clock_for_retry = outbox_wall_clock.clone();
         match supervisor
             .spawn_async(
                 klights_supervisor::TaskCategory::Background,
@@ -891,6 +898,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                             outbox_codec_for_retry.clone(),
                             apply_client_for_retry.clone(),
                             notify_for_retry.clone(),
+                            outbox_wall_clock_for_retry.clone(),
                         );
                         match dispatcher
                             .start(
@@ -1178,17 +1186,25 @@ async fn controlplane_join_client_identity_for_token(
     node_name: &str,
     supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> anyhow::Result<ControlplaneJoinClientIdentity> {
-    use crate::bootstrap::worker_identity::{
-        CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
-    };
+    use crate::bootstrap::worker_identity::SupervisedFilesystemWorkerCredentialStore;
 
     let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
         namespace,
         node_name,
         supervisor.clone(),
     );
+    controlplane_join_client_identity_for_token_from_store(token, &store, supervisor).await
+}
+
+async fn controlplane_join_client_identity_for_token_from_store(
+    token: &str,
+    store: &dyn crate::bootstrap::worker_identity::AsyncWorkerCredentialStore,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+) -> anyhow::Result<ControlplaneJoinClientIdentity> {
+    use crate::bootstrap::worker_identity::{CredentialSource, resolve_credential_async};
+
     let crypto = klights_supervisor::CryptoExecutor::new(supervisor);
-    match resolve_credential_async(&store, &crypto).await {
+    match resolve_credential_async(store, &crypto).await {
         Ok(CredentialSource::ExistingCert(cred)) => Ok(ControlplaneJoinClientIdentity {
             client_cert_pem: Some(cred.certificate_pem),
             client_key_pem: Some(cred.private_key_pem),
@@ -1388,12 +1404,13 @@ mod tests {
         use crate::bootstrap::worker_identity::{
             AsyncWorkerCredentialStore, SupervisedFilesystemWorkerCredentialStore, WorkerCredential,
         };
+        use tempfile::TempDir;
 
-        let namespace = format!("cp-rejoin-node-cert-{}", uuid::Uuid::new_v4());
+        let data_root = TempDir::new().expect("create isolated controlplane credential root");
         let node_name = "mn-controlplane1";
         let supervisor = test_supervisor();
-        let store = SupervisedFilesystemWorkerCredentialStore::for_namespace(
-            &namespace,
+        let store = SupervisedFilesystemWorkerCredentialStore::new(
+            data_root.path().join("etc"),
             node_name,
             supervisor.clone(),
         );
@@ -1408,8 +1425,10 @@ mod tests {
             .await
             .expect("persist test credential");
 
-        let identity = super::controlplane_join_client_identity_for_token(
-            "", &namespace, node_name, supervisor,
+        let identity = super::controlplane_join_client_identity_for_token_from_store(
+            "",
+            &store,
+            supervisor.clone(),
         )
         .await
         .expect("load persisted identity");
@@ -1422,8 +1441,7 @@ mod tests {
             identity.client_key_pem.as_deref(),
             Some(private_key_pem.as_str())
         );
-
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&namespace));
+        let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
     }
 
     #[tokio::test]

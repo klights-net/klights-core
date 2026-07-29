@@ -95,6 +95,28 @@ impl KubeletRuntimePaths {
     pub fn cni_rpc_socket(&self) -> PathBuf {
         self.data_root.join("cni").join("klights-cni.sock")
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(namespace: &str) -> Self {
+        use std::hash::{Hash, Hasher};
+
+        let identity = std::thread::current()
+            .name()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        identity.hash(&mut hasher);
+        namespace.hash(&mut hasher);
+        let run_root = std::env::var_os("KLIGHTS_TEST_DATA_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Self::new(
+            run_root
+                .join("klights-kubelet-tests")
+                .join(format!("{:016x}", hasher.finish())),
+        )
+        .expect("kubelet test runtime path must be absolute")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,5 +178,15 @@ mod tests {
         assert!(Arc::ptr_eq(&paths.data_root, &clone.data_root));
         assert_eq!(paths.containerd_data_dir(), clone.containerd_data_dir());
         assert_eq!(paths.volumes_root(), clone.volumes_root());
+    }
+
+    #[test]
+    fn test_fixture_is_stable_per_case_and_namespace() {
+        let first = KubeletRuntimePaths::for_test("same");
+        let second = KubeletRuntimePaths::for_test("same");
+        let other = KubeletRuntimePaths::for_test("other");
+
+        assert_eq!(first.data_root(), second.data_root());
+        assert_ne!(first.data_root(), other.data_root());
     }
 }

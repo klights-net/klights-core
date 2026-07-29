@@ -134,9 +134,16 @@ async fn spawn_cri_event_forwarder(
     lifecycle_tx: Option<
         tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 ) -> CriEventReceiver {
-    event_forwarder::spawn_cri_event_forwarder(cri, cancel_token, task_supervisor, lifecycle_tx)
-        .await
+    event_forwarder::spawn_cri_event_forwarder(
+        cri,
+        cancel_token,
+        task_supervisor,
+        lifecycle_tx,
+        wall_clock,
+    )
+    .await
 }
 
 async fn wait_for_cni_readiness(
@@ -158,7 +165,7 @@ fn pod_watch_reconnect_future(
             let _ = task_supervisor
                 .sleep(
                     "pod_manager_watch_reconnect",
-                    crate::reconnect_backoff::delay(attempt - 1),
+                    klights_supervisor::reconnect_backoff::delay(attempt - 1),
                 )
                 .await;
         }
@@ -350,6 +357,7 @@ async fn run_pod_watcher_with_runtime(
         cancel_token.clone(),
         local_execution.task_supervisor.clone(),
         cri_reconnect_lifecycle_tx,
+        local_execution.wall_clock.clone(),
     )
     .await;
 

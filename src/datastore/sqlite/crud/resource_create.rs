@@ -71,7 +71,7 @@ impl Datastore {
         ensure_resource_type_meta(&mut data, api_version, kind);
         ensure_metadata_identity(&mut data, namespace, name);
 
-        ensure_metadata_create_defaults(&mut data);
+        ensure_metadata_create_defaults(&mut data, self.wall_clock.now_utc());
 
         // Auto-inject ServiceAccount projected volume for Pods
         if kind == "Pod"

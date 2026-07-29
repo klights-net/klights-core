@@ -95,5 +95,8 @@ async fn open_sqlite(
         connection_key,
     )
     .await?;
-    Ok(Arc::new(SqliteNodeLocalDb::from_executor(executor)?))
+    Ok(Arc::new(SqliteNodeLocalDb::from_executor_with_clock(
+        executor,
+        Arc::new(klights_supervisor::SystemWallClock),
+    )?))
 }

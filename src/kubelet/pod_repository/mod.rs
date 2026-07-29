@@ -299,6 +299,7 @@ pub(crate) struct PodRepositoryAdapterDependencies {
 pub(crate) struct PodRepositoryRuntimeDependencies {
     pub supervisor: Arc<TaskSupervisor>,
     pub metrics: Arc<dyn klights_reconcile_api::ReconcileFailureMetrics>,
+    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 pub(crate) struct PodRepositoryCoreDependencies {
@@ -1056,6 +1057,7 @@ impl PodRepository {
         let PodRepositoryRuntimeDependencies {
             supervisor,
             metrics,
+            wall_clock,
         } = runtime;
         let PodRepositoryNetworkDependencies {
             pod_network_cache,
@@ -1081,12 +1083,14 @@ impl PodRepository {
             outbox.clone(),
             cluster_api.clone(),
             host_ip.clone(),
+            wall_clock.clone(),
         );
         let objects = PodObjectService::new(
             store.clone(),
             mutation_reconcile.clone(),
             outbox.clone(),
             cluster_api.clone(),
+            wall_clock,
         );
         let network_svc = PodNetworkService::new(
             pod_network_cache,
@@ -1452,13 +1456,6 @@ fn pod_has_owner_uid(pod: &Value, owner_uid: &str) -> bool {
                 .iter()
                 .any(|owner| owner.get("uid").and_then(|uid| uid.as_str()) == Some(owner_uid))
         })
-}
-
-pub fn current_epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
 }
 
 #[async_trait]

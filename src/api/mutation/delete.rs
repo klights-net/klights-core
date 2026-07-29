@@ -34,6 +34,7 @@ pub trait DeleteStrategy: Send + Sync {
 pub struct FinalizerAwareDeleteStrategy<'a> {
     pub resource_query: &'a dyn klights_leader_api::LeaderResourceQuery,
     pub lifecycle: &'a dyn klights_reconcile_api::FinalizerLifecyclePort,
+    pub operation_now: chrono::DateTime<chrono::Utc>,
 }
 
 #[async_trait]
@@ -67,6 +68,7 @@ impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
                 &target.name,
                 resource,
                 intent.preconditions.clone(),
+                self.operation_now,
             )
             .await?;
             return Ok(DeleteResult::MarkedTerminating(updated));
@@ -87,6 +89,7 @@ impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
                 orphan_children_before_completion: intent.orphan_children,
                 uid_mismatch_is_conflict: intent.uid_mismatch_is_conflict,
                 grace_seconds,
+                operation_now: self.operation_now,
             },
         )
         .await?

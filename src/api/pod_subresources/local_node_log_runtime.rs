@@ -38,7 +38,11 @@ impl LocalNodeLogRuntime {
     #[cfg(test)]
     pub(crate) fn new(containerd_namespace: String, task_supervisor: Arc<TaskSupervisor>) -> Self {
         Self {
-            pod_logs_root: crate::paths::pod_logs_root_path(&containerd_namespace),
+            pod_logs_root: std::env::temp_dir()
+                .join("klights-api-tests")
+                .join(containerd_namespace)
+                .join("logs")
+                .join("pods"),
             task_supervisor,
             clock: Arc::new(crate::auth::clock::SystemClock),
             pod_log_follow_watch: None,

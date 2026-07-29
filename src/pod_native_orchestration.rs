@@ -246,6 +246,7 @@ pub struct PodNativeOrchestration {
     service_reconcile: Arc<dyn PodServiceReconcileSink>,
     mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(test)]
     scheduler_bind_gate: std::sync::Mutex<Option<Arc<SchedulerBindGateForTest>>>,
 }
@@ -267,6 +268,7 @@ pub struct PodNativeOrchestrationDependencies {
     pub service_reconcile: Arc<dyn PodServiceReconcileSink>,
     pub mutation_effects: Arc<dyn klights_reconcile_api::ResourceMutationEffectsPort>,
     pub metrics: Arc<dyn ReconcileFailureMetrics>,
+    pub wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl PodNativeOrchestration {
@@ -288,6 +290,7 @@ impl PodNativeOrchestration {
             service_reconcile,
             mutation_effects,
             metrics,
+            wall_clock,
         } = dependencies;
         Self {
             pod_query,
@@ -306,6 +309,7 @@ impl PodNativeOrchestration {
             service_reconcile,
             mutation_effects,
             metrics,
+            wall_clock,
             #[cfg(test)]
             scheduler_bind_gate: std::sync::Mutex::new(None),
         }
@@ -336,6 +340,10 @@ impl PodNativeOrchestration {
         &self,
         request: PodApiCreateRequest,
     ) -> Result<PodApiCreateResult, AppError> {
+        let operation_now = self.wall_clock.now_utc();
+        let creation_time = klights_cluster_core::k8s_time::format_time(operation_now.to_owned());
+        let transition_time =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
         let PodApiCreateRequest {
             namespace,
             name,
@@ -454,7 +462,7 @@ impl PodNativeOrchestration {
             {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    Value::String(crate::k8s_time::now_time()),
+                    Value::String(creation_time),
                 );
             }
             let generation = meta_obj
@@ -490,14 +498,14 @@ impl PodNativeOrchestration {
                 json!({
                     "type": "PodScheduled",
                     "status": "False",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": transition_time.clone(),
                     "reason": "SchedulingPending",
                 })
             } else if let Some(message) = scheduling_decision.unschedulable_message.as_deref() {
                 json!({
                     "type": "PodScheduled",
                     "status": "False",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": transition_time.clone(),
                     "reason": "Unschedulable",
                     "message": message,
                 })
@@ -505,7 +513,7 @@ impl PodNativeOrchestration {
                 json!({
                     "type": "PodScheduled",
                     "status": "True",
-                    "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                    "lastTransitionTime": transition_time.clone(),
                 })
             };
             tracing::info!(
@@ -521,17 +529,17 @@ impl PodNativeOrchestration {
                         {
                             "type": "Initialized",
                             "status": "True",
-                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                            "lastTransitionTime": transition_time.clone(),
                         },
                         {
                             "type": "Ready",
                             "status": "False",
-                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                            "lastTransitionTime": transition_time.clone(),
                         },
                         {
                             "type": "ContainersReady",
                             "status": "False",
-                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                            "lastTransitionTime": transition_time.clone(),
                         },
                         pod_scheduled_condition
                     ],
@@ -725,6 +733,8 @@ impl PodNativeOrchestration {
         current: Resource,
         mut decision: PodSchedulingDecision,
     ) -> Result<Option<Resource>, AppError> {
+        let transition_time =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
         if let Some(node_name) = decision.node_name.as_deref()
             && !self
                 .planned_node_still_fits(namespace, name, &current.data, node_name)
@@ -764,7 +774,7 @@ impl PodNativeOrchestration {
                         json!({
                             "type": "PodScheduled",
                             "status": "False",
-                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                            "lastTransitionTime": transition_time.clone(),
                             "reason": "Unschedulable",
                             "message": message,
                         })
@@ -772,7 +782,7 @@ impl PodNativeOrchestration {
                         json!({
                             "type": "PodScheduled",
                             "status": "True",
-                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                            "lastTransitionTime": transition_time.clone(),
                         })
                     },
                 );
@@ -828,6 +838,7 @@ impl PodNativeOrchestration {
                 preemptor_name: name,
             },
             &decision.preemption_victims,
+            &transition_time,
         )
         .await?;
         if status_changed
@@ -880,6 +891,8 @@ impl PodNativeOrchestration {
         binding: Value,
         dry_run: bool,
     ) -> Result<(), AppError> {
+        let transition_time =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
         validate_pod_binding_object(namespace, name, &binding)?;
         let target_node = binding
             .pointer("/target/name")
@@ -926,7 +939,7 @@ impl PodNativeOrchestration {
         let mut body: Value = (*current.data).clone();
         merge_binding_annotations(&mut body, &binding);
         set_bound_node_name(&mut body, &target_node)?;
-        upsert_pod_scheduled_true(&mut body)?;
+        upsert_pod_scheduled_true(&mut body, &transition_time)?;
 
         if dry_run {
             return Ok(());
@@ -1779,6 +1792,7 @@ fn pod_counts_toward_node_allocated(
 async fn apply_pod_preemption(
     ctx: PodPreemptionContext<'_>,
     victims: &[PodPreemptionCandidate],
+    transition_time: &str,
 ) -> Result<(), AppError> {
     for victim in victims {
         let updated = mark_preemption_candidate(
@@ -1787,6 +1801,7 @@ async fn apply_pod_preemption(
             victim,
             ctx.preemptor_namespace,
             ctx.preemptor_name,
+            transition_time,
         )
         .await?;
         let uid = updated.uid.clone();
@@ -1820,14 +1835,16 @@ async fn mark_preemption_candidate(
     victim: &PodPreemptionCandidate,
     preemptor_namespace: &str,
     preemptor_name: &str,
+    transition_time: &str,
 ) -> Result<Resource, AppError> {
     const MAX_RETRIES: u32 = 5;
     let mut resource_version = victim.resource_version;
     let mut data = victim.data.clone();
 
     for attempt in 0..MAX_RETRIES {
-        mark_pod_preempted_metadata(&mut data);
-        let mut status = preempted_status(&data, preemptor_namespace, preemptor_name);
+        mark_pod_preempted_metadata(&mut data, transition_time);
+        let mut status =
+            preempted_status(&data, preemptor_namespace, preemptor_name, transition_time);
         // This is a scheduler-originated write (preemption sets the
         // scheduler-owned `DisruptionTarget` condition). Route it through the
         // central Pod status merge policy as the Scheduler owner so it is
@@ -1872,17 +1889,21 @@ async fn mark_preemption_candidate(
     unreachable!("preemption termination retry loop exhausted without returning")
 }
 
-fn mark_pod_preempted_metadata(data: &mut Value) {
-    let now = crate::k8s_time::now_legacy_timestamp();
+fn mark_pod_preempted_metadata(data: &mut Value, transition_time: &str) {
     if let Some(meta) = data.get_mut("metadata").and_then(|v| v.as_object_mut()) {
         meta.entry("deletionTimestamp".to_string())
-            .or_insert_with(|| json!(now.clone()));
+            .or_insert_with(|| json!(transition_time));
         meta.entry("deletionGracePeriodSeconds".to_string())
             .or_insert_with(|| json!(0));
     }
 }
 
-fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &str) -> Value {
+fn preempted_status(
+    data: &Value,
+    preemptor_namespace: &str,
+    preemptor_name: &str,
+    transition_time: &str,
+) -> Value {
     let mut status = data.get("status").cloned().unwrap_or_else(|| json!({}));
     if !status.is_object() {
         status = json!({});
@@ -1894,7 +1915,7 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
     let condition = json!({
         "type": "DisruptionTarget",
         "status": "True",
-        "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+        "lastTransitionTime": transition_time,
         "reason": "PreemptionByScheduler",
         "message": format!("Preempted by pod {preemptor_namespace}/{preemptor_name} on node")
     });
@@ -1915,7 +1936,7 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
                         Some(json!({
                             "type": "PodScheduled",
                             "status": "True",
-                            "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                            "lastTransitionTime": transition_time,
                         }))
                     })
             } else {
@@ -2073,7 +2094,7 @@ fn set_bound_node_name(pod: &mut Value, node_name: &str) -> Result<(), AppError>
     Ok(())
 }
 
-fn upsert_pod_scheduled_true(pod: &mut Value) -> Result<(), AppError> {
+fn upsert_pod_scheduled_true(pod: &mut Value, transition_time: &str) -> Result<(), AppError> {
     let pod_object = pod
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("Pod body must be an object".to_string()))?;
@@ -2095,7 +2116,7 @@ fn upsert_pod_scheduled_true(pod: &mut Value) -> Result<(), AppError> {
     conditions_array.push(json!({
         "type": "PodScheduled",
         "status": "True",
-        "lastTransitionTime": crate::k8s_time::now_legacy_timestamp()
+        "lastTransitionTime": transition_time
     }));
     Ok(())
 }

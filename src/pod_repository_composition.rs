@@ -99,6 +99,7 @@ struct RootPodRepositoryComposition {
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
     gc_coordination: Arc<dyn klights_reconcile_api::GcForegroundDeleteCoordination>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(test)]
     scheduler_bind_gate: Option<Arc<crate::pod_native_orchestration::SchedulerBindGateForTest>>,
 }
@@ -113,6 +114,7 @@ pub(crate) struct RootPodRepositoryParts {
 #[derive(Clone)]
 struct RootPodWorkqueuePersistence {
     node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     test_rows: Arc<std::sync::Mutex<Vec<crate::datastore::node_local::PodWorkqueueEntry>>>,
     test_next_id: Arc<std::sync::atomic::AtomicI64>,
 }
@@ -408,9 +410,10 @@ impl crate::kubelet::pod_repository::store::PodPersistence for WorkerPodPersiste
 pub(crate) fn new_pod_store(
     db: DatastoreHandle,
 ) -> crate::kubelet::pod_repository::store::PodStore {
-    crate::kubelet::pod_repository::store::PodStore::from_persistence(Arc::new(
-        RootPodPersistence { db },
-    ))
+    crate::kubelet::pod_repository::store::PodStore::from_persistence(
+        Arc::new(RootPodPersistence { db }),
+        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+    )
 }
 
 fn pod_persistence_error(error: anyhow::Error, namespace: &str, name: &str) -> anyhow::Error {
@@ -744,10 +747,7 @@ impl crate::kubelet::pod_repository::workqueue::PodWorkqueuePersistence
         let id = self
             .test_next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        let now_ms = self.wall_clock.now_ms();
         self.test_rows
             .lock()
             .unwrap()
@@ -863,6 +863,7 @@ impl RootPodRepositoryComposition {
             dependencies.status_only.clone(),
             dependencies.delete_coordinator.clone(),
             self.db.clone(),
+            self.wall_clock.clone(),
         );
         let pod_query: Arc<dyn klights_pod_api::PodQuery> = native.clone();
         let persistence: Arc<dyn klights_pod_api::PodPersistence> = native.clone();
@@ -900,6 +901,7 @@ impl RootPodRepositoryComposition {
                         self.metrics.clone(),
                     ),
                 metrics: self.metrics.clone(),
+                wall_clock: self.wall_clock.clone(),
             },
         ));
         #[cfg(test)]
@@ -974,11 +976,15 @@ pub(crate) fn build_pod_repository_parts(
             crate::control_plane::client::local::always_leader_watch(),
         ))
     });
-    let store = Arc::new(PodStore::from_persistence(Arc::new(RootPodPersistence {
-        db: db.clone(),
-    })));
+    let wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock> =
+        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock);
+    let store = Arc::new(PodStore::from_persistence(
+        Arc::new(RootPodPersistence { db: db.clone() }),
+        wall_clock.clone(),
+    ));
     let workqueue_persistence = RootPodWorkqueuePersistence {
         node_local,
+        wall_clock: wall_clock.clone(),
         test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
         test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
     };
@@ -989,6 +995,7 @@ pub(crate) fn build_pod_repository_parts(
             supervisor.clone(),
             metrics.clone(),
             leader_coordination,
+            wall_clock.clone(),
         )
     } else {
         PodWorkqueue::new(
@@ -996,6 +1003,7 @@ pub(crate) fn build_pod_repository_parts(
             workqueue_persistence,
             supervisor.clone(),
             metrics.clone(),
+            wall_clock.clone(),
         )
     };
     let status_only: Arc<dyn StateOnlyWriter> =
@@ -1005,6 +1013,7 @@ pub(crate) fn build_pod_repository_parts(
         workqueue.clone(),
         supervisor.clone(),
         metrics.clone(),
+        wall_clock.clone(),
     ));
     let (adapters, api, subresource, scheduling) = RootPodRepositoryComposition {
         db: db.clone(),
@@ -1012,6 +1021,7 @@ pub(crate) fn build_pod_repository_parts(
         side_effects: side_effects.clone(),
         metrics: metrics.clone(),
         gc_coordination,
+        wall_clock: Arc::new(klights_supervisor::SystemWallClock),
         #[cfg(test)]
         scheduler_bind_gate,
     }
@@ -1026,6 +1036,7 @@ pub(crate) fn build_pod_repository_parts(
         store.clone(),
         cluster_api.clone(),
         delivery_outbox.clone(),
+        wall_clock.clone(),
     );
     let repository_parts = PodRepository::build_parts_with_adapters(
         PodRepositoryCoreDependencies {
@@ -1036,6 +1047,7 @@ pub(crate) fn build_pod_repository_parts(
         PodRepositoryRuntimeDependencies {
             supervisor,
             metrics: metrics.clone(),
+            wall_clock,
         },
         PodRepositoryNetworkDependencies {
             pod_network_cache,
@@ -1059,18 +1071,25 @@ pub(crate) fn build_pod_repository_parts(
 pub(crate) fn build_worker_pod_repository_parts(
     config: WorkerPodRepositoryBuildConfig,
 ) -> crate::kubelet::pod_repository::facade::PodRepositoryParts {
-    let store = Arc::new(PodStore::from_persistence(Arc::new(WorkerPodPersistence {
-        resource_query: config.resource_query.clone(),
-    })));
+    let wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock> =
+        Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock);
+    let store = Arc::new(PodStore::from_persistence(
+        Arc::new(WorkerPodPersistence {
+            resource_query: config.resource_query.clone(),
+        }),
+        wall_clock.clone(),
+    ));
     let workqueue = PodWorkqueue::new(
         store.clone(),
         RootPodWorkqueuePersistence {
             node_local: Some(config.node_local),
+            wall_clock: wall_clock.clone(),
             test_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
             test_next_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
         },
         config.supervisor.clone(),
         config.metrics.clone(),
+        wall_clock.clone(),
     );
     let status_only: Arc<dyn StateOnlyWriter> =
         Arc::new(StatusOnlyWriterService::new(store.clone()));
@@ -1079,6 +1098,7 @@ pub(crate) fn build_worker_pod_repository_parts(
         store.clone(),
         Some(config.resource_query.clone()),
         Some(outbox.clone()),
+        wall_clock.clone(),
     );
     let adapters = WorkerPodAdapters::build(
         PodRepositoryAdapterDependencies {
@@ -1090,6 +1110,7 @@ pub(crate) fn build_worker_pod_repository_parts(
                 workqueue.clone(),
                 config.supervisor.clone(),
                 config.metrics.clone(),
+                wall_clock.clone(),
             )),
         },
         root_deletion.clone(),
@@ -1104,6 +1125,7 @@ pub(crate) fn build_worker_pod_repository_parts(
         PodRepositoryRuntimeDependencies {
             supervisor: config.supervisor,
             metrics: config.metrics,
+            wall_clock,
         },
         PodRepositoryNetworkDependencies {
             pod_network_cache: config.pod_network_cache,

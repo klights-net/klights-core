@@ -21,6 +21,7 @@ pub struct ProbeTaskRuntime {
     pub cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
     pub startup_completed: Arc<RwLock<HashSet<String>>>,
     pub lifecycle_tx: mpsc::Sender<LifecycleCommand>,
+    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 pub struct ProbeTaskTiming {
@@ -91,6 +92,7 @@ pub async fn spawn_probe_task_with_params(
         cri,
         startup_completed,
         lifecycle_tx,
+        wall_clock,
     } = runtime;
     let ProbeTaskSpec {
         pod_key,
@@ -199,7 +201,7 @@ pub async fn spawn_probe_task_with_params(
                             statuses,
                             &container_name,
                             initial_delay_secs,
-                            chrono::Utc::now(),
+                            wall_clock.now_utc(),
                         ) {
                             continue;
                         }
@@ -472,6 +474,7 @@ mod tests {
                 cri: None,
                 startup_completed,
                 lifecycle_tx: tx,
+                wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             },
             ProbeTaskSpec {
                 pod_key: "default/probed".to_string(),
@@ -556,6 +559,7 @@ mod tests {
                 cri: None,
                 startup_completed,
                 lifecycle_tx: tx,
+                wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             },
             ProbeTaskSpec {
                 pod_key: "default/probed".to_string(),

@@ -760,7 +760,7 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
 
     // Raft stamps the next sequential rv: the delete lands above the list rv.
     let delete_rv = list.resource_version + 1;
-    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
+    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
         delete_rv,
         vec![klights_cluster_core::LogApplyMutation::DeleteResource(
             klights_cluster_core::LogApplyResourceKey {
@@ -839,7 +839,7 @@ async fn list_resources_response_rv_precedes_delete_committed_after_snapshot() {
         panic!("expected a fresh delete commit");
     };
 
-    db.apply_log_apply_commit(crate::replication::log_apply_wire::test_live_commit(
+    db.apply_log_apply_commit(crate::datastore::test_support::test_live_commit(
         delete_rv + 1,
         vec![klights_cluster_core::LogApplyMutation::PutResource(
             klights_cluster_core::LogApplyResourceRow {

@@ -81,6 +81,8 @@ impl Datastore {
         let key = PatchKey::from_borrowed(api_version, kind, namespace, name);
         let uses_namespaced =
             use_namespaced_table(&key.api_version, &key.kind, &key.namespace.as_deref());
+        let transition_time =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
 
         let result = self
             .db_call("db_query", move |conn| {
@@ -230,7 +232,6 @@ impl Datastore {
                     &mut patched,
                 );
                 if zero_grace_pod_delete {
-                    let transition_time = crate::k8s_time::now_legacy_timestamp();
                     klights_types::mark_terminating_pod_unready_at(&mut patched, &transition_time);
                 }
                 preserve_server_metadata_fields_from_existing(&mut patched, &current.data);

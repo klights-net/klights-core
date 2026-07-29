@@ -8,35 +8,42 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait BootstrapCredentialStore: Send + Sync {
-    async fn install_ca_certificate(&self, namespace: &str, pem: Vec<u8>) -> Result<()>;
-    async fn install_ca_key(&self, namespace: &str, pem: Vec<u8>) -> Result<()>;
+    async fn install_ca_certificate(&self, pem: Vec<u8>) -> Result<()>;
+    async fn install_ca_key(&self, pem: Vec<u8>) -> Result<()>;
     async fn install_server_certificate(&self, path: PathBuf, pem: Vec<u8>) -> Result<()>;
 }
 
 #[derive(Clone)]
 pub struct SupervisedBootstrapCredentialStore {
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    etc_dir: PathBuf,
 }
 
 impl SupervisedBootstrapCredentialStore {
-    pub fn new(supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
-        Self { supervisor }
+    pub fn new(
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
+        etc_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            supervisor,
+            etc_dir: etc_dir.into(),
+        }
     }
 }
 
 #[async_trait]
 impl BootstrapCredentialStore for SupervisedBootstrapCredentialStore {
-    async fn install_ca_certificate(&self, namespace: &str, pem: Vec<u8>) -> Result<()> {
+    async fn install_ca_certificate(&self, pem: Vec<u8>) -> Result<()> {
         self.install(BootstrapCredentialArtifact::CaCertificate {
-            namespace: namespace.to_string(),
+            path: self.etc_dir.join("ca.crt"),
             bytes: pem,
         })
         .await
     }
 
-    async fn install_ca_key(&self, namespace: &str, pem: Vec<u8>) -> Result<()> {
+    async fn install_ca_key(&self, pem: Vec<u8>) -> Result<()> {
         self.install(BootstrapCredentialArtifact::CaKey {
-            namespace: namespace.to_string(),
+            path: self.etc_dir.join("ca.key"),
             bytes: pem,
         })
         .await
@@ -60,17 +67,17 @@ impl SupervisedBootstrapCredentialStore {
 }
 
 enum BootstrapCredentialArtifact {
-    CaCertificate { namespace: String, bytes: Vec<u8> },
-    CaKey { namespace: String, bytes: Vec<u8> },
+    CaCertificate { path: PathBuf, bytes: Vec<u8> },
+    CaKey { path: PathBuf, bytes: Vec<u8> },
     ServerCertificate { path: PathBuf, bytes: Vec<u8> },
 }
 
 impl BootstrapCredentialArtifact {
     fn path(&self) -> PathBuf {
         match self {
-            Self::CaCertificate { namespace, .. } => crate::paths::ca_cert_path(namespace),
-            Self::CaKey { namespace, .. } => crate::paths::ca_key_path(namespace),
-            Self::ServerCertificate { path, .. } => path.clone(),
+            Self::CaCertificate { path, .. }
+            | Self::CaKey { path, .. }
+            | Self::ServerCertificate { path, .. } => path.clone(),
         }
     }
 
@@ -186,7 +193,7 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let store = SupervisedBootstrapCredentialStore::new(supervisor);
+        let store = SupervisedBootstrapCredentialStore::new(supervisor, dir.path());
 
         store
             .install_server_certificate(path.clone(), b"old".to_vec())

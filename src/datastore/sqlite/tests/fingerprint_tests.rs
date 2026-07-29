@@ -589,7 +589,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
             .db_call("family-fingerprint-applied-outbox", |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT idempotency_key, subject_key, operation, first_seen_ms, applied_rv, \
-                     result_proto, status_stamp, reserved_rv \
+                     result_proto, status_stamp \
                      FROM applied_outbox ORDER BY idempotency_key",
                 )?;
                 let rows = stmt
@@ -602,7 +602,6 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
                             row.get::<_, Option<i64>>(4)?,
                             row.get::<_, Vec<u8>>(5)?,
                             row.get::<_, Option<i64>>(6)?,
-                            row.get::<_, Option<i64>>(7)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -621,7 +620,6 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
             hash_optional_i64(hasher, row.4);
             hash_bytes(hasher, &row.5);
             hash_optional_i64(hasher, row.6);
-            hash_optional_i64(hasher, row.7);
         }
         Ok(())
     }
@@ -719,7 +717,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
 async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
     let leader = Datastore::new_in_memory().await.unwrap();
     let follower = Datastore::new_in_memory().await.unwrap();
-    let derived_resource_commit = crate::replication::log_apply_wire::test_live_commit(
+    let derived_resource_commit = crate::datastore::test_support::test_live_commit(
         30,
         vec![LogApplyMutation::PutResource(LogApplyResourceRow {
             api_version: "v1".to_string(),
@@ -747,7 +745,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let seed_watch_10 = crate::replication::log_apply_wire::test_live_commit(
+    let seed_watch_10 = crate::datastore::test_support::test_live_commit(
         10,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -761,7 +759,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let seed_watch_20 = crate::replication::log_apply_wire::test_live_commit(
+    let seed_watch_20 = crate::datastore::test_support::test_live_commit(
         20,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
             event_id: None,
@@ -775,7 +773,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         })],
     );
 
-    let mixed_commit = crate::replication::log_apply_wire::test_live_commit(
+    let mixed_commit = crate::datastore::test_support::test_live_commit(
         60,
         vec![
             LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
@@ -884,7 +882,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
         ],
     );
 
-    let gc_commit = crate::replication::log_apply_wire::test_live_commit(
+    let gc_commit = crate::datastore::test_support::test_live_commit(
         61,
         vec![LogApplyMutation::GcWatchEvents {
             max_rows: 2,

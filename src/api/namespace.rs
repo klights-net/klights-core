@@ -92,6 +92,7 @@ pub(in crate::api) async fn list_namespaces(
             .unwrap());
     }
 
+    let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
     let has_continue = query
         .continue_token
@@ -99,7 +100,7 @@ pub(in crate::api) async fn list_namespaces(
         .is_some_and(|t| !t.is_empty());
     let rv_match = query.resolve_resource_version_match(has_continue)?;
     let (db_continue_name, continue_resource_version) =
-        process_continue_token(query.continue_token.clone())?;
+        process_continue_token_at(query.continue_token.clone(), operation_now.unix_timestamp())?;
 
     let list_query = crate::api::query::NamespaceListRequest {
         label_selector: query.label_selector.clone(),
@@ -143,10 +144,11 @@ pub(in crate::api) async fn list_namespaces(
     });
     if let Some(ref token) = list_response.continue_token {
         ns_metadata["continue"] =
-            serde_json::json!(crate::api::query::encode_response_continue_token(
+            serde_json::json!(crate::api::query::encode_response_continue_token_at(
                 token,
                 response_rv,
                 continue_resource_version,
+                operation_now.unix_timestamp(),
             ));
     }
     if let Some(remaining) = list_response.remaining_item_count {
@@ -230,7 +232,9 @@ pub(in crate::api) async fn create_namespace(
             {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    serde_json::Value::String(crate::k8s_time::now_time()),
+                    serde_json::Value::String(klights_cluster_core::k8s_time::format_time(
+                        crate::auth::clock::chrono_utc(state.operational().clock.now()),
+                    )),
                 );
             }
         }
@@ -273,7 +277,11 @@ pub(in crate::api) async fn create_namespace(
         );
     }
     let ca_cert_path = &state.operational().config.runtime.paths.ca_cert;
-    match crate::runtime_fs::read_utf8_async(&state.operational().file_process, ca_cert_path).await
+    match klights_supervisor::runtime_fs::read_utf8_async(
+        &state.operational().file_process,
+        ca_cert_path,
+    )
+    .await
     {
         Ok(ca_cert_pem) => {
             if let Err(e) = namespace_bootstrap
@@ -429,11 +437,12 @@ pub(in crate::api) async fn finalize_namespace(
             // Terminating (pods still draining, content pending). We must
             // enqueue a workqueue retry in that StillPending case too,
             // not only on Err.
-            let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome(
+            let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome_at(
                 state.resource_mutation().namespace_termination.as_ref(),
                 &resource.name,
                 &uid,
                 &state.controller_reconcile().metrics,
+                crate::auth::clock::chrono_utc(state.operational().clock.now()),
             )
             .await;
             let need_retry = match &outcome {
@@ -574,8 +583,9 @@ pub(in crate::api) async fn delete_namespace(
         ));
     }
 
+    let operation_now = crate::auth::clock::chrono_utc(state.operational().clock.now());
     let mut terminating: Value = (*current.data).clone();
-    set_namespace_terminating_status(&mut terminating, false);
+    set_namespace_terminating_status_at(&mut terminating, false, operation_now);
     let updated = crate::api::resource_command_ports::update_namespace(
         state.resource_mutation().resource_command.as_ref(),
         &name,
@@ -592,11 +602,12 @@ pub(in crate::api) async fn delete_namespace(
     // Use the outcome-returning variant: when the inner reconcile returns
     // Ok with StillPending (pods still draining, content not yet drained,
     // or worker-side races), enqueue a workqueue retry — not only on Err.
-    let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome(
+    let outcome = crate::api::reconcile_namespace_termination_for_uid_with_outcome_at(
         state.resource_mutation().namespace_termination.as_ref(),
         &name,
         &uid,
         &state.controller_reconcile().metrics,
+        operation_now,
     )
     .await;
     let need_retry = match &outcome {

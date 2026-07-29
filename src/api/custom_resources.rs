@@ -1058,6 +1058,7 @@ async fn list_cr_inner(
         }
     }
 
+    let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
     let has_continue = query
         .continue_token
@@ -1065,7 +1066,7 @@ async fn list_cr_inner(
         .is_some_and(|t| !t.is_empty());
     let rv_match = query.resolve_resource_version_match(has_continue)?;
     let (db_continue_name, continue_resource_version) =
-        process_continue_token(query.continue_token.clone())?;
+        process_continue_token_at(query.continue_token.clone(), operation_now.unix_timestamp())?;
 
     let needs_conversion = conversion
         .as_ref()
@@ -1260,10 +1261,11 @@ async fn list_cr_inner(
     });
     if let Some(ct) = continue_token {
         metadata["continue"] =
-            serde_json::Value::String(crate::api::query::encode_response_continue_token(
+            serde_json::Value::String(crate::api::query::encode_response_continue_token_at(
                 &ct,
                 response_rv,
                 continue_resource_version,
+                operation_now.unix_timestamp(),
             ));
     }
     if let Some(ric) = remaining_item_count {
@@ -1450,6 +1452,7 @@ async fn delete_collection_cr_inner(
     let strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
+        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
     };
     let results =
         crate::api::mutation::delete::delete_collection_items(&strategy, items, &delete_intent)
@@ -2283,6 +2286,7 @@ async fn delete_cr_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
+        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
     };
     match crate::api::mutation::delete::delete_loaded_with_strategy(
         &delete_strategy,

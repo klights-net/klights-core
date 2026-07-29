@@ -6,11 +6,19 @@ use crate::kubelet::node_heartbeat::{
 use crate::kubelet::pod_watch_source::{PodWatchEvent, PodWatchSource, PodWatchStream};
 use futures::StreamExt as _;
 
-pub struct SystemNodeHeartbeatClock;
+pub struct SystemNodeHeartbeatClock {
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
+}
+
+impl SystemNodeHeartbeatClock {
+    pub fn new(wall_clock: Arc<dyn klights_supervisor::WallClock>) -> Self {
+        Self { wall_clock }
+    }
+}
 
 impl NodeHeartbeatClock for SystemNodeHeartbeatClock {
     fn now_microtime(&self) -> String {
-        crate::k8s_time::now_microtime()
+        klights_cluster_core::k8s_time::format_microtime(self.wall_clock.now_utc())
     }
 }
 
@@ -506,14 +514,20 @@ impl NodeHeartbeatEventSource for DatastorePodWatchSource {
 pub struct RootPodEventSink {
     outbox: Option<Arc<crate::node_outbox::Outbox>>,
     datastore: crate::datastore::DatastoreHandle,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl RootPodEventSink {
     pub fn new(
         outbox: Option<Arc<crate::node_outbox::Outbox>>,
         datastore: crate::datastore::DatastoreHandle,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
-        Self { outbox, datastore }
+        Self {
+            outbox,
+            datastore,
+            wall_clock,
+        }
     }
 }
 
@@ -545,6 +559,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
                 event_type,
                 reporting_component,
                 reporting_instance: node_name,
+                operation_now: self.wall_clock.now_utc(),
             },
         )
         .await
@@ -558,16 +573,19 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for RootPodEventSink {
 pub struct WorkerPodEventSink {
     outbox: Arc<crate::node_outbox::Outbox>,
     resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl WorkerPodEventSink {
     pub fn new(
         outbox: Arc<crate::node_outbox::Outbox>,
         resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             outbox,
             resource_query,
+            wall_clock,
         }
     }
 }
@@ -600,6 +618,7 @@ impl crate::kubelet::pod_runtime::events::PodEventSink for WorkerPodEventSink {
                 event_type,
                 reporting_component,
                 reporting_instance: node_name,
+                operation_now: self.wall_clock.now_utc(),
             },
         )
         .await

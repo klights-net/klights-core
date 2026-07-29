@@ -104,6 +104,7 @@ pub(in crate::api) async fn list_pods(
             .unwrap());
     }
 
+    let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
 
     let has_continue = query
@@ -114,7 +115,7 @@ pub(in crate::api) async fn list_pods(
 
     // Decode continue token: check TTL and extract name for DB filter.
     let (db_continue_name, continue_resource_version) =
-        process_continue_token(query.continue_token)?;
+        process_continue_token_at(query.continue_token, operation_now.unix_timestamp())?;
 
     let list_query = klights_pod_api::PodListRequest::try_new(
         Some(namespace.clone()),
@@ -173,8 +174,7 @@ pub(in crate::api) async fn list_pods(
 
     // Return Table format if requested by kubectl
     if wants_table_format(&headers)? {
-        let now = state.operational().clock.now();
-        let table = pod_list_to_table_at(items, resource_version, now);
+        let table = pod_list_to_table_at(items, resource_version, operation_now);
         return Ok(Json(table).into_response());
     }
 
@@ -186,10 +186,11 @@ pub(in crate::api) async fn list_pods(
     if let Some(ref name) = list_continue_token {
         // Normal pages keep the session RV; inconsistent recovery pages must
         // keep returning inconsistent tokens.
-        let token = crate::api::query::encode_response_continue_token(
+        let token = crate::api::query::encode_response_continue_token_at(
             name,
             response_rv,
             continue_resource_version,
+            operation_now.unix_timestamp(),
         );
         metadata["continue"] = serde_json::json!(token);
     }
@@ -522,6 +523,7 @@ pub(in crate::api) async fn list_all_pods(
             .unwrap());
     }
 
+    let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
 
     let has_continue = query
@@ -532,7 +534,7 @@ pub(in crate::api) async fn list_all_pods(
 
     // Decode continue token: check TTL and extract name for DB filter.
     let (db_continue_name, continue_resource_version) =
-        process_continue_token(query.continue_token)?;
+        process_continue_token_at(query.continue_token, operation_now.unix_timestamp())?;
 
     let list_query = klights_pod_api::PodListRequest::try_new(
         None,
@@ -585,8 +587,7 @@ pub(in crate::api) async fn list_all_pods(
 
     // Return Table format if requested by kubectl
     if wants_table_format(&headers)? {
-        let now = state.operational().clock.now();
-        let table = pod_list_to_table_at(items, resource_version, now);
+        let table = pod_list_to_table_at(items, resource_version, operation_now);
         return Ok(Json(table).into_response());
     }
 
@@ -596,10 +597,11 @@ pub(in crate::api) async fn list_all_pods(
         "resourceVersion": resource_version,
     });
     if let Some(ref name) = list_continue_token {
-        let token = crate::api::query::encode_response_continue_token(
+        let token = crate::api::query::encode_response_continue_token_at(
             name,
             response_rv,
             continue_resource_version,
+            operation_now.unix_timestamp(),
         );
         metadata["continue"] = serde_json::json!(token);
     }

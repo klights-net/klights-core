@@ -151,10 +151,12 @@ impl GeneratedLifecyclePort for GeneratedHandlerAdapter {
 
     fn create_root_ca_config_map(&self, namespace: String) -> GeneratedHandlerFuture<'_, ()> {
         Box::pin(async move {
-            let ca_cert_pem =
-                crate::runtime_fs::read_utf8_async(&self.file_process, &self.ca_cert_path)
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
+            let ca_cert_pem = klights_supervisor::runtime_fs::read_utf8_async(
+                &self.file_process,
+                &self.ca_cert_path,
+            )
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
             crate::controllers::namespace::create_kube_root_ca_configmap_at(
                 self.db.as_ref(),
                 &namespace,

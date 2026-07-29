@@ -324,10 +324,12 @@ async fn test_projected_volume_secret_writes_files() {
     .unwrap();
 
     // Files should exist and be base64-decoded
-    let cert_content = crate::runtime_fs::read_utf8(format!("{}/cert.pem", path)).unwrap();
+    let cert_content =
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/cert.pem", path)).unwrap();
     assert_eq!(cert_content, "cert-data");
 
-    let key_content = crate::runtime_fs::read_utf8(format!("{}/key.pem", path)).unwrap();
+    let key_content =
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/key.pem", path)).unwrap();
     assert_eq!(key_content, "key-data");
 }
 
@@ -385,15 +387,15 @@ async fn test_projected_volume_configmap_without_items_writes_all_keys() {
     .unwrap();
 
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/app.conf", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/app.conf", path)).unwrap(),
         "server=localhost"
     );
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/db.conf", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/db.conf", path)).unwrap(),
         "host=db"
     );
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/log.conf", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/log.conf", path)).unwrap(),
         "level=info"
     );
 }
@@ -528,11 +530,11 @@ async fn test_projected_volume_secret_without_items_writes_all_keys() {
     .unwrap();
 
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/cert.pem", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/cert.pem", path)).unwrap(),
         "-----BEGIN CERT-----"
     );
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/key.pem", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/key.pem", path)).unwrap(),
         "-----BEGIN KEY-----"
     );
 }
@@ -732,18 +734,18 @@ async fn test_projected_volume_combines_configmap_secret_downward_api() {
 
     // All four source types produced files
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/config.yaml", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/config.yaml", path)).unwrap(),
         "app: test"
     );
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/api-key", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/api-key", path)).unwrap(),
         "secret-key-123"
     );
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/token", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/token", path)).unwrap(),
         "my-sa-token"
     );
-    let labels = crate::runtime_fs::read_utf8(format!("{}/labels", path)).unwrap();
+    let labels = klights_supervisor::runtime_fs::read_utf8(format!("{}/labels", path)).unwrap();
     assert!(
         labels.contains("app=\"myapp\""),
         "labels file should contain app label"
@@ -982,7 +984,7 @@ async fn test_projected_volume_sa_token_default_path_is_token() {
     .unwrap();
 
     assert_eq!(
-        crate::runtime_fs::read_utf8(format!("{}/token", path)).unwrap(),
+        klights_supervisor::runtime_fs::read_utf8(format!("{}/token", path)).unwrap(),
         "default-path-token",
         "SA token without explicit path should write to 'token'"
     );

@@ -92,8 +92,8 @@ fn test_build_mounts_sa_volume_via_volume_mount() {
         }]
     });
     let mut volume_paths = HashMap::new();
-    let runtime_ns = crate::paths::runtime_namespace();
-    let projected_path = crate::paths::volumes_root_path(&runtime_ns)
+    let projected_path = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights")
+        .volumes_root()
         .join("test-pod")
         .join("volumes")
         .join("projected")
@@ -500,7 +500,7 @@ async fn test_update_pod_status_triggers_endpoint_reconciliation() {
                 "ready": true,
                 "started": true,
                 "restartCount": 0,
-                "state": {"running": {"startedAt": crate::k8s_time::now_legacy_timestamp()}},
+                "state": {"running": {"startedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(klights_supervisor::SystemWallClock::now_utc())}},
                 "image": "nginx",
                 "imageID": "docker.io/library/nginx"
             })],
@@ -633,7 +633,7 @@ async fn test_update_pod_status_preserves_restart_count_and_last_state() {
                 "ready": true,
                 "started": true,
                 "restartCount": 0,
-                "state": {"running": {"startedAt": crate::k8s_time::now_legacy_timestamp()}},
+                "state": {"running": {"startedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(klights_supervisor::SystemWallClock::now_utc())}},
                 "image": "nginx",
                 "imageID": "docker.io/library/nginx"
             })],

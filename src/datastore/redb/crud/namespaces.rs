@@ -417,7 +417,11 @@ mod tests {
             .await
             .unwrap();
         // Insert a resource into this namespace via the resource store.
-        let resources = RedbResourceStore::new(s.accessor.clone(), s.commit_sink.clone());
+        let resources = RedbResourceStore::new(
+            s.accessor.clone(),
+            s.commit_sink.clone(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        );
         resources.create_res("v1", "ConfigMap", Some("hascontent"), "cm",
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"hascontent"}})).await.unwrap();
         let err = s.delete_ns_impl("hascontent").await.unwrap_err();
@@ -430,7 +434,11 @@ mod tests {
         s.create_ns("cnt", json!({"metadata":{"name":"cnt"}}))
             .await
             .unwrap();
-        let resources = RedbResourceStore::new(s.accessor.clone(), s.commit_sink.clone());
+        let resources = RedbResourceStore::new(
+            s.accessor.clone(),
+            s.commit_sink.clone(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        );
         resources
             .create_res(
                 "v1",
@@ -460,7 +468,11 @@ mod tests {
         s.create_ns("excl", json!({"metadata":{"name":"excl"}}))
             .await
             .unwrap();
-        let resources = RedbResourceStore::new(s.accessor.clone(), s.commit_sink.clone());
+        let resources = RedbResourceStore::new(
+            s.accessor.clone(),
+            s.commit_sink.clone(),
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        );
         resources
             .create_res(
                 "v1",

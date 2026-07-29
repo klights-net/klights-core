@@ -86,6 +86,7 @@ pub struct OutboxNodeSelfStatusPublisher {
     node_name: String,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
     outbox: std::sync::Arc<Outbox>,
+    wall_clock: std::sync::Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 impl OutboxNodeSelfStatusPublisher {
@@ -93,11 +94,13 @@ impl OutboxNodeSelfStatusPublisher {
         node_name: impl Into<String>,
         query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
         outbox: std::sync::Arc<Outbox>,
+        wall_clock: std::sync::Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self {
             node_name: node_name.into(),
             query,
             outbox,
+            wall_clock,
         }
     }
 }
@@ -156,7 +159,7 @@ impl klights_leader_api::LeaderNodeSelfStatus for OutboxNodeSelfStatusPublisher 
                     },
                     pod_uid: String::new(),
                     command,
-                    now_ms: epoch_ms(),
+                    now_ms: self.wall_clock.now_ms(),
                 })
                 .await
                 .map_err(|error| {
@@ -181,6 +184,7 @@ pub async fn publish_node_network_conditions(
     publisher: &dyn klights_leader_api::LeaderNodeSelfStatus,
     node_name: &str,
     dataplane_health: &klights_network_api::DataplaneHealthSnapshot,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<NodeNetworkRefreshResult> {
     let get = klights_leader_api::node_get_request(
         node_name,
@@ -191,7 +195,7 @@ pub async fn publish_node_network_conditions(
     };
     let conditions = NodeNetworkConditions::from_health(Some(dataplane_health));
     let mut node = existing.data.as_ref().clone();
-    if !apply_network_conditions(&mut node, &conditions) {
+    if !apply_network_conditions(&mut node, &conditions, operation_now) {
         return Ok(NodeNetworkRefreshResult::Unchanged);
     }
     let status = node
@@ -227,7 +231,12 @@ pub async fn refresh_node_network_conditions(
     let conditions = NodeNetworkConditions::from_health(Some(&dataplane_health));
     let mut node = existing.data.as_ref().clone();
     let commit_changed = stamp_git_commit_annotation(&mut node, "test-commit");
-    let status_changed = apply_network_conditions(&mut node, &conditions);
+    let status_changed = apply_network_conditions(
+        &mut node,
+        &conditions,
+        chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("fixed node condition test timestamp"),
+    );
 
     if let Some(outbox) = outbox {
         if !status_changed {
@@ -255,6 +264,7 @@ pub async fn refresh_node_network_conditions(
                 },
                 observed_status_stamp: None,
             },
+            1_700_000_000_000,
         )
         .await
         .context("Failed to enqueue Node network condition refresh")?;
@@ -329,6 +339,7 @@ pub(super) async fn send_node_command(
     node_name: &str,
     node_uid: &str,
     command: StorageCommand,
+    now_ms: i64,
 ) -> Result<OutboxSendRoute> {
     let subject_key = if node_uid.is_empty() {
         format!("v1/Node/{node_name}")
@@ -352,7 +363,7 @@ pub(super) async fn send_node_command(
             },
             pod_uid: String::new(),
             command,
-            now_ms: epoch_ms(),
+            now_ms,
         })
         .await
 }
@@ -397,24 +408,20 @@ pub async fn publish_node_external_ip_if_changed(
     Ok(())
 }
 
-fn epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
-    use crate::k8s_time::now_time as k8s_time_now;
     use crate::kubelet::node_heartbeat::{
         NODE_HEARTBEAT_INTERVAL, build_lease, run_heartbeat_with_interval,
     };
     use crate::networking::dataplane_health::DataplaneHealth;
     use std::sync::{Arc as StdArc, Mutex};
     use std::time::Duration;
+
+    fn k8s_time_now() -> String {
+        klights_cluster_core::k8s_time::format_time(klights_supervisor::SystemWallClock::now_utc())
+    }
 
     fn registration_profile(
         node_mode: &crate::bootstrap::NodeMode,
@@ -1997,7 +2004,12 @@ mod tests {
         .await
         .expect("open node-local db");
         let outbox = std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone()));
-        let publisher = OutboxNodeSelfStatusPublisher::new("worker-a", leader_query, outbox);
+        let publisher = OutboxNodeSelfStatusPublisher::new(
+            "worker-a",
+            leader_query,
+            outbox,
+            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        );
         let command = StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Node".to_string(),
@@ -2067,6 +2079,7 @@ mod tests {
             "worker-a",
             leader_query,
             std::sync::Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
+            std::sync::Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
         let request =
             klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {

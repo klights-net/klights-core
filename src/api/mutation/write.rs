@@ -4,8 +4,13 @@ use serde_json::Value;
 
 use crate::api::AppError;
 
-pub fn prepare_create_metadata(ns: Option<&str>, body: &mut Value, resource_name: &str) {
-    crate::api::inject_create_metadata(ns, body, resource_name);
+pub fn prepare_create_metadata(
+    ns: Option<&str>,
+    body: &mut Value,
+    resource_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    crate::api::inject_create_metadata_at(ns, body, resource_name, now);
 }
 
 pub fn prepare_builtin_generation_for_update(kind: &str, current: &Value, body: &mut Value) {
@@ -141,7 +146,12 @@ mod tests {
     #[test]
     fn prepare_create_metadata_stamps_identity_and_generation() {
         let mut body = serde_json::json!({"metadata": {}});
-        prepare_create_metadata(Some("default"), &mut body, "cm1");
+        prepare_create_metadata(
+            Some("default"),
+            &mut body,
+            "cm1",
+            chrono::DateTime::UNIX_EPOCH,
+        );
 
         assert_eq!(body["metadata"]["namespace"], "default");
         assert_eq!(body["metadata"]["name"], "cm1");

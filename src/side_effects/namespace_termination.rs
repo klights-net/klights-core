@@ -82,7 +82,7 @@ mod tests {
             "kind": "Namespace",
             "metadata": {
                 "name": ns_name,
-                "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
+                "deletionTimestamp": "2026-01-01T00:00:00.000000000Z",
             },
             "spec": { "finalizers": [] },
             "status": { "phase": "Terminating" }

@@ -1872,16 +1872,10 @@ pub fn inject_resource_version(
             );
         }
 
-        // Add creationTimestamp if not present
-        if meta_obj
-            .get("creationTimestamp")
-            .is_none_or(|v| v.is_null())
-        {
-            meta_obj.insert(
-                "creationTimestamp".to_string(),
-                serde_json::Value::String(crate::k8s_time::now_time()),
-            );
-        }
+        // `creationTimestamp` is storage-authored at create time. Response
+        // projection must never invent a fresh timestamp for an existing row:
+        // doing so changes the observable identity on every read and gives
+        // Raft followers a per-process ambient-time effect.
     }
     data
 }

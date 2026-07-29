@@ -3,6 +3,12 @@ use super::*;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn api_test_data_root(namespace: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("klights-api-tests")
+        .join(namespace)
+}
+
 fn apiservice_service_dns_names(service: &str, namespace: &str) -> Vec<String> {
     vec![
         format!("{service}.{namespace}.svc"),
@@ -4189,7 +4195,8 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     use tower::ServiceExt;
 
     let unique_ns = format!("tokenreview-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let etc_dir = crate::paths::etc_dir_path(&unique_ns)
+    let etc_dir = api_test_data_root(&unique_ns)
+        .join("etc")
         .to_string_lossy()
         .into_owned();
     std::fs::create_dir_all(&etc_dir).unwrap();
@@ -4200,7 +4207,9 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
         .unwrap()
         .to_string();
     std::fs::write(
-        crate::paths::service_account_signing_key_path(&unique_ns),
+        api_test_data_root(&unique_ns)
+            .join("etc")
+            .join("service-account-signing.key"),
         &ca_key_pem,
     )
     .unwrap();
@@ -4209,7 +4218,7 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
-            data_root: crate::paths::data_root_path(&unique_ns),
+            data_root: api_test_data_root(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     state.operational_mut().signing_keys =
@@ -4383,7 +4392,7 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
         "an omitted TokenReview audience must validate the default API audience"
     );
 
-    std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&unique_ns)).ok();
 }
 
 #[tokio::test]
@@ -4399,7 +4408,9 @@ async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     let signing_key = crate::auth::generate_ca_full().unwrap().3;
-    let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
+    let signing_key_path = api_test_data_root(&namespace)
+        .join("etc")
+        .join("service-account-signing.key");
     crate::signing_key_state_adapter::persist(
         &signing_key_path,
         &signing_key,
@@ -4466,7 +4477,7 @@ async fn test_tokenreview_unauthenticated_response_supports_protobuf() {
         "unauthenticated TokenReview JSON and protobuf objects must be identical"
     );
 
-    std::fs::remove_dir_all(crate::paths::data_root_path(&namespace)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&namespace)).ok();
 }
 
 #[tokio::test]
@@ -4528,7 +4539,8 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
     use tower::ServiceExt;
 
     let unique_ns = format!("tokenreview-pod-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let etc_dir = crate::paths::etc_dir_path(&unique_ns)
+    let etc_dir = api_test_data_root(&unique_ns)
+        .join("etc")
         .to_string_lossy()
         .into_owned();
     std::fs::create_dir_all(&etc_dir).unwrap();
@@ -4539,7 +4551,9 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
         .unwrap()
         .to_string();
     std::fs::write(
-        crate::paths::service_account_signing_key_path(&unique_ns),
+        api_test_data_root(&unique_ns)
+            .join("etc")
+            .join("service-account-signing.key"),
         &ca_key_pem,
     )
     .unwrap();
@@ -4548,7 +4562,7 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
-            data_root: crate::paths::data_root_path(&unique_ns),
+            data_root: api_test_data_root(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     state.operational_mut().signing_keys =
@@ -4649,7 +4663,7 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
         "service-account TokenReview must return only token-validated audiences"
     );
 
-    std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&unique_ns)).ok();
 }
 
 #[tokio::test]
@@ -5089,7 +5103,7 @@ async fn test_tokenreview_reports_signing_key_dependency_failure_in_status() {
     });
 
     assert_tokenreview_dependency_failure_formats(app, &request).await;
-    std::fs::remove_dir_all(crate::paths::data_root_path(&namespace)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&namespace)).ok();
 }
 
 async fn assert_tokenreview_dependency_failure_formats(
@@ -5231,7 +5245,9 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
     config.containerd_namespace = namespace.clone();
     state.operational_mut().config = crate::api::ApiOperationalConfig::from_test(config);
     let signing_key = crate::auth::generate_ca_full().unwrap().3;
-    let signing_key_path = crate::paths::service_account_signing_key_path(&namespace);
+    let signing_key_path = api_test_data_root(&namespace)
+        .join("etc")
+        .join("service-account-signing.key");
     crate::signing_key_state_adapter::persist(
         &signing_key_path,
         &signing_key,
@@ -5247,7 +5263,7 @@ async fn test_tokenreview_reports_oidc_internal_failure_in_status() {
         "spec": {"token": "header.payload.signature"}
     });
     assert_tokenreview_dependency_failure_formats(app, &request).await;
-    std::fs::remove_dir_all(crate::paths::data_root_path(&namespace)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&namespace)).ok();
 }
 
 #[tokio::test]
@@ -5294,7 +5310,8 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
         "tokenreview-node-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let etc_dir = crate::paths::etc_dir_path(&unique_ns)
+    let etc_dir = api_test_data_root(&unique_ns)
+        .join("etc")
         .to_string_lossy()
         .into_owned();
     std::fs::create_dir_all(&etc_dir).unwrap();
@@ -5305,7 +5322,9 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
         .unwrap()
         .to_string();
     std::fs::write(
-        crate::paths::service_account_signing_key_path(&unique_ns),
+        api_test_data_root(&unique_ns)
+            .join("etc")
+            .join("service-account-signing.key"),
         &ca_key_pem,
     )
     .unwrap();
@@ -5314,7 +5333,7 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
-            data_root: crate::paths::data_root_path(&unique_ns),
+            data_root: api_test_data_root(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     state.operational_mut().signing_keys =
@@ -5417,7 +5436,7 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
         node_name
     );
 
-    std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&unique_ns)).ok();
 }
 
 #[tokio::test]
@@ -5434,7 +5453,8 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
         "tokenreview-gone-{}",
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let etc_dir = crate::paths::etc_dir_path(&unique_ns)
+    let etc_dir = api_test_data_root(&unique_ns)
+        .join("etc")
         .to_string_lossy()
         .into_owned();
     std::fs::create_dir_all(&etc_dir).unwrap();
@@ -5445,7 +5465,9 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
         .unwrap()
         .to_string();
     std::fs::write(
-        crate::paths::service_account_signing_key_path(&unique_ns),
+        api_test_data_root(&unique_ns)
+            .join("etc")
+            .join("service-account-signing.key"),
         &ca_key_pem,
     )
     .unwrap();
@@ -5454,7 +5476,7 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
-            data_root: crate::paths::data_root_path(&unique_ns),
+            data_root: api_test_data_root(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     // SA exists, but the bound pod was deleted: TokenReview must not report the
@@ -5522,7 +5544,7 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
         "token bound to a deleted pod must not be authenticated"
     );
 
-    std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
+    std::fs::remove_dir_all(api_test_data_root(&unique_ns)).ok();
 }
 
 #[tokio::test]

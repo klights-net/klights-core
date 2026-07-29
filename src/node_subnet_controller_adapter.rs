@@ -135,6 +135,7 @@ impl NodeReadinessPublisher for KubeletNodeReadinessPublisher {
                 self.node_status.as_ref(),
                 node_name,
                 health,
+                klights_supervisor::SystemWallClock::now_utc(),
             )
             .await
             .map_err(|error| {

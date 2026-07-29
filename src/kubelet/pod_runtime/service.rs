@@ -243,6 +243,7 @@ pub struct RealPodRuntimeService {
     pub(super) container_control: Arc<dyn ContainerRuntimeControl>,
     pub(super) network: Arc<dyn PodNetworkRuntime>,
     pub(super) store: Arc<dyn PodRuntimeStore>,
+    pub(super) clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     pub(super) slot_admission: Arc<dyn PodSlotAdmission>,
     pub(super) repository: Arc<dyn PodRuntimeRepository>,
     pub(super) filesystem: Arc<dyn PodFilesystem>,
@@ -269,7 +270,10 @@ impl RealPodRuntimeService {
         resource_version: i64,
     ) -> anyhow::Result<bool> {
         let Some(deadline_secs) =
-            crate::kubelet::pod_runtime::active_deadline::exceeded_active_deadline_seconds(pod)
+            crate::kubelet::pod_runtime::active_deadline::exceeded_active_deadline_seconds_at(
+                pod,
+                self.clock.now_ms().div_euclid(1_000),
+            )
         else {
             return Ok(false);
         };
@@ -540,6 +544,7 @@ impl RealPodRuntimeService {
                         &new_container_id,
                         status,
                         &last_state_for_status,
+                        self.clock.now_utc(),
                     ) {
                         replace_container_status(
                             &mut restarted_statuses,
@@ -694,6 +699,7 @@ impl RealPodRuntimeService {
             container_control,
             network,
             store,
+            clock,
             slot_admission,
             repository,
             filesystem,
@@ -716,6 +722,7 @@ impl RealPodRuntimeService {
             container_control,
             network,
             store,
+            clock,
             slot_admission,
             repository,
             filesystem,
@@ -807,7 +814,9 @@ impl RealPodRuntimeService {
                 && event.kind == CriRuntimeContainerEventKind::Stopped
             {
                 let status = self.cri.container_status(container_id).await?;
-                if let Some(stopped) = init_container_stop_from_status(&status) {
+                if let Some(stopped) =
+                    init_container_stop_from_status(&status, self.clock.now_ms().div_euclid(1_000))
+                {
                     return Ok(stopped);
                 }
                 anyhow::bail!(
@@ -827,7 +836,10 @@ impl RealPodRuntimeService {
         container_id: &str,
     ) -> anyhow::Result<Option<InitContainerStop>> {
         let status = self.cri.container_status(container_id).await?;
-        Ok(init_container_stop_from_status(&status))
+        Ok(init_container_stop_from_status(
+            &status,
+            self.clock.now_ms().div_euclid(1_000),
+        ))
     }
 }
 
@@ -1441,10 +1453,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     )
                 })?;
 
-            let started_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let started_at = self.clock.now_ms().div_euclid(1_000);
             self.cri.start_container(&container_id).await.map_err(|e| {
                 anyhow::anyhow!("failed to start init container {}: {:#}", container_name, e)
             })?;
@@ -1505,14 +1514,19 @@ impl PodRuntimeService for RealPodRuntimeService {
                         restart_policy,
                         exit_code,
                     );
-                let terminated =
-                    build_init_failure_terminated_state(exit_code, started_at, stopped.finished_at);
+                let terminated = build_init_failure_terminated_state(
+                    exit_code,
+                    started_at,
+                    stopped.finished_at,
+                    self.clock.now_utc(),
+                );
                 let next_init_statuses = if retry {
                     build_retrying_init_container_statuses(
                         &pod,
                         container_name,
                         &init_container_statuses,
                         terminated,
+                        self.clock.now_utc(),
                     )
                 } else {
                     build_failed_init_container_statuses(
@@ -1521,6 +1535,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         exit_code,
                         started_at,
                         stopped.finished_at,
+                        self.clock.now_utc(),
                     )
                 };
                 self.write_pod_status(
@@ -1562,6 +1577,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     exit_code,
                     started_at,
                     stopped.finished_at,
+                    self.clock.now_utc(),
                 ),
             );
         }
@@ -2272,6 +2288,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 &key,
                 &resource.data,
                 &containers,
+                self.clock.now_utc(),
             )
             .await;
         if let Some(restarted_statuses) = self
@@ -2587,7 +2604,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     container_id,
                     image.to_string(),
                     String::new(),
-                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+                    self.clock.now_ms().saturating_mul(1_000_000),
                 ),
             );
         }
@@ -2684,6 +2701,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         image: &image,
                         image_ref: &image_ref,
                     },
+                    self.clock.now_utc(),
                 ));
                 continue;
             }
@@ -2707,6 +2725,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         .unwrap_or(""),
                     image_ref: "",
                 },
+                self.clock.now_utc(),
             ));
         }
 

@@ -151,6 +151,7 @@ pub struct PodDeleteCoordinator {
     queue: Arc<dyn PodDeleteQueuePort>,
     sleeper: Arc<dyn PodDeleteSleeperPort>,
     metrics: Arc<dyn ReconcileFailureMetrics>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 impl PodDeleteCoordinator {
@@ -159,12 +160,14 @@ impl PodDeleteCoordinator {
         workqueue: Arc<PodWorkqueue>,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self::new_with_ports(
             store,
             Arc::new(WorkqueuePodDeleteQueue { workqueue }),
             Arc::new(SupervisorPodDeleteSleeper { supervisor }),
             metrics,
+            wall_clock,
         )
     }
 
@@ -173,12 +176,14 @@ impl PodDeleteCoordinator {
         queue: Arc<dyn PodDeleteQueuePort>,
         sleeper: Arc<dyn PodDeleteSleeperPort>,
         metrics: Arc<dyn ReconcileFailureMetrics>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self {
             store,
             queue,
             sleeper,
             metrics,
+            wall_clock,
         }
     }
 
@@ -189,7 +194,11 @@ impl PodDeleteCoordinator {
     ) -> Value {
         let grace_period_seconds =
             pod_delete_grace_period_seconds(&resource.data, requested_grace_period_seconds);
-        let mut data = pod_data_with_deletion_metadata(&resource.data, grace_period_seconds);
+        let mut data = pod_data_with_deletion_metadata(
+            &resource.data,
+            grace_period_seconds,
+            self.wall_clock.now_utc(),
+        );
         if let Some(obj) = data.as_object_mut()
             && let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
         {
@@ -265,7 +274,11 @@ impl PodDeleteCoordinator {
             ensure_resource_preconditions_match(&delete_base, delete_preconditions)?;
             let grace_period_seconds =
                 pod_delete_grace_period_seconds(&delete_base.data, requested_grace_period_seconds);
-            let data = pod_data_with_deletion_metadata(&delete_base.data, grace_period_seconds);
+            let data = pod_data_with_deletion_metadata(
+                &delete_base.data,
+                grace_period_seconds,
+                self.wall_clock.now_utc(),
+            );
             let mark_result = if delete_preconditions.resource_version.is_some() {
                 self.store
                     .mark_deleting_at_resource_version(
@@ -439,7 +452,11 @@ fn is_repository_conflict(error: &anyhow::Error) -> bool {
     )
 }
 
-pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> Value {
+pub(super) fn pod_data_with_deletion_metadata(
+    data: &Value,
+    grace_period_seconds: i64,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> Value {
     let mut data = data.clone();
     if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut())
         && meta
@@ -448,7 +465,9 @@ pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds
     {
         meta.insert(
             "deletionTimestamp".to_string(),
-            Value::String(crate::k8s_time::now_legacy_timestamp()),
+            Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                operation_now,
+            )),
         );
         meta.insert(
             "deletionGracePeriodSeconds".to_string(),
@@ -459,7 +478,8 @@ pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds
         .pointer("/metadata/deletionTimestamp")
         .is_some_and(|timestamp| !timestamp.is_null())
     {
-        let transition_time = crate::k8s_time::now_legacy_timestamp();
+        let transition_time =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
         klights_types::mark_terminating_pod_unready_at(&mut data, &transition_time);
     }
     data
@@ -682,6 +702,7 @@ mod tests {
             queue.clone(),
             Arc::new(NoopDeleteSleeper),
             metrics.clone(),
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         );
 
         let err = coordinator

@@ -53,7 +53,7 @@ pub async fn init_default_namespaces_with_ca_path<S: NamespaceBootstrapStore + ?
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     // Read CA cert once (will be used for all namespaces)
-    let ca_cert_pem = crate::runtime_fs::read_utf8_async(file_process, ca_cert_path)
+    let ca_cert_pem = klights_supervisor::runtime_fs::read_utf8_async(file_process, ca_cert_path)
         .await
         .ok();
 
@@ -280,13 +280,14 @@ pub async fn reconcile_kube_root_ca_with_path<S: NamespaceBootstrapStore + ?Size
     }
 
     // Read the CA cert from the bootstrap file
-    let ca_pem = match crate::runtime_fs::read_utf8_async(file_process, ca_cert_path).await {
-        Ok(pem) => pem,
-        Err(e) => {
-            tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
-            return Ok(());
-        }
-    };
+    let ca_pem =
+        match klights_supervisor::runtime_fs::read_utf8_async(file_process, ca_cert_path).await {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
+                return Ok(());
+            }
+        };
 
     create_kube_root_ca_configmap_at(store, namespace, &ca_pem, now).await
 }
@@ -325,13 +326,14 @@ pub async fn reconcile_kube_root_ca_data_with_path<S: NamespaceBootstrapStore + 
     }
 
     // Read the CA cert from the bootstrap file
-    let ca_pem = match crate::runtime_fs::read_utf8_async(file_process, ca_cert_path).await {
-        Ok(pem) => pem,
-        Err(e) => {
-            tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
-            return Ok(());
-        }
-    };
+    let ca_pem =
+        match klights_supervisor::runtime_fs::read_utf8_async(file_process, ca_cert_path).await {
+            Ok(pem) => pem,
+            Err(e) => {
+                tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
+                return Ok(());
+            }
+        };
 
     // Get current CM and update its data
     let Some(cm) = store.get_configmap(namespace, "kube-root-ca.crt").await? else {
@@ -497,6 +499,90 @@ mod tests {
     use super::*;
     use tokio::sync::{Mutex, MutexGuard};
 
+    struct NamespaceRuntimeFixture {
+        _data_root: tempfile::TempDir,
+        ca_cert_path: std::path::PathBuf,
+        ca_pem: String,
+        apiservice_proxy_common_name: String,
+    }
+
+    impl NamespaceRuntimeFixture {
+        fn new() -> Self {
+            let data_root = tempfile::tempdir().expect("create namespace runtime fixture");
+            let etc_dir = data_root.path().join("etc");
+            std::fs::create_dir_all(&etc_dir).expect("create namespace runtime etc directory");
+
+            let (ca_cert, ca_key, ca_pem, ca_key_pem) =
+                crate::auth::generate_ca_full().expect("generate namespace fixture CA");
+            let (proxy_cert_pem, proxy_key_pem) = crate::auth::generate_apiservice_proxy_cert(
+                &ca_cert,
+                &ca_key,
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("generate APIService proxy client identity");
+            let ca_cert_path = etc_dir.join("ca.crt");
+            std::fs::write(&ca_cert_path, &ca_pem).expect("write namespace fixture CA");
+            std::fs::write(etc_dir.join("ca.key"), ca_key_pem)
+                .expect("write namespace fixture CA key");
+            std::fs::write(etc_dir.join("apiservice-proxy.crt"), &proxy_cert_pem)
+                .expect("write APIService proxy client certificate");
+            std::fs::write(etc_dir.join("apiservice-proxy.key"), &proxy_key_pem)
+                .expect("write APIService proxy client key");
+            assert!(
+                crate::auth::cert::apiservice_proxy_cert_and_key_match_config(
+                    &proxy_cert_pem,
+                    &proxy_key_pem,
+                ),
+                "namespace fixture must carry the canonical APIService proxy identity"
+            );
+
+            let proxy_cert_der = rustls_pemfile::certs(&mut proxy_cert_pem.as_bytes())
+                .next()
+                .expect("APIService proxy certificate PEM block")
+                .expect("parse APIService proxy certificate");
+            let proxy_user = crate::auth::user_from_cert(proxy_cert_der.as_ref())
+                .expect("read APIService proxy certificate identity");
+
+            Self {
+                _data_root: data_root,
+                ca_cert_path,
+                ca_pem,
+                apiservice_proxy_common_name: proxy_user.username,
+            }
+        }
+
+        async fn init_default_namespaces(&self, db: &dyn DatastoreBackend) -> Result<()> {
+            let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+            super::init_default_namespaces_with_ca_path(
+                &file_process,
+                db,
+                &self.ca_cert_path,
+                "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
+            )
+            .await
+        }
+
+        async fn reconcile_kube_root_ca(
+            &self,
+            db: &dyn DatastoreBackend,
+            namespace: &str,
+        ) -> Result<()> {
+            let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+            super::reconcile_kube_root_ca_with_path(
+                &file_process,
+                db,
+                namespace,
+                &self.ca_cert_path,
+                "2026-01-01T00:00:00Z".parse().expect("fixed test time"),
+            )
+            .await
+        }
+
+        fn requestheader_allowed_names(&self) -> serde_json::Value {
+            serde_json::json!(format!("[\"{}\"]", self.apiservice_proxy_common_name))
+        }
+    }
+
     async fn init_default_namespaces(db: &dyn DatastoreBackend) -> Result<()> {
         let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         super::init_default_namespaces(&file_process, db).await
@@ -589,20 +675,9 @@ mod tests {
     async fn test_init_default_namespaces_creates_kube_root_ca_configmaps() {
         // Setup test database
         let db = crate::datastore::test_support::in_memory().await;
+        let runtime = NamespaceRuntimeFixture::new();
 
-        // Use a unique namespace to avoid global state conflicts in parallel tests
-        let unique_ns = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let test_root = crate::paths::data_root_path(&unique_ns);
-        let ca_cert_path = crate::paths::ca_cert_path(&unique_ns);
-        let ca_pem = "-----BEGIN CERTIFICATE-----\ntest-ca-data\n-----END CERTIFICATE-----";
-
-        std::fs::create_dir_all(ca_cert_path.parent().unwrap()).unwrap();
-        std::fs::write(&ca_cert_path, ca_pem).unwrap();
-
-        let env_guard = set_containerd_namespace_for_test(&unique_ns).await;
-
-        init_default_namespaces(&db).await.unwrap();
-        drop(env_guard);
+        runtime.init_default_namespaces(&db).await.unwrap();
 
         // Verify each namespace has kube-root-ca.crt ConfigMap
         for ns_name in ["default", "kube-system", "kube-public", "kube-node-lease"] {
@@ -620,11 +695,8 @@ mod tests {
             let cm_data = cm.unwrap().data;
             assert_eq!(cm_data["metadata"]["name"], "kube-root-ca.crt");
             assert_eq!(cm_data["metadata"]["namespace"], ns_name);
-            assert_eq!(cm_data["data"]["ca.crt"], ca_pem);
+            assert_eq!(cm_data["data"]["ca.crt"], runtime.ca_pem);
         }
-
-        // Cleanup
-        std::fs::remove_dir_all(&test_root).ok();
     }
 
     #[tokio::test]
@@ -651,6 +723,7 @@ mod tests {
     #[tokio::test]
     async fn test_reconcile_kube_root_ca_recreates_after_deletion() {
         let db = crate::datastore::test_support::in_memory().await;
+        let runtime = NamespaceRuntimeFixture::new();
 
         // Create namespace so reconcile can check termination status
         let ns = serde_json::json!({
@@ -662,15 +735,11 @@ mod tests {
         });
         db.create_namespace("test-ns", ns).await.unwrap();
 
-        // Write CA cert to the expected path
-        let unique_ns = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let ca_cert_path = crate::paths::ca_cert_path(&unique_ns);
-        std::fs::create_dir_all(ca_cert_path.parent().unwrap()).unwrap();
-        std::fs::write(&ca_cert_path, "fake-ca-pem").unwrap();
-        let env_guard = set_containerd_namespace_for_test(&unique_ns).await;
-
         // First reconcile: creates the ConfigMap
-        reconcile_kube_root_ca(&db, "test-ns").await.unwrap();
+        runtime
+            .reconcile_kube_root_ca(&db, "test-ns")
+            .await
+            .unwrap();
         let cm = db
             .get_resource("v1", "ConfigMap", Some("test-ns"), "kube-root-ca.crt")
             .await
@@ -688,7 +757,10 @@ mod tests {
         assert!(cm.is_none(), "kube-root-ca.crt should be deleted");
 
         // Second reconcile: recreates it
-        reconcile_kube_root_ca(&db, "test-ns").await.unwrap();
+        runtime
+            .reconcile_kube_root_ca(&db, "test-ns")
+            .await
+            .unwrap();
         let cm = db
             .get_resource("v1", "ConfigMap", Some("test-ns"), "kube-root-ca.crt")
             .await
@@ -697,9 +769,6 @@ mod tests {
             cm.is_some(),
             "kube-root-ca.crt should be recreated after deletion"
         );
-
-        drop(env_guard);
-        std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
     }
 
     #[tokio::test]
@@ -893,14 +962,7 @@ mod tests {
     #[tokio::test]
     async fn test_init_default_namespaces_updates_legacy_extension_auth_allowed_names() {
         let db = crate::datastore::test_support::in_memory().await;
-
-        let unique_ns = format!("test-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        let test_root = crate::paths::data_root_path(&unique_ns);
-        let ca_cert_path = crate::paths::ca_cert_path(&unique_ns);
-        let ca_pem = "-----BEGIN CERTIFICATE-----\next-auth-ca\n-----END CERTIFICATE-----";
-
-        std::fs::create_dir_all(ca_cert_path.parent().unwrap()).unwrap();
-        std::fs::write(&ca_cert_path, ca_pem).unwrap();
+        let runtime = NamespaceRuntimeFixture::new();
         db.create_resource(
             "v1",
             "ConfigMap",
@@ -913,11 +975,11 @@ mod tests {
                     "name": "extension-apiserver-authentication",
                     "namespace": "kube-system",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": crate::k8s_time::now_time()
+                    "creationTimestamp": "2026-01-01T00:00:00Z"
                 },
                 "data": {
-                    "client-ca-file": ca_pem,
-                    "requestheader-client-ca-file": ca_pem,
+                    "client-ca-file": runtime.ca_pem.as_str(),
+                    "requestheader-client-ca-file": runtime.ca_pem.as_str(),
                     "requestheader-allowed-names": "[]",
                     "requestheader-username-headers": "[\"X-Remote-User\"]",
                     "requestheader-group-headers": "[\"X-Remote-Group\"]",
@@ -928,9 +990,7 @@ mod tests {
         .await
         .unwrap();
 
-        let env_guard = set_containerd_namespace_for_test(&unique_ns).await;
-        init_default_namespaces(&db).await.unwrap();
-        drop(env_guard);
+        runtime.init_default_namespaces(&db).await.unwrap();
 
         let cm = db
             .get_resource(
@@ -944,10 +1004,8 @@ mod tests {
             .expect("extension-apiserver-authentication must exist in kube-system");
         assert_eq!(
             cm.data["data"]["requestheader-allowed-names"],
-            serde_json::json!("[\"system:klights:apiservice-proxy\"]")
+            runtime.requestheader_allowed_names()
         );
-
-        std::fs::remove_dir_all(&test_root).ok();
     }
 
     #[tokio::test]

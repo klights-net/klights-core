@@ -349,7 +349,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         mode: "root".to_string(),
         hostport_range: Some("30000-30100".to_string()),
     };
-    let put_commit = crate::replication::log_apply_wire::test_live_commit(
+    let put_commit = crate::datastore::test_support::test_live_commit(
         1,
         vec![LogApplyMutation::PutNodeSubnet(put.clone())],
     );
@@ -378,7 +378,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         "node subnet rows must be deterministic between leader and follower after put replay",
     );
 
-    let allocate_commit = crate::replication::log_apply_wire::test_live_commit(
+    let allocate_commit = crate::datastore::test_support::test_live_commit(
         2,
         vec![LogApplyMutation::AllocateNodeSubnet(
             LogApplyNodeSubnetAllocation {
@@ -428,7 +428,7 @@ async fn raft_node_subnet_replay_is_deterministic() {
         "node subnet rows must match between leader and follower after allocation replay",
     );
 
-    let delete_commit = crate::replication::log_apply_wire::test_live_commit(
+    let delete_commit = crate::datastore::test_support::test_live_commit(
         3,
         vec![LogApplyMutation::DeleteNodeSubnet {
             node_name: "node-alpha".to_string(),
@@ -483,7 +483,7 @@ async fn raft_node_dataplane_replay_is_deterministic() {
         endpoint: "10.99.0.10".to_string(),
         port: Some(51820),
     };
-    let put_commit = crate::replication::log_apply_wire::test_live_commit(
+    let put_commit = crate::datastore::test_support::test_live_commit(
         1,
         vec![LogApplyMutation::PutNodeDataplane(put)],
     );
@@ -511,7 +511,7 @@ async fn raft_node_dataplane_replay_is_deterministic() {
         "node_dataplane replay must be byte-identical between leader and follower",
     );
 
-    let delete_commit = crate::replication::log_apply_wire::test_live_commit(
+    let delete_commit = crate::datastore::test_support::test_live_commit(
         2,
         vec![LogApplyMutation::DeleteNodeDataplane {
             node_name: "node-gamma".to_string(),

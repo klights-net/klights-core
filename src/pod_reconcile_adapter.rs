@@ -250,11 +250,12 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
     ) -> NamespaceTerminationFuture<'_> {
         Box::pin(async move {
             let outcome = match request.expected_uid {
-                Some(uid) => crate::api::reconcile_namespace_termination_for_uid_with_outcome(
+                Some(uid) => crate::api::reconcile_namespace_termination_for_uid_with_outcome_at(
                     self.namespace_lifecycle.as_ref(),
                     &request.namespace,
                     &uid,
                     self.metrics.as_ref(),
+                    klights_supervisor::SystemWallClock::now_utc(),
                 )
                 .await
                 .map(|outcome| match outcome {
@@ -265,10 +266,11 @@ impl NamespaceTerminationSink for PodReconcileAdapter {
                         NamespaceTerminationOutcome::StillPending
                     }
                 }),
-                None => crate::api::reconcile_namespace_termination(
+                None => crate::api::reconcile_namespace_termination_at(
                     self.namespace_lifecycle.as_ref(),
                     &request.namespace,
                     self.metrics.as_ref(),
+                    klights_supervisor::SystemWallClock::now_utc(),
                 )
                 .await
                 .map(|()| NamespaceTerminationOutcome::Finalized),

@@ -20,7 +20,7 @@ pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
         "spec": {
             "holderIdentity": node_name,
             "leaseDurationSeconds": klights_cluster_core::DEFAULT_NODE_LEASE_DURATION_SECONDS,
-            "renewTime": crate::k8s_time::now_microtime()
+            "renewTime": klights_cluster_core::k8s_time::format_microtime(klights_supervisor::SystemWallClock::now_utc())
         }
     })
 }
@@ -41,6 +41,7 @@ pub trait NodeHeartbeatClock: Send + Sync {
 // the cadence in one place: cluster-core's node lease contract.
 pub(crate) const NODE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(klights_cluster_core::DEFAULT_NODE_HEARTBEAT_INTERVAL_SECONDS as u64);
+const NODE_HEARTBEAT_EVENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Run the node heartbeat loop: renews the kube-node-lease every
 /// NODE_HEARTBEAT_INTERVAL (and on Node watch events) via the memory-only
@@ -90,6 +91,7 @@ pub(crate) async fn run_heartbeat_with_interval(
     }
 
     let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
+    let mut next_event_attempt = None;
     loop {
         let delay = next_heartbeat.saturating_duration_since(tokio::time::Instant::now());
         tokio::select! {
@@ -109,10 +111,15 @@ pub(crate) async fn run_heartbeat_with_interval(
                 next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
                 tracing::debug!("Node heartbeat sent for {}", node_name);
             }
-            event = event_source.next_node_event() => {
+            event = next_heartbeat_event(
+                event_source.as_ref(),
+                task_supervisor.as_ref(),
+                next_event_attempt,
+            ) => {
                 match event {
                     Ok(NodeHeartbeatEvent::NodeChanged { node_name: changed_node })
                         if changed_node == node_name => {
+                        next_event_attempt = None;
                         if let Err(err) =
                             renew_lease_with_client(
                                 lease_client.as_ref(),
@@ -126,17 +133,45 @@ pub(crate) async fn run_heartbeat_with_interval(
                         tracing::debug!("Node heartbeat sent for {}", node_name);
                     }
                     Ok(NodeHeartbeatEvent::ReplayExpired) => {
+                        next_event_attempt = None;
                         tracing::warn!("Node heartbeat replay window expired; waiting for next signal");
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        next_event_attempt = None;
+                    }
                     Err(err) => {
-                        tracing::warn!("Node heartbeat event source failed: {err:#}");
-                        break;
+                        // Node observation is only an acceleration signal for
+                        // the periodic lease renewal. Leader-proxy watches
+                        // intentionally close when authority changes, and
+                        // transport watches can fail transiently. Neither may
+                        // terminate kubelet liveness. Reconnect after a
+                        // supervised one-shot delay so persistent failures
+                        // remain idle-silent rather than spinning.
+                        tracing::warn!(
+                            retry_after = ?NODE_HEARTBEAT_EVENT_RETRY_DELAY,
+                            "Node heartbeat event source failed; periodic renewal remains active: {err:#}"
+                        );
+                        next_event_attempt =
+                            Some(tokio::time::Instant::now() + NODE_HEARTBEAT_EVENT_RETRY_DELAY);
                     }
                 }
             }
         };
     }
+}
+
+async fn next_heartbeat_event(
+    event_source: &dyn NodeHeartbeatEventSource,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    retry_at: Option<tokio::time::Instant>,
+) -> Result<NodeHeartbeatEvent> {
+    if let Some(retry_at) = retry_at {
+        let delay = retry_at.saturating_duration_since(tokio::time::Instant::now());
+        task_supervisor
+            .sleep("node_heartbeat_event_retry", delay)
+            .await?;
+    }
+    event_source.next_node_event().await
 }
 
 async fn renew_lease_with_client(
@@ -266,29 +301,43 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
-    async fn event_source_error_stops_after_initial_renewal() {
+    #[tokio::test(start_paused = true)]
+    async fn leadership_watch_closure_does_not_stop_controlplane_renewal() {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
         event_tx
-            .send(Err(anyhow::anyhow!("watch closed")))
+            .send(Err(anyhow::anyhow!(
+                "leadership-switching Node watch closed"
+            )))
             .await
             .expect("queue source error");
         let source = Arc::new(ChannelEventSource {
             events: tokio::sync::Mutex::new(event_rx),
         });
-        let (client, _) = RecordingLeaseClient::new();
-
-        run_heartbeat_with_interval(
+        let (client, count) = RecordingLeaseClient::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(run_heartbeat_with_interval(
             source,
             client.clone(),
             Arc::new(FixedClock),
-            "worker-a".to_string(),
-            tokio_util::sync::CancellationToken::new(),
+            "controlplane-a".to_string(),
+            cancel.clone(),
             supervisor(),
-            Duration::from_secs(60),
-        )
-        .await;
+            Duration::from_secs(10),
+        ));
 
-        assert_eq!(client.requests.lock().expect("request lock").len(), 1);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            *count.borrow() >= 2,
+            "periodic heartbeat must survive the leadership watch closure"
+        );
+        cancel.cancel();
+        task.await.expect("heartbeat task");
+
+        assert!(
+            client.requests.lock().expect("request lock").len() >= 2,
+            "initial and periodic renewals must both reach the leader capability"
+        );
     }
 }

@@ -113,13 +113,20 @@ pub fn should_restart_exited_container(restart_policy: &str, exit_code: i32) -> 
 
 pub fn restart_last_state_from_runtime_status(
     status: Option<&k8s_cri::v1::ContainerStatus>,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     let exit_code = status.map(|status| status.exit_code).unwrap_or(137);
     let mut terminated = serde_json::json!({
         "exitCode": exit_code,
         "reason": if exit_code == 0 { "Completed" } else { "Error" },
-        "startedAt": cri_timestamp_from_ns(status.map(|status| status.started_at).unwrap_or(0)),
-        "finishedAt": cri_timestamp_from_ns(status.map(|status| status.finished_at).unwrap_or(0)),
+        "startedAt": cri_timestamp_from_ns(
+            status.map(|status| status.started_at).unwrap_or(0),
+            operation_now,
+        ),
+        "finishedAt": cri_timestamp_from_ns(
+            status.map(|status| status.finished_at).unwrap_or(0),
+            operation_now,
+        ),
     });
     if let Some(message) =
         status.and_then(|status| (!status.message.is_empty()).then_some(status.message.as_str()))
@@ -152,6 +159,7 @@ pub fn restarted_running_container_status(
     new_container_id: &str,
     observed_status: &serde_json::Value,
     last_state: &serde_json::Value,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Option<serde_json::Value> {
     let container = find_pod_container_spec(pod, container_name)?;
     let image = container
@@ -187,7 +195,7 @@ pub fn restarted_running_container_status(
         "lastState": last_state.clone(),
         "state": {
             "running": {
-                "startedAt": crate::k8s_time::now_legacy_timestamp()
+                "startedAt": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now)
             }
         },
         "image": image,
@@ -238,6 +246,7 @@ pub(super) struct EphemeralContainerStatusInput<'a> {
 
 pub(super) fn build_ephemeral_container_status(
     input: EphemeralContainerStatusInput<'_>,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     let EphemeralContainerStatusInput {
         container_name,
@@ -253,7 +262,7 @@ pub(super) fn build_ephemeral_container_status(
         state if state == k8s_cri::v1::ContainerState::ContainerRunning as i32 => {
             serde_json::json!({
                 "running": {
-                    "startedAt": cri_timestamp_from_ns(started_at_ns)
+                    "startedAt": cri_timestamp_from_ns(started_at_ns, operation_now)
                 }
             })
         }
@@ -262,8 +271,8 @@ pub(super) fn build_ephemeral_container_status(
                 "terminated": {
                     "exitCode": exit_code,
                     "reason": if exit_code == 0 { "Completed" } else { "Error" },
-                    "startedAt": cri_timestamp_from_ns(started_at_ns),
-                    "finishedAt": cri_timestamp_from_ns(finished_at_ns),
+                    "startedAt": cri_timestamp_from_ns(started_at_ns, operation_now),
+                    "finishedAt": cri_timestamp_from_ns(finished_at_ns, operation_now),
                 }
             })
         }
@@ -290,15 +299,18 @@ pub(super) fn build_ephemeral_container_status(
     status
 }
 
-pub(super) fn cri_timestamp_from_ns(ns: i64) -> String {
+pub(super) fn cri_timestamp_from_ns(
+    ns: i64,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> String {
     if ns <= 0 {
-        return crate::k8s_time::now_legacy_timestamp();
+        return klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
     }
     let secs = ns / 1_000_000_000;
     let sub_ns = (ns % 1_000_000_000) as u32;
     chrono::DateTime::from_timestamp(secs, sub_ns)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%fZ").to_string())
-        .unwrap_or_else(crate::k8s_time::now_legacy_timestamp)
+        .unwrap_or_else(|| klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now))
 }
 
 #[cfg(test)]
@@ -360,31 +372,39 @@ mod tests {
 
     #[test]
     fn ephemeral_container_status_projects_cri_states() {
-        let running = build_ephemeral_container_status(EphemeralContainerStatusInput {
-            container_name: "debug",
-            container_id: Some("cid-running"),
-            state: k8s_cri::v1::ContainerState::ContainerRunning as i32,
-            started_at_ns: 1_700_000_000_000_000_000,
-            finished_at_ns: 0,
-            exit_code: 0,
-            image: "busybox",
-            image_ref: "sha256:busybox",
-        });
+        let operation_now = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("fixed ephemeral-container test timestamp");
+        let running = build_ephemeral_container_status(
+            EphemeralContainerStatusInput {
+                container_name: "debug",
+                container_id: Some("cid-running"),
+                state: k8s_cri::v1::ContainerState::ContainerRunning as i32,
+                started_at_ns: 1_700_000_000_000_000_000,
+                finished_at_ns: 0,
+                exit_code: 0,
+                image: "busybox",
+                image_ref: "sha256:busybox",
+            },
+            operation_now,
+        );
         assert_eq!(running["name"], "debug");
         assert_eq!(running["containerID"], "containerd://cid-running");
         assert_eq!(running["ready"], true);
         assert!(running.pointer("/state/running/startedAt").is_some());
 
-        let exited = build_ephemeral_container_status(EphemeralContainerStatusInput {
-            container_name: "debug",
-            container_id: Some("cid-exited"),
-            state: k8s_cri::v1::ContainerState::ContainerExited as i32,
-            started_at_ns: 1_700_000_000_000_000_000,
-            finished_at_ns: 1_700_000_001_000_000_000,
-            exit_code: 2,
-            image: "busybox",
-            image_ref: "sha256:busybox",
-        });
+        let exited = build_ephemeral_container_status(
+            EphemeralContainerStatusInput {
+                container_name: "debug",
+                container_id: Some("cid-exited"),
+                state: k8s_cri::v1::ContainerState::ContainerExited as i32,
+                started_at_ns: 1_700_000_000_000_000_000,
+                finished_at_ns: 1_700_000_001_000_000_000,
+                exit_code: 2,
+                image: "busybox",
+                image_ref: "sha256:busybox",
+            },
+            operation_now,
+        );
         assert_eq!(
             exited.pointer("/state/terminated/exitCode"),
             Some(&serde_json::json!(2))
@@ -394,16 +414,19 @@ mod tests {
             Some(&serde_json::json!("Error"))
         );
 
-        let waiting = build_ephemeral_container_status(EphemeralContainerStatusInput {
-            container_name: "debug",
-            container_id: None,
-            state: k8s_cri::v1::ContainerState::ContainerCreated as i32,
-            started_at_ns: 0,
-            finished_at_ns: 0,
-            exit_code: 0,
-            image: "busybox",
-            image_ref: "",
-        });
+        let waiting = build_ephemeral_container_status(
+            EphemeralContainerStatusInput {
+                container_name: "debug",
+                container_id: None,
+                state: k8s_cri::v1::ContainerState::ContainerCreated as i32,
+                started_at_ns: 0,
+                finished_at_ns: 0,
+                exit_code: 0,
+                image: "busybox",
+                image_ref: "",
+            },
+            operation_now,
+        );
         assert!(waiting.get("containerID").is_none());
         assert_eq!(
             waiting.pointer("/state/waiting/reason"),

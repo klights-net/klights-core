@@ -30,6 +30,8 @@ pub const META_INSERT: &str = "INSERT OR REPLACE INTO _klights_meta (key, value)
 /// writes to `sqlite_master`, sorted by table name for stability.
 /// Indexes are excluded; only the core data model (tables) is fingerprinted.
 pub(super) const SCHEMA_FINGERPRINT: &str =
+    "ca6298deae3dd5dc98e39bb4e5a37655b9fb9518f57c403907f75a74d3098073";
+pub(super) const PRE_CLEANUP_SCHEMA_FINGERPRINT: &str =
     "6f2e17e98d6f0ccd51ba998d0d91b465a75a603d5d8567fb678471dfc9de9d49";
 
 /// Verify the fingerprint matches or initialize it for a fresh DB.
@@ -59,6 +61,14 @@ pub(crate) fn check_or_init(conn: &rusqlite::Connection, db_path: &Path) -> Resu
             Ok(())
         }
         Some(v) if v == SCHEMA_FINGERPRINT => Ok(()),
+        Some(v) if v == PRE_CLEANUP_SCHEMA_FINGERPRINT => {
+            conn.execute(META_INSERT, ("schema_fingerprint", SCHEMA_FINGERPRINT))
+                .map_err(|e| OpenError::Corrupt {
+                    path: db_path.display().to_string(),
+                    details: format!("failed to advance schema_fingerprint: {e}"),
+                })?;
+            Ok(())
+        }
         Some(actual) => Err(OpenError::SchemaMismatch {
             path: db_path.display().to_string(),
             expected: SCHEMA_FINGERPRINT.to_string(),
@@ -131,6 +141,25 @@ mod tests {
         let a = compute_fingerprint_from_live_schema();
         let b = compute_fingerprint_from_live_schema();
         assert_eq!(a, b, "same schema must produce same fingerprint");
+    }
+
+    #[test]
+    fn upgrades_the_known_pre_cleanup_fingerprint_exactly_once() {
+        assert_ne!(SCHEMA_FINGERPRINT, PRE_CLEANUP_SCHEMA_FINGERPRINT);
+
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open");
+        super::super::schema::init_schema_in_conn(&mut conn).expect("init schema");
+        conn.execute(
+            META_INSERT,
+            ("schema_fingerprint", PRE_CLEANUP_SCHEMA_FINGERPRINT),
+        )
+        .expect("seed prior fingerprint");
+
+        check_or_init(&conn, Path::new("legacy-cluster.db")).expect("upgrade fingerprint");
+        let stored: String = conn
+            .query_row(META_SELECT, ["schema_fingerprint"], |row| row.get(0))
+            .expect("read upgraded fingerprint");
+        assert_eq!(stored, SCHEMA_FINGERPRINT);
     }
 
     #[test]

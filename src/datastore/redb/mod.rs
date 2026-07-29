@@ -54,6 +54,7 @@ pub struct RedbDatastore {
     network: RedbNetworkStore,
     rv_store: RedbRvStore,
     snapshot_sessions: Arc<tokio::sync::Semaphore>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl Clone for RedbDatastore {
@@ -63,6 +64,7 @@ impl Clone for RedbDatastore {
             #[cfg(test)]
             self.commit_sink.clone(),
             self.snapshot_sessions.clone(),
+            self.wall_clock.clone(),
         )
     }
 }
@@ -72,12 +74,14 @@ impl RedbDatastore {
         accessor: Arc<RedbAccessor>,
         #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
         snapshot_sessions: Arc<tokio::sync::Semaphore>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             resources: RedbResourceStore::new(
                 accessor.clone(),
                 #[cfg(test)]
                 commit_sink.clone(),
+                wall_clock.clone(),
             ),
             namespaces: RedbNamespaceStore::new(
                 accessor.clone(),
@@ -91,6 +95,7 @@ impl RedbDatastore {
             #[cfg(test)]
             commit_sink,
             snapshot_sessions,
+            wall_clock,
         }
     }
 
@@ -98,6 +103,7 @@ impl RedbDatastore {
         path: &std::path::Path,
         supervisor: Arc<TaskSupervisor>,
         #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         let path = if path.extension().is_none() {
             path.join("redb").join("cluster.redb")
@@ -119,6 +125,7 @@ impl RedbDatastore {
             #[cfg(test)]
             commit_sink,
             Arc::new(tokio::sync::Semaphore::new(1)),
+            wall_clock,
         ))
     }
 
@@ -126,6 +133,7 @@ impl RedbDatastore {
     pub async fn new_in_memory_with_supervisor_and_sink(
         supervisor: Arc<TaskSupervisor>,
         #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         let db = klights_cluster_datastore::redb::open_in_memory(supervisor.as_ref()).await?;
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
@@ -134,6 +142,7 @@ impl RedbDatastore {
             #[cfg(test)]
             commit_sink,
             Arc::new(tokio::sync::Semaphore::new(1)),
+            wall_clock,
         ))
     }
 
@@ -146,6 +155,7 @@ impl RedbDatastore {
             path,
             supervisor,
             crate::watch_commit_observation_adapter::new_sink(),
+            Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
     }
@@ -155,6 +165,7 @@ impl RedbDatastore {
         Self::new_in_memory_with_supervisor_and_sink(
             supervisor,
             crate::watch_commit_observation_adapter::new_sink(),
+            Arc::new(klights_supervisor::SystemWallClock),
         )
         .await
     }
@@ -168,6 +179,7 @@ impl RedbDatastore {
             accessor,
             crate::watch_commit_observation_adapter::new_sink(),
             Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(klights_supervisor::SystemWallClock),
         ))
     }
 }

@@ -104,7 +104,7 @@ pub fn read_termination_message_from_logs(log_path: &str) -> String {
     const MAX_LOG_BYTES: usize = 2048;
     const MAX_LOG_LINES: usize = 80;
 
-    let content = match crate::runtime_fs::read_utf8(log_path) {
+    let content = match klights_supervisor::runtime_fs::read_utf8(log_path) {
         Ok(content) => content,
         Err(_) => return String::new(),
     };
@@ -229,21 +229,14 @@ mod tests {
 
     #[test]
     fn test_termination_log_host_path_returns_expected_path() {
-        let runtime_paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-            crate::paths::data_root_path("klights"),
-        )
-        .unwrap();
+        let runtime_paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("klights");
         let path = termination_log_host_path(&runtime_paths, "default", "mypod", "mycontainer");
         assert_eq!(
             path,
-            crate::paths::containerd_termination_log_path(
-                "klights",
-                "default",
-                "mypod",
-                "mycontainer",
-            )
-            .to_string_lossy()
-            .into_owned()
+            runtime_paths
+                .containerd_termination_log("default", "mypod", "mycontainer")
+                .to_string_lossy()
+                .into_owned()
         );
     }
 

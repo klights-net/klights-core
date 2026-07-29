@@ -7,12 +7,16 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
 }
 
+pub fn chrono_utc(now: OffsetDateTime) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from(std::time::SystemTime::from(now))
+}
+
 /// Production wall-clock source.
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
+        time::OffsetDateTime::from(klights_supervisor::SystemWallClock::now())
     }
 }
 

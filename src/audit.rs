@@ -68,9 +68,10 @@ impl AuditEvent {
         identity: &AuthenticatedIdentity,
         request: &AuthorizationRequest,
         decision: &AuthorizationDecision,
+        operation_now: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         Self {
-            timestamp: crate::k8s_time::now_microtime(),
+            timestamp: klights_cluster_core::k8s_time::format_microtime(operation_now),
             stage: AuditStage::Authorization,
             user: AuditUser::from(identity),
             verb: request.verb.clone(),

@@ -33,7 +33,11 @@ struct MainUpdatePreconditionCheck<'a> {
 }
 
 impl Datastore {
-    fn ensure_deletion_timestamp_in_mark_data(data: &mut Value, grace_seconds: i64) {
+    fn ensure_deletion_timestamp_in_mark_data(
+        data: &mut Value,
+        grace_seconds: i64,
+        deletion_timestamp: &str,
+    ) {
         let Some(meta) = data
             .get_mut("metadata")
             .and_then(|value| value.as_object_mut())
@@ -47,7 +51,7 @@ impl Datastore {
         {
             meta.insert(
                 "deletionTimestamp".to_string(),
-                Value::String(crate::k8s_time::now_legacy_timestamp()),
+                Value::String(deletion_timestamp.to_string()),
             );
         }
         meta.entry("deletionGracePeriodSeconds".to_string())
@@ -74,6 +78,8 @@ impl Datastore {
         let n = name.to_string();
         let expected_rv = preconditions.resource_version;
         let expected_uid = preconditions.uid;
+        let deletion_timestamp =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
 
         let mark_outcome = if use_namespaced_table(api_version, kind, &namespace) {
             let ns = namespace.unwrap_or("default").to_string();
@@ -108,7 +114,11 @@ impl Datastore {
                     return Ok(Some((current_rv, current_bytes)));
                 }
 
-                Self::ensure_deletion_timestamp_in_mark_data(&mut current, grace_seconds);
+                Self::ensure_deletion_timestamp_in_mark_data(
+                    &mut current,
+                    grace_seconds,
+                    &deletion_timestamp,
+                );
                 let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
                 let new_rv = Self::next_resource_version_in_tx(&tx)?;
                 let rows = tx.execute(
@@ -168,7 +178,11 @@ impl Datastore {
                     return Ok(Some((current_rv, current_bytes)));
                 }
 
-                Self::ensure_deletion_timestamp_in_mark_data(&mut current, grace_seconds);
+                Self::ensure_deletion_timestamp_in_mark_data(
+                    &mut current,
+                    grace_seconds,
+                    &deletion_timestamp,
+                );
                 let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
                 let new_rv = Self::next_resource_version_in_tx(&tx)?;
                 let rows = tx.execute(

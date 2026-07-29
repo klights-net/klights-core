@@ -1,7 +1,7 @@
 pub mod payload;
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::Result;
 use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest, OutboxPayloadCodec};
@@ -401,6 +401,7 @@ pub struct Outbox {
     codec: Arc<dyn OutboxPayloadCodec>,
     notify: Arc<Notify>,
     stamp: Arc<tokio::sync::Mutex<StampState>>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 /// In-memory state of the per-node status-stamp allocator. `next` is the last
@@ -487,6 +488,7 @@ impl Outbox {
             OutboxStores::from_node_db(node_db),
             crate::replication::outbox_payload_codec::new_codec(),
             notify,
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 
@@ -494,12 +496,14 @@ impl Outbox {
         stores: OutboxStores,
         codec: Arc<dyn OutboxPayloadCodec>,
         notify: Arc<Notify>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             stores,
             codec,
             notify,
             stamp: Arc::new(tokio::sync::Mutex::new(StampState::default())),
+            wall_clock,
         }
     }
 
@@ -520,10 +524,7 @@ impl Outbox {
     /// stamp already issued. A wall-clock floor keeps freshly issued stamps
     /// comparable in magnitude with rows written before this allocator existed.
     pub async fn next_status_stamp(&self) -> Result<i64> {
-        let now_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
-            .unwrap_or(0);
+        let now_us = wall_clock_epoch_ms(self.wall_clock.as_ref()).saturating_mul(1_000);
         self.next_status_stamp_with_clock(now_us).await
     }
 
@@ -627,7 +628,7 @@ impl Outbox {
     ) -> Result<()> {
         let namespace = pod.namespace.as_deref().unwrap_or("default");
         let previous = self.stores.get_pod_status_checkpoint(&pod.uid).await?;
-        let status = merge_checkpoint_status_for_record(pod, status, previous.as_ref());
+        let status = merge_checkpoint_status_for_record(pod, status, previous.as_ref(), updated_ms);
         self.stores
             .upsert_pod_status_checkpoint(
                 &pod.uid,
@@ -876,14 +877,17 @@ fn merge_checkpoint_status_for_record(
     pod: &Resource,
     mut incoming: Value,
     previous: Option<&PodStatusCheckpointState>,
+    updated_ms: i64,
 ) -> Value {
+    let operation_now =
+        chrono::DateTime::from_timestamp_millis(updated_ms).unwrap_or(chrono::DateTime::UNIX_EPOCH);
     let namespace = pod.namespace.as_deref().unwrap_or("default");
     let Some(previous) = previous else {
-        normalize_bound_pod_scheduled_condition(pod, &mut incoming, None);
+        normalize_bound_pod_scheduled_condition(pod, &mut incoming, None, operation_now);
         return incoming;
     };
     if previous.namespace != namespace || previous.pod_name != pod.name {
-        normalize_bound_pod_scheduled_condition(pod, &mut incoming, None);
+        normalize_bound_pod_scheduled_condition(pod, &mut incoming, None, operation_now);
         return incoming;
     }
 
@@ -898,7 +902,12 @@ fn merge_checkpoint_status_for_record(
         merge_checkpoint_conditions(incoming_obj, previous_obj);
     }
 
-    normalize_bound_pod_scheduled_condition(pod, &mut incoming, Some(&previous.status));
+    normalize_bound_pod_scheduled_condition(
+        pod,
+        &mut incoming,
+        Some(&previous.status),
+        operation_now,
+    );
     incoming
 }
 
@@ -968,6 +977,7 @@ fn normalize_bound_pod_scheduled_condition(
     pod: &Resource,
     status: &mut Value,
     previous_status: Option<&Value>,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) {
     let bound = pod
         .data
@@ -987,7 +997,7 @@ fn normalize_bound_pod_scheduled_condition(
             serde_json::json!({
                 "type": "PodScheduled",
                 "status": "True",
-                "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                "lastTransitionTime": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
             })
         });
 
@@ -1062,6 +1072,7 @@ pub struct OutboxDispatcher {
     /// old fixed 200 ms default, so a lossy ~400 ms RTT backs off on the right
     /// scale. Idle-silent (no applies ⇒ no samples).
     rtt: std::sync::Arc<klights_types::RttEstimator>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl OutboxDispatcher {
@@ -1070,6 +1081,7 @@ impl OutboxDispatcher {
         codec: Arc<dyn OutboxPayloadCodec>,
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self::new_with_rtt_estimator(
             stores,
@@ -1077,6 +1089,7 @@ impl OutboxDispatcher {
             client,
             notify,
             std::sync::Arc::new(klights_types::RttEstimator::new()),
+            wall_clock,
         )
     }
 
@@ -1086,6 +1099,7 @@ impl OutboxDispatcher {
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
         rtt: std::sync::Arc<klights_types::RttEstimator>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             stores,
@@ -1099,6 +1113,7 @@ impl OutboxDispatcher {
             dispatch_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dispatch_errors_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             rtt,
+            wall_clock,
         }
     }
 
@@ -1107,8 +1122,10 @@ impl OutboxDispatcher {
         codec: Arc<dyn OutboxPayloadCodec>,
         client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
-        Self::new(stores, codec, client, notify).with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
+        Self::new(stores, codec, client, notify, wall_clock)
+            .with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
     }
 
     /// Return shared counters so callers (node_admin) can read them
@@ -1151,6 +1168,7 @@ impl OutboxDispatcher {
             crate::replication::outbox_payload_codec::new_codec(),
             client,
             Arc::new(Notify::new()),
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 
@@ -1166,6 +1184,7 @@ impl OutboxDispatcher {
             client,
             Arc::new(Notify::new()),
             rtt,
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 
@@ -1202,6 +1221,7 @@ impl OutboxDispatcher {
             crate::replication::outbox_payload_codec::new_codec(),
             client,
             notify,
+            Arc::new(klights_supervisor::SystemWallClock),
         )
         .with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
     }
@@ -1242,11 +1262,19 @@ impl OutboxDispatcher {
             // stall). A node.db blip, a slow-RPC lease race, or any
             // other transient failure is logged and backed off, then the
             // loop continues. Only `cancel` ends the task.
-            match self.dispatch_due_once(now_ms()).await {
+            match self
+                .dispatch_due_once(wall_clock_epoch_ms(self.wall_clock.as_ref()))
+                .await
+            {
                 Ok(DispatchOutcome::Dispatched) => continue,
                 Ok(DispatchOutcome::Idle { next_wake_ms }) => {
                     let sleep_until = next_wake_ms
-                        .map(instant_for_epoch_ms)
+                        .map(|epoch_ms| {
+                            instant_for_epoch_ms(
+                                epoch_ms,
+                                wall_clock_epoch_ms(self.wall_clock.as_ref()),
+                            )
+                        })
                         .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(()),
@@ -1768,7 +1796,10 @@ impl OutboxDispatcher {
                     if supervisor.root_cancellation_token().is_cancelled() {
                         return Err(klights_leader_api::OutboxDeliveryError::cancelled());
                     }
-                    let leased_until_ms = now_ms().saturating_add(self.lease_ms.max(1));
+                    let leased_until_ms = self
+                        .lease_ms
+                        .max(1)
+                        .saturating_add(wall_clock_epoch_ms(self.wall_clock.as_ref()));
                     let renewed = self
                         .stores
                         .renew_outbox_lease(row.id, lease_token, leased_until_ms)
@@ -1920,15 +1951,23 @@ fn actor_owned_pod_delete_needs_dead_letter(
     row.is_terminal_pod_delete
 }
 
+#[cfg(test)]
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    klights_supervisor::SystemWallClock::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
 
-fn instant_for_epoch_ms(epoch_ms: i64) -> tokio::time::Instant {
-    let now_epoch = now_ms();
+fn wall_clock_epoch_ms(clock: &dyn klights_supervisor::WallClock) -> i64 {
+    clock
+        .now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn instant_for_epoch_ms(epoch_ms: i64, now_epoch: i64) -> tokio::time::Instant {
     if epoch_ms <= now_epoch {
         tokio::time::Instant::now()
     } else {
@@ -3976,6 +4015,7 @@ mod tests {
                 event_type: "Normal",
                 reporting_component: "klights-kubelet",
                 reporting_instance: "node-a",
+                operation_now: klights_supervisor::SystemWallClock::now_utc(),
             },
         )
         .await

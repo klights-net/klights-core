@@ -2697,8 +2697,9 @@ mod inner_gate_tests {
             let data_root = tempfile::tempdir().unwrap();
             let namespace = data_root.path().to_str().unwrap().to_string();
             let signing_key_path = data_root.path().join("etc/service-account-signing.key");
-            crate::runtime_fs::create_dir_all(signing_key_path.parent().unwrap()).unwrap();
-            crate::runtime_fs::write(&signing_key_path, "unused-test-signing-key").unwrap();
+            klights_supervisor::runtime_fs::create_dir_all(signing_key_path.parent().unwrap())
+                .unwrap();
+            std::fs::write(&signing_key_path, "unused-test-signing-key").unwrap();
             let sign_probe = install_projected_token_issue_test_probe(namespace.clone(), reader);
             let client = Arc::new(
                 LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
@@ -2809,9 +2810,9 @@ mod inner_gate_tests {
         let data_root = tempfile::tempdir().unwrap();
         let namespace = data_root.path().to_str().unwrap().to_string();
         let signing_key_path = data_root.path().join("etc/service-account-signing.key");
-        crate::runtime_fs::create_dir_all(signing_key_path.parent().unwrap()).unwrap();
+        klights_supervisor::runtime_fs::create_dir_all(signing_key_path.parent().unwrap()).unwrap();
         let signing_key = crate::auth::generate_ca_full().unwrap().3;
-        crate::runtime_fs::write(&signing_key_path, &signing_key).unwrap();
+        std::fs::write(&signing_key_path, &signing_key).unwrap();
         let local = Arc::new(
             LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
                 LocalApiPersistencePorts::new(db.clone(), test_watch_signals(&db)),

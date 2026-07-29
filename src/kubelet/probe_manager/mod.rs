@@ -78,6 +78,7 @@ pub struct ProbeManager {
     cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
     lifecycle_tx: mpsc::Sender<LifecycleCommand>,
     task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 impl ProbeManager {
@@ -103,6 +104,7 @@ impl ProbeManager {
                 crate::kubelet::pod_runtime::test_support::MockCriRuntime::new(),
             )),
             lifecycle_tx,
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
         )
     }
 
@@ -111,6 +113,7 @@ impl ProbeManager {
         pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader>,
         cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
         lifecycle_tx: mpsc::Sender<LifecycleCommand>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     ) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -119,6 +122,7 @@ impl ProbeManager {
             cri,
             lifecycle_tx,
             task_supervisor,
+            wall_clock,
         }
     }
 
@@ -343,6 +347,7 @@ impl ProbeManager {
                 cri: self.cri.clone(),
                 startup_completed: self.startup_completed.clone(),
                 lifecycle_tx: self.lifecycle_tx.clone(),
+                wall_clock: self.wall_clock.clone(),
             },
             spec,
         )

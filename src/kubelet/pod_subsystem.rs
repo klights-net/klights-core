@@ -48,6 +48,7 @@ pub struct PodSubsystemConfig {
     pub runtime_node_role: RuntimeNodeRole,
     pub runtime_service: Option<Arc<dyn PodRuntimeService>>,
     pub runtime_store: Arc<dyn PodRuntimeStore>,
+    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     pub slot_admission: Arc<dyn PodSlotAdmission>,
     pub event_sink: Arc<dyn PodEventSink>,
 }
@@ -90,6 +91,7 @@ struct RuntimeServiceBuildRequest {
     resource_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
     projected_tokens: Option<Arc<dyn klights_leader_api::LeaderProjectedServiceAccountToken>>,
     runtime_store: Arc<dyn PodRuntimeStore>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     slot_admission: Arc<dyn PodSlotAdmission>,
     event_sink: Arc<dyn PodEventSink>,
     deletion_finalizer:
@@ -128,6 +130,7 @@ impl PodSubsystem {
                     crate::kubelet::pod_lifecycle_router::executor::NoopExecutor,
                 ))),
                 config.pod_actor_idle_grace,
+                config.wall_clock.clone(),
             )
             .with_runtime_observation_store(outbox.clone()),
         );
@@ -138,6 +141,7 @@ impl PodSubsystem {
                 lifecycle_concurrency,
                 PodLifecycleRouteMode::Multiplex,
                 config.pod_actor_idle_grace,
+                config.wall_clock.clone(),
             )),
         };
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
@@ -152,6 +156,7 @@ impl PodSubsystem {
                 repository.clone() as Arc<dyn crate::kubelet::pod_repository::PodReader>,
                 probe_cri_runtime.clone(),
                 lifecycle_tx.clone(),
+                config.wall_clock.clone(),
             ))
         });
         let runtime = match config.runtime_service.clone() {
@@ -173,6 +178,7 @@ impl PodSubsystem {
                 resource_query,
                 projected_tokens,
                 runtime_store: config.runtime_store.clone(),
+                wall_clock: config.wall_clock.clone(),
                 slot_admission: config.slot_admission.clone(),
                 event_sink: config.event_sink.clone(),
                 deletion_finalizer,
@@ -217,6 +223,7 @@ impl PodSubsystem {
             resource_query,
             projected_tokens,
             runtime_store,
+            wall_clock,
             slot_admission,
             event_sink,
             deletion_finalizer,
@@ -273,6 +280,7 @@ impl PodSubsystem {
                     ),
                 ),
                 store: runtime_store,
+                clock: wall_clock,
                 slot_admission,
                 repository: repository.clone(),
                 filesystem: Arc::new(
@@ -424,11 +432,14 @@ mod tests {
             runtime_store: Arc::new(
                 crate::kubelet::pod_runtime::test_support::MockPodRuntimeStore::new(),
             ),
+            wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::test_support::MockPodSlotAdmission::new(),
             ),
             event_sink: Arc::new(crate::bootstrap::kubelet_ports::RootPodEventSink::new(
-                None, db,
+                None,
+                db,
+                Arc::new(klights_supervisor::SystemWallClock),
             )),
         }
     }

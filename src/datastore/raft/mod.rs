@@ -10,7 +10,6 @@ pub(crate) use authority::{CommittedApplyAuthority, SnapshotInstallAuthority};
 pub mod network;
 pub mod node;
 pub(crate) mod proposal;
-pub mod rtt_estimator;
 pub(crate) mod snapshot;
 pub mod state_machine_impl;
 pub mod types;

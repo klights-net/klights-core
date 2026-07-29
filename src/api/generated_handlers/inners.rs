@@ -241,6 +241,7 @@ pub async fn mark_foreground_deletion_with_retry(
         name,
         initial_resource,
         delete_preconditions,
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed finalizer test timestamp"),
     )
     .await
 }
@@ -261,6 +262,8 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
             orphan_children_before_completion: request.orphan_children_before_completion,
             uid_mismatch_is_conflict: request.uid_mismatch_is_conflict,
             grace_seconds: 0,
+            operation_now: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .expect("fixed finalizer test timestamp"),
         },
     )
     .await
@@ -279,6 +282,7 @@ pub(in crate::api) async fn delete_collection_listed_resource_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
+        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
     };
     let target_identity = klights_types::ResourceKey::new(
         api_version,
@@ -449,6 +453,7 @@ pub(in crate::api) async fn list_inner(
             .unwrap());
     }
 
+    let operation_now = state.operational().clock.now();
     let normalized_limit = query.normalized_limit()?;
 
     // Validate and resolve resourceVersion / resourceVersionMatch for the plain
@@ -461,7 +466,7 @@ pub(in crate::api) async fn list_inner(
     let rv_match = query.resolve_resource_version_match(has_continue)?;
 
     let (db_continue_name, continue_resource_version) =
-        process_continue_token(query.continue_token)?;
+        process_continue_token_at(query.continue_token, operation_now.unix_timestamp())?;
 
     // Consistent-snapshot selection (pin Exact / session continuations, downgrade
     // a continuation that outran the retained window, honor resourceVersionMatch)
@@ -527,16 +532,20 @@ pub(in crate::api) async fn list_inner(
     let resource_version = response_rv.to_string();
 
     if wants_table_format(&headers)? {
-        let now = state.operational().clock.now();
         let table = match kind {
-            "Pod" => pod_list_to_table_at(items, resource_version, now),
-            "Node" => node_list_to_table_at(items, resource_version, now),
-            "ReplicaSet" => replicaset_list_to_table_at(items, resource_version, now),
-            "Deployment" => deployment_list_to_table_at(items, resource_version, now),
-            "StatefulSet" => statefulset_list_to_table_at(items, resource_version, now),
+            "Pod" => pod_list_to_table_at(items, resource_version, operation_now),
+            "Node" => node_list_to_table_at(items, resource_version, operation_now),
+            "ReplicaSet" => replicaset_list_to_table_at(items, resource_version, operation_now),
+            "Deployment" => deployment_list_to_table_at(items, resource_version, operation_now),
+            "StatefulSet" => statefulset_list_to_table_at(items, resource_version, operation_now),
             // Resources without a dedicated converter use kubectl's per-kind
             // columns, falling back to the upstream default (NAME + CREATED AT).
-            _ => crate::api::response::generic_list_to_table_at(kind, items, resource_version, now),
+            _ => crate::api::response::generic_list_to_table_at(
+                kind,
+                items,
+                resource_version,
+                operation_now,
+            ),
         };
         return Ok(Json(table).into_response());
     }
@@ -545,10 +554,11 @@ pub(in crate::api) async fn list_inner(
         "resourceVersion": resource_version,
     });
     if let Some(ref name) = continue_token {
-        let token = crate::api::query::encode_response_continue_token(
+        let token = crate::api::query::encode_response_continue_token_at(
             name,
             response_rv,
             continue_resource_version,
+            operation_now.unix_timestamp(),
         );
         metadata["continue"] = serde_json::json!(token);
     }
@@ -635,12 +645,17 @@ async fn inject_node_last_heartbeat_on_leader(
         obj.remove("lastHeartbeatTime");
     }
 
-    let is_raft_leader = state
+    let has_local_authority = state
         .operational()
-        .authority_router
+        .authority
         .as_ref()
-        .is_some_and(|router| router.has_local_authority());
-    if !is_raft_leader {
+        .is_some_and(|authority| {
+            let klights_leader_api::AuthorityRoute::Local(permit) = authority.route() else {
+                return false;
+            };
+            authority.validate(&permit).is_ok()
+        });
+    if !has_local_authority {
         return;
     }
 
@@ -859,10 +874,16 @@ impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
             )));
         }
 
-        crate::api::mutation::write::prepare_create_metadata(ns, &mut body, &resource_name);
+        let operation_now = crate::auth::clock::chrono_utc(self.state.operational().clock.now());
+        crate::api::mutation::write::prepare_create_metadata(
+            ns,
+            &mut body,
+            &resource_name,
+            operation_now,
+        );
 
         match kind {
-            "Pod" => apply_pod_create_defaults(&mut body),
+            "Pod" => apply_pod_create_defaults_at(&mut body, operation_now),
             "PersistentVolumeClaim" => apply_pvc_create_defaults(&mut body),
             "PersistentVolume" => apply_pv_create_defaults(&mut body),
             "Namespace" => ensure_namespace_status_phase_active(&mut body),
@@ -1135,6 +1156,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
         );
         let apply_force = self.query.force.unwrap_or(false);
         let is_dry_run = dry_run.is_all();
+        let operation_now = crate::auth::clock::chrono_utc(self.state.operational().clock.now());
         let api_version = self.target.api_version;
         let kind = self.target.kind;
         let ns = self.target.namespace;
@@ -1182,7 +1204,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     &patch,
                     &apply_manager,
                     api_version,
-                    &crate::k8s_time::now_time(),
+                    &klights_cluster_core::k8s_time::format_time(operation_now),
                     apply_force,
                 )
                 .map_err(|conflicts| AppError::Conflict(conflicts.message()))?;
@@ -1276,7 +1298,7 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                     &patch,
                     &apply_manager,
                     api_version,
-                    &crate::k8s_time::now_time(),
+                    &klights_cluster_core::k8s_time::format_time(operation_now),
                     apply_force,
                 )
                 .map_err(|conflicts| AppError::Conflict(conflicts.message()))?
@@ -1803,7 +1825,10 @@ pub(in crate::api) async fn delete_inner(
 
     if is_dry_run {
         let mut del_data: Value = (*resource.data).clone();
-        set_deletion_timestamp(&mut del_data);
+        set_deletion_timestamp_at(
+            &mut del_data,
+            crate::auth::clock::chrono_utc(state.operational().clock.now()),
+        );
         let result =
             crate::api::mutation::response::persisted_object(del_data, resource.resource_version);
         return Ok((StatusCode::OK, Json(result)));
@@ -1814,6 +1839,7 @@ pub(in crate::api) async fn delete_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
+        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
     };
     let outcome = crate::api::mutation::delete::delete_loaded_with_strategy(
         &delete_strategy,
@@ -2112,6 +2138,7 @@ pub(in crate::api) async fn delete_collection_shared_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         resource_query: state.resource_mutation().resource_query.as_ref(),
         lifecycle: state.resource_mutation().finalizer_lifecycle.as_ref(),
+        operation_now: crate::auth::clock::chrono_utc(state.operational().clock.now()),
     };
 
     for resource in list.into_items() {

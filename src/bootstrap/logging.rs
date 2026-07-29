@@ -31,11 +31,11 @@ pub(crate) fn init_tracing_from_env(containerd_namespace: &str) {
 
     if let Some(log_path) = log_file_path_from_env(containerd_namespace) {
         if let Some(parent) = log_path.parent() {
-            crate::runtime_fs::create_dir_all(parent).unwrap_or_else(|err| {
+            klights_supervisor::runtime_fs::create_dir_all(parent).unwrap_or_else(|err| {
                 panic!("failed to create log directory {}: {err}", parent.display())
             });
         }
-        let file = crate::runtime_fs::open_append(&log_path)
+        let file = klights_supervisor::runtime_fs::open_append(&log_path)
             .unwrap_or_else(|err| panic!("failed to open log file {}: {err}", log_path.display()));
         registry
             .with(

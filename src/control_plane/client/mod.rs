@@ -994,7 +994,11 @@ mod tests {
             .expect("read namespace")
             .expect("namespace exists");
         let mut terminating = std::sync::Arc::unwrap_or_clone(namespace.data);
-        crate::api::set_namespace_terminating_status(&mut terminating, false);
+        crate::api::set_namespace_terminating_status_at(
+            &mut terminating,
+            false,
+            klights_supervisor::SystemWallClock::now_utc(),
+        );
         db.update_namespace(
             "worker-finalize-ns",
             terminating,

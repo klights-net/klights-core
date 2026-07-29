@@ -31,10 +31,11 @@ impl ControlplaneCaFiles {
 
     #[cfg(test)]
     pub(super) fn set_namespace(&mut self, namespace: &str) {
+        let etc = PathBuf::from(namespace).join("etc");
         self.files = Some(ReplicationRuntimeFiles {
-            ca_cert: crate::paths::ca_cert_path(namespace),
-            ca_key: crate::paths::ca_key_path(namespace),
-            service_account_signing_key: crate::paths::service_account_signing_key_path(namespace),
+            ca_cert: etc.join("ca.crt"),
+            ca_key: etc.join("ca.key"),
+            service_account_signing_key: etc.join("service-account-signing.key"),
         });
     }
 
@@ -142,9 +143,10 @@ mod tests {
     async fn reads_existing_ca_material_through_supervisor() {
         let temp = tempfile::tempdir().unwrap();
         let namespace = temp_namespace(&temp);
-        std::fs::create_dir_all(crate::paths::etc_dir_path(&namespace)).unwrap();
-        std::fs::write(crate::paths::ca_cert_path(&namespace), "cert-pem").unwrap();
-        std::fs::write(crate::paths::ca_key_path(&namespace), "key-pem").unwrap();
+        let etc = temp.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(etc.join("ca.crt"), "cert-pem").unwrap();
+        std::fs::write(etc.join("ca.key"), "key-pem").unwrap();
         let supervisor = supervisor();
         let mut files = ControlplaneCaFiles::new(supervisor.clone());
         files.set_namespace(&namespace);

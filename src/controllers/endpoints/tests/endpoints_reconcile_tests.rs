@@ -169,7 +169,7 @@ async fn test_reconcile_endpoints_skips_terminating_namespace() {
             "kind": "Namespace",
             "metadata": {
                 "name": "terminating",
-                "deletionTimestamp": crate::k8s_time::now_legacy_timestamp()
+                "deletionTimestamp": "2026-01-01T00:00:00.000000000Z"
             },
             "spec": {"finalizers": ["kubernetes"]},
             "status": {"phase": "Terminating"}

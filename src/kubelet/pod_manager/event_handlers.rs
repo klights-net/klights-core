@@ -855,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn configmap_watch_refresh_uses_injected_runtime_paths() {
-        let temp = crate::paths::test_data_root_fixture("event-handler-configmap-refresh");
+        let temp = tempfile::tempdir().expect("create kubelet test fixture");
 
         let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
         let supervisor = fixture_supervisor();
@@ -952,8 +952,8 @@ mod tests {
         )
         .await;
 
-        let refreshed =
-            crate::runtime_fs::read_utf8(format!("{volume_path}/data-1")).expect("read refresh");
+        let refreshed = klights_supervisor::runtime_fs::read_utf8(format!("{volume_path}/data-1"))
+            .expect("read refresh");
         assert_eq!(refreshed, "value-2");
     }
 }

@@ -27,11 +27,15 @@ impl CniSocketFilesystem for RootCniSocketFilesystem {
         Box::pin(async move {
             let path = std::path::Path::new(socket_path.as_str());
             if let Some(parent) = path.parent() {
-                crate::runtime_fs::create_dir_all_async(&self.file_process, parent)
+                klights_supervisor::runtime_fs::create_dir_all_async(&self.file_process, parent)
                     .await
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            let _ = crate::runtime_fs::remove_file_if_exists_async(&self.file_process, path).await;
+            let _ = klights_supervisor::runtime_fs::remove_file_if_exists_async(
+                &self.file_process,
+                path,
+            )
+            .await;
             tokio::net::UnixListener::bind(path)
                 .with_context(|| format!("failed to bind {}", path.display()))
         })
@@ -40,9 +44,12 @@ impl CniSocketFilesystem for RootCniSocketFilesystem {
     fn remove_socket(&self, socket_path: &CniSocketPath) -> CniSocketFuture<'_, ()> {
         let socket_path = socket_path.clone();
         Box::pin(async move {
-            crate::runtime_fs::remove_file_if_exists_async(&self.file_process, socket_path.as_str())
-                .await
-                .map(|_| ())
+            klights_supervisor::runtime_fs::remove_file_if_exists_async(
+                &self.file_process,
+                socket_path.as_str(),
+            )
+            .await
+            .map(|_| ())
         })
     }
 }

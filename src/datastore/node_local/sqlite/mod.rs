@@ -28,6 +28,7 @@ pub struct SqliteNodeLocalDb {
     #[cfg(test)]
     pod_endpoint_snapshot_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
+    wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +182,18 @@ pub struct OutboxStats {
 }
 
 impl SqliteNodeLocalDb {
+    #[cfg(test)]
     pub fn from_executor(executor: DbExecutor) -> Result<Self> {
+        Self::from_executor_with_clock(
+            executor,
+            std::sync::Arc::new(klights_supervisor::SystemWallClock),
+        )
+    }
+
+    pub fn from_executor_with_clock(
+        executor: DbExecutor,
+        wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
+    ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
         let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
         Ok(Self {
@@ -193,7 +205,17 @@ impl SqliteNodeLocalDb {
                 std::sync::atomic::AtomicUsize::new(0),
             ),
             pod_slot_admission_tx,
+            wall_clock,
         })
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.wall_clock
+            .now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
     }
 
     pub async fn db_call<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
@@ -289,7 +311,7 @@ impl SqliteNodeLocalDb {
         let namespace = namespace.to_string();
         let pod_name = pod_name.to_string();
         let node_name = node_name.to_string();
-        let now = now_ms();
+        let now = self.now_ms();
         self.db_call("node_local:pod_runtime_admit", move |conn| {
             let updated = conn.execute(
                 queries::POD_RUNTIME_ADMIT,
@@ -318,6 +340,7 @@ impl SqliteNodeLocalDb {
         let event_namespace = namespace.clone();
         let event_pod_name = pod_name.clone();
         let event_pod_uid = pod_uid.clone();
+        let now = self.now_ms();
         let (result, event) = self
             .db_call("node_local:pod_slot_try_admit", move |conn| {
                 let tx = conn.transaction()?;
@@ -334,7 +357,7 @@ impl SqliteNodeLocalDb {
                                 node_name,
                                 PodSlotAdmissionState::Admitted.as_str(),
                                 rv,
-                                now_ms(),
+                                now,
                             ],
                         )?;
                         (
@@ -371,7 +394,7 @@ impl SqliteNodeLocalDb {
                                     node_name,
                                     PodSlotAdmissionState::Admitted.as_str(),
                                     rv,
-                                    now_ms(),
+                                    now,
                                 ],
                             )?;
                             (
@@ -423,6 +446,7 @@ impl SqliteNodeLocalDb {
         let event_namespace = namespace.clone();
         let event_pod_name = pod_name.clone();
         let event_pod_uid = pod_uid.clone();
+        let now = self.now_ms();
         let (result, event) = self
             .db_call("node_local:pod_slot_mark_terminating", move |conn| {
                 let tx = conn.transaction()?;
@@ -455,7 +479,7 @@ impl SqliteNodeLocalDb {
                                 node_name,
                                 PodSlotAdmissionState::Terminating.as_str(),
                                 rv,
-                                now_ms(),
+                                now,
                             ],
                         )?;
                         (
@@ -482,7 +506,7 @@ impl SqliteNodeLocalDb {
                                 node_name,
                                 PodSlotAdmissionState::Terminating.as_str(),
                                 rv,
-                                now_ms(),
+                                now,
                             ],
                         )?;
                         (
@@ -1099,7 +1123,7 @@ impl SqliteNodeLocalDb {
     ) -> Result<super::OutboxFailureDisposition> {
         let lease_token = lease_token.to_string();
         let error = error.to_string();
-        let now = now_ms();
+        let now = self.now_ms();
         self.db_call("node_local:outbox_record_failure", move |conn| {
             let tx = conn.transaction()?;
             let row = tx
@@ -1280,7 +1304,7 @@ impl SqliteNodeLocalDb {
         max_attempts: i64,
     ) -> Result<bool> {
         let idempotency_key = idempotency_key.to_string();
-        let now = now_ms();
+        let now = self.now_ms();
         self.db_call("node_local:outbox_dead_letter_move", move |conn| {
             let tx = conn.transaction()?;
             let row = tx
@@ -1372,7 +1396,7 @@ impl SqliteNodeLocalDb {
         id: i64,
         classification: klights_node_store::OutboxClassification,
     ) -> Result<bool> {
-        let now = now_ms();
+        let now = self.now_ms();
         let row = self
             .db_call("node_local:outbox_dead_letter_replay_get", move |conn| {
                 Ok(conn
@@ -1441,7 +1465,7 @@ impl SqliteNodeLocalDb {
     }
 
     pub async fn outbox_stats(&self) -> Result<OutboxStats> {
-        let now = now_ms();
+        let now = self.now_ms();
         self.db_call("node_local:outbox_stats", move |conn| {
             let pending: i64 = conn.query_row(queries::OUTBOX_COUNT, [], |row| row.get(0))?;
             let oldest_ms: Option<i64> = conn
@@ -1878,13 +1902,6 @@ fn quote_ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 impl SqliteNodeLocalDb {
     pub async fn reserve_ip_and_insert_network(
         &self,
@@ -1903,7 +1920,7 @@ impl SqliteNodeLocalDb {
         let subnet_base_int = request.subnet_base_int;
         let subnet_size = request.subnet_size;
         let sandbox_id = request.sandbox_id.clone();
-        let now = now_ms();
+        let now = self.now_ms();
         let outcome = self
             .db_call("node_local:reserve_ip_network", move |conn| {
                 reserve_ip_and_insert_network_in_conn(conn, request.as_borrowed(), now)
@@ -2238,7 +2255,7 @@ impl SqliteNodeLocalDb {
         let uid = pod.uid.clone();
         let payload = serde_json::to_vec(&payload)?;
         let last_error = last_error.map(str::to_string);
-        let now = now_ms();
+        let now = self.now_ms();
         let floor = now.saturating_add(min_delay_ms.max(0));
         self.db_call("node_local:workqueue_enqueue", move |conn| {
             let tail_other: i64 = conn.query_row(

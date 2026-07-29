@@ -32,6 +32,7 @@ pub struct PodEventRecord<'a> {
     pub event_type: &'a str,
     pub reporting_component: &'a str,
     pub reporting_instance: &'a str,
+    pub operation_now: chrono::DateTime<chrono::Utc>,
 }
 
 /// Focused cluster reads needed by Pod event production.
@@ -133,6 +134,7 @@ pub async fn emit_pod_event(
             event_type,
             reporting_component,
             reporting_instance,
+            operation_now: klights_supervisor::SystemWallClock::now_utc(),
         },
     )
     .await?;
@@ -292,7 +294,9 @@ where
         event_type,
         reporting_component,
         reporting_instance,
+        operation_now,
     } = record;
+    let operation_now_ms = operation_now.timestamp_millis();
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(|v| v.as_str())
@@ -338,7 +342,7 @@ where
     let random_suffix = &random_suffix[0..8];
     let event_name = format!("{}.{}", pod_name, random_suffix);
 
-    let now = crate::k8s_time::now_legacy_timestamp();
+    let now = klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
 
     // Conformance stability: kubelet may re-enter create/reconcile paths for the
     // same pod while assignment is unchanged. Avoid unbounded duplicate Scheduled
@@ -420,7 +424,7 @@ where
                         name: event_name.clone(),
                         data: event.clone(),
                     },
-                    now_ms: epoch_ms(),
+                    now_ms: operation_now_ms,
                 })
                 .await?;
         }
@@ -433,6 +437,7 @@ where
     Ok(event)
 }
 
+#[cfg(test)]
 fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -556,6 +561,42 @@ mod tests {
 
         // Verify count
         assert_eq!(event.get("count").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn control_plane_event_uses_supplied_operation_timestamp() {
+        let ds = crate::datastore::test_support::in_memory().await;
+        let pod = create_test_pod();
+        let operation_now = chrono::DateTime::parse_from_rfc3339("2026-07-29T12:34:56.789Z")
+            .expect("fixed timestamp should parse")
+            .with_timezone(&chrono::Utc);
+        let expected = klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
+
+        let event = emit_control_plane_pod_event(
+            &ds,
+            &ds,
+            PodEventRecord {
+                pod: &pod,
+                reason: "Started",
+                message: "Started container nginx",
+                event_type: "Normal",
+                reporting_component: "klights-controller",
+                reporting_instance: "cp1",
+                operation_now,
+            },
+        )
+        .await
+        .expect("event should be emitted");
+
+        assert_eq!(
+            event.pointer("/metadata/creationTimestamp"),
+            Some(&Value::String(expected.clone()))
+        );
+        assert_eq!(
+            event.get("firstTimestamp"),
+            Some(&Value::String(expected.clone()))
+        );
+        assert_eq!(event.get("lastTimestamp"), Some(&Value::String(expected)));
     }
 
     #[tokio::test]
@@ -786,7 +827,9 @@ mod tests {
                 "metadata": {
                     "name": "terminating-events",
                     "uid": "terminating-events-uid",
-                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp()
+                    "deletionTimestamp": klights_cluster_core::k8s_time::format_legacy_timestamp(
+                        klights_supervisor::SystemWallClock::now_utc()
+                    )
                 },
                 "spec": {"finalizers": ["kubernetes"]},
                 "status": {"phase": "Terminating"}
@@ -844,6 +887,7 @@ mod tests {
                 event_type: "Normal",
                 reporting_component: "klights-kubelet",
                 reporting_instance: "node-a",
+                operation_now: klights_supervisor::SystemWallClock::now_utc(),
             },
         )
         .await

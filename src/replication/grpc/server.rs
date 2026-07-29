@@ -3546,10 +3546,11 @@ mod tests {
             .await
             .unwrap();
         let (ca_cert, ca_key, ca_cert_pem, ca_key_pem) = crate::auth::generate_ca_full().unwrap();
-        let ca_cert_path = crate::paths::ca_cert_path(namespace);
-        let ca_key_path = crate::paths::ca_key_path(namespace);
-        let service_account_key_path = crate::paths::service_account_signing_key_path(namespace);
-        std::fs::create_dir_all(ca_cert_path.parent().unwrap()).unwrap();
+        let etc = std::path::Path::new(namespace).join("etc");
+        let ca_cert_path = etc.join("ca.crt");
+        let ca_key_path = etc.join("ca.key");
+        let service_account_key_path = etc.join("service-account-signing.key");
+        std::fs::create_dir_all(&etc).unwrap();
         std::fs::write(&ca_cert_path, ca_cert_pem).unwrap();
         std::fs::write(&ca_key_path, ca_key_pem).unwrap();
         std::fs::write(&service_account_key_path, "service-account-signing-key").unwrap();
@@ -6304,6 +6305,14 @@ mod tests {
 
     #[tokio::test]
     async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
+        struct TestWallClock;
+
+        impl crate::kubelet::pod_runtime::store::RuntimeClock for TestWallClock {
+            fn now_ms(&self) -> i64 {
+                1_704_164_645_000
+            }
+        }
+
         let db = crate::datastore::test_support::in_memory().await;
         let addresses =
             crate::kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
@@ -6311,7 +6320,7 @@ mod tests {
             klights_network_api::NodePeerMode::Root,
             crate::kubelet::node_config::KubeletNodeRole::Leader,
             false,
-            klights_types::BuildIdentity::new(crate::version::git_version(), "test-commit"),
+            klights_types::BuildIdentity::new("v0.0.0-test", "test-commit"),
         );
         crate::kubelet::node::register_node_at_addresses(
             &crate::kubelet::file_blocking::test_file_process_executor(),
@@ -6343,6 +6352,7 @@ mod tests {
             "leader-a",
             query.clone(),
             Arc::new(crate::node_outbox::Outbox::new(node_local.clone())),
+            Arc::new(TestWallClock),
         );
 
         super::refresh_local_node_external_ip_from_observed_endpoint(
@@ -6691,7 +6701,8 @@ mod tests {
                 crate::bootstrap::bootstrap_token::BootstrapTokenScope::Controlplane,
             )
             .await;
-            let namespace = format!("grpc-cp-token-{node_name}-{}", uuid::Uuid::new_v4());
+            let data_root = tempfile::tempdir().unwrap();
+            let namespace = data_root.path().to_string_lossy().to_string();
             let grpc = grpc_test_server_with_signing_ca(db, &namespace).await;
             let (_, csr_pem) = crate::auth::generate_server_csr(
                 "10.43.0.0/16",
@@ -6759,7 +6770,8 @@ mod tests {
             crate::bootstrap::bootstrap_token::BootstrapTokenScope::Worker,
         )
         .await;
-        let namespace = format!("grpc-cp-worker-leak-{}", uuid::Uuid::new_v4());
+        let data_root = tempfile::tempdir().unwrap();
+        let namespace = data_root.path().to_string_lossy().to_string();
         let grpc = grpc_test_server_with_signing_ca(db, &namespace).await;
         let (_, csr_pem) = crate::auth::generate_server_csr(
             "10.43.0.0/16",

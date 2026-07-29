@@ -2298,6 +2298,9 @@ impl PodRuntimeHarness {
                     container_control: container_control.clone(),
                     network: network.clone(),
                     store: store.clone(),
+                    clock: std::sync::Arc::new(
+                        crate::kubelet::pod_runtime::store::SystemRuntimeClock,
+                    ),
                     slot_admission: slot_admission.clone(),
                     repository: repo.clone(),
                     filesystem: filesystem.clone(),

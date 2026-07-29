@@ -56,6 +56,7 @@ pub(crate) async fn open_with_sink(
                 #[cfg(test)]
                 commit_sink,
                 outbox_codec,
+                Arc::new(klights_supervisor::SystemWallClock),
             )
             .await?;
             Ok(Arc::new(ds))
@@ -72,6 +73,7 @@ pub(crate) async fn open_with_sink(
                 #[cfg(test)]
                 commit_sink,
                 outbox_codec,
+                Arc::new(klights_supervisor::SystemWallClock),
             )
             .await?;
             Ok(Arc::new(ds))
@@ -82,6 +84,7 @@ pub(crate) async fn open_with_sink(
                 supervisor,
                 #[cfg(test)]
                 commit_sink,
+                Arc::new(klights_supervisor::SystemWallClock),
             )
             .await?;
             Ok(Arc::new(ds))
@@ -93,6 +96,7 @@ pub(crate) async fn open_with_sink(
                 supervisor,
                 #[cfg(test)]
                 commit_sink,
+                Arc::new(klights_supervisor::SystemWallClock),
             )
             .await?;
             Ok(Arc::new(ds))

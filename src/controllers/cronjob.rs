@@ -1651,7 +1651,7 @@ mod tests {
         // observedGeneration=metadata.generation, and a pre-set lastSuccessfulTime
         // (the `or_insert_with` keeps an existing value).
         let generation = 1_i64;
-        let now_str = crate::k8s_time::now_time();
+        let now_str = "2026-01-01T00:00:00Z".to_string();
         let matching_status = json!({
             "active": [],
             "observedGeneration": generation,
@@ -1665,7 +1665,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "cj-sync-uid",
                 "generation": generation,
-                "creationTimestamp": crate::k8s_time::now_time(),
+                "creationTimestamp": "2026-01-01T00:00:00Z",
             },
             "spec": {
                 "schedule": "* * * * *",
@@ -1716,7 +1716,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "cj-stale-status-uid",
                 "generation": 1,
-                "creationTimestamp": crate::k8s_time::now_time(),
+                "creationTimestamp": "2026-01-01T00:00:00Z",
             },
             "spec": {
                 "schedule": "* * * * *",

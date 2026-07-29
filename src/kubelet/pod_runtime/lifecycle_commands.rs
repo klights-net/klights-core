@@ -32,6 +32,7 @@ pub(super) async fn handle_lifecycle_command(
             container_name,
             reason,
         } => {
+            let operation_now = service.clock.now_utc();
             tracing::info!(
                 namespace = namespace,
                 pod = pod_name,
@@ -111,7 +112,8 @@ pub(super) async fn handle_lifecycle_command(
                 .await
                 .ok()
                 .and_then(|response| response.status);
-            let last_state = restart_last_state_from_runtime_status(stopped_status.as_ref());
+            let last_state =
+                restart_last_state_from_runtime_status(stopped_status.as_ref(), operation_now);
             let _ = service
                 .repository
                 .note_container_restart_for_uid(
@@ -191,6 +193,7 @@ pub(super) async fn handle_lifecycle_command(
                     &new_container_id,
                     observed_status,
                     &last_state,
+                    operation_now,
                 ) {
                     replace_container_status(&mut container_statuses, container_name, replacement);
                     let mut status = serde_json::json!({

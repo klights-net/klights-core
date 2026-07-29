@@ -10,7 +10,9 @@ async fn process_volumes(
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     let file_process = crate::kubelet::file_blocking::test_file_process_executor();
     let paths = crate::kubelet::runtime_paths::KubeletRuntimePaths::new(
-        crate::paths::data_root_path(containerd_namespace),
+        crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(containerd_namespace)
+            .data_root()
+            .to_path_buf(),
     )
     .unwrap();
     let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
@@ -330,7 +332,10 @@ async fn test_pvc_added_event_triggers_reconciliation() {
     // Call reconcile_pvc (what handle_watch_event will do)
     crate::controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
-        &crate::paths::test_data_root_path("pod-manager-pvc-tests").join("local-path-provisioner"),
+        &crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("pod-manager-pvc-tests")
+            .data_root()
+            .to_path_buf()
+            .join("local-path-provisioner"),
         &db,
         &pvc_with_rv,
     )
@@ -416,7 +421,10 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
 
     crate::controllers::pvc::reconcile_pvc(
         &crate::kubelet::file_blocking::test_file_process_executor(),
-        &crate::paths::test_data_root_path("pod-manager-pvc-tests").join("local-path-provisioner"),
+        &crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test("pod-manager-pvc-tests")
+            .data_root()
+            .to_path_buf()
+            .join("local-path-provisioner"),
         &db,
         &pvc_with_rv,
     )
@@ -491,8 +499,12 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
             }
             crate::controllers::pvc::reconcile_pvc(
                 &crate::kubelet::file_blocking::test_file_process_executor(),
-                &crate::paths::test_data_root_path("pod-manager-pvc-tests")
-                    .join("local-path-provisioner"),
+                &crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(
+                    "pod-manager-pvc-tests",
+                )
+                .data_root()
+                .to_path_buf()
+                .join("local-path-provisioner"),
                 &db,
                 &pvc_with_rv,
             )

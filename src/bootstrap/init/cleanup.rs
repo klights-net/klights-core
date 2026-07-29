@@ -291,8 +291,11 @@ async fn start_cleanup_cni_rpc_server(
     {
         Ok(handle) => handle,
         Err(e) => {
-            let _ =
-                crate::runtime_fs::remove_file_if_exists_async(file_process, &socket_path).await;
+            let _ = klights_supervisor::runtime_fs::remove_file_if_exists_async(
+                file_process,
+                &socket_path,
+            )
+            .await;
             return Err(e.into());
         }
     };

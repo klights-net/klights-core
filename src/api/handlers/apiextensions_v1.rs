@@ -173,7 +173,9 @@ pub async fn delete_crd_with_deregistration(
     if let Some(meta) = del_data.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         meta.insert(
             "deletionTimestamp".to_string(),
-            serde_json::Value::String(crate::k8s_time::now_legacy_timestamp()),
+            serde_json::Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            )),
         );
     }
     let _ = crate::api::resource_command_ports::update_non_pod_resource(
@@ -338,8 +340,11 @@ pub fn validate_api_approval(
 }
 
 // Helper to add Established condition to CRD status
-pub fn add_crd_established_condition(mut body: Value) -> Value {
-    let now = crate::k8s_time::now_legacy_timestamp();
+pub fn add_crd_established_condition_at(
+    mut body: Value,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let now = klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now);
 
     let established_condition = serde_json::json!({
         "type": "Established",
@@ -392,6 +397,11 @@ pub fn add_crd_established_condition(mut body: Value) -> Value {
     }
 
     body
+}
+
+#[cfg(test)]
+pub fn add_crd_established_condition(body: Value) -> Value {
+    add_crd_established_condition_at(body, chrono::DateTime::UNIX_EPOCH)
 }
 
 // Custom CRD create handler that registers the CRD in the registry
@@ -458,7 +468,10 @@ async fn create_crd_with_registration(
     .await?;
 
     // Register the CRD in the registry immediately (so API routes are ready)
-    let body_with_status = add_crd_established_condition(body.clone());
+    let body_with_status = add_crd_established_condition_at(
+        body.clone(),
+        crate::auth::clock::chrono_utc(state.operational().clock.now()),
+    );
     if let Err(e) = crate::api::discovery::register_crd_from_value(
         &state.discovery().crd_registry,
         &body_with_status,
@@ -698,7 +711,10 @@ async fn patch_crd_with_registration(
             )
             .await?;
 
-            let body_with_status = add_crd_established_condition(admitted);
+            let body_with_status = add_crd_established_condition_at(
+                admitted,
+                crate::auth::clock::chrono_utc(state.operational().clock.now()),
+            );
             if let Err(e) = crate::api::discovery::register_crd_from_value(
                 &state.discovery().crd_registry,
                 &body_with_status,

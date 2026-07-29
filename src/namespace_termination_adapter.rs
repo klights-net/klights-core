@@ -43,7 +43,12 @@ pub(crate) async fn reconcile(
     namespace: &str,
     metrics: &SideEffectMetrics,
 ) -> Result<()> {
-    crate::api::reconcile_namespace_termination(store, namespace, metrics)
-        .await
-        .map_err(|error| anyhow::anyhow!("namespace termination failed: {error:?}"))
+    crate::api::reconcile_namespace_termination_at(
+        store,
+        namespace,
+        metrics,
+        klights_supervisor::SystemWallClock::now_utc(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("namespace termination failed: {error:?}"))
 }

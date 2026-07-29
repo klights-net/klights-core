@@ -4,13 +4,18 @@ use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 
 pub trait RuntimeClock: Send + Sync {
     fn now_ms(&self) -> i64;
+
+    fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(self.now_ms())
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+    }
 }
 
 pub struct SystemRuntimeClock;
 
 impl RuntimeClock for SystemRuntimeClock {
     fn now_ms(&self) -> i64 {
-        std::time::SystemTime::now()
+        klights_supervisor::SystemWallClock::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()

@@ -114,7 +114,7 @@ async fn provision_pv_for_pvc<S: PvcStore + ?Sized>(
         .join(pvc_name)
         .to_string_lossy()
         .into_owned();
-    crate::runtime_fs::create_dir_all_async(file_process, &host_path)
+    klights_supervisor::runtime_fs::create_dir_all_async(file_process, &host_path)
         .await
         .with_context(|| format!("Failed to create directory {}", host_path))?;
 

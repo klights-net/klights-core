@@ -45,6 +45,24 @@ mod cases {
     }
 
     #[test]
+    fn plaintext_endpoint_is_confined_to_the_test_connector() {
+        assert!(
+            super::super::normalized_endpoint("http://127.0.0.1:7679").is_err(),
+            "the production endpoint normalizer must remain HTTPS-only"
+        );
+        assert_eq!(
+            super::super::connector_endpoint(" http://127.0.0.1:7679 ").unwrap(),
+            "http://127.0.0.1:7679",
+            "the cfg(test)-only connector must support in-process plaintext fixtures"
+        );
+        assert_eq!(
+            super::super::connector_endpoint("127.0.0.1:7679").unwrap(),
+            "https://127.0.0.1:7679",
+            "bare endpoints must keep the production HTTPS default"
+        );
+    }
+
+    #[test]
     fn resource_command_already_exists_survives_grpc_decode() {
         let error = super::super::resource_command_rpc_error(super::super::UnaryRpcError::Status(
             tonic::Status::already_exists("duplicate RuntimeClass"),
@@ -657,7 +675,7 @@ mod cases {
     }
 
     #[test]
-    fn steady_state_rpc_omits_bootstrap_token_from_metadata_and_join_payload() {
+    fn steady_state_join_payload_omits_bootstrap_token() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let client = ReplicationGrpcClient::new(
             GrpcClientConfig {
@@ -675,14 +693,6 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
 
-        let mut request = tonic::Request::new(klights_internal_protobuf::MetadataRequest {});
-        client.add_join_token(&mut request).unwrap();
-
-        assert!(
-            !request
-                .metadata()
-                .contains_key(crate::replication::grpc::JOIN_TOKEN_METADATA_KEY)
-        );
         assert_eq!(client.join_request().token, "");
         assert_eq!(
             client.join_request().command_codec_version,
@@ -809,11 +819,12 @@ mod cases {
             let server_shutdown = shutdown.clone();
             let server_supervisor = supervisor.clone();
             let server_namespace = namespace.clone();
+            let server_data_root = crate::paths::data_root_path(&server_namespace);
             let handle = tokio::spawn(async move {
                 crate::bootstrap::init::tls::serve_https(
                     app,
                     &addr.to_string(),
-                    &server_namespace,
+                    &server_data_root,
                     server_supervisor,
                     default_transport_policy(),
                     server_shutdown.cancelled_owned(),
@@ -2250,20 +2261,9 @@ mod cases {
 
     #[test]
     fn controlplane_join_proto_preserves_joiner_owned_registration_snapshot() {
-        let registration = crate::kubelet::node::NodeRegistrationSnapshot {
-            node_name: "cp-remote".to_string(),
-            node_mode: klights_network_api::NodePeerMode::Rootless,
-            node_role: crate::kubelet::node_config::KubeletNodeRole::Controlplane {
-                as_learner: true,
-            },
-            publish_external_ip: true,
-            addresses: crate::kubelet::node::NodeRegistrationAddresses::new(
-                "172.31.40.2".to_string(),
-                Some("192.0.2.40".to_string()),
-            ),
-            role_projection: None,
-            grpc_port: Some(7679),
-            host: crate::kubelet::node::NodeRegistrationHostFacts {
+        let registration = klights_leader_api::RemoteNodeRegistrationSnapshot {
+            node_mode: klights_leader_api::RemoteNodeMode::Rootless,
+            host: klights_leader_api::RemoteNodeHostFacts {
                 cpu_count: 23,
                 memory_ki: 45_678_901,
                 architecture: "joiner-arch".to_string(),
@@ -2404,7 +2404,7 @@ mod cases {
             klights_network_api::NodePeerMode::Root,
             crate::kubelet::node_config::KubeletNodeRole::Controlplane { as_learner: false },
             true,
-            klights_types::BuildIdentity::new(crate::version::git_version(), "test-commit"),
+            klights_types::BuildIdentity::new("v1.34.6+klights-test", "test-commit"),
         );
         let controlplane_registration =
             crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
@@ -2428,9 +2428,29 @@ mod cases {
                 high_watermark: None,
                 current_boundary: None,
             },
-            snapshot: crate::replication::grpc::client::RegistrationSnapshotView::remote_snapshot(
-                &controlplane_registration,
-            ),
+            snapshot: klights_leader_api::RemoteNodeRegistrationSnapshot {
+                node_mode: match controlplane_registration.node_mode {
+                    klights_network_api::NodePeerMode::Root => {
+                        klights_leader_api::RemoteNodeMode::Root
+                    }
+                    klights_network_api::NodePeerMode::Rootless => {
+                        klights_leader_api::RemoteNodeMode::Rootless
+                    }
+                },
+                host: klights_leader_api::RemoteNodeHostFacts {
+                    cpu_count: controlplane_registration.host.cpu_count,
+                    memory_ki: controlplane_registration.host.memory_ki,
+                    architecture: controlplane_registration.host.architecture,
+                    operating_system: controlplane_registration.host.operating_system,
+                    os_image: controlplane_registration.host.os_image,
+                    kernel_version: controlplane_registration.host.kernel_version,
+                    container_runtime_version: controlplane_registration
+                        .host
+                        .container_runtime_version,
+                    kubelet_version: controlplane_registration.host.kubelet_version,
+                    git_commit: controlplane_registration.host.git_commit,
+                },
+            },
         };
         assert_bounded!(
             "join_as_controlplane_rpc",

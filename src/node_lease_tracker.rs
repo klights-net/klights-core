@@ -58,17 +58,23 @@ pub struct NodeLeaseTracker {
 }
 
 impl NodeLeaseTracker {
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self::new_for_test(Utc::now())
+        Self::new_at(chrono::Utc::now())
     }
 
-    pub fn new_for_test(startup_time: DateTime<Utc>) -> Self {
+    pub fn new_at(startup_time: DateTime<Utc>) -> Self {
         Self {
             startup_time: RwLock::new(startup_time),
             startup_grace_seconds: DEFAULT_NODE_LEASE_DURATION_SECONDS,
             leases: RwLock::new(HashMap::new()),
             changed: Notify::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(startup_time: DateTime<Utc>) -> Self {
+        Self::new_at(startup_time)
     }
 
     /// Reset the startup grace window to begin at `now`.
@@ -169,6 +175,7 @@ impl NodeLeaseTracker {
     }
 }
 
+#[cfg(test)]
 impl Default for NodeLeaseTracker {
     fn default() -> Self {
         Self::new()

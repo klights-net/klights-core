@@ -58,10 +58,8 @@ fn test_inject_rv_preserves_existing_fields() {
     assert_eq!(result["metadata"]["annotations"]["key"], "value");
     assert!(!result["metadata"]["uid"].as_str().unwrap().is_empty());
     assert!(
-        !result["metadata"]["creationTimestamp"]
-            .as_str()
-            .unwrap()
-            .is_empty()
+        result["metadata"].get("creationTimestamp").is_none(),
+        "response projection must not author storage identity"
     );
     assert_eq!(result["data"]["config.yaml"], "content");
 }

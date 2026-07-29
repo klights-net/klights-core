@@ -11,6 +11,12 @@ use tokio::sync::oneshot;
 
 static PROXY_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+fn api_test_data_root(namespace: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("klights-api-tests")
+        .join(namespace)
+}
+
 struct EnvVarRestore {
     key: &'static str,
     value: Option<String>,
@@ -190,17 +196,11 @@ fn test_inject_rv_replaces_empty_uid() {
 }
 
 #[test]
-fn test_inject_rv_adds_creation_timestamp_if_missing() {
+fn test_inject_rv_does_not_author_creation_timestamp() {
     let data = json!({"metadata": {"name": "test"}});
     let result = inject_resource_version(data, 1);
 
-    let ts = result["metadata"]["creationTimestamp"].as_str().unwrap();
-    assert!(!ts.is_empty());
-    assert!(
-        ts.starts_with("20"),
-        "creationTimestamp should be RFC3339, got: {}",
-        ts
-    );
+    assert!(result["metadata"].get("creationTimestamp").is_none());
 }
 
 #[test]
@@ -5209,7 +5209,7 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
     use tower::ServiceExt;
 
     let unique_ns = format!("sa-bearer-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let etc_dir = crate::paths::etc_dir_path(&unique_ns);
+    let etc_dir = api_test_data_root(&unique_ns).join("etc");
     std::fs::create_dir_all(&etc_dir).unwrap();
 
     let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
@@ -5218,7 +5218,9 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
         .unwrap()
         .to_string();
     std::fs::write(
-        crate::paths::service_account_signing_key_path(&unique_ns),
+        api_test_data_root(&unique_ns)
+            .join("etc")
+            .join("service-account-signing.key"),
         &signing_key_pem,
     )
     .unwrap();
@@ -5227,7 +5229,7 @@ async fn test_api_accepts_valid_serviceaccount_bearer_token() {
     state.operational_mut().config =
         crate::api::ApiOperationalConfig::from_test(crate::KlightsConfig {
             containerd_namespace: unique_ns.clone(),
-            data_root: crate::paths::data_root_path(&unique_ns),
+            data_root: api_test_data_root(&unique_ns),
             ..crate::KlightsConfig::from_env().expect("env config valid in test")
         });
     state.operational_mut().signing_keys =
@@ -5596,13 +5598,15 @@ async fn test_raft_follower_proxy_forwards_authenticated_client_cert_identity_he
             .unwrap();
     });
 
-    let mut state = crate::api::test_support::build_test_app_state().await;
+    let state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    state.operational_mut().authority_router = Some(std::sync::Arc::new(
-        crate::api::authority_routing::HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None),
+    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
+        is_leader_rx,
+        leader_addr_rx,
+        None,
     ));
-    let app = crate::api::build_router(state);
+    let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
 
     let (ca_cert, ca_key, _, _) = crate::auth::generate_ca_full().unwrap();
     let (admin_cert_pem, _) = crate::auth::generate_admin_cert(&ca_cert, &ca_key).unwrap();
@@ -5761,11 +5765,14 @@ async fn raft_follower_health_endpoints_bypass_leader_proxy() {
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
 
-    let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.operational_mut().authority_router = Some(std::sync::Arc::new(
-        crate::api::authority_routing::HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None),
+    let follower_state = crate::api::test_support::build_test_app_state().await;
+    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
+        is_leader_rx,
+        leader_addr_rx,
+        None,
     ));
-    let app = crate::api::build_router(follower_state);
+    let app =
+        crate::api_server_shell::build_router_with_authority(follower_state, authority_router);
 
     for path in ["/healthz", "/livez", "/readyz"] {
         let response = app
@@ -5790,20 +5797,22 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn raft_proxy(
-        is_leader: bool,
-    ) -> std::sync::Arc<crate::api::authority_routing::HttpAuthorityRouter> {
+    fn raft_proxy(is_leader: bool) -> std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter> {
         let (_, is_leader_rx) = tokio::sync::watch::channel(is_leader);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-        std::sync::Arc::new(crate::api::authority_routing::HttpAuthorityRouter::new(
+        std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
             is_leader_rx,
             leader_addr_rx,
             None,
         ))
     }
 
-    async fn get_response(state: crate::api::ApiState, path: &str) -> axum::response::Response {
-        let app = crate::api::build_router(state);
+    async fn get_response(
+        state: crate::api::ApiState,
+        authority_router: std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter>,
+        path: &str,
+    ) -> axum::response::Response {
+        let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
         app.oneshot(
             Request::builder()
                 .method("GET")
@@ -5816,8 +5825,12 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         .unwrap()
     }
 
-    async fn get_node_body(state: crate::api::ApiState, path: &str) -> Value {
-        let response = get_response(state, path).await;
+    async fn get_node_body(
+        state: crate::api::ApiState,
+        authority_router: std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter>,
+        path: &str,
+    ) -> Value {
+        let response = get_response(state, authority_router, path).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -5826,7 +5839,7 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
     }
 
     let mut leader_state = crate::api::test_support::build_test_app_state().await;
-    leader_state.operational_mut().authority_router = Some(raft_proxy(true));
+    let leader_authority_router = raft_proxy(true);
     leader_state
         .resource_mutation_mut()
         .db
@@ -5871,19 +5884,24 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         .await
         .unwrap();
 
-    let leader_get = get_node_body(leader_state.clone(), "/api/v1/nodes/worker-a").await;
+    let leader_get = get_node_body(
+        leader_state.clone(),
+        leader_authority_router.clone(),
+        "/api/v1/nodes/worker-a",
+    )
+    .await;
     assert_eq!(
         leader_get["status"]["conditions"][0]["lastHeartbeatTime"],
         "2026-05-13T06:35:10Z"
     );
-    let leader_list = get_node_body(leader_state, "/api/v1/nodes").await;
+    let leader_list = get_node_body(leader_state, leader_authority_router, "/api/v1/nodes").await;
     assert_eq!(
         leader_list["items"][0]["status"]["conditions"][0]["lastHeartbeatTime"],
         "2026-05-13T06:35:10Z"
     );
 
-    let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.operational_mut().authority_router = Some(raft_proxy(false));
+    let follower_state = crate::api::test_support::build_test_app_state().await;
+    let follower_authority_router = raft_proxy(false);
     follower_state
         .resource_mutation()
         .db
@@ -5927,7 +5945,12 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         )
         .await
         .unwrap();
-    let follower_response = get_response(follower_state, "/api/v1/nodes/worker-a").await;
+    let follower_response = get_response(
+        follower_state,
+        follower_authority_router,
+        "/api/v1/nodes/worker-a",
+    )
+    .await;
     assert_eq!(
         follower_response.status(),
         StatusCode::SERVICE_UNAVAILABLE,
@@ -5950,11 +5973,10 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn raft_proxy_without_leader()
-    -> std::sync::Arc<crate::api::authority_routing::HttpAuthorityRouter> {
+    fn raft_proxy_without_leader() -> std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter> {
         let (_, is_leader_rx) = tokio::sync::watch::channel(false);
         let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-        std::sync::Arc::new(crate::api::authority_routing::HttpAuthorityRouter::new(
+        std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
             is_leader_rx,
             leader_addr_rx,
             None,
@@ -5963,11 +5985,12 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
 
     async fn follower_response(
         state: crate::api::ApiState,
+        authority_router: std::sync::Arc<crate::api_server_shell::HttpAuthorityRouter>,
         method: &str,
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> axum::response::Response {
-        let app = crate::api::build_router(state);
+        let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
         let mut builder = Request::builder().method(method).uri(uri);
         let body = if let Some(value) = body {
             builder = builder.header("content-type", "application/json");
@@ -6007,8 +6030,8 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
         assert_eq!(body["code"], 503);
     }
 
-    let mut follower_state = crate::api::test_support::build_test_app_state().await;
-    follower_state.operational_mut().authority_router = Some(raft_proxy_without_leader());
+    let follower_state = crate::api::test_support::build_test_app_state().await;
+    let authority_router = raft_proxy_without_leader();
 
     for (method, uri, body) in [
         ("GET", "/api/v1/nodes/worker-a", None),
@@ -6025,7 +6048,14 @@ async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write()
             })),
         ),
     ] {
-        let response = follower_response(follower_state.clone(), method, uri, body).await;
+        let response = follower_response(
+            follower_state.clone(),
+            authority_router.clone(),
+            method,
+            uri,
+            body,
+        )
+        .await;
         assert_retryable_503(response).await;
     }
 }
@@ -6040,11 +6070,13 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
     let addr = listener.local_addr().unwrap();
     drop(listener);
 
-    let mut follower_state = crate::api::test_support::build_test_app_state().await;
+    let follower_state = crate::api::test_support::build_test_app_state().await;
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
-    follower_state.operational_mut().authority_router = Some(std::sync::Arc::new(
-        crate::api::authority_routing::HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None),
+    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
+        is_leader_rx,
+        leader_addr_rx,
+        None,
     ));
     follower_state
         .resource_mutation()
@@ -6063,7 +6095,8 @@ async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler
         .await
         .unwrap();
 
-    let app = crate::api::build_router(follower_state);
+    let app =
+        crate::api_server_shell::build_router_with_authority(follower_state, authority_router);
     let response = app
         .oneshot(
             Request::builder()
@@ -6820,28 +6853,23 @@ async fn test_inconsistent_continue_token_uses_fresh_resource_version_without_wr
         .as_ref()
         .expect("first page must continue")
         .clone();
+    let test_now_unix_seconds = 1_700_000_000;
     let expired_data = ContinueTokenData {
         n: last_name,
         rv: first_rv,
-        ts: Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-                - CONTINUE_TOKEN_TTL_SECS
-                - 1,
-        ),
+        ts: Some(test_now_unix_seconds - CONTINUE_TOKEN_TTL_SECS - 1),
         session: false,
     };
     let expired_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&expired_data).unwrap());
-    let inconsistent_token = match process_continue_token(Some(expired_token)) {
-        Err(AppError::ResourceExpired(token)) => token,
-        other => panic!("expected expired continue token, got {other:?}"),
-    };
+    let inconsistent_token =
+        match process_continue_token_at(Some(expired_token), test_now_unix_seconds) {
+            Err(AppError::ResourceExpired(token)) => token,
+            other => panic!("expected expired continue token, got {other:?}"),
+        };
 
     let (continue_name, continue_resource_version) =
-        process_continue_token(Some(inconsistent_token)).unwrap();
+        process_continue_token_at(Some(inconsistent_token), test_now_unix_seconds).unwrap();
     let second_page = db
         .list_resources(
             "v1",
@@ -6913,7 +6941,7 @@ fn no_lenient_json_body_clone_in_production_handlers() {
 /// Verify http_client builds without danger_accept_invalid_certs when CA is present.
 #[test]
 fn raft_leader_proxy_client_builder_no_invalid_certs() {
-    use crate::api::authority_routing::HttpAuthorityRouter;
+    use crate::api_server_shell::HttpAuthorityRouter;
     let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_tx, leader_addr_rx) =
         tokio::sync::watch::channel(Some("https://127.0.0.1:7679".to_string()));
@@ -6931,7 +6959,7 @@ fn raft_leader_proxy_client_builder_no_invalid_certs() {
 /// Verify http_client builds without CA (backwards compat for single-node).
 #[test]
 fn raft_leader_proxy_client_builder_no_ca() {
-    use crate::api::authority_routing::HttpAuthorityRouter;
+    use crate::api_server_shell::HttpAuthorityRouter;
     let (_tx, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_tx, leader_addr_rx) =
         tokio::sync::watch::channel(Some("https://127.0.0.1:7679".to_string()));
@@ -7006,7 +7034,7 @@ async fn start_tls_server_async(cert_pem: String, key_pem: String, response: Str
 /// Proxy must reject a leader certificate signed by an untrusted CA.
 #[tokio::test]
 async fn raft_proxy_rejects_leader_certificate_signed_by_untrusted_ca() {
-    use crate::api::authority_routing::HttpAuthorityRouter;
+    use crate::api_server_shell::HttpAuthorityRouter;
 
     // Generate CA A + server cert signed by CA A
     let (ca_a_pem, _server_a_pem, _server_a_key) =
@@ -7046,7 +7074,7 @@ async fn raft_proxy_rejects_leader_certificate_signed_by_untrusted_ca() {
 /// and matching SAN.
 #[tokio::test]
 async fn raft_proxy_forwards_to_leader_with_trusted_ca_and_matching_san() {
-    use crate::api::authority_routing::HttpAuthorityRouter;
+    use crate::api_server_shell::HttpAuthorityRouter;
 
     let (ca_pem, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
 
@@ -7077,7 +7105,7 @@ async fn raft_proxy_forwards_to_leader_with_trusted_ca_and_matching_san() {
 /// the leader URL.
 #[tokio::test]
 async fn raft_proxy_rejects_leader_certificate_with_san_mismatch() {
-    use crate::api::authority_routing::HttpAuthorityRouter;
+    use crate::api_server_shell::HttpAuthorityRouter;
 
     // Server cert has SAN 127.0.0.2 but we'll connect to 127.0.0.1.
     let (ca_pem, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.2".to_string()]);
@@ -7109,7 +7137,7 @@ async fn raft_proxy_rejects_leader_certificate_with_san_mismatch() {
 /// Proxy must preserve method, path, query, headers, and body when forwarding.
 #[tokio::test]
 async fn raft_proxy_preserves_forwarded_method_path_query_headers_and_body() {
-    use crate::api::authority_routing::HttpAuthorityRouter;
+    use crate::api_server_shell::HttpAuthorityRouter;
 
     let (ca_pem, server_pem, server_key) = generate_ca_signed_cert(vec!["127.0.0.1".to_string()]);
 

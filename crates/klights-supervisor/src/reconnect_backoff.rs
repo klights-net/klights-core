@@ -1,4 +1,4 @@
-//! Reconnect policy for event streams.
+//! Shared reconnect policy for supervised event streams.
 
 /// Exponential reconnect delay from 500 ms, capped at 60 seconds.
 pub fn delay(attempt: u32) -> std::time::Duration {

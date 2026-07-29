@@ -25,13 +25,6 @@ use super::state::PodLifecycleState;
 
 pub const DEFAULT_POD_ACTOR_IDLE_GRACE: Duration = Duration::from_secs(30);
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
-}
-
 fn task_category_for_action(action: &PodAction) -> TaskCategory {
     match action {
         PodAction::StartPod { .. }
@@ -100,6 +93,7 @@ pub struct PodLifecycleActorRuntime {
     pub instance: ActorInstanceToken,
     pub idle_grace: Duration,
     pub runtime_observation_store: Option<Arc<Outbox>>,
+    pub wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 }
 
 fn pod_has_ephemeral_containers(pod: &serde_json::Value) -> bool {
@@ -217,6 +211,7 @@ pub struct PodLifecycleActor {
     idle_timer_armed_generation: Option<u64>,
     last_key: Option<PodLifecycleKey>,
     runtime_observation_store: Option<Arc<Outbox>>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     runtime_observation_checkpoint_loaded_for: Option<String>,
     #[cfg(test)]
     event_sink: Option<mpsc::Sender<&'static str>>,
@@ -254,6 +249,7 @@ impl PodLifecycleActor {
             idle_timer_armed_generation: None,
             last_key: None,
             runtime_observation_store: None,
+            wall_clock: Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
             runtime_observation_checkpoint_loaded_for: None,
             event_sink: Some(event_sink),
             uid_mismatch_warnings: Vec::new(),
@@ -282,6 +278,7 @@ impl PodLifecycleActor {
             idle_timer_armed_generation: None,
             last_key: None,
             runtime_observation_store: runtime.runtime_observation_store,
+            wall_clock: runtime.wall_clock,
             runtime_observation_checkpoint_loaded_for: None,
             #[cfg(test)]
             event_sink: None,
@@ -588,7 +585,12 @@ impl PodLifecycleActor {
             return;
         };
         if let Err(err) = store
-            .record_runtime_observation_checkpoint(&key.uid, ids, generation.max(1), now_ms())
+            .record_runtime_observation_checkpoint(
+                &key.uid,
+                ids,
+                generation.max(1),
+                self.wall_clock.now_ms(),
+            )
             .await
         {
             tracing::warn!(

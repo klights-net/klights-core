@@ -1,12 +1,5 @@
 use super::*;
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub(super) async fn spawn_cri_event_forwarder(
     cri: std::sync::Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -14,6 +7,7 @@ pub(super) async fn spawn_cri_event_forwarder(
     lifecycle_tx: Option<
         tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
+    wall_clock: std::sync::Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
 ) -> CriEventReceiver {
     use crate::kubelet::cri_events::{KubeletEvent, KubeletEventKind};
     use crate::kubelet::pod_runtime::cri::CriRuntimeContainerEventKind;
@@ -42,7 +36,7 @@ pub(super) async fn spawn_cri_event_forwarder(
                 Ok(stream) => {
                     if ever_connected {
                         generation = generation.saturating_add(1);
-                        let reconnected_at_ms = now_ms();
+                        let reconnected_at_ms = wall_clock.now_ms();
                         if let Some(tx) = lifecycle_tx.as_ref() {
                             let _ = tx
                                 .send(crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle::Reconnected {
@@ -65,7 +59,7 @@ pub(super) async fn spawn_cri_event_forwarder(
                     stream
                 }
                 Err(e) => {
-                    let delay = crate::reconnect_backoff::delay(reconnect_attempt);
+                    let delay = klights_supervisor::reconnect_backoff::delay(reconnect_attempt);
                     tracing::warn!(
                         "CRI event-stream subscribe attempt {} failed: {:#} - retry in {:?}",
                         reconnect_attempt + 1,
@@ -117,12 +111,12 @@ pub(super) async fn spawn_cri_event_forwarder(
                     }
                     Ok(None) => {
                     tracing::warn!("CRI event stream ended; reconnect loop will resubscribe");
-                        disconnected_at_ms.get_or_insert_with(now_ms);
+                        disconnected_at_ms.get_or_insert_with(|| wall_clock.now_ms());
                         break;
                     }
                     Err(e) => {
                         tracing::warn!("CRI event stream error: {:#} - reconnecting", e);
-                        disconnected_at_ms.get_or_insert_with(now_ms);
+                        disconnected_at_ms.get_or_insert_with(|| wall_clock.now_ms());
                         break;
                     }
                 }
@@ -281,8 +275,14 @@ mod tests {
             cancel.clone(),
         ));
 
-        let _events =
-            super::spawn_cri_event_forwarder(cri, cancel.clone(), supervisor(), Some(_tx)).await;
+        let _events = super::spawn_cri_event_forwarder(
+            cri,
+            cancel.clone(),
+            supervisor(),
+            Some(_tx),
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        )
+        .await;
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), lifecycle_rx.recv())
@@ -307,8 +307,14 @@ mod tests {
             cancel.clone(),
         ));
 
-        let _events =
-            super::spawn_cri_event_forwarder(cri, cancel.clone(), supervisor(), Some(tx)).await;
+        let _events = super::spawn_cri_event_forwarder(
+            cri,
+            cancel.clone(),
+            supervisor(),
+            Some(tx),
+            Arc::new(crate::kubelet::pod_runtime::store::SystemRuntimeClock),
+        )
+        .await;
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv())
             .await

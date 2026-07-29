@@ -745,7 +745,7 @@ mod tests {
             .expect("projected volume path should be created");
 
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "leader-issued-token"
         );
         let requests = sources.token_requests();
@@ -759,7 +759,11 @@ mod tests {
         assert_eq!(request.bound_pod_uid(), "pod-uid-a");
         assert_eq!(request.bound_node_name(), "node-a");
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 
     #[tokio::test]
@@ -848,20 +852,24 @@ mod tests {
 
         assert!(std::path::Path::new(&format!("{}/token", resolved)).exists());
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "worker-leader-token"
         );
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/ca.crt", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/ca.crt", resolved)).unwrap(),
             "cluster-ca-from-configmap"
         );
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/namespace", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/namespace", resolved)).unwrap(),
             "default"
         );
         assert_eq!(sources.token_requests().len(), 1);
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 
     #[tokio::test]
@@ -938,11 +946,15 @@ mod tests {
             .expect("projected volume path should be created");
 
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/podname", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/podname", resolved)).unwrap(),
             pod_name
         );
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 
     #[tokio::test]
@@ -1003,7 +1015,11 @@ mod tests {
         assert_eq!(resolved.as_deref(), Some(expected_path.as_str()));
         assert!(std::path::Path::new(&expected_path).exists());
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE") };
     }
@@ -1135,7 +1151,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "node-bound-token"
         );
 
@@ -1148,7 +1164,11 @@ mod tests {
         assert_eq!(requests[0].bound_node_name(), node_name);
         assert_eq!(requests[0].bound_node_uid(), None);
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 
     #[tokio::test]
@@ -1213,7 +1233,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "service-account-bound-token"
         );
 
@@ -1223,7 +1243,11 @@ mod tests {
         assert_eq!(requests[0].bound_pod_name(), pod_name);
         assert_eq!(requests[0].bound_pod_uid(), "pod-uid-a");
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 
     #[tokio::test]
@@ -1288,7 +1312,7 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "default-service-account-token"
         );
 
@@ -1300,7 +1324,11 @@ mod tests {
             "empty serviceAccountName must request a token for the Kubernetes default ServiceAccount"
         );
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 
     #[tokio::test]
@@ -1311,7 +1339,8 @@ mod tests {
             .unwrap()
             .as_nanos();
         let runtime_ns = format!("volreg-test-sa-signer-{}", suffix);
-        let etc_dir = crate::paths::etc_dir_path(&runtime_ns)
+        let etc_dir = crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+            .etc_dir()
             .to_string_lossy()
             .into_owned();
         std::fs::create_dir_all(&etc_dir).unwrap();
@@ -1360,11 +1389,15 @@ mod tests {
             .unwrap()
             .expect("projected volume path should be created");
         assert_eq!(
-            crate::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
+            klights_supervisor::runtime_fs::read_utf8(format!("{}/token", resolved)).unwrap(),
             "externally-issued-token"
         );
         assert_eq!(sources.token_requests().len(), 1);
 
-        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+        let _ = std::fs::remove_dir_all(
+            crate::kubelet::runtime_paths::KubeletRuntimePaths::for_test(&runtime_ns)
+                .data_root()
+                .to_path_buf(),
+        );
     }
 }

@@ -406,7 +406,7 @@ pub async fn cleanup_cni_config_dir(
     namespace: &str,
 ) -> Result<()> {
     let cni_dir = crate::paths::cni_conf_dir_path(namespace);
-    if crate::runtime_fs::remove_dir_all_if_exists_async(file_process, &cni_dir)
+    if klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(file_process, &cni_dir)
         .await
         .context(format!(
             "Failed to remove CNI config dir {}",
@@ -424,7 +424,7 @@ pub async fn cleanup_containerd_state_dir(
     namespace: &str,
 ) -> Result<()> {
     let state_dir = crate::paths::containerd_state_dir_path(namespace);
-    if crate::runtime_fs::remove_dir_all_if_exists_async(file_process, &state_dir)
+    if klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(file_process, &state_dir)
         .await
         .context(format!(
             "Failed to remove containerd state dir {}",
@@ -435,10 +435,12 @@ pub async fn cleanup_containerd_state_dir(
     }
     // Also remove the socket file in the state dir.
     let socket_path = crate::paths::containerd_socket_path(namespace);
-    let _ = crate::runtime_fs::remove_file_if_exists_async(file_process, &socket_path).await;
+    let _ = klights_supervisor::runtime_fs::remove_file_if_exists_async(file_process, &socket_path)
+        .await;
     // Remove parent if empty.
     if let Some(parent) = state_dir.parent() {
-        let _ = crate::runtime_fs::remove_dir_if_exists_async(file_process, parent).await;
+        let _ =
+            klights_supervisor::runtime_fs::remove_dir_if_exists_async(file_process, parent).await;
     }
     Ok(())
 }
@@ -489,7 +491,7 @@ pub async fn cleanup_containerd_auxiliary_dirs(
     namespace: &str,
 ) -> Result<()> {
     for dir in containerd_auxiliary_dir_paths(namespace) {
-        if crate::runtime_fs::remove_dir_all_if_exists_async(file_process, &dir)
+        if klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(file_process, &dir)
             .await
             .context(format!(
                 "Failed to remove containerd auxiliary dir {}",
@@ -501,7 +503,7 @@ pub async fn cleanup_containerd_auxiliary_dirs(
     }
 
     let root = crate::paths::containerd_root_dir_path(namespace);
-    let _ = crate::runtime_fs::remove_dir_if_exists_async(file_process, &root).await;
+    let _ = klights_supervisor::runtime_fs::remove_dir_if_exists_async(file_process, &root).await;
     Ok(())
 }
 
@@ -511,7 +513,7 @@ pub async fn cleanup_log_dir(
     namespace: &str,
 ) -> Result<()> {
     let log_dir = crate::paths::pod_logs_root_path(namespace);
-    if crate::runtime_fs::remove_dir_all_if_exists_async(file_process, &log_dir)
+    if klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(file_process, &log_dir)
         .await
         .context(format!("Failed to remove log dir {}", log_dir.display()))?
     {
@@ -545,12 +547,14 @@ async fn cleanup_volume_root_with_runner(
     runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
     file_process: &klights_supervisor::FileProcessExecutor,
 ) -> Result<()> {
-    if !crate::runtime_fs::exists_async(file_process, volumes_root).await? {
+    if !klights_supervisor::runtime_fs::exists_async(file_process, volumes_root).await? {
         return Ok(());
     }
 
     let mut roots = vec![volumes_root.to_string_lossy().into_owned()];
-    if let Ok(canonical) = crate::runtime_fs::canonicalize_async(file_process, volumes_root).await {
+    if let Ok(canonical) =
+        klights_supervisor::runtime_fs::canonicalize_async(file_process, volumes_root).await
+    {
         roots.push(canonical.to_string_lossy().into_owned());
     }
     let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
@@ -562,7 +566,7 @@ async fn cleanup_volume_root_with_runner(
     let mount_points = find_mount_points_under_roots(&mount_output, &root_refs);
     unmount_mount_points_with_runner(&mount_points, "pod volume", runner).await?;
 
-    crate::runtime_fs::remove_dir_all_if_exists_async(file_process, volumes_root)
+    klights_supervisor::runtime_fs::remove_dir_all_if_exists_async(file_process, volumes_root)
         .await
         .with_context(|| format!("Failed to remove volume dir {}", volumes_root.display()))?;
     tracing::info!("Removed volume dir: {}", volumes_root.display());

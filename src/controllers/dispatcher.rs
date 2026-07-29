@@ -1451,7 +1451,7 @@ mod tests {
                 "metadata": {
                     "name": "terminating-jobs",
                     "uid": "terminating-ns-uid",
-                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
+                    "deletionTimestamp": "2026-01-01T00:00:00.000000000Z",
                 },
                 "spec": {"finalizers": ["kubernetes"]},
                 "status": {"phase": "Terminating"}
@@ -1744,7 +1744,7 @@ mod tests {
                     "name": "ttl-deleting-job",
                     "namespace": "default",
                     "uid": "uid-ttl-deleting-job",
-                    "deletionTimestamp": crate::k8s_time::now_legacy_timestamp(),
+                    "deletionTimestamp": "2026-01-01T00:00:00.000000000Z",
                     "finalizers": ["foregroundDeletion"]
                 },
                 "spec": {

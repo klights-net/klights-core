@@ -29,14 +29,50 @@ impl DatastoreRaftCommitMaterializer {
     }
 }
 
+fn map_storage_mutation_error(error: anyhow::Error) -> klights_cluster_core::StorageMutationError {
+    use klights_cluster_core::{StorageCommandRejectionCode, StorageMutationError};
+    use klights_cluster_datastore::errors::DatastoreError;
+
+    let diagnostic = format!("{error:#}");
+    let concrete_code = error.chain().find_map(|source| {
+        source
+            .downcast_ref::<DatastoreError>()
+            .map(|error| match error {
+                DatastoreError::AlreadyExists { .. } => StorageCommandRejectionCode::AlreadyExists,
+                DatastoreError::NotFound { .. } => StorageCommandRejectionCode::NotFound,
+                DatastoreError::Conflict { .. } => StorageCommandRejectionCode::Conflict,
+            })
+    });
+    let lower = diagnostic.to_ascii_lowercase();
+    let rejection_code = concrete_code.or_else(|| {
+        if lower.contains("already exists") && lower.contains("409 conflict") {
+            Some(StorageCommandRejectionCode::AlreadyExists)
+        } else if lower.contains("409 conflict")
+            || lower.contains("version conflict")
+            || lower.contains("rv conflict")
+        {
+            Some(StorageCommandRejectionCode::Conflict)
+        } else if lower.contains("not found") {
+            Some(StorageCommandRejectionCode::NotFound)
+        } else {
+            None
+        }
+    });
+
+    match rejection_code {
+        Some(code) => StorageMutationError::rejected(code, diagnostic),
+        None => StorageMutationError::persistence(diagnostic),
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::datastore::raft::node::RaftCommitMaterializer for DatastoreRaftCommitMaterializer {
     async fn read_raft_metadata(
         &self,
         key: &str,
-    ) -> Result<Option<String>, crate::datastore::raft::node::RaftMaterializationError> {
+    ) -> Result<Option<String>, klights_cluster_core::StorageMutationError> {
         self.db.get_klights_meta(key).await.map_err(|error| {
-            crate::datastore::raft::node::RaftMaterializationError::persistence(error.to_string())
+            klights_cluster_core::StorageMutationError::persistence(error.to_string())
         })
     }
 
@@ -45,18 +81,12 @@ impl crate::datastore::raft::node::RaftCommitMaterializer for DatastoreRaftCommi
         command: klights_cluster_core::StorageCommand,
         operation: &str,
         authoring_node: &str,
-    ) -> Result<
-        klights_cluster_core::LogApplyCommit,
-        crate::datastore::raft::node::RaftMaterializationError,
-    > {
+    ) -> Result<klights_cluster_core::LogApplyCommit, klights_cluster_core::StorageMutationError>
+    {
         self.db
             .build_log_apply_commit_for_command(command, operation, authoring_node)
             .await
-            .map_err(|error| {
-                crate::datastore::raft::node::RaftMaterializationError::persistence(
-                    error.to_string(),
-                )
-            })
+            .map_err(map_storage_mutation_error)
     }
 
     async fn build_outbox(
@@ -1446,6 +1476,12 @@ mod tests {
         LogApplyCommit::try_new(mutations).expect("test commit must be an RV-zero live template")
     }
 
+    fn encoded_ack_result(resource_version: i64) -> Vec<u8> {
+        crate::outbox_response_codec_adapter::new_codec()
+            .encode(&klights_cluster_core::StorageResponse::Ack { resource_version })
+            .expect("encode applied-outbox acknowledgement")
+    }
+
     fn status_commit(
         idempotency_key: &str,
         status_message: &str,
@@ -1483,12 +1519,7 @@ mod tests {
                     operation: "PodStatus".to_string(),
                     first_seen_ms: status_stamp,
                     applied_rv: None,
-                    result_proto: crate::replication::outbox_response_wire::encode_outbox_response(
-                        &klights_cluster_core::command::StorageResponse::Ack {
-                            resource_version: 0,
-                        },
-                    )
-                    .expect("encode applied-outbox acknowledgement"),
+                    result_proto: encoded_ack_result(0),
                     status_stamp: Some(status_stamp),
                 }),
             ],
@@ -2604,15 +2635,12 @@ mod tests {
     #[tokio::test]
     async fn atomic_metadata_reads_reject_malformed_or_incomplete_observations() {
         let db = Datastore::new_in_memory().await.unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID, "cluster-a")
+        db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "cluster-a")
             .await
             .unwrap();
-        db.set_klights_meta(
-            crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH,
-            "not-a-number",
-        )
-        .await
-        .unwrap();
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "not-a-number")
+            .await
+            .unwrap();
         let handle: DatastoreHandle = Arc::new(db.clone()) as Arc<dyn DatastoreBackend>;
         let reader = DatastoreClusterMetadataRead::new(handle.clone());
         assert!(
@@ -2624,10 +2652,10 @@ mod tests {
                 .contains("leader_epoch")
         );
 
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "0")
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "0")
             .await
             .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_RAFT_VOTERS, "[]")
+        db.set_klights_meta(klights_cluster_store::RAFT_VOTERS_META_KEY, "[]")
             .await
             .unwrap();
         assert!(
@@ -2638,10 +2666,10 @@ mod tests {
                 .to_string()
                 .contains("incomplete")
         );
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_RAFT_TERM, "0")
+        db.set_klights_meta(klights_cluster_store::RAFT_TERM_META_KEY, "0")
             .await
             .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_RAFT_LEADER_HINT, "")
+        db.set_klights_meta(klights_cluster_store::RAFT_LEADER_HINT_META_KEY, "")
             .await
             .unwrap();
         assert!(
@@ -2668,14 +2696,11 @@ mod tests {
     async fn explicit_absent_membership_clears_stale_destination_keys() {
         let db = Datastore::new_in_memory().await.unwrap();
         for (key, value) in [
-            (crate::bootstrap::cluster_meta::KEY_CLUSTER_ID, "cluster-a"),
-            (crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "0"),
-            (
-                crate::bootstrap::cluster_meta::KEY_RAFT_VOTERS,
-                "[\"cp-1\"]",
-            ),
-            (crate::bootstrap::cluster_meta::KEY_RAFT_TERM, "4"),
-            (crate::bootstrap::cluster_meta::KEY_RAFT_LEADER_HINT, "cp-1"),
+            (klights_cluster_store::CLUSTER_ID_META_KEY, "cluster-a"),
+            (klights_cluster_store::LEADER_EPOCH_META_KEY, "0"),
+            (klights_cluster_store::RAFT_VOTERS_META_KEY, "[\"cp-1\"]"),
+            (klights_cluster_store::RAFT_TERM_META_KEY, "4"),
+            (klights_cluster_store::RAFT_LEADER_HINT_META_KEY, "cp-1"),
         ] {
             db.set_klights_meta(key, value).await.unwrap();
         }
@@ -2699,9 +2724,9 @@ mod tests {
             .await
             .unwrap();
         for key in [
-            crate::bootstrap::cluster_meta::KEY_RAFT_VOTERS,
-            crate::bootstrap::cluster_meta::KEY_RAFT_TERM,
-            crate::bootstrap::cluster_meta::KEY_RAFT_LEADER_HINT,
+            klights_cluster_store::RAFT_VOTERS_META_KEY,
+            klights_cluster_store::RAFT_TERM_META_KEY,
+            klights_cluster_store::RAFT_LEADER_HINT_META_KEY,
         ] {
             assert_eq!(db.get_klights_meta(key).await.unwrap(), None);
         }
@@ -2825,12 +2850,12 @@ mod tests {
         .await
         .unwrap();
         db.set_klights_meta(
-            crate::bootstrap::cluster_meta::KEY_CLUSTER_ID,
+            klights_cluster_store::CLUSTER_ID_META_KEY,
             "capture-fence-cluster",
         )
         .await
         .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "1")
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
             .await
             .unwrap();
         let handle: DatastoreHandle = Arc::new(db);
@@ -2874,12 +2899,7 @@ mod tests {
     #[tokio::test]
     async fn capture_keyset_pages_every_unbounded_family_without_gaps_or_duplicates() {
         let db = Datastore::new_in_memory().await.unwrap();
-        let result_proto = crate::replication::outbox_response_wire::encode_outbox_response(
-            &klights_cluster_core::command::StorageResponse::Ack {
-                resource_version: 1,
-            },
-        )
-        .unwrap();
+        let result_proto = encoded_ack_result(1);
         let mutations = (0..=klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE)
             .map(|index| {
                 LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
@@ -3017,12 +3037,7 @@ mod tests {
     #[tokio::test]
     async fn capture_restores_every_durable_family_and_preserves_outbox_dedupe() {
         let source = Datastore::new_in_memory().await.unwrap();
-        let result_proto = crate::replication::outbox_response_wire::encode_outbox_response(
-            &klights_cluster_core::command::StorageResponse::Ack {
-                resource_version: 7,
-            },
-        )
-        .unwrap();
+        let result_proto = encoded_ack_result(7);
         let outbox = LogApplyAppliedOutboxRow {
             idempotency_key: "captured-dedupe".into(),
             subject_key: "v1/ConfigMap/default/captured/captured-uid".into(),
@@ -3298,13 +3313,12 @@ mod tests {
         );
 
         let before = destination_ledger.current_apply_position().await.unwrap();
+        let mut duplicate_outbox = outbox;
+        duplicate_outbox.applied_rv = None;
         let duplicate = destination_ledger
-            .apply_committed_raft(CommittedRaftApplyRequest::new(
-                crate::replication::log_apply_wire::test_live_commit(
-                    0,
-                    vec![LogApplyMutation::PutAppliedOutbox(outbox)],
-                ),
-            ))
+            .apply_committed_raft(CommittedRaftApplyRequest::new(committed_v1(vec![
+                LogApplyMutation::PutAppliedOutbox(duplicate_outbox),
+            ])))
             .await
             .unwrap();
         assert!(matches!(
@@ -3323,10 +3337,10 @@ mod tests {
     #[tokio::test]
     async fn fenced_capture_streams_bounded_commits_ledgers_and_watermarks() {
         let (db, apply, _reader) = committed_store().await;
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID, "cluster-a")
+        db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "cluster-a")
             .await
             .unwrap();
-        db.set_klights_meta(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH, "0")
+        db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "0")
             .await
             .unwrap();
         db.create_resource("v1", "Pod", Some("default"), "adapter-status", json!({

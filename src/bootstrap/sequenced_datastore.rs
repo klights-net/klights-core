@@ -72,11 +72,29 @@ pub(crate) trait DatastoreApplier: Send + Sync {
 pub(crate) struct SequencedDatastore {
     passive: Arc<dyn DatastoreBackend>,
     proposal: Arc<dyn RaftProposal>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl SequencedDatastore {
+    #[cfg(test)]
     pub(crate) fn new(passive: Arc<dyn DatastoreBackend>, proposal: Arc<dyn RaftProposal>) -> Self {
-        Self { passive, proposal }
+        Self::new_with_clock(
+            passive,
+            proposal,
+            Arc::new(klights_supervisor::SystemWallClock),
+        )
+    }
+
+    pub(crate) fn new_with_clock(
+        passive: Arc<dyn DatastoreBackend>,
+        proposal: Arc<dyn RaftProposal>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
+    ) -> Self {
+        Self {
+            passive,
+            proposal,
+            wall_clock,
+        }
     }
 
     async fn propose_command(

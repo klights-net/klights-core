@@ -192,6 +192,7 @@ pub(crate) async fn complete_non_foreground_delete(
         orphan_children_before_completion: orphan_children,
         uid_mismatch_is_conflict: false,
         grace_seconds: 0,
+        operation_now: klights_supervisor::SystemWallClock::now_utc(),
     };
     match crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
         &lifecycle, request,

@@ -109,9 +109,10 @@ pub fn resource_has_finalizers(data: &Value, pointer: &str) -> bool {
         .is_some_and(|arr| !arr.is_empty())
 }
 
-pub fn set_namespace_terminating_status(
+pub fn set_namespace_terminating_status_at(
     namespace: &mut Value,
     with_content_failure_condition: bool,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) {
     if let Some(obj) = namespace.as_object_mut() {
         if let Some(metadata) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
@@ -120,7 +121,9 @@ pub fn set_namespace_terminating_status(
         {
             metadata.insert(
                 "deletionTimestamp".to_string(),
-                serde_json::json!(crate::k8s_time::now_legacy_timestamp()),
+                serde_json::json!(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                    operation_now
+                )),
             );
         }
 
@@ -137,7 +140,7 @@ pub fn set_namespace_terminating_status(
                         "status": "True",
                         "reason": "ContentDeletionFailed",
                         "message": "Namespace contains content with pending finalization",
-                        "lastTransitionTime": crate::k8s_time::now_legacy_timestamp(),
+                        "lastTransitionTime": klights_cluster_core::k8s_time::format_legacy_timestamp(operation_now),
                     }]),
                 );
             } else {
@@ -147,12 +150,40 @@ pub fn set_namespace_terminating_status(
     }
 }
 
+#[cfg(test)]
+fn test_namespace_operation_time() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("fixed namespace test timestamp")
+}
+
+#[cfg(test)]
+pub fn set_namespace_terminating_status(
+    namespace: &mut Value,
+    with_content_failure_condition: bool,
+) {
+    set_namespace_terminating_status_at(
+        namespace,
+        with_content_failure_condition,
+        test_namespace_operation_time(),
+    );
+}
+
+pub async fn reconcile_namespace_termination_at(
+    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
+    namespace: &str,
+    metrics: &(impl NamespaceTerminationMetrics + ?Sized),
+    operation_now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), AppError> {
+    reconcile_namespace_termination_inner(db, namespace, None, metrics, operation_now).await
+}
+
+#[cfg(test)]
 pub async fn reconcile_namespace_termination(
     db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
 ) -> Result<(), AppError> {
-    reconcile_namespace_termination_inner(db, namespace, None, metrics).await
+    reconcile_namespace_termination_at(db, namespace, metrics, test_namespace_operation_time())
+        .await
 }
 
 // `reconcile_namespace_termination_for_uid` (the legacy variant without an
@@ -179,14 +210,21 @@ pub enum NamespaceTerminationOutcome {
 /// Centralizes the "still terminating?" check so the workqueue does not
 /// have to perform its own forbidden DB query (the
 /// tests/source_guard_tests.py restricts it to workqueue CRUD only).
-pub async fn reconcile_namespace_termination_for_uid_with_outcome(
+pub async fn reconcile_namespace_termination_for_uid_with_outcome_at(
     db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     expected_uid: &str,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<NamespaceTerminationOutcome, AppError> {
-    let reconcile_result =
-        reconcile_namespace_termination_inner(db, namespace, Some(expected_uid), metrics).await;
+    let reconcile_result = reconcile_namespace_termination_inner(
+        db,
+        namespace,
+        Some(expected_uid),
+        metrics,
+        operation_now,
+    )
+    .await;
 
     // Whether the inner reconcile returned Ok or a transient Err, look at
     // the post-state to decide whether the workqueue should schedule a
@@ -220,11 +258,29 @@ pub async fn reconcile_namespace_termination_for_uid_with_outcome(
     Ok(outcome)
 }
 
+#[cfg(test)]
+pub async fn reconcile_namespace_termination_for_uid_with_outcome(
+    db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
+    namespace: &str,
+    expected_uid: &str,
+    metrics: &(impl NamespaceTerminationMetrics + ?Sized),
+) -> Result<NamespaceTerminationOutcome, AppError> {
+    reconcile_namespace_termination_for_uid_with_outcome_at(
+        db,
+        namespace,
+        expected_uid,
+        metrics,
+        test_namespace_operation_time(),
+    )
+    .await
+}
+
 async fn reconcile_namespace_termination_inner(
     db: &(impl klights_reconcile_api::NamespaceLifecycleStore + ?Sized),
     namespace: &str,
     expected_uid: Option<&str>,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), AppError> {
     // Termination reconcile is triggered from many call sites under load:
     // the API delete handler, every Pod actor finalize, and any deferred
@@ -235,7 +291,15 @@ async fn reconcile_namespace_termination_inner(
     // Both are benign — one of the racing reconciles already advanced the
     // termination — so we retry on Conflict and treat NotFound as success.
     for attempt in 0..5 {
-        match reconcile_namespace_termination_once(db, namespace, expected_uid, metrics).await {
+        match reconcile_namespace_termination_once(
+            db,
+            namespace,
+            expected_uid,
+            metrics,
+            operation_now,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(AppError::NotFound(_)) => return Ok(()),
             Err(AppError::Conflict(_)) if attempt < 4 => continue,
@@ -250,6 +314,7 @@ async fn reconcile_namespace_termination_once(
     namespace: &str,
     expected_uid: Option<&str>,
     metrics: &(impl NamespaceTerminationMetrics + ?Sized),
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), AppError> {
     let Some(current_ns) = db.get_terminating_namespace(namespace.to_string()).await? else {
         return Ok(());
@@ -296,7 +361,9 @@ async fn reconcile_namespace_termination_once(
             if let Some(meta) = pod.get_mut("metadata").and_then(|m| m.as_object_mut()) {
                 meta.insert(
                     "deletionTimestamp".to_string(),
-                    serde_json::json!(crate::k8s_time::now_legacy_timestamp()),
+                    serde_json::json!(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                        operation_now
+                    )),
                 );
                 meta.insert(
                     "deletionGracePeriodSeconds".to_string(),
@@ -309,7 +376,7 @@ async fn reconcile_namespace_termination_once(
     }
 
     let mut namespace_data: Value = (*current_ns.data).clone();
-    set_namespace_terminating_status(&mut namespace_data, pod_blockers);
+    set_namespace_terminating_status_at(&mut namespace_data, pod_blockers, operation_now);
     let updated_ns = db
         .update_terminating_namespace(
             namespace.to_string(),

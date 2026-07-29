@@ -23,6 +23,7 @@ pub(crate) struct RootPodNativeAdapter {
     status_only: Arc<dyn StateOnlyWriter>,
     delete_coordinator: Arc<PodDeleteCoordinator>,
     db: DatastoreHandle,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
 }
 
 impl RootPodNativeAdapter {
@@ -31,12 +32,14 @@ impl RootPodNativeAdapter {
         status_only: Arc<dyn StateOnlyWriter>,
         delete_coordinator: Arc<PodDeleteCoordinator>,
         db: DatastoreHandle,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             status_only,
             delete_coordinator,
             db,
+            wall_clock,
         })
     }
 }
@@ -227,6 +230,7 @@ impl PodControlPlaneEventSink for RootPodNativeAdapter {
                     event_type: &request.event_type,
                     reporting_component: &request.reporting_component,
                     reporting_instance: &request.reporting_instance,
+                    operation_now: self.wall_clock.now_utc(),
                 },
             )
             .await

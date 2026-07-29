@@ -5,16 +5,64 @@
 //! update if the constructor signature changes (e.g. when the dual-DB P5
 //! work lands). No behavior change today.
 //!
-//! The helpers also collapse two recurring follow-up patterns:
-//! - `(Datastore, DatastoreHandle)` pair construction (side-effect tests,
-//!   networking integration tests, `cni_plugin` test-state)
-//! - `Context::new(Arc::new(db.clone()), "test-node".into())` for the
-//!   controller-wrapper tests in `src/controllers/*_controller.rs`.
+//! The helpers also collapse the recurring `(Datastore, DatastoreHandle)` pair
+//! construction used by root-owned integration tests.
 
 #![cfg(test)]
 
 use super::{Datastore, DatastoreBackend, DatastoreHandle};
+use klights_cluster_core::{LogApplyCommit, LogApplyMutation};
 use std::sync::Arc;
+
+/// Build the RV-zero live-apply template consumed by passive-store tests.
+///
+/// Public resource versions are allocated by committed apply, so legacy
+/// fixture RVs are deliberately erased before validation.
+pub(crate) fn test_live_commit(
+    candidate_resource_version: i64,
+    mut mutations: Vec<LogApplyMutation>,
+) -> LogApplyCommit {
+    fn clear_nested_resource_version(data: &mut serde_json::Value) {
+        if let Some(metadata) = data
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("resourceVersion");
+        }
+    }
+
+    for mutation in &mut mutations {
+        match mutation {
+            LogApplyMutation::PutResource(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.data);
+            }
+            LogApplyMutation::PatchResourceLatest(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.patch);
+            }
+            LogApplyMutation::PutNamespace(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.data);
+            }
+            LogApplyMutation::PutWatchEvent(row) => {
+                row.resource_version = 0;
+                clear_nested_resource_version(&mut row.data);
+                if let Some(object) = row.data.get_mut("object") {
+                    clear_nested_resource_version(object);
+                }
+            }
+            LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
+            LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
+            LogApplyMutation::AdvanceResourceVersion { resource_version } => {
+                *resource_version = 0;
+            }
+            _ => {}
+        }
+    }
+    let _ = candidate_resource_version;
+    LogApplyCommit::try_new(mutations).expect("test live commit must be an RV-zero template")
+}
 
 /// Construct an in-memory `Datastore` for tests.  Panics on init failure
 /// (an in-memory SQLite open + schema apply is not a recoverable test
@@ -44,8 +92,9 @@ pub async fn ensure_namespace(db: &dyn DatastoreBackend, name: &str) {
     db.seed_namespace_for_test(name).await;
 }
 
-/// Construct a controller `Context` over an in-memory `Datastore`.
-/// `node_name` defaults to `"test-node"`.
+/// Construct the focused controller test context used by the thin controller
+/// runner fixtures. This helper is test-only and does not add a production
+/// datastore-to-controller compatibility seam.
 pub(crate) fn test_context(db: &Datastore) -> crate::controllers::Context {
     let db_handle = Arc::new(db.clone()) as DatastoreHandle;
     crate::controllers::Context::new(db_handle.clone(), "test-node".to_string())

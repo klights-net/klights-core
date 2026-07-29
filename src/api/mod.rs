@@ -18,7 +18,6 @@ pub mod macros;
 pub(crate) mod admission_ports;
 pub mod apiservice_proxy;
 pub(crate) mod auth_middleware;
-pub(crate) mod authority_routing;
 pub(crate) mod backend_proxy_headers;
 mod crd_conversion;
 pub(crate) mod custom_resource_ports;
@@ -92,12 +91,14 @@ use custom_resources::{
     update_custom_resource,
 };
 pub(in crate::api) use debug::pod_lifecycle_debug_dump;
+#[cfg(test)]
+pub use defaulting::{apply_pod_create_defaults, inject_create_metadata, set_deletion_timestamp};
 pub use defaulting::{
-    apply_pod_create_defaults, apply_pod_service_account_defaults, apply_pod_spec_create_defaults,
-    apply_pv_create_defaults, apply_pvc_create_defaults,
+    apply_pod_create_defaults_at, apply_pod_service_account_defaults,
+    apply_pod_spec_create_defaults, apply_pv_create_defaults, apply_pvc_create_defaults,
     apply_replicationcontroller_selector_default, apply_resourcequota_create_status,
     apply_workload_replicas_default, increment_generation_for_spec_change,
-    increment_generation_if_spec_changed, inject_create_metadata, set_deletion_timestamp,
+    increment_generation_if_spec_changed, inject_create_metadata_at, set_deletion_timestamp_at,
 };
 pub use errors::AppError;
 pub(crate) use errors::{map_mutating_admission_error, map_validating_admission_error};
@@ -128,8 +129,13 @@ pub use helpers::{
     enforce_limitrange_constraints_for_pvc, ensure_array, ensure_namespace_status_phase_active,
     ensure_object, normalize_resource_for_read, normalize_resource_for_storage,
     preserve_status_subresource_on_main_update, process_secret_stringdata,
+    reconcile_namespace_termination_at, reconcile_namespace_termination_for_uid_with_outcome_at,
+    resource_has_finalizers, set_namespace_terminating_status_at, validate_secret_data,
+};
+#[cfg(test)]
+pub use helpers::{
     reconcile_namespace_termination, reconcile_namespace_termination_for_uid_with_outcome,
-    resource_has_finalizers, set_namespace_terminating_status, validate_secret_data,
+    set_namespace_terminating_status,
 };
 pub(in crate::api) use namespace::{
     create_namespace, delete_namespace, finalize_namespace, get_namespace, list_namespaces,
@@ -141,11 +147,13 @@ pub(in crate::api) use pod_handlers::{
 };
 pub use pod_security::enforce_pod_security_admission;
 #[cfg(test)]
+use query::process_continue_token;
+#[cfg(test)]
 pub use query::{
     CONTINUE_TOKEN_TTL_SECS, ContinueTokenData, encode_continue_token,
     encode_inconsistent_continue_token,
 };
-use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token};
+use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token_at};
 // Used only by mod_tests; the production list handlers now go through
 // `query::resolve_list_page`, which calls this internally.
 #[cfg(test)]
@@ -166,6 +174,10 @@ use response::{
 use response::{node_list_to_table, pod_list_to_table, watch_event_to_table};
 #[cfg(test)]
 pub(crate) use routes::build_router;
+#[cfg(test)]
+pub(crate) fn build_router_parts(state: ApiState) -> (axum::Router, routes::NativeApiOuterLayers) {
+    routes::build_router_parts(state)
+}
 pub(crate) use state::ApiNodeRole;
 #[cfg(not(test))]
 use state::ApiState;

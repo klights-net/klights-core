@@ -1,5 +1,3 @@
-use crate::k8s_time::now_time as k8s_time_now;
-
 /// The two network-related Node conditions (`Ready` + `NetworkUnavailable`)
 /// derived from the local dataplane health. Shared by initial registration and
 /// the event-driven readiness reconciler so both encode health identically.
@@ -48,6 +46,7 @@ fn set_node_condition(
     status: &str,
     reason: &str,
     message: &str,
+    transition_time: &str,
 ) -> bool {
     let Some(conditions) = node
         .pointer_mut("/status/conditions")
@@ -69,7 +68,7 @@ fn set_node_condition(
         existing["reason"] = serde_json::json!(reason);
         existing["message"] = serde_json::json!(message);
         if status_changed {
-            existing["lastTransitionTime"] = serde_json::json!(k8s_time_now());
+            existing["lastTransitionTime"] = serde_json::json!(transition_time);
         }
         true
     } else {
@@ -78,7 +77,7 @@ fn set_node_condition(
             "status": status,
             "reason": reason,
             "message": message,
-            "lastTransitionTime": k8s_time_now(),
+            "lastTransitionTime": transition_time,
         }));
         true
     }
@@ -89,13 +88,16 @@ fn set_node_condition(
 pub(super) fn apply_network_conditions(
     node: &mut serde_json::Value,
     conditions: &NodeNetworkConditions,
+    operation_now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
+    let transition_time = klights_cluster_core::k8s_time::format_time(operation_now);
     let ready_changed = set_node_condition(
         node,
         "Ready",
         conditions.ready_status,
         conditions.ready_reason,
         &conditions.ready_message,
+        &transition_time,
     );
     let net_changed = set_node_condition(
         node,
@@ -103,6 +105,7 @@ pub(super) fn apply_network_conditions(
         conditions.net_unavail_status,
         conditions.net_unavail_reason,
         &conditions.net_unavail_message,
+        &transition_time,
     );
     ready_changed || net_changed
 }

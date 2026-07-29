@@ -31,7 +31,11 @@ use super::apply_command_to_backend;
 
 const NODE_LEASE_RENEW_OPERATION: &str = "LeaseRenew";
 
-fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
+fn ensure_mark_delete_timestamps(
+    data: &mut Value,
+    grace_seconds: i64,
+    operation_now: chrono::DateTime<chrono::Utc>,
+) {
     let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) else {
         return;
     };
@@ -42,7 +46,9 @@ fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
     {
         metadata.insert(
             "deletionTimestamp".to_string(),
-            Value::String(crate::k8s_time::now_legacy_timestamp()),
+            Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                operation_now,
+            )),
         );
     }
     metadata
@@ -439,7 +445,7 @@ impl DatastoreBackend for SequencedDatastore {
             return Ok(Some(current));
         }
 
-        ensure_mark_delete_timestamps(&mut current_data, grace_seconds);
+        ensure_mark_delete_timestamps(&mut current_data, grace_seconds, self.wall_clock.now_utc());
         let expected_rv = preconditions.resource_version.unwrap_or(0);
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),

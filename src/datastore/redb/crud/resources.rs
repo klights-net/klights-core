@@ -23,6 +23,7 @@ use klights_cluster_datastore::redb::tables;
 
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
+    wall_clock: Arc<dyn klights_supervisor::WallClock>,
     #[cfg(test)]
     commit_sink: Arc<dyn CommitObservationSink>,
 }
@@ -31,9 +32,11 @@ impl RedbResourceStore {
     pub fn new(
         accessor: Arc<RedbAccessor>,
         #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
+        wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             accessor,
+            wall_clock,
             #[cfg(test)]
             commit_sink,
         }
@@ -762,6 +765,8 @@ impl RedbResourceStore {
         let kind_event = kind_owned.clone();
         let ns_event = ns_owned.clone();
         let name_event = name_owned.clone();
+        let deletion_timestamp =
+            klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
 
         let (resource_version, data, uid) = self
             .db_call_with_observation("delete_res_with_tombstone", move |db| {
@@ -796,7 +801,7 @@ impl RedbResourceStore {
                     {
                         metadata.insert(
                             "deletionTimestamp".to_string(),
-                            serde_json::Value::String(crate::k8s_time::now_legacy_timestamp()),
+                            serde_json::Value::String(deletion_timestamp),
                         );
                     }
                     metadata
@@ -1531,6 +1536,7 @@ mod tests {
         RedbResourceStore::new(
             accessor,
             crate::watch_commit_observation_adapter::new_sink(),
+            Arc::new(klights_supervisor::SystemWallClock),
         )
     }
 
@@ -1665,7 +1671,11 @@ mod tests {
             watch_sink.as_ref(),
             klights_watch::WatchTopic::new("v1", "Pod"),
         );
-        let s = RedbResourceStore::new(accessor, watch_sink);
+        let s = RedbResourceStore::new(
+            accessor,
+            watch_sink,
+            Arc::new(klights_supervisor::SystemWallClock),
+        );
 
         let pod =
             json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"we","namespace":"default"}});

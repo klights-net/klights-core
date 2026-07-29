@@ -286,7 +286,7 @@ pub struct GrpcRaftNetwork {
     /// T4: shared RTT estimator fed by successful AppendEntries round-trips.
     /// AppendEntries is the most frequent raft RPC (heartbeats), so it is the
     /// natural RTT source. Idle-silent: no traffic ⇒ no samples ⇒ no work.
-    rtt: Arc<super::rtt_estimator::RttEstimator>,
+    rtt: Arc<klights_types::RttEstimator>,
 }
 
 impl GrpcRaftNetwork {
@@ -298,7 +298,7 @@ impl GrpcRaftNetwork {
             bound_target: None,
             bound_receiver_admission: None,
             metrics: Arc::new(GrpcRaftNetworkMetrics::default()),
-            rtt: Arc::new(super::rtt_estimator::RttEstimator::new()),
+            rtt: Arc::new(klights_types::RttEstimator::new()),
         }
     }
 

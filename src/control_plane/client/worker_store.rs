@@ -920,7 +920,7 @@ async fn sleep_before_watch_mirror_reconnect(
         _ = cancel.cancelled() => false,
         _ = supervisor.sleep(
             "worker_store_watch_mirror_reconnect",
-            crate::reconnect_backoff::delay(attempt),
+            klights_supervisor::reconnect_backoff::delay(attempt),
         ) => true,
     }
 }
@@ -2598,6 +2598,7 @@ mod tests {
                 event_type: "Normal",
                 reporting_component: "klights-kubelet",
                 reporting_instance: "worker-a",
+                operation_now: klights_supervisor::SystemWallClock::now_utc(),
             },
         )
         .await

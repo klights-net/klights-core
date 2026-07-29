@@ -266,12 +266,14 @@ pub(in crate::api) async fn authorize_request(
         .authorizer
         .authorize(&identity, &authorization)
         .await;
+    let operation_now = crate::auth::clock::chrono_utc(state.operational().clock.now());
     auth_policy
         .audit_sink
         .record(crate::audit::AuditEvent::authorization(
             &identity,
             &authorization,
             &decision,
+            operation_now,
         ));
     if decision.allowed {
         return next.run(request).await;

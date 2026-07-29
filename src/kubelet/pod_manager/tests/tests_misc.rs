@@ -33,16 +33,6 @@ async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_awar
 
     let (is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(false);
 
-    let (_leader_addr_tx, leader_addr_rx) =
-        tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
-    state.operational_mut().authority_router = Some(std::sync::Arc::new(
-        crate::api::authority_routing::HttpAuthorityRouter::new(
-            is_leader_rx.clone(),
-            leader_addr_rx,
-            None,
-        ),
-    ));
-
     // Seed a Pending PVC with no matching PV yet, then create the matching PV.
     let pvc = state
         .resource_mutation()

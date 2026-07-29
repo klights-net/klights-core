@@ -1489,12 +1489,14 @@ async fn follower_authority_router_does_not_fallback_local_for_pod_logs_without_
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let mut state = crate::api::test_support::build_test_app_state().await;
+    let state = crate::api::test_support::build_test_app_state().await;
     let remote_node = format!("{}-worker", state.operational().config.node_name);
     let (_, is_leader_rx) = tokio::sync::watch::channel(false);
     let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
-    state.operational_mut().authority_router = Some(std::sync::Arc::new(
-        crate::api::authority_routing::HttpAuthorityRouter::new(is_leader_rx, leader_addr_rx, None),
+    let authority_router = std::sync::Arc::new(crate::api_server_shell::HttpAuthorityRouter::new(
+        is_leader_rx,
+        leader_addr_rx,
+        None,
     ));
     state
         .resource_mutation()
@@ -1521,7 +1523,7 @@ async fn follower_authority_router_does_not_fallback_local_for_pod_logs_without_
         )
         .await
         .unwrap();
-    let app = crate::api::build_router(state);
+    let app = crate::api_server_shell::build_router_with_authority(state, authority_router);
 
     let response = app
         .oneshot(

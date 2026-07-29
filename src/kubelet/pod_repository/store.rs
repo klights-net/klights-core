@@ -144,14 +144,19 @@ pub(crate) trait PodPersistence: Send + Sync {
 
 pub struct PodStore {
     persistence: Arc<dyn PodPersistence>,
+    wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
     /// Incremented on every pod create/delete to signal sandbox GC that a sweep may be needed.
     pub(super) sandbox_gc_dirty: Arc<AtomicUsize>,
 }
 
 impl PodStore {
-    pub(crate) fn from_persistence(persistence: Arc<dyn PodPersistence>) -> Self {
+    pub(crate) fn from_persistence(
+        persistence: Arc<dyn PodPersistence>,
+        wall_clock: Arc<dyn crate::kubelet::pod_runtime::store::RuntimeClock>,
+    ) -> Self {
         Self {
             persistence,
+            wall_clock,
             sandbox_gc_dirty: Arc::new(AtomicUsize::new(1)),
         }
     }
@@ -245,7 +250,11 @@ impl PodStore {
             .and_then(|m| m.get("deletionTimestamp"))
             .filter(|value| !value.is_null())
             .cloned()
-            .unwrap_or_else(|| Value::String(crate::k8s_time::now_legacy_timestamp()));
+            .unwrap_or_else(|| {
+                Value::String(klights_cluster_core::k8s_time::format_legacy_timestamp(
+                    self.wall_clock.now_utc(),
+                ))
+            });
         let deletion_grace_period_seconds = metadata
             .and_then(|m| m.get("deletionGracePeriodSeconds"))
             .cloned()
