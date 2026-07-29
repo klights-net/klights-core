@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::{NodeLocalHandle, selector};
+use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalHandle, selector};
 use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::node_outbox::{DispatchOutcome, Outbox, OutboxCommand, OutboxDispatcher, OutboxSubject};
 use klights_cluster_core::command::StorageCommand;
@@ -174,7 +174,7 @@ async fn leader_dispatcher_uses_consolidated_apply() {
     // All rows should be completed (no more due).
     assert!(
         node_db
-            .claim_next_due_outbox(now + 100, 1_000, "check-empty")
+            .legacy_claim_next_due_outbox(now + 100, 1_000, "check-empty")
             .await
             .expect("claim after batch")
             .is_none(),
@@ -226,7 +226,7 @@ async fn outbox_lost_response_remains_retryable_and_claimable_after_backoff() {
 
     assert!(
         node_db
-            .claim_next_due_outbox(now, 1_000, "too-soon")
+            .legacy_claim_next_due_outbox(now, 1_000, "too-soon")
             .await
             .expect("claim too soon")
             .is_none(),
@@ -243,7 +243,7 @@ async fn outbox_lost_response_remains_retryable_and_claimable_after_backoff() {
 
     assert!(
         node_db
-            .claim_next_due_outbox(now + 120_000, 1_000, "done")
+            .legacy_claim_next_due_outbox(now + 120_000, 1_000, "done")
             .await
             .expect("claim after success")
             .is_none(),
@@ -364,11 +364,11 @@ async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
     };
     // Older row A, then younger row B, same subject.
     node_db
-        .enqueue_outbox(insert("older-A", 100))
+        .legacy_enqueue_outbox(insert("older-A", 100))
         .await
         .unwrap();
     node_db
-        .enqueue_outbox(insert("younger-B", 101))
+        .legacy_enqueue_outbox(insert("younger-B", 101))
         .await
         .unwrap();
 
@@ -376,7 +376,7 @@ async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
     // First batch claims only the oldest row A and leases it for a long time
     // (simulating an in-flight apply that hasn't completed/acked yet).
     let first = node_db
-        .claim_due_outbox_batch(now, 16, 10_000, "dispatcher-1")
+        .legacy_claim_due_outbox_batch(now, 16, 10_000, "dispatcher-1")
         .await
         .expect("first batch claim");
     assert_eq!(first.len(), 1, "only oldest per subject claimed");
@@ -385,7 +385,7 @@ async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
     // Second batch while A is still leased: B must remain blocked, because an
     // older same-subject row still exists. Current buggy SQL claims B here.
     let second = node_db
-        .claim_due_outbox_batch(now + 1, 16, 10_000, "dispatcher-2")
+        .legacy_claim_due_outbox_batch(now + 1, 16, 10_000, "dispatcher-2")
         .await
         .expect("second batch claim");
     assert!(
@@ -426,13 +426,13 @@ async fn outbox_strict_stream_single_claim_blocks_terminal_delete_behind_backoff
         .await
         .expect("enqueue status");
     let status = node_db
-        .claim_next_due_outbox(1_000, 100, "status-lease")
+        .legacy_claim_next_due_outbox(1_000, 100, "status-lease")
         .await
         .expect("claim status")
         .expect("status row due");
     assert_eq!(status.idempotency_key, "web-status-backoff");
     node_db
-        .mark_outbox_attempt_failed(status.id, "status-lease", 30_000, "transport down")
+        .legacy_mark_outbox_attempt_failed(status.id, "status-lease", 30_000, "transport down")
         .await
         .expect("back off status");
 
@@ -449,7 +449,7 @@ async fn outbox_strict_stream_single_claim_blocks_terminal_delete_behind_backoff
         .expect("enqueue actor finalize delete");
 
     let claimed = node_db
-        .claim_next_due_outbox(1_001, 100, "delete-lease")
+        .legacy_claim_next_due_outbox(1_001, 100, "delete-lease")
         .await
         .expect("claim while status is backed off");
     assert!(
@@ -458,7 +458,7 @@ async fn outbox_strict_stream_single_claim_blocks_terminal_delete_behind_backoff
     );
     assert_eq!(
         node_db
-            .next_outbox_wake_ms(1_001)
+            .legacy_next_outbox_wake_ms(1_001)
             .await
             .expect("next FIFO wake"),
         Some(30_000),
@@ -489,14 +489,19 @@ async fn outbox_strict_stream_batch_claim_blocks_terminal_delete_behind_backoff(
         .await
         .expect("enqueue status");
     let status = node_db
-        .claim_due_outbox_batch(1_000, 16, 100, "status-batch-lease")
+        .legacy_claim_due_outbox_batch(1_000, 16, 100, "status-batch-lease")
         .await
         .expect("claim status batch")
         .pop()
         .expect("status row due");
     assert_eq!(status.idempotency_key, "web-status-backoff-batch");
     node_db
-        .mark_outbox_attempt_failed(status.id, "status-batch-lease", 30_000, "transport down")
+        .legacy_mark_outbox_attempt_failed(
+            status.id,
+            "status-batch-lease",
+            30_000,
+            "transport down",
+        )
         .await
         .expect("back off status");
 
@@ -518,7 +523,7 @@ async fn outbox_strict_stream_batch_claim_blocks_terminal_delete_behind_backoff(
         .expect("enqueue actor finalize delete");
 
     let claimed = node_db
-        .claim_due_outbox_batch(1_001, 16, 100, "delete-batch-lease")
+        .legacy_claim_due_outbox_batch(1_001, 16, 100, "delete-batch-lease")
         .await
         .expect("claim while status is backed off");
     assert!(
@@ -527,7 +532,7 @@ async fn outbox_strict_stream_batch_claim_blocks_terminal_delete_behind_backoff(
     );
     assert_eq!(
         node_db
-            .next_outbox_wake_ms(1_001)
+            .legacy_next_outbox_wake_ms(1_001)
             .await
             .expect("next FIFO wake"),
         Some(30_000),
@@ -575,7 +580,7 @@ async fn outbox_strict_stream_batch_claim_leases_due_head_before_terminal_delete
         .expect("enqueue actor finalize delete");
 
     let claimed = node_db
-        .claim_due_outbox_batch(1_001, 16, 100, "delete-only-batch-lease")
+        .legacy_claim_due_outbox_batch(1_001, 16, 100, "delete-only-batch-lease")
         .await
         .expect("claim delete batch");
     assert_eq!(
@@ -647,7 +652,7 @@ async fn batch_claim_does_not_deadlock_different_subject_behind_superseded_statu
         .expect("enqueue actor finalize delete");
 
     let claimed = node_db
-        .claim_due_outbox_batch(1_002, 16, 100, "event-lease")
+        .legacy_claim_due_outbox_batch(1_002, 16, 100, "event-lease")
         .await
         .expect("claim event batch");
     assert_eq!(
@@ -689,7 +694,7 @@ async fn batch_claim_keeps_same_subject_blocked_while_status_is_in_flight() {
         .await
         .expect("enqueue status");
     let status = node_db
-        .claim_due_outbox_batch(1_000, 16, 10_000, "status-lease")
+        .legacy_claim_due_outbox_batch(1_000, 16, 10_000, "status-lease")
         .await
         .expect("claim status")
         .pop()
@@ -730,7 +735,7 @@ async fn batch_claim_keeps_same_subject_blocked_while_status_is_in_flight() {
         .expect("enqueue actor finalize delete");
 
     let claimed = node_db
-        .claim_due_outbox_batch(1_002, 16, 100, "blocked-lease")
+        .legacy_claim_due_outbox_batch(1_002, 16, 100, "blocked-lease")
         .await
         .expect("claim while status is in-flight");
     assert_eq!(
@@ -846,18 +851,18 @@ async fn nonterminal_status_remains_fifo_blocked_by_older_backed_off_status() {
     }
 
     let older = node_db
-        .claim_next_due_outbox(1_000, 100, "older-lease")
+        .legacy_claim_next_due_outbox(1_000, 100, "older-lease")
         .await
         .expect("claim older status")
         .expect("older status due");
     node_db
-        .mark_outbox_attempt_failed(older.id, "older-lease", 30_000, "transport down")
+        .legacy_mark_outbox_attempt_failed(older.id, "older-lease", 30_000, "transport down")
         .await
         .expect("back off older status");
 
     assert!(
         node_db
-            .claim_next_due_outbox(1_001, 100, "younger-lease")
+            .legacy_claim_next_due_outbox(1_001, 100, "younger-lease")
             .await
             .expect("claim younger status")
             .is_none(),
@@ -887,12 +892,17 @@ async fn actor_finalize_delete_for_replacement_uid_is_not_blocked_by_old_uid_sta
         .await
         .expect("enqueue old status");
     let old_status = node_db
-        .claim_next_due_outbox(1_000, 100, "old-status-lease")
+        .legacy_claim_next_due_outbox(1_000, 100, "old-status-lease")
         .await
         .expect("claim old status")
         .expect("old status due");
     node_db
-        .mark_outbox_attempt_failed(old_status.id, "old-status-lease", 30_000, "transport down")
+        .legacy_mark_outbox_attempt_failed(
+            old_status.id,
+            "old-status-lease",
+            30_000,
+            "transport down",
+        )
         .await
         .expect("back off old status");
 
@@ -914,7 +924,7 @@ async fn actor_finalize_delete_for_replacement_uid_is_not_blocked_by_old_uid_sta
         .expect("enqueue replacement delete");
 
     let claimed = node_db
-        .claim_next_due_outbox(1_001, 100, "replacement-delete-lease")
+        .legacy_claim_next_due_outbox(1_001, 100, "replacement-delete-lease")
         .await
         .expect("claim replacement delete")
         .expect("replacement UID delete must not share FIFO with old UID status");
@@ -974,7 +984,7 @@ async fn batch_claim_does_not_starve_unrelated_pod_status_behind_same_stream_del
         .expect("enqueue unrelated pod status");
 
     let claimed = node_db
-        .claim_due_outbox_batch(1_001, 16, 100, "same-stream-lease")
+        .legacy_claim_due_outbox_batch(1_001, 16, 100, "same-stream-lease")
         .await
         .expect("claim batch");
     assert_eq!(
@@ -1057,7 +1067,10 @@ async fn actor_owned_delete_terminal_case_is_handled(
         DispatchOutcome::Dispatched
     );
 
-    let dead = node_db.list_dead_letter().await.expect("list dead letter");
+    let dead = node_db
+        .legacy_list_dead_letter()
+        .await
+        .expect("list dead letter");
     if should_dead_letter {
         assert_eq!(dead.len(), 1);
         assert_eq!(dead[0].idempotency_key, key);
@@ -1069,7 +1082,7 @@ async fn actor_owned_delete_terminal_case_is_handled(
     }
     assert!(
         node_db
-            .claim_next_due_outbox(now + 100, 1_000, "check-empty")
+            .legacy_claim_next_due_outbox(now + 100, 1_000, "check-empty")
             .await
             .expect("claim")
             .is_none(),
@@ -1170,7 +1183,7 @@ async fn crash_after_cluster_apply_before_node_complete_replays_from_ledger() {
         // Now claim the row with a short lease and let it "expire"
         // (don't complete it, simulating a crash).
         let row = node_db
-            .claim_next_due_outbox(now, 10, "crashed-dispatcher")
+            .legacy_claim_next_due_outbox(now, 10, "crashed-dispatcher")
             .await
             .expect("claim")
             .expect("row");
@@ -1223,7 +1236,7 @@ async fn crash_after_cluster_apply_before_node_complete_replays_from_ledger() {
         // Row should be completed.
         assert!(
             node_db
-                .claim_next_due_outbox(now + 100, 1_000, "check-empty")
+                .legacy_claim_next_due_outbox(now + 100, 1_000, "check-empty")
                 .await
                 .expect("claim after recovery")
                 .is_none(),
@@ -1309,7 +1322,7 @@ async fn idempotency_survives_gc_replay() {
     // Both dispatches completed successfully.
     assert!(
         node_db
-            .claim_next_due_outbox(now + 200, 1_000, "check-empty")
+            .legacy_claim_next_due_outbox(now + 200, 1_000, "check-empty")
             .await
             .expect("claim after test")
             .is_none(),

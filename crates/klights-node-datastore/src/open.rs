@@ -45,7 +45,7 @@ fn db_call_error(error: NodeStoreOpenError) -> tokio_rusqlite::Error {
 }
 
 fn init_schema(conn: &mut rusqlite::Connection) -> Result<(), NodeStoreOpenError> {
-    super::schema::init_schema_in_conn(conn).map_err(|error| {
+    crate::schema::init_schema_in_conn(conn).map_err(|error| {
         NodeStoreOpenError::corrupt(
             "<unknown>",
             format!("node-local schema initialization failed: {error}"),
@@ -62,5 +62,5 @@ fn check_db_health(
             NodeStoreOpenError::corrupt(path, details)
         }
     })?;
-    super::schema::check_or_init_fingerprint(conn, db_path)
+    crate::schema::check_or_init_fingerprint(conn, db_path)
 }

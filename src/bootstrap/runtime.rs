@@ -452,6 +452,7 @@ mod tests {
     use super::super::init::tls::load_tls_pem_files;
     use super::should_use_worker_store_adapter_for_kubelet;
     use crate::bootstrap::{NodeMode, NodeRole};
+    use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -792,7 +793,7 @@ mod tests {
             .expect("worker dataplane metadata should enqueue");
 
         let row = node_db
-            .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+            .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
             .await
             .expect("claim outbox row")
             .expect("dataplane outbox row must exist");

@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
-use crate::datastore::node_local::{DeadLetterTestInsert, NodeLocalHandle, OutboxInsert};
+use crate::datastore::node_local::{
+    DeadLetterTestInsert, LegacyDeliveryTestStore as _, NodeLocalHandle, OutboxInsert,
+};
 use crate::datastore::node_local::{SqliteNodeLocalDb, selector};
 use crate::node_outbox::payload::OutboxPayload;
 use klights_cluster_core::command::StorageCommand;
@@ -45,8 +47,8 @@ async fn node_db() -> NodeLocalHandle {
 }
 
 async fn node_db_concrete() -> SqliteNodeLocalDb {
-    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-        crate::datastore::node_local::sqlite::open::in_memory_opts(),
+    let executor = klights_node_datastore::open::open_with_opts(
+        klights_node_datastore::open::in_memory_opts(),
         supervisor(),
         "sqlite:dead-letter-concrete-test",
     )
@@ -102,7 +104,7 @@ async fn dead_letter_after_max_attempts() {
     let ndb = node_db().await;
 
     // Enqueue a row with attempt=719 (one before max)
-    ndb.enqueue_outbox(OutboxInsert {
+    ndb.legacy_enqueue_outbox(OutboxInsert {
         idempotency_key: "dead-letter-key".to_string(),
         enqueued_ms: 1000,
         subject_key: "v1/Pod/default/web/uid-1".to_string(),
@@ -124,7 +126,7 @@ async fn dead_letter_after_max_attempts() {
     // The dead_letter_if_max_attempts checks that the row's attempt >= max_attempts before moving.
     // Since the row has attempt=0 by default, first call with max_attempts=0 should dead-letter.
     let result = ndb
-        .move_outbox_to_dead_letter_if_max_attempts("dead-letter-key", 0)
+        .legacy_move_outbox_to_dead_letter_if_max_attempts("dead-letter-key", 0)
         .await
         .expect("move to dead letter");
     assert!(
@@ -133,14 +135,17 @@ async fn dead_letter_after_max_attempts() {
     );
 
     // After moving, row should be in dead-letter
-    let dead_rows = ndb.list_dead_letter().await.expect("list dead letter");
+    let dead_rows = ndb
+        .legacy_list_dead_letter()
+        .await
+        .expect("list dead letter");
     assert_eq!(dead_rows.len(), 1);
     assert_eq!(dead_rows[0].idempotency_key, "dead-letter-key");
 
     // Outbox should be empty for this key
     let far_future = now_ms() + 86_400_000;
     let remaining = ndb
-        .claim_next_due_outbox(far_future, 100, "check-empty")
+        .legacy_claim_next_due_outbox(far_future, 100, "check-empty")
         .await
         .expect("claim check");
     assert!(
@@ -177,12 +182,15 @@ async fn replay_dead_letter_re_enqueues_with_attempt_zero() {
     .expect("insert dead letter");
 
     // Replay it
-    ndb.replay_dead_letter(1, pod_status_classification())
+    ndb.legacy_replay_dead_letter(1, pod_status_classification())
         .await
         .expect("replay dead letter");
 
     // Dead letter should be empty
-    let dead_rows = ndb.list_dead_letter().await.expect("list dead letter");
+    let dead_rows = ndb
+        .legacy_list_dead_letter()
+        .await
+        .expect("list dead letter");
     assert!(
         dead_rows.is_empty(),
         "dead letter should be empty after replay"
@@ -192,7 +200,7 @@ async fn replay_dead_letter_re_enqueues_with_attempt_zero() {
     // to ensure the newly inserted row (with current-time next_due_ms) is claimed.
     let far_future = now_ms() + 86_400_000; // 24h from now
     let row = ndb
-        .claim_next_due_outbox(far_future, 1000, "replay-check")
+        .legacy_claim_next_due_outbox(far_future, 1000, "replay-check")
         .await
         .expect("claim")
         .expect("row should exist");
@@ -209,7 +217,7 @@ async fn outbox_durability_dead_letter_replay_preserves_stream_position() {
     let ndb = node_db_concrete().await;
     let subject = "v1/Pod/default/replay-position/uid-1";
 
-    ndb.enqueue_outbox(OutboxInsert {
+    ndb.legacy_enqueue_outbox(OutboxInsert {
         idempotency_key: "replay-position-key".to_string(),
         enqueued_ms: 1_000,
         subject_key: subject.to_string(),
@@ -227,24 +235,24 @@ async fn outbox_durability_dead_letter_replay_preserves_stream_position() {
     .await
     .expect("enqueue sequenced row");
     let original = ndb
-        .claim_next_due_outbox(1_000, 1_000, "original-lease")
+        .legacy_claim_next_due_outbox(1_000, 1_000, "original-lease")
         .await
         .expect("claim original")
         .expect("original row");
 
     assert!(
-        ndb.move_outbox_to_dead_letter_if_max_attempts("replay-position-key", 0)
+        ndb.legacy_move_outbox_to_dead_letter_if_max_attempts("replay-position-key", 0)
             .await
             .expect("move to dead letter")
     );
     assert!(
-        ndb.replay_dead_letter(1, pod_status_classification())
+        ndb.legacy_replay_dead_letter(1, pod_status_classification())
             .await
             .expect("replay dead letter")
     );
 
     let replayed = ndb
-        .claim_next_due_outbox(now_ms() + 86_400_000, 1_000, "replay-lease")
+        .legacy_claim_next_due_outbox(now_ms() + 86_400_000, 1_000, "replay-lease")
         .await
         .expect("claim replay")
         .expect("replayed row");
@@ -262,7 +270,7 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
     let subject = "v1/Pod/default/strict-replay/uid-1";
     let far_future = now_ms() + 86_400_000;
 
-    ndb.enqueue_outbox(OutboxInsert {
+    ndb.legacy_enqueue_outbox(OutboxInsert {
         idempotency_key: "strict-replay-status".to_string(),
         enqueued_ms: 1_000,
         subject_key: subject.to_string(),
@@ -279,7 +287,7 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
     })
     .await
     .expect("enqueue stream head");
-    ndb.enqueue_outbox(OutboxInsert {
+    ndb.legacy_enqueue_outbox(OutboxInsert {
         idempotency_key: "strict-replay-terminal".to_string(),
         enqueued_ms: 1_001,
         subject_key: subject.to_string(),
@@ -298,25 +306,25 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
     .expect("enqueue terminal successor");
 
     assert!(
-        ndb.move_outbox_to_dead_letter_if_max_attempts("strict-replay-status", 0)
+        ndb.legacy_move_outbox_to_dead_letter_if_max_attempts("strict-replay-status", 0)
             .await
             .expect("move stream head to dead letter")
     );
     assert!(
-        !ndb.delete_dead_letter(1)
+        !ndb.legacy_delete_dead_letter(1)
             .await
             .expect("reject assigned dead-letter deletion"),
         "an assigned lower sequence may only leave dead-letter through exact replay"
     );
     assert!(
-        ndb.claim_next_due_outbox(far_future, 1_000, "blocked-terminal")
+        ndb.legacy_claim_next_due_outbox(far_future, 1_000, "blocked-terminal")
             .await
             .expect("claim behind dead-letter head")
             .is_none(),
         "a durable dead-letter stream head must survive restart as a strict FIFO blocker"
     );
     assert_eq!(
-        ndb.next_outbox_wake_ms(far_future)
+        ndb.legacy_next_outbox_wake_ms(far_future)
             .await
             .expect("wake behind dead-letter head"),
         None,
@@ -324,19 +332,19 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
     );
 
     assert!(
-        ndb.replay_dead_letter(1, pod_status_classification())
+        ndb.legacy_replay_dead_letter(1, pod_status_classification())
             .await
             .expect("replay exact head")
     );
     assert!(
-        ndb.next_outbox_wake_ms(far_future)
+        ndb.legacy_next_outbox_wake_ms(far_future)
             .await
             .expect("wake after exact replay")
             .is_some_and(|wake_ms| wake_ms <= far_future),
         "replaying the missing lower sequence must make that exact sequence wakeable"
     );
     let replayed = ndb
-        .claim_next_due_outbox(far_future, 1_000, "replayed-head")
+        .legacy_claim_next_due_outbox(far_future, 1_000, "replayed-head")
         .await
         .expect("claim replayed head")
         .expect("replayed head must be claimable");
@@ -349,13 +357,13 @@ async fn outbox_strict_stream_dead_letter_blocks_terminal_until_exact_replay_aft
     assert!(replayed.supersedable_pod_status);
     assert!(!replayed.is_terminal_pod_delete);
     assert!(
-        ndb.complete_outbox(replayed.id, "replayed-head")
+        ndb.legacy_complete_outbox(replayed.id, "replayed-head")
             .await
             .expect("complete replayed head")
     );
 
     let terminal = ndb
-        .claim_next_due_outbox(far_future, 1_000, "terminal-after-replay")
+        .legacy_claim_next_due_outbox(far_future, 1_000, "terminal-after-replay")
         .await
         .expect("claim terminal successor")
         .expect("terminal successor becomes eligible after exact replay succeeds");
@@ -386,12 +394,12 @@ async fn outbox_durability_legacy_dead_letter_gets_one_claim_time_sequence() {
     .expect("insert legacy dead letter");
 
     assert!(
-        ndb.replay_dead_letter(1, pod_status_classification())
+        ndb.legacy_replay_dead_letter(1, pod_status_classification())
             .await
             .expect("replay legacy row")
     );
     let replayed = ndb
-        .claim_next_due_outbox(now_ms() + 86_400_000, 1_000, "legacy-lease")
+        .legacy_claim_next_due_outbox(now_ms() + 86_400_000, 1_000, "legacy-lease")
         .await
         .expect("claim legacy replay")
         .expect("legacy replayed row");
@@ -421,7 +429,7 @@ async fn outbox_durability_replay_collision_keeps_dead_letter_for_retry() {
     })
     .await
     .expect("insert dead letter");
-    ndb.enqueue_outbox(OutboxInsert {
+    ndb.legacy_enqueue_outbox(OutboxInsert {
         idempotency_key: "replay-collision-key".to_string(),
         enqueued_ms: 3_000,
         subject_key: "v1/Pod/default/collision/uid-1".to_string(),
@@ -440,13 +448,13 @@ async fn outbox_durability_replay_collision_keeps_dead_letter_for_retry() {
     .expect("insert colliding live row");
 
     assert!(
-        ndb.replay_dead_letter(1, pod_status_classification())
+        ndb.legacy_replay_dead_letter(1, pod_status_classification())
             .await
             .is_err(),
         "a live idempotency-key collision must fail replay"
     );
     assert_eq!(
-        ndb.list_dead_letter()
+        ndb.legacy_list_dead_letter()
             .await
             .expect("list retained dead letter")
             .len(),
@@ -478,9 +486,14 @@ async fn delete_dead_letter_removes_entry() {
     .await
     .expect("insert dead letter");
 
-    ndb.delete_dead_letter(1).await.expect("delete dead letter");
+    ndb.legacy_delete_dead_letter(1)
+        .await
+        .expect("delete dead letter");
 
-    let dead_rows = ndb.list_dead_letter().await.expect("list dead letter");
+    let dead_rows = ndb
+        .legacy_list_dead_letter()
+        .await
+        .expect("list dead letter");
     assert!(
         dead_rows.is_empty(),
         "dead letter should be empty after delete"
@@ -493,7 +506,7 @@ async fn outbox_stats_return_metrics() {
 
     // Enqueue a few rows
     for i in 0..3 {
-        ndb.enqueue_outbox(OutboxInsert {
+        ndb.legacy_enqueue_outbox(OutboxInsert {
             idempotency_key: format!("stats-key-{}", i),
             enqueued_ms: now_ms(),
             subject_key: format!("v1/Pod/default/web-{i}/uid-{i}"),
@@ -516,7 +529,7 @@ async fn outbox_stats_return_metrics() {
         .expect("enqueue stats row");
     }
 
-    let stats = ndb.outbox_stats().await.expect("outbox stats");
+    let stats = ndb.legacy_outbox_stats().await.expect("outbox stats");
     assert_eq!(stats.pending, 3);
     assert!(stats.oldest_age_seconds >= 0.0);
     assert_eq!(stats.dead_letter_count, 0);

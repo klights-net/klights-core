@@ -1,29 +1,44 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::broadcast;
 
 use super::types::{
-    PodEndpointEvent, PodEndpointRow, PodNetworkAllocationRequest, PodNetworkEndpoint,
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult, PodSlotMutationResult,
     PodWorkqueueEntry, PodWorkqueueKind,
 };
-use klights_node_store::NodeIdentity;
+use klights_node_store::{
+    CacheNetworkFuture, DeadLetterStore, EndpointDeleteOutcome, EndpointUpsertOutcome,
+    NodeIdentity, NodeKey, OutboxDispatcherStore, OutboxProducerStore, OutboxStatusStampStore,
+    PodEndpointRecord, PodEndpointStore, PodEndpointStoreEventSource, PodEndpointStoreEventStream,
+    PodIpamStore, PodNetworkAllocation,
+    PodNetworkAllocationRequest as StorePodNetworkAllocationRequest, PodNetworkAssignmentSnapshot,
+    PodNetworkCache, PodNetworkEndpoint as StorePodNetworkEndpoint, PodStatusCheckpointStore,
+    PodUidKey, ReplicationCheckpointStore, RuntimeObservationCheckpointStore, SandboxKey,
+};
 use klights_types::PodIdentity;
 
-use super::{
-    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats,
-    PodNetworkAssignmentRow, PodNetworkReservationError, PodRuntimeRow, PodStatusCheckpoint,
-    ProbeStateRow, ReplicationCheckpoint, SqliteNodeLocalDb,
-};
+use super::{PodRuntimeRow, ProbeStateRow, SqliteNodeLocalDb};
 
 #[async_trait]
-pub trait NodeLocalBackend: NodeIdentity + Send + Sync {
-    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent>;
-    async fn subscribe_pod_endpoints_with_snapshot(
+pub trait NodeLocalBackend:
+    NodeIdentity
+    + OutboxProducerStore
+    + OutboxDispatcherStore
+    + OutboxStatusStampStore
+    + DeadLetterStore
+    + PodStatusCheckpointStore
+    + RuntimeObservationCheckpointStore
+    + ReplicationCheckpointStore
+    + PodNetworkCache
+    + PodIpamStore
+    + PodEndpointStore
+    + PodEndpointStoreEventSource
+    + Send
+    + Sync
+{
+    fn subscribe_pod_slot_admissions(
         &self,
-    ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)>;
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent>;
+    ) -> tokio::sync::broadcast::Receiver<PodSlotAdmissionEvent>;
     async fn pod_slot_try_admit(
         &self,
         namespace: &str,
@@ -44,66 +59,6 @@ pub trait NodeLocalBackend: NodeIdentity + Send + Sync {
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<PodSlotClearResult>;
-
-    async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()>;
-    async fn claim_next_due_outbox(
-        &self,
-        now_ms: i64,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Option<OutboxRow>>;
-    async fn renew_outbox_lease(
-        &self,
-        id: i64,
-        lease_token: &str,
-        leased_until_ms: i64,
-    ) -> Result<bool>;
-    async fn mark_outbox_attempt_failed(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-    ) -> Result<bool>;
-    async fn record_outbox_failure(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-        max_attempts: i64,
-    ) -> Result<OutboxFailureDisposition>;
-    async fn complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool>;
-    async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize>;
-    async fn next_outbox_wake_ms(&self, now_ms: i64) -> Result<Option<i64>>;
-
-    async fn claim_due_outbox_batch(
-        &self,
-        now_ms: i64,
-        limit: usize,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Vec<OutboxRow>>;
-    async fn complete_superseded_status_outbox_for_terminal_pod_delete(
-        &self,
-        subject_key: &str,
-        terminal_delete_id: i64,
-    ) -> Result<usize>;
-
-    async fn move_outbox_to_dead_letter_if_max_attempts(
-        &self,
-        idempotency_key: &str,
-        max_attempts: i64,
-    ) -> Result<bool>;
-    async fn list_dead_letter(&self) -> Result<Vec<DeadLetterRow>>;
-    async fn get_dead_letter(&self, id: i64) -> Result<Option<DeadLetterRow>>;
-    async fn delete_dead_letter(&self, id: i64) -> Result<bool>;
-    async fn replay_dead_letter(
-        &self,
-        id: i64,
-        classification: klights_node_store::OutboxClassification,
-    ) -> Result<bool>;
-    async fn outbox_stats(&self) -> Result<OutboxStats>;
 
     async fn admit_pod_runtime(
         &self,
@@ -126,74 +81,6 @@ pub trait NodeLocalBackend: NodeIdentity + Send + Sync {
     async fn get_pod_runtime(&self, pod_uid: &str) -> Result<Option<PodRuntimeRow>>;
     async fn list_pod_runtime(&self) -> Result<Vec<PodRuntimeRow>>;
     async fn list_pod_runtime_by_namespace(&self, namespace: &str) -> Result<Vec<PodRuntimeRow>>;
-    async fn upsert_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        base_rv: i64,
-        status: Value,
-        updated_ms: i64,
-    ) -> Result<()>;
-    async fn get_pod_status_checkpoint(&self, pod_uid: &str)
-    -> Result<Option<PodStatusCheckpoint>>;
-    async fn mark_pod_status_checkpoint_applied(
-        &self,
-        pod_uid: &str,
-        applied_rv: i64,
-        updated_ms: i64,
-    ) -> Result<()>;
-    async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()>;
-
-    async fn upsert_runtime_observation_checkpoint(
-        &self,
-        checkpoint: super::sqlite::RuntimeObservationCheckpoint,
-    ) -> Result<()>;
-    async fn get_runtime_observation_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<super::sqlite::RuntimeObservationCheckpoint>>;
-    async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()>;
-
-    async fn reserve_ip_and_insert_network(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<(String, u32)>;
-    async fn reserve_network_assignment(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> std::result::Result<(String, u32), PodNetworkReservationError>;
-    async fn get_network_assignment_for_uid(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<PodNetworkAssignmentRow>>;
-    async fn get_network_assignment_for_pod(
-        &self,
-        pod: PodIdentity,
-    ) -> Result<Option<PodNetworkAssignmentRow>>;
-    async fn get_network_assignment_for_sandbox(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<PodNetworkAssignmentRow>>;
-    async fn delete_network_assignment_if_matches(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<bool>;
-    async fn get_network_for_uid(&self, pod_uid: &str) -> Result<Option<PodNetworkEndpoint>>;
-    async fn get_network_for_sandbox(&self, sandbox_id: &str)
-    -> Result<Option<PodNetworkEndpoint>>;
-    async fn delete_network_for_sandbox(&self, sandbox_id: &str) -> Result<()>;
-    async fn list_networks(&self) -> Result<Vec<String>>;
-    async fn list_network_assignments(&self) -> Result<Vec<PodNetworkAssignmentRow>>;
-
-    async fn upsert_endpoint(&self, row: PodEndpointRow) -> Result<()>;
-    async fn delete_endpoint_for_uid(&self, pod_uid: &str) -> Result<()>;
-    async fn get_endpoint_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>>;
-    async fn list_endpoints_all(&self) -> Result<Vec<PodEndpointRow>>;
-    async fn list_endpoints_for_node(&self, node_name: &str) -> Result<Vec<PodEndpointRow>>;
 
     async fn enqueue_workqueue(
         &self,
@@ -222,29 +109,113 @@ pub trait NodeLocalBackend: NodeIdentity + Send + Sync {
         container_name: &str,
         probe_kind: &str,
     ) -> Result<Option<ProbeStateRow>>;
+}
 
-    async fn read_replication_checkpoint(&self) -> Result<Option<ReplicationCheckpoint>>;
-    async fn write_replication_checkpoint(
+impl PodNetworkCache for SqliteNodeLocalDb {
+    fn get_network_for_uid(
         &self,
-        last_applied_rv: i64,
-        leader_epoch: i64,
-        cluster_id: &str,
-    ) -> Result<()>;
+        pod_uid: PodUidKey,
+    ) -> CacheNetworkFuture<'_, Option<StorePodNetworkEndpoint>> {
+        self.network_state_ref().get_network_for_uid(pod_uid)
+    }
+
+    fn get_network_for_pod(
+        &self,
+        pod: PodIdentity,
+    ) -> CacheNetworkFuture<'_, Option<StorePodNetworkEndpoint>> {
+        self.network_state_ref().get_network_for_pod(pod)
+    }
+
+    fn get_network_for_sandbox(
+        &self,
+        sandbox_id: SandboxKey,
+    ) -> CacheNetworkFuture<'_, Option<StorePodNetworkEndpoint>> {
+        self.network_state_ref().get_network_for_sandbox(sandbox_id)
+    }
+
+    fn get_network_for_assignment(
+        &self,
+        sandbox_id: SandboxKey,
+        pod: PodIdentity,
+    ) -> CacheNetworkFuture<'_, Option<StorePodNetworkEndpoint>> {
+        self.network_state_ref()
+            .get_network_for_assignment(sandbox_id, pod)
+    }
+
+    fn delete_network_for_sandbox(&self, sandbox_id: SandboxKey) -> CacheNetworkFuture<'_, ()> {
+        self.network_state_ref()
+            .delete_network_for_sandbox(sandbox_id)
+    }
+
+    fn delete_network_if_matches(
+        &self,
+        request: StorePodNetworkAllocationRequest,
+    ) -> CacheNetworkFuture<'_, bool> {
+        self.network_state_ref().delete_network_if_matches(request)
+    }
+
+    fn list_network_assignments(
+        &self,
+    ) -> CacheNetworkFuture<'_, Vec<PodNetworkAssignmentSnapshot>> {
+        self.network_state_ref().list_network_assignments()
+    }
+}
+
+impl PodIpamStore for SqliteNodeLocalDb {
+    fn reserve_ip_and_insert_network(
+        &self,
+        request: StorePodNetworkAllocationRequest,
+    ) -> CacheNetworkFuture<'_, PodNetworkAllocation> {
+        self.network_state_ref()
+            .reserve_ip_and_insert_network(request)
+    }
+}
+
+impl PodEndpointStore for SqliteNodeLocalDb {
+    fn upsert_endpoint(
+        &self,
+        record: PodEndpointRecord,
+    ) -> CacheNetworkFuture<'_, EndpointUpsertOutcome> {
+        self.network_state_ref().upsert_endpoint(record)
+    }
+
+    fn delete_endpoint_for_uid(
+        &self,
+        pod_uid: PodUidKey,
+    ) -> CacheNetworkFuture<'_, EndpointDeleteOutcome> {
+        self.network_state_ref().delete_endpoint_for_uid(pod_uid)
+    }
+
+    fn get_endpoint_by_pod_ip(
+        &self,
+        pod_ip: std::net::Ipv4Addr,
+    ) -> CacheNetworkFuture<'_, Option<PodEndpointRecord>> {
+        self.network_state_ref().get_endpoint_by_pod_ip(pod_ip)
+    }
+
+    fn list_endpoints_all(&self) -> CacheNetworkFuture<'_, Vec<PodEndpointRecord>> {
+        self.network_state_ref().list_endpoints_all()
+    }
+
+    fn list_endpoints_for_node(
+        &self,
+        node_name: NodeKey,
+    ) -> CacheNetworkFuture<'_, Vec<PodEndpointRecord>> {
+        self.network_state_ref().list_endpoints_for_node(node_name)
+    }
+}
+
+impl PodEndpointStoreEventSource for SqliteNodeLocalDb {
+    fn subscribe_endpoint_events(&self) -> CacheNetworkFuture<'_, PodEndpointStoreEventStream> {
+        self.network_state_ref().subscribe_endpoint_events()
+    }
 }
 
 #[async_trait]
 impl NodeLocalBackend for SqliteNodeLocalDb {
-    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        SqliteNodeLocalDb::subscribe_pod_endpoints(self)
-    }
-
-    async fn subscribe_pod_endpoints_with_snapshot(
+    fn subscribe_pod_slot_admissions(
         &self,
-    ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)> {
-        SqliteNodeLocalDb::subscribe_pod_endpoints_with_snapshot(self).await
-    }
-
-    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
+    ) -> tokio::sync::broadcast::Receiver<PodSlotAdmissionEvent> {
         SqliteNodeLocalDb::subscribe_pod_slot_admissions(self)
     }
 
@@ -276,136 +247,6 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         pod_uid: &str,
     ) -> Result<PodSlotClearResult> {
         SqliteNodeLocalDb::pod_slot_clear_if_uid(self, namespace, pod_name, pod_uid).await
-    }
-
-    async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
-        SqliteNodeLocalDb::enqueue_outbox(self, row).await
-    }
-
-    async fn claim_next_due_outbox(
-        &self,
-        now_ms: i64,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Option<OutboxRow>> {
-        SqliteNodeLocalDb::claim_next_due_outbox(self, now_ms, lease_ms, lease_token).await
-    }
-
-    async fn renew_outbox_lease(
-        &self,
-        id: i64,
-        lease_token: &str,
-        leased_until_ms: i64,
-    ) -> Result<bool> {
-        SqliteNodeLocalDb::renew_outbox_lease(self, id, lease_token, leased_until_ms).await
-    }
-
-    async fn mark_outbox_attempt_failed(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-    ) -> Result<bool> {
-        SqliteNodeLocalDb::mark_outbox_attempt_failed(
-            self,
-            id,
-            lease_token,
-            backoff_until_ms,
-            error,
-        )
-        .await
-    }
-
-    async fn record_outbox_failure(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-        max_attempts: i64,
-    ) -> Result<OutboxFailureDisposition> {
-        SqliteNodeLocalDb::record_outbox_failure(
-            self,
-            id,
-            lease_token,
-            backoff_until_ms,
-            error,
-            max_attempts,
-        )
-        .await
-    }
-
-    async fn complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool> {
-        SqliteNodeLocalDb::complete_outbox(self, id, lease_token).await
-    }
-
-    async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize> {
-        SqliteNodeLocalDb::requeue_expired_outbox_leases(self, now_ms).await
-    }
-
-    async fn next_outbox_wake_ms(&self, now_ms: i64) -> Result<Option<i64>> {
-        SqliteNodeLocalDb::next_outbox_wake_ms(self, now_ms).await
-    }
-
-    async fn claim_due_outbox_batch(
-        &self,
-        now_ms: i64,
-        limit: usize,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Vec<OutboxRow>> {
-        SqliteNodeLocalDb::claim_due_outbox_batch(self, now_ms, limit, lease_ms, lease_token).await
-    }
-
-    async fn complete_superseded_status_outbox_for_terminal_pod_delete(
-        &self,
-        subject_key: &str,
-        terminal_delete_id: i64,
-    ) -> Result<usize> {
-        SqliteNodeLocalDb::complete_superseded_status_outbox_for_terminal_pod_delete(
-            self,
-            subject_key,
-            terminal_delete_id,
-        )
-        .await
-    }
-
-    async fn move_outbox_to_dead_letter_if_max_attempts(
-        &self,
-        idempotency_key: &str,
-        max_attempts: i64,
-    ) -> Result<bool> {
-        SqliteNodeLocalDb::move_outbox_to_dead_letter_if_max_attempts(
-            self,
-            idempotency_key,
-            max_attempts,
-        )
-        .await
-    }
-
-    async fn list_dead_letter(&self) -> Result<Vec<DeadLetterRow>> {
-        SqliteNodeLocalDb::list_dead_letter(self).await
-    }
-
-    async fn get_dead_letter(&self, id: i64) -> Result<Option<DeadLetterRow>> {
-        SqliteNodeLocalDb::get_dead_letter(self, id).await
-    }
-
-    async fn delete_dead_letter(&self, id: i64) -> Result<bool> {
-        SqliteNodeLocalDb::delete_dead_letter(self, id).await
-    }
-
-    async fn replay_dead_letter(
-        &self,
-        id: i64,
-        classification: klights_node_store::OutboxClassification,
-    ) -> Result<bool> {
-        SqliteNodeLocalDb::replay_dead_letter(self, id, classification).await
-    }
-
-    async fn outbox_stats(&self) -> Result<OutboxStats> {
-        SqliteNodeLocalDb::outbox_stats(self).await
     }
 
     async fn admit_pod_runtime(
@@ -451,148 +292,6 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
 
     async fn list_pod_runtime_by_namespace(&self, namespace: &str) -> Result<Vec<PodRuntimeRow>> {
         SqliteNodeLocalDb::list_pod_runtime_by_namespace(self, namespace).await
-    }
-
-    async fn upsert_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        base_rv: i64,
-        status: Value,
-        updated_ms: i64,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::upsert_pod_status_checkpoint(
-            self, pod_uid, namespace, pod_name, base_rv, status, updated_ms,
-        )
-        .await
-    }
-
-    async fn get_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<PodStatusCheckpoint>> {
-        SqliteNodeLocalDb::get_pod_status_checkpoint(self, pod_uid).await
-    }
-
-    async fn mark_pod_status_checkpoint_applied(
-        &self,
-        pod_uid: &str,
-        applied_rv: i64,
-        updated_ms: i64,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::mark_pod_status_checkpoint_applied(self, pod_uid, applied_rv, updated_ms)
-            .await
-    }
-
-    async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        SqliteNodeLocalDb::delete_pod_status_checkpoint(self, pod_uid).await
-    }
-
-    async fn upsert_runtime_observation_checkpoint(
-        &self,
-        checkpoint: super::sqlite::RuntimeObservationCheckpoint,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::upsert_runtime_observation_checkpoint(self, checkpoint).await
-    }
-
-    async fn get_runtime_observation_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<super::sqlite::RuntimeObservationCheckpoint>> {
-        SqliteNodeLocalDb::get_runtime_observation_checkpoint(self, pod_uid).await
-    }
-
-    async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        SqliteNodeLocalDb::delete_runtime_observation_checkpoint(self, pod_uid).await
-    }
-
-    async fn reserve_ip_and_insert_network(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<(String, u32)> {
-        SqliteNodeLocalDb::reserve_ip_and_insert_network(self, request).await
-    }
-
-    async fn reserve_network_assignment(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> std::result::Result<(String, u32), PodNetworkReservationError> {
-        SqliteNodeLocalDb::reserve_network_assignment(self, request).await
-    }
-
-    async fn get_network_assignment_for_uid(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<PodNetworkAssignmentRow>> {
-        SqliteNodeLocalDb::get_network_assignment_for_uid(self, pod_uid).await
-    }
-
-    async fn get_network_assignment_for_pod(
-        &self,
-        pod: PodIdentity,
-    ) -> Result<Option<PodNetworkAssignmentRow>> {
-        SqliteNodeLocalDb::get_network_assignment_for_pod(self, pod).await
-    }
-
-    async fn get_network_assignment_for_sandbox(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<PodNetworkAssignmentRow>> {
-        SqliteNodeLocalDb::get_network_assignment_for_sandbox(self, sandbox_id).await
-    }
-
-    async fn delete_network_assignment_if_matches(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<bool> {
-        SqliteNodeLocalDb::delete_network_assignment_if_matches(self, request).await
-    }
-
-    async fn get_network_for_uid(&self, pod_uid: &str) -> Result<Option<PodNetworkEndpoint>> {
-        SqliteNodeLocalDb::get_network_for_uid(self, pod_uid).await
-    }
-
-    async fn get_network_for_sandbox(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        SqliteNodeLocalDb::get_network_for_sandbox(self, sandbox_id).await
-    }
-
-    async fn delete_network_for_sandbox(&self, sandbox_id: &str) -> Result<()> {
-        SqliteNodeLocalDb::delete_network_for_sandbox(self, sandbox_id).await
-    }
-
-    async fn list_networks(&self) -> Result<Vec<String>> {
-        SqliteNodeLocalDb::list_networks(self).await
-    }
-
-    async fn list_network_assignments(&self) -> Result<Vec<PodNetworkAssignmentRow>> {
-        SqliteNodeLocalDb::list_network_assignments(self).await
-    }
-
-    async fn upsert_endpoint(&self, row: PodEndpointRow) -> Result<()> {
-        SqliteNodeLocalDb::upsert_endpoint(self, row).await
-    }
-
-    async fn delete_endpoint_for_uid(&self, pod_uid: &str) -> Result<()> {
-        SqliteNodeLocalDb::delete_endpoint_for_uid(self, pod_uid).await
-    }
-
-    async fn get_endpoint_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>> {
-        SqliteNodeLocalDb::get_endpoint_by_pod_ip(self, pod_ip).await
-    }
-
-    async fn list_endpoints_all(&self) -> Result<Vec<PodEndpointRow>> {
-        SqliteNodeLocalDb::list_endpoints_all(self).await
-    }
-
-    async fn list_endpoints_for_node(&self, node_name: &str) -> Result<Vec<PodEndpointRow>> {
-        SqliteNodeLocalDb::list_endpoints_for_node(self, node_name).await
     }
 
     async fn enqueue_workqueue(
@@ -654,24 +353,5 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         probe_kind: &str,
     ) -> Result<Option<ProbeStateRow>> {
         SqliteNodeLocalDb::get_probe_state(self, pod_uid, container_name, probe_kind).await
-    }
-
-    async fn read_replication_checkpoint(&self) -> Result<Option<ReplicationCheckpoint>> {
-        SqliteNodeLocalDb::read_replication_checkpoint(self).await
-    }
-
-    async fn write_replication_checkpoint(
-        &self,
-        last_applied_rv: i64,
-        leader_epoch: i64,
-        cluster_id: &str,
-    ) -> Result<()> {
-        SqliteNodeLocalDb::write_replication_checkpoint(
-            self,
-            last_applied_rv,
-            leader_epoch,
-            cluster_id,
-        )
-        .await
     }
 }

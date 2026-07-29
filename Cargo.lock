@@ -2036,6 +2036,7 @@ dependencies = [
  "klights-leader-api",
  "klights-network-api",
  "klights-node-api",
+ "klights-node-datastore",
  "klights-node-store",
  "klights-pod-api",
  "klights-reconcile-api",
@@ -2241,6 +2242,19 @@ dependencies = [
 [[package]]
 name = "klights-node-datastore"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "klights-node-store",
+ "klights-supervisor",
+ "klights-types",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-rusqlite",
+ "uuid",
+]
 
 [[package]]
 name = "klights-node-store"

@@ -3279,6 +3279,7 @@ mod tests {
     };
 
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
+    use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use crate::replication::grpc::server::{
         require_worker_command_codec_v3, validate_join_metadata,
     };
@@ -6365,7 +6366,7 @@ mod tests {
         .expect("observed leader endpoint should enqueue local Node status");
 
         let row = node_local
-            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
+            .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
             .await
             .expect("inspect outbox")
             .expect("external IP status row");

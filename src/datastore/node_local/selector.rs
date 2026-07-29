@@ -92,16 +92,12 @@ async fn open_sqlite(
     connection_key: &'static str,
 ) -> Result<Arc<SqliteNodeLocalDb>> {
     let opts = match path {
-        Some(path) => crate::datastore::node_local::sqlite::open::disk_opts(path.to_path_buf()),
-        None => crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        Some(path) => klights_node_datastore::open::disk_opts(path.to_path_buf()),
+        None => klights_node_datastore::open::in_memory_opts(),
     }
     .with_key_file(key_file)?;
-    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-        opts,
-        supervisor,
-        connection_key,
-    )
-    .await?;
+    let executor =
+        klights_node_datastore::open::open_with_opts(opts, supervisor, connection_key).await?;
     Ok(Arc::new(SqliteNodeLocalDb::from_executor_with_clock(
         executor,
         Arc::new(klights_supervisor::SystemWallClock),

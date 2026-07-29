@@ -1969,8 +1969,8 @@ mod tests {
 
     async fn fresh_node(node_id: NodeId) -> (RaftNode, Arc<dyn DatastoreBackend>) {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let node_executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-node-test",
         )
@@ -2095,8 +2095,8 @@ mod tests {
         let mut backends = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
-                crate::datastore::node_local::sqlite::open::in_memory_opts(),
+            let exec = klights_node_datastore::open::open_with_opts(
+                klights_node_datastore::open::in_memory_opts(),
                 supervisor.clone(),
                 "sqlite:raft-cluster-test",
             )
@@ -2283,8 +2283,8 @@ mod tests {
         let mut mocks = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
-                crate::datastore::node_local::sqlite::open::in_memory_opts(),
+            let exec = klights_node_datastore::open::open_with_opts(
+                klights_node_datastore::open::in_memory_opts(),
                 supervisor.clone(),
                 "sqlite:raft-forward-test",
             )
@@ -2374,8 +2374,8 @@ mod tests {
         let mut backends = Vec::new();
         for id in [10u64, 20, 30] {
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
-                crate::datastore::node_local::sqlite::open::in_memory_opts(),
+            let exec = klights_node_datastore::open::open_with_opts(
+                klights_node_datastore::open::in_memory_opts(),
                 supervisor.clone(),
                 "sqlite:raft-follower-no-local-commit-test",
             )
@@ -2487,8 +2487,8 @@ mod tests {
         use crate::datastore::raft::proposal::RaftProposal;
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let exec = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-rejected-materialized-commit-test",
         )
@@ -2623,8 +2623,8 @@ mod tests {
     ) -> (RaftNode, Arc<dyn DatastoreBackend>) {
         use crate::datastore::raft::network::LoopbackRaftNetworkFactory;
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let exec = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-voter-test",
         )
@@ -3579,8 +3579,8 @@ mod tests {
     #[tokio::test]
     async fn leader_backs_off_on_session_fence_then_catches_up_without_client_rebuild() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-session-fence-leader",
         )
@@ -4073,8 +4073,8 @@ mod tests {
 
         // Leader node.
         let sup1 = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec1 = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let exec1 = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             sup1.clone(),
             "sqlite:raft-demote-test-l",
         )
@@ -4107,8 +4107,8 @@ mod tests {
 
         // Voter node.
         let sup2 = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let exec2 = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let exec2 = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             sup2.clone(),
             "sqlite:raft-demote-test-v",
         )

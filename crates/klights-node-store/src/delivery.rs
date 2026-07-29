@@ -1005,15 +1005,23 @@ impl DeadLetterKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadLetterReplayRequest {
     key: DeadLetterKey,
+    classification: OutboxClassification,
 }
 
 impl DeadLetterReplayRequest {
-    pub const fn new(key: DeadLetterKey) -> Self {
-        Self { key }
+    pub const fn new(key: DeadLetterKey, classification: OutboxClassification) -> Self {
+        Self {
+            key,
+            classification,
+        }
     }
 
     pub const fn key(self) -> DeadLetterKey {
         self.key
+    }
+
+    pub const fn classification(self) -> OutboxClassification {
+        self.classification
     }
 }
 
@@ -1021,11 +1029,11 @@ impl DeadLetterReplayRequest {
 pub struct DeadLetterEntry {
     id: i64,
     original_id: i64,
+    client_id: String,
     idempotency_key: String,
     enqueued_ms: i64,
     subject: OutboxSubject,
     operation: String,
-    classification: OutboxClassification,
     sequence: OutboxSequence,
     payload: Vec<u8>,
     attempts: i64,
@@ -1038,35 +1046,41 @@ impl DeadLetterEntry {
     pub fn try_new(
         id: i64,
         original_id: i64,
+        client_id: impl Into<String>,
         idempotency_key: impl Into<String>,
         enqueued_ms: i64,
         subject: OutboxSubject,
         operation: impl Into<String>,
-        classification: OutboxClassification,
         sequence: OutboxSequence,
         payload: Vec<u8>,
         attempts: i64,
         last_error: impl Into<String>,
         moved_at_ms: i64,
     ) -> Result<Self, DeliveryError> {
+        let client_id = client_id.into();
         let idempotency_key = idempotency_key.into();
         let operation = operation.into();
         require_positive(id, "dead_letter.id")?;
-        require_positive(original_id, "dead_letter.original_id")?;
+        // Legacy administrative/test rows can carry the schema's zero
+        // sentinel. Preserve that persisted fact instead of rejecting an
+        // otherwise readable dead-letter row.
+        require_nonnegative(original_id, "dead_letter.original_id")?;
+        // Pre-stream-identity rows persist an empty client ID. Listing and
+        // exact replay must preserve that legacy sentinel; replay allocates
+        // the current client identity transactionally when needed.
         require_nonempty(&idempotency_key, "dead_letter.idempotency_key")?;
         require_nonempty(&operation, "dead_letter.operation")?;
-        validate_sequence(classification, sequence, false)?;
         require_nonnegative(enqueued_ms, "dead_letter.enqueued_ms")?;
         require_nonnegative(attempts, "dead_letter.attempts")?;
         require_nonnegative(moved_at_ms, "dead_letter.moved_at_ms")?;
         Ok(Self {
             id,
             original_id,
+            client_id,
             idempotency_key,
             enqueued_ms,
             subject,
             operation,
-            classification,
             sequence,
             payload,
             attempts,
@@ -1080,6 +1094,9 @@ impl DeadLetterEntry {
     pub const fn original_id(&self) -> i64 {
         self.original_id
     }
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
     pub fn idempotency_key(&self) -> &str {
         &self.idempotency_key
     }
@@ -1091,9 +1108,6 @@ impl DeadLetterEntry {
     }
     pub fn operation(&self) -> &str {
         &self.operation
-    }
-    pub const fn classification(&self) -> OutboxClassification {
-        self.classification
     }
     pub const fn sequence(&self) -> OutboxSequence {
         self.sequence
@@ -1400,6 +1414,41 @@ impl RuntimeObservationCheckpoint {
     }
 }
 
+/// Neutral node-local replay checkpoint retained for the transitional
+/// replication surface. It carries no OpenRaft or cluster-datastore type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicationCheckpoint {
+    last_applied_rv: i64,
+    leader_epoch: i64,
+    cluster_id: String,
+}
+
+impl ReplicationCheckpoint {
+    pub fn new(last_applied_rv: i64, leader_epoch: i64, cluster_id: impl Into<String>) -> Self {
+        Self {
+            last_applied_rv,
+            leader_epoch,
+            cluster_id: cluster_id.into(),
+        }
+    }
+
+    pub const fn last_applied_rv(&self) -> i64 {
+        self.last_applied_rv
+    }
+
+    pub const fn leader_epoch(&self) -> i64 {
+        self.leader_epoch
+    }
+
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    pub fn into_parts(self) -> (i64, i64, String) {
+        (self.last_applied_rv, self.leader_epoch, self.cluster_id)
+    }
+}
+
 /// Heap-erased future used at the coarse node-persistence boundary.
 pub type DeliveryFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DeliveryError>> + Send + 'a>>;
@@ -1524,5 +1573,18 @@ pub trait RuntimeObservationCheckpointStore: Send + Sync {
     fn delete_runtime_observation_checkpoint(
         &self,
         key: PodCheckpointKey,
+    ) -> DeliveryFuture<'_, ()>;
+}
+
+/// Surface-only node-local replication checkpoint persistence.
+///
+/// No production consumer remains after removal of the legacy backup applier;
+/// the exact persisted surface stays explicit until broad node-local storage
+/// removal can prove it is safe to delete.
+pub trait ReplicationCheckpointStore: Send + Sync {
+    fn read_replication_checkpoint(&self) -> DeliveryFuture<'_, Option<ReplicationCheckpoint>>;
+    fn write_replication_checkpoint(
+        &self,
+        checkpoint: ReplicationCheckpoint,
     ) -> DeliveryFuture<'_, ()>;
 }

@@ -12,7 +12,7 @@ pub struct SqliteNodeIdentity {
 }
 
 impl SqliteNodeIdentity {
-    pub(crate) fn new(executor: DbExecutor) -> Self {
+    pub fn new(executor: DbExecutor) -> Self {
         Self { executor }
     }
 

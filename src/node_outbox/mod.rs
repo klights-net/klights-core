@@ -98,14 +98,12 @@ impl OutboxStores {
 
     #[cfg(test)]
     fn from_node_db(node_db: crate::datastore::node_local::NodeLocalHandle) -> Self {
-        let adapter =
-            crate::datastore::node_local::delivery_adapter::NodeLocalDeliveryAdapter::new(node_db);
         Self::new(
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-            adapter.clone(),
-            adapter,
+            node_db.clone(),
+            node_db.clone(),
+            node_db.clone(),
+            node_db.clone(),
+            node_db,
         )
     }
 
@@ -1990,7 +1988,7 @@ mod tests {
     use tokio::sync::{Mutex, Notify};
 
     use crate::datastore::backend_kind::BackendKind;
-    use crate::datastore::node_local::{NodeLocalHandle, selector};
+    use crate::datastore::node_local::{LegacyDeliveryTestStore as _, NodeLocalHandle, selector};
     use crate::node_outbox::payload::OutboxOperationExt as _;
     use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
     use klights_cluster_core::ResourcePreconditions;
@@ -2042,7 +2040,7 @@ mod tests {
             .expect("record through focused outbox port");
 
         let stored = node_db
-            .get_pod_status_checkpoint("uid-worker-pod")
+            .legacy_get_pod_status_checkpoint("uid-worker-pod")
             .await
             .expect("read checkpoint")
             .expect("checkpoint exists");
@@ -2119,7 +2117,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(lease_ms as u64 * 2)).await;
         assert_eq!(
             node_db
-                .requeue_expired_outbox_leases(super::now_ms())
+                .legacy_requeue_expired_outbox_leases(super::now_ms())
                 .await
                 .expect("requeue expired leases while RPC is active"),
             0,
@@ -2335,7 +2333,7 @@ mod tests {
         let node_db = node_db().await;
         let outbox = Outbox::new(node_db.clone());
         node_db
-            .upsert_pod_status_checkpoint(
+            .legacy_upsert_pod_status_checkpoint(
                 "uid-terminal",
                 "default",
                 "terminal",
@@ -2376,7 +2374,7 @@ mod tests {
         );
         assert!(
             node_db
-                .get_pod_status_checkpoint("uid-terminal")
+                .legacy_get_pod_status_checkpoint("uid-terminal")
                 .await
                 .expect("read status checkpoint")
                 .is_none(),
@@ -2492,7 +2490,7 @@ mod tests {
 
         // The row is backed off with bounded jitter; advance to the actual wake and redeliver.
         let after_backoff = node_db
-            .next_outbox_wake_ms(20)
+            .legacy_next_outbox_wake_ms(20)
             .await
             .expect("read next jittered wake")
             .expect("retry wake exists");
@@ -2515,7 +2513,7 @@ mod tests {
         assert_eq!(client.calls().await.len(), 2, "row must be retried once");
         assert!(
             node_db
-                .claim_next_due_outbox(after_backoff + 1, 1_000, "check-empty")
+                .legacy_claim_next_due_outbox(after_backoff + 1, 1_000, "check-empty")
                 .await
                 .expect("claim")
                 .is_none(),
@@ -2554,19 +2552,19 @@ mod tests {
         // Simulate an in-flight slow apply whose lease then expires:
         // claim with a short lease token, then requeue (clears the lease).
         let row = node_db
-            .claim_next_due_outbox(20, 5, "stale-token")
+            .legacy_claim_next_due_outbox(20, 5, "stale-token")
             .await
             .expect("claim")
             .expect("a due row");
         node_db
-            .requeue_expired_outbox_leases(100)
+            .legacy_requeue_expired_outbox_leases(100)
             .await
             .expect("requeue");
         // The stale-token complete now finds no matching lease — the race
         // is detected and is non-fatal (does not lose the row).
         assert!(
             !node_db
-                .complete_outbox(row.id, "stale-token")
+                .legacy_complete_outbox(row.id, "stale-token")
                 .await
                 .expect("complete"),
             "stale-token complete must report a lost lease race, not error"
@@ -2582,7 +2580,7 @@ mod tests {
         );
         assert!(
             node_db
-                .claim_next_due_outbox(300, 1_000, "check-empty")
+                .legacy_claim_next_due_outbox(300, 1_000, "check-empty")
                 .await
                 .expect("claim")
                 .is_none(),
@@ -2684,7 +2682,7 @@ mod tests {
         );
         assert!(
             node_db
-                .claim_next_due_outbox(20, 1_000, "assert-empty")
+                .legacy_claim_next_due_outbox(20, 1_000, "assert-empty")
                 .await
                 .expect("claim after production dispatch")
                 .is_none()
@@ -2742,7 +2740,7 @@ mod tests {
         assert_eq!(client.calls().await, vec!["key-1", "key-2"]);
         assert!(
             node_db
-                .claim_next_due_outbox(10, 1_000, "assert-empty")
+                .legacy_claim_next_due_outbox(10, 1_000, "assert-empty")
                 .await
                 .expect("claim after drain")
                 .is_none()
@@ -2833,7 +2831,7 @@ mod tests {
             .await
             .expect("enqueue");
         let claimed = node_db
-            .claim_next_due_outbox(100, 50, "dead-dispatcher")
+            .legacy_claim_next_due_outbox(100, 50, "dead-dispatcher")
             .await
             .expect("initial claim")
             .expect("row claimed");
@@ -2882,7 +2880,7 @@ mod tests {
 
         for _ in 0..10 {
             let row = node_db
-                .claim_next_due_outbox(2_000, 100, "crashed-dispatcher")
+                .legacy_claim_next_due_outbox(2_000, 100, "crashed-dispatcher")
                 .await
                 .expect("claim")
                 .expect("row");
@@ -2925,7 +2923,7 @@ mod tests {
         assert_eq!(client.calls().await.len(), 60);
         assert!(
             node_db
-                .claim_next_due_outbox(now, 1_000, "assert-empty")
+                .legacy_claim_next_due_outbox(now, 1_000, "assert-empty")
                 .await
                 .expect("claim after drain")
                 .is_none()
@@ -2993,7 +2991,7 @@ mod tests {
         );
         assert!(
             node_db
-                .claim_next_due_outbox(next_retry, 1_000, "assert-empty")
+                .legacy_claim_next_due_outbox(next_retry, 1_000, "assert-empty")
                 .await
                 .expect("claim after terminal drop")
                 .is_none()
@@ -3044,11 +3042,11 @@ mod tests {
         }
 
         assert!(
-            node_db.list_dead_letter().await.unwrap().is_empty(),
+            node_db.legacy_list_dead_letter().await.unwrap().is_empty(),
             "codec rejection must never dead-letter the durable actor delete"
         );
         let retained = node_db
-            .claim_next_due_outbox(now, 1_000, "retained-codec-row")
+            .legacy_claim_next_due_outbox(now, 1_000, "retained-codec-row")
             .await
             .unwrap()
             .expect("codec-rejected actor delete must remain durable");
@@ -3098,13 +3096,13 @@ mod tests {
 
         let mut next_due_times = Vec::new();
         while let Some(row) = node_db
-            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect-jitter")
+            .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect-jitter")
             .await
             .expect("claim retry row")
         {
             next_due_times.push(row.next_due_ms);
             node_db
-                .complete_outbox(row.id, row.lease_token.as_deref().expect("lease token"))
+                .legacy_complete_outbox(row.id, row.lease_token.as_deref().expect("lease token"))
                 .await
                 .expect("complete inspected row");
         }
@@ -3293,7 +3291,7 @@ mod tests {
         let node_db = node_db().await;
         let outbox = Outbox::new(node_db.clone());
         node_db
-            .upsert_pod_status_checkpoint(
+            .legacy_upsert_pod_status_checkpoint(
                 "uid-checkpoint-race",
                 "default",
                 "checkpoint-race",
@@ -3310,7 +3308,7 @@ mod tests {
             .await
             .expect("record newer checkpoint");
         node_db
-            .mark_pod_status_checkpoint_applied("uid-checkpoint-race", 12, 300)
+            .legacy_mark_pod_status_checkpoint_applied("uid-checkpoint-race", 12, 300)
             .await
             .expect("older outbox row marked applied");
         let live = klights_cluster_core::Resource {
@@ -3353,7 +3351,7 @@ mod tests {
         );
         assert!(
             node_db
-                .get_pod_status_checkpoint("uid-checkpoint-race")
+                .legacy_get_pod_status_checkpoint("uid-checkpoint-race")
                 .await
                 .expect("read checkpoint")
                 .is_some(),
@@ -3599,7 +3597,10 @@ mod tests {
             ),
             "actor-finalize delete should complete superseded status rows"
         );
-        let dead_letters = node_db.list_dead_letter().await.expect("list dead letter");
+        let dead_letters = node_db
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter");
         assert!(
             dead_letters.is_empty(),
             "ordered actor-finalize delete must not dead-letter: {dead_letters:?}"
@@ -3629,7 +3630,7 @@ mod tests {
             .expect("open node-local test db");
         let sqlite_node_db = sqlite_node_db.expect("SQLite test backend");
         node_db
-            .enqueue_outbox(crate::datastore::node_local::OutboxInsert {
+            .legacy_enqueue_outbox(crate::datastore::node_local::OutboxInsert {
                 idempotency_key: "unknown-operation-seq-1".to_string(),
                 enqueued_ms: 1_000,
                 subject_key: "v1/Pod/default/after-unknown/uid-after-unknown".to_string(),
@@ -3780,7 +3781,7 @@ mod tests {
         );
         assert!(
             node_db
-                .claim_next_due_outbox(1_003, 1_000, "assert-empty")
+                .legacy_claim_next_due_outbox(1_003, 1_000, "assert-empty")
                 .await
                 .expect("claim after drain")
                 .is_none()
@@ -3800,7 +3801,7 @@ mod tests {
         .await
         .unwrap();
         node_db
-            .enqueue_outbox(crate::datastore::node_local::OutboxInsert {
+            .legacy_enqueue_outbox(crate::datastore::node_local::OutboxInsert {
                 idempotency_key: "assigned-empty-payload".to_string(),
                 enqueued_ms: 1,
                 subject_key: "v1/Pod/default/web/pod-uid".to_string(),
@@ -3837,7 +3838,7 @@ mod tests {
         assert_eq!(watermark.len(), 1);
         assert_eq!(watermark[0].client_id, client_id);
         assert_eq!(watermark[0].stream_seq, 1);
-        assert!(node_db.list_dead_letter().await.unwrap().is_empty());
+        assert!(node_db.legacy_list_dead_letter().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3854,7 +3855,7 @@ mod tests {
             .expect("open node-local test db");
         let sqlite_node_db = sqlite_node_db.expect("SQLite test backend");
         node_db
-            .enqueue_outbox(crate::datastore::node_local::OutboxInsert {
+            .legacy_enqueue_outbox(crate::datastore::node_local::OutboxInsert {
                 idempotency_key: "unknown-operation-retry".to_string(),
                 enqueued_ms: 1_000,
                 subject_key: "internal/unknown-operation-retry".to_string(),
@@ -3913,7 +3914,7 @@ mod tests {
         );
         assert_eq!(client.calls().await, vec!["unknown-operation-retry"]);
         assert_eq!(
-            sqlite_node_db.outbox_stats().await.unwrap().pending,
+            sqlite_node_db.legacy_outbox_stats().await.unwrap().pending,
             1,
             "transport/follower failure must retain the assigned row for retry"
         );
@@ -4023,13 +4024,13 @@ mod tests {
 
         let mut operations = Vec::new();
         while let Some(row) = node_db
-            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
+            .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
             .await
             .expect("claim")
         {
             operations.push(row.operation);
             node_db
-                .complete_outbox(row.id, row.lease_token.as_deref().expect("lease token"))
+                .legacy_complete_outbox(row.id, row.lease_token.as_deref().expect("lease token"))
                 .await
                 .expect("complete");
         }

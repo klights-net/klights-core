@@ -319,11 +319,11 @@ fn dead_letter_values_preserve_original_delivery_identity() {
     let entry = DeadLetterEntry::try_new(
         8,
         41,
+        "client/raw",
         "idempotency/raw",
         101,
         subject(),
         "RuntimeReconcile",
-        workload_classification(),
         OutboxSequence::try_new(99, 7).unwrap(),
         vec![0, 1, 0, 255],
         17,
@@ -333,11 +333,11 @@ fn dead_letter_values_preserve_original_delivery_identity() {
     .unwrap();
     assert_eq!(entry.id(), 8);
     assert_eq!(entry.original_id(), 41);
+    assert_eq!(entry.client_id(), "client/raw");
     assert_eq!(entry.idempotency_key(), "idempotency/raw");
     assert_eq!(entry.enqueued_ms(), 101);
     assert_eq!(entry.subject(), &subject());
     assert_eq!(entry.operation(), "RuntimeReconcile");
-    assert_eq!(entry.classification(), workload_classification());
     assert_eq!(entry.sequence(), OutboxSequence::try_new(99, 7).unwrap());
     assert_eq!(entry.payload(), &[0, 1, 0, 255]);
     assert_eq!(entry.attempts(), 17);
@@ -352,8 +352,31 @@ fn dead_letter_values_preserve_original_delivery_identity() {
     assert_eq!(stats.dispatch_errors_total(), 7);
 
     let key = DeadLetterKey::try_new(8).unwrap();
-    let replay = DeadLetterReplayRequest::new(key);
+    let replay = DeadLetterReplayRequest::new(key, workload_classification());
     assert_eq!(replay.key().get(), 8);
+    assert_eq!(replay.classification(), workload_classification());
+}
+
+#[test]
+fn dead_letter_entry_preserves_legacy_zero_original_id() {
+    let entry = DeadLetterEntry::try_new(
+        7,
+        0,
+        "",
+        "legacy-key",
+        1,
+        subject(),
+        "PodStatus",
+        OutboxSequence::unassigned(),
+        vec![1, 2, 3],
+        1,
+        "legacy",
+        2,
+    )
+    .expect("zero is the persisted legacy sentinel");
+
+    assert_eq!(entry.original_id(), 0);
+    assert_eq!(entry.client_id(), "");
 }
 
 #[test]

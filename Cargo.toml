@@ -61,6 +61,7 @@ klights-leader-rpc = { path = "crates/klights-leader-rpc" }
 k8s-native-service = { path = "crates/k8s-native-service" }
 klights-watch = { path = "crates/klights-watch" }
 klights-node-store = { path = "crates/klights-node-store" }
+klights-node-datastore = { path = "crates/klights-node-datastore" }
 klights-node-api = { path = "crates/klights-node-api" }
 klights-pod-api = { path = "crates/klights-pod-api" }
 klights-reconcile-api = { path = "crates/klights-reconcile-api" }
@@ -203,6 +204,7 @@ klights-leader-api = { workspace = true }
 klights-watch = { workspace = true }
 klights-node-api = { workspace = true }
 klights-node-store = { workspace = true }
+klights-node-datastore = { workspace = true }
 klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }
 klights-network-api = { workspace = true }
@@ -324,5 +326,6 @@ sqlcipher = [
     "sqlite",
     "rusqlite/bundled-sqlcipher-vendored-openssl",
     "klights-cluster-datastore/sqlcipher",
+    "klights-node-datastore/sqlcipher",
     "klights-supervisor/sqlcipher",
 ]

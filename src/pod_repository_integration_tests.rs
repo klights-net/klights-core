@@ -8,6 +8,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use crate::datastore::node_local::LegacyDeliveryTestStore as _;
 use anyhow::Result;
 use serde_json::json;
 
@@ -1084,7 +1085,7 @@ async fn worker_status_enqueue_does_not_bypass_leader_side_effects() {
         "outbox mode must not write Pod status directly to cluster storage"
     );
     let row = node_db
-        .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+        .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
         .await
         .expect("claim outbox")
         .expect("status row enqueued");
@@ -1496,7 +1497,7 @@ async fn outbox_status_reads_current_pod_through_leader_api() {
     );
     assert!(
         node_db
-            .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+            .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
             .await
             .expect("claim outbox")
             .is_some()
@@ -1565,7 +1566,7 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
         "kubelet sandbox metadata path must not write cluster storage directly"
     );
     let row = node_db
-        .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+        .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
         .await
         .expect("claim outbox")
         .expect("metadata row enqueued");
@@ -1661,7 +1662,7 @@ async fn controller_owner_reference_update_commits_to_leader_store_not_node_outb
     );
     assert!(
         node_db
-            .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+            .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
             .await
             .expect("inspect node outbox")
             .is_none(),
@@ -1934,7 +1935,7 @@ async fn worker_actor_finalization_enqueues_uid_qualified_pod_delete_outbox() {
         "worker finalization must not depend on a local cluster datastore row"
     );
     let row = node_db
-        .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+        .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
         .await
         .expect("claim outbox")
         .expect("delete row enqueued");
@@ -1990,7 +1991,7 @@ async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal(
     let (_direct_store, direct_db) = crate::datastore::test_support::in_memory_with_handle().await;
     let node_db = fixture_node_local().await;
     node_db
-        .upsert_pod_status_checkpoint(
+        .legacy_upsert_pod_status_checkpoint(
             "uid-finalize-checkpoint",
             "default",
             "finalize-checkpoint",
@@ -2050,7 +2051,7 @@ async fn worker_actor_finalization_preserves_checkpoint_until_committed_removal(
     );
     assert!(
         node_db
-            .get_pod_status_checkpoint("uid-finalize-checkpoint")
+            .legacy_get_pod_status_checkpoint("uid-finalize-checkpoint")
             .await
             .expect("read status checkpoint")
             .is_some(),
@@ -2107,7 +2108,7 @@ async fn worker_actor_finalization_uses_fresh_leader_read_before_emitting_finali
         "fresh leader observation only queues the exact-RV command; committed removal is still pending"
     );
     let row = node_db
-        .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+        .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
         .await
         .expect("claim outbox");
     assert!(
@@ -6703,6 +6704,28 @@ async fn pod_subresource_writes_return_conflict_on_stale_rv() {
     );
 }
 
+async fn reserve_test_network_assignment(
+    node_local: &crate::datastore::node_local::NodeLocalHandle,
+    sandbox_id: &str,
+    pod_name: &str,
+    pod_uid: &str,
+    veth_host: &str,
+    netns_path: &str,
+) {
+    let request = klights_node_store::PodNetworkAllocationRequest::try_new(
+        sandbox_id,
+        klights_types::PodIdentity::new("default", pod_name, pod_uid),
+        0x0a2a_0000,
+        256,
+        veth_host,
+        netns_path,
+    )
+    .unwrap();
+    klights_node_store::PodIpamStore::reserve_ip_and_insert_network(node_local.as_ref(), request)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn read_pod_network_assignment_returns_assigned_ip() {
     use super::PodNetworkReader;
@@ -6722,22 +6745,15 @@ async fn read_pod_network_assignment_returns_assigned_ip() {
         None,
     );
 
-    node_local
-        .reserve_network_assignment(
-            crate::datastore::node_local::PodNetworkAllocationRequest::new(
-                "sandbox-net-1",
-                crate::datastore::node_local::PodNetworkAllocationPod::new(
-                    "default", "p-net", "uid-1",
-                ),
-                crate::datastore::node_local::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
-                crate::datastore::node_local::PodNetworkAllocationLink::new(
-                    "vethXYZ",
-                    "/var/run/netns/cni-1",
-                ),
-            ),
-        )
-        .await
-        .unwrap();
+    reserve_test_network_assignment(
+        &node_local,
+        "sandbox-net-1",
+        "p-net",
+        "uid-1",
+        "vethXYZ",
+        "/var/run/netns/cni-1",
+    )
+    .await;
     let assignment = repo
         .read_pod_network_assignment("sandbox-net-1", "default", "p-net", "uid-1", false)
         .await
@@ -6921,24 +6937,15 @@ async fn read_pod_network_assignment_retries_then_succeeds() {
     });
 
     registered.changed().await.unwrap();
-    node_local
-        .reserve_network_assignment(
-            crate::datastore::node_local::PodNetworkAllocationRequest::new(
-                "sandbox-net-late",
-                crate::datastore::node_local::PodNetworkAllocationPod::new(
-                    "default",
-                    "p-net-late",
-                    "uid-late",
-                ),
-                crate::datastore::node_local::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
-                crate::datastore::node_local::PodNetworkAllocationLink::new(
-                    "vethL",
-                    "/var/run/netns/cni-late",
-                ),
-            ),
-        )
-        .await
-        .unwrap();
+    reserve_test_network_assignment(
+        &node_local,
+        "sandbox-net-late",
+        "p-net-late",
+        "uid-late",
+        "vethL",
+        "/var/run/netns/cni-late",
+    )
+    .await;
     events.publish_assignment(&key);
 
     let assignment = read_handle.await.unwrap().unwrap();
@@ -7123,24 +7130,15 @@ async fn read_pod_network_assignment_tolerates_cni_db_backlog() {
     // Full conformance can queue DB work around RunPodSandbox; the reader must
     // stay parked on the event rather than burning retry sleeps.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    node_local
-        .reserve_network_assignment(
-            crate::datastore::node_local::PodNetworkAllocationRequest::new(
-                "sandbox-net-backlogged",
-                crate::datastore::node_local::PodNetworkAllocationPod::new(
-                    "default",
-                    "p-net-backlogged",
-                    "uid-backlogged",
-                ),
-                crate::datastore::node_local::PodNetworkAllocationSubnet::new(0x0a2a_0000, 256),
-                crate::datastore::node_local::PodNetworkAllocationLink::new(
-                    "vethB",
-                    "/var/run/netns/cni-backlogged",
-                ),
-            ),
-        )
-        .await
-        .unwrap();
+    reserve_test_network_assignment(
+        &node_local,
+        "sandbox-net-backlogged",
+        "p-net-backlogged",
+        "uid-backlogged",
+        "vethB",
+        "/var/run/netns/cni-backlogged",
+    )
+    .await;
     events.publish_assignment(&key);
 
     let assignment = read_handle.await.unwrap().unwrap();
@@ -12206,7 +12204,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         PodDeletionFinalizeResult::FinalizersPending
     ));
     let row = node_db
-        .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+        .legacy_claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
         .await
         .expect("claim outbox")
         .expect("delete-mark row enqueued");

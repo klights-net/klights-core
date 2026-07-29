@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{
-    NodeLocalBackend, NodeLocalDb, NodeLocalHandle, OutboxFailureDisposition, OutboxInsert,
-    SqliteNodeLocalDb, selector,
+    LegacyDeliveryTestStore as _, NodeLocalBackend, NodeLocalDb, NodeLocalHandle,
+    OutboxFailureDisposition, OutboxInsert, SqliteNodeLocalDb, selector,
 };
 use crate::datastore::node_local::{
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
@@ -27,8 +27,8 @@ fn supervisor() -> Arc<TaskSupervisor> {
 }
 
 async fn open_node_local_in_memory() -> NodeLocalDb {
-    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-        crate::datastore::node_local::sqlite::open::in_memory_opts(),
+    let executor = klights_node_datastore::open::open_with_opts(
+        klights_node_datastore::open::in_memory_opts(),
         supervisor(),
         "sqlite:node-local-test",
     )
@@ -38,8 +38,8 @@ async fn open_node_local_in_memory() -> NodeLocalDb {
 }
 
 async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
-    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-        crate::datastore::node_local::sqlite::open::in_memory_opts(),
+    let executor = klights_node_datastore::open::open_with_opts(
+        klights_node_datastore::open::in_memory_opts(),
         supervisor(),
         "sqlite:node-local-backend-test",
     )
@@ -50,9 +50,9 @@ async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
 }
 
 async fn open_node_local_on_disk(path: &std::path::Path) -> NodeLocalDb {
-    let mut opts = crate::datastore::node_local::sqlite::open::disk_opts(path.to_path_buf());
+    let mut opts = klights_node_datastore::open::disk_opts(path.to_path_buf());
     opts.allow_existing_perms = true;
-    let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
+    let executor = klights_node_datastore::open::open_with_opts(
         opts,
         supervisor(),
         "sqlite:node-local-disk-test",
@@ -124,7 +124,7 @@ fn test_outbox_insert_with_operation(
 #[tokio::test]
 async fn outbox_failure_threshold_is_atomic_and_lease_bound() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "atomic-dead-letter",
         "v1/Pod/default/web/pod-uid",
         1,
@@ -135,48 +135,48 @@ async fn outbox_failure_threshold_is_atomic_and_lease_bound() {
         .await
         .unwrap();
     let row = db
-        .claim_next_due_outbox(1, 1_000, "owned-lease")
+        .legacy_claim_next_due_outbox(1, 1_000, "owned-lease")
         .await
         .unwrap()
         .unwrap();
 
     assert_eq!(
-        db.record_outbox_failure(row.id, "stale-lease", 10, "retry", 720)
+        db.legacy_record_outbox_failure(row.id, "stale-lease", 10, "retry", 720)
             .await
             .unwrap(),
         OutboxFailureDisposition::LeaseLost
     );
-    assert!(db.list_dead_letter().await.unwrap().is_empty());
+    assert!(db.legacy_list_dead_letter().await.unwrap().is_empty());
     assert_eq!(
-        db.record_outbox_failure(row.id, "owned-lease", 10, "retry", 720)
+        db.legacy_record_outbox_failure(row.id, "owned-lease", 10, "retry", 720)
             .await
             .unwrap(),
         OutboxFailureDisposition::DeadLettered
     );
-    let dead = db.list_dead_letter().await.unwrap();
+    let dead = db.legacy_list_dead_letter().await.unwrap();
     assert_eq!(dead.len(), 1);
     assert_eq!(dead[0].attempts, 720);
     assert_eq!(dead[0].last_error, "retry");
     assert_eq!(
-        db.record_outbox_failure(row.id, "owned-lease", 10, "duplicate", 720)
+        db.legacy_record_outbox_failure(row.id, "owned-lease", 10, "duplicate", 720)
             .await
             .unwrap(),
         OutboxFailureDisposition::LeaseLost
     );
-    assert_eq!(db.list_dead_letter().await.unwrap().len(), 1);
+    assert_eq!(db.legacy_list_dead_letter().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn node_local_outbox_assigns_monotonic_seq_per_stream() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "same-stream-1",
         "v1/Pod/default/web/pod-uid",
         1,
     ))
     .await
     .unwrap();
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "same-stream-2",
         "v1/Pod/default/web/pod-uid",
         2,
@@ -185,13 +185,15 @@ async fn node_local_outbox_assigns_monotonic_seq_per_stream() {
     .unwrap();
 
     let first = db
-        .claim_next_due_outbox(10, 1000, "lease-a")
+        .legacy_claim_next_due_outbox(10, 1000, "lease-a")
         .await
         .unwrap()
         .unwrap();
-    db.complete_outbox(first.id, "lease-a").await.unwrap();
+    db.legacy_complete_outbox(first.id, "lease-a")
+        .await
+        .unwrap();
     let second = db
-        .claim_next_due_outbox(10, 1000, "lease-b")
+        .legacy_claim_next_due_outbox(10, 1000, "lease-b")
         .await
         .unwrap()
         .unwrap();
@@ -215,7 +217,7 @@ async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
     legacy.payload_proto = vec![1];
 
     let db = open_node_local_on_disk(&path).await;
-    db.enqueue_outbox(legacy)
+    db.legacy_enqueue_outbox(legacy)
         .await
         .expect("seed durable row using current shape");
     db.clear_outbox_stream_identity_for_test("legacy-pre-stream-row")
@@ -225,7 +227,7 @@ async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
 
     let db = open_node_local_on_disk(&path).await;
     let first = db
-        .claim_next_due_outbox(100, 1_000, "legacy-first-lease")
+        .legacy_claim_next_due_outbox(100, 1_000, "legacy-first-lease")
         .await
         .expect("claim legacy row after restart")
         .expect("legacy row must remain deliverable");
@@ -242,7 +244,7 @@ async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
     )
     .expect("claim must repair identity before request validation can drop the row");
     assert!(
-        db.mark_outbox_attempt_failed(
+        db.legacy_mark_outbox_attempt_failed(
             first.id,
             "legacy-first-lease",
             200,
@@ -258,11 +260,11 @@ async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
         110,
     );
     successor.payload_proto = vec![2];
-    db.enqueue_outbox(successor)
+    db.legacy_enqueue_outbox(successor)
         .await
         .expect("enqueue same-stream successor");
     assert!(
-        db.claim_next_due_outbox(150, 1_000, "blocked-successor")
+        db.legacy_claim_next_due_outbox(150, 1_000, "blocked-successor")
             .await
             .expect("query blocked successor")
             .is_none(),
@@ -272,7 +274,7 @@ async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
 
     let db = open_node_local_on_disk(&path).await;
     let retried = db
-        .claim_next_due_outbox(200, 1_000, "legacy-restart-lease")
+        .legacy_claim_next_due_outbox(200, 1_000, "legacy-restart-lease")
         .await
         .expect("claim repaired row after second restart")
         .expect("repaired row survives restart");
@@ -282,13 +284,13 @@ async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
         (first.stream_id, 1)
     );
     assert!(
-        db.complete_outbox(retried.id, "legacy-restart-lease")
+        db.legacy_complete_outbox(retried.id, "legacy-restart-lease")
             .await
             .expect("complete legacy row after leader decision")
     );
 
     let successor = db
-        .claim_next_due_outbox(201, 1_000, "successor-lease")
+        .legacy_claim_next_due_outbox(201, 1_000, "successor-lease")
         .await
         .expect("claim successor")
         .expect("successor progresses after legacy decision");
@@ -309,12 +311,12 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
         ("legacy-dead-head", 101),
         ("legacy-live-tail", 102),
     ] {
-        db.enqueue_outbox(test_outbox_insert(key, subject, enqueued_ms))
+        db.legacy_enqueue_outbox(test_outbox_insert(key, subject, enqueued_ms))
             .await
             .expect("seed pre-stream row");
     }
     assert!(
-        db.move_outbox_to_dead_letter_if_max_attempts("legacy-dead-head", 0)
+        db.legacy_move_outbox_to_dead_letter_if_max_attempts("legacy-dead-head", 0)
             .await
             .expect("move legacy middle row to dead letter")
     );
@@ -324,25 +326,25 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
     drop(db);
 
     let db = open_node_local_on_disk(&path).await;
-    db.enqueue_outbox(test_outbox_insert("current-successor", subject, 103))
+    db.legacy_enqueue_outbox(test_outbox_insert("current-successor", subject, 103))
         .await
         .expect("enqueue current row before any legacy claim");
 
     let first = db
-        .claim_next_due_outbox(200, 1_000, "legacy-head-lease")
+        .legacy_claim_next_due_outbox(200, 1_000, "legacy-head-lease")
         .await
         .expect("claim repaired legacy head")
         .expect("legacy head remains first");
     assert_eq!(first.idempotency_key, "legacy-live-head");
     assert_eq!(first.stream_seq, 1);
     assert!(
-        db.complete_outbox(first.id, "legacy-head-lease")
+        db.legacy_complete_outbox(first.id, "legacy-head-lease")
             .await
             .expect("complete legacy head")
     );
 
     let dead = db
-        .list_dead_letter()
+        .legacy_list_dead_letter()
         .await
         .expect("list repaired dead letter");
     assert_eq!(dead.len(), 1);
@@ -351,7 +353,7 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
     assert_eq!(dead[0].stream_id, first.stream_id);
     assert_eq!(dead[0].stream_seq, 2);
     assert!(
-        db.claim_next_due_outbox(200, 1_000, "blocked-live-tail")
+        db.legacy_claim_next_due_outbox(200, 1_000, "blocked-live-tail")
             .await
             .expect("query behind repaired dead letter")
             .is_none(),
@@ -359,20 +361,20 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
     );
 
     assert!(
-        db.replay_dead_letter(dead[0].id, pod_status_classification())
+        db.legacy_replay_dead_letter(dead[0].id, pod_status_classification())
             .await
             .expect("replay exact repaired dead-letter head")
     );
     let replay_now = i64::MAX / 4;
     let replayed = db
-        .claim_next_due_outbox(replay_now, 1_000, "legacy-dead-replay")
+        .legacy_claim_next_due_outbox(replay_now, 1_000, "legacy-dead-replay")
         .await
         .expect("claim replayed legacy dead-letter row")
         .expect("replayed dead-letter row is the exact next sequence");
     assert_eq!(replayed.idempotency_key, "legacy-dead-head");
     assert_eq!(replayed.stream_seq, 2);
     assert!(
-        db.complete_outbox(replayed.id, "legacy-dead-replay")
+        db.legacy_complete_outbox(replayed.id, "legacy-dead-replay")
             .await
             .expect("complete replayed legacy dead-letter row")
     );
@@ -382,7 +384,7 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
         ("current-successor", 4, "current-successor-lease"),
     ] {
         let row = db
-            .claim_next_due_outbox(replay_now, 1_000, token)
+            .legacy_claim_next_due_outbox(replay_now, 1_000, token)
             .await
             .expect("claim ordered successor")
             .expect("ordered successor is deliverable");
@@ -391,7 +393,7 @@ async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
         assert_eq!(row.stream_id, first.stream_id);
         assert_eq!(row.stream_seq, expected_seq);
         assert!(
-            db.complete_outbox(row.id, token)
+            db.legacy_complete_outbox(row.id, token)
                 .await
                 .expect("complete ordered successor")
         );
@@ -403,7 +405,7 @@ async fn node_local_outbox_commits_stream_sequence_before_enqueue_returns() {
     let db = open_node_local_in_memory().await;
     let subject = "v1/Pod/default/atomic-sequence/pod-uid";
 
-    db.enqueue_outbox(test_outbox_insert("atomic-sequence-1", subject, 1))
+    db.legacy_enqueue_outbox(test_outbox_insert("atomic-sequence-1", subject, 1))
         .await
         .unwrap();
     assert_eq!(
@@ -417,7 +419,7 @@ async fn node_local_outbox_commits_stream_sequence_before_enqueue_returns() {
         "the durable sequence must exist before any claim or delivery can observe the row",
     );
 
-    db.enqueue_outbox(test_outbox_insert("atomic-sequence-2", subject, 2))
+    db.legacy_enqueue_outbox(test_outbox_insert("atomic-sequence-2", subject, 2))
         .await
         .unwrap();
     assert_eq!(
@@ -437,15 +439,15 @@ async fn outbox_durability_next_wake_tracks_the_fifo_blocker_not_blocked_younger
     let db = open_node_local_in_memory().await;
     let subject = "v1/Pod/default/fifo-wake/pod-uid";
 
-    db.enqueue_outbox(test_outbox_insert("fifo-blocker", subject, 500))
+    db.legacy_enqueue_outbox(test_outbox_insert("fifo-blocker", subject, 500))
         .await
         .unwrap();
-    db.enqueue_outbox(test_outbox_insert("fifo-blocked-younger", subject, 100))
+    db.legacy_enqueue_outbox(test_outbox_insert("fifo-blocked-younger", subject, 100))
         .await
         .unwrap();
 
     assert_eq!(
-        db.next_outbox_wake_ms(200).await.unwrap(),
+        db.legacy_next_outbox_wake_ms(200).await.unwrap(),
         Some(500),
         "a past-due younger row cannot cause a wake loop while an older FIFO row is future-due",
     );
@@ -456,19 +458,19 @@ async fn outbox_durability_next_wake_tracks_an_older_active_lease() {
     let db = open_node_local_in_memory().await;
     let subject = "v1/Pod/default/leased-fifo-wake/pod-uid";
 
-    db.enqueue_outbox(test_outbox_insert("leased-fifo-blocker", subject, 100))
+    db.legacy_enqueue_outbox(test_outbox_insert("leased-fifo-blocker", subject, 100))
         .await
         .unwrap();
-    db.enqueue_outbox(test_outbox_insert("leased-fifo-younger", subject, 100))
+    db.legacy_enqueue_outbox(test_outbox_insert("leased-fifo-younger", subject, 100))
         .await
         .unwrap();
-    db.claim_next_due_outbox(100, 400, "active-lease")
+    db.legacy_claim_next_due_outbox(100, 400, "active-lease")
         .await
         .unwrap()
         .expect("claim older blocker");
 
     assert_eq!(
-        db.next_outbox_wake_ms(200).await.unwrap(),
+        db.legacy_next_outbox_wake_ms(200).await.unwrap(),
         Some(500),
         "the older row's lease expiry, not a blocked younger due time, controls the next wake",
     );
@@ -477,14 +479,14 @@ async fn outbox_durability_next_wake_tracks_an_older_active_lease() {
 #[tokio::test]
 async fn node_local_outbox_rows_share_stable_client_epoch() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "client-epoch-1",
         "v1/Pod/default/a/uid-a",
         1,
     ))
     .await
     .unwrap();
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "client-epoch-2",
         "v1/Pod/default/b/uid-b",
         2,
@@ -493,13 +495,15 @@ async fn node_local_outbox_rows_share_stable_client_epoch() {
     .unwrap();
 
     let first = db
-        .claim_next_due_outbox(10, 1000, "lease-a")
+        .legacy_claim_next_due_outbox(10, 1000, "lease-a")
         .await
         .unwrap()
         .unwrap();
-    db.complete_outbox(first.id, "lease-a").await.unwrap();
+    db.legacy_complete_outbox(first.id, "lease-a")
+        .await
+        .unwrap();
     let second = db
-        .claim_next_due_outbox(10, 1000, "lease-b")
+        .legacy_claim_next_due_outbox(10, 1000, "lease-b")
         .await
         .unwrap()
         .unwrap();
@@ -523,14 +527,14 @@ fn node_local_outbox_hash_reserves_zero_for_unsequenced_ops() {
 #[tokio::test]
 async fn node_local_outbox_claim_skips_same_subject_rows_with_stream_in_flight() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "inflight-stream-1",
         "v1/Pod/default/web-2/uid-2",
         1,
     ))
     .await
     .unwrap();
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "inflight-stream-2",
         "v1/Pod/default/web-2/uid-2",
         2,
@@ -539,13 +543,13 @@ async fn node_local_outbox_claim_skips_same_subject_rows_with_stream_in_flight()
     .unwrap();
 
     let first = db
-        .claim_next_due_outbox(10, 1000, "lease-a")
+        .legacy_claim_next_due_outbox(10, 1000, "lease-a")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(first.stream_seq, 1);
     assert!(
-        db.claim_next_due_outbox(10, 1000, "lease-b")
+        db.legacy_claim_next_due_outbox(10, 1000, "lease-b")
             .await
             .unwrap()
             .is_none(),
@@ -556,14 +560,14 @@ async fn node_local_outbox_claim_skips_same_subject_rows_with_stream_in_flight()
 #[tokio::test]
 async fn node_local_outbox_batch_claim_is_atomic_across_independent_claimers() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "atomic-claim-a",
         "v1/Pod/default/a/uid-a",
         1,
     ))
     .await
     .unwrap();
-    db.enqueue_outbox(test_outbox_insert(
+    db.legacy_enqueue_outbox(test_outbox_insert(
         "atomic-claim-b",
         "v1/Pod/default/b/uid-b",
         1,
@@ -572,8 +576,8 @@ async fn node_local_outbox_batch_claim_is_atomic_across_independent_claimers() {
     .unwrap();
 
     let (left, right) = tokio::join!(
-        db.claim_due_outbox_batch(10, 2, 1_000, "claim-left"),
-        db.claim_due_outbox_batch(10, 2, 1_000, "claim-right"),
+        db.legacy_claim_due_outbox_batch(10, 2, 1_000, "claim-left"),
+        db.legacy_claim_due_outbox_batch(10, 2, 1_000, "claim-right"),
     );
     let left = left.unwrap();
     let right = right.unwrap();
@@ -592,7 +596,7 @@ async fn node_local_outbox_batch_claim_is_atomic_across_independent_claimers() {
 #[tokio::test]
 async fn node_local_outbox_prioritizes_status_before_older_events() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert_with_operation(
+    db.legacy_enqueue_outbox(test_outbox_insert_with_operation(
         "event-first",
         "events.k8s.io/v1/Event/default/diagnostic/event-uid",
         "EventCreate",
@@ -600,7 +604,7 @@ async fn node_local_outbox_prioritizes_status_before_older_events() {
     ))
     .await
     .unwrap();
-    db.enqueue_outbox(test_outbox_insert_with_operation(
+    db.legacy_enqueue_outbox(test_outbox_insert_with_operation(
         "status-second",
         "v1/Pod/default/web/pod-uid",
         "PodStatus",
@@ -610,7 +614,7 @@ async fn node_local_outbox_prioritizes_status_before_older_events() {
     .unwrap();
 
     let claimed = db
-        .claim_next_due_outbox(10, 1000, "lease-status")
+        .legacy_claim_next_due_outbox(10, 1000, "lease-status")
         .await
         .unwrap()
         .expect("status row should be claimable");
@@ -624,7 +628,7 @@ async fn node_local_outbox_prioritizes_status_before_older_events() {
 #[tokio::test]
 async fn node_local_outbox_ages_diagnostic_events_into_fair_service() {
     let db = open_node_local_in_memory().await;
-    db.enqueue_outbox(test_outbox_insert_with_operation(
+    db.legacy_enqueue_outbox(test_outbox_insert_with_operation(
         "aged-event",
         "events.k8s.io/v1/Event/default/diagnostic/event-uid",
         "EventCreate",
@@ -632,7 +636,7 @@ async fn node_local_outbox_ages_diagnostic_events_into_fair_service() {
     ))
     .await
     .unwrap();
-    db.enqueue_outbox(test_outbox_insert_with_operation(
+    db.legacy_enqueue_outbox(test_outbox_insert_with_operation(
         "fresh-status",
         "v1/Pod/default/web/pod-uid",
         "PodStatus",
@@ -642,7 +646,7 @@ async fn node_local_outbox_ages_diagnostic_events_into_fair_service() {
     .unwrap();
 
     let claimed = db
-        .claim_next_due_outbox(
+        .legacy_claim_next_due_outbox(
             crate::node_outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
             1_000,
             "lease-aged-event",
@@ -665,7 +669,7 @@ async fn node_local_outbox_keeps_lease_then_node_status_ahead_of_workload_status
         ("node-status", "NodeStatus"),
         ("lease-renew", "LeaseRenew"),
     ] {
-        db.enqueue_outbox(test_outbox_insert_with_operation(
+        db.legacy_enqueue_outbox(test_outbox_insert_with_operation(
             key,
             &format!("subject/{key}"),
             operation,
@@ -679,12 +683,12 @@ async fn node_local_outbox_keeps_lease_then_node_status_ahead_of_workload_status
     for index in 0..3 {
         let token = format!("priority-lease-{index}");
         let row = db
-            .claim_next_due_outbox(10, 1_000, &token)
+            .legacy_claim_next_due_outbox(10, 1_000, &token)
             .await
             .unwrap()
             .expect("priority row");
         order.push(row.idempotency_key.clone());
-        db.complete_outbox(row.id, &token).await.unwrap();
+        db.legacy_complete_outbox(row.id, &token).await.unwrap();
     }
     assert_eq!(order, ["lease-renew", "node-status", "pod-status"]);
 }
@@ -748,7 +752,7 @@ async fn node_local_schema_has_only_slim_uid_bound_tables() {
 async fn pod_status_checkpoint_is_uid_bound_and_status_only() {
     let db = open_node_local_in_memory().await;
 
-    db.upsert_pod_status_checkpoint(
+    db.legacy_upsert_pod_status_checkpoint(
         "uid-1",
         "default",
         "web",
@@ -763,7 +767,7 @@ async fn pod_status_checkpoint_is_uid_bound_and_status_only() {
     .expect("upsert checkpoint");
 
     let checkpoint = db
-        .get_pod_status_checkpoint("uid-1")
+        .legacy_get_pod_status_checkpoint("uid-1")
         .await
         .expect("get checkpoint")
         .expect("checkpoint exists");
@@ -778,11 +782,11 @@ async fn pod_status_checkpoint_is_uid_bound_and_status_only() {
     );
     assert!(checkpoint.status.get("metadata").is_none());
 
-    db.mark_pod_status_checkpoint_applied("uid-1", 12, 200)
+    db.legacy_mark_pod_status_checkpoint_applied("uid-1", 12, 200)
         .await
         .expect("mark applied");
     assert_eq!(
-        db.get_pod_status_checkpoint("uid-1")
+        db.legacy_get_pod_status_checkpoint("uid-1")
             .await
             .expect("get marked")
             .expect("checkpoint still exists")
@@ -790,11 +794,11 @@ async fn pod_status_checkpoint_is_uid_bound_and_status_only() {
         Some(12)
     );
 
-    db.delete_pod_status_checkpoint("uid-1")
+    db.legacy_delete_pod_status_checkpoint("uid-1")
         .await
         .expect("delete checkpoint");
     assert!(
-        db.get_pod_status_checkpoint("uid-1")
+        db.legacy_get_pod_status_checkpoint("uid-1")
             .await
             .expect("get deleted")
             .is_none()
@@ -999,51 +1003,13 @@ fn node_local_backend_has_no_cluster_resource_crud() {
 }
 
 #[tokio::test]
-async fn endpoint_handoff_queues_mutation_after_authoritative_snapshot() {
-    let db = open_node_local_in_memory().await;
-    let handoff_guard = db.lock_pod_endpoint_handoff_for_test().await;
-    let mut subscribe = Box::pin(db.subscribe_pod_endpoints_with_snapshot());
-    assert!(matches!(
-        futures::poll!(subscribe.as_mut()),
-        std::task::Poll::Pending
-    ));
-
-    let row = crate::datastore::node_local::PodEndpointRow {
-        pod_uid: "handoff-uid".into(),
-        namespace: "default".into(),
-        pod_name: "handoff-pod".into(),
-        node_name: "node-a".into(),
-        mode: crate::datastore::node_local::PodEndpointMode::EncryptedDirect,
-        pod_ip: "10.42.0.9".parse().unwrap(),
-        node_ip: "192.0.2.9".parse().unwrap(),
-        host_port_tcp: None,
-        host_port_udp: None,
-        generation: 1,
-        updated_at: 1,
-    };
-    let mut upsert = Box::pin(db.upsert_endpoint(row.clone()));
-    assert!(matches!(
-        futures::poll!(upsert.as_mut()),
-        std::task::Poll::Pending
-    ));
-
-    drop(handoff_guard);
-    let (snapshot, mut events) = subscribe.await.expect("atomic endpoint handoff");
-    assert!(
-        snapshot.is_empty(),
-        "queued upsert must be after the snapshot"
-    );
-    upsert.await.expect("queued endpoint upsert");
-    assert_eq!(
-        events.recv().await.expect("post-snapshot event"),
-        crate::datastore::node_local::PodEndpointEvent::Upsert(row)
-    );
-}
-
-#[tokio::test]
 async fn malformed_endpoint_ports_fail_instead_of_wrapping_to_u16() {
     let db = open_node_local_in_memory().await;
-    for (tcp, udp) in [(Some(65_536i64), None), (None, Some(-1i64))] {
+    for (tcp, udp) in [
+        (Some(65_536i64), None),
+        (None, Some(-1i64)),
+        (Some(0i64), None),
+    ] {
         db.db_call("test_insert_malformed_endpoint_port", move |conn| {
             conn.execute("DELETE FROM pod_endpoints", [])?;
             conn.execute(
@@ -1058,10 +1024,12 @@ async fn malformed_endpoint_ports_fail_instead_of_wrapping_to_u16() {
         })
         .await
         .unwrap();
-        let error = db
-            .get_endpoint_by_pod_ip("10.42.0.10".parse().unwrap())
-            .await
-            .expect_err("invalid persisted port must fail decoding");
+        let error = klights_node_store::PodEndpointStore::get_endpoint_by_pod_ip(
+            &db,
+            "10.42.0.10".parse().unwrap(),
+        )
+        .await
+        .expect_err("invalid persisted port must fail decoding");
         assert!(
             format!("{error:#}").contains("pod endpoint port outside 1..=65535"),
             "unexpected decode error: {error:#}"
@@ -1076,7 +1044,7 @@ async fn runtime_observation_checkpoint_survives_actor_restart() {
     use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
     let db = open_node_local_in_memory().await;
 
-    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+    db.legacy_upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
         pod_uid: "uid-restart".to_string(),
         container_ids: vec![
             "containerd://ctr-abc".to_string(),
@@ -1090,7 +1058,7 @@ async fn runtime_observation_checkpoint_survives_actor_restart() {
 
     // Simulate actor restart: a new actor reads back the persisted checkpoint.
     let loaded = db
-        .get_runtime_observation_checkpoint("uid-restart")
+        .legacy_get_runtime_observation_checkpoint("uid-restart")
         .await
         .expect("get checkpoint")
         .expect("checkpoint must exist after actor restart");
@@ -1116,7 +1084,7 @@ async fn runtime_observation_checkpoint_survives_worker_restart() {
     let db = open_node_local_in_memory().await;
 
     // Write checkpoints for two pods
-    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+    db.legacy_upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
         pod_uid: "uid-pod-a".to_string(),
         container_ids: vec!["containerd://ctr-a1".to_string()],
         generation: 1,
@@ -1125,7 +1093,7 @@ async fn runtime_observation_checkpoint_survives_worker_restart() {
     .await
     .expect("upsert pod-a checkpoint");
 
-    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+    db.legacy_upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
         pod_uid: "uid-pod-b".to_string(),
         container_ids: vec!["containerd://ctr-b1".to_string()],
         generation: 3,
@@ -1136,30 +1104,30 @@ async fn runtime_observation_checkpoint_survives_worker_restart() {
 
     // Simulate worker restart: both checkpoints survive and can be loaded.
     let a = db
-        .get_runtime_observation_checkpoint("uid-pod-a")
+        .legacy_get_runtime_observation_checkpoint("uid-pod-a")
         .await
         .expect("get a")
         .expect("a exists");
     assert_eq!(a.generation, 1);
     let b = db
-        .get_runtime_observation_checkpoint("uid-pod-b")
+        .legacy_get_runtime_observation_checkpoint("uid-pod-b")
         .await
         .expect("get b")
         .expect("b exists");
     assert_eq!(b.generation, 3);
 
     // Reconcile pod-a; checkpoint deleted. pod-b checkpoint survives.
-    db.delete_runtime_observation_checkpoint("uid-pod-a")
+    db.legacy_delete_runtime_observation_checkpoint("uid-pod-a")
         .await
         .expect("delete a");
     assert!(
-        db.get_runtime_observation_checkpoint("uid-pod-a")
+        db.legacy_get_runtime_observation_checkpoint("uid-pod-a")
             .await
             .expect("get a after delete")
             .is_none()
     );
     assert!(
-        db.get_runtime_observation_checkpoint("uid-pod-b")
+        db.legacy_get_runtime_observation_checkpoint("uid-pod-b")
             .await
             .expect("get b after a delete")
             .is_some()
@@ -1171,7 +1139,7 @@ async fn runtime_observation_checkpoint_is_uid_bound() {
     use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
     let db = open_node_local_in_memory().await;
 
-    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+    db.legacy_upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
         pod_uid: "uid-alpha".to_string(),
         container_ids: vec!["containerd://alpha-1".to_string()],
         generation: 5,
@@ -1180,7 +1148,7 @@ async fn runtime_observation_checkpoint_is_uid_bound() {
     .await
     .expect("upsert alpha");
 
-    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+    db.legacy_upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
         pod_uid: "uid-beta".to_string(),
         container_ids: vec![
             "containerd://beta-1".to_string(),
@@ -1194,7 +1162,7 @@ async fn runtime_observation_checkpoint_is_uid_bound() {
 
     // Each UID returns only its own checkpoint.
     let alpha = db
-        .get_runtime_observation_checkpoint("uid-alpha")
+        .legacy_get_runtime_observation_checkpoint("uid-alpha")
         .await
         .expect("get alpha")
         .expect("alpha exists");
@@ -1202,7 +1170,7 @@ async fn runtime_observation_checkpoint_is_uid_bound() {
     assert_eq!(alpha.generation, 5);
 
     let beta = db
-        .get_runtime_observation_checkpoint("uid-beta")
+        .legacy_get_runtime_observation_checkpoint("uid-beta")
         .await
         .expect("get beta")
         .expect("beta exists");
@@ -1210,17 +1178,17 @@ async fn runtime_observation_checkpoint_is_uid_bound() {
     assert_eq!(beta.generation, 7);
 
     // Deleting alpha must not affect beta.
-    db.delete_runtime_observation_checkpoint("uid-alpha")
+    db.legacy_delete_runtime_observation_checkpoint("uid-alpha")
         .await
         .expect("delete alpha");
     assert!(
-        db.get_runtime_observation_checkpoint("uid-alpha")
+        db.legacy_get_runtime_observation_checkpoint("uid-alpha")
             .await
             .expect("get alpha gone")
             .is_none()
     );
     assert!(
-        db.get_runtime_observation_checkpoint("uid-beta")
+        db.legacy_get_runtime_observation_checkpoint("uid-beta")
             .await
             .expect("get beta still")
             .is_some()
@@ -1232,7 +1200,7 @@ async fn runtime_observation_checkpoint_is_removed_after_successful_reconcile() 
     use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
     let db = open_node_local_in_memory().await;
 
-    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+    db.legacy_upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
         pod_uid: "uid-reconcile".to_string(),
         container_ids: vec!["containerd://ctr-99".to_string()],
         generation: 1,
@@ -1242,19 +1210,19 @@ async fn runtime_observation_checkpoint_is_removed_after_successful_reconcile() 
     .expect("upsert before reconcile");
 
     assert!(
-        db.get_runtime_observation_checkpoint("uid-reconcile")
+        db.legacy_get_runtime_observation_checkpoint("uid-reconcile")
             .await
             .expect("pre-reconcile get")
             .is_some()
     );
 
     // Successful reconcile: actor removes its checkpoint.
-    db.delete_runtime_observation_checkpoint("uid-reconcile")
+    db.legacy_delete_runtime_observation_checkpoint("uid-reconcile")
         .await
         .expect("delete after reconcile");
 
     assert!(
-        db.get_runtime_observation_checkpoint("uid-reconcile")
+        db.legacy_get_runtime_observation_checkpoint("uid-reconcile")
             .await
             .expect("post-reconcile get")
             .is_none(),

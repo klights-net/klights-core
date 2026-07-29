@@ -1,1 +1,16 @@
-//! Node-local datastore adapters for klights.
+//! Passive node-local datastore adapters for klights.
+//!
+//! Backend selection and root composition remain outside this package. Raft
+//! values are persisted as opaque bytes behind neutral node-store contracts.
+
+pub mod delivery;
+mod delivery_queries;
+mod identity;
+pub mod network_state;
+pub mod open;
+mod raft_durability;
+pub mod schema;
+
+pub use identity::SqliteNodeIdentity;
+pub use network_state::SqliteNodeNetworkStateStore;
+pub use raft_durability::SqliteRaftDurability;

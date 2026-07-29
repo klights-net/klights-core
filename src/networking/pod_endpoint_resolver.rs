@@ -184,7 +184,6 @@ mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
     use crate::datastore::node_local::{NodeLocalHandle, selector};
-    use crate::datastore::node_local::{PodEndpointMode, PodEndpointRow};
     use crate::datastore::sqlite::Datastore;
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::Arc;
@@ -211,20 +210,30 @@ mod tests {
         events
     }
 
-    fn sample_row(uid: &str, pod_ip: Ipv4Addr, mode: PodEndpointMode) -> PodEndpointRow {
-        PodEndpointRow {
-            pod_uid: uid.to_string(),
-            namespace: "default".to_string(),
-            pod_name: format!("pod-{uid}"),
-            node_name: "node-a".to_string(),
+    fn sample_row(uid: &str, pod_ip: Ipv4Addr, mode: PodEndpointMode) -> PodEndpointRecord {
+        PodEndpointRecord::try_new(
+            klights_types::PodIdentity::new("default", &format!("pod-{uid}"), uid),
+            "node-a",
             mode,
             pod_ip,
-            node_ip: pod_ip,
-            host_port_tcp: None,
-            host_port_udp: None,
-            generation: 1,
-            updated_at: 1_700_000_000,
-        }
+            pod_ip,
+            None,
+            None,
+            1,
+            1_700_000_000,
+        )
+        .unwrap()
+    }
+
+    async fn persist_endpoint(store: &dyn PodEndpointStore, row: PodEndpointRecord) {
+        store.upsert_endpoint(row).await.unwrap();
+    }
+
+    async fn remove_endpoint(store: &dyn PodEndpointStore, pod_uid: &str) {
+        store
+            .delete_endpoint_for_uid(klights_node_store::PodUidKey::try_new(pod_uid).unwrap())
+            .await
+            .unwrap();
     }
 
     async fn build_resolver() -> (NodeLocalHandle, Datastore, SqlitePodEndpointResolver) {
@@ -268,7 +277,7 @@ mod tests {
             Ipv4Addr::new(10, 42, 1, 5),
             PodEndpointMode::EncryptedDirect,
         );
-        node_local.upsert_endpoint(row).await.unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
         let resolved = resolver.resolve(Ipv4Addr::new(10, 42, 1, 5)).await.unwrap();
         assert!(resolved.is_none(), "missing metadata must install no route");
     }
@@ -281,7 +290,7 @@ mod tests {
             Ipv4Addr::new(10, 42, 1, 7),
             PodEndpointMode::EncryptedDirect,
         );
-        node_local.upsert_endpoint(row).await.unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
         cluster_db
             .update_node_dataplane(
                 klights_cluster_store::DataplanePeerMetadata::try_new(
@@ -319,7 +328,7 @@ mod tests {
             Ipv4Addr::new(10, 42, 1, 6),
             PodEndpointMode::EncryptedDirect,
         );
-        node_local.upsert_endpoint(row).await.unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
         cluster_db
             .update_node_dataplane(
                 klights_cluster_store::DataplanePeerMetadata::try_new(
@@ -352,14 +361,19 @@ mod tests {
     #[tokio::test]
     async fn test_resolver_returns_hostport_for_hostport_mode_row() {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
-        let mut row = sample_row(
-            "uid-hp",
-            Ipv4Addr::new(10, 42, 9, 1),
+        let row = PodEndpointRecord::try_new(
+            klights_types::PodIdentity::new("default", "pod-uid-hp", "uid-hp"),
+            "node-a",
             PodEndpointMode::Hostport,
-        );
-        row.host_port_tcp = Some(31000);
-        row.node_ip = Ipv4Addr::new(192, 0, 2, 10);
-        node_local.upsert_endpoint(row).await.unwrap();
+            Ipv4Addr::new(10, 42, 9, 1),
+            Ipv4Addr::new(192, 0, 2, 10),
+            Some(31_000),
+            None,
+            1,
+            1_700_000_000,
+        )
+        .unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
         let resolved = resolver
             .resolve(Ipv4Addr::new(10, 42, 9, 1))
             .await
@@ -385,7 +399,7 @@ mod tests {
             Ipv4Addr::new(10, 42, 9, 2),
             PodEndpointMode::Hostport,
         );
-        node_local.upsert_endpoint(row).await.unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
 
         let resolved = resolver.resolve(Ipv4Addr::new(10, 42, 9, 2)).await.unwrap();
         assert_eq!(
@@ -404,7 +418,7 @@ mod tests {
             Ipv4Addr::new(10, 42, 7, 9),
             PodEndpointMode::EncryptedDirect,
         );
-        node_local.upsert_endpoint(row).await.unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
         let evt = tokio::time::timeout(Duration::from_secs(2), next_endpoint_event(&mut stream))
             .await
             .expect("timed out waiting for upsert")
@@ -419,7 +433,7 @@ mod tests {
             other => panic!("expected Upsert(Direct), got {other:?}"),
         }
 
-        node_local.delete_endpoint_for_uid("uid-w").await.unwrap();
+        remove_endpoint(node_local.as_ref(), "uid-w").await;
         let evt = tokio::time::timeout(Duration::from_secs(2), next_endpoint_event(&mut stream))
             .await
             .expect("timed out waiting for delete")
@@ -436,28 +450,30 @@ mod tests {
     async fn test_resolver_watch_emits_old_delete_before_address_change_upsert() {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
         let mut events = subscribe_after_initial_resync(&resolver).await;
-        node_local
-            .upsert_endpoint(sample_row(
+        persist_endpoint(
+            node_local.as_ref(),
+            sample_row(
                 "uid-address-change",
                 Ipv4Addr::new(10, 42, 7, 10),
                 PodEndpointMode::EncryptedDirect,
-            ))
-            .await
-            .unwrap();
+            ),
+        )
+        .await;
         let _initial =
             tokio::time::timeout(Duration::from_secs(2), next_endpoint_event(&mut events))
                 .await
                 .expect("timed out waiting for initial upsert")
                 .expect("subscription must remain open");
 
-        node_local
-            .upsert_endpoint(sample_row(
+        persist_endpoint(
+            node_local.as_ref(),
+            sample_row(
                 "uid-address-change",
                 Ipv4Addr::new(10, 42, 7, 11),
                 PodEndpointMode::EncryptedDirect,
-            ))
-            .await
-            .unwrap();
+            ),
+        )
+        .await;
         let delete = tokio::time::timeout(Duration::from_secs(2), next_endpoint_event(&mut events))
             .await
             .expect("timed out waiting for old-address delete")
@@ -487,16 +503,19 @@ mod tests {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
         let mut stream = subscribe_after_initial_resync(&resolver).await;
 
-        let mut row = sample_row(
-            "uid-hpw",
-            Ipv4Addr::new(10, 42, 8, 9),
+        let row = PodEndpointRecord::try_new(
+            klights_types::PodIdentity::new("default", "pod-uid-hpw", "uid-hpw"),
+            "rootless-b",
             PodEndpointMode::Hostport,
-        );
-        row.node_name = "rootless-b".to_string();
-        row.node_ip = Ipv4Addr::new(192, 0, 2, 44);
-        row.host_port_tcp = Some(31234);
-        row.host_port_udp = Some(31235);
-        node_local.upsert_endpoint(row).await.unwrap();
+            Ipv4Addr::new(10, 42, 8, 9),
+            Ipv4Addr::new(192, 0, 2, 44),
+            Some(31_234),
+            Some(31_235),
+            1,
+            1_700_000_000,
+        )
+        .unwrap();
+        persist_endpoint(node_local.as_ref(), row).await;
 
         let evt = tokio::time::timeout(Duration::from_secs(2), next_endpoint_event(&mut stream))
             .await
@@ -534,14 +553,15 @@ mod tests {
             .await
             .unwrap();
         let mut stream = subscribe_after_initial_resync(&resolver).await;
-        node_local
-            .upsert_endpoint(sample_row(
+        persist_endpoint(
+            node_local.as_ref(),
+            sample_row(
                 "uid-direct-watch",
                 Ipv4Addr::new(10, 42, 8, 10),
                 PodEndpointMode::EncryptedDirect,
-            ))
-            .await
-            .unwrap();
+            ),
+        )
+        .await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), next_endpoint_event(&mut stream))
             .await
@@ -564,14 +584,15 @@ mod tests {
         let mut stream = subscribe_after_initial_resync(&resolver).await;
 
         for i in 0..4_097u16 {
-            node_local
-                .upsert_endpoint(sample_row(
+            persist_endpoint(
+                node_local.as_ref(),
+                sample_row(
                     &format!("uid-{i:05}"),
                     Ipv4Addr::new(10, 60, (i / 256) as u8, (i % 256) as u8),
                     PodEndpointMode::EncryptedDirect,
-                ))
-                .await
-                .unwrap();
+                ),
+            )
+            .await;
         }
 
         let first = tokio::time::timeout(Duration::from_secs(5), next_endpoint_event(&mut stream))
@@ -594,14 +615,15 @@ mod tests {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
         let mut stream = subscribe_after_initial_resync(&resolver).await;
         for i in 0..4_097u16 {
-            node_local
-                .upsert_endpoint(sample_row(
+            persist_endpoint(
+                node_local.as_ref(),
+                sample_row(
                     &format!("stale-{i:05}"),
                     Ipv4Addr::new(10, 61, (i / 256) as u8, (i % 256) as u8),
                     PodEndpointMode::EncryptedDirect,
-                ))
-                .await
-                .unwrap();
+                ),
+            )
+            .await;
         }
 
         assert!(matches!(
@@ -613,7 +635,7 @@ mod tests {
             Ipv4Addr::new(10, 62, 0, 1),
             PodEndpointMode::EncryptedDirect,
         );
-        node_local.upsert_endpoint(current.clone()).await.unwrap();
+        persist_endpoint(node_local.as_ref(), current.clone()).await;
         let event = next_endpoint_event(&mut stream)
             .await
             .expect("fresh subscription must deliver post-resync mutation");
@@ -622,7 +644,7 @@ mod tests {
                 event,
                 klights_network_api::PodEndpointEvent::Upsert(PodEndpointTopology::Direct(
                     ref endpoint
-                )) if endpoint.pod_ip() == current.pod_ip
+                )) if endpoint.pod_ip() == current.pod_ip()
             ),
             "retained pre-resync backlog must be discarded; got {event:?}"
         );
@@ -631,8 +653,8 @@ mod tests {
     #[tokio::test]
     async fn test_resolver_lag_relist_failure_is_observable_and_fresh_retry_is_authoritative() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor,
             "sqlite:pod-endpoint-resolver-failure-test",
         )
@@ -658,16 +680,30 @@ mod tests {
             next_endpoint_event(&mut failed_stream).await,
             Some(klights_network_api::PodEndpointEvent::Resync(_))
         ));
-        node_local.fail_next_pod_endpoint_snapshot();
+        node_local
+            .db_call("test_insert_malformed_endpoint_for_relist", move |conn| {
+                conn.execute(
+                    "INSERT INTO pod_endpoints \
+                     (pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
+                      host_port_tcp, host_port_udp, generation, updated_ms) \
+                     VALUES ('malformed-relist', 'default', 'malformed-relist', 'node-a', \
+                             'hostport', '10.63.255.254', '192.0.2.10', 65536, NULL, 1, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         for i in 0..4_097u16 {
-            node_local
-                .upsert_endpoint(sample_row(
+            persist_endpoint(
+                &node_local,
+                sample_row(
                     &format!("failed-relist-{i:05}"),
                     Ipv4Addr::new(10, 64, (i / 256) as u8, (i % 256) as u8),
                     PodEndpointMode::EncryptedDirect,
-                ))
-                .await
-                .unwrap();
+                ),
+            )
+            .await;
         }
         let error =
             match std::future::poll_fn(|context| failed_stream.as_mut().poll_next(context)).await {
@@ -676,12 +712,22 @@ mod tests {
             };
         assert!(matches!(error, PodEndpointError::EventSource { .. }));
 
+        node_local
+            .db_call("test_delete_malformed_endpoint_for_retry", move |conn| {
+                conn.execute(
+                    "DELETE FROM pod_endpoints WHERE pod_uid = 'malformed-relist'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         let current = sample_row(
             "after-failed-snapshot",
             Ipv4Addr::new(10, 63, 0, 1),
             PodEndpointMode::EncryptedDirect,
         );
-        node_local.upsert_endpoint(current.clone()).await.unwrap();
+        persist_endpoint(&node_local, current.clone()).await;
         let mut retry = resolver.subscribe().await.expect("fresh retry");
         let Some(klights_network_api::PodEndpointEvent::Resync(snapshot)) =
             next_endpoint_event(&mut retry).await
@@ -690,7 +736,7 @@ mod tests {
         };
         assert_eq!(
             snapshot.first().map(PodEndpointTopology::pod_ip),
-            Some(current.pod_ip)
+            Some(current.pod_ip())
         );
     }
 
@@ -734,20 +780,23 @@ mod tests {
         let mut inserted_ips: Vec<Ipv4Addr> = Vec::new();
         for i in 0..5000u16 {
             let ip = Ipv4Addr::new(10, 42, (i / 256) as u8, (i % 256) as u8);
-            let row = PodEndpointRow {
-                pod_uid: format!("uid-{i}"),
-                namespace: "default".to_string(),
-                pod_name: format!("pod-{i}"),
-                node_name: "node-a".to_string(),
-                mode: PodEndpointMode::EncryptedDirect,
-                pod_ip: ip,
-                node_ip: Ipv4Addr::new(10, 0, 0, 1),
-                host_port_tcp: None,
-                host_port_udp: None,
-                generation: 1,
-                updated_at: 1_700_000_000,
-            };
-            node_local.upsert_endpoint(row).await.unwrap();
+            let row = PodEndpointRecord::try_new(
+                klights_types::PodIdentity::new(
+                    "default",
+                    &format!("pod-{i}"),
+                    &format!("uid-{i}"),
+                ),
+                "node-a",
+                PodEndpointMode::EncryptedDirect,
+                ip,
+                Ipv4Addr::new(10, 0, 0, 1),
+                None,
+                None,
+                1,
+                1_700_000_000,
+            )
+            .unwrap();
+            persist_endpoint(node_local.as_ref(), row).await;
             inserted_ips.push(ip);
         }
 

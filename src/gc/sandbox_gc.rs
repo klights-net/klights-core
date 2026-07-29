@@ -22,6 +22,7 @@ use crate::kubelet::cri::CriClient;
 use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_node_store::{CacheNetworkError, PodNetworkCache, SandboxKey};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -65,6 +66,24 @@ impl SandboxGc {
         let mut cri = self.cri.lock().await;
         let sandboxes = cri.list_pod_sandboxes(None).await?;
         Ok(sandboxes.into_iter().map(|sb| sb.id).collect())
+    }
+
+    async fn delete_cached_network(&self, sandbox_id: &str) -> Result<(), CacheNetworkError> {
+        PodNetworkCache::delete_network_for_sandbox(
+            self.node_local.as_ref(),
+            SandboxKey::try_new(sandbox_id)?,
+        )
+        .await
+    }
+
+    async fn list_cached_network_ids(&self) -> Result<Vec<String>, CacheNetworkError> {
+        PodNetworkCache::list_network_assignments(self.node_local.as_ref())
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| row.request().sandbox_id().to_string())
+                    .collect()
+            })
     }
 
     /// Run one sweep. Returns the number of orphan sandboxes removed.
@@ -176,11 +195,7 @@ impl SandboxGc {
                     "sandbox_gc: SQLite delete_sandbox_for_uid failed"
                 );
             }
-            if let Err(e) = self
-                .node_local
-                .delete_network_for_sandbox(&sandbox.id)
-                .await
-            {
+            if let Err(e) = self.delete_cached_network(&sandbox.id).await {
                 tracing::debug!(
                     sandbox_id = %sandbox.id,
                     error = %e,
@@ -244,18 +259,14 @@ impl SandboxGc {
         let live_ids_for_network_cleanup =
             pod_network_cleanup_live_ids(&live_sandbox_ids, refresh_result);
 
-        match self.node_local.list_networks().await {
+        match self.list_cached_network_ids().await {
             Ok(sandbox_ids) => {
                 for sandbox_id in pod_network_cleanup_candidates(
                     sandbox_ids,
                     &live_ids_for_network_cleanup,
                     &stale_sandbox_row_ids,
                 ) {
-                    if let Err(e) = self
-                        .node_local
-                        .delete_network_for_sandbox(&sandbox_id)
-                        .await
-                    {
+                    if let Err(e) = self.delete_cached_network(&sandbox_id).await {
                         tracing::debug!(
                             sandbox_id = %sandbox_id,
                             error = %e,

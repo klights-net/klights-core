@@ -116,19 +116,13 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         pod_uid: klights_node_store::PodUidKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        Box::pin(async move {
-            let Some(node_local) = &self.node_local else {
-                return Ok(None);
-            };
-            node_local
-                .get_network_for_uid(pod_uid.as_str())
-                .await
-                .map_err(|error| {
-                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
-                })?
-                .map(test_network_endpoint)
-                .transpose()
-        })
+        match &self.node_local {
+            Some(node_local) => klights_node_store::PodNetworkCache::get_network_for_uid(
+                node_local.as_ref(),
+                pod_uid,
+            ),
+            None => Box::pin(async { Ok(None) }),
+        }
     }
 
     fn get_network_for_pod(
@@ -136,24 +130,12 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         pod: klights_types::PodIdentity,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        Box::pin(async move {
-            let Some(node_local) = &self.node_local else {
-                return Ok(None);
-            };
-            node_local
-                .get_network_assignment_for_pod(pod)
-                .await
-                .map_err(|error| {
-                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
-                })?
-                .map(|row| crate::datastore::node_local::PodNetworkEndpoint {
-                    ip_addr: row.ip_addr,
-                    veth_host: row.veth_host,
-                    netns_path: row.netns_path,
-                })
-                .map(test_network_endpoint)
-                .transpose()
-        })
+        match &self.node_local {
+            Some(node_local) => {
+                klights_node_store::PodNetworkCache::get_network_for_pod(node_local.as_ref(), pod)
+            }
+            None => Box::pin(async { Ok(None) }),
+        }
     }
 
     fn get_network_for_sandbox(
@@ -161,78 +143,55 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         sandbox_id: klights_node_store::SandboxKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        Box::pin(async move {
-            let Some(node_local) = &self.node_local else {
-                return Ok(None);
-            };
-            node_local
-                .get_network_for_sandbox(sandbox_id.as_str())
-                .await
-                .map_err(|error| {
-                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
-                })?
-                .map(test_network_endpoint)
-                .transpose()
-        })
+        match &self.node_local {
+            Some(node_local) => klights_node_store::PodNetworkCache::get_network_for_sandbox(
+                node_local.as_ref(),
+                sandbox_id,
+            ),
+            None => Box::pin(async { Ok(None) }),
+        }
     }
 
     fn get_network_for_assignment(
         &self,
         sandbox_id: klights_node_store::SandboxKey,
-        _pod: klights_types::PodIdentity,
+        pod: klights_types::PodIdentity,
     ) -> klights_node_store::CacheNetworkFuture<'_, Option<klights_node_store::PodNetworkEndpoint>>
     {
-        self.get_network_for_sandbox(sandbox_id)
+        match &self.node_local {
+            Some(node_local) => klights_node_store::PodNetworkCache::get_network_for_assignment(
+                node_local.as_ref(),
+                sandbox_id,
+                pod,
+            ),
+            None => Box::pin(async { Ok(None) }),
+        }
     }
 
     fn delete_network_for_sandbox(
         &self,
         sandbox_id: klights_node_store::SandboxKey,
     ) -> klights_node_store::CacheNetworkFuture<'_, ()> {
-        Box::pin(async move {
-            let Some(node_local) = &self.node_local else {
-                return Ok(());
-            };
-            node_local
-                .delete_network_for_sandbox(sandbox_id.as_str())
-                .await
-                .map_err(|error| {
-                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
-                })
-        })
+        match &self.node_local {
+            Some(node_local) => klights_node_store::PodNetworkCache::delete_network_for_sandbox(
+                node_local.as_ref(),
+                sandbox_id,
+            ),
+            None => Box::pin(async { Ok(()) }),
+        }
     }
 
     fn delete_network_if_matches(
         &self,
         request: klights_node_store::PodNetworkAllocationRequest,
     ) -> klights_node_store::CacheNetworkFuture<'_, bool> {
-        Box::pin(async move {
-            let Some(node_local) = &self.node_local else {
-                return Ok(false);
-            };
-            let legacy = crate::datastore::node_local::PodNetworkAllocationRequest::new(
-                request.sandbox_id(),
-                crate::datastore::node_local::PodNetworkAllocationPod::new(
-                    &request.pod().namespace,
-                    &request.pod().name,
-                    &request.pod().uid,
-                ),
-                crate::datastore::node_local::PodNetworkAllocationSubnet::new(
-                    request.subnet_base_int(),
-                    request.subnet_size(),
-                ),
-                crate::datastore::node_local::PodNetworkAllocationLink::new(
-                    request.veth_host(),
-                    request.netns_path(),
-                ),
-            );
-            node_local
-                .delete_network_assignment_if_matches(legacy)
-                .await
-                .map_err(|error| {
-                    klights_node_store::CacheNetworkError::persistence_failed(error.to_string())
-                })
-        })
+        match &self.node_local {
+            Some(node_local) => klights_node_store::PodNetworkCache::delete_network_if_matches(
+                node_local.as_ref(),
+                request,
+            ),
+            None => Box::pin(async { Ok(false) }),
+        }
     }
 
     fn list_network_assignments(
@@ -241,16 +200,13 @@ impl klights_node_store::PodNetworkCache for TestDatastorePodNetworkCache {
         '_,
         Vec<klights_node_store::PodNetworkAssignmentSnapshot>,
     > {
-        Box::pin(async { unreachable!("test-only cache does not drive network cleanup") })
+        match &self.node_local {
+            Some(node_local) => {
+                klights_node_store::PodNetworkCache::list_network_assignments(node_local.as_ref())
+            }
+            None => Box::pin(async { Ok(Vec::new()) }),
+        }
     }
-}
-
-#[cfg(test)]
-fn test_network_endpoint(
-    row: crate::datastore::node_local::PodNetworkEndpoint,
-) -> Result<klights_node_store::PodNetworkEndpoint, klights_node_store::CacheNetworkError> {
-    klights_node_store::PodNetworkEndpoint::try_new(row.ip_addr, row.veth_host, row.netns_path)
-        .map_err(|error| klights_node_store::CacheNetworkError::corrupt_data(error.to_string()))
 }
 
 pub mod background;

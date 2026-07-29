@@ -1554,6 +1554,7 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
 mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
+    use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use crate::datastore::{NetworkMetadataStore, ResourceListStore, ResourceStore};
     use crate::kubelet::pod_lifecycle_router::{
         PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
@@ -2608,7 +2609,7 @@ mod tests {
         .expect("worker-store event emission should enqueue event");
 
         let row = node_local
-            .claim_next_due_outbox(i64::MAX / 2, 1_000, "event-test")
+            .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "event-test")
             .await
             .expect("claim outbox")
             .expect("event outbox row should be enqueued");

@@ -279,8 +279,8 @@ mod tests {
 
     async fn fresh_storage() -> SqliteRaftLogStorage {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-log-test",
         )

@@ -868,16 +868,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     let outbox = {
         let notify = Arc::new(tokio::sync::Notify::new());
-        let delivery_store =
-            crate::datastore::node_local::delivery_adapter::NodeLocalDeliveryAdapter::new(
-                node_local.clone(),
-            );
         let outbox_stores = crate::node_outbox::OutboxStores::new(
-            delivery_store.clone(),
-            delivery_store.clone(),
-            delivery_store.clone(),
-            delivery_store.clone(),
-            delivery_store,
+            node_local.clone(),
+            node_local.clone(),
+            node_local.clone(),
+            node_local.clone(),
+            node_local.clone(),
         );
         let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
         let outbox_wall_clock: Arc<dyn klights_supervisor::WallClock> =

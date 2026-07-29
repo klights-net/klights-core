@@ -24,8 +24,9 @@ pub use delivery::{
     OutboxProducerStore, OutboxRecord, OutboxSequence, OutboxSequencePolicy, OutboxStats,
     OutboxStatusStampStore, OutboxSubject, OutboxSupersedability, OutboxSupersedeRequest,
     PodCheckpointKey, PodStatusCheckpoint, PodStatusCheckpointApplied, PodStatusCheckpointStore,
-    PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
-    RuntimeObservationGeneration, TerminalDeleteClassification,
+    PodStatusCheckpointUpsert, ReplicationCheckpoint, ReplicationCheckpointStore,
+    RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore, RuntimeObservationGeneration,
+    TerminalDeleteClassification,
 };
 pub use identity::{NodeIdentity, NodeIdentityError, NodeIdentityFuture};
 pub use open::NodeStoreOpenError;

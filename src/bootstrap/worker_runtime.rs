@@ -211,16 +211,12 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let _ = leader_endpoint;
 
     let ob_notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    let delivery_store =
-        crate::datastore::node_local::delivery_adapter::NodeLocalDeliveryAdapter::new(
-            node_local.clone(),
-        );
     let outbox_stores = crate::node_outbox::OutboxStores::new(
-        delivery_store.clone(),
-        delivery_store.clone(),
-        delivery_store.clone(),
-        delivery_store.clone(),
-        delivery_store,
+        node_local.clone(),
+        node_local.clone(),
+        node_local.clone(),
+        node_local.clone(),
+        node_local.clone(),
     );
     let outbox_codec = crate::replication::outbox_payload_codec::new_codec();
     let outbox_wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock> =

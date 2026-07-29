@@ -11,8 +11,9 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::datastore::node_local::{DeadLetterRow, NodeLocalHandle};
+use crate::datastore::node_local::NodeLocalHandle;
 use crate::node_outbox::payload::OutboxOperationExt as _;
+use klights_node_store::{DeadLetterEntry, DeadLetterKey, DeadLetterReplayRequest};
 use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 #[derive(Clone)]
@@ -30,6 +31,56 @@ struct OutboxStatusResponse {
     outbox_dead_letter_total: i64,
 }
 
+#[derive(Serialize)]
+struct DeadLetterResponse {
+    id: i64,
+    original_id: i64,
+    client_id: String,
+    idempotency_key: String,
+    enqueued_ms: i64,
+    subject_key: String,
+    subject_api_version: String,
+    subject_kind: String,
+    subject_namespace: Option<String>,
+    subject_name: String,
+    subject_uid: Option<String>,
+    pod_uid: String,
+    operation: String,
+    stream_id: i64,
+    stream_seq: i64,
+    payload_proto: Vec<u8>,
+    attempts: i64,
+    last_error: String,
+    moved_at_ms: i64,
+}
+
+impl From<DeadLetterEntry> for DeadLetterResponse {
+    fn from(entry: DeadLetterEntry) -> Self {
+        let resource = entry.subject().resource();
+        Self {
+            id: entry.id(),
+            original_id: entry.original_id(),
+            client_id: entry.client_id().to_string(),
+            idempotency_key: entry.idempotency_key().to_string(),
+            enqueued_ms: entry.enqueued_ms(),
+            subject_key: entry.subject().subject_key().to_string(),
+            subject_api_version: resource.api_version.clone(),
+            subject_kind: resource.kind.clone(),
+            subject_namespace: resource.namespace.clone(),
+            subject_name: resource.name.clone(),
+            subject_uid: entry.subject().subject_uid().map(str::to_string),
+            pod_uid: entry.subject().pod_uid().to_string(),
+            operation: entry.operation().to_string(),
+            stream_id: entry.sequence().stream_id(),
+            stream_seq: entry.sequence().stream_seq(),
+            payload_proto: entry.payload().to_vec(),
+            attempts: entry.attempts(),
+            last_error: entry.last_error().to_string(),
+            moved_at_ms: entry.moved_at_ms(),
+        }
+    }
+}
+
 async fn outbox_status(
     State(state): State<AdminState>,
 ) -> Result<Json<OutboxStatusResponse>, StatusCode> {
@@ -39,23 +90,23 @@ async fn outbox_status(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(OutboxStatusResponse {
-        outbox_pending: stats.pending,
-        outbox_oldest_age_seconds: stats.oldest_age_seconds,
-        outbox_dispatch_total: stats.dispatch_total as u64,
-        outbox_dispatch_errors_total: stats.dispatch_errors_total as u64,
-        outbox_dead_letter_total: stats.dead_letter_count,
+        outbox_pending: stats.pending(),
+        outbox_oldest_age_seconds: stats.oldest_age_seconds(),
+        outbox_dispatch_total: stats.dispatch_total() as u64,
+        outbox_dispatch_errors_total: stats.dispatch_errors_total() as u64,
+        outbox_dead_letter_total: stats.dead_letter_count(),
     }))
 }
 
 async fn dead_letter_list(
     State(state): State<AdminState>,
-) -> Result<Json<Vec<DeadLetterRow>>, StatusCode> {
+) -> Result<Json<Vec<DeadLetterResponse>>, StatusCode> {
     let rows = state
         .node_db
         .list_dead_letter()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(rows))
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 
 async fn dead_letter_replay(
@@ -64,21 +115,24 @@ async fn dead_letter_replay(
 ) -> Result<StatusCode, StatusCode> {
     let row = state
         .node_db
-        .get_dead_letter(id)
+        .get_dead_letter(DeadLetterKey::try_new(id).map_err(|_| StatusCode::NOT_FOUND)?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let operation = crate::node_outbox::payload::OutboxOperation::try_from(row.operation.as_str())
+    let operation = crate::node_outbox::payload::OutboxOperation::try_from(row.operation())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let payload =
-        crate::replication::storage_wire_codec::decode_outbox_payload_protobuf(&row.payload_proto)
+        crate::replication::storage_wire_codec::decode_outbox_payload_protobuf(row.payload())
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let classification = operation
         .classification(payload.command())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let replayed = state
         .node_db
-        .replay_dead_letter(id, classification)
+        .replay_dead_letter(DeadLetterReplayRequest::new(
+            DeadLetterKey::try_new(id).map_err(|_| StatusCode::NOT_FOUND)?,
+            classification,
+        ))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if replayed {
@@ -95,7 +149,7 @@ async fn dead_letter_delete(
 ) -> Result<StatusCode, StatusCode> {
     let deleted = state
         .node_db
-        .delete_dead_letter(id)
+        .delete_dead_letter(DeadLetterKey::try_new(id).map_err(|_| StatusCode::NOT_FOUND)?)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if deleted {
@@ -163,7 +217,9 @@ mod tests {
 
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::node_local::sqlite::DeadLetterTestInsert;
-    use crate::datastore::node_local::{NodeLocalHandle, OutboxInsert, selector};
+    use crate::datastore::node_local::{
+        LegacyDeliveryTestStore as _, NodeLocalHandle, OutboxInsert, selector,
+    };
     use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn supervisor() -> Arc<TaskSupervisor> {
@@ -214,7 +270,7 @@ mod tests {
         // Use the concrete SqliteNodeLocalDb for test-only insert.
         // We open a separate handle via selector and downcast isn't available,
         // so we insert via enqueue + move.
-        ndb.enqueue_outbox(OutboxInsert {
+        ndb.legacy_enqueue_outbox(OutboxInsert {
             idempotency_key: "node-admin-dl-key".to_string(),
             enqueued_ms: 1000,
             subject_key: "v1/Pod/default/web/uid-1".to_string(),
@@ -231,10 +287,13 @@ mod tests {
         })
         .await
         .expect("enqueue for dead letter");
-        ndb.move_outbox_to_dead_letter_if_max_attempts("node-admin-dl-key", 0)
+        ndb.legacy_move_outbox_to_dead_letter_if_max_attempts("node-admin-dl-key", 0)
             .await
             .expect("move to dead letter");
-        let dead = ndb.list_dead_letter().await.expect("list dead letter");
+        let dead = ndb
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter");
         let id = dead.first().expect("dead letter row").id;
         (ndb, id)
     }
@@ -268,7 +327,10 @@ mod tests {
             })
             .await
             .expect("insert unassigned dead letter");
-        let dead = ndb.list_dead_letter().await.expect("list dead letter");
+        let dead = ndb
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter");
         let id = dead.first().expect("dead letter row").id;
         (ndb, id)
     }
@@ -280,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn outbox_status_endpoint_returns_metrics() {
         let ndb = node_db().await;
-        ndb.enqueue_outbox(OutboxInsert {
+        ndb.legacy_enqueue_outbox(OutboxInsert {
             idempotency_key: "status-test-key".to_string(),
             enqueued_ms: 1000,
             subject_key: "v1/Pod/default/web/uid-1".to_string(),
@@ -369,7 +431,10 @@ mod tests {
             .expect("successful replay must wake the idle dispatcher");
 
         // Dead letter should be empty
-        let dead = ndb.list_dead_letter().await.expect("list dead letter");
+        let dead = ndb
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter");
         assert!(dead.is_empty());
     }
 
@@ -391,7 +456,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        let dead = ndb.list_dead_letter().await.expect("list dead letter");
+        let dead = ndb
+            .legacy_list_dead_letter()
+            .await
+            .expect("list dead letter");
         assert!(dead.is_empty());
     }
 
@@ -408,7 +476,7 @@ mod tests {
             .expect("write errors counter");
 
         // Enqueue a row so oldest_age_seconds has a value.
-        ndb.enqueue_outbox(OutboxInsert {
+        ndb.legacy_enqueue_outbox(OutboxInsert {
             idempotency_key: "counter-test-key".to_string(),
             enqueued_ms: 1000,
             subject_key: "v1/Pod/default/web/uid-1".to_string(),

@@ -296,7 +296,7 @@ fn repair_legacy_outbox_stream_identity(conn: &mut rusqlite::Connection) -> rusq
         return Ok(());
     }
 
-    let stable_client_id = super::ensure_outbox_client_id_in_tx(&tx)?;
+    let stable_client_id = ensure_outbox_client_id_in_tx(&tx)?;
     for row in rows {
         let client_id = if row.client_id.is_empty() {
             stable_client_id.as_str()
@@ -306,7 +306,7 @@ fn repair_legacy_outbox_stream_identity(conn: &mut rusqlite::Connection) -> rusq
         let stream_id = if row.stream_id > 0 {
             row.stream_id
         } else {
-            super::outbox_stream_id(&row.subject_key)
+            outbox_stream_id(&row.subject_key)
         };
         let stream_seq = if row.stream_seq > 0 {
             tx.execute(
@@ -316,7 +316,7 @@ fn repair_legacy_outbox_stream_identity(conn: &mut rusqlite::Connection) -> rusq
             )?;
             row.stream_seq
         } else {
-            super::allocate_next_outbox_stream_seq(&tx, stream_id)?
+            allocate_next_outbox_stream_seq(&tx, stream_id)?
         };
         let table = match row.location {
             Location::Live => "outbox",
@@ -331,6 +331,58 @@ fn repair_legacy_outbox_stream_identity(conn: &mut rusqlite::Connection) -> rusq
     }
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) fn ensure_outbox_client_id_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<String> {
+    const KEY: &str = "outbox_client_id";
+    if let Some(client_id) = tx
+        .query_row(
+            "SELECT value FROM _node_meta WHERE key = ?1",
+            [KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(client_id);
+    }
+    let client_id = format!("outbox-{}", uuid::Uuid::new_v4());
+    tx.execute(
+        "INSERT INTO _node_meta (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![KEY, &client_id],
+    )?;
+    Ok(client_id)
+}
+
+pub(crate) fn allocate_next_outbox_stream_seq(
+    tx: &rusqlite::Transaction<'_>,
+    stream_id: i64,
+) -> rusqlite::Result<i64> {
+    let prior_seq: Option<i64> = tx
+        .query_row(
+            "SELECT last_seq FROM outbox_stream_sequences WHERE stream_id = ?1",
+            [stream_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let next_seq = prior_seq.unwrap_or(0).saturating_add(1);
+    tx.execute(
+        "INSERT INTO outbox_stream_sequences (stream_id, last_seq) VALUES (?1, ?2) \
+         ON CONFLICT(stream_id) DO UPDATE SET last_seq = excluded.last_seq",
+        rusqlite::params![stream_id, next_seq],
+    )?;
+    Ok(next_seq)
+}
+
+pub(crate) fn outbox_stream_id(subject_key: &str) -> i64 {
+    let digest = Sha256::digest(subject_key.as_bytes());
+    let mut shard_bytes = [0_u8; 8];
+    shard_bytes.copy_from_slice(&digest[..8]);
+    let value = u64::from_be_bytes(shard_bytes);
+    let stream_id = (value & i64::MAX as u64) as i64;
+    if stream_id == 0 { 1 } else { stream_id }
 }
 
 fn outbox_has_column(conn: &mut rusqlite::Connection, column_name: &str) -> rusqlite::Result<bool> {

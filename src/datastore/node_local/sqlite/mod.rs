@@ -1,26 +1,21 @@
-mod identity;
-pub(crate) mod open;
 mod queries;
-mod raft_durability;
-pub mod schema;
 
 use anyhow::{Result, anyhow};
+use klights_node_datastore::{
+    SqliteNodeIdentity, SqliteNodeNetworkStateStore, SqliteRaftDurability,
+    delivery::SqliteDeliveryStore,
+};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use super::types::{
-    PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkAllocationRequest,
-    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
-    PodSlotClearResult, PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind,
+    PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
+    PodSlotMutationResult, PodWorkqueueEntry, PodWorkqueueKind,
 };
-#[cfg(test)]
-use super::types::{PodNetworkAllocationLink, PodNetworkAllocationPod, PodNetworkAllocationSubnet};
-pub use identity::SqliteNodeIdentity;
 use klights_supervisor::DbExecutor;
-pub use raft_durability::SqliteRaftDurability;
-const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
+#[cfg(test)]
+use sha2::{Digest, Sha256};
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 
 #[derive(Clone)]
@@ -28,10 +23,8 @@ pub struct SqliteNodeLocalDb {
     executor: DbExecutor,
     identity: std::sync::Arc<SqliteNodeIdentity>,
     raft_persistence: std::sync::Arc<SqliteRaftDurability>,
-    pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
-    pod_endpoint_handoff: std::sync::Arc<tokio::sync::Mutex<()>>,
-    #[cfg(test)]
-    pod_endpoint_snapshot_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    delivery: std::sync::Arc<SqliteDeliveryStore>,
+    network_state: std::sync::Arc<SqliteNodeNetworkStateStore>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
     wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
 }
@@ -48,6 +41,7 @@ pub struct PodRuntimeRow {
     pub started_ms: Option<i64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PodStatusCheckpoint {
     pub pod_uid: String,
@@ -66,6 +60,7 @@ pub struct PodStatusCheckpoint {
 /// actor or worker restart when CRI/containerd may have already dropped the
 /// short-lived container details. UID-bound and node-local only; never
 /// replicated through cluster.db or raft.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeObservationCheckpoint {
     pub pod_uid: String,
@@ -74,6 +69,7 @@ pub struct RuntimeObservationCheckpoint {
     pub updated_ms: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxInsert {
     pub idempotency_key: String,
@@ -91,6 +87,7 @@ pub struct OutboxInsert {
     pub next_due_ms: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     pub id: i64,
@@ -129,6 +126,7 @@ pub struct ProbeStateRow {
     pub next_eligible_ms: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationCheckpoint {
     pub last_applied_rv: i64,
@@ -136,6 +134,7 @@ pub struct ReplicationCheckpoint {
     pub cluster_id: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeadLetterRow {
     pub id: i64,
@@ -177,6 +176,7 @@ pub struct DeadLetterTestInsert<'a> {
     pub moved_at_ms: i64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct OutboxStats {
     pub pending: i64,
@@ -199,18 +199,19 @@ impl SqliteNodeLocalDb {
         executor: DbExecutor,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
-        let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
         let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
         Ok(Self {
             identity: std::sync::Arc::new(SqliteNodeIdentity::new(executor.clone())),
             raft_persistence: std::sync::Arc::new(SqliteRaftDurability::new(executor.clone())),
+            delivery: std::sync::Arc::new(SqliteDeliveryStore::new(
+                executor.clone(),
+                wall_clock.clone(),
+            )),
+            network_state: std::sync::Arc::new(SqliteNodeNetworkStateStore::new(
+                executor.clone(),
+                wall_clock.clone(),
+            )),
             executor,
-            pod_endpoint_tx,
-            pod_endpoint_handoff: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            #[cfg(test)]
-            pod_endpoint_snapshot_failures: std::sync::Arc::new(
-                std::sync::atomic::AtomicUsize::new(0),
-            ),
             pod_slot_admission_tx,
             wall_clock,
         })
@@ -226,6 +227,14 @@ impl SqliteNodeLocalDb {
 
     pub(crate) fn identity_ref(&self) -> &SqliteNodeIdentity {
         &self.identity
+    }
+
+    pub(crate) fn delivery_ref(&self) -> &SqliteDeliveryStore {
+        &self.delivery
+    }
+
+    pub(crate) fn network_state_ref(&self) -> &SqliteNodeNetworkStateStore {
+        &self.network_state
     }
 
     fn now_ms(&self) -> i64 {
@@ -245,40 +254,190 @@ impl SqliteNodeLocalDb {
         self.executor.call_raw(query_name, f).await
     }
 
-    pub async fn subscribe_pod_endpoints_with_snapshot(
+    #[cfg(test)]
+    pub async fn outbox_stream_position_for_test(
         &self,
-    ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)> {
-        let _handoff = self.pod_endpoint_handoff.lock().await;
-        let receiver = self.pod_endpoint_tx.subscribe();
-        #[cfg(test)]
-        if self
-            .pod_endpoint_snapshot_failures
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |remaining| remaining.checked_sub(1),
+        idempotency_key: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_stream_position_test", move |conn| {
+            conn.query_row(
+                "SELECT stream_id, stream_seq FROM outbox WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .is_ok()
-        {
-            return Err(anyhow!("injected pod endpoint snapshot failure"));
-        }
-        let snapshot = self.list_endpoints_all().await?;
-        Ok((snapshot, receiver))
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow!("outbox stream-position test read failed: {error}"))
     }
 
     #[cfg(test)]
-    pub fn fail_next_pod_endpoint_snapshot(&self) {
-        self.pod_endpoint_snapshot_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    pub async fn clear_outbox_stream_identity_for_test(&self, idempotency_key: &str) -> Result<()> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_legacy_stream_test", move |conn| {
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
+                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
+                 WHERE idempotency_key = ?1",
+                [&idempotency_key],
+            )?;
+            if changed != 1 {
+                return Err(tokio_rusqlite::Error::Other(Box::new(
+                    std::io::Error::other(format!(
+                        "test legacy identity mutation changed {changed} rows instead of exactly one"
+                    )),
+                )));
+            }
+            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
     }
 
     #[cfg(test)]
-    pub async fn lock_pod_endpoint_handoff_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.pod_endpoint_handoff.clone().lock_owned().await
+    pub async fn clear_all_outbox_stream_identity_for_test(&self) -> Result<()> {
+        self.db_call("node_local:outbox_legacy_stream_all_test", move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
+                 WHERE operation != 'LeaseRenew'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE outbox_dead_letter SET client_id = '', stream_id = 0, stream_seq = 0 \
+                 WHERE operation != 'LeaseRenew'",
+                [],
+            )?;
+            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
     }
 
-    pub fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
-        self.pod_endpoint_tx.subscribe()
+    #[cfg(test)]
+    pub async fn set_outbox_operation_for_test(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+    ) -> Result<()> {
+        let idempotency_key = idempotency_key.to_string();
+        let operation = operation.to_string();
+        self.db_call("node_local:outbox_operation_test_update", move |conn| {
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
+            let update = conn.execute(
+                "UPDATE outbox SET operation = ?2 WHERE idempotency_key = ?1",
+                rusqlite::params![idempotency_key, operation],
+            );
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
+            let changed = update?;
+            if changed != 1 {
+                return Err(tokio_rusqlite::Error::Other(Box::new(
+                    std::io::Error::other(format!(
+                        "test operation-only mutation changed {changed} rows instead of exactly one"
+                    )),
+                )));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox operation test update failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn outbox_operation_for_test(&self, idempotency_key: &str) -> Result<Option<String>> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_operation_test_read", move |conn| {
+            conn.query_row(
+                "SELECT operation FROM outbox WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow!("outbox operation test read failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn set_outbox_attempt_for_test(
+        &self,
+        idempotency_key: &str,
+        attempt: i64,
+    ) -> Result<()> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_attempt_test_update", move |conn| {
+            let changed = conn.execute(
+                "UPDATE outbox SET attempt = ?2 WHERE idempotency_key = ?1",
+                rusqlite::params![idempotency_key, attempt],
+            )?;
+            if changed != 1 {
+                return Err(tokio_rusqlite::Error::Other(Box::new(
+                    std::io::Error::other(format!(
+                        "test attempt mutation changed {changed} rows instead of exactly one"
+                    )),
+                )));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox attempt test update failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn insert_dead_letter_test_only(&self, row: DeadLetterTestInsert<'_>) -> Result<()> {
+        let idempotency_key = row.idempotency_key.to_string();
+        let operation = row.operation.to_string();
+        let subject_key = row.subject_key.to_string();
+        let subject_api_version = row.subject_api_version.to_string();
+        let subject_kind = row.subject_kind.to_string();
+        let subject_namespace = row.subject_namespace.map(str::to_string);
+        let subject_name = row.subject_name.to_string();
+        let subject_uid = row.subject_uid.map(str::to_string);
+        let pod_uid = row.pod_uid.to_string();
+        let payload_proto = row.payload_proto.to_vec();
+        let attempts = row.attempts;
+        let last_error = row.last_error.to_string();
+        let moved_at_ms = row.moved_at_ms;
+        self.db_call("node_local:dead_letter_test_insert", move |conn| {
+            conn.execute(
+                "INSERT INTO outbox_dead_letter \
+                 (original_id, client_id, idempotency_key, enqueued_ms, subject_key, \
+                  subject_api_version, subject_kind, subject_namespace, subject_name, subject_uid, \
+                  pod_uid, operation, stream_id, stream_seq, payload_proto, attempts, last_error, \
+                  moved_at_ms) VALUES \
+                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                rusqlite::params![
+                    0_i64,
+                    "",
+                    idempotency_key,
+                    0_i64,
+                    subject_key,
+                    subject_api_version,
+                    subject_kind,
+                    subject_namespace,
+                    subject_name,
+                    subject_uid,
+                    pod_uid,
+                    operation,
+                    0_i64,
+                    0_i64,
+                    payload_proto,
+                    attempts,
+                    last_error,
+                    moved_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("dead letter test insert failed: {error}"))
     }
 
     pub fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
@@ -705,834 +864,6 @@ impl SqliteNodeLocalDb {
         .map_err(|e| anyhow!("pod_runtime list namespace failed: {e}"))
     }
 
-    pub async fn upsert_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-        namespace: &str,
-        pod_name: &str,
-        base_rv: i64,
-        status: Value,
-        updated_ms: i64,
-    ) -> Result<()> {
-        let pod_uid = pod_uid.to_string();
-        let namespace = namespace.to_string();
-        let pod_name = pod_name.to_string();
-        let status_json = serde_json::to_vec(&status)?;
-        self.db_call("node_local:pod_status_checkpoint_upsert", move |conn| {
-            conn.execute(
-                queries::POD_STATUS_CHECKPOINT_UPSERT,
-                rusqlite::params![
-                    pod_uid,
-                    namespace,
-                    pod_name,
-                    base_rv,
-                    status_json,
-                    updated_ms
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("pod_status_checkpoint upsert failed: {e}"))
-    }
-
-    pub async fn get_pod_status_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<PodStatusCheckpoint>> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call("node_local:pod_status_checkpoint_get", move |conn| {
-            conn.query_row(
-                queries::POD_STATUS_CHECKPOINT_GET_UID,
-                [pod_uid],
-                row_to_pod_status_checkpoint,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("pod_status_checkpoint get failed: {e}"))
-    }
-
-    pub async fn mark_pod_status_checkpoint_applied(
-        &self,
-        pod_uid: &str,
-        applied_rv: i64,
-        updated_ms: i64,
-    ) -> Result<()> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call(
-            "node_local:pod_status_checkpoint_mark_applied",
-            move |conn| {
-                conn.execute(
-                    queries::POD_STATUS_CHECKPOINT_MARK_APPLIED,
-                    rusqlite::params![pod_uid, applied_rv, updated_ms],
-                )?;
-                Ok(())
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("pod_status_checkpoint mark applied failed: {e}"))
-    }
-
-    pub async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call("node_local:pod_status_checkpoint_delete", move |conn| {
-            conn.execute(queries::POD_STATUS_CHECKPOINT_DELETE_UID, [pod_uid])?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("pod_status_checkpoint delete failed: {e}"))
-    }
-
-    pub async fn upsert_runtime_observation_checkpoint(
-        &self,
-        checkpoint: RuntimeObservationCheckpoint,
-    ) -> Result<()> {
-        let RuntimeObservationCheckpoint {
-            pod_uid,
-            container_ids,
-            generation,
-            updated_ms,
-        } = checkpoint;
-        let container_ids_json = serde_json::to_string(&container_ids)?;
-        self.db_call(
-            "node_local:runtime_observation_checkpoint_upsert",
-            move |conn| {
-                conn.execute(
-                    queries::RUNTIME_OBSERVATION_CHECKPOINT_UPSERT,
-                    rusqlite::params![pod_uid, container_ids_json, generation, updated_ms],
-                )?;
-                Ok(())
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("runtime_observation_checkpoint upsert failed: {e}"))
-    }
-
-    pub async fn get_runtime_observation_checkpoint(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<RuntimeObservationCheckpoint>> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call(
-            "node_local:runtime_observation_checkpoint_get",
-            move |conn| {
-                conn.query_row(
-                    queries::RUNTIME_OBSERVATION_CHECKPOINT_GET_UID,
-                    [pod_uid],
-                    row_to_runtime_observation_checkpoint,
-                )
-                .optional()
-                .map_err(tokio_rusqlite::Error::from)
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("runtime_observation_checkpoint get failed: {e}"))
-    }
-
-    pub async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call(
-            "node_local:runtime_observation_checkpoint_delete",
-            move |conn| {
-                conn.execute(
-                    queries::RUNTIME_OBSERVATION_CHECKPOINT_DELETE_UID,
-                    [pod_uid],
-                )?;
-                Ok(())
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("runtime_observation_checkpoint delete failed: {e}"))
-    }
-
-    pub async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
-        let (priority_class, supersedable_pod_status, is_terminal_pod_delete, sequence_policy) =
-            row.classification.persisted_values();
-        self.db_call("node_local:outbox_enqueue", move |conn| {
-            let tx = conn.transaction()?;
-            let client_id = ensure_outbox_client_id_in_tx(&tx)?;
-            let sequenced = sequence_policy
-                == klights_node_store::OutboxSequencePolicy::PerSubject.persisted_value();
-            let stream_id = if sequenced {
-                outbox_stream_id(&row.subject_key)
-            } else {
-                0
-            };
-            let stream_seq = if sequenced {
-                allocate_next_outbox_stream_seq(&tx, stream_id)?
-            } else {
-                0
-            };
-            tx.execute(
-                queries::OUTBOX_INSERT,
-                rusqlite::params![
-                    client_id,
-                    row.idempotency_key,
-                    row.enqueued_ms,
-                    row.subject_key,
-                    row.subject_api_version,
-                    row.subject_kind,
-                    row.subject_namespace,
-                    row.subject_name,
-                    row.subject_uid,
-                    row.pod_uid,
-                    row.operation,
-                    priority_class,
-                    supersedable_pod_status,
-                    is_terminal_pod_delete,
-                    stream_id,
-                    stream_seq,
-                    row.payload_proto,
-                    row.next_due_ms
-                ],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("outbox enqueue failed: {e}"))
-    }
-
-    #[cfg(test)]
-    pub async fn outbox_stream_position_for_test(
-        &self,
-        idempotency_key: &str,
-    ) -> Result<Option<(i64, i64)>> {
-        let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_stream_position_test", move |conn| {
-            conn.query_row(
-                "SELECT stream_id, stream_seq FROM outbox WHERE idempotency_key = ?1",
-                [idempotency_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("outbox stream-position test read failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn clear_outbox_stream_identity_for_test(&self, idempotency_key: &str) -> Result<()> {
-        let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_legacy_stream_test", move |conn| {
-            let tx = conn.transaction()?;
-            let changed = tx.execute(
-                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
-                 WHERE idempotency_key = ?1",
-                [&idempotency_key],
-            )?;
-            if changed != 1 {
-                return Err(tokio_rusqlite::Error::Other(Box::new(
-                    std::io::Error::other(format!(
-                        "test legacy identity mutation changed {changed} rows instead of exactly one"
-                    )),
-                )));
-            }
-            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn clear_all_outbox_stream_identity_for_test(&self) -> Result<()> {
-        self.db_call("node_local:outbox_legacy_stream_all_test", move |conn| {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
-                 WHERE operation != 'LeaseRenew'",
-                [],
-            )?;
-            tx.execute(
-                "UPDATE outbox_dead_letter SET client_id = '', stream_id = 0, stream_seq = 0 \
-                 WHERE operation != 'LeaseRenew'",
-                [],
-            )?;
-            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn set_outbox_operation_for_test(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-    ) -> Result<()> {
-        let idempotency_key = idempotency_key.to_string();
-        let operation = operation.to_string();
-        self.db_call("node_local:outbox_operation_test_update", move |conn| {
-            conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
-            let update = conn.execute(
-                "UPDATE outbox SET operation = ?2 WHERE idempotency_key = ?1",
-                rusqlite::params![idempotency_key, operation],
-            );
-            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
-            let changed = update?;
-            if changed != 1 {
-                return Err(tokio_rusqlite::Error::Other(Box::new(
-                    std::io::Error::other(format!(
-                        "test operation-only mutation changed {changed} rows instead of exactly one"
-                    )),
-                )));
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox operation test update failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn outbox_operation_for_test(&self, idempotency_key: &str) -> Result<Option<String>> {
-        let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_operation_test_read", move |conn| {
-            conn.query_row(
-                "SELECT operation FROM outbox WHERE idempotency_key = ?1",
-                [idempotency_key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("outbox operation test read failed: {error}"))
-    }
-
-    #[cfg(test)]
-    pub async fn set_outbox_attempt_for_test(
-        &self,
-        idempotency_key: &str,
-        attempt: i64,
-    ) -> Result<()> {
-        let idempotency_key = idempotency_key.to_string();
-        self.db_call("node_local:outbox_attempt_test_update", move |conn| {
-            let changed = conn.execute(
-                "UPDATE outbox SET attempt = ?2 WHERE idempotency_key = ?1",
-                rusqlite::params![idempotency_key, attempt],
-            )?;
-            if changed != 1 {
-                return Err(tokio_rusqlite::Error::Other(Box::new(
-                    std::io::Error::other(format!(
-                        "test attempt mutation changed {changed} rows instead of exactly one"
-                    )),
-                )));
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("outbox attempt test update failed: {error}"))
-    }
-
-    pub async fn claim_next_due_outbox(
-        &self,
-        now_ms: i64,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Option<OutboxRow>> {
-        let lease_token = lease_token.to_string();
-        self.db_call("node_local:outbox_claim_next_due", move |conn| {
-            let tx = conn.transaction()?;
-            let id: Option<i64> = tx
-                .query_row(queries::outbox_claim_next_due(), [now_ms], |row| row.get(0))
-                .optional()?;
-            let Some(id) = id else {
-                tx.commit()?;
-                return Ok(None);
-            };
-            let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
-            tx.execute(
-                queries::OUTBOX_SET_LEASE,
-                rusqlite::params![id, leased_until_ms, lease_token, now_ms],
-            )?;
-            let row = tx.query_row(queries::OUTBOX_ROW_SELECT, [id], row_to_outbox)?;
-            tx.commit()?;
-            Ok(Some(row))
-        })
-        .await
-        .map_err(|e| anyhow!("outbox claim failed: {e}"))
-    }
-
-    pub async fn renew_outbox_lease(
-        &self,
-        id: i64,
-        lease_token: &str,
-        leased_until_ms: i64,
-    ) -> Result<bool> {
-        let lease_token = lease_token.to_string();
-        self.db_call("node_local:outbox_renew_lease", move |conn| {
-            let changed = conn.execute(
-                queries::OUTBOX_RENEW_LEASE,
-                rusqlite::params![id, lease_token, leased_until_ms],
-            )?;
-            Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| anyhow!("outbox renew lease failed: {e}"))
-    }
-
-    pub async fn mark_outbox_attempt_failed(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-    ) -> Result<bool> {
-        let lease_token = lease_token.to_string();
-        let error = error.to_string();
-        self.db_call("node_local:outbox_mark_failed", move |conn| {
-            let changed = conn.execute(
-                queries::OUTBOX_MARK_FAILED,
-                rusqlite::params![id, lease_token, backoff_until_ms, error],
-            )?;
-            Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| anyhow!("outbox mark failed failed: {e}"))
-    }
-
-    pub async fn record_outbox_failure(
-        &self,
-        id: i64,
-        lease_token: &str,
-        backoff_until_ms: i64,
-        error: &str,
-        max_attempts: i64,
-    ) -> Result<super::OutboxFailureDisposition> {
-        let lease_token = lease_token.to_string();
-        let error = error.to_string();
-        let now = self.now_ms();
-        self.db_call("node_local:outbox_record_failure", move |conn| {
-            let tx = conn.transaction()?;
-            let row = tx
-                .query_row(queries::OUTBOX_ROW_SELECT, [id], row_to_outbox)
-                .optional()?;
-            let Some(mut row) =
-                row.filter(|row| row.lease_token.as_deref() == Some(lease_token.as_str()))
-            else {
-                tx.commit()?;
-                return Ok(super::OutboxFailureDisposition::LeaseLost);
-            };
-            row.attempt = row.attempt.saturating_add(1);
-            row.last_error = Some(error.clone());
-            if row.attempt >= max_attempts.max(1) {
-                tx.execute(
-                    queries::DEAD_LETTER_INSERT,
-                    rusqlite::params![
-                        row.id,
-                        row.client_id,
-                        row.idempotency_key,
-                        row.enqueued_ms,
-                        row.subject_key,
-                        row.subject_api_version,
-                        row.subject_kind,
-                        row.subject_namespace,
-                        row.subject_name,
-                        row.subject_uid,
-                        row.pod_uid,
-                        row.operation,
-                        row.stream_id,
-                        row.stream_seq,
-                        row.payload_proto,
-                        row.attempt,
-                        error,
-                        now,
-                    ],
-                )?;
-                let changed = tx.execute(
-                    "DELETE FROM outbox WHERE id = ?1 AND lease_token = ?2",
-                    rusqlite::params![id, lease_token],
-                )?;
-                if changed != 1 {
-                    return Err(tokio_rusqlite::Error::Other(Box::new(
-                        std::io::Error::other("outbox lease changed during dead-letter move"),
-                    )));
-                }
-                tx.commit()?;
-                Ok(super::OutboxFailureDisposition::DeadLettered)
-            } else {
-                let changed = tx.execute(
-                    queries::OUTBOX_MARK_FAILED,
-                    rusqlite::params![id, lease_token, backoff_until_ms, error],
-                )?;
-                if changed != 1 {
-                    tx.commit()?;
-                    return Ok(super::OutboxFailureDisposition::LeaseLost);
-                }
-                tx.commit()?;
-                Ok(super::OutboxFailureDisposition::RetryScheduled)
-            }
-        })
-        .await
-        .map_err(|e| anyhow!("outbox record failure failed: {e}"))
-    }
-
-    pub async fn complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool> {
-        let lease_token = lease_token.to_string();
-        self.db_call("node_local:outbox_complete", move |conn| {
-            let changed =
-                conn.execute(queries::OUTBOX_COMPLETE, rusqlite::params![id, lease_token])?;
-            Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| anyhow!("outbox complete failed: {e}"))
-    }
-
-    /// Claim up to `limit` due outbox rows in a single transaction.
-    /// Preserves strict per-subject_key FIFO single-in-flight: a row is never
-    /// claimed while an older row for the same subject still exists (whether due
-    /// or leased), so at most one row per subject is ever in flight across
-    /// batches. Cross-subject rows still pipeline freely.
-    pub async fn claim_due_outbox_batch(
-        &self,
-        now_ms: i64,
-        limit: usize,
-        lease_ms: i64,
-        lease_token: &str,
-    ) -> Result<Vec<OutboxRow>> {
-        let lease_token = lease_token.to_string();
-        let limit_i64 = limit.min(256) as i64;
-        // Select, conditionally lease, and fetch in one transaction so
-        // independent dispatchers cannot claim the same row.
-        let rows = self
-            .db_call("node_local:outbox_claim_batch", move |conn| {
-                let tx = conn.transaction()?;
-                let ids = {
-                    let mut stmt = tx.prepare(queries::outbox_claim_due_batch())?;
-                    let rows =
-                        stmt.query_map(rusqlite::params![now_ms, limit_i64], |row| row.get(0))?;
-                    rows.collect::<rusqlite::Result<Vec<i64>>>()?
-                };
-                if ids.is_empty() {
-                    tx.commit()?;
-                    return Ok(Vec::new());
-                }
-                let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
-                let mut leased_ids = Vec::new();
-                for &id in &ids {
-                    let changed = tx.execute(
-                        queries::OUTBOX_SET_LEASE,
-                        rusqlite::params![id, leased_until_ms, lease_token, now_ms],
-                    )?;
-                    if changed > 0 {
-                        leased_ids.push(id);
-                    }
-                }
-                let mut rows = Vec::with_capacity(leased_ids.len());
-                {
-                    let mut stmt = tx.prepare(queries::OUTBOX_ROW_SELECT)?;
-                    for id in leased_ids {
-                        if let Some(row) = stmt.query_row([id], row_to_outbox).optional()? {
-                            rows.push(row);
-                        }
-                    }
-                }
-                tx.commit()?;
-                Ok(rows)
-            })
-            .await
-            .map_err(|e| anyhow!("outbox batch claim failed: {e}"))?;
-
-        Ok(rows)
-    }
-
-    pub async fn complete_superseded_status_outbox_for_terminal_pod_delete(
-        &self,
-        subject_key: &str,
-        terminal_delete_id: i64,
-    ) -> Result<usize> {
-        let subject_key = subject_key.to_string();
-        self.db_call(
-            "node_local:outbox_complete_superseded_terminal_pod_delete_status",
-            move |conn| {
-                conn.execute(
-                    queries::OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS,
-                    rusqlite::params![subject_key, terminal_delete_id],
-                )
-                .map_err(tokio_rusqlite::Error::from)
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("outbox complete superseded status failed: {e}"))
-    }
-
-    pub async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize> {
-        self.db_call("node_local:outbox_requeue_expired", move |conn| {
-            conn.execute(queries::OUTBOX_REQUEUE_EXPIRED, [now_ms])
-                .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("outbox requeue expired failed: {e}"))
-    }
-
-    pub async fn next_outbox_wake_ms(&self, now_ms: i64) -> Result<Option<i64>> {
-        self.db_call("node_local:outbox_next_wake", move |conn| {
-            conn.query_row(queries::OUTBOX_NEXT_WAKE, [now_ms], |row| {
-                row.get::<_, Option<i64>>(0)
-            })
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("outbox next wake failed: {e}"))
-    }
-
-    pub async fn move_outbox_to_dead_letter_if_max_attempts(
-        &self,
-        idempotency_key: &str,
-        max_attempts: i64,
-    ) -> Result<bool> {
-        let idempotency_key = idempotency_key.to_string();
-        let now = self.now_ms();
-        self.db_call("node_local:outbox_dead_letter_move", move |conn| {
-            let tx = conn.transaction()?;
-            let row = tx
-                .query_row(
-                    "SELECT id, attempt FROM outbox WHERE idempotency_key = ?1",
-                    [&idempotency_key],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()?;
-            let Some((_original_id, attempt)) = row else {
-                tx.commit()?;
-                return Ok(false);
-            };
-            if attempt < max_attempts {
-                tx.commit()?;
-                return Ok(false);
-            }
-            let dead_row: Option<OutboxRow> = tx
-                .query_row(queries::OUTBOX_ROW_SELECT, [&_original_id], row_to_outbox)
-                .optional()?;
-            let Some(dead_row) = dead_row else {
-                tx.commit()?;
-                return Ok(false);
-            };
-            tx.execute(
-                queries::DEAD_LETTER_INSERT,
-                rusqlite::params![
-                    dead_row.id,
-                    dead_row.client_id,
-                    dead_row.idempotency_key,
-                    dead_row.enqueued_ms,
-                    dead_row.subject_key,
-                    dead_row.subject_api_version,
-                    dead_row.subject_kind,
-                    dead_row.subject_namespace,
-                    dead_row.subject_name,
-                    dead_row.subject_uid,
-                    dead_row.pod_uid,
-                    dead_row.operation,
-                    dead_row.stream_id,
-                    dead_row.stream_seq,
-                    dead_row.payload_proto,
-                    dead_row.attempt,
-                    dead_row.last_error.unwrap_or_default(),
-                    now,
-                ],
-            )?;
-            tx.execute("DELETE FROM outbox WHERE id = ?1", [dead_row.id])?;
-            tx.commit()?;
-            Ok(true)
-        })
-        .await
-        .map_err(|e| anyhow!("outbox dead letter move failed: {e}"))
-    }
-
-    pub async fn list_dead_letter(&self) -> Result<Vec<DeadLetterRow>> {
-        self.db_call("node_local:outbox_dead_letter_list", move |conn| {
-            let mut stmt = conn.prepare(queries::DEAD_LETTER_LIST)?;
-            let rows = stmt
-                .query_map([], row_to_dead_letter)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("dead letter list failed: {e}"))
-    }
-
-    pub async fn get_dead_letter(&self, id: i64) -> Result<Option<DeadLetterRow>> {
-        self.db_call("node_local:outbox_dead_letter_get", move |conn| {
-            conn.query_row(queries::DEAD_LETTER_GET, [id], row_to_dead_letter)
-                .optional()
-                .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("dead letter get failed: {e}"))
-    }
-
-    pub async fn delete_dead_letter(&self, id: i64) -> Result<bool> {
-        self.db_call("node_local:outbox_dead_letter_delete", move |conn| {
-            let changed = conn.execute(queries::DEAD_LETTER_DELETE, [id])?;
-            Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| anyhow!("dead letter delete failed: {e}"))
-    }
-
-    pub async fn replay_dead_letter(
-        &self,
-        id: i64,
-        classification: klights_node_store::OutboxClassification,
-    ) -> Result<bool> {
-        let now = self.now_ms();
-        let row = self
-            .db_call("node_local:outbox_dead_letter_replay_get", move |conn| {
-                Ok(conn
-                    .query_row(queries::DEAD_LETTER_GET, [id], row_to_dead_letter)
-                    .optional()?)
-            })
-            .await
-            .map_err(|e| anyhow!("outbox dead letter replay read failed: {e}"))?;
-        let Some(row) = row else {
-            return Ok(false);
-        };
-        let (priority_class, supersedable_pod_status, is_terminal_pod_delete, sequence_policy) =
-            classification.persisted_values();
-        self.db_call("node_local:outbox_dead_letter_replay", move |conn| {
-            let tx = conn.transaction()?;
-            let client_id = if row.client_id.is_empty() {
-                ensure_outbox_client_id_in_tx(&tx)?
-            } else {
-                row.client_id
-            };
-            let sequenced = sequence_policy
-                == klights_node_store::OutboxSequencePolicy::PerSubject.persisted_value();
-            let stream_id = if row.stream_id > 0 {
-                row.stream_id
-            } else if sequenced {
-                outbox_stream_id(&row.subject_key)
-            } else {
-                0
-            };
-            let stream_seq = if row.stream_seq > 0 {
-                row.stream_seq
-            } else if sequenced {
-                allocate_next_outbox_stream_seq(&tx, stream_id)?
-            } else {
-                0
-            };
-            tx.execute(
-                queries::OUTBOX_INSERT,
-                rusqlite::params![
-                    client_id,
-                    row.idempotency_key,
-                    row.enqueued_ms,
-                    row.subject_key,
-                    row.subject_api_version,
-                    row.subject_kind,
-                    row.subject_namespace,
-                    row.subject_name,
-                    row.subject_uid,
-                    row.pod_uid,
-                    row.operation,
-                    priority_class,
-                    supersedable_pod_status,
-                    is_terminal_pod_delete,
-                    stream_id,
-                    stream_seq,
-                    row.payload_proto,
-                    now,
-                ],
-            )?;
-            tx.execute(queries::DEAD_LETTER_DELETE_AFTER_REPLAY, [id])?;
-            tx.commit()?;
-            Ok(true)
-        })
-        .await
-        .map_err(|e| anyhow!("dead letter replay failed: {e}"))
-    }
-
-    pub async fn outbox_stats(&self) -> Result<OutboxStats> {
-        let now = self.now_ms();
-        self.db_call("node_local:outbox_stats", move |conn| {
-            let pending: i64 = conn.query_row(queries::OUTBOX_COUNT, [], |row| row.get(0))?;
-            let oldest_ms: Option<i64> = conn
-                .query_row(queries::OUTBOX_OLDEST_ENQUEUED, [], |row| row.get(0))
-                .optional()?
-                .flatten();
-            let oldest_age_seconds = oldest_ms
-                .map(|ms| (now.saturating_sub(ms) as f64) / 1000.0)
-                .unwrap_or(0.0);
-            let dead_letter_count: i64 =
-                conn.query_row(queries::DEAD_LETTER_COUNT, [], |row| row.get(0))?;
-            let dispatch_total: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM _node_meta WHERE key = 'outbox_dispatch_total'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            let dispatch_errors_total: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(CAST(value AS INTEGER), 0) FROM _node_meta WHERE key = 'outbox_dispatch_errors_total'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            Ok(OutboxStats {
-                pending,
-                oldest_age_seconds,
-                dead_letter_count,
-                dispatch_total,
-                dispatch_errors_total,
-            })
-        })
-        .await
-        .map_err(|e| anyhow!("outbox stats failed: {e}"))
-    }
-
-    #[cfg(test)]
-    pub async fn insert_dead_letter_test_only(&self, row: DeadLetterTestInsert<'_>) -> Result<()> {
-        let idempotency_key = row.idempotency_key.to_string();
-        let operation = row.operation.to_string();
-        let subject_key = row.subject_key.to_string();
-        let subject_api_version = row.subject_api_version.to_string();
-        let subject_kind = row.subject_kind.to_string();
-        let subject_namespace = row.subject_namespace.map(str::to_string);
-        let subject_name = row.subject_name.to_string();
-        let subject_uid = row.subject_uid.map(str::to_string);
-        let pod_uid = row.pod_uid.to_string();
-        let payload_proto = row.payload_proto.to_vec();
-        let attempts = row.attempts;
-        let last_error = row.last_error.to_string();
-        let moved_at_ms = row.moved_at_ms;
-        self.db_call("node_local:dead_letter_test_insert", move |conn| {
-            conn.execute(
-                queries::DEAD_LETTER_INSERT,
-                rusqlite::params![
-                    0_i64,
-                    "",
-                    idempotency_key,
-                    0_i64,
-                    subject_key,
-                    subject_api_version,
-                    subject_kind,
-                    subject_namespace,
-                    subject_name,
-                    subject_uid,
-                    pod_uid,
-                    operation,
-                    0_i64,
-                    0_i64,
-                    payload_proto,
-                    attempts,
-                    last_error,
-                    moved_at_ms,
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("dead letter test insert failed: {e}"))
-    }
-
     pub async fn record_probe_result(
         &self,
         pod_uid: &str,
@@ -1586,40 +917,6 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("probe_state get failed: {e}"))
-    }
-
-    pub async fn read_replication_checkpoint(&self) -> Result<Option<ReplicationCheckpoint>> {
-        self.db_call("node_local:checkpoint_get", move |conn| {
-            conn.query_row(queries::REPLICATION_CHECKPOINT_GET, [], |row| {
-                Ok(ReplicationCheckpoint {
-                    last_applied_rv: row.get(0)?,
-                    leader_epoch: row.get(1)?,
-                    cluster_id: row.get(2)?,
-                })
-            })
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("replication checkpoint get failed: {e}"))
-    }
-
-    pub async fn write_replication_checkpoint(
-        &self,
-        last_applied_rv: i64,
-        leader_epoch: i64,
-        cluster_id: &str,
-    ) -> Result<()> {
-        let cluster_id = cluster_id.to_string();
-        self.db_call("node_local:checkpoint_set", move |conn| {
-            conn.execute(
-                queries::REPLICATION_CHECKPOINT_SET,
-                rusqlite::params![last_applied_rv, leader_epoch, cluster_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("replication checkpoint set failed: {e}"))
     }
 
     // T3: `append_log_apply_entry`, `list_log_apply_entries_after`,
@@ -1705,39 +1002,6 @@ impl SqliteNodeLocalDb {
     }
 }
 
-fn ensure_outbox_client_id_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<String> {
-    const KEY: &str = "outbox_client_id";
-    if let Some(client_id) = tx
-        .query_row(queries::META_GET, [KEY], |row| row.get::<_, String>(0))
-        .optional()?
-    {
-        return Ok(client_id);
-    }
-    let client_id = format!("outbox-{}", uuid::Uuid::new_v4());
-    tx.execute(queries::META_SET, rusqlite::params![KEY, &client_id])?;
-    Ok(client_id)
-}
-
-fn allocate_next_outbox_stream_seq(
-    tx: &rusqlite::Transaction<'_>,
-    stream_id: i64,
-) -> rusqlite::Result<i64> {
-    let prior_seq: Option<i64> = tx
-        .query_row(
-            "SELECT last_seq FROM outbox_stream_sequences WHERE stream_id = ?1",
-            [stream_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let next_seq = prior_seq.unwrap_or(0).saturating_add(1);
-    tx.execute(
-        "INSERT INTO outbox_stream_sequences (stream_id, last_seq) VALUES (?1, ?2) \
-         ON CONFLICT(stream_id) DO UPDATE SET last_seq = excluded.last_seq",
-        rusqlite::params![stream_id, next_seq],
-    )?;
-    Ok(next_seq)
-}
-
 fn row_to_pod_runtime(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodRuntimeRow> {
     Ok(PodRuntimeRow {
         pod_uid: row.get(0)?,
@@ -1748,67 +1012,6 @@ fn row_to_pod_runtime(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodRuntimeRow
         cgroup_path: row.get(5)?,
         created_ms: row.get(6)?,
         started_ms: row.get(7)?,
-    })
-}
-
-fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
-    Ok(OutboxRow {
-        id: row.get(0)?,
-        client_id: row.get(1)?,
-        idempotency_key: row.get(2)?,
-        enqueued_ms: row.get(3)?,
-        subject_key: row.get(4)?,
-        subject_api_version: row.get(5)?,
-        subject_kind: row.get(6)?,
-        subject_namespace: row.get(7)?,
-        subject_name: row.get(8)?,
-        subject_uid: row.get(9)?,
-        pod_uid: row.get(10)?,
-        operation: row.get(11)?,
-        priority_class: row.get(12)?,
-        supersedable_pod_status: row.get::<_, i64>(13)? != 0,
-        is_terminal_pod_delete: row.get::<_, i64>(14)? != 0,
-        stream_id: row.get(15)?,
-        stream_seq: row.get(16)?,
-        payload_proto: row.get(17)?,
-        attempt: row.get(18)?,
-        next_due_ms: row.get(19)?,
-        leased_until_ms: row.get(20)?,
-        lease_token: row.get(21)?,
-        last_error: row.get(22)?,
-    })
-}
-
-pub fn outbox_stream_id(subject_key: &str) -> i64 {
-    let digest = Sha256::digest(subject_key.as_bytes());
-    let mut shard_bytes = [0_u8; 8];
-    shard_bytes.copy_from_slice(&digest[..8]);
-    let value = u64::from_be_bytes(shard_bytes);
-    let stream_id = (value & i64::MAX as u64) as i64;
-    if stream_id == 0 { 1 } else { stream_id }
-}
-
-fn row_to_dead_letter(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {
-    Ok(DeadLetterRow {
-        id: row.get(0)?,
-        original_id: row.get(1)?,
-        client_id: row.get(2)?,
-        idempotency_key: row.get(3)?,
-        enqueued_ms: row.get(4)?,
-        subject_key: row.get(5)?,
-        subject_api_version: row.get(6)?,
-        subject_kind: row.get(7)?,
-        subject_namespace: row.get(8)?,
-        subject_name: row.get(9)?,
-        subject_uid: row.get(10)?,
-        pod_uid: row.get(11)?,
-        operation: row.get(12)?,
-        stream_id: row.get(13)?,
-        stream_seq: row.get(14)?,
-        payload_proto: row.get(15)?,
-        attempts: row.get(16)?,
-        last_error: row.get(17)?,
-        moved_at_ms: row.get(18)?,
     })
 }
 
@@ -1866,343 +1069,6 @@ fn quote_ident(value: &str) -> String {
 }
 
 impl SqliteNodeLocalDb {
-    pub async fn reserve_ip_and_insert_network(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<(String, u32)> {
-        self.reserve_network_assignment(request)
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
-    pub async fn reserve_network_assignment(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> std::result::Result<(String, u32), super::PodNetworkReservationError> {
-        let request = request.into_owned();
-        let subnet_base_int = request.subnet_base_int;
-        let subnet_size = request.subnet_size;
-        let sandbox_id = request.sandbox_id.clone();
-        let now = self.now_ms();
-        let outcome = self
-            .db_call("node_local:reserve_ip_network", move |conn| {
-                reserve_ip_and_insert_network_in_conn(conn, request.as_borrowed(), now)
-            })
-            .await
-            .map_err(|error| super::PodNetworkReservationError::Persistence {
-                message: format!("pod network reserve failed: {error}"),
-            })?;
-        match outcome {
-            PodNetworkReservationOutcome::Reserved(ip_addr, ip_int) => Ok((ip_addr, ip_int)),
-            PodNetworkReservationOutcome::IdentityConflict => {
-                Err(super::PodNetworkReservationError::IdentityConflict { sandbox_id })
-            }
-            PodNetworkReservationOutcome::AddressExhausted => {
-                Err(super::PodNetworkReservationError::AddressExhausted {
-                    subnet_base_int,
-                    subnet_size,
-                })
-            }
-        }
-    }
-
-    pub async fn get_network_assignment_for_uid(
-        &self,
-        pod_uid: &str,
-    ) -> Result<Option<super::PodNetworkAssignmentRow>> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call("node_local:get_network_assignment_uid", move |conn| {
-            conn.query_row(
-                "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
-                        ip_addr, ip_int, veth_host, netns_path \
-                   FROM pod_networks WHERE pod_uid = ?1 ORDER BY created_ms DESC LIMIT 1",
-                [pod_uid],
-                row_to_pod_network_assignment,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("pod network assignment get uid failed: {error}"))
-    }
-
-    pub async fn get_network_assignment_for_pod(
-        &self,
-        pod: klights_types::PodIdentity,
-    ) -> Result<Option<super::PodNetworkAssignmentRow>> {
-        self.db_call("node_local:get_network_assignment_pod", move |conn| {
-            conn.query_row(
-                "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
-                        ip_addr, ip_int, veth_host, netns_path \
-                   FROM pod_networks \
-                  WHERE namespace = ?1 AND pod_name = ?2 AND pod_uid = ?3 \
-                  ORDER BY created_ms DESC LIMIT 1",
-                rusqlite::params![pod.namespace, pod.name, pod.uid],
-                row_to_pod_network_assignment,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("pod network assignment get pod failed: {error}"))
-    }
-
-    pub async fn get_network_assignment_for_sandbox(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<super::PodNetworkAssignmentRow>> {
-        let sandbox_id = sandbox_id.to_string();
-        self.db_call("node_local:get_network_assignment_sandbox", move |conn| {
-            conn.query_row(
-                "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
-                            ip_addr, ip_int, veth_host, netns_path \
-                       FROM pod_networks WHERE sandbox_id = ?1",
-                [sandbox_id],
-                row_to_pod_network_assignment,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|error| anyhow!("pod network assignment get sandbox failed: {error}"))
-    }
-
-    pub async fn delete_network_assignment_if_matches(
-        &self,
-        request: PodNetworkAllocationRequest<'_>,
-    ) -> Result<bool> {
-        let request = request.into_owned();
-        self.db_call(
-            "node_local:delete_network_assignment_if_matches",
-            move |conn| {
-                let deleted = conn.execute(
-                    "DELETE FROM pod_networks \
-                      WHERE sandbox_id = ?1 AND namespace = ?2 AND pod_name = ?3 AND pod_uid = ?4 \
-                        AND subnet_base_int = ?5 AND subnet_size = ?6 \
-                        AND veth_host = ?7 AND netns_path = ?8",
-                    rusqlite::params![
-                        request.sandbox_id,
-                        request.namespace,
-                        request.pod_name,
-                        request.pod_uid,
-                        i64::from(request.subnet_base_int),
-                        i64::from(request.subnet_size),
-                        request.veth_host,
-                        request.netns_path,
-                    ],
-                )?;
-                Ok(deleted == 1)
-            },
-        )
-        .await
-        .map_err(|error| anyhow!("pod network assignment conditional delete failed: {error}"))
-    }
-
-    pub async fn get_network_for_uid(&self, pod_uid: &str) -> Result<Option<PodNetworkEndpoint>> {
-        let pod_uid = pod_uid.to_string();
-        self.db_call("node_local:get_network_uid", move |conn| {
-            conn.query_row(
-                "SELECT ip_addr, veth_host, netns_path FROM pod_networks \
-                 WHERE pod_uid = ?1 ORDER BY created_ms DESC LIMIT 1",
-                [pod_uid],
-                row_to_pod_network_endpoint,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("pod network get uid failed: {e}"))
-    }
-
-    pub async fn get_network_for_sandbox(
-        &self,
-        sandbox_id: &str,
-    ) -> Result<Option<PodNetworkEndpoint>> {
-        let sandbox_id = sandbox_id.to_string();
-        self.db_call("node_local:get_network_sandbox", move |conn| {
-            conn.query_row(
-                "SELECT ip_addr, veth_host, netns_path FROM pod_networks WHERE sandbox_id = ?1",
-                [sandbox_id],
-                row_to_pod_network_endpoint,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("pod network get sandbox failed: {e}"))
-    }
-
-    pub async fn delete_network_for_sandbox(&self, sandbox_id: &str) -> Result<()> {
-        let sandbox_id = sandbox_id.to_string();
-        self.db_call("node_local:delete_network_sandbox", move |conn| {
-            conn.execute(
-                "DELETE FROM pod_networks WHERE sandbox_id = ?1",
-                [sandbox_id],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("pod network delete failed: {e}"))
-    }
-
-    pub async fn list_networks(&self) -> Result<Vec<String>> {
-        self.db_call("node_local:list_networks", move |conn| {
-            let rows = conn
-                .prepare("SELECT sandbox_id FROM pod_networks ORDER BY sandbox_id")?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("pod network list failed: {e}"))
-    }
-
-    pub async fn list_network_assignments(&self) -> Result<Vec<super::PodNetworkAssignmentRow>> {
-        self.db_call("node_local:list_network_assignments", move |conn| {
-            let rows = conn
-                .prepare(
-                    "SELECT sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
-                            ip_addr, ip_int, veth_host, netns_path \
-                       FROM pod_networks ORDER BY sandbox_id",
-                )?
-                .query_map([], row_to_pod_network_assignment)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("pod network list failed: {e}"))
-    }
-
-    pub async fn upsert_endpoint(&self, row: PodEndpointRow) -> Result<()> {
-        let _handoff = self.pod_endpoint_handoff.lock().await;
-        let tx = self.pod_endpoint_tx.clone();
-        let event_row = row.clone();
-        self.db_call("node_local:upsert_endpoint", move |conn| {
-            let prior_ip: Option<String> = conn
-                .query_row(
-                    "SELECT pod_ip FROM pod_endpoints WHERE pod_uid = ?1",
-                    [&row.pod_uid],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            conn.execute(
-                "INSERT OR REPLACE INTO pod_endpoints \
-                 (pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-                  host_port_tcp, host_port_udp, generation, updated_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                rusqlite::params![
-                    row.pod_uid,
-                    row.namespace,
-                    row.pod_name,
-                    row.node_name,
-                    row.mode.as_str(),
-                    row.pod_ip.to_string(),
-                    row.node_ip.to_string(),
-                    row.host_port_tcp.map(|p| p as i64),
-                    row.host_port_udp.map(|p| p as i64),
-                    row.generation,
-                    row.updated_at
-                ],
-            )?;
-            Ok(prior_ip)
-        })
-        .await
-        .map(|prior_ip| {
-            if let Some(prior_ip) = prior_ip
-                && prior_ip != event_row.pod_ip.to_string()
-                && let Ok(pod_ip) = prior_ip.parse()
-            {
-                let _ = tx.send(PodEndpointEvent::Delete {
-                    pod_uid: event_row.pod_uid.clone(),
-                    pod_ip,
-                });
-            }
-            let _ = tx.send(PodEndpointEvent::Upsert(event_row));
-        })
-        .map_err(|e| anyhow!("pod endpoint upsert failed: {e}"))
-    }
-
-    pub async fn delete_endpoint_for_uid(&self, pod_uid: &str) -> Result<()> {
-        let _handoff = self.pod_endpoint_handoff.lock().await;
-        let pod_uid = pod_uid.to_string();
-        let event_pod_uid = pod_uid.clone();
-        let tx = self.pod_endpoint_tx.clone();
-        self.db_call("node_local:delete_endpoint", move |conn| {
-            let old_ip: Option<String> = conn
-                .query_row(
-                    "SELECT pod_ip FROM pod_endpoints WHERE pod_uid = ?1",
-                    [&pod_uid],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            conn.execute("DELETE FROM pod_endpoints WHERE pod_uid = ?1", [&pod_uid])?;
-            Ok(old_ip)
-        })
-        .await
-        .map(|old_ip| {
-            if let Some(ip) = old_ip.and_then(|s| s.parse().ok()) {
-                let _ = tx.send(PodEndpointEvent::Delete {
-                    pod_uid: event_pod_uid,
-                    pod_ip: ip,
-                });
-            }
-        })
-        .map_err(|e| anyhow!("pod endpoint delete failed: {e}"))
-    }
-
-    pub async fn get_endpoint_by_pod_ip(
-        &self,
-        pod_ip: std::net::Ipv4Addr,
-    ) -> Result<Option<PodEndpointRow>> {
-        let pod_ip = pod_ip.to_string();
-        self.db_call("node_local:get_endpoint_by_pod_ip", move |conn| {
-            Ok(conn
-                .query_row(
-                    "SELECT pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-                        host_port_tcp, host_port_udp, generation, updated_ms \
-                 FROM pod_endpoints WHERE pod_ip = ?1",
-                    [&pod_ip],
-                    row_to_pod_endpoint,
-                )
-                .optional()?)
-        })
-        .await
-        .map_err(|e| anyhow!("pod endpoint get by pod_ip failed: {e}"))
-    }
-
-    pub async fn list_endpoints_for_node(&self, node_name: &str) -> Result<Vec<PodEndpointRow>> {
-        let node_name = node_name.to_string();
-        self.db_call("node_local:list_endpoints_node", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-                        host_port_tcp, host_port_udp, generation, updated_ms \
-                 FROM pod_endpoints WHERE node_name = ?1 ORDER BY pod_uid",
-            )?;
-            let rows = stmt
-                .query_map([node_name], row_to_pod_endpoint)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("pod endpoint list by node failed: {e}"))
-    }
-
-    pub async fn list_endpoints_all(&self) -> Result<Vec<PodEndpointRow>> {
-        self.db_call("node_local:list_endpoints_all", move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip, \
-                        host_port_tcp, host_port_udp, generation, updated_ms \
-                 FROM pod_endpoints ORDER BY node_name, pod_uid",
-            )?;
-            let rows = stmt
-                .query_map([], row_to_pod_endpoint)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("pod endpoint list all failed: {e}"))
-    }
-
     pub async fn enqueue_workqueue(
         &self,
         kind: PodWorkqueueKind,
@@ -2327,469 +1193,12 @@ impl SqliteNodeLocalDb {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum PodNetworkReservationOutcome {
-    Reserved(String, u32),
-    IdentityConflict,
-    AddressExhausted,
-}
-
-fn reserve_ip_and_insert_network_in_conn(
-    conn: &rusqlite::Connection,
-    request: PodNetworkAllocationRequest<'_>,
-    now_ms: i64,
-) -> tokio_rusqlite::Result<PodNetworkReservationOutcome> {
-    if request.subnet.size < 4 {
-        return Err(tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "subnet too small for pod IPAM",
-        ))));
-    }
-
-    if let Some(existing) = conn
-        .query_row(
-            "SELECT namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
-                    ip_addr, ip_int, veth_host, netns_path \
-               FROM pod_networks WHERE sandbox_id = ?1",
-            [request.sandbox_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)? as u32,
-                    row.get::<_, i64>(4)? as u32,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)? as u32,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            },
-        )
-        .optional()?
-    {
-        let exact_identity = existing.0 == request.pod.namespace
-            && existing.1 == request.pod.name
-            && existing.2 == request.pod.uid
-            && existing.7 == request.link.veth_host
-            && existing.8 == request.link.netns_path;
-        let exact_subnet =
-            existing.3 == request.subnet.base_int && existing.4 == request.subnet.size;
-        if exact_identity && exact_subnet {
-            return Ok(PodNetworkReservationOutcome::Reserved(
-                existing.5, existing.6,
-            ));
-        }
-
-        let usable_start = request.subnet.base_int + 2;
-        let usable_end = request.subnet.base_int + request.subnet.size - 2;
-        let legacy_subnet = existing.3 == 0 && existing.4 == 0;
-        let stored_ip_matches = existing
-            .5
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| u32::from(ip) == existing.6);
-        if exact_identity
-            && legacy_subnet
-            && stored_ip_matches
-            && existing.6 >= usable_start
-            && existing.6 <= usable_end
-        {
-            let adopted = conn.execute(
-                "UPDATE pod_networks \
-                    SET subnet_base_int = ?1, subnet_size = ?2 \
-                  WHERE sandbox_id = ?3 AND namespace = ?4 AND pod_name = ?5 AND pod_uid = ?6 \
-                    AND subnet_base_int = 0 AND subnet_size = 0 \
-                    AND ip_addr = ?7 AND ip_int = ?8 AND veth_host = ?9 AND netns_path = ?10 \
-                    AND ip_int >= ?11 AND ip_int <= ?12",
-                rusqlite::params![
-                    i64::from(request.subnet.base_int),
-                    i64::from(request.subnet.size),
-                    request.sandbox_id,
-                    request.pod.namespace,
-                    request.pod.name,
-                    request.pod.uid,
-                    existing.5,
-                    i64::from(existing.6),
-                    request.link.veth_host,
-                    request.link.netns_path,
-                    i64::from(usable_start),
-                    i64::from(usable_end),
-                ],
-            )?;
-            if adopted == 1 {
-                return Ok(PodNetworkReservationOutcome::Reserved(
-                    existing.5, existing.6,
-                ));
-            }
-        }
-
-        return Ok(PodNetworkReservationOutcome::IdentityConflict);
-    }
-
-    let start = request.subnet.base_int + 2;
-    let end = request.subnet.base_int + request.subnet.size - 2;
-    if start > end {
-        return Err(tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "subnet has no usable pod IPs",
-        ))));
-    }
-
-    let max_allocated: Option<i64> = conn.query_row(
-        "SELECT MAX(ip_int) FROM pod_networks WHERE ip_int >= ?1 AND ip_int <= ?2",
-        rusqlite::params![start as i64, end as i64],
-        |row| row.get(0),
-    )?;
-    let next_after_max = max_allocated
-        .map(|v| v as u32 + 1)
-        .filter(|candidate| *candidate <= end)
-        .unwrap_or(start);
-    let usable_count = end - start + 1;
-
-    for offset in 0..usable_count {
-        let candidate = start + ((next_after_max - start + offset) % usable_count);
-        let ip_addr = klights_types::ipv4_from_u32(candidate);
-        let inserted = conn.execute(
-            "INSERT INTO pod_networks \
-             (sandbox_id, namespace, pod_name, pod_uid, subnet_base_int, subnet_size, \
-              ip_addr, ip_int, veth_host, netns_path, created_ms) \
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(ip_int) DO NOTHING",
-            rusqlite::params![
-                request.sandbox_id,
-                request.pod.namespace,
-                request.pod.name,
-                request.pod.uid,
-                i64::from(request.subnet.base_int),
-                i64::from(request.subnet.size),
-                ip_addr,
-                candidate as i64,
-                request.link.veth_host,
-                request.link.netns_path,
-                now_ms
-            ],
-        )?;
-        if inserted > 0 {
-            return Ok(PodNetworkReservationOutcome::Reserved(
-                klights_types::ipv4_from_u32(candidate),
-                candidate,
-            ));
-        }
-    }
-
-    Ok(PodNetworkReservationOutcome::AddressExhausted)
-}
-
-fn row_to_pod_network_assignment(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<super::PodNetworkAssignmentRow> {
-    Ok(super::PodNetworkAssignmentRow {
-        sandbox_id: row.get(0)?,
-        namespace: row.get(1)?,
-        pod_name: row.get(2)?,
-        pod_uid: row.get(3)?,
-        subnet_base_int: row.get::<_, i64>(4)? as u32,
-        subnet_size: row.get::<_, i64>(5)? as u32,
-        ip_addr: row.get(6)?,
-        ip_int: row.get::<_, i64>(7)? as u32,
-        veth_host: row.get(8)?,
-        netns_path: row.get(9)?,
-    })
-}
-
-fn row_to_pod_network_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodNetworkEndpoint> {
-    Ok(PodNetworkEndpoint {
-        ip_addr: row.get(0)?,
-        veth_host: row.get(1)?,
-        netns_path: row.get(2)?,
-    })
-}
-
-fn row_to_pod_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodEndpointRow> {
-    let mode: String = row.get(4)?;
-    let mode = match mode.as_str() {
-        "encrypted_direct" => PodEndpointMode::EncryptedDirect,
-        "hostport" => PodEndpointMode::Hostport,
-        other => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::other(format!(
-                    "invalid pod endpoint mode {other}"
-                ))),
-            ));
-        }
-    };
-    let pod_ip: String = row.get(5)?;
-    let node_ip: Option<String> = row.get(6)?;
-    Ok(PodEndpointRow {
-        pod_uid: row.get(0)?,
-        namespace: row.get(1)?,
-        pod_name: row.get(2)?,
-        node_name: row.get(3)?,
-        mode,
-        pod_ip: pod_ip.parse().map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
-        })?,
-        node_ip: node_ip
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&pod_ip)
-            .parse()
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    6,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?,
-        host_port_tcp: endpoint_port(row, 7)?,
-        host_port_udp: endpoint_port(row, 8)?,
-        generation: row.get(9)?,
-        updated_at: row.get(10)?,
-    })
-}
-
-fn endpoint_port(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u16>> {
-    let Some(value) = row.get::<_, Option<i64>>(index)? else {
-        return Ok(None);
-    };
-    u16::try_from(value)
-        .ok()
-        .filter(|port| *port != 0)
-        .map(Some)
-        .ok_or_else(|| {
-            rusqlite::Error::FromSqlConversionFailure(
-                index,
-                rusqlite::types::Type::Integer,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "pod endpoint port outside 1..=65535",
-                )),
-            )
-        })
-}
-
-fn row_to_pod_status_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodStatusCheckpoint> {
-    let status_json: Vec<u8> = row.get(5)?;
-    let status = serde_json::from_slice(&status_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Blob, Box::new(e))
-    })?;
-    Ok(PodStatusCheckpoint {
-        pod_uid: row.get(0)?,
-        namespace: row.get(1)?,
-        pod_name: row.get(2)?,
-        base_rv: row.get(3)?,
-        applied_rv: row.get(4)?,
-        status,
-        updated_ms: row.get(6)?,
-    })
-}
-
-fn row_to_runtime_observation_checkpoint(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<RuntimeObservationCheckpoint> {
-    let container_ids_json: String = row.get(1)?;
-    let container_ids: Vec<String> = serde_json::from_str(&container_ids_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    Ok(RuntimeObservationCheckpoint {
-        pod_uid: row.get(0)?,
-        container_ids,
-        generation: row.get::<_, i64>(2)? as u64,
-        updated_ms: row.get(3)?,
-    })
-}
-
 #[cfg(test)]
-mod pod_network_reservation_tests {
-    use super::*;
-
-    fn legacy_connection() -> rusqlite::Connection {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "
-                CREATE TABLE pod_networks (
-                    sandbox_id TEXT PRIMARY KEY,
-                    namespace TEXT NOT NULL,
-                    pod_name TEXT NOT NULL,
-                    pod_uid TEXT NOT NULL,
-                    subnet_base_int INTEGER NOT NULL,
-                    subnet_size INTEGER NOT NULL,
-                    ip_addr TEXT NOT NULL,
-                    ip_int INTEGER NOT NULL UNIQUE,
-                    veth_host TEXT NOT NULL,
-                    netns_path TEXT NOT NULL,
-                    created_ms INTEGER NOT NULL
-                );
-                INSERT INTO pod_networks VALUES (
-                    'sandbox-legacy', 'default', 'pod-legacy', 'uid-legacy',
-                    0, 0, '10.42.89.2', 170547458, 'veth-legacy',
-                    '/run/netns/legacy', 1
-                );
-                ",
-            )
-            .unwrap();
-        connection
-    }
-
-    #[test]
-    fn fresh_schema_legacy_insert_uses_zero_sentinel_and_exact_adoption() {
-        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
-        schema::init_schema_in_conn(&mut connection).unwrap();
-        let base = u32::from(std::net::Ipv4Addr::new(10, 42, 89, 0));
-        connection
-            .execute(
-                "INSERT INTO pod_networks \
-                 (sandbox_id, namespace, pod_name, pod_uid, ip_addr, ip_int, \
-                  veth_host, netns_path, created_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    "sandbox-legacy",
-                    "default",
-                    "pod-legacy",
-                    "uid-legacy",
-                    "10.42.89.2",
-                    i64::from(base + 2),
-                    "veth-legacy",
-                    "/run/netns/legacy",
-                    1_i64,
-                ],
-            )
-            .unwrap();
-
-        let sentinel: (u32, u32) = connection
-            .query_row(
-                "SELECT subnet_base_int, subnet_size FROM pod_networks",
-                [],
-                |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
-            )
-            .unwrap();
-        assert_eq!(sentinel, (0, 0));
-
-        let outcome = reserve_ip_and_insert_network_in_conn(
-            &connection,
-            PodNetworkAllocationRequest::new(
-                "sandbox-legacy",
-                PodNetworkAllocationPod::new("default", "pod-legacy", "uid-legacy"),
-                PodNetworkAllocationSubnet::new(base, 256),
-                PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
-            ),
-            2,
-        )
-        .unwrap();
-        assert_eq!(
-            outcome,
-            PodNetworkReservationOutcome::Reserved("10.42.89.2".to_string(), base + 2)
-        );
-
-        let adopted: (u32, u32) = connection
-            .query_row(
-                "SELECT subnet_base_int, subnet_size FROM pod_networks",
-                [],
-                |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
-            )
-            .unwrap();
-        assert_eq!(adopted, (base, 256));
-    }
-
-    #[test]
-    fn legacy_subnet_adoption_rejects_every_identity_or_usable_range_mismatch() {
-        let base = u32::from(std::net::Ipv4Addr::new(10, 42, 89, 0));
-        let mismatches = [
-            (
-                "other",
-                "pod-legacy",
-                "uid-legacy",
-                base,
-                "veth-legacy",
-                "/run/netns/legacy",
-            ),
-            (
-                "default",
-                "other",
-                "uid-legacy",
-                base,
-                "veth-legacy",
-                "/run/netns/legacy",
-            ),
-            (
-                "default",
-                "pod-legacy",
-                "other",
-                base,
-                "veth-legacy",
-                "/run/netns/legacy",
-            ),
-            (
-                "default",
-                "pod-legacy",
-                "uid-legacy",
-                base,
-                "veth-other",
-                "/run/netns/legacy",
-            ),
-            (
-                "default",
-                "pod-legacy",
-                "uid-legacy",
-                base,
-                "veth-legacy",
-                "/run/netns/other",
-            ),
-            (
-                "default",
-                "pod-legacy",
-                "uid-legacy",
-                u32::from(std::net::Ipv4Addr::new(10, 42, 90, 0)),
-                "veth-legacy",
-                "/run/netns/legacy",
-            ),
-        ];
-
-        for (namespace, name, uid, requested_base, veth, netns) in mismatches {
-            let connection = legacy_connection();
-            let outcome = reserve_ip_and_insert_network_in_conn(
-                &connection,
-                PodNetworkAllocationRequest::new(
-                    "sandbox-legacy",
-                    PodNetworkAllocationPod::new(namespace, name, uid),
-                    PodNetworkAllocationSubnet::new(requested_base, 256),
-                    PodNetworkAllocationLink::new(veth, netns),
-                ),
-                2,
-            )
-            .unwrap();
-            assert_eq!(outcome, PodNetworkReservationOutcome::IdentityConflict);
-            let subnet: (u32, u32) = connection
-                .query_row(
-                    "SELECT subnet_base_int, subnet_size FROM pod_networks",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
-                )
-                .unwrap();
-            assert_eq!(subnet, (0, 0), "mismatch must not backfill legacy row");
-        }
-
-        let connection = legacy_connection();
-        connection
-            .execute(
-                "UPDATE pod_networks SET ip_addr = '192.0.2.2' WHERE sandbox_id = 'sandbox-legacy'",
-                [],
-            )
-            .unwrap();
-        let outcome = reserve_ip_and_insert_network_in_conn(
-            &connection,
-            PodNetworkAllocationRequest::new(
-                "sandbox-legacy",
-                PodNetworkAllocationPod::new("default", "pod-legacy", "uid-legacy"),
-                PodNetworkAllocationSubnet::new(base, 256),
-                PodNetworkAllocationLink::new("veth-legacy", "/run/netns/legacy"),
-            ),
-            2,
-        )
-        .unwrap();
-        assert_eq!(outcome, PodNetworkReservationOutcome::IdentityConflict);
-    }
+pub fn outbox_stream_id(subject_key: &str) -> i64 {
+    let digest = Sha256::digest(subject_key.as_bytes());
+    let mut shard_bytes = [0_u8; 8];
+    shard_bytes.copy_from_slice(&digest[..8]);
+    let value = u64::from_be_bytes(shard_bytes);
+    let stream_id = (value & i64::MAX as u64) as i64;
+    if stream_id == 0 { 1 } else { stream_id }
 }

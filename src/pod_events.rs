@@ -6,7 +6,7 @@ use crate::datastore::DatastoreBackend;
 #[cfg(test)]
 use crate::datastore::backend_kind::BackendKind;
 #[cfg(test)]
-use crate::datastore::node_local::selector;
+use crate::datastore::node_local::{LegacyDeliveryTestStore as _, selector};
 use crate::node_outbox::payload::OutboxOperation;
 #[cfg(test)]
 use crate::node_outbox::payload::OutboxPayload;
@@ -161,7 +161,7 @@ async fn flush_single_outbox_command(
     lease_token: &str,
 ) -> Result<()> {
     let Some(row) = node_db
-        .claim_next_due_outbox(epoch_ms(), 1_000, lease_token)
+        .legacy_claim_next_due_outbox(epoch_ms(), 1_000, lease_token)
         .await?
     else {
         return Ok(());
@@ -189,7 +189,7 @@ async fn flush_single_outbox_command(
     };
     result?;
     node_db
-        .complete_outbox(row.id, lease_token)
+        .legacy_complete_outbox(row.id, lease_token)
         .await
         .map(|_| ())
 }

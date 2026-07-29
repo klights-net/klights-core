@@ -412,6 +412,7 @@ pub async fn publish_node_external_ip_if_changed(
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
+    use crate::datastore::node_local::LegacyDeliveryTestStore as _;
     use crate::kubelet::node_heartbeat::{
         NODE_HEARTBEAT_INTERVAL, build_lease, run_heartbeat_with_interval,
     };
@@ -2041,7 +2042,7 @@ mod tests {
             "self-status publisher must not bypass the durable queue with direct leader apply"
         );
         let row = node_local
-            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
+            .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
             .await
             .expect("claim queued status")
             .expect("one durable status row");
@@ -2100,7 +2101,7 @@ mod tests {
         ));
         assert!(
             node_local
-                .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
+                .legacy_claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
                 .await
                 .expect("inspect queue")
                 .is_none()

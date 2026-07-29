@@ -419,8 +419,8 @@ mod tests {
 
     async fn fresh_sm() -> SqliteRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let node_executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-sm-test-node",
         )
@@ -514,8 +514,8 @@ mod tests {
 
     async fn build_sm_with_backend(backend: Arc<dyn DatastoreBackend>) -> SqliteRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let node_executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let node_executor = klights_node_datastore::open::open_with_opts(
+            klights_node_datastore::open::in_memory_opts(),
             supervisor.clone(),
             "sqlite:raft-snapshot-test-node",
         )

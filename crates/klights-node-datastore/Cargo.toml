@@ -8,5 +8,28 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+sqlcipher = [
+    "rusqlite/bundled-sqlcipher-vendored-openssl",
+    "klights-supervisor/sqlcipher",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true }
+klights-node-store = { workspace = true }
+klights-supervisor = { workspace = true }
+klights-types = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tokio-rusqlite = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4"] }
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

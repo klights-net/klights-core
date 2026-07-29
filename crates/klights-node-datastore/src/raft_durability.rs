@@ -40,7 +40,7 @@ pub struct SqliteRaftDurability {
 }
 
 impl SqliteRaftDurability {
-    pub(crate) fn new(executor: DbExecutor) -> Self {
+    pub fn new(executor: DbExecutor) -> Self {
         Self { executor }
     }
 
@@ -519,8 +519,8 @@ mod tests {
     use super::*;
 
     async fn fresh() -> SqliteRaftDurability {
-        let executor = crate::datastore::node_local::sqlite::open::open_with_opts(
-            crate::datastore::node_local::sqlite::open::in_memory_opts(),
+        let executor = crate::open::open_with_opts(
+            crate::open::in_memory_opts(),
             Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
             "sqlite:raft-durability-test",
         )
