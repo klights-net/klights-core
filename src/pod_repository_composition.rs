@@ -417,6 +417,26 @@ pub(crate) fn new_pod_store(
 }
 
 fn pod_persistence_error(error: anyhow::Error, namespace: &str, name: &str) -> anyhow::Error {
+    if let Some(error) = error.downcast_ref::<klights_cluster_core::StorageMutationError>() {
+        use klights_cluster_core::StorageCommandRejectionCode;
+
+        let message = error.message().to_string();
+        return match error.rejection_code() {
+            Some(StorageCommandRejectionCode::AlreadyExists) => {
+                anyhow::Error::new(klights_pod_api::PodRepositoryError::already_exists(message))
+            }
+            Some(StorageCommandRejectionCode::Conflict) => {
+                anyhow::Error::new(klights_pod_api::PodRepositoryError::conflict(message))
+            }
+            Some(StorageCommandRejectionCode::NotFound) => anyhow::Error::new(
+                klights_pod_api::PodRepositoryError::not_found(namespace, name),
+            ),
+            Some(StorageCommandRejectionCode::InvalidCommit) => {
+                anyhow::Error::new(klights_pod_api::PodRepositoryError::internal(message))
+            }
+            None => anyhow::Error::new(klights_pod_api::PodRepositoryError::unavailable(message)),
+        };
+    }
     if let Some(error) = error.downcast_ref::<klights_cluster_datastore::errors::DatastoreError>() {
         return match error {
             klights_cluster_datastore::errors::DatastoreError::AlreadyExists { message } => {
@@ -1138,4 +1158,48 @@ pub(crate) fn build_worker_pod_repository_parts(
         },
         adapters,
     )
+}
+
+#[cfg(test)]
+mod pod_persistence_error_tests {
+    use klights_cluster_core::{StorageCommandRejectionCode, StorageMutationError};
+    use klights_pod_api::PodRepositoryError;
+
+    use super::pod_persistence_error;
+
+    #[test]
+    fn neutral_already_exists_rejection_preserves_pod_repository_category() {
+        let mapped = pod_persistence_error(
+            StorageMutationError::rejected(
+                StorageCommandRejectionCode::AlreadyExists,
+                "Resource already exists (409 Conflict)",
+            )
+            .into(),
+            "default",
+            "duplicate",
+        );
+
+        assert!(matches!(
+            mapped.downcast_ref::<PodRepositoryError>(),
+            Some(PodRepositoryError::AlreadyExists { .. })
+        ));
+    }
+
+    #[test]
+    fn neutral_conflict_rejection_preserves_pod_repository_category() {
+        let mapped = pod_persistence_error(
+            StorageMutationError::rejected(
+                StorageCommandRejectionCode::Conflict,
+                "resourceVersion precondition failed (409 Conflict)",
+            )
+            .into(),
+            "default",
+            "stale",
+        );
+
+        assert!(matches!(
+            mapped.downcast_ref::<PodRepositoryError>(),
+            Some(PodRepositoryError::Conflict { .. })
+        ));
+    }
 }
