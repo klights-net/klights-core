@@ -126,6 +126,28 @@ pub struct EncodedRaftLogEntry {
     payload: OpaqueRaftBytes,
 }
 
+/// Exact encoded last-applied value plus its decoded neutral coordinate when
+/// the encoded value contains one. An encoded JSON `null` remains a present,
+/// byte-exact value with no coordinate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedRaftAppliedValue {
+    coordinate: Option<RaftLogCoordinate>,
+    payload: OpaqueRaftBytes,
+}
+
+impl EncodedRaftAppliedValue {
+    pub fn new(coordinate: Option<RaftLogCoordinate>, payload: OpaqueRaftBytes) -> Self {
+        Self {
+            coordinate,
+            payload,
+        }
+    }
+
+    pub fn into_parts(self) -> (Option<RaftLogCoordinate>, OpaqueRaftBytes) {
+        (self.coordinate, self.payload)
+    }
+}
+
 impl EncodedRaftLogEntry {
     pub fn new(coordinate: RaftLogCoordinate, payload: OpaqueRaftBytes) -> Self {
         Self {
@@ -211,6 +233,46 @@ pub struct EncodedRaftLogState {
     encoded_last_purged: Option<OpaqueRaftBytes>,
 }
 
+/// Atomically observed inputs needed by the OpenRaft adapter to reconstruct
+/// the current durable boundary.
+///
+/// The retained log coordinate is neutral. Purged and applied anchors retain
+/// their exact historical byte encoding and are decoded only by replication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedRaftStorageBoundary {
+    last_entry: Option<RaftLogCoordinate>,
+    encoded_last_purged: Option<OpaqueRaftBytes>,
+    encoded_last_applied: Option<OpaqueRaftBytes>,
+}
+
+impl EncodedRaftStorageBoundary {
+    pub fn new(
+        last_entry: Option<RaftLogCoordinate>,
+        encoded_last_purged: Option<OpaqueRaftBytes>,
+        encoded_last_applied: Option<OpaqueRaftBytes>,
+    ) -> Self {
+        Self {
+            last_entry,
+            encoded_last_purged,
+            encoded_last_applied,
+        }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<RaftLogCoordinate>,
+        Option<OpaqueRaftBytes>,
+        Option<OpaqueRaftBytes>,
+    ) {
+        (
+            self.last_entry,
+            self.encoded_last_purged,
+            self.encoded_last_applied,
+        )
+    }
+}
+
 impl EncodedRaftLogState {
     pub fn new(
         last_entry: Option<RaftLogCoordinate>,
@@ -291,10 +353,35 @@ impl RaftAppliedStateWrite {
     }
 }
 
+/// Persistence-side applied-state update. The replication adapter pairs the
+/// opaque last-applied bytes with their neutral coordinate before crossing
+/// this lower boundary. `None` preserves the existing row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RaftAppliedStatePersistenceWrite {
+    encoded_last_applied: Option<EncodedRaftAppliedValue>,
+    encoded_last_membership: Option<OpaqueRaftBytes>,
+}
+
+impl RaftAppliedStatePersistenceWrite {
+    pub fn new(
+        encoded_last_applied: Option<EncodedRaftAppliedValue>,
+        encoded_last_membership: Option<OpaqueRaftBytes>,
+    ) -> Self {
+        Self {
+            encoded_last_applied,
+            encoded_last_membership,
+        }
+    }
+
+    pub fn into_parts(self) -> (Option<EncodedRaftAppliedValue>, Option<OpaqueRaftBytes>) {
+        (self.encoded_last_applied, self.encoded_last_membership)
+    }
+}
+
 pub type RaftDurabilityFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, RaftDurabilityError>> + Send + 'a>>;
 
-pub trait RaftLogDurability: Send + Sync {
+pub trait RaftLogPersistence: Send + Sync {
     fn read_log_range(
         &self,
         range: RaftLogRange,
@@ -315,9 +402,9 @@ pub trait RaftLogDurability: Send + Sync {
     /// Full term/leader identity detects an anchored node.db rollback even
     /// when a restored backup contains the same incarnation UUID.
     fn load_storage_log_attestation(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>>;
-    /// Current durable Raft boundary: the greater of the last retained log
-    /// entry and last-purged/snapshot anchor.
-    fn load_storage_current_boundary(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>>;
+    /// Atomically load the opaque inputs used by the replication adapter to
+    /// reconstruct the current durable Raft boundary.
+    fn load_storage_boundary_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftStorageBoundary>;
     /// Atomically discard a learner-only log suffix that has neither a
     /// snapshot/purge boundary nor applied state and starts above index zero.
     ///
@@ -326,6 +413,21 @@ pub trait RaftLogDurability: Send + Sync {
     /// learners, which can safely reacquire authoritative state from a leader.
     /// The durable vote is deliberately preserved.
     fn reset_orphaned_learner_log(&self) -> RaftDurabilityFuture<'_, bool>;
+}
+
+/// OpenRaft-facing durability adapter. All ordinary persistence methods come
+/// from the neutral lower port; only current-boundary reconstruction requires
+/// adapter-owned decoding.
+pub trait RaftLogDurability: RaftLogPersistence {
+    fn load_storage_current_boundary(&self) -> RaftDurabilityFuture<'_, Option<RaftLogCoordinate>>;
+}
+
+pub trait RaftAppliedStatePersistence: Send + Sync {
+    fn load_applied_state(&self) -> RaftDurabilityFuture<'_, EncodedRaftAppliedState>;
+    fn store_applied_state_persistence(
+        &self,
+        state: RaftAppliedStatePersistenceWrite,
+    ) -> RaftDurabilityFuture<'_, ()>;
 }
 
 pub trait RaftAppliedStateDurability: Send + Sync {
@@ -371,8 +473,25 @@ mod tests {
     #[test]
     fn traits_are_independently_object_safe() {
         fn log(_: Option<&dyn RaftLogDurability>) {}
+        fn log_persistence(_: Option<&dyn RaftLogPersistence>) {}
         fn applied(_: Option<&dyn RaftAppliedStateDurability>) {}
+        fn applied_persistence(_: Option<&dyn RaftAppliedStatePersistence>) {}
         log(None);
+        log_persistence(None);
         applied(None);
+        applied_persistence(None);
+    }
+
+    #[test]
+    fn boundary_state_preserves_all_opaque_inputs() {
+        let boundary = EncodedRaftStorageBoundary::new(
+            Some(RaftLogCoordinate::new(5, 4, 3)),
+            Some(OpaqueRaftBytes::new(vec![1, 0, 1])),
+            Some(OpaqueRaftBytes::new(vec![2, 0, 2])),
+        );
+        let (last, purged, applied) = boundary.into_parts();
+        assert_eq!(last.unwrap().index(), 5);
+        assert_eq!(purged.unwrap().as_slice(), [1, 0, 1]);
+        assert_eq!(applied.unwrap().as_slice(), [2, 0, 2]);
     }
 }

@@ -2,6 +2,7 @@
 
 mod cache_network;
 mod delivery;
+mod identity;
 mod open;
 mod raft_durability;
 mod runtime_work;
@@ -26,11 +27,14 @@ pub use delivery::{
     PodStatusCheckpointUpsert, RuntimeObservationCheckpoint, RuntimeObservationCheckpointStore,
     RuntimeObservationGeneration, TerminalDeleteClassification,
 };
+pub use identity::{NodeIdentity, NodeIdentityError, NodeIdentityFuture};
 pub use open::NodeStoreOpenError;
 pub use raft_durability::{
-    EncodedRaftAppliedState, EncodedRaftLogEntry, EncodedRaftLogState, OpaqueRaftBytes,
-    RaftAppliedStateDurability, RaftAppliedStateWrite, RaftDurabilityError, RaftDurabilityFuture,
-    RaftLogBatch, RaftLogCoordinate, RaftLogDurability, RaftLogRange, RaftPurgeRequest,
+    EncodedRaftAppliedState, EncodedRaftAppliedValue, EncodedRaftLogEntry, EncodedRaftLogState,
+    EncodedRaftStorageBoundary, OpaqueRaftBytes, RaftAppliedStateDurability,
+    RaftAppliedStatePersistence, RaftAppliedStatePersistenceWrite, RaftAppliedStateWrite,
+    RaftDurabilityError, RaftDurabilityFuture, RaftLogBatch, RaftLogCoordinate, RaftLogDurability,
+    RaftLogPersistence, RaftLogRange, RaftPurgeRequest,
 };
 pub use runtime_work::{
     DueTimeMs, ObservedPodVersion, OwnedPodSandbox, PodRuntimeAdmission, PodRuntimeCgroup,

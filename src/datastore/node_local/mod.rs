@@ -1,7 +1,9 @@
 pub mod backend;
 pub(crate) mod delivery_adapter;
 pub mod handle;
+mod identity_adapter;
 pub(crate) mod network_adapter;
+pub(crate) mod raft_adapter;
 pub mod redb;
 pub mod selector;
 pub mod sqlite;

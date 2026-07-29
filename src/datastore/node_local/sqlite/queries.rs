@@ -263,40 +263,6 @@ mod tests {
     }
 }
 
-// --- Phase 3 Raft (openraft storage-v2) ------------------------------------
-// raft_log_entries: serialized openraft::Entry<TypeConfig> blob, keyed by
-// log_index, with term and leader_node_id duplicated for index/log-state
-// queries without deserializing every blob.
-pub(super) const RAFT_LOG_INSERT: &str = "INSERT INTO raft_log_entries \
-     (log_index, term, leader_node_id, entry_blob) VALUES (?1, ?2, ?3, ?4) \
-     ON CONFLICT(log_index) DO UPDATE SET \
-       term = excluded.term, \
-       leader_node_id = excluded.leader_node_id, \
-       entry_blob = excluded.entry_blob";
-pub(super) const RAFT_LOG_GET_RANGE: &str = "SELECT log_index, term, leader_node_id, entry_blob FROM raft_log_entries \
-     WHERE log_index >= ?1 AND log_index < ?2 ORDER BY log_index ASC";
-pub(super) const RAFT_LOG_GET_RANGE_UNBOUNDED: &str = "SELECT log_index, term, leader_node_id, entry_blob FROM raft_log_entries \
-     WHERE log_index >= ?1 ORDER BY log_index ASC";
-pub(super) const RAFT_LOG_LAST: &str = "SELECT log_index, term, leader_node_id \
-     FROM raft_log_entries ORDER BY log_index DESC LIMIT 1";
-pub(super) const RAFT_LOG_FIRST_INDEX: &str =
-    "SELECT log_index FROM raft_log_entries ORDER BY log_index ASC LIMIT 1";
-// Truncate logs from log_index (inclusive) onward — used when a follower
-// receives an AppendEntries that conflicts with its local tail. This is
-// the divergence-recovery primitive missing from the Phase 2 path.
-pub(super) const RAFT_LOG_TRUNCATE_FROM: &str =
-    "DELETE FROM raft_log_entries WHERE log_index >= ?1";
-// Purge logs up to log_index inclusive — used after snapshot install.
-pub(super) const RAFT_LOG_PURGE_UPTO: &str = "DELETE FROM raft_log_entries WHERE log_index <= ?1";
-
-// raft_meta: singleton key/value rows for vote, last-committed, last-purged.
-pub(super) const RAFT_META_GET: &str = "SELECT value FROM raft_meta WHERE key = ?1";
-pub(super) const RAFT_META_SET: &str = "INSERT INTO raft_meta (key, value) VALUES (?1, ?2) \
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
-pub(super) const RAFT_META_DELETE_RECOVERABLE_STATE: &str = "DELETE FROM raft_meta WHERE key IN ('committed', 'last_purged_log_id', \
-     'last_applied', 'last_membership', 'storage_log_high_watermark', \
-     'storage_log_high_term', 'storage_log_high_leader')";
-
 pub(super) const DEAD_LETTER_INSERT: &str = "INSERT INTO outbox_dead_letter \
      (original_id, client_id, idempotency_key, enqueued_ms, subject_key, subject_api_version, \
       subject_kind, subject_namespace, subject_name, subject_uid, pod_uid, \

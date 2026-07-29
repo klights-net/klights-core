@@ -49,10 +49,17 @@ pub async fn open_leader_node_local(
     match kind {
         BackendKind::Sqlite => {
             let sqlite = open_sqlite(path, supervisor, key_file, connection_key).await?;
+            let persistence = sqlite.raft_persistence();
+            let raft = Arc::new(
+                crate::datastore::node_local::raft_adapter::OpenRaftNodeDurabilityAdapter::new(
+                    persistence.clone(),
+                    persistence,
+                ),
+            );
             Ok(LeaderNodeLocalStores {
                 node: sqlite.clone(),
-                raft_log: sqlite.clone(),
-                raft_applied_state: sqlite,
+                raft_log: raft.clone(),
+                raft_applied_state: raft,
             })
         }
         BackendKind::Redb => {

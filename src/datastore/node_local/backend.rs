@@ -8,6 +8,7 @@ use super::types::{
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotClearResult, PodSlotMutationResult,
     PodWorkqueueEntry, PodWorkqueueKind,
 };
+use klights_node_store::NodeIdentity;
 use klights_types::PodIdentity;
 
 use super::{
@@ -17,10 +18,7 @@ use super::{
 };
 
 #[async_trait]
-pub trait NodeLocalBackend: Send + Sync {
-    fn close(&self) {}
-    fn backend_name(&self) -> &'static str;
-
+pub trait NodeLocalBackend: NodeIdentity + Send + Sync {
     fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent>;
     async fn subscribe_pod_endpoints_with_snapshot(
         &self,
@@ -46,10 +44,6 @@ pub trait NodeLocalBackend: Send + Sync {
         pod_name: &str,
         pod_uid: &str,
     ) -> Result<PodSlotClearResult>;
-
-    async fn ensure_node_identity(&self, cluster_id: &str, node_uid: &str) -> Result<()>;
-    async fn get_node_meta(&self, key: &str) -> Result<Option<String>>;
-    async fn set_node_meta(&self, key: &str, value: &str) -> Result<()>;
 
     async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()>;
     async fn claim_next_due_outbox(
@@ -240,10 +234,6 @@ pub trait NodeLocalBackend: Send + Sync {
 
 #[async_trait]
 impl NodeLocalBackend for SqliteNodeLocalDb {
-    fn backend_name(&self) -> &'static str {
-        "sqlite"
-    }
-
     fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
         SqliteNodeLocalDb::subscribe_pod_endpoints(self)
     }
@@ -286,18 +276,6 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
         pod_uid: &str,
     ) -> Result<PodSlotClearResult> {
         SqliteNodeLocalDb::pod_slot_clear_if_uid(self, namespace, pod_name, pod_uid).await
-    }
-
-    async fn ensure_node_identity(&self, cluster_id: &str, node_uid: &str) -> Result<()> {
-        SqliteNodeLocalDb::ensure_node_identity(self, cluster_id, node_uid).await
-    }
-
-    async fn get_node_meta(&self, key: &str) -> Result<Option<String>> {
-        SqliteNodeLocalDb::get_meta(self, key).await
-    }
-
-    async fn set_node_meta(&self, key: &str, value: &str) -> Result<()> {
-        SqliteNodeLocalDb::set_meta(self, key, value).await
     }
 
     async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {

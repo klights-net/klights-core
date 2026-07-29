@@ -9,6 +9,7 @@ use crate::datastore::node_local::{
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState, PodSlotClearResult,
     PodSlotMutationResult,
 };
+use klights_node_store::NodeIdentity;
 use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn pod_status_classification() -> klights_node_store::OutboxClassification {

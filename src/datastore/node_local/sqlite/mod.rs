@@ -1,3 +1,4 @@
+mod identity;
 pub(crate) mod open;
 mod queries;
 mod raft_durability;
@@ -16,13 +17,17 @@ use super::types::{
 };
 #[cfg(test)]
 use super::types::{PodNetworkAllocationLink, PodNetworkAllocationPod, PodNetworkAllocationSubnet};
+pub use identity::SqliteNodeIdentity;
 use klights_supervisor::DbExecutor;
+pub use raft_durability::SqliteRaftDurability;
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 
 #[derive(Clone)]
 pub struct SqliteNodeLocalDb {
     executor: DbExecutor,
+    identity: std::sync::Arc<SqliteNodeIdentity>,
+    raft_persistence: std::sync::Arc<SqliteRaftDurability>,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_endpoint_handoff: std::sync::Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -197,6 +202,8 @@ impl SqliteNodeLocalDb {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
         let (pod_slot_admission_tx, _) = broadcast::channel(POD_SLOT_ADMISSION_CHANNEL_BOUND);
         Ok(Self {
+            identity: std::sync::Arc::new(SqliteNodeIdentity::new(executor.clone())),
+            raft_persistence: std::sync::Arc::new(SqliteRaftDurability::new(executor.clone())),
             executor,
             pod_endpoint_tx,
             pod_endpoint_handoff: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -207,6 +214,18 @@ impl SqliteNodeLocalDb {
             pod_slot_admission_tx,
             wall_clock,
         })
+    }
+
+    pub(crate) fn raft_persistence(&self) -> std::sync::Arc<SqliteRaftDurability> {
+        self.raft_persistence.clone()
+    }
+
+    pub(crate) fn raft_persistence_ref(&self) -> &SqliteRaftDurability {
+        &self.raft_persistence
+    }
+
+    pub(crate) fn identity_ref(&self) -> &SqliteNodeIdentity {
+        &self.identity
     }
 
     fn now_ms(&self) -> i64 {
@@ -264,40 +283,6 @@ impl SqliteNodeLocalDb {
 
     pub fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
         self.pod_slot_admission_tx.subscribe()
-    }
-
-    pub async fn ensure_node_identity(&self, cluster_id: &str, node_uid: &str) -> Result<()> {
-        let cluster_id = cluster_id.to_string();
-        let node_uid = node_uid.to_string();
-        self.db_call("node_local:ensure_identity", move |conn| {
-            ensure_meta_matches_or_insert(conn, "cluster_id", &cluster_id)?;
-            ensure_meta_matches_or_insert(conn, "node_uid", &node_uid)?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("node.db identity check failed: {e}"))
-    }
-
-    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let key = key.to_string();
-        self.db_call("node_local:get_meta", move |conn| {
-            conn.query_row(queries::META_GET, [key], |row| row.get(0))
-                .optional()
-                .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("node meta get failed: {e}"))
-    }
-
-    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        let key = key.to_string();
-        let value = value.to_string();
-        self.db_call("node_local:set_meta", move |conn| {
-            conn.execute(queries::META_SET, rusqlite::params![key, value])?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("node meta set failed: {e}"))
     }
 
     pub async fn admit_pod_runtime(
@@ -1717,28 +1702,6 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("test body column check failed: {e}"))
-    }
-}
-
-fn ensure_meta_matches_or_insert(
-    conn: &rusqlite::Connection,
-    key: &str,
-    expected: &str,
-) -> rusqlite::Result<()> {
-    let live: Option<String> = conn
-        .query_row(queries::META_GET, [key], |row| row.get(0))
-        .optional()?;
-    match live {
-        None => {
-            conn.execute(queries::META_SET, rusqlite::params![key, expected])?;
-            Ok(())
-        }
-        Some(actual) if actual == expected => Ok(()),
-        Some(actual) => Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::other(format!(
-                "node.db identity mismatch for {key}: expected {expected}, found {actual}"
-            )),
-        ))),
     }
 }
 
