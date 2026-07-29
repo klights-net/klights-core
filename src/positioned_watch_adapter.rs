@@ -38,12 +38,14 @@ pub(crate) async fn datastore_watch_resource_scope(
     api_version: &str,
     kind: &str,
 ) -> Result<klights_watch::WatchResourceScope, LeaderWatchError> {
-    if crate::datastore::sqlite::scope::is_builtin_api_version(api_version) {
-        return Ok(if crate::datastore::sqlite::scope::is_namespaced(kind) {
-            klights_watch::WatchResourceScope::Namespaced
-        } else {
-            klights_watch::WatchResourceScope::Cluster
-        });
+    if klights_cluster_datastore::sqlite::scope::is_builtin_api_version(api_version) {
+        return Ok(
+            if klights_cluster_datastore::sqlite::scope::is_namespaced(kind) {
+                klights_watch::WatchResourceScope::Namespaced
+            } else {
+                klights_watch::WatchResourceScope::Cluster
+            },
+        );
     }
 
     let Some((group, version)) = api_version.rsplit_once('/') else {

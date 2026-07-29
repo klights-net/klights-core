@@ -10,10 +10,10 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use super::{RedbAccessor, tables};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
-use klights_cluster_datastore::redb::{RedbAccessor, tables};
 use klights_cluster_store::{
     DataplaneEncryption, DataplaneMode, DataplanePeerMetadata, DurableRawWatchEvent,
     DurableReplayFloor, DurableReplayTarget, DurableWatchEvent, DurableWatchScope,
@@ -30,12 +30,12 @@ use super::replay_floor::LegacyReplayFloor;
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 
 #[derive(Clone)]
-pub(super) struct RedbReadCore {
+pub struct RedbReadCore {
     accessor: Arc<RedbAccessor>,
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum RedbCollectionScope {
+pub enum RedbCollectionScope {
     LegacyAny,
     Cluster,
     AllNamespaces,
@@ -43,7 +43,7 @@ pub(super) enum RedbCollectionScope {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(super) struct RedbListQuery {
+pub struct RedbListQuery {
     pub label_selector: Option<String>,
     pub field_selector: Option<String>,
     pub limit: Option<i64>,
@@ -51,7 +51,7 @@ pub(super) struct RedbListQuery {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct RedbResourceList {
+pub struct RedbResourceList {
     pub items: Vec<Resource>,
     pub position: WatchReplayPosition,
     pub continuation: Option<ResourceCollectionKey>,
@@ -59,25 +59,25 @@ pub(super) struct RedbResourceList {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum RedbCheckedWatchRead<T> {
+pub enum RedbCheckedWatchRead<T> {
     Events(Vec<T>),
     Expired,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct RedbPositionedWatchPage<T> {
+pub struct RedbPositionedWatchPage<T> {
     pub events: Vec<PositionedWatchEvent<T>>,
     pub next_position: WatchReplayPosition,
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum RedbPositionedWatchRead<T> {
+pub enum RedbPositionedWatchRead<T> {
     Events(RedbPositionedWatchPage<T>),
     Expired,
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum RedbSnapshotRead {
+pub enum RedbSnapshotRead {
     Historical {
         items: Vec<Resource>,
         position: WatchReplayPosition,
@@ -101,7 +101,7 @@ struct StoredWatchEvent<'a> {
 }
 
 impl RedbReadCore {
-    pub(super) fn new(accessor: Arc<RedbAccessor>) -> Self {
+    pub fn new(accessor: Arc<RedbAccessor>) -> Self {
         Self { accessor }
     }
 
@@ -113,7 +113,7 @@ impl RedbReadCore {
         self.accessor.call(label, operation).await
     }
 
-    pub(super) async fn allocator_position(&self) -> Result<WatchReplayPosition> {
+    pub async fn allocator_position(&self) -> Result<WatchReplayPosition> {
         self.call("redb-read:allocator-position", |database| {
             let read = database.begin_read()?;
             replay_position_in_read(&read)
@@ -121,7 +121,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn get_resource(
+    pub async fn get_resource(
         &self,
         api_version: &str,
         kind: &str,
@@ -161,7 +161,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn list_resources(
+    pub async fn list_resources(
         &self,
         api_version: &str,
         kind: &str,
@@ -368,7 +368,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn list_resources_for_watch_targets(
+    pub async fn list_resources_for_watch_targets(
         &self,
         targets: &[DurableWatchTarget],
         label_selector: Option<&str>,
@@ -397,7 +397,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn list_resource_keys(
+    pub async fn list_resource_keys(
         &self,
         api_version: &str,
         kind: &str,
@@ -430,7 +430,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
+    pub async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
         self.call("redb-read:list-cluster-resources", |database| {
             let read = database.begin_read()?;
             let table = read.open_table(tables::RES_CLUSTER)?;
@@ -439,7 +439,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn find_owned(
+    pub async fn find_owned(
         &self,
         owner_uid: &str,
         namespace: Option<&str>,
@@ -473,7 +473,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn list_namespace_resources(
+    pub async fn list_namespace_resources(
         &self,
         namespace: &str,
         kind: Option<&str>,
@@ -494,7 +494,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
+    pub async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
         Ok(i64::try_from(
             self.list_namespace_resources(namespace, None, false)
                 .await?
@@ -679,7 +679,7 @@ fn replay_position_in_read(read: &redb::ReadTransaction) -> Result<WatchReplayPo
 }
 
 impl RedbReadCore {
-    pub(super) async fn watch_events_since(
+    pub async fn watch_events_since(
         &self,
         targets: &[DurableWatchTarget],
         since_resource_version: i64,
@@ -692,7 +692,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn watch_events_since_checked(
+    pub async fn watch_events_since_checked(
         &self,
         targets: &[DurableWatchTarget],
         since_resource_version: i64,
@@ -728,7 +728,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn positioned_watch_events(
+    pub async fn positioned_watch_events(
         &self,
         targets: &[DurableWatchTarget],
         position: WatchReplayPosition,
@@ -793,7 +793,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn raw_watch_events_since_checked(
+    pub async fn raw_watch_events_since_checked(
         &self,
         targets: &[DurableWatchTarget],
         since_resource_version: i64,
@@ -839,7 +839,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn positioned_raw_watch_events(
+    pub async fn positioned_raw_watch_events(
         &self,
         targets: &[DurableWatchTarget],
         position: WatchReplayPosition,
@@ -906,7 +906,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn all_watch_events_since(
+    pub async fn all_watch_events_since(
         &self,
         since_resource_version: i64,
         deleted_only: bool,
@@ -925,7 +925,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn all_watch_events_since_paged(
+    pub async fn all_watch_events_since_paged(
         &self,
         since_resource_version: i64,
         after_event_id: i64,
@@ -966,7 +966,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn replay_floors(&self) -> Result<Vec<DurableReplayFloor>> {
+    pub async fn replay_floors(&self) -> Result<Vec<DurableReplayFloor>> {
         self.call("redb-read:replay-floors", |database| {
             let read = database.begin_read()?;
             let table = read.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
@@ -985,7 +985,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn replay_floors_paged(
+    pub async fn replay_floors_paged(
         &self,
         after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
         limit: NonZeroUsize,
@@ -1310,7 +1310,7 @@ fn decode_durable_floor(key: &[u8], value: &[u8]) -> Result<Option<DurableReplay
 }
 
 impl RedbReadCore {
-    pub(super) async fn snapshot_at_position(
+    pub async fn snapshot_at_position(
         &self,
         targets: &[DurableWatchTarget],
         label_selector: Option<&str>,
@@ -1350,10 +1350,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn get_node_subnet(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<StoredNodeSubnet>> {
+    pub async fn get_node_subnet(&self, node_name: &str) -> Result<Option<StoredNodeSubnet>> {
         let node_name = node_name.to_string();
         self.call("redb-read:get-node-subnet", move |database| {
             let read = database.begin_read()?;
@@ -1366,7 +1363,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn list_peer_subnets(
+    pub async fn list_peer_subnets(
         &self,
         request: PeerTopologyRequest,
     ) -> Result<Vec<StoredNodeSubnet>> {
@@ -1391,7 +1388,7 @@ impl RedbReadCore {
         .await
     }
 
-    pub(super) async fn get_node_dataplane(
+    pub async fn get_node_dataplane(
         &self,
         node_name: &str,
     ) -> Result<Option<DataplanePeerMetadata>> {

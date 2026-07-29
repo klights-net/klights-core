@@ -5,7 +5,7 @@ use rusqlite::ToSql;
 use serde_json::Value;
 
 use super::read_store::SqliteReadStore;
-use crate::datastore::position_membership::{
+use crate::position_membership::{
     MembershipHistoryEvent, MembershipReconstructor, ReconstructedMembership,
     apply_membership_selectors, resource_from_history, sort_for_durable_watch_targets,
 };
@@ -15,7 +15,7 @@ use klights_cluster_store::{
 };
 
 impl SqliteReadStore {
-    pub(crate) async fn snapshot_resources_at_position(
+    pub async fn snapshot_resources_at_position(
         &self,
         targets: &[DurableWatchTarget],
         label_selector: Option<&str>,

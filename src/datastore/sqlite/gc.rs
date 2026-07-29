@@ -208,10 +208,12 @@ impl Datastore {
             .await
             .map_err(anyhow::Error::new)?
         {
-            super::read_store::SqliteCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
-            super::read_store::SqliteCheckedWatchRead::Events(events) => {
-                Ok(WatchReplayRead::Events(focused_events_to_catchup(events)))
+            klights_cluster_datastore::sqlite::read_store::SqliteCheckedWatchRead::Expired => {
+                Ok(WatchReplayRead::Expired)
             }
+            klights_cluster_datastore::sqlite::read_store::SqliteCheckedWatchRead::Events(
+                events,
+            ) => Ok(WatchReplayRead::Events(focused_events_to_catchup(events))),
         }
     }
 
@@ -231,10 +233,12 @@ impl Datastore {
             .await
             .map_err(anyhow::Error::new)?
         {
-            super::read_store::SqliteCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
-            super::read_store::SqliteCheckedWatchRead::Events(events) => {
-                Ok(WatchReplayRead::Events(focused_events_to_catchup(events)))
+            klights_cluster_datastore::sqlite::read_store::SqliteCheckedWatchRead::Expired => {
+                Ok(WatchReplayRead::Expired)
             }
+            klights_cluster_datastore::sqlite::read_store::SqliteCheckedWatchRead::Events(
+                events,
+            ) => Ok(WatchReplayRead::Events(focused_events_to_catchup(events))),
         }
     }
 

@@ -9,20 +9,14 @@ mod applier;
 mod cluster_replace;
 mod cluster_state_apply;
 mod crud;
-mod filters;
 mod focused_ports;
 mod gc;
 mod merge_patch;
 mod outbox_codec;
 pub(super) mod owner_ref_index;
-mod position_membership;
 pub(crate) mod queries;
-pub mod read_store;
-mod replay_floor;
 mod resource_shape;
 mod rv_helpers;
-pub(crate) mod scope;
-mod selector_index;
 mod snapshot_capture;
 #[cfg(test)]
 pub(crate) use snapshot_capture::install_snapshot_capture_page_pause;
@@ -85,6 +79,7 @@ struct AppliedOutboxLedgerInput<'a> {
     terminal_error: Option<&'a klights_cluster_core::OutboxApplyError>,
 }
 
+use klights_cluster_datastore::sqlite::SqliteReadStore;
 use klights_supervisor::DbExecutor;
 use klights_supervisor::sqlite_open as opener;
 pub use watch::create_pending_watch_event;
@@ -166,9 +161,13 @@ impl Datastore {
             .snapshot_resources_at_rv(api_version, kind, namespace, focused_query, snapshot_rv)
             .await?
         {
-            crud::snapshot::ExactSnapshotRead::Current => Ok(SnapshotAtRv::Current),
-            crud::snapshot::ExactSnapshotRead::Expired => Ok(SnapshotAtRv::Expired),
-            crud::snapshot::ExactSnapshotRead::List(page) => {
+            klights_cluster_datastore::sqlite::ExactSnapshotRead::Current => {
+                Ok(SnapshotAtRv::Current)
+            }
+            klights_cluster_datastore::sqlite::ExactSnapshotRead::Expired => {
+                Ok(SnapshotAtRv::Expired)
+            }
+            klights_cluster_datastore::sqlite::ExactSnapshotRead::List(page) => {
                 let position = page.snapshot().position();
                 let continue_token = page
                     .continuation()
@@ -224,13 +223,12 @@ use crate::datastore::pod_serviceaccount::{
     inject_serviceaccount_volume, should_inject_serviceaccount_volume,
 };
 #[cfg(test)]
-use filters::filter_by_field_selector;
-use filters::{
-    matches_field_selector_conditions, matches_label_requirements, parse_label_selector,
-    split_sql_pushdown_conditions,
-};
+use klights_cluster_datastore::sqlite::filters::filter_by_field_selector;
 #[cfg(test)]
-use filters::{resolve_field_path, split_selector};
+use klights_cluster_datastore::sqlite::filters::parse_label_selector;
+#[cfg(test)]
+use klights_cluster_datastore::sqlite::filters::{resolve_field_path, split_selector};
+use klights_cluster_datastore::sqlite::scope::use_namespaced_table;
 use resource_shape::hydrate_watch_event_data;
 use resource_shape::{
     ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
@@ -239,7 +237,6 @@ use resource_shape::{
     validate_metadata_uid_immutable, validate_resource_preconditions,
     warn_uid_precondition_mismatch,
 };
-use scope::use_namespaced_table;
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -279,7 +276,7 @@ struct ResourceMutationPauseRegistration {
 pub struct Datastore {
     executor: DbExecutor,
     read_executor: DbExecutor,
-    focused_reads: std::sync::Arc<read_store::SqliteReadStore>,
+    focused_reads: std::sync::Arc<SqliteReadStore>,
     #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
@@ -3569,13 +3566,14 @@ impl Datastore {
         #[cfg(test)]
         let fail_next_watch_position_observation =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let focused_reads = std::sync::Arc::new(read_store::SqliteReadStore::new(
+        #[cfg(test)]
+        let focused_reads = std::sync::Arc::new(SqliteReadStore::new_with_test_instrumentation(
             read_executor.clone(),
-            #[cfg(test)]
             fail_next_watch_position_observation.clone(),
-            #[cfg(test)]
             resource_get_call_count.clone(),
         ));
+        #[cfg(not(test))]
+        let focused_reads = std::sync::Arc::new(SqliteReadStore::new(read_executor.clone()));
         Ok(Self {
             executor,
             read_executor,
@@ -3595,7 +3593,7 @@ impl Datastore {
         })
     }
 
-    pub(crate) fn focused_read_store(&self) -> std::sync::Arc<read_store::SqliteReadStore> {
+    pub(crate) fn focused_read_store(&self) -> std::sync::Arc<SqliteReadStore> {
         self.focused_reads.clone()
     }
 

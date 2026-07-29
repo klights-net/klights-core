@@ -300,6 +300,7 @@ tikv-jemalloc-ctl = { workspace = true }
 debug = 1
 
 [dev-dependencies]
+klights-cluster-datastore = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }

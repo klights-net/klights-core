@@ -2132,9 +2132,15 @@ name = "klights-cluster-datastore"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "klights-cluster-core",
+ "klights-cluster-store",
  "klights-supervisor",
+ "klights-types",
  "redb",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",

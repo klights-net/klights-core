@@ -1,4 +1,4 @@
-use super::queries;
+use super::read_queries as queries;
 use klights_cluster_store::{DurableWatchScope, ReplayRetentionBoundary};
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";

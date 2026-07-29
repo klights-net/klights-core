@@ -274,4 +274,52 @@ mod tests {
             "selector membership should retain and reuse the matching Arc<Value>"
         );
     }
+
+    #[test]
+    fn exact_position_prior_object_drives_synthetic_deleted_payload() {
+        let selected = Resource {
+            id: 0,
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "sample".into(),
+            uid: String::new(),
+            resource_version: 50,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "sample",
+                    "namespace": "default",
+                    "labels": {"selected": "true"},
+                    "resourceVersion": "50"
+                }
+            })),
+        };
+        let mut membership = SelectorMembership::default();
+        membership.replace_from_resources([&selected]);
+
+        let transitioned = membership
+            .transition(
+                WatchEvent::modified(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "sample",
+                        "namespace": "default",
+                        "labels": {"selected": "false"},
+                        "resourceVersion": "40"
+                    }
+                })),
+                false,
+            )
+            .expect("leaving an exact-position member must emit");
+
+        assert_eq!(transitioned.event_type, EventType::Deleted);
+        assert_eq!(
+            transitioned.object.pointer("/metadata/labels/selected"),
+            Some(&serde_json::json!("true")),
+            "synthetic DELETED must carry the exact-position prior object"
+        );
+    }
 }

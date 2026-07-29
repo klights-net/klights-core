@@ -36,7 +36,7 @@ fn spawn_raw_create_with_watch_event(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
             rusqlite::params![api_version, kind, namespace, name, uid, rv, &row_data],
         )?;
-        crate::datastore::sqlite::selector_index::upsert_index_entries(
+        klights_cluster_datastore::sqlite::selector_index::upsert_index_entries(
             &tx,
             &api_version,
             &kind,

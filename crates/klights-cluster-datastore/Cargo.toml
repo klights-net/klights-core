@@ -10,6 +10,7 @@ publish.workspace = true
 
 [features]
 default = []
+test-support = []
 sqlcipher = [
     "rusqlite/bundled-sqlcipher-vendored-openssl",
     "klights-supervisor/sqlcipher",
@@ -17,9 +18,14 @@ sqlcipher = [
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
+klights-cluster-core = { workspace = true }
+klights-cluster-store = { workspace = true }
 klights-supervisor = { workspace = true }
+klights-types = { workspace = true }
 redb = { workspace = true }
 rusqlite = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -30,6 +36,7 @@ tracing = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+base64 = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

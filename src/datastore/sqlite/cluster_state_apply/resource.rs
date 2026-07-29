@@ -9,10 +9,11 @@ use super::super::cluster_replace::{ApplyConflictCode, apply_conflict_error, oth
 use super::super::crud::helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
-use super::super::{create_pending_watch_event, owner_ref_index, queries, selector_index};
+use super::super::{create_pending_watch_event, owner_ref_index, queries};
 use crate::datastore::types::PendingWatchEvent;
 use klights_cluster_core::PatchKind;
 use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
+use klights_cluster_datastore::sqlite::selector_index;
 use rusqlite::OptionalExtension;
 
 pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {

@@ -1,8 +1,9 @@
-use super::*;
-
+use anyhow::Result;
+use klights_cluster_core::Resource;
+use serde_json::Value;
 type LabelRequirement = klights_types::LabelRequirement;
 
-pub(super) fn matches_label_requirements(data: &Value, requirements: &[LabelRequirement]) -> bool {
+pub fn matches_label_requirements(data: &Value, requirements: &[LabelRequirement]) -> bool {
     let labels = data
         .get("metadata")
         .and_then(|m| m.get("labels"))
@@ -10,14 +11,11 @@ pub(super) fn matches_label_requirements(data: &Value, requirements: &[LabelRequ
     requirements.iter().all(|req| req.matches(labels))
 }
 
-pub(super) fn resolve_field_path<'a>(
-    data: &'a Value,
-    path: &str,
-) -> Option<std::borrow::Cow<'a, str>> {
+pub fn resolve_field_path<'a>(data: &'a Value, path: &str) -> Option<std::borrow::Cow<'a, str>> {
     klights_types::resolve_field_value(data, path)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Resource> {
     let selector = klights_types::FieldSelector::parse(selector)
         .expect("API validation must reject malformed field selectors before datastore filtering");
@@ -29,23 +27,21 @@ pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Res
         .collect()
 }
 
-pub(super) type FieldSelectorCondition = klights_types::FieldRequirement;
-
 /// SQL-level pushdown plan for a field selector. The fields directly indexed
 /// in the namespaced/cluster tables (`name`, `namespace`) can become extra
 /// SQL `AND` clauses; everything else stays as a residual selector that
 /// `matches_field_selector_conditions` evaluates in Rust.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(super) struct SqlPushdownConditions {
+pub struct SqlPushdownConditions {
     pub sql_name_eq: Option<String>,
     pub sql_namespace_eq: Option<String>,
-    pub residual_fields: Vec<FieldSelectorCondition>,
+    pub residual_fields: Vec<klights_types::FieldRequirement>,
 }
 
 /// Split a field selector string into SQL-pushdown-eligible equality conditions
 /// on `metadata.name` / `metadata.namespace` and the residual selector that
 /// must still be evaluated in Rust over the JSON body.
-pub(super) fn split_sql_pushdown_conditions(selector: &str) -> Result<SqlPushdownConditions> {
+pub fn split_sql_pushdown_conditions(selector: &str) -> Result<SqlPushdownConditions> {
     let mut sql_name_eq: Option<String> = None;
     let mut sql_namespace_eq: Option<String> = None;
     let mut residual_fields = Vec::new();
@@ -70,9 +66,9 @@ pub(super) fn split_sql_pushdown_conditions(selector: &str) -> Result<SqlPushdow
     })
 }
 
-pub(super) fn matches_field_selector_conditions(
+pub fn matches_field_selector_conditions(
     resource: &Resource,
-    conditions: &[FieldSelectorCondition],
+    conditions: &[klights_types::FieldRequirement],
 ) -> bool {
     conditions.iter().all(|condition| {
         condition.matches_resource_with_identity(
@@ -83,12 +79,12 @@ pub(super) fn matches_field_selector_conditions(
     })
 }
 
-#[cfg(test)]
-pub(super) fn split_selector(selector: &str) -> Vec<&str> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn split_selector(selector: &str) -> Vec<&str> {
     klights_types::split_selector(selector)
 }
 
-pub(super) fn parse_label_selector(selector: &str) -> Result<Vec<LabelRequirement>> {
+pub fn parse_label_selector(selector: &str) -> Result<Vec<LabelRequirement>> {
     Ok(klights_types::parse_label_selector(selector)?)
 }
 

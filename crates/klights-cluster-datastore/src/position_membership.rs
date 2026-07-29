@@ -11,8 +11,6 @@ use klights_cluster_core::{Resource, WatchReplayPosition};
 use klights_cluster_store::{DurableWatchScope, DurableWatchTarget};
 use serde_json::Value;
 
-#[cfg(test)]
-use super::{WatchTarget, WatchTargetScope};
 use klights_types::LabelSelector;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -169,33 +167,6 @@ pub(crate) fn sort_for_durable_watch_targets(
     });
 }
 
-#[cfg(test)]
-pub(crate) fn sort_for_watch_targets(items: &mut [Resource], targets: &[WatchTarget]) {
-    items.sort_unstable_by(|left, right| {
-        let order = |resource: &Resource| {
-            targets
-                .iter()
-                .position(|target| {
-                    target.api_version == resource.api_version
-                        && target.kind == resource.kind
-                        && match &target.scope {
-                            WatchTargetScope::Cluster => resource.namespace.is_none(),
-                            WatchTargetScope::Namespaced(Some(namespace)) => {
-                                resource.namespace.as_deref() == Some(namespace.as_str())
-                            }
-                            WatchTargetScope::Namespaced(None) => resource.namespace.is_some(),
-                        }
-                })
-                .unwrap_or(usize::MAX)
-        };
-        (order(left), &left.namespace, &left.name).cmp(&(
-            order(right),
-            &right.namespace,
-            &right.name,
-        ))
-    });
-}
-
 pub(crate) fn apply_membership_selectors(
     items: Vec<Resource>,
     label_selector: Option<&str>,
@@ -294,21 +265,6 @@ mod tests {
             selected.resource.resource_version
         );
         assert_eq!(items[0].data, selected.resource.data);
-
-        let mut membership = crate::watch::SelectorMembership::default();
-        membership.replace_from_resources(&items);
-        let transitioned = membership
-            .transition(
-                crate::watch::WatchEvent::modified((*nonmatching_resource()).clone()),
-                false,
-            )
-            .expect("leaving an exact-position member must emit");
-        assert_eq!(transitioned.event_type, crate::watch::EventType::Deleted);
-        assert_eq!(
-            transitioned.object.pointer("/metadata/labels/selected"),
-            Some(&serde_json::json!("true")),
-            "synthetic DELETED must carry the exact-position prior object"
-        );
     }
 
     #[test]
@@ -384,17 +340,13 @@ mod tests {
             )
         };
         let mut items = vec![make("widgets.test/v1"), make("widgets.test/v2")];
-        sort_for_watch_targets(
+        sort_for_durable_watch_targets(
             &mut items,
             &[
-                WatchTarget::namespaced("widgets.test/v2", "Widget"),
-                WatchTarget::namespaced("widgets.test/v1", "Widget"),
+                DurableWatchTarget::namespaced("widgets.test/v2", "Widget"),
+                DurableWatchTarget::namespaced("widgets.test/v1", "Widget"),
             ],
         );
         assert_eq!(items[0].api_version, "widgets.test/v2");
-    }
-
-    fn nonmatching_resource() -> Arc<Value> {
-        event(11, 40, "MODIFIED", false).resource.data
     }
 }

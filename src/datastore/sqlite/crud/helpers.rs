@@ -3,32 +3,6 @@
 use super::super::queries;
 use super::*;
 
-/// Read-side K8s Events compat shim. Identity (insert/update/delete) is
-/// strict per (api_version, kind, namespace, name) — the new unique index
-/// enforces it. But Events have a long-standing K8s compat where the same
-/// resource may be addressed via either `core/v1` or `events.k8s.io/v1`,
-/// so a client that POSTed to one group expects to also see the row via
-/// the other group's READ path.
-///
-/// For Event reads, expand the api_version filter to cover both groups.
-/// For everything else, return the single api_version verbatim. This is
-/// explicit and documented — NOT the ambiguous identity bypass that used
-/// to live inline as `event_kind_lookup`.
-pub fn event_read_api_versions(api_version: &str, kind: &str) -> Vec<&'static str> {
-    if kind == "Event" && (api_version == "v1" || api_version == "events.k8s.io/v1") {
-        vec!["v1", "events.k8s.io/v1"]
-    } else {
-        // Caller already owns the single api_version string; the static lifetime
-        // here is unused (callers won't read element 0 in this branch).
-        Vec::new()
-    }
-}
-
-/// Returns true iff this read needs the cross-group expansion above.
-pub fn needs_event_v1_compat(api_version: &str, kind: &str) -> bool {
-    !event_read_api_versions(api_version, kind).is_empty()
-}
-
 /// Insert a row into `watch_events` for a CRUD mutation. Used by
 /// create/update/update_status/patch/delete on both the namespaced and
 /// cluster tables — bind `namespace = None` for cluster-scoped resources
@@ -303,43 +277,14 @@ pub fn metadata_equal_ignoring_rv(a: &Value, b: &Value) -> bool {
     true
 }
 
-pub fn row_to_namespaced_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resource> {
-    let data_bytes: Vec<u8> = row.get(7)?;
-    let data: Value = serde_json::from_slice(&data_bytes)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    Ok(Resource {
-        id: row.get(0)?,
-        api_version: row.get(1)?,
-        kind: row.get(2)?,
-        namespace: Some(row.get(3)?),
-        name: row.get(4)?,
-        resource_version: row.get(5)?,
-        uid: row.get(6)?,
-        data: std::sync::Arc::new(data),
-    })
-}
-
-pub fn row_to_cluster_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<Resource> {
-    let data_bytes: Vec<u8> = row.get(6)?;
-    let data: Value = serde_json::from_slice(&data_bytes)
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    Ok(Resource {
-        id: row.get(0)?,
-        api_version: row.get(1)?,
-        kind: row.get(2)?,
-        namespace: None,
-        name: row.get(3)?,
-        resource_version: row.get(4)?,
-        uid: row.get(5)?,
-        data: std::sync::Arc::new(data),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+    use klights_cluster_datastore::sqlite::read_helpers::{
+        event_read_api_versions, needs_event_v1_compat,
+    };
 
     #[test]
     fn event_read_api_versions_expands_for_v1_event() {

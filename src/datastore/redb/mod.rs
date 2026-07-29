@@ -16,11 +16,7 @@ pub mod advance;
 mod applier;
 mod backend_impl;
 mod helpers;
-pub mod key_codec;
 pub mod network;
-mod read_core;
-pub mod read_store;
-mod replay_floor;
 pub mod snapshot;
 mod snapshot_capture;
 pub mod watch;
@@ -37,9 +33,8 @@ mod tests;
 use advance::RedbRvStore;
 use crud::namespaces::RedbNamespaceStore;
 use crud::resources::RedbResourceStore;
-use klights_cluster_datastore::redb::{RedbAccessor, RedbOpenOpts};
+use klights_cluster_datastore::redb::{RedbAccessor, RedbOpenOpts, RedbReadStore};
 use network::RedbNetworkStore;
-use read_store::RedbReadStore;
 use watch::RedbWatchStore;
 
 /// Redb-backed datastore composed from focused domain stores.

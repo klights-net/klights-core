@@ -1,5 +1,7 @@
 use super::*;
-use crate::datastore::sqlite::crud::helpers::{event_read_api_versions, needs_event_v1_compat};
+use klights_cluster_datastore::sqlite::read_helpers::{
+    event_read_api_versions, needs_event_v1_compat,
+};
 use serde_json::json;
 
 // ---- Unit tests for the compat helpers ---------------------------------

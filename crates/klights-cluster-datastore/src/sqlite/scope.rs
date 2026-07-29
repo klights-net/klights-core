@@ -4,7 +4,7 @@
 /// This is the canonical scope list for built-in kinds. Other layers (e.g. the
 /// gRPC watch replay path) must share it rather than maintaining a second list
 /// that drifts out of sync.
-pub(crate) fn is_namespaced(kind: &str) -> bool {
+pub fn is_namespaced(kind: &str) -> bool {
     !matches!(
         kind,
         "APIService"
@@ -33,7 +33,7 @@ pub(crate) fn is_namespaced(kind: &str) -> bool {
     )
 }
 
-pub(crate) fn is_builtin_api_version(api_version: &str) -> bool {
+pub fn is_builtin_api_version(api_version: &str) -> bool {
     matches!(
         api_version,
         "v1" | "apps/v1"
@@ -61,15 +61,11 @@ pub(crate) fn is_builtin_api_version(api_version: &str) -> bool {
 
 /// Dynamic/custom resources can be either cluster-scoped or namespaced depending on CRD scope.
 /// When namespace is None we must not blindly coerce to namespaced default.
-pub(super) fn is_dynamic_custom_resource(api_version: &str, kind: &str) -> bool {
+pub fn is_dynamic_custom_resource(api_version: &str, kind: &str) -> bool {
     !is_builtin_api_version(api_version) && !matches!(kind, "Namespace" | "Event")
 }
 
-pub(super) fn use_namespaced_table(
-    api_version: &str,
-    kind: &str,
-    namespace: &Option<&str>,
-) -> bool {
+pub fn use_namespaced_table(api_version: &str, kind: &str, namespace: &Option<&str>) -> bool {
     if is_dynamic_custom_resource(api_version, kind) {
         return namespace.is_some();
     }

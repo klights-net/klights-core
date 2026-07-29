@@ -9,9 +9,9 @@ use anyhow::Context;
 
 use super::super::owner_ref_index;
 use super::super::queries;
-use super::super::selector_index;
 use super::helpers::*;
 use super::*;
+use klights_cluster_datastore::sqlite::selector_index;
 
 use crate::datastore::sqlite::create_pending_watch_event;
 

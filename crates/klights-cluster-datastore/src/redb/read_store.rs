@@ -3,10 +3,10 @@
 //! The facade and its read-core dependency form the mechanically movable
 //! Phase 10B Redb slice. Root datastore compatibility lives outside it.
 
+use super::RedbAccessor;
+use crate::errors;
 use anyhow::Result;
 use klights_cluster_core::{Resource, WatchReplayPosition};
-use klights_cluster_datastore::errors;
-use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_store::{
     AllocatorStateError, AllocatorStateFuture, ClusterOwnershipRead, ClusterResourceRead,
     ClusterResourceScopeRead, ClusterTopologyFuture, ClusterTopologyRead, ClusterTopologyReadError,
@@ -37,13 +37,13 @@ pub struct RedbReadStore {
 }
 
 impl RedbReadStore {
-    pub(super) fn new(accessor: std::sync::Arc<RedbAccessor>) -> Self {
+    pub fn new(accessor: std::sync::Arc<RedbAccessor>) -> Self {
         Self {
             core: RedbReadCore::new(accessor),
         }
     }
 
-    pub(super) const fn core(&self) -> &RedbReadCore {
+    pub const fn core(&self) -> &RedbReadCore {
         &self.core
     }
 

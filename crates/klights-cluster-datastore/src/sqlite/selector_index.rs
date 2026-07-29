@@ -14,7 +14,7 @@
 use serde_json::Value;
 
 use super::filters::resolve_field_path;
-use super::queries;
+use super::read_queries as queries;
 
 /// When residual selectors (inequality, notin, unindexed fields) are present,
 /// fetch `min(limit * FACTOR, MAX)` candidate rows from SQL, then apply
@@ -28,7 +28,7 @@ pub const SELECTOR_RESIDUAL_MAX_CANDIDATES: usize = 4096;
 /// Only paths that appear in Kubernetes field selectors are indexed.
 /// `metadata.name` and `metadata.namespace` are already pushed to SQL via
 /// `split_sql_pushdown_conditions` and do not need index table entries.
-pub(super) fn indexed_field_paths(api_version: &str, kind: &str) -> &'static [&'static str] {
+pub fn indexed_field_paths(api_version: &str, kind: &str) -> &'static [&'static str] {
     match (api_version, kind) {
         ("v1", "Pod") => &[
             "spec.nodeName",
@@ -76,11 +76,7 @@ pub(super) fn indexed_field_paths(api_version: &str, kind: &str) -> &'static [&'
 /// like `spec.nodeName` (absent = unscheduled, no schema default):
 /// defaulting them would make `spec.nodeName=foo` match every unscheduled
 /// pod.
-pub(super) fn indexed_field_default(
-    api_version: &str,
-    kind: &str,
-    path: &str,
-) -> Option<&'static str> {
+pub fn indexed_field_default(api_version: &str, kind: &str, path: &str) -> Option<&'static str> {
     klights_types::default_field_value(api_version, kind, path)
 }
 
@@ -100,7 +96,7 @@ fn extract_labels(data: &Value) -> Vec<(String, String)> {
 }
 
 /// Delete all index rows (labels + fields) for one resource.
-pub(super) fn delete_index_entries(
+pub fn delete_index_entries(
     conn: &rusqlite::Connection,
     api_version: &str,
     kind: &str,
@@ -123,7 +119,7 @@ pub(super) fn delete_index_entries(
 /// Accepts the serialized `data_bytes` to avoid requiring the caller to
 /// deserialize the JSON — the cost of one extra deserialization per write
 /// is negligible compared to the write itself.
-pub(super) fn upsert_index_entries(
+pub fn upsert_index_entries(
     conn: &rusqlite::Connection,
     api_version: &str,
     kind: &str,
@@ -190,7 +186,7 @@ fn insert_index_entries(
 
 /// Resolved pushdown plan for selector queries: SQL EXISTS/NOT EXISTS fragments
 /// from the index tables, plus residual requirements that must be evaluated in Rust.
-pub(super) struct SelectorPushdown {
+pub struct SelectorPushdown {
     /// SQL WHERE clause fragments (each is a complete AND-able condition).
     pub sql_clauses: Vec<String>,
     /// SQL parameter values, one Vec per clause (flattened into a single params vec at bind time).
@@ -198,7 +194,7 @@ pub(super) struct SelectorPushdown {
     /// Label requirements that cannot be pushed to SQL (Inequality, NotIn multi-value).
     pub residual_labels: Vec<klights_types::LabelRequirement>,
     /// Field conditions that cannot be pushed to SQL (not in indexed_field_paths).
-    pub residual_fields: Vec<super::filters::FieldSelectorCondition>,
+    pub residual_fields: Vec<klights_types::FieldRequirement>,
 }
 
 /// Build a pushdown plan from parsed label requirements and field conditions.
@@ -212,9 +208,9 @@ pub(super) struct SelectorPushdown {
 /// Pushable label variants: Equality, Inequality, Exists, NotExists, In,
 /// NotIn (all fully pushed via EXISTS/NOT EXISTS).
 /// Field conditions are pushed if their path is in `indexed_field_paths`.
-pub(super) fn build_selector_pushdown(
+pub fn build_selector_pushdown(
     label_requirements: &[klights_types::LabelRequirement],
-    field_conditions: &[super::filters::FieldSelectorCondition],
+    field_conditions: &[klights_types::FieldRequirement],
     api_version: &str,
     kind: &str,
     param_offset: usize,
@@ -423,7 +419,7 @@ mod tests {
     #[test]
     fn insert_index_entries_materializes_default_for_absent_unschedulable() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
         let data = json!({"metadata": {"name": "n"}, "spec": {}});
         let bytes = serde_json::to_vec(&data).unwrap();
         upsert_index_entries(&conn, "v1", "Node", "", "n", &bytes).unwrap();
@@ -440,7 +436,7 @@ mod tests {
     #[test]
     fn upsert_and_delete_round_trip() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {"labels": {"app": "test"}},
@@ -487,7 +483,7 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_entries() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data_v1 = json!({"metadata": {"labels": {"app": "v1"}}});
         let data_v2 = json!({"metadata": {"labels": {"app": "v2", "env": "prod"}}});
@@ -524,7 +520,7 @@ mod tests {
     #[test]
     fn cluster_scoped_uses_empty_namespace() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({"metadata": {"labels": {"role": "control-plane"}}, "spec": {"unschedulable": true}});
         upsert_index_entries(

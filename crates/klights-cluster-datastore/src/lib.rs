@@ -5,5 +5,6 @@
 //! and composition remain the responsibility of the root `klights` package.
 
 pub mod errors;
+mod position_membership;
 pub mod redb;
 pub mod sqlite;

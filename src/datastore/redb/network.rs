@@ -14,7 +14,7 @@ use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
-use super::read_core::RedbReadCore;
+use klights_cluster_datastore::redb::read_core::RedbReadCore;
 
 #[derive(Clone)]
 pub struct RedbNetworkStore {

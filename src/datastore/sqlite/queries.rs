@@ -9,13 +9,22 @@
 //! When porting to a second backend (`postgres/queries.rs`,
 //! `mysql/queries.rs`), this is the only file that needs translation.
 
+pub(super) use klights_cluster_datastore::sqlite::read_queries::CLUSTER_GET;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::METADATA_SELECT_RV_INT;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::NAMESPACE_GET;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::NAMESPACE_RESOURCES_COUNT;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::NAMESPACED_GET;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::NODE_SUBNET_SELECT_BY_NAME;
+#[cfg(test)]
+pub(super) use klights_cluster_datastore::sqlite::read_queries::OWNERSHIP_INDEXED_NAMESPACED_EMPTY_UID_BY_IDENTITY;
+pub(super) use klights_cluster_datastore::sqlite::read_queries::WATCH_EVENTS_MIN_RV;
+
 // ---------------------------------------------------------------------------
 // metadata / resource_version
 // ---------------------------------------------------------------------------
 
 pub(super) const METADATA_INCREMENT_RV: &str = "UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'resource_version'";
-pub(super) const METADATA_SELECT_RV_INT: &str =
-    "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'resource_version'";
 pub(super) const METADATA_SET_RV: &str =
     "UPDATE metadata SET value = ?1 WHERE key = 'resource_version'";
 
@@ -35,23 +44,6 @@ pub(super) const WATCH_EVENTS_INSERT: &str = "INSERT INTO watch_events (api_vers
 /// RV, same content) and distinguish it from real divergence.
 pub(super) const WATCH_EVENTS_SELECT_BY_IDENTITY_RV: &str = "SELECT event_type, data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5";
 
-pub(super) const WATCH_EVENTS_LIST_CLUSTER_SINCE: &str = "SELECT api_version, kind, NULL as namespace, name, resource_version, event_type, data \
-     FROM watch_events \
-     WHERE api_version = ?1 AND kind = ?2 AND namespace IS NULL AND resource_version > ?3 \
-     ORDER BY resource_version ASC, id ASC";
-
-pub(super) const WATCH_EVENTS_LIST_NAMESPACED_SINCE_HEAD: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
-     FROM watch_events \
-     WHERE api_version = ?1 AND kind = ?2 AND resource_version > ?3";
-
-pub(super) const WATCH_EVENTS_LIST_TARGETS_HEAD: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
-     FROM watch_events WHERE resource_version > ?1 AND (";
-
-pub(super) const WATCH_EVENTS_LIST_ALL_SINCE: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
-     FROM watch_events \
-     WHERE resource_version > ?1 \
-     ORDER BY resource_version ASC, id ASC";
-
 /// memory-improvement.md §10 P1: keyset-paginated form of
 /// `WATCH_EVENTS_LIST_ALL_SINCE`. Adds the `id` column (for the next cursor)
 /// and restricts to rows strictly AFTER `(?2, ?3)` in the same
@@ -64,11 +56,6 @@ pub(super) const WATCH_EVENTS_LIST_ALL_SINCE_PAGED: &str = "SELECT api_version, 
      ORDER BY resource_version ASC, id ASC \
      LIMIT ?4";
 
-pub(super) const WATCH_EVENTS_LIST_DELETED_SINCE: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
-     FROM watch_events \
-     WHERE resource_version > ?1 AND event_type = 'DELETED' \
-     ORDER BY resource_version ASC, id ASC";
-
 #[cfg(test)]
 pub(super) const WATCH_EVENTS_COUNT: &str = "SELECT COUNT(*) FROM watch_events";
 
@@ -76,9 +63,6 @@ pub(super) const WATCH_EVENTS_COUNT: &str = "SELECT COUNT(*) FROM watch_events";
 /// first) and `resource_version` is monotonic with id, so the row with the
 /// smallest id carries the smallest retained RV. Used to detect watches whose
 /// resume point predates the window (→ `410 Gone`).
-pub(super) const WATCH_EVENTS_MIN_RV: &str =
-    "SELECT resource_version FROM watch_events ORDER BY id ASC LIMIT 1";
-
 pub(super) const WATCH_EVENTS_SCOPE_COUNT: &str = "SELECT COUNT(*) FROM (
          SELECT 1 FROM watch_events
          GROUP BY api_version, kind, COALESCE(namespace, '#cluster')
@@ -92,14 +76,6 @@ pub(super) const WATCH_REPLAY_FLOOR_UPSERT: &str =
      DO UPDATE SET floor_rv = MAX(watch_replay_floors.floor_rv, excluded.floor_rv),
                    floor_event_id = MAX(watch_replay_floors.floor_event_id, excluded.floor_event_id),
                    floor_position_exact = 1";
-
-pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_SCOPE: &str =
-    "SELECT floor_rv, floor_event_id, floor_position_exact FROM watch_replay_floors
-     WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3";
-
-pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_NAMESPACED_ALL: &str =
-    "SELECT floor_rv, floor_event_id, floor_position_exact FROM watch_replay_floors
-     WHERE api_version = ?1 AND kind = ?2 AND namespace_key <> '#cluster'";
 
 pub(super) const WATCH_EVENTS_GC_CANDIDATES: &str =
     "SELECT id, api_version, kind, COALESCE(namespace, '#cluster'), resource_version
@@ -212,12 +188,6 @@ pub(super) const NAMESPACES_UPSERT_EXACT: &str = "INSERT INTO namespaces \
      ON CONFLICT(name) DO UPDATE SET \
      uid = excluded.uid, resource_version = excluded.resource_version, data = excluded.data";
 
-pub(super) const NAMESPACE_GET: &str =
-    "SELECT name, resource_version, uid, data FROM namespaces WHERE name = ?1";
-
-pub(super) const NAMESPACES_LIST_HEAD: &str =
-    "SELECT name, resource_version, uid, data FROM namespaces";
-
 pub(super) const NAMESPACE_UPDATE: &str = "UPDATE namespaces SET uid = ?1, resource_version = ?2, data = ?3 WHERE name = ?4 AND resource_version = ?5";
 
 pub(super) const NAMESPACE_GET_DATA: &str = "SELECT data FROM namespaces WHERE name = ?1";
@@ -228,27 +198,6 @@ pub(super) const NAMESPACE_RESOURCES_DELETE_NON_PODS: &str = "DELETE FROM namesp
 pub(super) const NAMESPACE_DELETE: &str = "DELETE FROM namespaces WHERE name = ?1";
 
 pub(super) const NAMESPACE_EXISTS: &str = "SELECT 1 FROM namespaces WHERE name = ?1";
-
-pub(super) const NAMESPACE_RESOURCES_LIST_ALL: &str =
-    "SELECT id, api_version, kind, namespace, name, resource_version, uid, data
-     FROM namespaced_resources
-     WHERE namespace = ?1
-     ORDER BY kind, name";
-
-pub(super) const NAMESPACE_RESOURCES_LIST_OF_KIND: &str =
-    "SELECT id, api_version, kind, namespace, name, resource_version, uid, data
-     FROM namespaced_resources
-     WHERE namespace = ?1 AND kind = ?2
-     ORDER BY kind, name";
-
-pub(super) const NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND: &str =
-    "SELECT id, api_version, kind, namespace, name, resource_version, uid, data
-     FROM namespaced_resources
-     WHERE namespace = ?1 AND kind <> ?2
-     ORDER BY kind, name";
-
-pub(super) const NAMESPACE_RESOURCES_COUNT: &str =
-    "SELECT COUNT(*) FROM namespaced_resources WHERE namespace = ?1";
 
 // ---------------------------------------------------------------------------
 // namespaced_resources / cluster_resources core CRUD
@@ -267,36 +216,6 @@ pub(super) const CLUSTER_UPSERT_EXACT: &str = "INSERT INTO cluster_resources \
      VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6) \
      ON CONFLICT(api_version, kind, name) DO UPDATE SET \
      uid = excluded.uid, resource_version = excluded.resource_version, data = excluded.data";
-
-pub(super) const NAMESPACED_GET_EVENT_COMPAT: &str = "SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version IN ('v1', 'events.k8s.io/v1') AND kind = ?1 AND namespace = ?2 AND name = ?3 LIMIT 1";
-
-pub(super) const NAMESPACED_GET: &str = "SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2 AND namespace = ?3 AND name = ?4";
-
-pub(super) const CLUSTER_GET: &str = "SELECT id, api_version, kind, name, resource_version, uid, data FROM cluster_resources WHERE api_version = ?1 AND kind = ?2 AND name = ?3";
-
-pub(super) const NAMESPACED_LIST_HEAD: &str = "SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources ";
-
-pub(super) const NAMESPACED_COUNT_HEAD: &str = "SELECT COUNT(*) FROM namespaced_resources ";
-
-pub(super) const CLUSTER_LIST_HEAD: &str = "SELECT id, api_version, kind, name, resource_version, uid, data FROM cluster_resources WHERE api_version = ?1 AND kind = ?2";
-
-pub(super) const CLUSTER_LIST_ALL: &str = "SELECT id, api_version, kind, name, resource_version, uid, data FROM cluster_resources ORDER BY api_version, kind, name";
-
-pub(super) const CLUSTER_COUNT_HEAD: &str =
-    "SELECT COUNT(*) FROM cluster_resources WHERE api_version = ?1 AND kind = ?2";
-
-pub(super) const NAMESPACED_LIST_BY_AV_KIND_HEAD: &str = "WHERE api_version = ?1 AND kind = ?2";
-
-pub(super) const NAMESPACED_LIST_BY_KIND_EVENT_COMPAT_HEAD: &str =
-    "WHERE api_version IN ('v1', 'events.k8s.io/v1') AND kind = ?1";
-
-pub(super) const NAMESPACED_KEYS_FOR_SCOPE: &str = "SELECT namespace, name
-         FROM namespaced_resources
-         WHERE api_version = ?1 AND kind = ?2";
-
-pub(super) const CLUSTER_KEYS_FOR_SCOPE: &str = "SELECT name
-         FROM cluster_resources
-         WHERE api_version = ?1 AND kind = ?2";
 
 pub(super) const NAMESPACED_UPDATE_BY_RV: &str = "UPDATE namespaced_resources SET resource_version = ?1, uid = ?2, data = ?3 WHERE api_version = ?4 AND kind = ?5 AND namespace = ?6 AND name = ?7 AND (?8 IS NULL OR resource_version = ?8) AND (?9 IS NULL OR uid = ?9)";
 
@@ -359,10 +278,6 @@ pub(super) const CLUSTER_PATCH_WATCH_INSERT: &str = "INSERT INTO watch_events
 // node_subnets
 // ---------------------------------------------------------------------------
 
-pub(super) const NODE_SUBNET_SELECT_BY_NAME: &str = "SELECT node_name, subnet, subnet_base_int, gateway_ip, \
-                node_ip, mode, hostport_range \
-         FROM node_subnets WHERE node_name = ?1";
-
 pub(super) const NODE_SUBNET_INSERT_OR_IGNORE: &str = "INSERT OR IGNORE INTO node_subnets \
          (node_name, subnet, subnet_base_int, gateway_ip, \
           node_ip, mode, hostport_range, created_at) \
@@ -378,10 +293,6 @@ pub(super) const NODE_SUBNET_UPSERT_EXACT: &str = "INSERT INTO node_subnets \
          node_ip = excluded.node_ip, \
          mode = excluded.mode, \
          hostport_range = excluded.hostport_range";
-
-pub(super) const NODE_SUBNET_LIST_PEERS: &str = "SELECT node_name, subnet, subnet_base_int, gateway_ip, \
-                node_ip, mode, hostport_range \
-         FROM node_subnets WHERE node_name != ?1";
 
 pub(super) const NODE_SUBNET_UPDATE_PEER_ATTRIBUTES: &str =
     "UPDATE node_subnets SET mode = ?1, hostport_range = ?2 WHERE node_name = ?3";
@@ -401,39 +312,11 @@ pub(super) const NODE_DATAPLANE_UPSERT: &str = concat!(
     "updated_at = excluded.updated_at"
 );
 
-pub(super) const NODE_DATAPLANE_SELECT_BY_NAME: &str = "SELECT node_name, mode, encryption, public_key, endpoint, port \
-       FROM node_dataplane WHERE node_name = ?1";
-
 pub(super) const NODE_DATAPLANE_DELETE: &str = "DELETE FROM node_dataplane WHERE node_name = ?1";
 
 // ---------------------------------------------------------------------------
 // ownership / owner_uid lookups via resource_owner_refs index
 // ---------------------------------------------------------------------------
-
-pub(super) const OWNERSHIP_INDEXED_NAMESPACED_BY_UID: &str = "SELECT r.id, r.api_version, r.kind, r.namespace, r.name, r.resource_version, r.uid, r.data \
-     FROM namespaced_resources r \
-     INNER JOIN resource_owner_refs o ON o.api_version = r.api_version AND o.kind = r.kind AND o.namespace = r.namespace AND o.name = r.name \
-     WHERE o.owner_uid = ?1";
-
-pub(super) const OWNERSHIP_INDEXED_CLUSTER_BY_UID: &str = "SELECT r.id, r.api_version, r.kind, r.name, r.resource_version, r.uid, r.data \
-     FROM cluster_resources r \
-     INNER JOIN resource_owner_refs o ON o.api_version = r.api_version AND o.kind = r.kind AND o.namespace = '' AND o.name = r.name \
-     WHERE o.owner_uid = ?1";
-
-pub(super) const OWNERSHIP_INDEXED_NAMESPACED_BY_KIND_AV_UID: &str = "SELECT r.id, r.api_version, r.kind, r.namespace, r.name, r.resource_version, r.uid, r.data \
-     FROM namespaced_resources r \
-     INNER JOIN resource_owner_refs o ON o.api_version = r.api_version AND o.kind = r.kind AND o.namespace = r.namespace AND o.name = r.name \
-     WHERE r.kind = ?1 AND r.namespace = ?2 AND r.api_version = ?3 AND o.owner_uid = ?4";
-
-pub(super) const OWNERSHIP_INDEXED_CLUSTER_BY_KIND_AV_UID: &str = "SELECT r.id, r.api_version, r.kind, r.name, r.resource_version, r.uid, r.data \
-     FROM cluster_resources r \
-     INNER JOIN resource_owner_refs o ON o.api_version = r.api_version AND o.kind = r.kind AND o.namespace = '' AND o.name = r.name \
-     WHERE r.kind = ?1 AND r.api_version = ?2 AND o.owner_uid = ?3";
-
-pub(super) const OWNERSHIP_INDEXED_NAMESPACED_EMPTY_UID_BY_IDENTITY: &str = "SELECT r.id, r.api_version, r.kind, r.namespace, r.name, r.resource_version, r.uid, r.data \
-     FROM resource_owner_refs o \
-     INNER JOIN namespaced_resources r ON r.api_version = o.api_version AND r.kind = o.kind AND r.namespace = o.namespace AND r.name = o.name \
-     WHERE o.owner_kind = ?1 AND o.owner_name = ?2 AND o.owner_uid = ''";
 
 pub(super) const SELECT_KLIGHTS_META: &str = "SELECT value FROM _klights_meta WHERE key = ?1";
 
@@ -454,14 +337,6 @@ pub(super) const APPLIED_OUTBOX_DELETE_BY_KEY: &str =
 // ---------------------------------------------------------------------------
 // Selector index tables (resource_labels, resource_fields)
 // ---------------------------------------------------------------------------
-
-pub(super) const LABEL_INDEX_DELETE_FOR_RESOURCE: &str = "DELETE FROM resource_labels WHERE api_version = ?1 AND kind = ?2 AND namespace = ?3 AND name = ?4";
-
-pub(super) const FIELD_INDEX_DELETE_FOR_RESOURCE: &str = "DELETE FROM resource_fields WHERE api_version = ?1 AND kind = ?2 AND namespace = ?3 AND name = ?4";
-
-pub(super) const LABEL_INDEX_INSERT: &str = "INSERT INTO resource_labels (api_version, kind, namespace, name, key, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
-
-pub(super) const FIELD_INDEX_INSERT: &str = "INSERT INTO resource_fields (api_version, kind, namespace, name, field, value) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
 pub(super) const REPLACE_STATE_DELETE_RESOURCE_LABELS: &str = "DELETE FROM resource_labels";
 pub(super) const REPLACE_STATE_DELETE_RESOURCE_FIELDS: &str = "DELETE FROM resource_fields";

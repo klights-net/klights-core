@@ -245,8 +245,8 @@ mod tests {
 
     #[test]
     fn concrete_read_stores_own_every_focused_read_port() {
-        assert_all_focused_read_ports::<crate::datastore::sqlite::read_store::SqliteReadStore>();
-        assert_all_focused_read_ports::<crate::datastore::redb::read_store::RedbReadStore>();
+        assert_all_focused_read_ports::<klights_cluster_datastore::sqlite::SqliteReadStore>();
+        assert_all_focused_read_ports::<klights_cluster_datastore::redb::RedbReadStore>();
     }
 
     async fn open_selected(request: PassiveStoreOpenRequest<'_>) -> OpenedPassiveStore {

@@ -1,8 +1,8 @@
 use super::owner_ref_index;
 use super::queries;
-use super::selector_index;
 use super::*;
 use anyhow::{Result, anyhow};
+use klights_cluster_datastore::sqlite::selector_index;
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 

@@ -1,9 +1,9 @@
 use std::net::Ipv4Addr;
 
+use crate::errors;
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
-use klights_cluster_datastore::errors;
 use klights_cluster_store::{
     AllocatorStateError, AllocatorStateFuture, ClusterOwnershipRead, ClusterResourceRead,
     ClusterResourceScopeRead, ClusterTopologyFuture, ClusterTopologyRead, ClusterTopologyReadError,
@@ -28,42 +28,41 @@ use klights_types::{HostPortRange, LabelSelector, NodeName, NodePeerMode, PodSub
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
-use super::queries;
+use super::read_queries as queries;
 
 /// Passive SQLite implementation of cluster resource/history/topology reads.
 #[derive(Clone)]
 pub struct SqliteReadStore {
     executor: DbExecutor,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(test)]
-    pub(in crate::datastore::sqlite) resource_get_call_count:
-        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
-pub(in crate::datastore::sqlite) struct SqliteResourceList {
-    pub(in crate::datastore::sqlite) items: Vec<Resource>,
-    pub(in crate::datastore::sqlite) resource_version: i64,
-    pub(in crate::datastore::sqlite) watch_replay_position: Option<WatchReplayPosition>,
-    pub(in crate::datastore::sqlite) continue_token: Option<String>,
-    pub(in crate::datastore::sqlite) remaining_item_count: Option<i64>,
+pub struct SqliteResourceList {
+    pub items: Vec<Resource>,
+    pub resource_version: i64,
+    pub watch_replay_position: Option<WatchReplayPosition>,
+    pub continue_token: Option<String>,
+    pub remaining_item_count: Option<i64>,
 }
 
-pub(in crate::datastore::sqlite) enum SqliteCheckedWatchRead {
+pub enum SqliteCheckedWatchRead {
     Events(Vec<DurableWatchEvent>),
     Expired,
 }
 
 #[derive(Clone, Copy)]
-pub(in crate::datastore::sqlite) struct SqliteResourceListQuery<'a> {
-    pub(in crate::datastore::sqlite) label_selector: Option<&'a str>,
-    pub(in crate::datastore::sqlite) field_selector: Option<&'a str>,
-    pub(in crate::datastore::sqlite) limit: Option<i64>,
-    pub(in crate::datastore::sqlite) continue_token: Option<&'a str>,
+pub struct SqliteResourceListQuery<'a> {
+    pub label_selector: Option<&'a str>,
+    pub field_selector: Option<&'a str>,
+    pub limit: Option<i64>,
+    pub continue_token: Option<&'a str>,
 }
 
 impl<'a> SqliteResourceListQuery<'a> {
-    pub(in crate::datastore::sqlite) const fn new(
+    pub const fn new(
         label_selector: Option<&'a str>,
         field_selector: Option<&'a str>,
         limit: Option<i64>,
@@ -1086,23 +1085,32 @@ fn map_resource_error(error: anyhow::Error) -> ResourceReadError {
 }
 
 impl SqliteReadStore {
-    pub fn new(
+    pub fn new(executor: DbExecutor) -> Self {
+        Self {
+            executor,
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_watch_position_observation: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+            #[cfg(any(test, feature = "test-support"))]
+            resource_get_call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn new_with_test_instrumentation(
         executor: DbExecutor,
-        #[cfg(test)] fail_next_watch_position_observation: std::sync::Arc<
-            std::sync::atomic::AtomicBool,
-        >,
-        #[cfg(test)] resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             executor,
-            #[cfg(test)]
             fail_next_watch_position_observation,
-            #[cfg(test)]
             resource_get_call_count,
         }
     }
 
-    pub(crate) async fn read_db_call<T, F>(
+    pub async fn read_db_call<T, F>(
         &self,
         label: &'static str,
         operation: F,
@@ -1143,7 +1151,7 @@ impl SqliteReadStore {
         })
     }
 
-    pub(crate) async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
+    pub async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
         let name = name.to_string();
         let result = self
             .read_db_call("db_query", move |connection| {
@@ -1175,7 +1183,7 @@ impl SqliteReadStore {
         }
     }
 
-    pub(in crate::datastore::sqlite) async fn list_namespaces(
+    pub async fn list_namespaces(
         &self,
         label_selector: Option<&str>,
         field_selector: Option<&str>,
@@ -1253,7 +1261,7 @@ impl SqliteReadStore {
         .map_err(|error| anyhow!("Failed to list namespaces: {error}"))
     }
 
-    pub(in crate::datastore::sqlite) async fn list_namespaces_page(
+    pub async fn list_namespaces_page(
         &self,
         label_selector: Option<&str>,
         field_selector: Option<&str>,
@@ -1278,12 +1286,12 @@ impl SqliteReadStore {
         Ok(list)
     }
 
-    pub(crate) async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
+    pub async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
         self.list_namespace_resources_filtered(namespace, SqliteNamespaceKindFilter::All)
             .await
     }
 
-    pub(crate) async fn list_namespace_resources_of_kind(
+    pub async fn list_namespace_resources_of_kind(
         &self,
         namespace: &str,
         kind: &str,
@@ -1292,7 +1300,7 @@ impl SqliteReadStore {
             .await
     }
 
-    pub(crate) async fn list_namespace_resources_excluding_kind(
+    pub async fn list_namespace_resources_excluding_kind(
         &self,
         namespace: &str,
         kind: &str,
@@ -1361,7 +1369,7 @@ impl SqliteReadStore {
         Ok(rows)
     }
 
-    pub(crate) async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
+    pub async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
         let namespace = namespace.to_string();
         let count = self
             .read_db_call("db_query", move |connection| {
@@ -1377,10 +1385,7 @@ impl SqliteReadStore {
         Ok(count)
     }
 
-    pub(crate) async fn get_node_subnet(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<StoredNodeSubnet>> {
+    pub async fn get_node_subnet(&self, node_name: &str) -> Result<Option<StoredNodeSubnet>> {
         let node_name = node_name.to_string();
         self.read_db_call("db_query", move |connection| {
             connection
@@ -1396,7 +1401,7 @@ impl SqliteReadStore {
         .map_err(|error| anyhow!("Failed to get node subnet: {error}"))
     }
 
-    pub(crate) async fn list_peer_subnets(
+    pub async fn list_peer_subnets(
         &self,
         request: PeerTopologyRequest,
     ) -> Result<Vec<StoredNodeSubnet>> {
@@ -1414,7 +1419,7 @@ impl SqliteReadStore {
         .map_err(|error| anyhow!("Failed to list peer subnets: {error}"))
     }
 
-    pub(crate) async fn get_node_dataplane(
+    pub async fn get_node_dataplane(
         &self,
         node_name: &str,
     ) -> Result<Option<DataplanePeerMetadata>> {
@@ -1433,10 +1438,10 @@ impl SqliteReadStore {
         .map_err(|error| anyhow!("Failed to get node dataplane metadata: {error}"))
     }
 
-    pub(crate) async fn read_allocator_state(
+    pub async fn read_allocator_state(
         &self,
     ) -> std::result::Result<DurableAllocatorState, AllocatorStateError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self
             .fail_next_watch_position_observation
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -1482,7 +1487,7 @@ impl SqliteReadStore {
         DurableAllocatorState::try_new(position)
     }
 
-    pub(in crate::datastore::sqlite) async fn replay_watch_events_since_checked(
+    pub async fn replay_watch_events_since_checked(
         &self,
         targets: &[klights_cluster_store::DurableWatchTarget],
         since_resource_version: i64,
@@ -1566,7 +1571,7 @@ impl SqliteReadStore {
                     .await
                     .map_err(map_resource_error)?
                 {
-                    super::crud::snapshot::ExactSnapshotRead::Current => {
+                    super::snapshot::ExactSnapshotRead::Current => {
                         let mut page = SqliteReadStore::list_resources(
                             self,
                             request.api_version(),
@@ -1592,13 +1597,13 @@ impl SqliteReadStore {
                             query.limit(),
                         )?))
                     }
-                    super::crud::snapshot::ExactSnapshotRead::Expired => {
+                    super::snapshot::ExactSnapshotRead::Expired => {
                         Err(ResourceReadError::Expired {
                             requested,
                             oldest_available: 0,
                         })
                     }
-                    super::crud::snapshot::ExactSnapshotRead::List(page) => {
+                    super::snapshot::ExactSnapshotRead::List(page) => {
                         Ok(ResourceListRead::Historical(page))
                     }
                 }

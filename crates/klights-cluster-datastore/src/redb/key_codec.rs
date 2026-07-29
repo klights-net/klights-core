@@ -24,7 +24,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 /// Encode a resource identity into an ordered byte key.
 /// Table selection (RES_CLUSTER vs RES_NS) is done by the caller;
 /// this function builds the key WITHOUT a scope_byte prefix.
-pub(super) fn resource_key(av: &str, kind: &str, ns: Option<&str>, name: &str) -> Vec<u8> {
+pub fn resource_key(av: &str, kind: &str, ns: Option<&str>, name: &str) -> Vec<u8> {
     let mut buf =
         Vec::with_capacity(av.len() + kind.len() + name.len() + ns.map_or(0, |n| n.len()) + 6);
     push_str(&mut buf, av);
@@ -39,7 +39,7 @@ pub(super) fn resource_key(av: &str, kind: &str, ns: Option<&str>, name: &str) -
 /// Build the key prefix for a resource kind, without the name.
 /// For RES_NS: [av][kind][ns] (or just [av][kind] when ns is None).
 /// For RES_CLUSTER: [av][kind].
-pub(super) fn resource_prefix(av: &str, kind: &str, ns: Option<&str>) -> Vec<u8> {
+pub fn resource_prefix(av: &str, kind: &str, ns: Option<&str>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(av.len() + kind.len() + ns.map_or(0, |n| n.len()) + 4);
     push_str(&mut buf, av);
     push_str(&mut buf, kind);
@@ -58,7 +58,7 @@ fn push_str(buf: &mut Vec<u8>, s: &str) {
 /// Decode a resource key back into its components.
 /// The key no longer has a scope_byte — scope is determined by which table the
 /// key came from (RES_CLUSTER → None, RES_NS → Some(ns)).
-pub(super) fn decode_resource_key(
+pub fn decode_resource_key(
     key: &[u8],
     namespaced: bool,
 ) -> Option<(&str, &str, Option<&str>, &str)> {
@@ -86,7 +86,7 @@ fn pop_str(data: &[u8]) -> Option<(&str, &[u8])> {
 
 /// Lexicographic next byte sequence.  Increments the last byte with carry
 /// propagation.  Returns `None` for `\xFF\xFF...` (overflow → use unbounded upper).
-pub(super) fn lex_next(key: &[u8]) -> Option<Vec<u8>> {
+pub fn lex_next(key: &[u8]) -> Option<Vec<u8>> {
     let mut v = key.to_vec();
     for byte in v.iter_mut().rev() {
         let (next, overflow) = byte.overflowing_add(1);
