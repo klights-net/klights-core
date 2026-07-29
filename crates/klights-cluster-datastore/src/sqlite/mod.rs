@@ -14,6 +14,7 @@ mod position_membership;
 pub mod read_helpers;
 pub mod read_queries;
 pub mod read_store;
+pub mod recovery;
 mod replay_floor;
 mod resource_read;
 pub mod resource_shape;

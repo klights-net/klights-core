@@ -14,19 +14,19 @@ use klights_supervisor::sqlite_open::{OpenOpts, OpenPath};
 
 const MAX_CONCURRENT_SNAPSHOT_SESSIONS: usize = 2;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
-pub(crate) struct SnapshotCapturePagePause {
-    pub(crate) reached: Arc<tokio::sync::Notify>,
-    pub(crate) resume: Arc<tokio::sync::Notify>,
+pub struct SnapshotCapturePagePause {
+    pub reached: Arc<tokio::sync::Notify>,
+    pub resume: Arc<tokio::sync::Notify>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static SNAPSHOT_CAPTURE_PAGE_PAUSE: std::sync::Mutex<Option<SnapshotCapturePagePause>> =
     std::sync::Mutex::new(None);
 
-#[cfg(test)]
-pub(crate) fn install_snapshot_capture_page_pause() -> SnapshotCapturePagePause {
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_snapshot_capture_page_pause() -> SnapshotCapturePagePause {
     let pause = SnapshotCapturePagePause {
         reached: Arc::new(tokio::sync::Notify::new()),
         resume: Arc::new(tokio::sync::Notify::new()),
@@ -36,7 +36,7 @@ pub(crate) fn install_snapshot_capture_page_pause() -> SnapshotCapturePagePause 
 }
 
 #[derive(Clone)]
-pub(crate) struct SqliteSnapshotFactory {
+pub struct SqliteSnapshotFactory {
     opts: OpenOpts,
     supervisor: Arc<klights_supervisor::TaskSupervisor>,
     permits: Arc<tokio::sync::Semaphore>,
@@ -44,7 +44,7 @@ pub(crate) struct SqliteSnapshotFactory {
 }
 
 impl SqliteSnapshotFactory {
-    pub(crate) fn new(opts: OpenOpts, supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
+    pub fn new(opts: OpenOpts, supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
         let serialize_writes = matches!(&opts.path, OpenPath::SharedMemory(_));
         Self {
             opts,
@@ -56,16 +56,21 @@ impl SqliteSnapshotFactory {
         }
     }
 
-    pub(crate) async fn open(
+    pub async fn begin_snapshot(
         &self,
         request: SnapshotCaptureRequest,
-    ) -> Result<PreparedSqliteSnapshot> {
+        fence: klights_cluster_store::SnapshotExclusiveFence,
+    ) -> Result<Box<dyn SnapshotCaptureSession>> {
+        self.open(request).await?.pin(fence).await
+    }
+
+    async fn open(&self, request: SnapshotCaptureRequest) -> Result<PreparedSqliteSnapshot> {
         let permit = self.permits.clone().try_acquire_owned().map_err(|_| {
             anyhow::Error::new(SnapshotPersistenceError::ResourceExhausted {
                 message: "snapshot session capacity exhausted".to_string(),
             })
         })?;
-        let executor = klights_cluster_datastore::sqlite::open_read_only_with_opts(
+        let executor = crate::sqlite::open_read_only_with_opts(
             self.opts.clone(),
             self.supervisor.clone(),
             "sqlite:cluster-snapshot",
@@ -80,7 +85,7 @@ impl SqliteSnapshotFactory {
     }
 }
 
-pub(crate) struct PreparedSqliteSnapshot {
+struct PreparedSqliteSnapshot {
     executor: DbExecutor,
     request: SnapshotCaptureRequest,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -88,7 +93,7 @@ pub(crate) struct PreparedSqliteSnapshot {
 }
 
 impl PreparedSqliteSnapshot {
-    pub(crate) async fn pin(
+    async fn pin(
         self,
         fence: klights_cluster_store::SnapshotExclusiveFence,
     ) -> Result<Box<dyn SnapshotCaptureSession>> {
@@ -121,7 +126,7 @@ impl PreparedSqliteSnapshot {
             dropped: tokio::sync::Notify::new(),
             permit: std::sync::Mutex::new(Some(permit)),
             fence: std::sync::Mutex::new(retained_fence),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_rollback: std::sync::atomic::AtomicBool::new(false),
         });
         let drop_cleanup = cleanup.clone();
@@ -211,7 +216,7 @@ impl SnapshotCaptureSession for SqliteSnapshotSession {
                     })
                     .await
                     .map_err(map_sqlite_snapshot_error)?;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if page.is_some() {
                     let pause = SNAPSHOT_CAPTURE_PAGE_PAUSE.lock().unwrap().take();
                     if let Some(pause) = pause {
@@ -259,7 +264,7 @@ struct SessionCleanup {
     dropped: tokio::sync::Notify,
     permit: std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
     fence: std::sync::Mutex<Option<klights_cluster_store::SnapshotExclusiveFence>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_rollback: std::sync::atomic::AtomicBool,
 }
 
@@ -272,12 +277,12 @@ impl SessionCleanup {
         {
             return Ok(());
         }
-        let rollback = if cfg!(test) && {
-            #[cfg(test)]
+        let rollback = if cfg!(any(test, feature = "test-support")) && {
+            #[cfg(any(test, feature = "test-support"))]
             {
                 self.fail_rollback.load(Ordering::Acquire)
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             {
                 false
             }
@@ -308,30 +313,140 @@ impl SessionCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::DatastoreBackend;
-    use crate::datastore::sqlite::Datastore;
     use klights_cluster_core::{LogApplyAppliedOutboxRow, LogApplyMutation};
+    use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
     use serde_json::json;
 
-    async fn persistent_store() -> (tempfile::TempDir, Datastore) {
+    struct TestStore {
+        executor: DbExecutor,
+        factory: SqliteSnapshotFactory,
+        snapshot_fence: Arc<tokio::sync::RwLock<()>>,
+    }
+
+    impl TestStore {
+        async fn open(opts: OpenOpts) -> Self {
+            let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            ));
+            let executor =
+                crate::sqlite::open_with_opts(opts.clone(), supervisor.clone(), "recovery-test")
+                    .await
+                    .unwrap();
+            Self {
+                executor,
+                factory: SqliteSnapshotFactory::new(opts, supervisor),
+                snapshot_fence: Arc::new(tokio::sync::RwLock::new(())),
+            }
+        }
+
+        async fn new_in_memory() -> Self {
+            Self::open(OpenOpts::shared_memory("recovery-test")).await
+        }
+
+        async fn set_klights_meta(&self, key: &'static str, value: &'static str) {
+            self.executor
+                .call_raw("recovery-test:set-meta", move |conn| {
+                    conn.execute(crate::sqlite::META_INSERT, (key, value))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn create_resource(&self, name: &'static str, data: serde_json::Value) {
+            let data = serde_json::to_vec(&data).unwrap();
+            self.executor
+                .call_raw("recovery-test:create-resource", move |conn| {
+                    conn.execute(
+                        "INSERT INTO namespaced_resources
+                         (api_version,kind,namespace,name,uid,resource_version,created_rv,data)
+                         VALUES('v1','ConfigMap','default',?1,?2,1,1,?3)",
+                        rusqlite::params![name, format!("uid-{name}"), data],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn has_resource(&self, name: &'static str) -> bool {
+            self.executor
+                .call_raw("recovery-test:has-resource", move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM namespaced_resources
+                            WHERE api_version='v1' AND kind='ConfigMap'
+                              AND namespace='default' AND name=?1
+                         )",
+                        [name],
+                        |row| row.get::<_, bool>(0),
+                    )?)
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn insert_applied_outbox(&self, row: LogApplyAppliedOutboxRow) {
+            self.executor
+                .call_raw("recovery-test:insert-applied-outbox", move |conn| {
+                    conn.execute(
+                        "INSERT INTO applied_outbox
+                         (idempotency_key,subject_key,operation,first_seen_ms,applied_rv,
+                          result_proto,status_stamp)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                        rusqlite::params![
+                            row.idempotency_key,
+                            row.subject_key,
+                            row.operation,
+                            row.first_seen_ms,
+                            row.applied_rv,
+                            row.result_proto,
+                            row.status_stamp,
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn db_call<T, F>(&self, query_name: &'static str, call: F) -> T
+        where
+            T: Send + 'static,
+            F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+        {
+            self.executor.call_raw(query_name, call).await.unwrap()
+        }
+
+        async fn acquire_snapshot_exclusive_fence(&self) -> SnapshotExclusiveFence {
+            SnapshotExclusiveFence::new(self.snapshot_fence.clone().write_owned().await)
+        }
+
+        async fn acquire_snapshot_mutation_fence(&self) -> SnapshotMutationFence {
+            SnapshotMutationFence::new(self.snapshot_fence.clone().read_owned().await)
+        }
+
+        async fn begin_pinned_snapshot_capture(
+            &self,
+            request: SnapshotCaptureRequest,
+            fence: SnapshotExclusiveFence,
+        ) -> Box<dyn SnapshotCaptureSession> {
+            self.factory.begin_snapshot(request, fence).await.unwrap()
+        }
+    }
+
+    async fn persistent_store() -> (tempfile::TempDir, TestStore) {
         let root = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
-            klights_supervisor::TaskCategoryConfig::default(),
-        ));
-        let db = Datastore::new_persistent_paths(&root.path().join("cluster.db"), supervisor, None)
-            .await
-            .unwrap();
+        let db = TestStore::open(OpenOpts::disk(root.path().join("cluster.db"))).await;
         db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "pinned-cluster")
-            .await
-            .unwrap();
+            .await;
         db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
-            .await
-            .unwrap();
+            .await;
         (root, db)
     }
 
@@ -347,54 +462,35 @@ mod tests {
     }
 
     async fn begin_capture(
-        db: &Datastore,
+        db: &TestStore,
         request: SnapshotCaptureRequest,
     ) -> Box<dyn SnapshotCaptureSession> {
-        let fence = DatastoreBackend::acquire_snapshot_exclusive_fence(db)
-            .await
-            .unwrap()
-            .expect("SQLite supplies a snapshot capture fence");
-        db.begin_pinned_snapshot_capture(request, fence)
-            .await
-            .unwrap()
+        let fence = db.acquire_snapshot_exclusive_fence().await;
+        db.begin_pinned_snapshot_capture(request, fence).await
     }
 
     #[tokio::test]
     async fn sqlite_in_memory_capture_round_trips_through_pinned_session() {
-        let db = Arc::new(Datastore::new_in_memory().await.unwrap());
+        let db = Arc::new(TestStore::new_in_memory().await);
         db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "memory-cluster")
-            .await
-            .unwrap();
+            .await;
         db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
-            .await
-            .unwrap();
+            .await;
         db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
             "before-anchor",
             json!({"metadata":{"name":"before-anchor","namespace":"default"}}),
         )
-        .await
-        .unwrap();
+        .await;
         let mut session = begin_capture(db.as_ref(), request()).await;
         let writer_db = db.clone();
         let writer = tokio::spawn(async move {
-            let _mutation_fence =
-                DatastoreBackend::acquire_snapshot_mutation_fence(writer_db.as_ref())
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let _mutation_fence = writer_db.acquire_snapshot_mutation_fence().await;
             writer_db
                 .create_resource(
-                    "v1",
-                    "ConfigMap",
-                    Some("default"),
                     "after-snapshot",
                     json!({"metadata":{"name":"after-snapshot","namespace":"default"}}),
                 )
-                .await
-                .unwrap();
+                .await;
         });
         tokio::task::yield_now().await;
         assert!(
@@ -417,48 +513,30 @@ mod tests {
         assert!(names.iter().any(|name| name == "before-anchor"));
         assert_eq!(session.header().metadata().cluster_id, "memory-cluster");
         writer.await.unwrap();
-        assert!(
-            db.get_resource("v1", "ConfigMap", Some("default"), "after-snapshot")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(db.has_resource("after-snapshot").await);
     }
 
     #[tokio::test]
     async fn sqlite_pinned_session_releases_fence_and_excludes_post_anchor_apply() {
         let (_root, db) = persistent_store().await;
         db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
             "before-anchor",
             json!({"metadata":{"name":"before-anchor","namespace":"default"}}),
         )
-        .await
-        .unwrap();
+        .await;
         let mut session = begin_capture(&db, request()).await;
 
-        let mutation = DatastoreBackend::acquire_snapshot_mutation_fence(&db);
+        let mutation = db.acquire_snapshot_mutation_fence();
         let mutation = tokio::time::timeout(std::time::Duration::from_secs(2), mutation)
             .await
-            .expect("begin_capture must release the short exclusive fence")
-            .unwrap()
-            .unwrap();
+            .expect("begin_capture must release the short exclusive fence");
         db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
             "after-anchor",
             json!({"metadata":{"name":"after-anchor","namespace":"default"}}),
         )
-        .await
-        .unwrap();
+        .await;
         assert!(
-            db.get_resource("v1", "ConfigMap", Some("default"), "after-anchor")
-                .await
-                .unwrap()
-                .is_some(),
+            db.has_resource("after-anchor").await,
             "ordinary shared read lane must observe current state while snapshot lane is pinned"
         );
         drop(mutation);
@@ -484,7 +562,7 @@ mod tests {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
             klights_supervisor::TaskCategoryConfig::default(),
         ));
-        let executor = klights_cluster_datastore::sqlite::open_with_opts(
+        let executor = crate::sqlite::open_with_opts(
             klights_supervisor::OpenOpts::in_memory(),
             supervisor,
             "snapshot-rollback-failure",
@@ -525,8 +603,7 @@ mod tests {
                 result_proto: vec![index as u8],
                 status_stamp: None,
             })
-            .await
-            .unwrap();
+            .await;
         }
         let mut session = begin_capture(&db, request()).await;
         let mut lengths = Vec::new();
@@ -553,8 +630,7 @@ mod tests {
             result_proto: Vec::new(),
             status_stamp: None,
         })
-        .await
-        .unwrap();
+        .await;
         db.db_call("seed-watermark", |conn| {
             conn.execute(
                 "INSERT INTO outbox_stream_watermarks(client_id,stream_id,last_seq)
@@ -563,8 +639,7 @@ mod tests {
             )?;
             Ok(())
         })
-        .await
-        .unwrap();
+        .await;
         let mut session = begin_capture(&db, request()).await;
         let mut kinds = Vec::new();
         while let Some(page) = session.next_page().await.unwrap() {
@@ -595,8 +670,7 @@ mod tests {
             )?;
             Ok(())
         })
-        .await
-        .unwrap();
+        .await;
         let mut session = begin_capture(&db, request()).await;
         loop {
             match session.next_page().await {

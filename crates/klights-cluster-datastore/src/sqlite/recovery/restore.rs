@@ -1,6 +1,6 @@
-//! Corrected Phase 10D authoritative SQLite restore transaction.
+//! Authoritative SQLite restore transaction.
 
-use super::super::{live_apply, queries, transaction_primitives};
+use super::super::{live_apply, mutation_queries as queries, transaction_primitives};
 use klights_cluster_core::{ClusterMembership, LogApplyMutation, SnapshotRestoreOperation};
 use klights_cluster_store::{
     CLUSTER_ID_META_KEY as KEY_CLUSTER_ID, LEADER_EPOCH_META_KEY as KEY_LEADER_EPOCH,
@@ -8,7 +8,7 @@ use klights_cluster_store::{
     RAFT_VOTERS_META_KEY as KEY_RAFT_VOTERS, StagedPostCommit,
 };
 
-pub(crate) struct SnapshotReplayFloor {
+pub struct SnapshotReplayFloor {
     pub api_version: String,
     pub kind: String,
     pub namespace_key: String,
@@ -17,20 +17,20 @@ pub(crate) struct SnapshotReplayFloor {
     pub position_is_exact: bool,
 }
 
-pub(crate) enum SnapshotMembership {
+pub enum SnapshotMembership {
     LegacyOmitted,
     AuthoritativeAbsent,
     Present(ClusterMembership),
 }
 
-pub(crate) struct SnapshotMetadata {
+pub struct SnapshotMetadata {
     pub cluster_id: String,
     pub leader_epoch: i64,
     pub membership: SnapshotMembership,
     pub command_codec_activation_version: Option<u32>,
 }
 
-pub(crate) fn replace_resource_state_in_conn(
+pub fn replace_resource_state_in_conn(
     conn: &mut rusqlite::Connection,
     entries: Vec<SnapshotRestoreOperation>,
     current_rv: i64,

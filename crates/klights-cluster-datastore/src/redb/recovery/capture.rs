@@ -15,10 +15,10 @@ use klights_cluster_store::{
 };
 use tokio::sync::oneshot;
 
-use klights_cluster_datastore::redb::key_codec;
+use crate::redb::key_codec;
 
 use super::RedbRecoveryStore;
-use klights_cluster_datastore::redb::tables;
+use crate::redb::tables;
 
 enum Command {
     Next(oneshot::Sender<Result<Option<SnapshotCapturePage>, SnapshotPersistenceError>>),
@@ -112,7 +112,7 @@ fn session_terminal_error(state: &AtomicU8) -> SnapshotPersistenceError {
 }
 
 impl RedbRecoveryStore {
-    pub(crate) async fn begin_snapshot(
+    pub async fn begin_snapshot(
         &self,
         request: SnapshotCaptureRequest,
         fence: klights_cluster_store::SnapshotExclusiveFence,
@@ -766,7 +766,7 @@ fn watermark_page(
             continue;
         }
         rows.push(
-            klights_cluster_datastore::redb::live_committed_apply::decode_outbox_watermark_key(
+            crate::redb::live_committed_apply::decode_outbox_watermark_key(
                 key.value(),
                 value.value(),
             )
@@ -915,19 +915,86 @@ fn corrupt(error: impl std::fmt::Display) -> SnapshotPersistenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::DatastoreBackend;
-    use crate::datastore::redb::RedbDatastore;
+    use crate::redb::RedbAccessor;
     use klights_cluster_core::LogApplyAppliedOutboxRow;
+    use klights_cluster_store::SnapshotExclusiveFence;
     use std::sync::Arc;
 
-    async fn store() -> RedbDatastore {
-        let db = RedbDatastore::new_in_memory().await.unwrap();
+    #[derive(Clone)]
+    struct TestStore {
+        accessor: Arc<RedbAccessor>,
+        recovery: RedbRecoveryStore,
+    }
+
+    impl TestStore {
+        async fn new_in_memory() -> Self {
+            let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
+            ));
+            let database = crate::redb::open_in_memory(supervisor.as_ref())
+                .await
+                .unwrap();
+            let accessor = Arc::new(RedbAccessor::new(Arc::new(database), supervisor));
+            Self {
+                recovery: RedbRecoveryStore::new(
+                    accessor.clone(),
+                    Arc::new(tokio::sync::Semaphore::new(2)),
+                ),
+                accessor,
+            }
+        }
+
+        async fn set_klights_meta(&self, key: &'static str, value: &'static str) {
+            self.accessor
+                .call("recovery-test:set-meta", move |database| {
+                    let write = database.begin_write()?;
+                    {
+                        let mut table = write.open_table(tables::KLIGHTS_META)?;
+                        table.insert(key, value)?;
+                    }
+                    write.commit()?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) {
+            let key = record.idempotency_key.clone();
+            let bytes = serde_json::to_vec(&record).unwrap();
+            self.accessor
+                .call("recovery-test:insert-applied-outbox", move |database| {
+                    let write = database.begin_write()?;
+                    {
+                        let mut table = write.open_table(tables::APPLIED_OUTBOX)?;
+                        table.insert(key.as_str(), bytes.as_slice())?;
+                    }
+                    write.commit()?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+
+        async fn acquire_snapshot_exclusive_fence(&self) -> SnapshotExclusiveFence {
+            SnapshotExclusiveFence::new(self.accessor.acquire_snapshot_exclusive().await)
+        }
+
+        async fn begin_pinned_snapshot_capture(
+            &self,
+            request: SnapshotCaptureRequest,
+            fence: SnapshotExclusiveFence,
+        ) -> Box<dyn SnapshotCaptureSession> {
+            self.recovery.begin_snapshot(request, fence).await.unwrap()
+        }
+    }
+
+    async fn store() -> TestStore {
+        let db = TestStore::new_in_memory().await;
         db.set_klights_meta(klights_cluster_store::CLUSTER_ID_META_KEY, "redb-pinned")
-            .await
-            .unwrap();
+            .await;
         db.set_klights_meta(klights_cluster_store::LEADER_EPOCH_META_KEY, "1")
-            .await
-            .unwrap();
+            .await;
         db
     }
 
@@ -943,16 +1010,11 @@ mod tests {
     }
 
     async fn begin_capture(
-        db: &RedbDatastore,
+        db: &TestStore,
         request: SnapshotCaptureRequest,
     ) -> Box<dyn SnapshotCaptureSession> {
-        let fence = DatastoreBackend::acquire_snapshot_exclusive_fence(db)
-            .await
-            .unwrap()
-            .expect("Redb supplies a snapshot capture fence");
-        db.begin_pinned_snapshot_capture(request, fence)
-            .await
-            .unwrap()
+        let fence = db.acquire_snapshot_exclusive_fence().await;
+        db.begin_pinned_snapshot_capture(request, fence).await
     }
 
     #[tokio::test]
@@ -968,13 +1030,9 @@ mod tests {
                 result_proto: Vec::new(),
                 status_stamp: None,
             })
-            .await
-            .unwrap();
+            .await;
         }
-        let fence = DatastoreBackend::acquire_snapshot_exclusive_fence(&db)
-            .await
-            .unwrap()
-            .expect("Redb supplies a snapshot capture fence");
+        let fence = db.acquire_snapshot_exclusive_fence().await;
         let mutation_db = db.clone();
         let mutation = tokio::spawn(async move {
             mutation_db
@@ -987,8 +1045,7 @@ mod tests {
                     result_proto: Vec::new(),
                     status_stamp: None,
                 })
-                .await
-                .unwrap();
+                .await;
         });
         tokio::task::yield_now().await;
         assert!(
@@ -997,8 +1054,7 @@ mod tests {
         );
         let mut session = db
             .begin_pinned_snapshot_capture(request(Duration::from_secs(30)), fence)
-            .await
-            .unwrap();
+            .await;
         mutation.await.unwrap();
         let mut lengths = Vec::new();
         let mut keys = Vec::new();

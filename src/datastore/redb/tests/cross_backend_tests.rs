@@ -58,6 +58,19 @@ async fn redb_applied_outbox_snapshot_page_rejects_unbounded_requests() {
     );
 }
 
+#[tokio::test]
+async fn redb_authoritative_replacement_remains_explicitly_fail_closed() {
+    let db = redb_db().await;
+    let error =
+        DatastoreBackend::replace_replicated_resource_state(&db, Vec::new(), 0, None, None, None)
+            .await
+            .expect_err("Redb authoritative replacement is not certified before Phase 10F");
+    assert_eq!(
+        error.to_string(),
+        "backend does not support atomic replicated resource-state replacement"
+    );
+}
+
 /// Run the same async test body against both backends.
 /// Generates `<name>_sqlite` and `<name>_redb` test functions.
 /// Uses concat_idents! internally to produce the names.

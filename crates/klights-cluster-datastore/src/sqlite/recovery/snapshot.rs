@@ -1,4 +1,4 @@
-//! Root-independent Phase 10D SQLite snapshot capture algorithms.
+//! SQLite snapshot capture algorithms.
 
 use std::sync::Arc;
 

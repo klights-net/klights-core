@@ -10,6 +10,7 @@ mod opener;
 pub mod ordinary_mutations;
 pub mod read_core;
 mod read_store;
+pub mod recovery;
 mod replay_floor;
 pub mod tables;
 

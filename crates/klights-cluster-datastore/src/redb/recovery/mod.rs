@@ -1,4 +1,4 @@
-//! Phase 10D Redb recovery-only metadata ownership.
+//! Redb recovery-only metadata ownership.
 //!
 //! Live cluster-meta mutation stays with `live_committed_apply`. Snapshot
 //! capture/restore remains in the adjacent recovery modules and root facade
@@ -7,28 +7,28 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::redb::{RedbAccessor, tables};
 use ::redb::ReadableDatabase;
 use anyhow::{Result, anyhow};
 use klights_cluster_core::{ClusterMembership, ClusterMetadata};
-use klights_cluster_datastore::redb::{RedbAccessor, tables};
 use klights_cluster_store::SnapshotMembership;
 
 mod backend_snapshot;
 mod capture;
 
-pub(super) struct RedbClusterMetadataObservation {
-    pub(super) metadata: ClusterMetadata,
-    pub(super) membership: SnapshotMembership,
+pub struct RedbClusterMetadataObservation {
+    pub metadata: ClusterMetadata,
+    pub membership: SnapshotMembership,
 }
 
 #[derive(Clone)]
-pub(super) struct RedbRecoveryStore {
+pub struct RedbRecoveryStore {
     accessor: Arc<RedbAccessor>,
     snapshot_sessions: Arc<tokio::sync::Semaphore>,
 }
 
 impl RedbRecoveryStore {
-    pub(super) fn new(
+    pub fn new(
         accessor: Arc<RedbAccessor>,
         snapshot_sessions: Arc<tokio::sync::Semaphore>,
     ) -> Self {
@@ -38,7 +38,7 @@ impl RedbRecoveryStore {
         }
     }
 
-    pub(super) async fn read_cluster_metadata(&self) -> Result<RedbClusterMetadataObservation> {
+    pub async fn read_cluster_metadata(&self) -> Result<RedbClusterMetadataObservation> {
         self.accessor
             .call("redb_atomic_cluster_metadata_observation", |db| {
                 let read = db.begin_read()?;
@@ -112,7 +112,7 @@ impl RedbRecoveryStore {
             .await
     }
 
-    pub(super) async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
+    pub async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
         let key = key.to_string();
         self.accessor
             .call("redb_get_klights_meta", move |db| {

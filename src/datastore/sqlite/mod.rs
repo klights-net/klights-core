@@ -12,7 +12,6 @@ mod focused_ports;
 mod gc;
 mod merge_patch;
 mod outbox_codec;
-mod recovery;
 mod rv_helpers;
 mod snapshot_capture;
 #[cfg(test)]
@@ -296,7 +295,7 @@ pub struct Datastore {
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
     wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
-    snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
+    snapshot_factory: Option<klights_cluster_datastore::sqlite::recovery::SqliteSnapshotFactory>,
     #[cfg(test)]
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -3531,7 +3530,9 @@ impl Datastore {
     async fn from_executors(
         executor: DbExecutor,
         read_executor: DbExecutor,
-        snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
+        snapshot_factory: Option<
+            klights_cluster_datastore::sqlite::recovery::SqliteSnapshotFactory,
+        >,
         #[cfg(test)] commit_sink: std::sync::Arc<dyn CommitObservationSink>,
         outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
@@ -3593,7 +3594,10 @@ impl Datastore {
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
-            snapshot_capture::SqliteSnapshotFactory::new(opts, executor.task_supervisor())
+            klights_cluster_datastore::sqlite::recovery::SqliteSnapshotFactory::new(
+                opts,
+                executor.task_supervisor(),
+            )
         });
         let read_executor = executor.read_lane_clone();
         Self::from_executors(
@@ -3659,7 +3663,10 @@ impl Datastore {
             )
         })?;
         let snapshot_factory =
-            snapshot_capture::SqliteSnapshotFactory::new(read_opts, supervisor.clone());
+            klights_cluster_datastore::sqlite::recovery::SqliteSnapshotFactory::new(
+                read_opts,
+                supervisor.clone(),
+            );
         let ds = Self::from_executors(
             executor,
             read_executor,
@@ -3728,9 +3735,12 @@ impl Datastore {
             "sqlite:memory:cluster",
         )
         .await?;
-        let snapshot_factory = executor
-            .snapshot_open_opts()
-            .map(|opts| snapshot_capture::SqliteSnapshotFactory::new(opts, supervisor.clone()));
+        let snapshot_factory = executor.snapshot_open_opts().map(|opts| {
+            klights_cluster_datastore::sqlite::recovery::SqliteSnapshotFactory::new(
+                opts,
+                supervisor.clone(),
+            )
+        });
         let read_executor = executor.read_lane_clone();
         Self::from_executors(
             executor,
@@ -3895,8 +3905,7 @@ impl DatastoreBackend for Datastore {
             .snapshot_factory
             .as_ref()
             .ok_or_else(|| anyhow!("pinned SQLite capture requires a snapshot-only disk lane"))?;
-        let prepared = factory.open(request).await?;
-        prepared.pin(fence).await
+        factory.begin_snapshot(request, fence).await
     }
 
     #[cfg(test)]

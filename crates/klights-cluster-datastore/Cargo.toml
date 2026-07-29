@@ -18,6 +18,7 @@ sqlcipher = [
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 klights-cluster-core = { workspace = true }

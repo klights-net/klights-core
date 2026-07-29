@@ -16,7 +16,7 @@ use klights_cluster_store::{
 };
 
 use super::RedbRecoveryStore;
-use klights_cluster_datastore::redb::tables;
+use crate::redb::tables;
 
 /// Tables included in cluster snapshots (ClusterReplicated + ConfigReplicated).
 /// NodeLocal tables are excluded — they belong to individual nodes.
@@ -336,60 +336,124 @@ impl DatastoreSnapshotter for RedbRecoveryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datastore::backend::DatastoreBackend;
-    use crate::datastore::redb::RedbDatastore;
-    use serde_json::json;
+    use crate::redb::{RedbAccessor, key_codec};
+    use std::sync::Arc;
 
-    async fn fresh_redb() -> RedbDatastore {
-        RedbDatastore::new_in_memory().await.unwrap()
+    struct TestStore {
+        accessor: Arc<RedbAccessor>,
+        recovery: RedbRecoveryStore,
     }
 
-    async fn snapshot(db: &RedbDatastore) -> SnapshotEnvelope {
-        let fence = DatastoreBackend::acquire_snapshot_exclusive_fence(db)
+    async fn fresh_redb() -> TestStore {
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
+        let database = crate::redb::open_in_memory(supervisor.as_ref())
+            .await
+            .unwrap();
+        let accessor = Arc::new(RedbAccessor::new(Arc::new(database), supervisor));
+        TestStore {
+            recovery: RedbRecoveryStore::new(
+                accessor.clone(),
+                Arc::new(tokio::sync::Semaphore::new(2)),
+            ),
+            accessor,
+        }
+    }
+
+    async fn snapshot(db: &TestStore) -> SnapshotEnvelope {
+        let fence = SnapshotExclusiveFence::new(db.accessor.acquire_snapshot_exclusive().await);
+        db.recovery.snapshot(fence).await.unwrap()
+    }
+
+    async fn restore(db: &TestStore, envelope: &SnapshotEnvelope) -> Result<()> {
+        let fence = SnapshotExclusiveFence::new(db.accessor.acquire_snapshot_exclusive().await);
+        db.recovery.restore(envelope, fence).await
+    }
+
+    async fn seed_cluster_state(db: &TestStore) {
+        db.accessor
+            .call("recovery-test:seed-cluster-state", |database| {
+                let write = database.begin_write()?;
+                {
+                    let mut namespaces = write.open_table(tables::NAMESPACES)?;
+                    namespaces.insert("ns1", br#"{"metadata":{"name":"ns1"}}"#.as_slice())?;
+                    let mut resources = write.open_table(tables::RES_NS)?;
+                    let key = key_codec::resource_key("v1", "ConfigMap", Some("ns1"), "cm1");
+                    resources.insert(
+                        key.as_slice(),
+                        (
+                            2,
+                            br#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm1","namespace":"ns1"},"data":{"k":"v"}}"#
+                                .as_slice(),
+                        ),
+                    )?;
+                    let mut cluster_resources = write.open_table(tables::RES_CLUSTER)?;
+                    let key = key_codec::resource_key("v1", "Node", None, "n1");
+                    cluster_resources.insert(
+                        key.as_slice(),
+                        (
+                            3,
+                            br#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"}}"#
+                                .as_slice(),
+                        ),
+                    )?;
+                    let mut subnets = write.open_table(tables::NODE_SUBNETS)?;
+                    subnets.insert("n1", b"10.42.0.0/24".as_slice())?;
+                    let mut meta = write.open_table(tables::META)?;
+                    meta.insert("rv", b"3".as_slice())?;
+                }
+                write.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn table_contains(db: &TestStore, table: &'static str) -> bool {
+        db.accessor
+            .call("recovery-test:table-contains", move |database| {
+                let read = database.begin_read()?;
+                match table {
+                    "namespaces" => Ok(read.open_table(tables::NAMESPACES)?.get("ns1")?.is_some()),
+                    "res_ns" => {
+                        let key = key_codec::resource_key("v1", "ConfigMap", Some("ns1"), "cm1");
+                        Ok(read
+                            .open_table(tables::RES_NS)?
+                            .get(key.as_slice())?
+                            .is_some())
+                    }
+                    "res_cluster" => {
+                        let key = key_codec::resource_key("v1", "Node", None, "n1");
+                        Ok(read
+                            .open_table(tables::RES_CLUSTER)?
+                            .get(key.as_slice())?
+                            .is_some())
+                    }
+                    _ => unreachable!(),
+                }
+            })
             .await
             .unwrap()
-            .expect("Redb supplies a snapshot fence");
-        db.snapshot(fence).await.unwrap()
     }
 
-    async fn restore(db: &RedbDatastore, envelope: &SnapshotEnvelope) -> Result<()> {
-        let fence = DatastoreBackend::acquire_snapshot_exclusive_fence(db)
-            .await?
-            .expect("Redb supplies a snapshot fence");
-        db.restore(envelope, fence).await
+    async fn meta_value(db: &TestStore, key: &'static str) -> Option<Vec<u8>> {
+        db.accessor
+            .call("recovery-test:meta-value", move |database| {
+                let read = database.begin_read()?;
+                let table = read.open_table(tables::META)?;
+                Ok(table.get(key)?.map(|value| value.value().to_vec()))
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_cluster_state_and_rv() {
         let db = fresh_redb().await;
 
-        // Create some cluster state
-        db.create_namespace("ns1", json!({"metadata":{"name":"ns1"}}))
-            .await
-            .unwrap();
-        db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("ns1"),
-            "cm1",
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm1","namespace":"ns1"},"data":{"k":"v"}}),
-        )
-        .await
-        .unwrap();
-        db.create_resource(
-            "v1",
-            "Node",
-            None,
-            "n1",
-            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"n1"}}),
-        )
-        .await
-        .unwrap();
-        db.allocate_node_subnet("n1", "10.42.0.0/16", "192.168.1.1")
-            .await
-            .unwrap();
-
-        let rv_before = db.get_current_resource_version().await.unwrap();
+        seed_cluster_state(&db).await;
+        let rv_before = 3;
 
         // Snapshot
         let envelope = snapshot(&db).await;
@@ -402,50 +466,41 @@ mod tests {
         restore(&db2, &envelope).await.unwrap();
 
         // Verify restored state
-        let ns = db2.get_namespace("ns1").await.unwrap();
-        assert!(ns.is_some());
-
-        let cm = db2
-            .get_resource("v1", "ConfigMap", Some("ns1"), "cm1")
-            .await
-            .unwrap();
-        assert!(cm.is_some());
-        assert_eq!(cm.unwrap().data["data"]["k"], "v");
-
-        let node = db2.get_resource("v1", "Node", None, "n1").await.unwrap();
-        assert!(node.is_some());
-
-        let rv_after = db2.get_current_resource_version().await.unwrap();
-        assert_eq!(rv_after, envelope.last_applied_rv);
+        assert!(table_contains(&db2, "namespaces").await);
+        assert!(table_contains(&db2, "res_ns").await);
+        assert!(table_contains(&db2, "res_cluster").await);
+        assert_eq!(
+            meta_value(&db2, "rv").await.as_deref(),
+            Some(b"3".as_slice())
+        );
     }
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_empty_watch_history_high_water() {
         let db = fresh_redb().await;
-        db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            "before-gc",
-            json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {"name": "before-gc", "namespace": "default"}
-            }),
-        )
-        .await
-        .unwrap();
-        let before_gc = db.current_watch_replay_position().await.unwrap();
-        assert!(before_gc.event_id > 0);
-        assert!(db.gc_watch_events(0, -1).await.unwrap() > 0);
+        db.accessor
+            .call("recovery-test:seed-empty-watch-high-water", |database| {
+                let write = database.begin_write()?;
+                {
+                    let mut meta = write.open_table(tables::META)?;
+                    meta.insert("watch_event_id", b"7".as_slice())?;
+                    let mut events = write.open_table(tables::WATCH_EVENTS)?;
+                    events.insert(7, b"temporary".as_slice())?;
+                    events.remove(7)?;
+                }
+                write.commit()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         let envelope = snapshot(&db).await;
         let restored = fresh_redb().await;
         restore(&restored, &envelope).await.unwrap();
 
         assert_eq!(
-            restored.current_watch_replay_position().await.unwrap(),
-            before_gc,
+            meta_value(&restored, "watch_event_id").await.as_deref(),
+            Some(b"7".as_slice()),
             "redb snapshot meta must retain the allocator after all rows are compacted"
         );
     }
@@ -516,8 +571,8 @@ mod tests {
     #[tokio::test]
     async fn schema_fingerprint_is_stable() {
         let db = fresh_redb().await;
-        let fp1 = db.schema_fingerprint();
-        let fp2 = db.schema_fingerprint();
+        let fp1 = db.recovery.schema_fingerprint();
+        let fp2 = db.recovery.schema_fingerprint();
         assert_eq!(fp1, fp2);
     }
 }

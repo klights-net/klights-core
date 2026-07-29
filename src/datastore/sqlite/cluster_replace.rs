@@ -64,31 +64,37 @@ impl Datastore {
         let watch_replay_floors = watch_replay_floors.map(|floors| {
             floors
                 .into_iter()
-                .map(|floor| super::recovery::SnapshotReplayFloor {
-                    api_version: floor.api_version,
-                    kind: floor.kind,
-                    namespace_key: floor.namespace_key,
-                    floor_resource_version: floor.floor_resource_version,
-                    floor_event_id: floor.floor_event_id,
-                    position_is_exact: floor.position_is_exact,
-                })
+                .map(
+                    |floor| klights_cluster_datastore::sqlite::recovery::SnapshotReplayFloor {
+                        api_version: floor.api_version,
+                        kind: floor.kind,
+                        namespace_key: floor.namespace_key,
+                        floor_resource_version: floor.floor_resource_version,
+                        floor_event_id: floor.floor_event_id,
+                        position_is_exact: floor.position_is_exact,
+                    },
+                )
                 .collect()
         });
-        let metadata = metadata.map(|metadata| super::recovery::SnapshotMetadata {
+        let metadata = metadata.map(|metadata| {
+            klights_cluster_datastore::sqlite::recovery::SnapshotMetadata {
             cluster_id: metadata.cluster_id,
             leader_epoch: metadata.leader_epoch,
             membership: match metadata.membership {
                 crate::datastore::ReplicatedMembershipState::LegacyOmitted => {
-                    super::recovery::SnapshotMembership::LegacyOmitted
+                    klights_cluster_datastore::sqlite::recovery::SnapshotMembership::LegacyOmitted
                 }
                 crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent => {
-                    super::recovery::SnapshotMembership::AuthoritativeAbsent
+                    klights_cluster_datastore::sqlite::recovery::SnapshotMembership::AuthoritativeAbsent
                 }
                 crate::datastore::ReplicatedMembershipState::Present(membership) => {
-                    super::recovery::SnapshotMembership::Present(membership)
+                    klights_cluster_datastore::sqlite::recovery::SnapshotMembership::Present(
+                        membership,
+                    )
                 }
             },
             command_codec_activation_version: metadata.command_codec_activation_version,
+            }
         });
         #[cfg(test)]
         let watch_bus = self.commit_sink.clone();
@@ -99,15 +105,16 @@ impl Datastore {
             "replace_replicated_resource_state",
             move |conn| {
                 let context = super::live_apply::TransactionContext::new(outbox_codec.as_ref());
-                let pending = super::recovery::replace_resource_state_in_conn(
-                    conn,
-                    entries,
-                    current_rv,
-                    watch_event_high_water,
-                    watch_replay_floors,
-                    metadata,
-                    &context,
-                )?;
+                let pending =
+                    klights_cluster_datastore::sqlite::recovery::replace_resource_state_in_conn(
+                        conn,
+                        entries,
+                        current_rv,
+                        watch_event_high_water,
+                        watch_replay_floors,
+                        metadata,
+                        &context,
+                    )?;
                 Ok(((), pending))
             },
             move |pending| {
