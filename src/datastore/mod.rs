@@ -24,6 +24,7 @@ pub use klights_cluster_core::{
     PatchKind, PositionedWatchEvent, Resource, ResourceBatchOperation, ResourceBatchPutMode,
     ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
+pub use klights_cluster_store::StagedPostCommit;
 #[cfg(test)]
 pub(crate) use klights_watch::WatchTopic;
 pub use types::*;
@@ -32,4 +33,4 @@ pub use types::*;
 pub use sqlite::test_support;
 
 #[cfg(test)]
-pub use sqlite::create_pending_watch_event;
+pub use sqlite::{create_staged_post_commit, staged_post_commit_from_event, staged_test_event};

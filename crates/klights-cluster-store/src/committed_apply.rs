@@ -11,7 +11,7 @@ use std::pin::Pin;
 
 use klights_cluster_core::{
     CommittedApplyOutcome, LogApplyAppliedOutboxRow, LogApplyCommit, OutboxStreamWatermark,
-    Resource, WatchReplayPosition,
+    PodEndpointEffect, Resource, WatchReplayPosition,
 };
 
 /// Persistence failure returned by committed apply or its ledger reads.
@@ -77,17 +77,41 @@ impl CommittedRaftApplyRequest {
 #[derive(Clone, Debug)]
 pub struct CommittedRaftApplyReceipt {
     outcome: CommittedApplyOutcome,
+    returned_resource: Option<Resource>,
+    pod_endpoint_effect: PodEndpointEffect,
 }
 
 impl CommittedRaftApplyReceipt {
-    pub fn new(outcome: CommittedApplyOutcome) -> Self {
-        Self { outcome }
+    pub fn new(outcome: CommittedApplyOutcome, pod_endpoint_effect: PodEndpointEffect) -> Self {
+        let returned_resource = match &outcome {
+            CommittedApplyOutcome::Visible { resource, .. } => resource.clone(),
+            _ => None,
+        };
+        Self {
+            outcome,
+            returned_resource,
+            pod_endpoint_effect,
+        }
+    }
+    pub fn with_returned_resource(mut self, resource: Option<Resource>) -> Self {
+        self.returned_resource = resource;
+        self
     }
     pub const fn outcome(&self) -> &CommittedApplyOutcome {
         &self.outcome
     }
     pub fn into_outcome(self) -> CommittedApplyOutcome {
         self.outcome
+    }
+    pub const fn pod_endpoint_effect(&self) -> PodEndpointEffect {
+        self.pod_endpoint_effect
+    }
+    pub fn into_parts(self) -> (CommittedApplyOutcome, Option<Resource>, PodEndpointEffect) {
+        (
+            self.outcome,
+            self.returned_resource,
+            self.pod_endpoint_effect,
+        )
     }
     pub const fn applied_resource_version(&self) -> Option<i64> {
         match &self.outcome {
@@ -108,10 +132,7 @@ impl CommittedRaftApplyReceipt {
         }
     }
     pub const fn applied_resource(&self) -> Option<&Resource> {
-        match &self.outcome {
-            CommittedApplyOutcome::Visible { resource, .. } => resource.as_ref(),
-            _ => None,
-        }
+        self.returned_resource.as_ref()
     }
 }
 

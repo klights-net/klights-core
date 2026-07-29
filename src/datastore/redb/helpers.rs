@@ -7,10 +7,92 @@ use std::collections::BTreeSet;
 
 use ::redb::ReadableTable;
 use anyhow::Result;
+#[cfg(test)]
+use bytes::Bytes;
+#[cfg(test)]
+use serde::Serialize;
 use serde_json::Value;
 
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_cluster_datastore::redb::tables;
+
+#[allow(clippy::too_many_arguments)]
+pub fn log_noop_resource_write(
+    operation: &str,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    uid: &str,
+    resource_version: i64,
+    reason: &str,
+) {
+    tracing::info!(
+        target: "klights::datastore::noop_update",
+        operation,
+        api_version,
+        kind,
+        namespace = namespace.unwrap_or(""),
+        name,
+        uid,
+        resource_version,
+        reason,
+        "skipped no-op datastore write"
+    );
+}
+
+pub fn stage_resource_post_commit(
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    resource_version: i64,
+    event_type: &str,
+    data: impl Into<std::sync::Arc<Value>>,
+) -> klights_cluster_store::StagedPostCommit {
+    #[cfg(not(test))]
+    {
+        let _ = (name, event_type, data);
+        klights_cluster_store::StagedPostCommit::new(api_version, kind, namespace, resource_version)
+    }
+    #[cfg(test)]
+    {
+        let mut data = std::sync::Arc::unwrap_or_clone(data.into());
+        if let Some(object) = data.as_object_mut() {
+            object.insert("apiVersion".to_string(), Value::from(api_version));
+            object.insert("kind".to_string(), Value::from(kind));
+            let metadata = object
+                .entry("metadata")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.insert("name".to_string(), Value::from(name));
+                if let Some(namespace) = namespace {
+                    metadata.insert("namespace".to_string(), Value::from(namespace));
+                }
+                metadata.insert(
+                    "resourceVersion".to_string(),
+                    Value::from(resource_version.to_string()),
+                );
+            }
+        }
+        let resource = Resource::try_from_data(std::sync::Arc::new(data))
+            .expect("Redb staged test resource has canonical identity");
+        #[derive(Serialize)]
+        struct WatchEnvelope<'a> {
+            #[serde(rename = "type")]
+            event_type: &'a str,
+            object: &'a Value,
+        }
+        let encoded_json = serde_json::to_vec(&WatchEnvelope {
+            event_type,
+            object: resource.data.as_ref(),
+        })
+        .ok()
+        .map(Bytes::from);
+        klights_cluster_store::StagedPostCommit::new(api_version, kind, namespace, resource_version)
+            .with_test_event(event_type, resource, encoded_json)
+    }
+}
 
 /// Deserialize a redb value body into an Arc<Value>.
 pub fn body_val(body: &[u8]) -> std::sync::Arc<Value> {

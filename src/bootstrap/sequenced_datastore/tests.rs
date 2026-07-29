@@ -193,13 +193,13 @@ mod cases {
             "apply_raft_log_apply_commit",
         );
         assert_application_apply_rejected(
-            DatastoreBackend::apply_raft_log_apply_commit_outcome(
+            DatastoreBackend::apply_raft_log_apply_commit_receipt(
                 &ds,
                 crate::replication::log_apply_wire::test_live_commit(3, Vec::new()),
             )
             .await
             .expect_err("application facade must reject Raft committed apply outcomes"),
-            "apply_raft_log_apply_commit_outcome",
+            "apply_raft_log_apply_commit_receipt",
         );
 
         assert_application_apply_rejected(
@@ -234,7 +234,7 @@ mod cases {
             "apply_raft_log_apply_commit",
         );
         assert_application_apply_rejected(
-            crate::datastore::ReplicationStore::apply_raft_log_apply_commit_outcome(
+            crate::datastore::ReplicationStore::apply_raft_log_apply_commit_receipt(
                 &ds,
                 crate::replication::log_apply_wire::test_live_commit(6, Vec::new()),
             )
@@ -242,7 +242,7 @@ mod cases {
             .expect_err(
                 "replication compatibility facade must reject Raft committed apply outcomes",
             ),
-            "apply_raft_log_apply_commit_outcome",
+            "apply_raft_log_apply_commit_receipt",
         );
 
         assert_eq!(

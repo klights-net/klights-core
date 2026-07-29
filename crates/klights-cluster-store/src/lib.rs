@@ -10,11 +10,13 @@ mod durable_recovery;
 mod namespace_content;
 mod ownership;
 mod pod_uid_precondition;
+mod post_commit;
 mod raw_watch_history;
 mod read_validation;
 mod replay_retention;
 mod resource_read;
 mod resource_scope;
+mod response_codec;
 mod topology;
 mod watch_range;
 
@@ -46,6 +48,9 @@ pub use pod_uid_precondition::{
     PodUidPreconditionError, PodUidPreconditionFuture, PodUidPreconditionRead,
     PodUidPreconditionRequest, PodUidPreconditionState,
 };
+pub use post_commit::StagedPostCommit;
+#[cfg(feature = "test-support")]
+pub use post_commit::StagedResourceEvent;
 pub use raw_watch_history::{
     DurableRawWatchEvent, DurableRawWatchHistoryRead, PositionedRawWatchHistoryPage,
     PositionedRawWatchHistoryRead, RawWatchEventsAfterPositionRequest, RawWatchEventsSinceRequest,
@@ -62,6 +67,7 @@ pub use resource_scope::{
     ClusterResourceScopeRead, ResourceKeyScopeRequest, ResourceScopeSnapshot,
     ResourceSnapshotAtPositionRequest, ResourceSnapshotRead, ResourceWatchTargetsRequest,
 };
+pub use response_codec::OutboxResponseCodec;
 pub use topology::{
     ClusterTopologyFuture, ClusterTopologyRead, ClusterTopologyReadError, DataplaneEncryption,
     DataplaneMetadataError, DataplaneMode, DataplanePeerMetadata, NodeTopologyRequest,

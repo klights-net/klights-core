@@ -327,9 +327,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let state_machine_stores =
                 crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
                     Arc::new(
-                        crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
-                            passive_backend.clone(),
-                            crate::datastore::raft::committed_apply(),
+                        crate::datastore::cluster_store_adapter::ObservedCommittedRaftApply::new(
+                            Arc::new(
+                                crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
+                                    passive_backend.clone(),
+                                    crate::datastore::raft::committed_apply(),
+                                ),
+                            ),
                             watch_commit_wiring.wakeups.clone(),
                         ),
                     ),

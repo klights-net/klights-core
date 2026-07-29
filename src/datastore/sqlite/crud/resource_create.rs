@@ -8,7 +8,7 @@ use super::*;
 use klights_cluster_datastore::sqlite::selector_index;
 use rusqlite::TransactionBehavior;
 
-use crate::datastore::sqlite::create_pending_watch_event;
+use crate::datastore::sqlite::create_staged_post_commit;
 
 impl Datastore {
     pub(super) async fn warn_uid_precondition_mismatch_if_live(
@@ -152,7 +152,7 @@ impl Datastore {
                         "ControllerRevision stored in DB"
                     );
                 }
-                let _pending = create_pending_watch_event(
+                let _pending = create_staged_post_commit(
                     api_version,
                     kind,
                     namespace,

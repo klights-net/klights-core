@@ -120,8 +120,10 @@ pub(crate) fn raft_state_machine_store_ports_for_test(
     db: DatastoreHandle,
 ) -> crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts {
     let materializer = std::sync::Arc::new(DatastoreRaftCommitMaterializer::new(db.clone()));
+    let persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply> =
+        std::sync::Arc::new(DatastoreCommittedRaftApply::new_for_test(db.clone()));
     crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
-        std::sync::Arc::new(DatastoreCommittedRaftApply::new_for_test(db.clone())),
+        std::sync::Arc::new(ObservedCommittedRaftApply::new_for_test(persistence)),
         std::sync::Arc::new(DatastoreAuthoritativeSnapshotPersistence::new_for_test(
             db.clone(),
         )),
@@ -439,24 +441,60 @@ fn port_page(
 /// cluster-store ports directly after physical extraction.
 pub(crate) struct DatastoreCommittedRaftApply {
     db: DatastoreHandle,
-    wakeups: Option<std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>>,
 }
 
 impl DatastoreCommittedRaftApply {
     pub(crate) fn new(
         db: DatastoreHandle,
         _authority: crate::datastore::raft::CommittedApplyAuthority,
+    ) -> Self {
+        Self { db }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(db: DatastoreHandle) -> Self {
+        Self { db }
+    }
+}
+
+impl PrivilegedCommittedRaftApply for DatastoreCommittedRaftApply {
+    fn apply_committed_raft(
+        &self,
+        request: CommittedRaftApplyRequest,
+    ) -> CommittedApplyFuture<'_, CommittedRaftApplyReceipt> {
+        Box::pin(async move {
+            self.db
+                .apply_raft_log_apply_commit_receipt(request.into_commit())
+                .await
+                .map_err(map_committed_apply_error)
+        })
+    }
+}
+
+/// Root decorator that projects the canonical persistence receipt into the
+/// OpenRaft response and publishes active post-commit wakeups.
+pub(crate) struct ObservedCommittedRaftApply {
+    persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply>,
+    wakeups: Option<std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>>,
+}
+
+impl ObservedCommittedRaftApply {
+    pub(crate) fn new(
+        persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply>,
         wakeups: std::sync::Arc<dyn klights_leader_api::PostCommitWakeup>,
     ) -> Self {
         Self {
-            db,
+            persistence,
             wakeups: Some(wakeups),
         }
     }
 
     #[cfg(test)]
-    fn new_for_test(db: DatastoreHandle) -> Self {
-        Self { db, wakeups: None }
+    fn new_for_test(persistence: std::sync::Arc<dyn PrivilegedCommittedRaftApply>) -> Self {
+        Self {
+            persistence,
+            wakeups: None,
+        }
     }
 
     fn publish_visible_commit(&self, commit: &LogApplyCommit, resource_version: i64) {
@@ -471,30 +509,10 @@ impl DatastoreCommittedRaftApply {
             }
         }
     }
-
-    pub(crate) async fn apply_committed_raft_result(
-        &self,
-        request: CommittedRaftApplyRequest,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult, CommittedApplyError> {
-        let commit = request.into_commit();
-        let result = self
-            .db
-            .apply_raft_log_apply_commit(commit.clone())
-            .await
-            .map_err(map_committed_apply_error)?;
-        if result.public_resource_changed
-            && let Some(resource_version) = result.applied_rv
-        {
-            self.publish_visible_commit(&commit, resource_version);
-        }
-        Ok(result)
-    }
 }
 
 #[async_trait::async_trait]
-impl crate::datastore::raft::state_machine_impl::RaftCommittedApply
-    for DatastoreCommittedRaftApply
-{
+impl crate::datastore::raft::state_machine_impl::RaftCommittedApply for ObservedCommittedRaftApply {
     async fn apply_committed(
         &self,
         request: CommittedRaftApplyRequest,
@@ -502,30 +520,89 @@ impl crate::datastore::raft::state_machine_impl::RaftCommittedApply
         crate::datastore::raft::types::StorageCommandResult,
         klights_cluster_store::CommittedApplyError,
     > {
-        self.apply_committed_raft_result(request).await
+        let commit = request.commit().clone();
+        let receipt = self.persistence.apply_committed_raft(request).await?;
+        if let CommittedApplyOutcome::Visible {
+            resource_version, ..
+        } = receipt.outcome()
+        {
+            self.publish_visible_commit(&commit, *resource_version);
+        }
+        Ok(storage_command_result_from_committed_outcome(&receipt))
     }
 }
 
-impl PrivilegedCommittedRaftApply for DatastoreCommittedRaftApply {
-    fn apply_committed_raft(
-        &self,
-        request: CommittedRaftApplyRequest,
-    ) -> CommittedApplyFuture<'_, CommittedRaftApplyReceipt> {
-        Box::pin(async move {
-            let commit = request.into_commit();
-            let outcome = self
-                .db
-                .apply_raft_log_apply_commit_outcome(commit.clone())
-                .await
-                .map_err(map_committed_apply_error)?;
-            if let CommittedApplyOutcome::Visible {
-                resource_version, ..
-            } = &outcome
-            {
-                self.publish_visible_commit(&commit, *resource_version);
+pub(crate) fn storage_command_result_from_committed_outcome(
+    receipt: &CommittedRaftApplyReceipt,
+) -> crate::datastore::raft::types::StorageCommandResult {
+    let applied_mutation = receipt
+        .applied_resource()
+        .cloned()
+        .map(crate::datastore::raft::types::AppliedMutation::Resource);
+    match receipt.outcome() {
+        CommittedApplyOutcome::Visible {
+            resource_version, ..
+        } => crate::datastore::raft::types::StorageCommandResult {
+            applied_rv: Some(*resource_version),
+            error_message: None,
+            rejection_code: None,
+            public_resource_changed: true,
+            applied_mutation,
+            pod_endpoint_effect: receipt.pod_endpoint_effect(),
+        },
+        CommittedApplyOutcome::NoPublicChange {
+            resource_version, ..
+        } => crate::datastore::raft::types::StorageCommandResult {
+            applied_rv: Some(*resource_version),
+            error_message: None,
+            rejection_code: None,
+            public_resource_changed: false,
+            applied_mutation,
+            pod_endpoint_effect: receipt.pod_endpoint_effect(),
+        },
+        CommittedApplyOutcome::Rejected(rejection) => {
+            use klights_cluster_core::{CommittedApplyRejection, StorageCommandRejectionCode};
+            let rejection_code = match rejection {
+                CommittedApplyRejection::AlreadyExists { .. } => {
+                    StorageCommandRejectionCode::AlreadyExists
+                }
+                CommittedApplyRejection::NotFound { .. } => StorageCommandRejectionCode::NotFound,
+                CommittedApplyRejection::UidConflict { .. }
+                | CommittedApplyRejection::ResourceVersionConflict { .. } => {
+                    StorageCommandRejectionCode::Conflict
+                }
+                CommittedApplyRejection::InvalidCommit { .. } => {
+                    StorageCommandRejectionCode::InvalidCommit
+                }
+                _ => StorageCommandRejectionCode::InvalidCommit,
+            };
+            crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: None,
+                error_message: Some(rejection.message().to_string()),
+                rejection_code: Some(rejection_code),
+                public_resource_changed: false,
+                applied_mutation: None,
+                pod_endpoint_effect: receipt.pod_endpoint_effect(),
             }
-            Ok(CommittedRaftApplyReceipt::new(outcome))
-        })
+        }
+        _ => crate::datastore::raft::types::StorageCommandResult {
+            applied_rv: None,
+            error_message: Some("unsupported canonical committed-apply outcome".to_string()),
+            rejection_code: Some(klights_cluster_core::StorageCommandRejectionCode::InvalidCommit),
+            public_resource_changed: false,
+            applied_mutation: None,
+            pod_endpoint_effect: receipt.pod_endpoint_effect(),
+        },
+    }
+}
+
+impl super::sqlite::Datastore {
+    pub async fn apply_raft_log_apply_commit(
+        &self,
+        commit: LogApplyCommit,
+    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+        let receipt = self.apply_raft_log_apply_commit_receipt(commit).await?;
+        Ok(storage_command_result_from_committed_outcome(&receipt))
     }
 }
 

@@ -6,12 +6,7 @@ use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::datastore::CommitObservationSink;
-use crate::datastore::redb::helpers;
-use crate::datastore::sqlite::create_pending_watch_event;
-#[cfg(test)]
-use crate::datastore::sqlite::publish_pending;
+use super::super::helpers;
 use klights_cluster_core::Resource;
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::read_core::RedbCollectionScope;
@@ -22,20 +17,11 @@ use klights_cluster_datastore::redb::tables;
 #[derive(Clone)]
 pub struct RedbNamespaceStore {
     pub accessor: Arc<RedbAccessor>,
-    #[cfg(test)]
-    pub commit_sink: Arc<dyn CommitObservationSink>,
 }
 
 impl RedbNamespaceStore {
-    pub fn new(
-        accessor: Arc<RedbAccessor>,
-        #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
-    ) -> Self {
-        Self {
-            accessor,
-            #[cfg(test)]
-            commit_sink,
-        }
+    pub fn new(accessor: Arc<RedbAccessor>) -> Self {
+        Self { accessor }
     }
 
     async fn db_call<T, F>(&self, label: &str, f: F) -> Result<T>
@@ -46,21 +32,20 @@ impl RedbNamespaceStore {
         self.accessor.call(label, f).await
     }
 
-    async fn db_call_with_observation<T, F>(&self, label: &str, f: F) -> Result<T>
+    async fn db_call_with_post_commit<T, F>(
+        &self,
+        label: &str,
+        f: F,
+    ) -> Result<(T, Option<klights_cluster_store::StagedPostCommit>)>
     where
         T: Send + 'static,
-        F: FnOnce(&::redb::Database) -> Result<(T, Option<crate::datastore::PendingWatchEvent>)>
+        F: FnOnce(
+                &::redb::Database,
+            ) -> Result<(T, Option<klights_cluster_store::StagedPostCommit>)>
             + Send
             + 'static,
     {
-        let (result, pending) = self.accessor.call(label, f).await?;
-        #[cfg(not(test))]
-        let _ = pending;
-        #[cfg(test)]
-        if let Some(pending) = pending {
-            publish_pending(pending, self.commit_sink.as_ref());
-        }
-        Ok(result)
+        self.accessor.call(label, f).await
     }
 
     // -----------------------------------------------------------------------
@@ -100,9 +85,13 @@ impl RedbNamespaceStore {
         })
     }
 
-    pub async fn create_ns(&self, name: &str, data: Value) -> Result<Resource> {
+    pub async fn create_ns(
+        &self,
+        name: &str,
+        data: Value,
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         let name_owned = name.to_string();
-        self.db_call_with_observation("create_ns", move |db| {
+        self.db_call_with_post_commit("create_ns", move |db| {
             let name: &str = &name_owned;
             let body = serde_json::to_vec(&data)?;
             let w = db.begin_write()?;
@@ -117,7 +106,7 @@ impl RedbNamespaceStore {
             let ev = serde_json::json!({"apiVersion":"v1","kind":"Namespace","namespace":null,"name":name,"eventType":"ADDED","data":data});
             helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            let pending = create_pending_watch_event(
+            let pending = helpers::stage_resource_post_commit(
                     "v1",
                     "Namespace",
                     None,
@@ -308,10 +297,7 @@ mod tests {
             .await
             .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        RedbNamespaceStore::new(
-            accessor,
-            crate::watch_commit_observation_adapter::new_sink(),
-        )
+        RedbNamespaceStore::new(accessor)
     }
 
     #[tokio::test]
@@ -346,7 +332,6 @@ mod tests {
         // Insert a resource into this namespace via the resource store.
         let resources = RedbResourceStore::new(
             s.accessor.clone(),
-            s.commit_sink.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         );
         resources.create_res("v1", "ConfigMap", Some("hascontent"), "cm",
@@ -363,7 +348,6 @@ mod tests {
             .unwrap();
         let resources = RedbResourceStore::new(
             s.accessor.clone(),
-            s.commit_sink.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         );
         resources
@@ -397,7 +381,6 @@ mod tests {
             .unwrap();
         let resources = RedbResourceStore::new(
             s.accessor.clone(),
-            s.commit_sink.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         );
         resources

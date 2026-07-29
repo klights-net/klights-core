@@ -1,6 +1,6 @@
 use super::cluster_state_apply::{ApplyEffects, RaftClusterStateApplier};
 use super::{Datastore, queries};
-use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
+use crate::datastore::types::{AppliedOutboxRecord, ReplicatedSnapshotMetadata};
 use anyhow::{Result, anyhow};
 use klights_cluster_core::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark, Resource,
@@ -13,6 +13,7 @@ use klights_cluster_core::{
 };
 #[cfg(test)]
 use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
+use klights_cluster_store::StagedPostCommit;
 use klights_cluster_store::{
     CLUSTER_ID_META_KEY as KEY_CLUSTER_ID, LEADER_EPOCH_META_KEY as KEY_LEADER_EPOCH,
     RAFT_LEADER_HINT_META_KEY as KEY_RAFT_LEADER_HINT, RAFT_TERM_META_KEY as KEY_RAFT_TERM,
@@ -124,7 +125,7 @@ fn replace_resource_state_in_conn(
     watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
     metadata: Option<ReplicatedSnapshotMetadata>,
     context: &super::outbox_codec::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
+) -> tokio_rusqlite::Result<Vec<StagedPostCommit>> {
     if current_rv < 0 {
         return Err(other_error("snapshot current_rv must be non-negative"));
     }
@@ -415,30 +416,17 @@ impl Datastore {
         Ok(())
     }
 
-    pub async fn apply_raft_log_apply_commit(
+    pub async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        Ok(self
-            .apply_raft_log_apply_commit_atomically(commit)
-            .await?
-            .result)
-    }
-
-    pub async fn apply_raft_log_apply_commit_outcome(
-        &self,
-        commit: LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        Ok(self
-            .apply_raft_log_apply_commit_atomically(commit)
-            .await?
-            .committed_outcome)
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        self.apply_raft_log_apply_commit_atomically(commit).await
     }
 
     async fn apply_raft_log_apply_commit_atomically(
         &self,
         commit: LogApplyCommit,
-    ) -> Result<RaftLogApplyCommitted> {
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
         #[cfg(test)]
         let watch_bus = self.commit_sink.clone();
         let outbox_codec = self.outbox_codec.clone();
@@ -454,10 +442,11 @@ impl Datastore {
                     let outcome = apply_commit_in_tx_for_raft_with_context(&tx, commit, &context)?;
                     tx.commit()?;
                     Ok((
-                        RaftLogApplyCommitted {
-                            result: outcome.result,
-                            committed_outcome: outcome.committed_outcome,
-                        },
+                        klights_cluster_store::CommittedRaftApplyReceipt::new(
+                            outcome.committed_outcome,
+                            outcome.pod_endpoint_effect,
+                        )
+                        .with_returned_resource(outcome.returned_resource),
                         outcome.pending,
                     ))
                 },
@@ -483,85 +472,35 @@ impl Datastore {
 }
 
 pub(crate) struct RaftLogApplyOutcome {
-    pub result: crate::datastore::raft::types::StorageCommandResult,
     pub committed_outcome: klights_cluster_core::CommittedApplyOutcome,
-    pub pending: Vec<PendingWatchEvent>,
-}
-
-struct RaftLogApplyCommitted {
-    result: crate::datastore::raft::types::StorageCommandResult,
-    committed_outcome: klights_cluster_core::CommittedApplyOutcome,
+    pub returned_resource: Option<Resource>,
+    pub pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
+    pub pending: Vec<StagedPostCommit>,
 }
 
 impl RaftLogApplyOutcome {
     fn try_new(
         committed_outcome: klights_cluster_core::CommittedApplyOutcome,
-        pending: Vec<PendingWatchEvent>,
+        pending: Vec<StagedPostCommit>,
         pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
     ) -> tokio_rusqlite::Result<Self> {
-        let result = match &committed_outcome {
-            klights_cluster_core::CommittedApplyOutcome::Visible {
-                resource_version,
-                resource,
-            } => crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: Some(*resource_version),
-                error_message: None,
-                rejection_code: None,
-                public_resource_changed: true,
-                applied_mutation: resource
-                    .clone()
-                    .map(crate::datastore::raft::types::AppliedMutation::Resource),
-                pod_endpoint_effect,
-            },
-            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
-                resource_version,
-                ..
-            } => crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: Some(*resource_version),
-                error_message: None,
-                rejection_code: None,
-                public_resource_changed: false,
-                applied_mutation: None,
-                pod_endpoint_effect,
-            },
-            klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
-                crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: None,
-                    error_message: Some(rejection.message().to_string()),
-                    rejection_code: Some(match rejection {
-                        klights_cluster_core::CommittedApplyRejection::AlreadyExists { .. } => {
-                            klights_cluster_core::StorageCommandRejectionCode::AlreadyExists
-                        }
-                        klights_cluster_core::CommittedApplyRejection::NotFound { .. } => {
-                            klights_cluster_core::StorageCommandRejectionCode::NotFound
-                        }
-                        klights_cluster_core::CommittedApplyRejection::UidConflict { .. }
-                        | klights_cluster_core::CommittedApplyRejection::ResourceVersionConflict {
-                            ..
-                        } => klights_cluster_core::StorageCommandRejectionCode::Conflict,
-                        klights_cluster_core::CommittedApplyRejection::InvalidCommit { .. } => {
-                            klights_cluster_core::StorageCommandRejectionCode::InvalidCommit
-                        }
-                        _ => {
-                            klights_cluster_core::StorageCommandRejectionCode::InvalidCommit
-                        }
-                    }),
-                    public_resource_changed: false,
-                    applied_mutation: None,
-                    pod_endpoint_effect,
-                }
+        let returned_resource = match &committed_outcome {
+            klights_cluster_core::CommittedApplyOutcome::Visible { resource, .. } => {
+                resource.clone()
             }
-            _ => {
-                return Err(other_error(
-                    "unsupported canonical committed-apply outcome variant",
-                ));
-            }
+            _ => None,
         };
         Ok(Self {
-            result,
             committed_outcome,
+            returned_resource,
+            pod_endpoint_effect,
             pending,
         })
+    }
+
+    fn with_returned_resource(mut self, resource: Option<Resource>) -> Self {
+        self.returned_resource = resource;
+        self
     }
 }
 
@@ -688,13 +627,12 @@ pub(crate) fn apply_commit_in_tx_for_raft_with_context(
     if let Some(template) = outbox_template.as_ref()
         && let Some(existing) = applied_outbox_record_in_tx(tx, &template.idempotency_key)?
     {
-        let result = storage_result_from_applied_outbox(&existing, context)?;
-        if result.error_message.is_some() {
-            let outcome = committed_outcome_from_storage_result(
-                result,
-                false,
-                klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
-            )?;
+        let (resource_version, error_message, returned_resource) =
+            receipt_from_applied_outbox(&existing, context)?;
+        if let Some(message) = error_message {
+            let outcome = klights_cluster_core::CommittedApplyOutcome::Rejected(
+                committed_rejection_from_message(message),
+            );
             return RaftLogApplyOutcome::try_new(
                 outcome,
                 Vec::new(),
@@ -705,17 +643,22 @@ pub(crate) fn apply_commit_in_tx_for_raft_with_context(
                 ),
             );
         }
-        let resource_version = result.applied_rv.ok_or_else(|| {
+        let resource_version = resource_version.ok_or_else(|| {
             other_error("duplicate applied_outbox row has no applied resourceVersion")
         })?;
-        return Ok(RaftLogApplyOutcome {
-            result,
-            committed_outcome: klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+        return Ok(RaftLogApplyOutcome::try_new(
+            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
                 resource_version,
                 reason: klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
             },
-            pending: Vec::new(),
-        });
+            Vec::new(),
+            pod_endpoint_effect(
+                pod_target.as_ref(),
+                pod_before.as_ref(),
+                pod_before.as_ref(),
+            ),
+        )?
+        .with_returned_resource(returned_resource));
     }
 
     // A duplicate watermark has already been applied. Do not allocate a V1
@@ -793,10 +736,8 @@ pub(crate) fn apply_commit_in_tx_for_raft_with_context(
     tx.execute("SAVEPOINT raft_apply_attempt", [])?;
     match apply_commit_in_tx_returning_rv_and_mutation_with_context(tx, commit, context) {
         Ok((rv, pending, applied_mutation)) => {
-            if let (
-                Some(template),
-                Some(crate::datastore::raft::types::AppliedMutation::Resource(resource)),
-            ) = (outbox_template.as_ref(), applied_mutation.as_ref())
+            if let (Some(template), Some(resource)) =
+                (outbox_template.as_ref(), applied_mutation.as_ref())
                 && template.operation == klights_cluster_core::log_apply::POD_METADATA_OPERATION
                 && resource.api_version == "v1"
                 && resource.kind == "Pod"
@@ -835,9 +776,7 @@ pub(crate) fn apply_commit_in_tx_for_raft_with_context(
             };
             let visible_change = after_position.resource_version > before_position.resource_version
                 || after_position.event_id > before_position.event_id;
-            let resource = applied_mutation.map(|mutation| match mutation {
-                crate::datastore::raft::types::AppliedMutation::Resource(resource) => resource,
-            });
+            let resource = applied_mutation;
             let outcome = if visible_change || resource.is_some() {
                 klights_cluster_core::CommittedApplyOutcome::Visible {
                     resource_version: rv,
@@ -903,37 +842,6 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     apply_commit_in_tx_for_raft_with_context(tx, commit, &context)
 }
 
-fn committed_outcome_from_storage_result(
-    result: crate::datastore::raft::types::StorageCommandResult,
-    visible_change: bool,
-    no_change_reason: klights_cluster_core::NoPublicChangeReason,
-) -> tokio_rusqlite::Result<klights_cluster_core::CommittedApplyOutcome> {
-    if let Some(message) = result.error_message {
-        return Ok(klights_cluster_core::CommittedApplyOutcome::Rejected(
-            committed_rejection_from_message(message),
-        ));
-    }
-    let resource = result.applied_mutation.map(|mutation| match mutation {
-        crate::datastore::raft::types::AppliedMutation::Resource(resource) => resource,
-    });
-    let resource_version = result.applied_rv.ok_or_else(|| {
-        other_error("committed apply returned neither a public resourceVersion nor a rejection")
-    })?;
-    if visible_change || resource.is_some() {
-        Ok(klights_cluster_core::CommittedApplyOutcome::Visible {
-            resource_version,
-            resource,
-        })
-    } else {
-        Ok(
-            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
-                resource_version,
-                reason: no_change_reason,
-            },
-        )
-    }
-}
-
 fn committed_rejection_from_conflict(
     error: &tokio_rusqlite::Error,
     message: String,
@@ -982,7 +890,7 @@ pub(crate) fn apply_commit_in_tx_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::outbox_codec::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
+) -> tokio_rusqlite::Result<Vec<StagedPostCommit>> {
     let (_applied_rv, pending) = apply_commit_in_tx_returning_rv_with_context(tx, commit, context)?;
     Ok(pending)
 }
@@ -991,7 +899,7 @@ pub(crate) fn apply_commit_in_tx_returning_rv_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::outbox_codec::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
+) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>)> {
     let (applied_rv, pending, _applied_mutation) =
         apply_commit_in_tx_returning_rv_and_mutation_with_context(tx, commit, context)?;
     Ok((applied_rv, pending))
@@ -1001,11 +909,7 @@ pub(crate) fn apply_commit_in_tx_returning_rv_and_mutation_with_context(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     context: &super::outbox_codec::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(
-    i64,
-    Vec<PendingWatchEvent>,
-    Option<crate::datastore::raft::types::AppliedMutation>,
-)> {
+) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
     let has_explicit_watch_history = commit
         .mutations()
         .iter()
@@ -1023,11 +927,7 @@ fn apply_commit_in_tx_with_watch_events(
     commit: ApplyCommit,
     emit_watch_events: bool,
     context: &super::outbox_codec::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<(
-    i64,
-    Vec<PendingWatchEvent>,
-    Option<crate::datastore::raft::types::AppliedMutation>,
-)> {
+) -> tokio_rusqlite::Result<(i64, Vec<StagedPostCommit>, Option<Resource>)> {
     if commit.resource_version < 0 {
         return Err(other_error(
             "log_apply commit resourceVersion must be non-negative",
@@ -1182,7 +1082,7 @@ fn resolve_bound_pod_finalizations_in_tx(
 
 fn applied_mutation_from_stamped_commit(
     commit: &ApplyCommit,
-) -> tokio_rusqlite::Result<Option<crate::datastore::raft::types::AppliedMutation>> {
+) -> tokio_rusqlite::Result<Option<Resource>> {
     let Some(deleted_key) = commit.mutations.iter().find_map(|mutation| match mutation {
         LogApplyMutation::DeleteResource(key) => Some(key),
         _ => None,
@@ -1214,18 +1114,16 @@ fn applied_mutation_from_stamped_commit(
     {
         metadata.remove("resourceVersion");
     }
-    Ok(Some(
-        crate::datastore::raft::types::AppliedMutation::Resource(Resource {
-            id: 0,
-            api_version: watch_row.api_version.clone(),
-            kind: watch_row.kind.clone(),
-            namespace: watch_row.namespace.clone(),
-            name: watch_row.name.clone(),
-            uid: Resource::uid_from_data(&watch_row.data),
-            resource_version: source_resource_version,
-            data: std::sync::Arc::new(data),
-        }),
-    ))
+    Ok(Some(Resource {
+        id: 0,
+        api_version: watch_row.api_version.clone(),
+        kind: watch_row.kind.clone(),
+        namespace: watch_row.namespace.clone(),
+        name: watch_row.name.clone(),
+        uid: Resource::uid_from_data(&watch_row.data),
+        resource_version: source_resource_version,
+        data: std::sync::Arc::new(data),
+    }))
 }
 
 fn outbox_watermark_decision_in_tx(
@@ -1390,20 +1288,13 @@ fn applied_outbox_record_in_tx(
     .map_err(tokio_rusqlite::Error::from)
 }
 
-fn storage_result_from_applied_outbox(
+fn receipt_from_applied_outbox(
     row: &AppliedOutboxRecord,
     context: &super::outbox_codec::TransactionContext<'_>,
-) -> tokio_rusqlite::Result<crate::datastore::raft::types::StorageCommandResult> {
+) -> tokio_rusqlite::Result<(Option<i64>, Option<String>, Option<Resource>)> {
     match context.decode(&row.result_proto) {
         Ok(klights_cluster_core::command::StorageResponse::Error { message }) => {
-            Ok(crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: row.applied_rv,
-                error_message: Some(message),
-                rejection_code: None,
-                public_resource_changed: false,
-                applied_mutation: None,
-                pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::Unchanged,
-            })
+            Ok((row.applied_rv, Some(message), None))
         }
         Ok(klights_cluster_core::command::StorageResponse::Resource {
             resource_version,
@@ -1412,25 +1303,9 @@ fn storage_result_from_applied_outbox(
             let mut resource = crate::datastore::Resource::try_from_data(std::sync::Arc::new(data))
                 .map_err(|error| other_error(error.to_string()))?;
             resource.resource_version = resource_version;
-            Ok(crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: row.applied_rv,
-                error_message: None,
-                rejection_code: None,
-                public_resource_changed: false,
-                applied_mutation: Some(crate::datastore::raft::types::AppliedMutation::Resource(
-                    resource,
-                )),
-                pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::Unchanged,
-            })
+            Ok((row.applied_rv, None, Some(resource)))
         }
-        Ok(_) => Ok(crate::datastore::raft::types::StorageCommandResult {
-            applied_rv: row.applied_rv,
-            error_message: None,
-            rejection_code: None,
-            public_resource_changed: false,
-            applied_mutation: None,
-            pod_endpoint_effect: klights_cluster_core::PodEndpointEffect::Unchanged,
-        }),
+        Ok(_) => Ok((row.applied_rv, None, None)),
         Err(err) => Err(other_error(format!(
             "failed to decode applied_outbox result: {err}"
         ))),

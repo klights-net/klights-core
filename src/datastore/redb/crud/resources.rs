@@ -9,12 +9,7 @@ use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::datastore::CommitObservationSink;
-use crate::datastore::redb::helpers;
-use crate::datastore::sqlite::create_pending_watch_event;
-#[cfg(test)]
-use crate::datastore::sqlite::publish_pending;
+use super::super::helpers;
 use crate::datastore::types::*;
 use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_cluster_datastore::redb::RedbAccessor;
@@ -28,21 +23,16 @@ use klights_cluster_datastore::redb::tables;
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
-    #[cfg(test)]
-    commit_sink: Arc<dyn CommitObservationSink>,
 }
 
 impl RedbResourceStore {
     pub fn new(
         accessor: Arc<RedbAccessor>,
-        #[cfg(test)] commit_sink: Arc<dyn CommitObservationSink>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
         Self {
             accessor,
             wall_clock,
-            #[cfg(test)]
-            commit_sink,
         }
     }
 
@@ -56,21 +46,20 @@ impl RedbResourceStore {
         self.accessor.call(label, f).await
     }
 
-    async fn db_call_with_observation<T, F>(&self, label: &str, f: F) -> Result<T>
+    async fn db_call_with_post_commit<T, F>(
+        &self,
+        label: &str,
+        f: F,
+    ) -> Result<(T, Option<klights_cluster_store::StagedPostCommit>)>
     where
         T: Send + 'static,
-        F: FnOnce(&::redb::Database) -> Result<(T, Option<crate::datastore::PendingWatchEvent>)>
+        F: FnOnce(
+                &::redb::Database,
+            ) -> Result<(T, Option<klights_cluster_store::StagedPostCommit>)>
             + Send
             + 'static,
     {
-        let (result, pending) = self.accessor.call(label, f).await?;
-        #[cfg(not(test))]
-        let _ = pending;
-        #[cfg(test)]
-        if let Some(pending) = pending {
-            publish_pending(pending, self.commit_sink.as_ref());
-        }
-        Ok(result)
+        self.accessor.call(label, f).await
     }
 
     // -----------------------------------------------------------------------
@@ -84,7 +73,7 @@ impl RedbResourceStore {
         ns: Option<&str>,
         name: &str,
         mut data: Value,
-    ) -> Result<Resource> {
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         helpers::ensure_uid(&mut data);
         let data_clone = Arc::new(data.clone());
         let key = resource_key(av, kind, ns, name);
@@ -97,8 +86,8 @@ impl RedbResourceStore {
         let kind_res = kind_owned.clone();
         let ns_res = ns_owned.clone();
         let name_res = name_owned.clone();
-        let rv = self
-            .db_call_with_observation("create_res", move |db| {
+        let (rv, pending) = self
+            .db_call_with_post_commit("create_res", move |db| {
                 let res_tbl = if ns_owned.is_some() {
                     tables::RES_NS
                 } else {
@@ -132,7 +121,7 @@ impl RedbResourceStore {
                     Some(&body),
                 )?;
                 w.commit()?;
-                let pending = create_pending_watch_event(
+                let pending = helpers::stage_resource_post_commit(
                         &av_owned,
                         &kind_owned,
                         ns_owned.as_deref(),
@@ -144,16 +133,19 @@ impl RedbResourceStore {
                 Ok((rv, Some(pending)))
             })
             .await?;
-        Ok(Resource {
-            id: 0,
-            api_version: av_res,
-            kind: kind_res,
-            namespace: ns_res,
-            name: name_res,
-            uid: Resource::uid_from_data(&data_clone),
-            resource_version: rv,
-            data: data_clone,
-        })
+        Ok((
+            Resource {
+                id: 0,
+                api_version: av_res,
+                kind: kind_res,
+                namespace: ns_res,
+                name: name_res,
+                uid: Resource::uid_from_data(&data_clone),
+                resource_version: rv,
+                data: data_clone,
+            },
+            pending,
+        ))
     }
 
     #[cfg(test)]
@@ -165,7 +157,7 @@ impl RedbResourceStore {
         name: &str,
         mut data: Value,
         options: ReplicatedCreateOptions,
-    ) -> Result<Resource> {
+    ) -> Result<(Resource, Vec<klights_cluster_store::StagedPostCommit>)> {
         let ReplicatedCreateOptions {
             resource_version,
             meta_uid,
@@ -196,8 +188,6 @@ impl RedbResourceStore {
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|value| value.to_string());
         let name_owned = name.to_string();
-        #[cfg(test)]
-        let watch_bus = self.commit_sink.clone();
         let incoming_uid_for_db = incoming_uid.clone();
         let av_for_db = av_owned.clone();
         let kind_for_db = kind_owned.clone();
@@ -390,109 +380,104 @@ impl RedbResourceStore {
             } => {
                 let current_data: Value =
                     serde_json::from_slice(&current_data).unwrap_or(Value::Null);
-                Ok(Resource {
-                    id: 0,
-                    api_version: av_owned,
-                    kind: kind_owned,
-                    namespace: ns_owned,
-                    name: name_owned,
-                    uid: Resource::uid_from_data(&current_data),
-                    resource_version: current_rv,
-                    data: Arc::new(current_data),
-                })
+                Ok((
+                    Resource {
+                        id: 0,
+                        api_version: av_owned,
+                        kind: kind_owned,
+                        namespace: ns_owned,
+                        name: name_owned,
+                        uid: Resource::uid_from_data(&current_data),
+                        resource_version: current_rv,
+                        data: Arc::new(current_data),
+                    },
+                    Vec::new(),
+                ))
             }
             ApplyCreateResult::Inserted => {
-                #[cfg(test)]
-                publish_pending(
-                    create_pending_watch_event(
-                        &av_owned,
-                        &kind_owned,
-                        ns_owned.as_deref(),
-                        &name_owned,
-                        resource_version,
-                        "ADDED",
-                        (*data_for_return).clone(),
-                    ),
-                    watch_bus.as_ref(),
-                );
-                Ok(Resource {
-                    id: 0,
-                    api_version: av_owned,
-                    kind: kind_owned,
-                    namespace: ns_owned,
-                    name: name_owned,
-                    uid: incoming_uid,
+                let pending = helpers::stage_resource_post_commit(
+                    &av_owned,
+                    &kind_owned,
+                    ns_owned.as_deref(),
+                    &name_owned,
                     resource_version,
-                    data: data_for_return,
-                })
+                    "ADDED",
+                    (*data_for_return).clone(),
+                );
+                Ok((
+                    Resource {
+                        id: 0,
+                        api_version: av_owned,
+                        kind: kind_owned,
+                        namespace: ns_owned,
+                        name: name_owned,
+                        uid: incoming_uid,
+                        resource_version,
+                        data: data_for_return,
+                    },
+                    vec![pending],
+                ))
             }
             ApplyCreateResult::UpdatedSameUid => {
-                #[cfg(test)]
-                publish_pending(
-                    create_pending_watch_event(
-                        &av_owned,
-                        &kind_owned,
-                        ns_owned.as_deref(),
-                        &name_owned,
-                        resource_version,
-                        "MODIFIED",
-                        (*data_for_return).clone(),
-                    ),
-                    watch_bus.as_ref(),
-                );
-                Ok(Resource {
-                    id: 0,
-                    api_version: av_owned,
-                    kind: kind_owned,
-                    namespace: ns_owned,
-                    name: name_owned,
-                    uid: incoming_uid,
+                let pending = helpers::stage_resource_post_commit(
+                    &av_owned,
+                    &kind_owned,
+                    ns_owned.as_deref(),
+                    &name_owned,
                     resource_version,
-                    data: data_for_return,
-                })
+                    "MODIFIED",
+                    (*data_for_return).clone(),
+                );
+                Ok((
+                    Resource {
+                        id: 0,
+                        api_version: av_owned,
+                        kind: kind_owned,
+                        namespace: ns_owned,
+                        name: name_owned,
+                        uid: incoming_uid,
+                        resource_version,
+                        data: data_for_return,
+                    },
+                    vec![pending],
+                ))
             }
             ApplyCreateResult::ReplacedDifferentUid {
                 old_data,
                 deleted_rv,
             } => {
-                #[cfg(test)]
                 let old_object: Value = serde_json::from_slice(&old_data).unwrap_or(Value::Null);
-                #[cfg(test)]
-                publish_pending(
-                    create_pending_watch_event(
-                        &av_owned,
-                        &kind_owned,
-                        ns_owned.as_deref(),
-                        &name_owned,
-                        deleted_rv,
-                        "DELETED",
-                        old_object,
-                    ),
-                    watch_bus.as_ref(),
+                let deleted = helpers::stage_resource_post_commit(
+                    &av_owned,
+                    &kind_owned,
+                    ns_owned.as_deref(),
+                    &name_owned,
+                    deleted_rv,
+                    "DELETED",
+                    old_object,
                 );
-                #[cfg(test)]
-                publish_pending(
-                    create_pending_watch_event(
-                        &av_owned,
-                        &kind_owned,
-                        ns_owned.as_deref(),
-                        &name_owned,
-                        resource_version,
-                        "ADDED",
-                        (*data_for_return).clone(),
-                    ),
-                    watch_bus.as_ref(),
-                );
-                Ok(Resource {
-                    id: 0,
-                    api_version: av_owned,
-                    kind: kind_owned,
-                    namespace: ns_owned,
-                    name: name_owned,
-                    uid: incoming_uid,
+                let added = helpers::stage_resource_post_commit(
+                    &av_owned,
+                    &kind_owned,
+                    ns_owned.as_deref(),
+                    &name_owned,
                     resource_version,
-                    data: data_for_return,
-                })
+                    "ADDED",
+                    (*data_for_return).clone(),
+                );
+                Ok((
+                    Resource {
+                        id: 0,
+                        api_version: av_owned,
+                        kind: kind_owned,
+                        namespace: ns_owned,
+                        name: name_owned,
+                        uid: incoming_uid,
+                        resource_version,
+                        data: data_for_return,
+                    },
+                    vec![deleted, added],
+                ))
             }
         }
     }
@@ -517,7 +502,7 @@ impl RedbResourceStore {
         name: &str,
         data: Value,
         expected_rv: i64,
-    ) -> Result<Resource> {
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         self.update_res_with_preconditions(
             av,
             kind,
@@ -537,13 +522,13 @@ impl RedbResourceStore {
         name: &str,
         data: Value,
         preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         let key = resource_key(av, kind, ns, name);
         let av_owned = av.to_string();
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|s| s.to_string());
         let name_owned = name.to_string();
-        self.db_call_with_observation("update_res", move |db: &::redb::Database| {
+        self.db_call_with_post_commit("update_res", move |db: &::redb::Database| {
             let mut data = data.clone();
             let key = key.clone();
             let av_o = av_owned.clone();
@@ -590,17 +575,15 @@ impl RedbResourceStore {
                 "resourceVersion",
             ) {
                 let uid = Resource::uid_from_data(&current);
-                crate::datastore::diagnostics::log_noop_resource_write(
-                    crate::datastore::diagnostics::NoopResourceWrite {
-                        operation: "redb_update_resource",
-                        api_version: &av_o,
-                        kind: &kind_o,
-                        namespace: ns_o.as_deref(),
-                        name: &name_o,
-                        uid: &uid,
-                        resource_version: cur_rv,
-                        reason: "object unchanged",
-                    },
+                helpers::log_noop_resource_write(
+                    "redb_update_resource",
+                    &av_o,
+                    &kind_o,
+                    ns_o.as_deref(),
+                    &name_o,
+                    &uid,
+                    cur_rv,
+                    "object unchanged",
                 );
                 w.commit()?;
                 return Ok((Resource {
@@ -636,7 +619,7 @@ impl RedbResourceStore {
                 Some(&body),
             )?;
             w.commit()?;
-            let pending = create_pending_watch_event(
+            let pending = helpers::stage_resource_post_commit(
                     &av_o,
                     &kind_o,
                     ns_o.as_deref(),
@@ -665,13 +648,13 @@ impl RedbResourceStore {
         kind: &str,
         ns: Option<&str>,
         name: &str,
-    ) -> Result<()> {
+    ) -> Result<((), Option<klights_cluster_store::StagedPostCommit>)> {
         let key = resource_key(av, kind, ns, name);
         let av_owned = av.to_string();
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(|s| s.to_string());
         let name_owned = name.to_string();
-        self.db_call_with_observation("delete_res", move |db| {
+        self.db_call_with_post_commit("delete_res", move |db| {
             let res_tbl = if ns_owned.is_some() {
                 tables::RES_NS
             } else {
@@ -708,7 +691,7 @@ impl RedbResourceStore {
                 None,
             )?;
             w.commit()?;
-            let pending = create_pending_watch_event(
+            let pending = helpers::stage_resource_post_commit(
                     &av_owned,
                     &kind_owned,
                     ns_owned.as_deref(),
@@ -730,7 +713,7 @@ impl RedbResourceStore {
         name: &str,
         preconditions: ResourcePreconditions,
         grace_seconds: i64,
-    ) -> Result<Resource> {
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         let key = resource_key(av, kind, ns, name);
         let av_owned = av.to_string();
         let kind_owned = kind.to_string();
@@ -747,8 +730,8 @@ impl RedbResourceStore {
         let deletion_timestamp =
             klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
 
-        let (resource_version, data, uid) = self
-            .db_call_with_observation("delete_res_with_tombstone", move |db| {
+        let ((resource_version, data, uid), pending) = self
+            .db_call_with_post_commit("delete_res_with_tombstone", move |db| {
                 let res_tbl = if ns_error.is_some() {
                     tables::RES_NS
                 } else {
@@ -820,7 +803,7 @@ impl RedbResourceStore {
                     None,
                 )?;
                 w.commit()?;
-                let pending = create_pending_watch_event(
+                let pending = helpers::stage_resource_post_commit(
                         &av_event,
                         &kind_event,
                         ns_event.as_deref(),
@@ -833,16 +816,19 @@ impl RedbResourceStore {
             })
             .await?;
 
-        Ok(Resource {
-            id: 0,
-            api_version: av_owned,
-            kind: kind_owned,
-            namespace: ns_owned,
-            name: name_owned,
-            uid,
-            resource_version,
-            data,
-        })
+        Ok((
+            Resource {
+                id: 0,
+                api_version: av_owned,
+                kind: kind_owned,
+                namespace: ns_owned,
+                name: name_owned,
+                uid,
+                resource_version,
+                data,
+            },
+            pending,
+        ))
     }
 
     pub async fn list_res(
@@ -957,12 +943,12 @@ impl RedbResourceStore {
         name: &str,
         status: Value,
         expected_rv: Option<i64>,
-    ) -> Result<Resource> {
+    ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         let av_owned = av.to_string();
         let kind_owned = kind.to_string();
         let name_owned = name.to_string();
         let ns_owned = ns.map(|s| s.to_string());
-        self.db_call_with_observation("update_status_only", move |db: &::redb::Database| {
+        self.db_call_with_post_commit("update_status_only", move |db: &::redb::Database| {
             let av_o = av_owned.clone();
             let kind_o = kind_owned.clone();
             let name_o = name_owned.clone();
@@ -998,17 +984,15 @@ impl RedbResourceStore {
             let mut current: Value = serde_json::from_slice(&old_body).unwrap_or(Value::Null);
             if current.get("status") == Some(&status_c) {
                 let uid = Resource::uid_from_data(&current);
-                crate::datastore::diagnostics::log_noop_resource_write(
-                    crate::datastore::diagnostics::NoopResourceWrite {
-                        operation: "redb_update_status_only",
-                        api_version: av,
-                        kind,
-                        namespace: ns,
-                        name,
-                        uid: &uid,
-                        resource_version: cur_rv,
-                        reason: "status unchanged",
-                    },
+                helpers::log_noop_resource_write(
+                    "redb_update_status_only",
+                    av,
+                    kind,
+                    ns,
+                    name,
+                    &uid,
+                    cur_rv,
+                    "status unchanged",
                 );
                 w.commit()?;
                 return Ok((Resource {
@@ -1038,7 +1022,7 @@ impl RedbResourceStore {
             let ev = serde_json::json!({"apiVersion":av,"kind":kind,"namespace":ns,"name":name,"eventType":"MODIFIED","data":current});
             helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            let pending = create_pending_watch_event(
+            let pending = helpers::stage_resource_post_commit(
                     av,
                     kind,
                     ns,
@@ -1072,12 +1056,15 @@ impl RedbResourceStore {
         ns: Option<&str>,
         name: &str,
         patch: Value,
-    ) -> Result<Option<Resource>> {
+    ) -> Result<(
+        Option<Resource>,
+        Option<klights_cluster_store::StagedPostCommit>,
+    )> {
         let av_owned = av.to_string();
         let kind_owned = kind.to_string();
         let name_owned = name.to_string();
         let ns_owned = ns.map(|s| s.to_string());
-        self.db_call_with_observation("patch", move |db| {
+        self.db_call_with_post_commit("patch", move |db| {
             let av: &str = &av_owned;
             let kind: &str = &kind_owned;
             let name: &str = &name_owned;
@@ -1110,17 +1097,15 @@ impl RedbResourceStore {
                 "resourceVersion",
             ) {
                 let uid = Resource::uid_from_data(&before_patch);
-                crate::datastore::diagnostics::log_noop_resource_write(
-                    crate::datastore::diagnostics::NoopResourceWrite {
-                        operation: "redb_patch_resource_latest",
-                        api_version: av,
-                        kind,
-                        namespace: ns,
-                        name,
-                        uid: &uid,
-                        resource_version: current.0 as i64,
-                        reason: "patch result unchanged",
-                    },
+                helpers::log_noop_resource_write(
+                    "redb_patch_resource_latest",
+                    av,
+                    kind,
+                    ns,
+                    name,
+                    &uid,
+                    current.0 as i64,
+                    "patch result unchanged",
                 );
                 w.commit()?;
                 return Ok((Some(Resource {
@@ -1156,7 +1141,7 @@ impl RedbResourceStore {
             let ev = serde_json::json!({"apiVersion":av,"kind":kind,"namespace":ns,"name":name,"eventType":"MODIFIED","data":current_data});
             helpers::watch_insert(&w, rv, &ev)?;
             w.commit()?;
-            let pending = create_pending_watch_event(
+            let pending = helpers::stage_resource_post_commit(
                     av,
                     kind,
                     ns,
@@ -1212,11 +1197,7 @@ mod tests {
             .await
             .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        RedbResourceStore::new(
-            accessor,
-            crate::watch_commit_observation_adapter::new_sink(),
-            Arc::new(klights_supervisor::SystemWallClock),
-        )
+        RedbResourceStore::new(accessor, Arc::new(klights_supervisor::SystemWallClock))
     }
 
     // ── tests of code paths NOT covered by cross_backend_tests.rs ──
@@ -1339,43 +1320,34 @@ mod tests {
 
     #[tokio::test]
     async fn watch_events_emitted_on_create_update_delete() {
-        use crate::watch::events::EventType;
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let db = open_boundary::open_in_memory(supervisor.as_ref())
             .await
             .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        let watch_sink = crate::watch_commit_observation_adapter::new_sink();
-        let mut watch_rx = crate::watch_commit_observation_adapter::subscribe_test_events(
-            watch_sink.as_ref(),
-            klights_watch::WatchTopic::new("v1", "Pod"),
-        );
-        let s = RedbResourceStore::new(
-            accessor,
-            watch_sink,
-            Arc::new(klights_supervisor::SystemWallClock),
-        );
+        let s = RedbResourceStore::new(accessor, Arc::new(klights_supervisor::SystemWallClock));
 
         let pod =
             json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"we","namespace":"default"}});
-        let created = s
+        let (created, pending) = s
             .create_res("v1", "Pod", Some("default"), "we", pod)
             .await
             .unwrap();
-        let ev1 = watch_rx.recv().await.unwrap();
-        assert_eq!(ev1.event_type, EventType::Added);
+        let pending = pending.unwrap();
+        assert_eq!(pending.test_event().unwrap().event_type(), "ADDED");
 
-        s.update_res("v1", "Pod", Some("default"), "we",
+        let (_, pending) = s.update_res("v1", "Pod", Some("default"), "we",
             json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"we","namespace":"default","labels":{"x":"y"}}}),
             created.resource_version).await.unwrap();
-        let ev2 = watch_rx.recv().await.unwrap();
-        assert_eq!(ev2.event_type, EventType::Modified);
+        let pending = pending.unwrap();
+        assert_eq!(pending.test_event().unwrap().event_type(), "MODIFIED");
 
-        s.delete_res("v1", "Pod", Some("default"), "we")
+        let (_, pending) = s
+            .delete_res("v1", "Pod", Some("default"), "we")
             .await
             .unwrap();
-        let ev3 = watch_rx.recv().await.unwrap();
-        assert_eq!(ev3.event_type, EventType::Deleted);
+        let pending = pending.unwrap();
+        assert_eq!(pending.test_event().unwrap().event_type(), "DELETED");
     }
 
     #[tokio::test]

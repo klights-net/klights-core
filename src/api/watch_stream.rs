@@ -2801,7 +2801,7 @@ mod tests {
 
     #[test]
     fn watch_json_event_reuses_encoded_bytes_for_identical_subscribers() {
-        let pending = crate::datastore::create_pending_watch_event(
+        let pending = crate::datastore::create_staged_post_commit(
             "v1",
             "Pod",
             Some("default"),
@@ -2810,8 +2810,9 @@ mod tests {
             "ADDED",
             serde_json::json!({"metadata": {"name": "p1"}}),
         );
-        let event1 = pending.event.clone();
-        let event2 = pending.event.clone();
+        let event = crate::datastore::staged_test_event(&pending).unwrap();
+        let event1 = event.clone();
+        let event2 = event;
 
         let p1 = event1
             .encoded_payload
@@ -2865,7 +2866,7 @@ mod tests {
 
     #[test]
     fn watch_table_and_normal_subscribers_do_not_share_wrong_payload() {
-        let pending = crate::datastore::create_pending_watch_event(
+        let pending = crate::datastore::create_staged_post_commit(
             "v1",
             "Pod",
             Some("default"),
@@ -2874,9 +2875,10 @@ mod tests {
             "ADDED",
             serde_json::json!({"metadata": {"name": "p1"}}),
         );
+        let event = crate::datastore::staged_test_event(&pending).unwrap();
 
         let ctx_json = WatchEncodeReuseContext {
-            event: &pending.event,
+            event: &event,
             table_format: false,
             protobuf: false,
             selector_transitioned: false,
@@ -2884,7 +2886,7 @@ mod tests {
         assert!(can_reuse_encoded_watch_payload(&ctx_json));
 
         let ctx_table = WatchEncodeReuseContext {
-            event: &pending.event,
+            event: &event,
             table_format: true,
             protobuf: false,
             selector_transitioned: false,
@@ -2892,7 +2894,7 @@ mod tests {
         assert!(!can_reuse_encoded_watch_payload(&ctx_table));
 
         let ctx_protobuf = WatchEncodeReuseContext {
-            event: &pending.event,
+            event: &event,
             table_format: false,
             protobuf: true,
             selector_transitioned: false,
@@ -2900,15 +2902,15 @@ mod tests {
         assert!(!can_reuse_encoded_watch_payload(&ctx_protobuf));
 
         let ctx_transitioned = WatchEncodeReuseContext {
-            event: &pending.event,
+            event: &event,
             table_format: false,
             protobuf: false,
             selector_transitioned: true,
         };
         assert!(!can_reuse_encoded_watch_payload(&ctx_transitioned));
 
-        let json_line = serialize_watch_event_line(pending.event.clone(), "Pod", false);
-        let table_line = serialize_watch_event_line(pending.event, "Pod", true);
+        let json_line = serialize_watch_event_line(event.clone(), "Pod", false);
+        let table_line = serialize_watch_event_line(event, "Pod", true);
         assert_ne!(json_line, table_line, "table and JSON output must differ");
     }
 

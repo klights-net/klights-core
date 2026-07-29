@@ -1,2 +1,3 @@
 mod cross_backend_tests;
+mod phase10c1_mutation_characterization;
 mod read_store_parity_tests;

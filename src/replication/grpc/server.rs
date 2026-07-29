@@ -4057,7 +4057,7 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        db.broadcast_watch_event(crate::datastore::PendingWatchEvent::from_event(
+        db.broadcast_watch_event(crate::datastore::staged_post_commit_from_event(
             crate::watch::WatchEvent::modified(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",

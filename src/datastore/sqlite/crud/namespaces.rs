@@ -1,6 +1,6 @@
 use super::super::queries;
 use super::*;
-use crate::datastore::sqlite::create_pending_watch_event;
+use crate::datastore::sqlite::create_staged_post_commit;
 impl Datastore {
     pub async fn create_namespace(&self, name: &str, mut data: Value) -> Result<Resource> {
         ensure_resource_type_meta(&mut data, "v1", "Namespace");
@@ -34,7 +34,7 @@ impl Datastore {
 
         match result {
             Ok(rv) => {
-                let _pending = create_pending_watch_event(
+                let _pending = create_staged_post_commit(
                     "v1",
                     "Namespace",
                     None,
@@ -179,7 +179,7 @@ impl Datastore {
 
         match result {
             Ok(rv) => {
-                let _pending = create_pending_watch_event(
+                let _pending = create_staged_post_commit(
                     "v1",
                     "Namespace",
                     None,
@@ -278,7 +278,7 @@ impl Datastore {
             }) => {
                 let data: Value = serde_json::from_slice(&namespace_data)?;
                 let _pending =
-                    create_pending_watch_event("v1", "Namespace", None, name, rv, "DELETED", data);
+                    create_staged_post_commit("v1", "Namespace", None, name, rv, "DELETED", data);
                 #[cfg(test)]
                 self.publish_watch_event(_pending);
                 Ok(rv)

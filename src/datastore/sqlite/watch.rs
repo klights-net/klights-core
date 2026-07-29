@@ -3,15 +3,13 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 #[cfg(test)]
-use super::hydrate_watch_event_data;
-#[cfg(test)]
-use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_payload};
+use crate::watch::{WatchContentType, WatchEvent, WatchReceiver};
 #[cfg(test)]
 use klights_watch::WatchTopic;
 
-use super::{CatchUpResource, Datastore, PendingWatchEvent};
 #[cfg(test)]
-use super::{CommitObservation, CommitObservationSink};
+use super::CommitObservationSink;
+use super::{CatchUpResource, Datastore, StagedPostCommit};
 use klights_cluster_core::Resource;
 
 /// Free function to publish a pending watch event after DB commit.
@@ -23,16 +21,16 @@ use klights_cluster_core::Resource;
 ///   follower alike)
 ///
 /// Per HA contract bullet #4, request handlers must never call the
-/// watch bus directly — they hand a `PendingWatchEvent` back
+/// watch bus directly — they hand a `StagedPostCommit` back
 /// and this function publishes it. tests/source_guard_tests.py enforces this.
 #[cfg(test)]
-pub fn publish_pending(pending: PendingWatchEvent, sink: &dyn CommitObservationSink) {
+pub fn publish_pending(pending: StagedPostCommit, sink: &dyn CommitObservationSink) {
     publish_pending_batch(std::iter::once(pending), sink);
 }
 
 #[cfg(test)]
 pub fn publish_pending_batch(
-    pending: impl IntoIterator<Item = PendingWatchEvent>,
+    pending: impl IntoIterator<Item = StagedPostCommit>,
     sink: &dyn CommitObservationSink,
 ) {
     let pending = pending.into_iter().collect::<Vec<_>>();
@@ -41,18 +39,14 @@ pub fn publish_pending_batch(
     {
         let events = pending
             .iter()
-            .map(|pending| pending.event.clone())
+            .filter_map(staged_test_event)
             .collect::<Vec<_>>();
         for event in &events {
             crate::datastore::diagnostics::log_watch_event_broadcast(event);
         }
         crate::watch_commit_observation_adapter::publish_test_events(sink, events);
     }
-    let observations = pending
-        .iter()
-        .map(CommitObservation::from)
-        .collect::<Vec<_>>();
-    sink.observe(&observations);
+    sink.observe(&pending);
 }
 
 /// Map a DB-stored event_type string back to a `Cow<'static, str>` reusing
@@ -67,11 +61,11 @@ fn catchup_event_type_from_db(event_type: String) -> std::borrow::Cow<'static, s
     }
 }
 
-/// Create a PendingWatchEvent from raw parameters.
+/// Create a StagedPostCommit from raw parameters.
 ///
 /// Used by crud operations to stage a watch event inside the transaction,
 /// then publish after commit via `Datastore::publish_watch_event`.
-pub fn create_pending_watch_event(
+pub fn create_staged_post_commit(
     api_version: &str,
     kind: &str,
     namespace: Option<&str>,
@@ -79,29 +73,56 @@ pub fn create_pending_watch_event(
     resource_version: i64,
     event_type: &str,
     data: impl Into<std::sync::Arc<Value>>,
-) -> PendingWatchEvent {
+) -> StagedPostCommit {
     #[cfg(not(test))]
     {
         let _ = (name, event_type, data);
-        PendingWatchEvent::from_signal_metadata(api_version, kind, namespace, resource_version)
+        StagedPostCommit::new(api_version, kind, namespace, resource_version)
     }
 
     #[cfg(test)]
     {
-        let data = std::sync::Arc::unwrap_or_clone(data.into());
-        let mut event = WatchEvent::from_type(
+        crate::datastore::types::with_staged_test_resource_event(
+            StagedPostCommit::new(api_version, kind, namespace, resource_version),
             event_type,
-            hydrate_watch_event_data(data, api_version, kind, namespace, name, resource_version),
-        );
-        event.encoded_payload = encode_watch_payload(&event, WatchContentType::Json).ok();
-        PendingWatchEvent {
-            api_version: api_version.to_string(),
-            kind: kind.to_string(),
-            namespace: namespace.map(str::to_string),
-            resource_version,
-            event,
-        }
+            name,
+            data.into(),
+        )
     }
+}
+
+#[cfg(test)]
+pub fn staged_test_event(pending: &StagedPostCommit) -> Option<WatchEvent> {
+    let staged = pending.test_event()?;
+    let mut event =
+        WatchEvent::from_type(staged.event_type(), staged.resource().data.as_ref().clone());
+    event.encoded_payload =
+        staged
+            .encoded_json()
+            .cloned()
+            .map(|bytes| crate::watch::events::EncodedWatchPayload {
+                content_type: WatchContentType::Json,
+                bytes,
+            });
+    Some(event)
+}
+
+#[cfg(test)]
+pub fn staged_post_commit_from_event(event: WatchEvent) -> StagedPostCommit {
+    let resource = Resource::try_from_data(event.object.clone())
+        .expect("test watch event must carry canonical resource identity");
+    let encoded_json = event
+        .encoded_payload
+        .as_ref()
+        .filter(|payload| payload.content_type == WatchContentType::Json)
+        .map(|payload| payload.bytes.clone());
+    StagedPostCommit::new(
+        &resource.api_version,
+        &resource.kind,
+        resource.namespace.as_deref(),
+        resource.resource_version,
+    )
+    .with_test_event(event.event_type.to_string(), resource, encoded_json)
 }
 
 impl Datastore {
@@ -186,7 +207,7 @@ impl Datastore {
     /// path is identical whether called from CRUD methods or a future
     /// Raft FSM apply hook.
     #[cfg(test)]
-    pub fn publish_watch_event(&self, pending: PendingWatchEvent) {
+    pub fn publish_watch_event(&self, pending: StagedPostCommit) {
         publish_pending(pending, self.commit_sink.as_ref());
     }
 
@@ -195,12 +216,12 @@ impl Datastore {
     /// the post-commit signals are grouped per `(topic, namespace)` through
     /// `publish_pending_batch` instead of emitting one signal per event.
     #[cfg(test)]
-    pub fn publish_watch_events(&self, pending: impl IntoIterator<Item = PendingWatchEvent>) {
+    pub fn publish_watch_events(&self, pending: impl IntoIterator<Item = StagedPostCommit>) {
         publish_pending_batch(pending, self.commit_sink.as_ref());
     }
 
     #[cfg(test)]
-    pub fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    pub fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         self.publish_watch_event(pending);
     }
 }
@@ -230,7 +251,7 @@ mod tests {
             .unwrap();
         let mut watch_rx = ds.subscribe_watch(WatchTopic::new("v1", "Pod"));
 
-        let pending = create_pending_watch_event(
+        let pending = create_staged_post_commit(
             "v1",
             "Pod",
             Some("default"),
@@ -455,7 +476,7 @@ mod tests {
             .unwrap();
         let mut pod_rx = ds.subscribe_watch(WatchTopic::new("v1", "Pod"));
 
-        ds.broadcast_watch_event(create_pending_watch_event(
+        ds.broadcast_watch_event(create_staged_post_commit(
             "v1",
             "ConfigMap",
             Some("default"),
@@ -472,7 +493,7 @@ mod tests {
             "Pod topic subscribers must not wake for ConfigMap events"
         );
 
-        ds.broadcast_watch_event(create_pending_watch_event(
+        ds.broadcast_watch_event(create_staged_post_commit(
             "v1",
             "Pod",
             Some("default"),
@@ -500,7 +521,7 @@ mod tests {
 
         publish_pending_batch(
             vec![
-                create_pending_watch_event(
+                create_staged_post_commit(
                     "v1",
                     "Pod",
                     Some("default"),
@@ -509,7 +530,7 @@ mod tests {
                     "MODIFIED",
                     serde_json::json!({"metadata": {"labels": {"app": "a"}}}),
                 ),
-                create_pending_watch_event(
+                create_staged_post_commit(
                     "v1",
                     "Pod",
                     Some("default"),
@@ -518,7 +539,7 @@ mod tests {
                     "MODIFIED",
                     serde_json::json!({"metadata": {"labels": {"app": "b"}}}),
                 ),
-                create_pending_watch_event(
+                create_staged_post_commit(
                     "v1",
                     "Pod",
                     Some("kube-system"),

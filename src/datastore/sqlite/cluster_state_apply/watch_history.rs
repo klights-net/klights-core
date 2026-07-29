@@ -1,7 +1,7 @@
 use super::super::crud::helpers::{
     WatchEventInsert, WatchEventPayload, insert_watch_event_in_conn,
 };
-use super::super::{create_pending_watch_event, gc::gc_watch_events_in_tx};
+use super::super::{create_staged_post_commit, gc::gc_watch_events_in_tx};
 use klights_cluster_core::LogApplyWatchEventRow;
 
 pub(in crate::datastore::sqlite) struct WatchHistoryStateApplier<'tx, 'conn> {
@@ -16,7 +16,7 @@ impl<'tx, 'conn> WatchHistoryStateApplier<'tx, 'conn> {
     pub(in crate::datastore::sqlite) fn apply_put_watch_event(
         &self,
         row: LogApplyWatchEventRow,
-    ) -> tokio_rusqlite::Result<crate::datastore::types::PendingWatchEvent> {
+    ) -> tokio_rusqlite::Result<klights_cluster_store::StagedPostCommit> {
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         insert_watch_event_in_conn(
@@ -34,7 +34,7 @@ impl<'tx, 'conn> WatchHistoryStateApplier<'tx, 'conn> {
                 },
             ),
         )?;
-        Ok(create_pending_watch_event(
+        Ok(create_staged_post_commit(
             &row.api_version,
             &row.kind,
             row.namespace.as_deref(),

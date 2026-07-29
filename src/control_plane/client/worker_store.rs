@@ -1285,11 +1285,11 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
         self.unsupported("apply_raft_log_apply_commit")
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        self.unsupported("apply_raft_log_apply_commit_outcome")
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        self.unsupported("apply_raft_log_apply_commit_receipt")
     }
 
     #[cfg(test)]
@@ -2895,26 +2895,26 @@ mod tests {
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(cluster_api, "worker-a".to_string());
 
+        let pending = crate::datastore::create_staged_post_commit(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "deleted-config",
+            42,
+            "DELETED",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "deleted-config",
+                    "resourceVersion": "41"
+                },
+                "data": {"data-1": "value-1"}
+            }),
+        );
         adapter.publish_watch(
-            crate::datastore::create_pending_watch_event(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "deleted-config",
-                42,
-                "DELETED",
-                serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": {
-                        "namespace": "default",
-                        "name": "deleted-config",
-                        "resourceVersion": "41"
-                    },
-                    "data": {"data-1": "value-1"}
-                }),
-            )
-            .event,
+            crate::datastore::staged_test_event(&pending).expect("staged test watch event"),
         );
 
         let replay = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(

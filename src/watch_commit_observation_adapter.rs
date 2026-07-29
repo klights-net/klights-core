@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::datastore::{CommitObservation, CommitObservationSink};
+use crate::datastore::CommitObservationSink;
 #[cfg(test)]
 use crate::watch::WatchBus;
+#[cfg(test)]
+use klights_cluster_store::StagedPostCommit;
 
 pub(crate) struct WatchCommitWiring {
     #[cfg(test)]
@@ -101,15 +103,15 @@ impl WatchCommitObservationSink {
 
 #[cfg(test)]
 impl CommitObservationSink for WatchCommitObservationSink {
-    fn observe(&self, observations: &[CommitObservation]) {
+    fn observe(&self, observations: &[StagedPostCommit]) {
         let advances = observations
             .iter()
             .map(|observation| {
                 klights_leader_api::PostCommitAdvance::new(
-                    &observation.api_version,
-                    &observation.kind,
-                    observation.namespace.clone(),
-                    observation.resource_version,
+                    observation.api_version(),
+                    observation.kind(),
+                    observation.namespace().map(str::to_string),
+                    observation.resource_version(),
                 )
             })
             .collect::<Vec<_>>();
@@ -235,11 +237,11 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSink {
-        observations: Mutex<Vec<CommitObservation>>,
+        observations: Mutex<Vec<StagedPostCommit>>,
     }
 
     impl CommitObservationSink for RecordingSink {
-        fn observe(&self, observations: &[CommitObservation]) {
+        fn observe(&self, observations: &[StagedPostCommit]) {
             self.observations
                 .lock()
                 .unwrap()

@@ -74,17 +74,8 @@ impl RedbDatastore {
         snapshot_sessions: Arc<tokio::sync::Semaphore>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
-        let resources = RedbResourceStore::new(
-            accessor.clone(),
-            #[cfg(test)]
-            commit_sink.clone(),
-            wall_clock.clone(),
-        );
-        let namespaces = RedbNamespaceStore::new(
-            accessor.clone(),
-            #[cfg(test)]
-            commit_sink.clone(),
-        );
+        let resources = RedbResourceStore::new(accessor.clone(), wall_clock.clone());
+        let namespaces = RedbNamespaceStore::new(accessor.clone());
         let watch_store = RedbWatchStore::new(accessor.clone());
         let network = RedbNetworkStore::new(accessor.clone());
         let read_store = Arc::new(RedbReadStore::new(accessor.clone()));
@@ -185,6 +176,28 @@ impl RedbDatastore {
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(klights_supervisor::SystemWallClock),
         ))
+    }
+
+    fn finish_post_commit<T>(
+        &self,
+        (result, pending): (T, Option<klights_cluster_store::StagedPostCommit>),
+    ) -> T {
+        #[cfg(not(test))]
+        let _ = pending;
+        #[cfg(test)]
+        if let Some(pending) = pending {
+            crate::datastore::sqlite::publish_pending(pending, self.commit_sink.as_ref());
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn finish_post_commits<T>(
+        &self,
+        (result, pending): (T, Vec<klights_cluster_store::StagedPostCommit>),
+    ) -> T {
+        crate::datastore::sqlite::publish_pending_batch(pending, self.commit_sink.as_ref());
+        result
     }
 
     pub(crate) fn focused_read_store(&self) -> Arc<RedbReadStore> {

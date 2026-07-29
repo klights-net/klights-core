@@ -6,12 +6,12 @@ mod pod_cleanup;
 mod resource;
 mod watch_history;
 
-use crate::datastore::types::PendingWatchEvent;
 use klights_cluster_core::ClusterMutation;
+use klights_cluster_store::StagedPostCommit;
 
 #[derive(Default)]
 pub(super) struct ApplyEffects {
-    pending_watch_events: Vec<PendingWatchEvent>,
+    pending_watch_events: Vec<StagedPostCommit>,
 }
 
 impl ApplyEffects {
@@ -21,11 +21,11 @@ impl ApplyEffects {
         }
     }
 
-    pub(super) fn push_watch_event(&mut self, event: PendingWatchEvent) {
+    pub(super) fn push_watch_event(&mut self, event: StagedPostCommit) {
         self.pending_watch_events.push(event);
     }
 
-    pub(super) fn into_pending_watch_events(self) -> Vec<PendingWatchEvent> {
+    pub(super) fn into_pending_watch_events(self) -> Vec<StagedPostCommit> {
         self.pending_watch_events
     }
 }
@@ -243,8 +243,8 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
 #[cfg(test)]
 mod tests {
     use super::ApplyEffects;
-    use crate::datastore::types::PendingWatchEvent;
-    use crate::watch::{EventType, WatchEvent};
+    use crate::datastore::staged_post_commit_from_event;
+    use crate::watch::WatchEvent;
     use serde_json::json;
 
     #[test]
@@ -253,23 +253,32 @@ mod tests {
         assert!(effects.into_pending_watch_events().is_empty());
 
         let mut effects = ApplyEffects::new();
-        effects.push_watch_event(PendingWatchEvent::from_event(WatchEvent::added(
+        effects.push_watch_event(staged_post_commit_from_event(WatchEvent::added(
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"first","resourceVersion":"1"}}),
         )));
-        effects.push_watch_event(PendingWatchEvent::from_event(WatchEvent::modified(
+        effects.push_watch_event(staged_post_commit_from_event(WatchEvent::modified(
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"second","resourceVersion":"2"}}),
         )));
-        effects.push_watch_event(PendingWatchEvent::from_event(WatchEvent::deleted(
+        effects.push_watch_event(staged_post_commit_from_event(WatchEvent::deleted(
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"third","resourceVersion":"3"}}),
         )));
 
         let events = effects.into_pending_watch_events();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].event.event_type, EventType::Added);
-        assert_eq!(events[1].event.event_type, EventType::Modified);
-        assert_eq!(events[2].event.event_type, EventType::Deleted);
-        assert_eq!(events[0].event.object["metadata"]["name"], json!("first"));
-        assert_eq!(events[1].event.object["metadata"]["name"], json!("second"));
-        assert_eq!(events[2].event.object["metadata"]["name"], json!("third"));
+        assert_eq!(events[0].test_event().unwrap().event_type(), "ADDED");
+        assert_eq!(events[1].test_event().unwrap().event_type(), "MODIFIED");
+        assert_eq!(events[2].test_event().unwrap().event_type(), "DELETED");
+        assert_eq!(
+            events[0].test_event().unwrap().resource().data["metadata"]["name"],
+            json!("first")
+        );
+        assert_eq!(
+            events[1].test_event().unwrap().resource().data["metadata"]["name"],
+            json!("second")
+        );
+        assert_eq!(
+            events[2].test_event().unwrap().resource().data["metadata"]["name"],
+            json!("third")
+        );
     }
 }

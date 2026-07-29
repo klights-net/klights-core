@@ -21,6 +21,7 @@ impl PrivilegedCommittedRaftApply for FakeCommittedStore {
                     resource_version: 17,
                     resource: None,
                 },
+                klights_cluster_core::PodEndpointEffect::NotApplicable,
             ))
         })
     }
@@ -82,11 +83,12 @@ fn committed_apply_request_and_receipt_preserve_canonical_values() {
     assert_eq!(request.commit(), &commit);
     assert_eq!(request.into_commit(), commit);
 
-    let receipt = CommittedRaftApplyReceipt::new(CommittedApplyOutcome::Rejected(
-        CommittedApplyRejection::ResourceVersionConflict {
+    let receipt = CommittedRaftApplyReceipt::new(
+        CommittedApplyOutcome::Rejected(CommittedApplyRejection::ResourceVersionConflict {
             message: "terminal conflict".to_string(),
-        },
-    ));
+        }),
+        klights_cluster_core::PodEndpointEffect::NotApplicable,
+    );
     assert!(matches!(
         receipt.outcome(),
         CommittedApplyOutcome::Rejected(CommittedApplyRejection::ResourceVersionConflict { .. })

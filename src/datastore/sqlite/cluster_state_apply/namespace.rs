@@ -1,9 +1,9 @@
 use super::super::crud::helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
-use super::super::{create_pending_watch_event, queries};
-use crate::datastore::types::PendingWatchEvent;
+use super::super::{create_staged_post_commit, queries};
 use klights_cluster_core::LogApplyNamespaceRow;
+use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
 
 pub(in crate::datastore::sqlite) struct NamespaceStateApplier<'tx, 'conn> {
@@ -19,7 +19,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         &self,
         row: LogApplyNamespaceRow,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         let existing = self
@@ -59,7 +59,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
                 &data_bytes,
             ),
         )?;
-        Ok(Some(create_pending_watch_event(
+        Ok(Some(create_staged_post_commit(
             "v1",
             "Namespace",
             None,
@@ -75,7 +75,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         resource_version: i64,
         name: &str,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
         let existing = self
             .tx
             .query_row(
@@ -106,7 +106,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         )?;
         let data: serde_json::Value =
             serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
-        Ok(Some(create_pending_watch_event(
+        Ok(Some(create_staged_post_commit(
             "v1",
             "Namespace",
             None,

@@ -10,7 +10,7 @@ use super::helpers::*;
 use super::*;
 use klights_cluster_datastore::sqlite::selector_index;
 
-use crate::datastore::sqlite::create_pending_watch_event;
+use crate::datastore::sqlite::create_staged_post_commit;
 
 struct ResourceUpdateWithPreconditions<'a> {
     api_version: &'a str,
@@ -585,7 +585,7 @@ impl Datastore {
 
         match result {
             Ok((id, new_rv, data)) => {
-                let _pending = create_pending_watch_event(
+                let _pending = create_staged_post_commit(
                     api_version,
                     kind,
                     namespace,
@@ -835,7 +835,7 @@ impl Datastore {
                     .context("deserialize merged status payload")?;
 
                 if outcome.changed {
-                    let _pending = create_pending_watch_event(
+                    let _pending = create_staged_post_commit(
                         api_version,
                         kind,
                         namespace,

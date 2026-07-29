@@ -125,10 +125,6 @@ use klights_cluster_core::command::StorageCommand;
 use klights_watch::WatchTopic;
 
 #[cfg(test)]
-use super::types::CommitObservation;
-#[cfg(test)]
-use super::types::PendingWatchEvent;
-#[cfg(test)]
 use super::types::ReplicatedCreateOptions;
 use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
@@ -141,6 +137,8 @@ use klights_cluster_core::{
     PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
     WatchReplayPosition,
 };
+#[cfg(test)]
+use klights_cluster_store::StagedPostCommit;
 
 /// Exclusive guard held while a logical snapshot walks multiple bounded read
 /// pages. Backends without this coordination return `None`.
@@ -164,20 +162,9 @@ pub struct SnapshotMutationFence {
 /// injected by root composition and must not perform datastore work.
 #[cfg(test)]
 pub trait CommitObservationSink: Send + Sync {
-    fn observe(&self, observations: &[CommitObservation]);
+    fn observe(&self, observations: &[StagedPostCommit]);
     #[cfg(test)]
     fn as_any(&self) -> &dyn Any;
-}
-
-pub trait OutboxResponseCodec: Send + Sync {
-    fn encode(
-        &self,
-        response: &klights_cluster_core::StorageResponse,
-    ) -> std::result::Result<Vec<u8>, String>;
-    fn decode(
-        &self,
-        bytes: &[u8],
-    ) -> std::result::Result<klights_cluster_core::StorageResponse, String>;
 }
 
 #[async_trait]
@@ -252,7 +239,7 @@ pub trait DatastoreBackend: Send + Sync {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
 
     #[cfg(test)]
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent);
+    fn broadcast_watch_event(&self, pending: StagedPostCommit);
 
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
     ///
@@ -324,12 +311,12 @@ pub trait DatastoreBackend: Send + Sync {
     /// Apply one committed Raft entry and return the canonical outcome derived
     /// inside the same datastore transaction. Backends must fail before
     /// mutation when they cannot provide this atomic classification.
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
         Err(anyhow::anyhow!(
-            "datastore backend does not support atomic committed-apply outcomes"
+            "datastore backend does not support atomic committed-apply receipts"
         ))
     }
 
@@ -1756,10 +1743,10 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome>;
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt>;
     #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
@@ -1816,12 +1803,12 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
         self.as_ref().apply_raft_log_apply_commit(commit).await
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
         self.as_ref()
-            .apply_raft_log_apply_commit_outcome(commit)
+            .apply_raft_log_apply_commit_receipt(commit)
             .await
     }
 
@@ -1967,7 +1954,7 @@ impl BackendLifecycleStore for DatastoreBackendLifecyclePort {
 #[cfg(test)]
 pub trait TestWatchStore: Send + Sync {
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent);
+    fn broadcast_watch_event(&self, pending: StagedPostCommit);
 }
 
 /// Broad read queries used by leader-side controllers and API helpers.

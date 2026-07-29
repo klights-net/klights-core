@@ -5,14 +5,108 @@
 //! against `crate::datastore::*` without pulling in SQLite-specific code.
 
 use anyhow::{Result, anyhow};
+#[cfg(test)]
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 
-#[cfg(test)]
-use crate::watch::WatchEvent;
-
 use klights_cluster_core::Resource;
+
+#[cfg(test)]
+#[derive(Serialize)]
+struct TestWatchEnvelope<'a> {
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    object: &'a Value,
+}
+
+#[cfg(test)]
+pub(crate) fn with_staged_test_resource_event(
+    staged: klights_cluster_store::StagedPostCommit,
+    event_type: &str,
+    name: &str,
+    data: std::sync::Arc<Value>,
+) -> klights_cluster_store::StagedPostCommit {
+    let data = hydrate_staged_test_resource(
+        std::sync::Arc::unwrap_or_clone(data),
+        staged.api_version(),
+        staged.kind(),
+        staged.namespace(),
+        name,
+        staged.resource_version(),
+    );
+    let is_envelope = data
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "ADDED" | "MODIFIED" | "DELETED" | "ERROR"))
+        && data.get("object").is_some();
+    let resource_data = if is_envelope {
+        data.get("object")
+            .expect("checked staged watch envelope object")
+            .clone()
+    } else {
+        data.clone()
+    };
+    let resource = Resource::try_from_data(std::sync::Arc::new(resource_data))
+        .expect("staged test resource has canonical identity");
+    let encoded_json = if is_envelope {
+        serde_json::to_vec(&data)
+    } else {
+        serde_json::to_vec(&TestWatchEnvelope {
+            event_type,
+            object: resource.data.as_ref(),
+        })
+    }
+    .ok()
+    .map(Bytes::from);
+    staged.with_test_event(event_type, resource, encoded_json)
+}
+
+#[cfg(test)]
+fn hydrate_staged_test_resource(
+    mut data: Value,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    resource_version: i64,
+) -> Value {
+    if data
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| matches!(event_type, "ADDED" | "MODIFIED" | "DELETED" | "ERROR"))
+        && let Some(object) = data.get_mut("object")
+    {
+        *object = hydrate_staged_test_resource(
+            std::mem::take(object),
+            api_version,
+            kind,
+            namespace,
+            name,
+            resource_version,
+        );
+        return data;
+    }
+    if let Some(object) = data.as_object_mut() {
+        object.insert("apiVersion".to_string(), Value::from(api_version));
+        object.insert("kind".to_string(), Value::from(kind));
+        let metadata = object
+            .entry("metadata")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.insert("name".to_string(), Value::from(name));
+            if let Some(namespace) = namespace {
+                metadata.insert("namespace".to_string(), Value::from(namespace));
+            }
+            metadata.insert(
+                "resourceVersion".to_string(),
+                Value::from(resource_version.to_string()),
+            );
+        }
+    }
+    data
+}
 
 pub const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
 
@@ -185,30 +279,6 @@ pub struct CatchUpResource {
     pub event_type: std::borrow::Cow<'static, str>,
 }
 
-/// Neutral post-commit notification emitted by persistence after a resource
-/// mutation is durable. Root composition owns delivery channels and watch
-/// signal projection.
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommitObservation {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub resource_version: i64,
-}
-
-#[cfg(test)]
-impl From<&PendingWatchEvent> for CommitObservation {
-    fn from(pending: &PendingWatchEvent) -> Self {
-        Self {
-            api_version: pending.api_version.clone(),
-            kind: pending.kind.clone(),
-            namespace: pending.namespace.clone(),
-            resource_version: pending.resource_version,
-        }
-    }
-}
-
 /// Result of a checked durable watch replay read.
 ///
 /// `Expired` means the requested resume RV is outside the retained
@@ -252,6 +322,7 @@ impl CatchUpResource {
 #[cfg(test)]
 mod resource_arc_tests {
     use super::*;
+    use crate::watch::WatchEvent;
     use serde_json::json;
 
     #[test]
@@ -446,78 +517,6 @@ impl From<klights_cluster_core::LogApplyAppliedOutboxRow> for AppliedOutboxRecor
             applied_rv: row.applied_rv,
             result_proto: row.result_proto,
             status_stamp: row.status_stamp,
-        }
-    }
-}
-
-/// Pending watch event staged during a DB write, to be broadcast after commit.
-///
-/// Returned from create/update/patch/delete operations so callers can broadcast
-/// the event outside the transaction boundary. Lives at the trait surface so
-/// any backend's mutation methods can stage events the same way.
-#[derive(Clone, Debug)]
-pub struct PendingWatchEvent {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub resource_version: i64,
-    #[cfg(test)]
-    pub event: WatchEvent,
-}
-
-impl PendingWatchEvent {
-    pub fn from_signal_metadata(
-        api_version: impl Into<String>,
-        kind: impl Into<String>,
-        namespace: Option<&str>,
-        resource_version: i64,
-    ) -> Self {
-        let api_version = api_version.into();
-        let kind = kind.into();
-        let namespace = namespace.map(str::to_string);
-
-        Self {
-            #[cfg(test)]
-            event: WatchEvent::modified(serde_json::json!({
-                "apiVersion": api_version.clone(),
-                "kind": kind.clone(),
-                "metadata": {
-                    "namespace": namespace.clone(),
-                    "resourceVersion": resource_version.to_string()
-                }
-            })),
-            api_version,
-            kind,
-            namespace,
-            resource_version,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn from_event(event: WatchEvent) -> Self {
-        let object = event.object.as_ref();
-        let metadata = object.get("metadata").unwrap_or(&Value::Null);
-        Self {
-            api_version: object
-                .get("apiVersion")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            kind: object
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            namespace: metadata
-                .get("namespace")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            resource_version: metadata
-                .get("resourceVersion")
-                .and_then(Value::as_str)
-                .and_then(|rv| rv.parse::<i64>().ok())
-                .unwrap_or_default(),
-            event,
         }
     }
 }

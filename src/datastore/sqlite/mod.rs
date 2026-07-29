@@ -53,22 +53,20 @@ impl std::fmt::Debug for Datastore {
 #[cfg(test)]
 pub use super::backend::CommitObservationSink;
 pub use super::backend::{
-    DatastoreBackend, DatastoreHandle, NamespaceStore, OutboxResponseCodec, ResourceStore,
-    WatchStore,
+    DatastoreBackend, DatastoreHandle, NamespaceStore, ResourceStore, WatchStore,
 };
-#[cfg(test)]
-pub use super::types::CommitObservation;
 pub use super::types::{
     AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, PendingWatchEvent, PodCleanupIntent, PositionedWatchReplay,
-    PositionedWatchReplayRead, ReplicatedCreateOptions, ReplicatedMembershipState,
-    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchTarget,
-    WatchTargetScope,
+    ListPageRequest, PodCleanupIntent, PositionedWatchReplay, PositionedWatchReplayRead,
+    ReplicatedCreateOptions, ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList,
+    ResourceListQuery, SnapshotAtRv, WatchTarget, WatchTargetScope,
 };
 use klights_cluster_core::{
     PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
     WatchReplayPosition,
 };
+use klights_cluster_store::OutboxResponseCodec;
+pub use klights_cluster_store::StagedPostCommit;
 
 struct AppliedOutboxLedgerInput<'a> {
     idempotency_key: String,
@@ -82,7 +80,9 @@ struct AppliedOutboxLedgerInput<'a> {
 use klights_cluster_datastore::sqlite::SqliteReadStore;
 use klights_supervisor::DbExecutor;
 use klights_supervisor::sqlite_open as opener;
-pub use watch::create_pending_watch_event;
+pub use watch::create_staged_post_commit;
+#[cfg(test)]
+pub use watch::{staged_post_commit_from_event, staged_test_event};
 
 fn focused_watch_targets(
     targets: &[WatchTarget],
@@ -218,6 +218,8 @@ impl Datastore {
 }
 #[cfg(test)]
 pub use watch::publish_pending;
+#[cfg(test)]
+pub use watch::publish_pending_batch;
 
 use crate::datastore::pod_serviceaccount::{
     inject_serviceaccount_volume, should_inject_serviceaccount_volume,
@@ -296,14 +298,14 @@ pub struct Datastore {
 struct AtomicOutboxMutation {
     applied_rv: Option<i64>,
     result_proto: Vec<u8>,
-    pending: Option<PendingWatchEvent>,
+    pending: Option<StagedPostCommit>,
     committed_resource: Option<crate::datastore::Resource>,
 }
 
 enum OutboxTxnOutcome {
     Applied {
         applied_rv: i64,
-        pending: Option<PendingWatchEvent>,
+        pending: Option<StagedPostCommit>,
         resource_changed: bool,
         pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
         committed_resource: Option<crate::datastore::Resource>,
@@ -2742,9 +2744,7 @@ impl Datastore {
             )?;
 
         let pending_event = pending.into_iter().next();
-        let committed_resource = applied_mutation.map(|mutation| match mutation {
-            crate::datastore::raft::types::AppliedMutation::Resource(resource) => resource,
-        });
+        let committed_resource = applied_mutation;
         let response = if durable_actor_cascade {
             committed_resource.as_ref().map_or(
                 StorageResponse::Ack {
@@ -3966,7 +3966,7 @@ impl DatastoreBackend for Datastore {
     }
 
     #[cfg(test)]
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         Datastore::broadcast_watch_event(self, pending);
     }
 
@@ -4003,11 +4003,11 @@ impl DatastoreBackend for Datastore {
         Datastore::apply_raft_log_apply_commit(self, commit).await
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        Datastore::apply_raft_log_apply_commit_outcome(self, commit).await
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        Datastore::apply_raft_log_apply_commit_receipt(self, commit).await
     }
 
     async fn create_resource(

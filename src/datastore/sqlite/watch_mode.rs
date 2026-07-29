@@ -2,7 +2,7 @@
 //!
 //! DSB-04 formalizes the watch broadcast path. The system runs in
 //! `PostCommitOnly` mode — every CRUD method calls
-//! `create_pending_watch_event()` inside the DB transaction and then
+//! `create_staged_post_commit()` inside the DB transaction and then
 //! `broadcast_watch_event()` after the DB call returns (post-commit).
 //!
 //! The `WatchBroadcastMode` enum in `backend.rs` carries the mode

@@ -24,6 +24,8 @@ use klights_cluster_datastore::redb::read_core::RedbListQuery;
 use klights_cluster_datastore::redb::read_core::RedbPositionedWatchRead;
 use klights_cluster_datastore::redb::read_core::RedbSnapshotRead;
 use klights_cluster_datastore::redb::tables;
+#[cfg(test)]
+use klights_cluster_store::StagedPostCommit;
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 #[cfg(test)]
@@ -273,8 +275,8 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     #[cfg(test)]
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
-        let event = pending.event;
+    fn broadcast_watch_event(&self, pending: StagedPostCommit) {
+        let event = crate::datastore::staged_test_event(&pending).expect("staged test watch event");
         let _ = WatchSignal::from_event(&event);
         crate::watch_commit_observation_adapter::publish_test_events(
             self.commit_sink.as_ref(),
@@ -299,7 +301,8 @@ impl DatastoreBackend for RedbDatastore {
         m: &str,
         d: Value,
     ) -> Result<Resource> {
-        self.resources.create_res(a, k, n, m, d).await
+        let committed = self.resources.create_res(a, k, n, m, d).await?;
+        Ok(self.finish_post_commit(committed))
     }
     #[cfg(test)]
     async fn apply_replicated_create_resource(
@@ -311,9 +314,11 @@ impl DatastoreBackend for RedbDatastore {
         d: Value,
         o: crate::datastore::types::ReplicatedCreateOptions,
     ) -> Result<Resource> {
-        self.resources
+        let committed = self
+            .resources
             .apply_replicated_create_resource(a, k, n, m, d, o)
-            .await
+            .await?;
+        Ok(self.finish_post_commits(committed))
     }
     async fn get_resource(
         &self,
@@ -333,7 +338,8 @@ impl DatastoreBackend for RedbDatastore {
         d: Value,
         e: i64,
     ) -> Result<Resource> {
-        self.resources.update_res(a, k, n, m, d, e).await
+        let committed = self.resources.update_res(a, k, n, m, d, e).await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn update_resource_with_preconditions(
         &self,
@@ -344,12 +350,16 @@ impl DatastoreBackend for RedbDatastore {
         d: Value,
         p: ResourcePreconditions,
     ) -> Result<Resource> {
-        self.resources
+        let committed = self
+            .resources
             .update_res_with_preconditions(a, k, n, m, d, p)
-            .await
+            .await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn delete_resource(&self, a: &str, k: &str, n: Option<&str>, m: &str) -> Result<()> {
-        self.resources.delete_res(a, k, n, m).await
+        let committed = self.resources.delete_res(a, k, n, m).await?;
+        self.finish_post_commit(committed);
+        Ok(())
     }
     async fn delete_resource_with_preconditions(
         &self,
@@ -384,7 +394,9 @@ impl DatastoreBackend for RedbDatastore {
                 .into());
             }
         }
-        self.resources.delete_res(a, k, n, m).await
+        let committed = self.resources.delete_res(a, k, n, m).await?;
+        self.finish_post_commit(committed);
+        Ok(())
     }
 
     async fn delete_resource_without_watch_with_tombstone(
@@ -396,9 +408,11 @@ impl DatastoreBackend for RedbDatastore {
         p: ResourcePreconditions,
         grace_seconds: i64,
     ) -> Result<Resource> {
-        self.resources
+        let committed = self
+            .resources
             .delete_res_with_tombstone(a, k, n, m, p, grace_seconds)
-            .await
+            .await?;
+        Ok(self.finish_post_commit(committed))
     }
 
     async fn list_resources(
@@ -480,9 +494,11 @@ impl DatastoreBackend for RedbDatastore {
         s: Value,
         e: Option<i64>,
     ) -> Result<Resource> {
-        self.resources
+        let committed = self
+            .resources
             .update_status_only_impl(a, k, n, m, s, e)
-            .await
+            .await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn update_status_only_with_preconditions(
         &self,
@@ -508,9 +524,11 @@ impl DatastoreBackend for RedbDatastore {
                 .into());
             }
         }
-        self.resources
+        let committed = self
+            .resources
             .update_status_only_impl(a, k, n, m, s, p.resource_version)
-            .await
+            .await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn get_current_resource_version(&self) -> Result<i64> {
         self.accessor
@@ -529,7 +547,8 @@ impl DatastoreBackend for RedbDatastore {
             .await
     }
     async fn create_namespace(&self, n: &str, d: Value) -> Result<Resource> {
-        self.namespaces.create_ns(n, d).await
+        let committed = self.namespaces.create_ns(n, d).await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn get_namespace(&self, n: &str) -> Result<Option<Resource>> {
         self.read_store
@@ -958,7 +977,8 @@ impl DatastoreBackend for RedbDatastore {
         _pk: PatchKind,
         p: Value,
     ) -> Result<Option<Resource>> {
-        self.resources.patch(a, k, ns, n, p).await
+        let committed = self.resources.patch(a, k, ns, n, p).await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn patch_resource_latest_with_preconditions(
         &self,
@@ -1908,11 +1928,11 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_outcome(self, commit).await
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_receipt(self, commit).await
     }
 
     #[cfg(test)]
@@ -1996,7 +2016,7 @@ impl crate::datastore::TestWatchStore for RedbDatastore {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         crate::datastore::DatastoreBackend::broadcast_watch_event(self, pending);
     }
 }

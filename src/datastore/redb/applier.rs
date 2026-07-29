@@ -27,9 +27,11 @@ impl DatastoreApplier for RedbDatastore {
                 name,
                 data,
             } => {
-                self.resources
+                let committed = self
+                    .resources
                     .create_res(&api_version, &kind, namespace.as_deref(), &name, data)
                     .await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::UpdateResource {
                 api_version,
@@ -44,7 +46,8 @@ impl DatastoreApplier for RedbDatastore {
                 if preconditions.resource_version.is_none() {
                     preconditions.resource_version = Some(expected_rv);
                 }
-                self.resources
+                let committed = self
+                    .resources
                     .update_res_with_preconditions(
                         &api_version,
                         &kind,
@@ -54,6 +57,7 @@ impl DatastoreApplier for RedbDatastore {
                         preconditions,
                     )
                     .await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::DeleteResource {
                 api_version,
@@ -155,7 +159,8 @@ impl DatastoreApplier for RedbDatastore {
                 .await?;
             }
             StorageCommand::CreateNamespace { name, data } => {
-                self.namespaces.create_ns(&name, data).await?;
+                let committed = self.namespaces.create_ns(&name, data).await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::UpdateNamespace {
                 name,

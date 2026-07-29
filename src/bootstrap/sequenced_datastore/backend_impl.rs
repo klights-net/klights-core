@@ -16,14 +16,16 @@ use tokio::sync::broadcast;
 #[cfg(test)]
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
+#[cfg(test)]
+use crate::datastore::types::ReplicatedCreateOptions;
 use crate::datastore::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, PodCleanupIntent,
     PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
-#[cfg(test)]
-use crate::datastore::types::{PendingWatchEvent, ReplicatedCreateOptions};
 use klights_cluster_datastore::errors::DatastoreError;
+#[cfg(test)]
+use klights_cluster_store::StagedPostCommit;
 
 use super::SequencedDatastore;
 #[cfg(test)]
@@ -106,7 +108,7 @@ impl DatastoreBackend for SequencedDatastore {
     }
 
     #[cfg(test)]
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         self.passive.broadcast_watch_event(pending);
     }
 
@@ -135,11 +137,11 @@ impl DatastoreBackend for SequencedDatastore {
         reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        reject_application_committed_apply("apply_raft_log_apply_commit_outcome")
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        reject_application_committed_apply("apply_raft_log_apply_commit_receipt")
     }
 
     async fn create_resource(
@@ -1802,11 +1804,11 @@ impl crate::datastore::ReplicationStore for SequencedDatastore {
         reject_application_committed_apply("apply_raft_log_apply_commit")
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
-    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
-        reject_application_committed_apply("apply_raft_log_apply_commit_outcome")
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        reject_application_committed_apply("apply_raft_log_apply_commit_receipt")
     }
 
     #[cfg(test)]
@@ -1890,7 +1892,7 @@ impl crate::datastore::TestWatchStore for SequencedDatastore {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         crate::datastore::DatastoreBackend::broadcast_watch_event(self, pending);
     }
 }

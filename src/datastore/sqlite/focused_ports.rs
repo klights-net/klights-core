@@ -547,11 +547,11 @@ impl crate::datastore::ReplicationStore for Datastore {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 
-    async fn apply_raft_log_apply_commit_outcome(
+    async fn apply_raft_log_apply_commit_receipt(
         &self,
         commit: klights_cluster_core::LogApplyCommit,
-    ) -> anyhow::Result<klights_cluster_core::CommittedApplyOutcome> {
-        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_outcome(self, commit).await
+    ) -> anyhow::Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_receipt(self, commit).await
     }
 
     #[cfg(test)]
@@ -635,7 +635,7 @@ impl crate::datastore::TestWatchStore for Datastore {
         crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
     }
 
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    fn broadcast_watch_event(&self, pending: StagedPostCommit) {
         crate::datastore::DatastoreBackend::broadcast_watch_event(self, pending);
     }
 }

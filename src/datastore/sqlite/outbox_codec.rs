@@ -1,4 +1,4 @@
-use crate::datastore::OutboxResponseCodec;
+use klights_cluster_store::OutboxResponseCodec;
 
 pub(crate) struct TransactionContext<'a> {
     outbox_codec: &'a dyn OutboxResponseCodec,

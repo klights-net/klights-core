@@ -9,11 +9,11 @@ use super::super::cluster_replace::{ApplyConflictCode, apply_conflict_error, oth
 use super::super::crud::helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
-use super::super::{create_pending_watch_event, owner_ref_index, queries};
-use crate::datastore::types::PendingWatchEvent;
+use super::super::{create_staged_post_commit, owner_ref_index, queries};
 use klights_cluster_core::PatchKind;
 use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
 use klights_cluster_datastore::sqlite::selector_index;
+use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
 
 pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {
@@ -147,7 +147,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
         event_type: &str,
         data_bytes: &[u8],
         data: serde_json::Value,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
         if !emit_watch_events {
             return Ok(None);
         }
@@ -163,7 +163,7 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
                 data_bytes,
             ),
         )?;
-        Ok(Some(create_pending_watch_event(
+        Ok(Some(create_staged_post_commit(
             identity.api_version,
             identity.kind,
             identity.namespace(),
@@ -184,7 +184,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         mut row: LogApplyResourceRow,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
         let existing = {
@@ -238,7 +238,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         patch: LogApplyResourcePatch,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
         let identity = resource_identity(
@@ -289,7 +289,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         resource_version: i64,
         key: LogApplyResourceKey,
         emit_watch_events: bool,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+    ) -> tokio_rusqlite::Result<Option<StagedPostCommit>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
         let identity = resource_identity(
