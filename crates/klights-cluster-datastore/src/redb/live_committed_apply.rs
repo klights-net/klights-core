@@ -11,27 +11,31 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
+use super::RedbAccessor;
+use super::key_codec::resource_key;
 use super::mutation_helpers as helpers;
+use super::read_core::RedbReadCore;
+use super::tables;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, OutboxApplyError, OutboxStreamWatermark, Resource,
 };
-use klights_cluster_datastore::redb::RedbAccessor;
-use klights_cluster_datastore::redb::key_codec::resource_key;
-use klights_cluster_datastore::redb::read_core::RedbReadCore;
-use klights_cluster_datastore::redb::tables;
 use klights_cluster_store::SnapshotOutboxWatermarkCursor;
+use klights_cluster_store::{
+    CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
+    CommittedRaftApplyRequest, PrivilegedCommittedRaftApply,
+};
 
 #[derive(Clone)]
-pub(super) struct RedbLiveCommittedApplyStore {
+pub struct RedbLiveCommittedApplyStore {
     accessor: Arc<RedbAccessor>,
 }
 
 impl RedbLiveCommittedApplyStore {
-    pub(super) fn new(accessor: Arc<RedbAccessor>) -> Self {
+    pub fn new(accessor: Arc<RedbAccessor>) -> Self {
         Self { accessor }
     }
 
-    pub(super) async fn update_status(
+    pub async fn update_status(
         &self,
         api_version: &str,
         kind: &str,
@@ -63,9 +67,9 @@ impl RedbLiveCommittedApplyStore {
                         && expected_rv > 0
                         && current_rv != expected_rv
                     {
-                        return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                            format!("rv conflict: expected {expected_rv} got {current_rv}"),
-                        )
+                        return Err(crate::errors::DatastoreError::conflict(format!(
+                            "rv conflict: expected {expected_rv} got {current_rv}"
+                        ))
                         .into());
                     }
                     (row.value().1.to_vec(), current_rv)
@@ -150,7 +154,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn update_status_with_preconditions(
+    pub async fn update_status_with_preconditions(
         &self,
         api_version: &str,
         kind: &str,
@@ -171,10 +175,9 @@ impl RedbLiveCommittedApplyStore {
                 .pointer("/metadata/uid")
                 .and_then(Value::as_str);
             if actual_uid != Some(expected_uid) {
-                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                    "UID precondition failed",
-                )
-                .into());
+                return Err(
+                    crate::errors::DatastoreError::conflict("UID precondition failed").into(),
+                );
             }
         }
         self.update_status(
@@ -188,7 +191,7 @@ impl RedbLiveCommittedApplyStore {
         .await
     }
 
-    pub(super) async fn applied_outbox_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+    pub async fn applied_outbox_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
         self.accessor
             .call("redb_applied_outbox_prunable_count", move |db| {
                 let read = db.begin_read()?;
@@ -206,7 +209,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn list_outbox_watermarks(&self) -> Result<Vec<OutboxStreamWatermark>> {
+    pub async fn list_outbox_watermarks(&self) -> Result<Vec<OutboxStreamWatermark>> {
         self.accessor
             .call("redb_outbox_stream_watermarks_list_all", |db| {
                 let read = db.begin_read()?;
@@ -221,7 +224,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn list_outbox_watermarks_paged(
+    pub async fn list_outbox_watermarks_paged(
         &self,
         after: Option<&SnapshotOutboxWatermarkCursor>,
         limit: NonZeroUsize,
@@ -267,10 +270,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn get_applied_outbox_bytes(
-        &self,
-        idempotency_key: &str,
-    ) -> Result<Option<Vec<u8>>> {
+    pub async fn get_applied_outbox_bytes(&self, idempotency_key: &str) -> Result<Option<Vec<u8>>> {
         let key = idempotency_key.to_string();
         self.accessor
             .call("redb_get_applied_outbox", move |db| {
@@ -281,7 +281,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn insert_applied_outbox_bytes(
+    pub async fn insert_applied_outbox_bytes(
         &self,
         idempotency_key: String,
         bytes: Vec<u8>,
@@ -304,7 +304,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn list_applied_outbox_bytes(&self) -> Result<Vec<(String, Vec<u8>)>> {
+    pub async fn list_applied_outbox_bytes(&self) -> Result<Vec<(String, Vec<u8>)>> {
         self.accessor
             .call("redb_list_applied_outbox", move |db| {
                 let read = db.begin_read()?;
@@ -319,7 +319,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn list_applied_outbox_bytes_paged(
+    pub async fn list_applied_outbox_bytes_paged(
         &self,
         after_key: Option<&str>,
         limit: NonZeroUsize,
@@ -363,7 +363,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
+    pub async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
         let cutoff = now_ms.saturating_sub(ttl_ms);
         self.accessor
             .call("redb_applied_outbox_gc", move |db| {
@@ -395,7 +395,7 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
+    pub async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
         let key = key.to_string();
         let value = value.to_string();
         self.accessor
@@ -411,64 +411,75 @@ impl RedbLiveCommittedApplyStore {
             .await
     }
 
-    pub(super) fn apply_log_apply_commit<T>(&self) -> Result<T> {
+    pub fn apply_log_apply_commit<T>(&self) -> Result<T> {
         Err(anyhow!("backend does not support log-apply commit replay"))
     }
 
-    pub(super) fn apply_raft_log_apply_commit<T>(&self) -> Result<T> {
+    pub fn apply_raft_log_apply_commit<T>(&self) -> Result<T> {
         Err(anyhow!(
             "redb backend does not support raft log-apply commit replay"
         ))
     }
 
-    pub(super) fn apply_raft_log_apply_commit_receipt<T>(&self) -> Result<T> {
+    pub fn apply_raft_log_apply_commit_receipt<T>(&self) -> Result<T> {
         Err(anyhow!(
             "datastore backend does not support atomic committed-apply receipts"
         ))
     }
 
-    pub(super) fn apply_outbox_transactionally<T>(
-        &self,
-    ) -> std::result::Result<T, OutboxApplyError> {
+    pub fn apply_outbox_transactionally<T>(&self) -> std::result::Result<T, OutboxApplyError> {
         Err(OutboxApplyError::Retryable(
             "redb: apply_outbox_transactionally not implemented".to_string(),
         ))
     }
 
-    pub(super) fn apply_outbox_transactionally_with_watermark<T>(
+    pub fn apply_outbox_transactionally_with_watermark<T>(
         &self,
     ) -> std::result::Result<T, OutboxApplyError> {
         self.apply_outbox_transactionally()
     }
 
-    pub(super) fn apply_outbox_transactionally_with_watermark_effect<T>(
+    pub fn apply_outbox_transactionally_with_watermark_effect<T>(
         &self,
     ) -> std::result::Result<T, OutboxApplyError> {
         self.apply_outbox_transactionally()
     }
 
-    pub(super) fn build_log_apply_commit_for_command<T>(&self) -> Result<T> {
+    pub fn build_log_apply_commit_for_command<T>(&self) -> Result<T> {
         Err(anyhow!(
             "backend does not support generic raft commit materialization"
         ))
     }
 
-    pub(super) fn build_log_apply_commit_for_outbox<T>(
-        &self,
-    ) -> std::result::Result<T, OutboxApplyError> {
+    pub fn build_log_apply_commit_for_outbox<T>(&self) -> std::result::Result<T, OutboxApplyError> {
         Err(OutboxApplyError::Retryable(
             "redb: build_log_apply_commit_for_outbox not implemented".to_string(),
         ))
     }
 
-    pub(super) fn build_log_apply_commit_for_outbox_with_watermark<T>(
+    pub fn build_log_apply_commit_for_outbox_with_watermark<T>(
         &self,
     ) -> std::result::Result<T, OutboxApplyError> {
         self.build_log_apply_commit_for_outbox()
     }
 }
 
-pub(super) fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Vec<u8>> {
+impl PrivilegedCommittedRaftApply for RedbLiveCommittedApplyStore {
+    fn apply_committed_raft(
+        &self,
+        _request: CommittedRaftApplyRequest,
+    ) -> CommittedApplyFuture<'_, CommittedRaftApplyReceipt> {
+        Box::pin(async move {
+            self.apply_raft_log_apply_commit_receipt().map_err(|error| {
+                CommittedApplyError::UnsupportedMode {
+                    message: format!("{error:#}"),
+                }
+            })
+        })
+    }
+}
+
+pub fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Vec<u8>> {
     if client_id.is_empty() || client_id.contains('\0') || stream_id <= 0 {
         return Err(anyhow!(
             "outbox watermark requires a non-empty NUL-free client ID and positive stream ID"
@@ -481,10 +492,7 @@ pub(super) fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Ve
     Ok(key)
 }
 
-pub(super) fn decode_outbox_watermark_key(
-    key: &[u8],
-    stream_seq: i64,
-) -> Result<OutboxStreamWatermark> {
+pub fn decode_outbox_watermark_key(key: &[u8], stream_seq: i64) -> Result<OutboxStreamWatermark> {
     if key.len() < 10 || key[key.len() - 9] != 0 {
         return Err(anyhow!("corrupt redb outbox-watermark key"));
     }

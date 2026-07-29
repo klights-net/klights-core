@@ -1,12 +1,12 @@
 mod authority;
-pub(crate) use authority::{committed_apply, snapshot_install};
+pub(crate) use authority::snapshot_install;
 pub mod compressed;
 pub mod flow_control;
 pub mod grpc_network;
 pub mod log_storage;
 pub mod membership_client;
 
-pub(crate) use authority::{CommittedApplyAuthority, SnapshotInstallAuthority};
+pub(crate) use authority::SnapshotInstallAuthority;
 pub mod network;
 pub mod node;
 pub(crate) mod proposal;

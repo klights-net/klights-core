@@ -2,6 +2,7 @@
 
 mod accessor;
 pub mod key_codec;
+pub mod live_committed_apply;
 mod meta;
 pub mod mutation_helpers;
 mod open_boundary;

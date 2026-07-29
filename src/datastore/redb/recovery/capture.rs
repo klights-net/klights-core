@@ -766,7 +766,7 @@ fn watermark_page(
             continue;
         }
         rows.push(
-            super::super::live_committed_apply::decode_outbox_watermark_key(
+            klights_cluster_datastore::redb::live_committed_apply::decode_outbox_watermark_key(
                 key.value(),
                 value.value(),
             )

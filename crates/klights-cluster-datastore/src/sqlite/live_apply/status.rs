@@ -1,18 +1,18 @@
 //! Status-only SQLite mutation primitive owned by the 10C.2 live packet.
 
 use super::{mutation_helpers, owner_ref_index, queries, transaction_primitives};
+use crate::sqlite::selector_index;
 use klights_cluster_core::ResourcePreconditions;
-use klights_cluster_datastore::sqlite::selector_index;
 use serde_json::Value;
 
-pub(crate) struct StatusUpdate {
+pub struct StatusUpdate {
     pub id: i64,
     pub resource_version: i64,
     pub data: Vec<u8>,
     pub changed: bool,
 }
 
-pub(crate) fn update_status_in_conn(
+pub fn update_status_in_conn(
     conn: &rusqlite::Connection,
     api_version: &str,
     kind: &str,

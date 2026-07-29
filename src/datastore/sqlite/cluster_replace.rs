@@ -10,13 +10,6 @@ use anyhow::{Result, anyhow};
 use klights_cluster_core::{LogApplyCommit, SnapshotRestoreOperation};
 
 #[cfg(test)]
-pub(crate) use super::live_apply::apply_commit_in_tx_for_raft;
-pub(crate) use super::live_apply::{
-    apply_commit_in_tx_returning_rv_and_mutation_with_context, apply_commit_in_tx_with_context,
-    other_error,
-};
-
-#[cfg(test)]
 #[derive(Clone)]
 pub(super) struct PostCommitPublishPause {
     pub(crate) reached: std::sync::Arc<tokio::sync::Notify>,
@@ -137,21 +130,16 @@ impl Datastore {
     }
 
     pub async fn apply_log_apply_commit(&self, commit: LogApplyCommit) -> Result<()> {
-        let outbox_codec = self.outbox_codec.clone();
-        let _pending = self
-            .db_call("apply_log_apply_commit", move |conn| {
-                let context = super::live_apply::TransactionContext::new(outbox_codec.as_ref());
-                let tx = conn.transaction()?;
-                let pending =
-                    super::live_apply::apply_commit_in_tx_with_context(&tx, commit, &context)?;
-                tx.commit()?;
-                Ok(pending)
-            })
+        let pending = self
+            .live_committed_apply
+            .apply_log_apply_commit(commit)
             .await
             .map_err(|err| anyhow!("failed to apply log_apply commit: {err}"))?;
 
+        #[cfg(not(test))]
+        let _ = pending;
         #[cfg(test)]
-        self.publish_watch_events(_pending);
+        self.publish_watch_events(pending);
         Ok(())
     }
 
@@ -167,43 +155,21 @@ impl Datastore {
         commit: LogApplyCommit,
     ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
         #[cfg(test)]
-        let watch_bus = self.commit_sink.clone();
-        let outbox_codec = self.outbox_codec.clone();
-        #[cfg(test)]
         let post_commit_publish_pause = self.post_commit_publish_pause.clone();
-        self.db_call_with_post_commit(
-            "apply_raft_log_apply_commit",
-            move |conn| {
-                let context = super::live_apply::TransactionContext::new(outbox_codec.as_ref());
-                let tx = conn.transaction()?;
-                let outcome = super::live_apply::apply_commit_in_tx_for_raft_with_context(
-                    &tx, commit, &context,
-                )?;
-                tx.commit()?;
-                Ok((
-                    klights_cluster_store::CommittedRaftApplyReceipt::new(
-                        outcome.committed_outcome,
-                        outcome.pod_endpoint_effect,
-                    )
-                    .with_returned_resource(outcome.returned_resource),
-                    outcome.pending,
-                ))
-            },
-            move |pending| {
-                #[cfg(not(test))]
-                let _ = pending;
-                #[cfg(test)]
-                let published =
-                    pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
-                #[cfg(test)]
-                super::watch::publish_pending_batch(pending, watch_bus.as_ref());
-                #[cfg(test)]
-                if let Some(published) = published {
-                    published.notify_one();
-                }
-            },
-        )
-        .await
-        .map_err(|err| anyhow!("failed to apply raft log_apply commit: {err}"))
+        let (receipt, pending) = self
+            .live_committed_apply
+            .apply_committed_with_pending(commit)
+            .await?;
+        #[cfg(not(test))]
+        let _ = pending;
+        #[cfg(test)]
+        {
+            let published = pause_after_commit_before_publish(post_commit_publish_pause.as_ref());
+            super::watch::publish_pending_batch(pending, self.commit_sink.as_ref());
+            if let Some(published) = published {
+                published.notify_one();
+            }
+        }
+        Ok(receipt)
     }
 }

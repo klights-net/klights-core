@@ -91,6 +91,7 @@ impl PassiveReadPorts {
 pub(crate) struct OpenedPassiveStore {
     pub(crate) backend: DatastoreHandle,
     pub(crate) read_ports: PassiveReadPorts,
+    pub(crate) committed_apply: Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply>,
 }
 
 /// Open the already-selected passive cluster datastore adapter.
@@ -120,8 +121,10 @@ pub(crate) async fn open_with_sink(
             )
             .await?;
             let focused_reads = ds.focused_read_store();
+            let committed_apply = ds.focused_committed_apply();
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
+                committed_apply,
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),
@@ -145,8 +148,10 @@ pub(crate) async fn open_with_sink(
             )
             .await?;
             let focused_reads = ds.focused_read_store();
+            let committed_apply = ds.focused_committed_apply();
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
+                committed_apply,
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),
@@ -164,8 +169,10 @@ pub(crate) async fn open_with_sink(
             )
             .await?;
             let focused_reads = ds.focused_read_store();
+            let committed_apply = ds.focused_committed_apply();
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
+                committed_apply,
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),
@@ -184,8 +191,10 @@ pub(crate) async fn open_with_sink(
             )
             .await?;
             let focused_reads = ds.focused_read_store();
+            let committed_apply = ds.focused_committed_apply();
             Ok(OpenedPassiveStore {
                 backend: Arc::new(ds),
+                committed_apply,
                 read_ports: PassiveReadPorts::new(
                     focused_reads.clone(),
                     focused_reads.clone(),

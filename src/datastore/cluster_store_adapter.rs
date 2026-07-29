@@ -3,21 +3,21 @@
 use klights_cluster_core::{CommittedApplyOutcome, LogApplyCommit, LogApplyMutation};
 #[cfg(test)]
 use klights_cluster_store::{
-    AllocatorStateError, AllocatorStateFuture, ClusterResourceRead, DurableAllocatorRead,
-    DurableAllocatorState, DurableReplayFloor, DurableWatchEvent, DurableWatchHistoryRead,
+    AllocatorStateError, AllocatorStateFuture, AppliedOutboxLookup, ClusterResourceRead,
+    CommittedApplyError, CommittedApplyFuture, DurableAllocatorRead, DurableAllocatorState,
+    DurableApplyLedgerRead, DurableReplayFloor, DurableWatchEvent, DurableWatchHistoryRead,
     DurableWatchScope, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
     ResourceGetRequest, ResourceListPage, ResourceListRead, ResourceListRequest,
     ResourceListSnapshot, ResourceReadError, ResourceReadFuture, ResourceVersionMatch,
     WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
 };
 use klights_cluster_store::{
-    AppliedOutboxLookup, AuthoritativeSnapshot, AuthoritativeSnapshotCapture,
-    AuthoritativeSnapshotPersistence, ClusterMetadataFuture, ClusterMetadataRead,
-    ClusterMetadataStoreError, CommittedApplyError, CommittedApplyFuture,
-    CommittedRaftApplyReceipt, CommittedRaftApplyRequest, DurableApplyLedgerRead,
-    DurableReplayTarget, PersistedClusterMetadata, PrivilegedCommittedRaftApply,
-    SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCapturePageKind, SnapshotCaptureSession,
-    SnapshotMembership, SnapshotPersistenceError, SnapshotPersistenceFuture,
+    AuthoritativeSnapshot, AuthoritativeSnapshotCapture, AuthoritativeSnapshotPersistence,
+    ClusterMetadataFuture, ClusterMetadataRead, ClusterMetadataStoreError,
+    CommittedRaftApplyReceipt, CommittedRaftApplyRequest, DurableReplayTarget,
+    PersistedClusterMetadata, PrivilegedCommittedRaftApply, SnapshotCaptureHeader,
+    SnapshotCapturePage, SnapshotCapturePageKind, SnapshotCaptureSession, SnapshotMembership,
+    SnapshotPersistenceError, SnapshotPersistenceFuture,
 };
 
 use super::DatastoreHandle;
@@ -439,24 +439,19 @@ fn port_page(
 ///
 /// REMOVE(Phase 10): concrete cluster datastore adapters implement the
 /// cluster-store ports directly after physical extraction.
+#[cfg(test)]
 pub(crate) struct DatastoreCommittedRaftApply {
     db: DatastoreHandle,
 }
 
+#[cfg(test)]
 impl DatastoreCommittedRaftApply {
-    pub(crate) fn new(
-        db: DatastoreHandle,
-        _authority: crate::datastore::raft::CommittedApplyAuthority,
-    ) -> Self {
-        Self { db }
-    }
-
-    #[cfg(test)]
     fn new_for_test(db: DatastoreHandle) -> Self {
         Self { db }
     }
 }
 
+#[cfg(test)]
 impl PrivilegedCommittedRaftApply for DatastoreCommittedRaftApply {
     fn apply_committed_raft(
         &self,
@@ -655,6 +650,7 @@ fn post_commit_advances(
         .collect()
 }
 
+#[cfg(test)]
 impl DurableApplyLedgerRead for DatastoreCommittedRaftApply {
     fn current_apply_position(
         &self,
@@ -691,6 +687,7 @@ impl DurableApplyLedgerRead for DatastoreCommittedRaftApply {
     }
 }
 
+#[cfg(test)]
 fn map_committed_apply_error(error: anyhow::Error) -> CommittedApplyError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();

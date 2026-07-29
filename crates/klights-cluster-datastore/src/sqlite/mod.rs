@@ -2,6 +2,7 @@
 
 pub mod filters;
 mod fingerprint;
+pub mod live_apply;
 pub mod mutation_diagnostics;
 pub mod mutation_helpers;
 pub mod mutation_queries;

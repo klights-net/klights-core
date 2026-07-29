@@ -146,6 +146,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     .context("Failed to open datastore")?;
     let passive_backend = opened_passive.backend;
     let passive_read_ports = opened_passive.read_ports;
+    let committed_apply = opened_passive.committed_apply;
 
     // T1.6: joining controlplanes get their initial cluster.db
     // contents from raft (install_snapshot or AppendEntries from index 0
@@ -331,12 +332,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 crate::datastore::raft::state_machine_impl::RaftStateMachineStorePorts::new(
                     Arc::new(
                         crate::datastore::cluster_store_adapter::ObservedCommittedRaftApply::new(
-                            Arc::new(
-                                crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
-                                    passive_backend.clone(),
-                                    crate::datastore::raft::committed_apply(),
-                                ),
-                            ),
+                            committed_apply,
                             watch_commit_wiring.wakeups.clone(),
                         ),
                     ),

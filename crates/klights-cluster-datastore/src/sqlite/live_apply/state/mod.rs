@@ -244,9 +244,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
 #[cfg(test)]
 mod tests {
     use super::ApplyEffects;
-    use crate::datastore::staged_post_commit_from_event;
-    use crate::watch::WatchEvent;
-    use serde_json::json;
+    use klights_cluster_store::StagedPostCommit;
 
     #[test]
     fn apply_effects_starts_empty_and_preserves_watch_event_order() {
@@ -254,32 +252,17 @@ mod tests {
         assert!(effects.into_pending_watch_events().is_empty());
 
         let mut effects = ApplyEffects::new();
-        effects.push_watch_event(staged_post_commit_from_event(WatchEvent::added(
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"first","resourceVersion":"1"}}),
-        )));
-        effects.push_watch_event(staged_post_commit_from_event(WatchEvent::modified(
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"second","resourceVersion":"2"}}),
-        )));
-        effects.push_watch_event(staged_post_commit_from_event(WatchEvent::deleted(
-            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"third","resourceVersion":"3"}}),
-        )));
+        effects.push_watch_event(StagedPostCommit::new("v1", "ConfigMap", Some("first"), 1));
+        effects.push_watch_event(StagedPostCommit::new("v1", "ConfigMap", Some("second"), 2));
+        effects.push_watch_event(StagedPostCommit::new("v1", "ConfigMap", Some("third"), 3));
 
         let events = effects.into_pending_watch_events();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].test_event().unwrap().event_type(), "ADDED");
-        assert_eq!(events[1].test_event().unwrap().event_type(), "MODIFIED");
-        assert_eq!(events[2].test_event().unwrap().event_type(), "DELETED");
-        assert_eq!(
-            events[0].test_event().unwrap().resource().data["metadata"]["name"],
-            json!("first")
-        );
-        assert_eq!(
-            events[1].test_event().unwrap().resource().data["metadata"]["name"],
-            json!("second")
-        );
-        assert_eq!(
-            events[2].test_event().unwrap().resource().data["metadata"]["name"],
-            json!("third")
-        );
+        assert_eq!(events[0].namespace(), Some("first"));
+        assert_eq!(events[1].namespace(), Some("second"));
+        assert_eq!(events[2].namespace(), Some("third"));
+        assert_eq!(events[0].resource_version(), 1);
+        assert_eq!(events[1].resource_version(), 2);
+        assert_eq!(events[2].resource_version(), 3);
     }
 }

@@ -10,9 +10,9 @@ use super::super::mutation_helpers::{
 };
 use super::super::{ApplyConflictCode, apply_conflict_error, other_error};
 use super::super::{create_staged_post_commit, owner_ref_index, queries};
+use crate::sqlite::selector_index;
 use klights_cluster_core::PatchKind;
 use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
-use klights_cluster_datastore::sqlite::selector_index;
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
 

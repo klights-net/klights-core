@@ -15,7 +15,6 @@ pub mod advance;
 #[cfg(test)]
 mod applier;
 mod backend_impl;
-mod live_committed_apply;
 pub mod network;
 mod recovery;
 pub mod snapshot;
@@ -37,8 +36,7 @@ use crud::resources::RedbResourceStore;
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::RedbOpenOpts;
 use klights_cluster_datastore::redb::RedbReadStore;
-use klights_cluster_datastore::redb::mutation_helpers;
-use live_committed_apply::RedbLiveCommittedApplyStore;
+use klights_cluster_datastore::redb::live_committed_apply::RedbLiveCommittedApplyStore;
 use network::RedbNetworkStore;
 use recovery::RedbRecoveryStore;
 use watch::RedbWatchStore;
@@ -205,5 +203,11 @@ impl RedbDatastore {
 
     pub(crate) fn focused_read_store(&self) -> Arc<RedbReadStore> {
         self.read_store.clone()
+    }
+
+    pub(crate) fn focused_committed_apply(
+        &self,
+    ) -> Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply> {
+        Arc::new(self.live_committed_apply.clone())
     }
 }

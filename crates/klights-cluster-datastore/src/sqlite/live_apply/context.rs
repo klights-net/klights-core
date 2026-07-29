@@ -2,26 +2,23 @@
 
 use klights_cluster_store::OutboxResponseCodec;
 
-pub(crate) struct TransactionContext<'a> {
+pub struct TransactionContext<'a> {
     outbox_codec: &'a dyn OutboxResponseCodec,
 }
 
 impl<'a> TransactionContext<'a> {
-    pub(crate) fn new(outbox_codec: &'a dyn OutboxResponseCodec) -> Self {
+    pub fn new(outbox_codec: &'a dyn OutboxResponseCodec) -> Self {
         Self { outbox_codec }
     }
 
-    pub(crate) fn encode(
+    pub fn encode(
         &self,
         response: &klights_cluster_core::StorageResponse,
     ) -> Result<Vec<u8>, String> {
         self.outbox_codec.encode(response)
     }
 
-    pub(crate) fn decode(
-        &self,
-        bytes: &[u8],
-    ) -> Result<klights_cluster_core::StorageResponse, String> {
+    pub fn decode(&self, bytes: &[u8]) -> Result<klights_cluster_core::StorageResponse, String> {
         self.outbox_codec.decode(bytes)
     }
 }

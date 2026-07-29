@@ -136,7 +136,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
             rusqlite::params![name],
         )?;
         for (api_version, kind, namespace, resource_name) in rows {
-            klights_cluster_datastore::sqlite::selector_index::delete_index_entries(
+            crate::sqlite::selector_index::delete_index_entries(
                 self.tx,
                 &api_version,
                 &kind,

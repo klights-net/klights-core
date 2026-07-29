@@ -12,7 +12,8 @@ pub(crate) fn watch_events_min_scope_rows(max_rows: i64) -> i64 {
     max_rows.clamp(1, DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE)
 }
 
-pub(crate) fn watch_events_min_scope_rows_for_scope_count(max_rows: i64, scope_count: i64) -> i64 {
+#[doc(hidden)]
+pub fn watch_events_min_scope_rows_for_scope_count(max_rows: i64, scope_count: i64) -> i64 {
     if max_rows <= 0 || scope_count <= 0 {
         return 0;
     }
@@ -26,7 +27,7 @@ pub(crate) fn watch_events_min_scope_rows_for_scope_count(max_rows: i64, scope_c
     watch_events_min_scope_rows(max_rows).min(dynamic_floor)
 }
 
-pub(crate) fn watch_events_min_scope_rows_in_conn(
+pub fn watch_events_min_scope_rows_in_conn(
     conn: &rusqlite::Connection,
     max_rows: i64,
 ) -> rusqlite::Result<i64> {
@@ -38,7 +39,7 @@ pub(crate) fn watch_events_min_scope_rows_in_conn(
     ))
 }
 
-pub(crate) fn gc_watch_events_in_tx(
+pub fn gc_watch_events_in_tx(
     tx: &rusqlite::Transaction<'_>,
     max_rows: i64,
     batch_cap: i64,

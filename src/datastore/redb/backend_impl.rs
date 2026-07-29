@@ -84,7 +84,7 @@ fn durable_floor_to_legacy(floor: klights_cluster_store::DurableReplayFloor) -> 
 }
 
 #[cfg(test)]
-use super::live_committed_apply::outbox_watermark_key;
+use klights_cluster_datastore::redb::live_committed_apply::outbox_watermark_key;
 
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {

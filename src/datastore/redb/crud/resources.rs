@@ -10,13 +10,13 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::super::live_committed_apply::RedbLiveCommittedApplyStore;
 use crate::datastore::types::{
     ListPageRequest, ResourceList, ResourceListQuery, WatchTarget, WatchTargetScope,
 };
 use klights_cluster_core::{Resource, ResourcePatchRequest, ResourcePreconditions};
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::RedbOrdinaryResourceStore;
+use klights_cluster_datastore::redb::live_committed_apply::RedbLiveCommittedApplyStore;
 use klights_cluster_datastore::redb::read_core::RedbCollectionScope;
 use klights_cluster_datastore::redb::read_core::RedbListQuery;
 use klights_cluster_datastore::redb::read_core::RedbReadCore;

@@ -10,7 +10,6 @@ mod cluster_replace;
 mod crud;
 mod focused_ports;
 mod gc;
-mod live_apply;
 mod merge_patch;
 mod outbox_codec;
 mod recovery;
@@ -79,10 +78,12 @@ struct AppliedOutboxLedgerInput<'a> {
 
 use self::mutation_queries as queries;
 use klights_cluster_datastore::sqlite::SqliteReadStore;
+use klights_cluster_datastore::sqlite::live_apply;
 use klights_cluster_datastore::sqlite::mutation_diagnostics;
 use klights_cluster_datastore::sqlite::mutation_helpers;
 use klights_cluster_datastore::sqlite::mutation_queries;
 use klights_cluster_datastore::sqlite::ordinary;
+#[cfg(test)]
 use klights_cluster_datastore::sqlite::owner_ref_index;
 use klights_cluster_datastore::sqlite::resource_shape;
 use klights_cluster_datastore::sqlite::transaction_primitives;
@@ -287,6 +288,9 @@ pub struct Datastore {
     executor: DbExecutor,
     read_executor: DbExecutor,
     focused_reads: std::sync::Arc<SqliteReadStore>,
+    live_committed_apply: std::sync::Arc<
+        klights_cluster_datastore::sqlite::live_apply::SqliteLiveCommittedApplyStore,
+    >,
     #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
@@ -573,14 +577,13 @@ impl Datastore {
                 _ => None,
             };
             if observed.is_some_and(|value| value != 0 && value != candidate_resource_version) {
-                return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                return Err(live_apply::other_error(
                     "materialized mutation resourceVersion differs from its private candidate",
                 ));
             }
         }
-        klights_cluster_core::LogApplyCommit::try_new(mutations).map_err(|error| {
-            crate::datastore::sqlite::cluster_replace::other_error(error.to_string())
-        })
+        klights_cluster_core::LogApplyCommit::try_new(mutations)
+            .map_err(|error| live_apply::other_error(error.to_string()))
     }
 
     fn author_live_commit_from_cluster_mutations(
@@ -1962,10 +1965,7 @@ impl Datastore {
                     None,
                     operation_now,
                 )?;
-                let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
-                        &tx, commit, &context,
-                    )?;
+                let pending = live_apply::apply_commit_in_tx_with_context(&tx, commit, &context)?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -2006,10 +2006,7 @@ impl Datastore {
                     None,
                     operation_now,
                 )?;
-                let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
-                        &tx, commit, &context,
-                    )?;
+                let pending = live_apply::apply_commit_in_tx_with_context(&tx, commit, &context)?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -2103,10 +2100,7 @@ impl Datastore {
                     None,
                     operation_now,
                 )?;
-                let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_with_context(
-                        &tx, commit, &context,
-                    )?;
+                let pending = live_apply::apply_commit_in_tx_with_context(&tx, commit, &context)?;
                 tx.commit()?;
                 Ok(pending)
             })
@@ -2317,7 +2311,7 @@ impl Datastore {
                         )
                         .optional()?;
                     if watermark.stream_seq <= 0 {
-                        return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                        return Err(live_apply::other_error(
                             "outbox stream seq must be positive",
                         ));
                     }
@@ -2327,7 +2321,7 @@ impl Datastore {
                             return Ok(BuildOutboxTxnOutcome::AlreadyApplied(None));
                         }
                         if watermark.stream_seq != last_seq.saturating_add(1) {
-                            return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                            return Err(live_apply::other_error(
                                 format!(
                                     "outbox stream gap for seq {}: last committed seq is {}",
                                     watermark.stream_seq, last_seq
@@ -2335,7 +2329,7 @@ impl Datastore {
                             ));
                         }
                     } else if watermark.stream_seq != 1 {
-                        return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                        return Err(live_apply::other_error(
                             format!(
                                 "outbox stream gap for seq {}: last committed seq is 0",
                                 watermark.stream_seq
@@ -2745,10 +2739,8 @@ impl Datastore {
         )?;
 
         let (applied_rv, pending, applied_mutation) =
-            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv_and_mutation_with_context(
-                tx,
-                commit,
-                context,
+            live_apply::apply_commit_in_tx_returning_rv_and_mutation_with_context(
+                tx, commit, context,
             )?;
 
         let pending_event = pending.into_iter().next();
@@ -3558,10 +3550,17 @@ impl Datastore {
         ));
         #[cfg(not(test))]
         let focused_reads = std::sync::Arc::new(SqliteReadStore::new(read_executor.clone()));
+        let live_committed_apply = std::sync::Arc::new(
+            klights_cluster_datastore::sqlite::live_apply::SqliteLiveCommittedApplyStore::new(
+                executor.clone(),
+                outbox_codec.clone(),
+            ),
+        );
         Ok(Self {
             executor,
             read_executor,
             focused_reads,
+            live_committed_apply,
             #[cfg(test)]
             commit_sink,
             outbox_codec,
@@ -3579,6 +3578,12 @@ impl Datastore {
 
     pub(crate) fn focused_read_store(&self) -> std::sync::Arc<SqliteReadStore> {
         self.focused_reads.clone()
+    }
+
+    pub(crate) fn focused_committed_apply(
+        &self,
+    ) -> std::sync::Arc<dyn klights_cluster_store::PrivilegedCommittedRaftApply> {
+        self.live_committed_apply.clone()
     }
 
     async fn from_executor(
@@ -3798,21 +3803,11 @@ impl DatastoreBackend for Datastore {
             };
             let cluster_id = get(klights_cluster_store::CLUSTER_ID_META_KEY)?
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    crate::datastore::sqlite::cluster_replace::other_error(
-                        "cluster_id is missing or empty",
-                    )
-                })?;
-            let raw_epoch =
-                get(klights_cluster_store::LEADER_EPOCH_META_KEY)?.ok_or_else(|| {
-                    crate::datastore::sqlite::cluster_replace::other_error(
-                        "leader_epoch is missing",
-                    )
-                })?;
+                .ok_or_else(|| live_apply::other_error("cluster_id is missing or empty"))?;
+            let raw_epoch = get(klights_cluster_store::LEADER_EPOCH_META_KEY)?
+                .ok_or_else(|| live_apply::other_error("leader_epoch is missing"))?;
             let leader_epoch = raw_epoch.parse::<i64>().map_err(|_| {
-                crate::datastore::sqlite::cluster_replace::other_error(format!(
-                    "invalid leader_epoch {raw_epoch:?}"
-                ))
+                live_apply::other_error(format!("invalid leader_epoch {raw_epoch:?}"))
             })?;
             let raw_rv: String = conn.query_row(
                 "SELECT value FROM metadata WHERE key = 'resource_version'",
@@ -3820,12 +3815,10 @@ impl DatastoreBackend for Datastore {
                 |row| row.get(0),
             )?;
             let current_rv = raw_rv.parse::<i64>().map_err(|_| {
-                crate::datastore::sqlite::cluster_replace::other_error(format!(
-                    "invalid resource_version metadata {raw_rv:?}"
-                ))
+                live_apply::other_error(format!("invalid resource_version metadata {raw_rv:?}"))
             })?;
             if leader_epoch < 0 || current_rv < 0 {
-                return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                return Err(live_apply::other_error(
                     "cluster metadata numeric values must be non-negative",
                 ));
             }
@@ -3837,14 +3830,10 @@ impl DatastoreBackend for Datastore {
                 (Some(raw_voters), Some(raw_term), Some(raw_hint)) => {
                     let voters: Vec<String> =
                         serde_json::from_str(&raw_voters).map_err(|error| {
-                            crate::datastore::sqlite::cluster_replace::other_error(format!(
-                                "invalid voters metadata: {error}"
-                            ))
+                            live_apply::other_error(format!("invalid voters metadata: {error}"))
                         })?;
                     let term = raw_term.parse::<i64>().map_err(|_| {
-                        crate::datastore::sqlite::cluster_replace::other_error(format!(
-                            "invalid raft term {raw_term:?}"
-                        ))
+                        live_apply::other_error(format!("invalid raft term {raw_term:?}"))
                     })?;
                     let mut unique = std::collections::HashSet::with_capacity(voters.len());
                     if term < 0
@@ -3853,7 +3842,7 @@ impl DatastoreBackend for Datastore {
                             .iter()
                             .any(|voter| voter.is_empty() || !unique.insert(voter.as_str()))
                     {
-                        return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                        return Err(live_apply::other_error(
                             "membership contains an invalid term or voter set",
                         ));
                     }
@@ -3865,9 +3854,7 @@ impl DatastoreBackend for Datastore {
                     })
                 }
                 _ => {
-                    return Err(crate::datastore::sqlite::cluster_replace::other_error(
-                        "membership metadata is incomplete",
-                    ));
+                    return Err(live_apply::other_error("membership metadata is incomplete"));
                 }
             };
             Ok(ClusterMetadataObservation {

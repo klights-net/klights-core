@@ -20,6 +20,7 @@ mod encryption_tests;
 mod event_compat_tests;
 mod fingerprint_tests;
 mod ipam_and_network_tests;
+mod live_apply_coordinator_tests;
 mod namespace_and_watch_tests;
 mod owner_reference_query_tests;
 mod pod_status_stamp_tests;

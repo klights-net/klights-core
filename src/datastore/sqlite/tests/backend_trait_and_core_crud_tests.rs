@@ -8,8 +8,22 @@ use crate::datastore::{
     ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore, ResourcePreconditions,
     StatusStore, WatchHistoryStore, WatchMaintenanceStore, WatchReplayAnchorStore,
 };
+use klights_cluster_core::LogApplyCommit;
 use klights_cluster_core::command::StorageCommand;
+use klights_cluster_datastore::sqlite::live_apply::RaftLogApplyOutcome;
 use serde_json::json;
+
+fn apply_commit_in_tx_for_raft(
+    tx: &rusqlite::Transaction<'_>,
+    commit: LogApplyCommit,
+) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
+    let codec = crate::outbox_response_codec_adapter::new_codec();
+    let context =
+        klights_cluster_datastore::sqlite::live_apply::TransactionContext::new(codec.as_ref());
+    klights_cluster_datastore::sqlite::live_apply::apply_commit_in_tx_for_raft_with_context(
+        tx, commit, &context,
+    )
+}
 
 async fn table_column_info(
     db: &Datastore,
@@ -84,11 +98,8 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
 
     db.db_call("test_duplicate_outbox_watermark_noop", move |conn| {
         let tx = conn.transaction()?;
-        crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_for_raft(
-            &tx,
-            commit.clone(),
-        )?;
-        crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_for_raft(&tx, commit)?;
+        apply_commit_in_tx_for_raft(&tx, commit.clone())?;
+        apply_commit_in_tx_for_raft(&tx, commit)?;
         tx.commit()?;
         Ok(())
     })
@@ -455,8 +466,7 @@ async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
     let result = db
         .db_call("test_outbox_watermark_gap_rejects", move |conn| {
             let tx = conn.transaction()?;
-            let result =
-                crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_for_raft(&tx, commit);
+            let result = apply_commit_in_tx_for_raft(&tx, commit);
             tx.commit()?;
             result.map(|_| ())
         })
