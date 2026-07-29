@@ -116,6 +116,28 @@ impl crate::controllers::gc::GcResourceStore for RootControllerLeaderPort {
         .await
     }
 
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        validate_controller_effect()?;
+        crate::controllers::gc::GcResourceStore::update_main_resource_with_preconditions(
+            self.store.as_ref(),
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            preconditions,
+        )
+        .await
+    }
+
     async fn find_owned_resources(
         &self,
         owner_uid: &str,

@@ -28,6 +28,15 @@ pub trait GcResourceStore: Send + Sync {
         data: serde_json::Value,
         preconditions: ResourcePreconditions,
     ) -> ControllerStoreResult<Resource>;
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource>;
     async fn find_owned_resources(
         &self,
         owner_uid: &str,
@@ -521,7 +530,7 @@ async fn remove_owner_ref_from_resource(
         }
 
         match db
-            .update_resource_with_preconditions(
+            .update_main_resource_with_preconditions(
                 &current.api_version,
                 &current.kind,
                 current.namespace.as_deref(),
@@ -591,7 +600,7 @@ async fn remove_owner_refs_from_resource(
         }
 
         match db
-            .update_resource_with_preconditions(
+            .update_main_resource_with_preconditions(
                 &current.api_version,
                 &current.kind,
                 current.namespace.as_deref(),
@@ -1262,6 +1271,7 @@ pub async fn orphan_children(
         }
     }
 
+    let mut first_error = None;
     for resource in owned {
         if let Err(e) = remove_owner_ref_from_resource(
             db,
@@ -1274,10 +1284,13 @@ pub async fn orphan_children(
         .await
         {
             tracing::warn!("Failed to orphan resource: {}", e);
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
         }
     }
 
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Foreground deletion: delete children first, then parent can be deleted

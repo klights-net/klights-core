@@ -58,6 +58,28 @@ where
         .map_err(map_controller_store_error)
     }
 
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        DatastoreBackend::update_main_resource_with_preconditions(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            preconditions,
+        )
+        .await
+        .map_err(map_controller_store_error)
+    }
+
     async fn find_owned_resources(
         &self,
         owner_uid: &str,

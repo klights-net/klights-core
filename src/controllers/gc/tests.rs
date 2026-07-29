@@ -135,6 +135,142 @@ fn non_pod_finalization(
     crate::gc_delete_adapter::GcNonPodFinalizationAdapter::new(Arc::new(db.clone()))
 }
 
+struct StatusChurningGcStore {
+    db: crate::datastore::sqlite::Datastore,
+    update_attempts: AtomicUsize,
+    typed_conflicts_remaining: AtomicUsize,
+    fail_main_update: bool,
+}
+
+impl StatusChurningGcStore {
+    async fn bump_status(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<()> {
+        let live = GcResourceStore::get_resource(&self.db, api_version, kind, namespace, name)
+            .await?
+            .expect("status-race resource must remain live");
+        let attempt = self.update_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        self.db
+            .update_status_only(
+                api_version,
+                kind,
+                namespace,
+                name,
+                json!({"replicas": attempt, "readyReplicas": attempt}),
+                Some(live.resource_version),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| ControllerStoreError::internal(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl GcResourceStore for StatusChurningGcStore {
+    async fn list_custom_resource_definitions(&self) -> ControllerStoreResult<Vec<Resource>> {
+        GcResourceStore::list_custom_resource_definitions(&self.db).await
+    }
+
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> ControllerStoreResult<Option<Resource>> {
+        GcResourceStore::get_resource(&self.db, api_version, kind, namespace, name).await
+    }
+
+    async fn update_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        self.bump_status(api_version, kind, namespace, name).await?;
+        GcResourceStore::update_resource_with_preconditions(
+            &self.db,
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            preconditions,
+        )
+        .await
+    }
+
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: ResourcePreconditions,
+    ) -> ControllerStoreResult<Resource> {
+        if self.fail_main_update {
+            return Err(ControllerStoreError::unavailable(
+                "injected owner-reference update failure",
+            ));
+        }
+        self.bump_status(api_version, kind, namespace, name).await?;
+        if self
+            .typed_conflicts_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ControllerStoreError::conflict(
+                "injected committed-apply conflict",
+            ));
+        }
+        GcResourceStore::update_main_resource_with_preconditions(
+            &self.db,
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            preconditions,
+        )
+        .await
+    }
+
+    async fn find_owned_resources(
+        &self,
+        owner_uid: &str,
+        namespace: Option<&str>,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        GcResourceStore::find_owned_resources(&self.db, owner_uid, namespace).await
+    }
+
+    async fn find_owned_by_name_kind_empty_uid(
+        &self,
+        owner_api_version: &str,
+        owner_name: &str,
+        owner_kind: &str,
+        namespace: Option<&str>,
+    ) -> ControllerStoreResult<Vec<Resource>> {
+        GcResourceStore::find_owned_by_name_kind_empty_uid(
+            &self.db,
+            owner_api_version,
+            owner_name,
+            owner_kind,
+            namespace,
+        )
+        .await
+    }
+}
+
 #[derive(Clone)]
 enum FakeNonPodResult {
     Outcome(klights_reconcile_api::GcNonPodFinalizationOutcome),
@@ -853,6 +989,139 @@ async fn foreground_owner_ref_removal_retries_after_child_status_conflict() {
         child.data.pointer("/status/phase").and_then(|v| v.as_str()),
         Some("Running"),
         "retry must preserve concurrent status updates"
+    );
+}
+
+#[tokio::test]
+async fn orphan_owner_ref_removal_survives_continuous_child_status_churn() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let owner_uid = "deployment-status-churn-uid";
+
+    db.create_resource(
+        "apps/v1",
+        "ReplicaSet",
+        Some("default"),
+        "status-churn-rs",
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "status-churn-rs",
+                "namespace": "default",
+                "uid": "status-churn-rs-uid",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "status-churn-deployment",
+                    "uid": owner_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {"replicas": 1},
+            "status": {"replicas": 0, "readyReplicas": 0}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let racing = StatusChurningGcStore {
+        db: db.clone(),
+        update_attempts: AtomicUsize::new(0),
+        typed_conflicts_remaining: AtomicUsize::new(1),
+        fail_main_update: false,
+    };
+    orphan_children(
+        &racing,
+        owner_uid,
+        "apps/v1",
+        "status-churn-deployment",
+        "Deployment",
+        Some("default".to_string()),
+    )
+    .await
+    .expect("orphaning should tolerate status-only child updates");
+
+    let child = db
+        .get_resource("apps/v1", "ReplicaSet", Some("default"), "status-churn-rs")
+        .await
+        .unwrap()
+        .expect("orphaned ReplicaSet must survive");
+    assert!(
+        child
+            .data
+            .pointer("/metadata/ownerReferences")
+            .and_then(|refs| refs.as_array())
+            .is_none_or(Vec::is_empty),
+        "orphaned ReplicaSet must not retain the Deployment owner reference"
+    );
+    assert_eq!(
+        child
+            .data
+            .pointer("/status/readyReplicas")
+            .and_then(serde_json::Value::as_u64),
+        Some(2),
+        "main-resource ownerRef removal must preserve the racing status update"
+    );
+    assert_eq!(
+        racing.update_attempts.load(Ordering::SeqCst),
+        2,
+        "typed committed-apply conflict must refetch once without exhausting GC retries"
+    );
+}
+
+#[tokio::test]
+async fn orphan_children_returns_error_when_owner_ref_update_does_not_commit() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let owner_uid = "deployment-orphan-failure-uid";
+
+    db.create_resource(
+        "apps/v1",
+        "ReplicaSet",
+        Some("default"),
+        "orphan-failure-rs",
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "orphan-failure-rs",
+                "namespace": "default",
+                "uid": "orphan-failure-rs-uid",
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "orphan-failure-deployment",
+                    "uid": owner_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {"replicas": 1},
+            "status": {"replicas": 1}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let failing = StatusChurningGcStore {
+        db,
+        update_attempts: AtomicUsize::new(0),
+        typed_conflicts_remaining: AtomicUsize::new(0),
+        fail_main_update: true,
+    };
+    let error = orphan_children(
+        &failing,
+        owner_uid,
+        "apps/v1",
+        "orphan-failure-deployment",
+        "Deployment",
+        Some("default".to_string()),
+    )
+    .await
+    .expect_err("orphaning must fail closed while a child still retains the owner");
+
+    assert!(
+        error
+            .to_string()
+            .contains("injected owner-reference update failure")
     );
 }
 
