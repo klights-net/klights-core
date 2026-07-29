@@ -1,6 +1,6 @@
 use super::*;
 
-pub mod helpers;
+use klights_cluster_datastore::sqlite::mutation_helpers;
 mod namespace_mutation;
 mod namespace_read;
 mod node_subnet;

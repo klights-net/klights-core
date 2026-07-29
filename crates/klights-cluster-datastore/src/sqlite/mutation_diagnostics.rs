@@ -1,6 +1,6 @@
 //! Root-independent diagnostics shared by SQLite mutation packets.
 
-pub(super) struct NoopResourceWrite<'a> {
+pub struct NoopResourceWrite<'a> {
     pub operation: &'a str,
     pub api_version: &'a str,
     pub kind: &'a str,
@@ -11,7 +11,7 @@ pub(super) struct NoopResourceWrite<'a> {
     pub reason: &'a str,
 }
 
-pub(super) fn log_noop_resource_write(entry: NoopResourceWrite<'_>) {
+pub fn log_noop_resource_write(entry: NoopResourceWrite<'_>) {
     tracing::info!(
         target: "klights::datastore::noop_update",
         operation = %entry.operation,

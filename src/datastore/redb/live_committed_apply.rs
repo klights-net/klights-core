@@ -11,7 +11,7 @@ use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use super::helpers;
+use super::mutation_helpers as helpers;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, OutboxApplyError, OutboxStreamWatermark, Resource,
 };

@@ -124,7 +124,7 @@ fn pod_state_in_tx(
     };
     bytes
         .map(|bytes| {
-            serde_json::from_slice(&bytes).map_err(super::crud::helpers::serde_to_sqlite_error)
+            serde_json::from_slice(&bytes).map_err(super::mutation_helpers::serde_to_sqlite_error)
         })
         .transpose()
 }
@@ -580,7 +580,7 @@ fn resolve_bound_pod_finalizations_in_tx(
             continue;
         }
         let data: serde_json::Value = serde_json::from_slice(&data_bytes)
-            .map_err(super::crud::helpers::serde_to_sqlite_error)?;
+            .map_err(super::mutation_helpers::serde_to_sqlite_error)?;
         let assigned_node = data
             .pointer("/spec/nodeName")
             .and_then(serde_json::Value::as_str)

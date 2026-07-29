@@ -562,7 +562,7 @@ impl crate::datastore::ReplicationStore for Datastore {
         namespace: Option<&str>,
         name: &str,
         data: Value,
-        options: crate::datastore::types::ReplicatedCreateOptions,
+        options: crate::datastore::ReplicatedCreateOptions,
     ) -> anyhow::Result<Resource> {
         crate::datastore::DatastoreBackend::apply_replicated_create_resource(
             self,

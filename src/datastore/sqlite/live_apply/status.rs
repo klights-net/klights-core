@@ -1,6 +1,6 @@
 //! Status-only SQLite mutation primitive owned by the 10C.2 live packet.
 
-use super::{crud, owner_ref_index, queries, transaction_primitives};
+use super::{mutation_helpers, owner_ref_index, queries, transaction_primitives};
 use klights_cluster_core::ResourcePreconditions;
 use klights_cluster_datastore::sqlite::selector_index;
 use serde_json::Value;
@@ -48,7 +48,7 @@ pub(crate) fn update_status_in_conn(
     }
 
     let mut current: Value =
-        serde_json::from_slice(&current_bytes).map_err(crud::helpers::serde_to_sqlite_error)?;
+        serde_json::from_slice(&current_bytes).map_err(mutation_helpers::serde_to_sqlite_error)?;
     if current.get("status") == Some(&status) {
         tracing::info!(
             target: "klights::datastore::noop_update",
@@ -74,7 +74,7 @@ pub(crate) fn update_status_in_conn(
     } else {
         current = serde_json::json!({ "status": status });
     }
-    let merged = serde_json::to_vec(&current).map_err(crud::helpers::serde_to_sqlite_error)?;
+    let merged = serde_json::to_vec(&current).map_err(mutation_helpers::serde_to_sqlite_error)?;
     let new_rv = transaction_primitives::next_resource_version_in_tx(conn)?;
     let rows = if let Some(_namespace) = namespace {
         conn.execute(
@@ -95,9 +95,9 @@ pub(crate) fn update_status_in_conn(
     let namespace_key = namespace.unwrap_or("");
     selector_index::upsert_index_entries(conn, api_version, kind, namespace_key, name, &merged)?;
     owner_ref_index::upsert_owner_refs(conn, api_version, kind, namespace_key, name, &merged)?;
-    crud::helpers::insert_watch_event_in_conn(
+    mutation_helpers::insert_watch_event_in_conn(
         conn,
-        crud::helpers::WatchEventInsert::new(
+        mutation_helpers::WatchEventInsert::new(
             api_version,
             kind,
             namespace,

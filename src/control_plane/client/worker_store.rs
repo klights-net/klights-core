@@ -1303,7 +1303,7 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
         _namespace: Option<&str>,
         _name: &str,
         _data: Value,
-        _options: crate::datastore::types::ReplicatedCreateOptions,
+        _options: crate::datastore::ReplicatedCreateOptions,
     ) -> Result<Resource> {
         self.unsupported("apply_replicated_create_resource")
     }

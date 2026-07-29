@@ -11,14 +11,12 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::super::live_committed_apply::RedbLiveCommittedApplyStore;
-use super::super::ordinary_mutations::RedbOrdinaryResourceStore;
-#[cfg(test)]
-use crate::datastore::types::ReplicatedCreateOptions;
 use crate::datastore::types::{
     ListPageRequest, ResourceList, ResourceListQuery, WatchTarget, WatchTargetScope,
 };
 use klights_cluster_core::{Resource, ResourcePatchRequest, ResourcePreconditions};
 use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::RedbOrdinaryResourceStore;
 use klights_cluster_datastore::redb::read_core::RedbCollectionScope;
 use klights_cluster_datastore::redb::read_core::RedbListQuery;
 use klights_cluster_datastore::redb::read_core::RedbReadCore;
@@ -52,21 +50,6 @@ impl RedbResourceStore {
     ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
         self.ordinary
             .create_resource(api_version, kind, namespace, name, data)
-            .await
-    }
-
-    #[cfg(test)]
-    pub async fn apply_replicated_create_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        options: ReplicatedCreateOptions,
-    ) -> Result<(Resource, Vec<klights_cluster_store::StagedPostCommit>)> {
-        self.ordinary
-            .apply_replicated_create_resource(api_version, kind, namespace, name, data, options)
             .await
     }
 

@@ -5,7 +5,7 @@
 //! normalized payload so raft members cannot diverge by recomputing local state
 //! while applying the same committed entry.
 
-use super::super::crud::helpers::{
+use super::super::mutation_helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
 use super::super::{ApplyConflictCode, apply_conflict_error, other_error};

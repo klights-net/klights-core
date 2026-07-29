@@ -1,8 +1,10 @@
-use super::{crud, owner_ref_index, queries, transaction_primitives, use_namespaced_table};
-use klights_cluster_datastore::sqlite::selector_index;
+use super::{
+    mutation_helpers, owner_ref_index, queries, selector_index, transaction_primitives,
+    use_namespaced_table,
+};
 use rusqlite::TransactionBehavior;
 
-pub(crate) struct CreateResourceInput {
+pub struct CreateResourceInput {
     pub api_version: String,
     pub kind: String,
     pub namespace: Option<String>,
@@ -11,7 +13,7 @@ pub(crate) struct CreateResourceInput {
     pub data: Vec<u8>,
 }
 
-pub(crate) fn create_resource_in_conn(
+pub fn create_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: CreateResourceInput,
 ) -> tokio_rusqlite::Result<(i64, i64)> {
@@ -33,9 +35,9 @@ pub(crate) fn create_resource_in_conn(
         )?;
         selector_index::upsert_index_entries(&tx, &api_version, &kind, &namespace, &name, &data)?;
         owner_ref_index::upsert_owner_refs(&tx, &api_version, &kind, &namespace, &name, &data)?;
-        crud::helpers::insert_watch_event_in_conn(
+        mutation_helpers::insert_watch_event_in_conn(
             &tx,
-            crud::helpers::WatchEventInsert::new(
+            mutation_helpers::WatchEventInsert::new(
                 &api_version,
                 &kind,
                 Some(&namespace),
@@ -52,9 +54,9 @@ pub(crate) fn create_resource_in_conn(
         )?;
         selector_index::upsert_index_entries(&tx, &api_version, &kind, "", &name, &data)?;
         owner_ref_index::upsert_owner_refs(&tx, &api_version, &kind, "", &name, &data)?;
-        crud::helpers::insert_watch_event_in_conn(
+        mutation_helpers::insert_watch_event_in_conn(
             &tx,
-            crud::helpers::WatchEventInsert::new(
+            mutation_helpers::WatchEventInsert::new(
                 &api_version,
                 &kind,
                 None,

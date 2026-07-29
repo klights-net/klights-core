@@ -15,10 +15,8 @@ pub mod advance;
 #[cfg(test)]
 mod applier;
 mod backend_impl;
-mod helpers;
 mod live_committed_apply;
 pub mod network;
-mod ordinary_mutations;
 mod recovery;
 pub mod snapshot;
 mod snapshot_capture;
@@ -36,7 +34,10 @@ mod tests;
 use advance::RedbRvStore;
 use crud::namespaces::RedbNamespaceStore;
 use crud::resources::RedbResourceStore;
-use klights_cluster_datastore::redb::{RedbAccessor, RedbOpenOpts, RedbReadStore};
+use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::RedbOpenOpts;
+use klights_cluster_datastore::redb::RedbReadStore;
+use klights_cluster_datastore::redb::mutation_helpers;
 use live_committed_apply::RedbLiveCommittedApplyStore;
 use network::RedbNetworkStore;
 use recovery::RedbRecoveryStore;
@@ -199,15 +200,6 @@ impl RedbDatastore {
         if let Some(pending) = pending {
             crate::datastore::sqlite::publish_pending(pending, self.commit_sink.as_ref());
         }
-        result
-    }
-
-    #[cfg(test)]
-    fn finish_post_commits<T>(
-        &self,
-        (result, pending): (T, Vec<klights_cluster_store::StagedPostCommit>),
-    ) -> T {
-        crate::datastore::sqlite::publish_pending_batch(pending, self.commit_sink.as_ref());
         result
     }
 

@@ -1352,8 +1352,9 @@ mod inner_gate_tests {
     //! writes the moment the receiver observes `true`.
 
     use super::*;
+    use crate::datastore::ReplicatedCreateOptions;
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::{DatastoreBackend, ReplicatedCreateOptions, ResourceListQuery};
+    use crate::datastore::{DatastoreBackend, ResourceListQuery};
     use crate::node_outbox::payload::{OutboxOperation, OutboxPayload};
     use futures::StreamExt as _;
     use klights_cluster_core::command::StorageCommand;

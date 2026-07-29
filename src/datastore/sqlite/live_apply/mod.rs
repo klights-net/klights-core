@@ -25,6 +25,6 @@ pub(crate) use state::watch_history::{gc_watch_events_in_tx, watch_events_min_sc
 // moves before 10C.2; no Raft, replication, leader API, or broad datastore
 // owner is reachable through this module.
 use super::{
-    create_staged_post_commit, crud, owner_ref_index, queries, resource_shape,
+    create_staged_post_commit, mutation_helpers, owner_ref_index, queries, resource_shape,
     transaction_primitives, use_namespaced_table,
 };

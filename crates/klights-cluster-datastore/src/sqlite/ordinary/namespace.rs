@@ -1,11 +1,11 @@
-use super::{crud, queries, transaction_primitives};
+use super::{mutation_helpers, queries, transaction_primitives};
 
-pub(crate) enum NamespaceDeleteResult {
+pub enum NamespaceDeleteResult {
     Deleted { rv: i64, data: Vec<u8> },
     HasRemainingContent,
 }
 
-pub(crate) fn create_namespace_in_conn(
+pub fn create_namespace_in_conn(
     conn: &rusqlite::Connection,
     name: String,
     uid: String,
@@ -16,14 +16,14 @@ pub(crate) fn create_namespace_in_conn(
         queries::NAMESPACES_INSERT,
         rusqlite::params![&name, &uid, rv, &data],
     )?;
-    crud::helpers::insert_watch_event_in_conn(
+    mutation_helpers::insert_watch_event_in_conn(
         conn,
-        crud::helpers::WatchEventInsert::new("v1", "Namespace", None, &name, rv, "ADDED", &data),
+        mutation_helpers::WatchEventInsert::new("v1", "Namespace", None, &name, rv, "ADDED", &data),
     )?;
     Ok(rv)
 }
 
-pub(crate) fn update_namespace_in_conn(
+pub fn update_namespace_in_conn(
     conn: &rusqlite::Connection,
     name: String,
     uid: String,
@@ -40,14 +40,22 @@ pub(crate) fn update_namespace_in_conn(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
-    crud::helpers::insert_watch_event_in_conn(
+    mutation_helpers::insert_watch_event_in_conn(
         conn,
-        crud::helpers::WatchEventInsert::new("v1", "Namespace", None, &name, rv, "MODIFIED", &data),
+        mutation_helpers::WatchEventInsert::new(
+            "v1",
+            "Namespace",
+            None,
+            &name,
+            rv,
+            "MODIFIED",
+            &data,
+        ),
     )?;
     Ok(rv)
 }
 
-pub(crate) fn delete_namespace_in_conn(
+pub fn delete_namespace_in_conn(
     conn: &mut rusqlite::Connection,
     name: String,
 ) -> tokio_rusqlite::Result<NamespaceDeleteResult> {
@@ -72,9 +80,9 @@ pub(crate) fn delete_namespace_in_conn(
             rusqlite::Error::QueryReturnedNoRows,
         ));
     }
-    crud::helpers::insert_watch_event_in_conn(
+    mutation_helpers::insert_watch_event_in_conn(
         &tx,
-        crud::helpers::WatchEventInsert::new(
+        mutation_helpers::WatchEventInsert::new(
             "v1",
             "Namespace",
             None,
@@ -91,7 +99,7 @@ pub(crate) fn delete_namespace_in_conn(
     })
 }
 
-pub(crate) fn delete_namespace_contents_in_conn(
+pub fn delete_namespace_contents_in_conn(
     conn: &mut rusqlite::Connection,
     name: String,
 ) -> tokio_rusqlite::Result<()> {

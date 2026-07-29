@@ -1,11 +1,9 @@
 //! Root-independent SQLite transaction primitives shared by serial Phase 10 packets.
 
-use super::queries;
+use super::mutation_queries as queries;
 use rusqlite::OptionalExtension;
 
-pub(super) fn watch_event_allocator_high_water(
-    conn: &rusqlite::Connection,
-) -> rusqlite::Result<i64> {
+pub fn watch_event_allocator_high_water(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
     conn.query_row(
         "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'watch_events'), 0)",
         [],
@@ -13,7 +11,7 @@ pub(super) fn watch_event_allocator_high_water(
     )
 }
 
-pub(super) fn set_watch_event_allocator(
+pub fn set_watch_event_allocator(
     conn: &rusqlite::Connection,
     high_water: i64,
 ) -> rusqlite::Result<()> {
@@ -30,16 +28,16 @@ pub(super) fn set_watch_event_allocator(
     Ok(())
 }
 
-pub(super) fn next_resource_version_in_tx(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+pub fn next_resource_version_in_tx(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
     conn.execute(queries::METADATA_INCREMENT_RV, [])?;
     conn.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))
 }
 
-pub(super) fn current_resource_version(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
+pub fn current_resource_version(conn: &rusqlite::Connection) -> rusqlite::Result<i64> {
     conn.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))
 }
 
-pub(super) fn advance_resource_version_after(
+pub fn advance_resource_version_after(
     conn: &rusqlite::Connection,
     min_rv: i64,
 ) -> rusqlite::Result<i64> {
@@ -49,7 +47,7 @@ pub(super) fn advance_resource_version_after(
     Ok(next)
 }
 
-pub(super) fn resource_snapshot_for_key_at_rv(
+pub fn resource_snapshot_for_key_at_rv(
     tx: &rusqlite::Transaction<'_>,
     api_version: &str,
     kind: &str,

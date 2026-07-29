@@ -520,9 +520,9 @@ fn floor_key_prefix(api_version: &str, kind: &str) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::datastore::redb::helpers;
     use klights_cluster_datastore::redb as open_boundary;
     use klights_cluster_datastore::redb::RedbAccessor;
+    use klights_cluster_datastore::redb::mutation_helpers as helpers;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;

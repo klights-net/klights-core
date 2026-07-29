@@ -124,13 +124,13 @@ use klights_cluster_core::command::StorageCommand;
 #[cfg(test)]
 use klights_watch::WatchTopic;
 
-#[cfg(test)]
-use super::types::ReplicatedCreateOptions;
 use super::types::{
     CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
     PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
     SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
+#[cfg(test)]
+use crate::datastore::ReplicatedCreateOptions;
 #[cfg(test)]
 use klights_cluster_core::command::CommandMeta;
 use klights_cluster_core::{

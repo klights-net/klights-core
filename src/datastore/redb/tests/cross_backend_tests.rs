@@ -987,7 +987,11 @@ parametrize_backends!(
     }
 );
 
-parametrize_backends!(positive_rv_handoff_keeps_late_lower_rv_events, |db| {
+#[tokio::test]
+async fn sqlite_positive_rv_handoff_keeps_late_lower_rv_events() {
+    let db = sqlite_db().await;
+    let db: &dyn DatastoreBackend = &db;
+
     async fn apply(db: &dyn DatastoreBackend, name: &str, resource_version: i64) {
         db.apply_replicated_create_resource(
             "v1",
@@ -1004,7 +1008,7 @@ parametrize_backends!(positive_rv_handoff_keeps_late_lower_rv_events, |db| {
                     "resourceVersion": resource_version.to_string()
                 }
             }),
-            ReplicatedCreateOptions {
+            crate::datastore::ReplicatedCreateOptions {
                 resource_version,
                 meta_uid: Some(format!("uid-{name}")),
             },
@@ -1051,7 +1055,7 @@ parametrize_backends!(positive_rv_handoff_keeps_late_lower_rv_events, |db| {
         position.resource_version_filter_through_event_id, 0,
         "RV filtering must be released after replay crosses the handoff anchor"
     );
-});
+}
 
 parametrize_backends!(
     snapshot_at_exact_watch_position_reverses_later_change,

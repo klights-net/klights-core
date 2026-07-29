@@ -14,10 +14,10 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 #[cfg(test)]
+use crate::datastore::ReplicatedCreateOptions;
+#[cfg(test)]
 use crate::datastore::WatchTopic;
 use crate::datastore::backend::DatastoreBackend;
-#[cfg(test)]
-use crate::datastore::types::ReplicatedCreateOptions;
 use crate::datastore::types::{
     CatchUpResource, ListPageRequest, PositionedWatchReplayRead, ReplicatedSnapshotMetadata,
     ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,

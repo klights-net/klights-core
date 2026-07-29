@@ -1,7 +1,8 @@
 //! Static helpers used by SQLite resource CRUD.
 
-use super::super::queries;
-use super::*;
+use super::mutation_queries as queries;
+use super::resource_shape::hydrate_watch_event_data;
+use serde_json::Value;
 
 /// Insert a row into `watch_events` for a CRUD mutation. Used by
 /// create/update/update_status/patch/delete on both the namespaced and
@@ -209,7 +210,7 @@ pub fn serde_to_sqlite_error(error: serde_json::Error) -> tokio_rusqlite::Error 
 }
 
 // TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn advance_metadata_rv_to_at_least(
     conn: &rusqlite::Connection,
     resource_version: i64,
@@ -282,9 +283,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use klights_cluster_datastore::sqlite::read_helpers::{
-        event_read_api_versions, needs_event_v1_compat,
-    };
+    use crate::sqlite::read_helpers::{event_read_api_versions, needs_event_v1_compat};
 
     #[test]
     fn event_read_api_versions_expands_for_v1_event() {

@@ -9,14 +9,12 @@ use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use super::super::helpers;
-#[cfg(test)]
-use crate::datastore::types::ReplicatedCreateOptions;
+use super::super::RedbAccessor;
+use super::super::key_codec::resource_key;
+use super::super::mutation_helpers as helpers;
+use super::super::read_core::RedbReadCore;
+use super::super::tables;
 use klights_cluster_core::{Resource, ResourcePatchRequest, ResourcePreconditions};
-use klights_cluster_datastore::redb::RedbAccessor;
-use klights_cluster_datastore::redb::key_codec::resource_key;
-use klights_cluster_datastore::redb::read_core::RedbReadCore;
-use klights_cluster_datastore::redb::tables;
 
 #[derive(Clone)]
 pub struct RedbOrdinaryResourceStore {
@@ -33,16 +31,6 @@ impl RedbOrdinaryResourceStore {
             accessor,
             wall_clock,
         }
-    }
-
-    /// Run a synchronous redb closure on the DB-category blocking pool.
-    #[cfg(test)]
-    async fn db_call<T, F>(&self, label: &str, f: F) -> Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&::redb::Database) -> Result<T> + Send + 'static,
-    {
-        self.accessor.call(label, f).await
     }
 
     async fn db_call_with_post_commit<T, F>(
@@ -148,19 +136,16 @@ impl RedbOrdinaryResourceStore {
     }
 
     #[cfg(test)]
-    pub async fn apply_replicated_create_resource(
+    async fn apply_replicated_create_resource(
         &self,
         av: &str,
         kind: &str,
         ns: Option<&str>,
         name: &str,
         mut data: Value,
-        options: ReplicatedCreateOptions,
+        resource_version: i64,
+        meta_uid: Option<String>,
     ) -> Result<(Resource, Vec<klights_cluster_store::StagedPostCommit>)> {
-        let ReplicatedCreateOptions {
-            resource_version,
-            meta_uid,
-        } = options;
         if resource_version <= 0 {
             return Err(anyhow!(
                 "replicated create resourceVersion must be positive"
@@ -173,7 +158,7 @@ impl RedbOrdinaryResourceStore {
         if let Some(expected_uid) = meta_uid.as_deref()
             && expected_uid != incoming_uid
         {
-            return Err(klights_cluster_datastore::errors::DatastoreError::conflict(format!(
+            return Err(crate::errors::DatastoreError::conflict(format!(
                 "replicated create UID precondition failed: expected {expected_uid} got {incoming_uid}"
             ))
             .into());
@@ -208,7 +193,8 @@ impl RedbOrdinaryResourceStore {
         }
 
         let outcome = self
-            .db_call("apply_replicated_create_resource", move |db| {
+            .accessor
+            .call("apply_replicated_create_resource", move |db| {
                 let w = db.begin_write()?;
                 let av_o = av_for_db;
                 let kind_o = kind_for_db;
@@ -713,16 +699,15 @@ impl RedbOrdinaryResourceStore {
                     .pointer("/metadata/uid")
                     .and_then(Value::as_str);
                 if actual_uid != Some(expected_uid) {
-                    return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                        "UID precondition failed",
-                    )
-                    .into());
+                    return Err(
+                        crate::errors::DatastoreError::conflict("UID precondition failed").into(),
+                    );
                 }
             }
             if let Some(expected_rv) = preconditions.resource_version
                 && resource.resource_version != expected_rv
             {
-                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
+                return Err(crate::errors::DatastoreError::conflict(
                     "resourceVersion precondition failed",
                 )
                 .into());
@@ -769,7 +754,7 @@ impl RedbOrdinaryResourceStore {
                 let (old_body, data, _) = {
                     let table = w.open_table(res_tbl)?;
                     let Some(current_row) = table.get(key.as_slice())? else {
-                        return Err(klights_cluster_datastore::errors::DatastoreError::not_found(format!(
+                        return Err(crate::errors::DatastoreError::not_found(format!(
                             "delete_resource_without_watch_with_tombstone: {av_error}/{kind_error}/{name_error} not found"
                         ))
                         .into());
@@ -1007,16 +992,15 @@ impl RedbOrdinaryResourceStore {
                     .pointer("/metadata/uid")
                     .and_then(Value::as_str);
                 if actual_uid != Some(expected_uid) {
-                    return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                        "UID precondition failed",
-                    )
-                    .into());
+                    return Err(
+                        crate::errors::DatastoreError::conflict("UID precondition failed").into(),
+                    );
                 }
             }
             if let Some(expected_rv) = preconditions.resource_version
                 && resource.resource_version != expected_rv
             {
-                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
+                return Err(crate::errors::DatastoreError::conflict(
                     "resourceVersion precondition failed",
                 )
                 .into());
@@ -1029,27 +1013,238 @@ impl RedbOrdinaryResourceStore {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
-    use crate::datastore::redb::crud::resources::RedbResourceStore;
+    use klights_cluster_core::WatchReplayPosition;
+    use klights_cluster_store::DurableWatchTarget;
     use serde_json::json;
 
-    use klights_cluster_datastore::redb as open_boundary;
-    use klights_cluster_datastore::redb::RedbAccessor;
+    use crate::redb as open_boundary;
+    use crate::redb::RedbAccessor;
     use klights_supervisor::TaskSupervisor;
 
     use super::*;
 
-    async fn store() -> RedbResourceStore {
+    struct TestQuery {
+        label_selector: Option<String>,
+        field_selector: Option<String>,
+        limit: Option<i64>,
+        continue_token: Option<String>,
+    }
+
+    impl TestQuery {
+        fn new(
+            label_selector: Option<&str>,
+            field_selector: Option<&str>,
+            limit: Option<i64>,
+            continue_token: Option<&str>,
+        ) -> Self {
+            Self {
+                label_selector: label_selector.map(str::to_string),
+                field_selector: field_selector.map(str::to_string),
+                limit,
+                continue_token: continue_token.map(str::to_string),
+            }
+        }
+    }
+
+    struct TestList {
+        items: Vec<Resource>,
+        continue_token: Option<String>,
+        remaining_item_count: Option<i64>,
+    }
+
+    struct TestStore {
+        accessor: Arc<RedbAccessor>,
+        ordinary: RedbOrdinaryResourceStore,
+    }
+
+    impl TestStore {
+        async fn create_res(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            data: Value,
+        ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+            self.ordinary
+                .create_resource(api_version, kind, namespace, name, data)
+                .await
+        }
+
+        async fn get_res(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> Result<Option<Resource>> {
+            RedbReadCore::new(self.accessor.clone())
+                .get_resource(api_version, kind, namespace, name)
+                .await
+        }
+
+        async fn update_res(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+            data: Value,
+            expected_rv: i64,
+        ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+            self.ordinary
+                .update_resource(api_version, kind, namespace, name, data, expected_rv)
+                .await
+        }
+
+        async fn delete_res(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            name: &str,
+        ) -> Result<((), Option<klights_cluster_store::StagedPostCommit>)> {
+            self.ordinary
+                .delete_resource(api_version, kind, namespace, name)
+                .await
+        }
+
+        async fn list_res(
+            &self,
+            api_version: &str,
+            kind: &str,
+            namespace: Option<&str>,
+            query: TestQuery,
+        ) -> Result<TestList> {
+            let page = RedbReadCore::new(self.accessor.clone())
+                .list_resources(
+                    api_version,
+                    kind,
+                    namespace.map_or(
+                        super::super::super::read_core::RedbCollectionScope::LegacyAny,
+                        |namespace| {
+                            super::super::super::read_core::RedbCollectionScope::Namespace(
+                                namespace.to_string(),
+                            )
+                        },
+                    ),
+                    super::super::super::read_core::RedbListQuery {
+                        label_selector: query.label_selector,
+                        field_selector: query.field_selector,
+                        limit: query.limit,
+                        cursor: query.continue_token.map(|name| {
+                            klights_cluster_store::ResourceCollectionKey::new(
+                                namespace.map(str::to_string),
+                                name,
+                            )
+                        }),
+                    },
+                )
+                .await?;
+            Ok(TestList {
+                items: page.items,
+                continue_token: page
+                    .continuation
+                    .map(|continuation| continuation.name().to_string()),
+                remaining_item_count: page.remaining_item_count,
+            })
+        }
+    }
+
+    async fn store() -> TestStore {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let db = open_boundary::open_in_memory(supervisor.as_ref())
             .await
             .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        RedbResourceStore::new(accessor, Arc::new(klights_supervisor::SystemWallClock))
+        TestStore {
+            ordinary: RedbOrdinaryResourceStore::new(
+                accessor.clone(),
+                Arc::new(klights_supervisor::SystemWallClock),
+            ),
+            accessor,
+        }
     }
 
     // ── tests of code paths NOT covered by cross_backend_tests.rs ──
+
+    #[tokio::test]
+    async fn fixed_rv_handoff_keeps_late_lower_rv_events() {
+        async fn apply(store: &TestStore, name: &str, resource_version: i64) {
+            store
+                .ordinary
+                .apply_replicated_create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    name,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": name,
+                            "namespace": "default",
+                            "uid": format!("uid-{name}"),
+                            "resourceVersion": resource_version.to_string()
+                        }
+                    }),
+                    resource_version,
+                    Some(format!("uid-{name}")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let store = store().await;
+        apply(&store, "at-floor", 10).await;
+        apply(&store, "pre-anchor", 12).await;
+        let reader = RedbReadCore::new(store.accessor.clone());
+        let anchor = reader.allocator_position().await.unwrap();
+        apply(&store, "late-lower", 11).await;
+        apply(&store, "post-anchor", 13).await;
+
+        let targets = [DurableWatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "default",
+        )];
+        let mut position =
+            WatchReplayPosition::from_resource_version_through_event_id(10, anchor.event_id);
+        let mut names = Vec::new();
+        loop {
+            let replay = reader
+                .positioned_watch_events(
+                    &targets,
+                    position,
+                    NonZeroUsize::new(1).expect("positive page size"),
+                )
+                .await
+                .unwrap();
+            let super::super::super::read_core::RedbPositionedWatchRead::Events(replay) = replay
+            else {
+                panic!("fresh composite handoff must be replayable");
+            };
+            names.extend(
+                replay
+                    .events
+                    .iter()
+                    .map(|event| event.event.resource().name.clone()),
+            );
+            position = replay.next_position;
+            if replay.events.is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(names, vec!["pre-anchor", "late-lower", "post-anchor"]);
+        assert_eq!(
+            position.resource_version_filter_through_event_id, 0,
+            "RV filtering must be released after replay crosses the handoff anchor"
+        );
+    }
 
     #[tokio::test]
     async fn ensure_uid_generates_stable_uuid() {
@@ -1125,7 +1320,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(None, None, Some(3), None),
+                TestQuery::new(None, None, Some(3), None),
             )
             .await
             .unwrap();
@@ -1136,12 +1331,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
-                    None,
-                    None,
-                    Some(3),
-                    page1.continue_token.as_deref(),
-                ),
+                TestQuery::new(None, None, Some(3), page1.continue_token.as_deref()),
             )
             .await
             .unwrap();
@@ -1174,7 +1364,13 @@ mod tests {
             .await
             .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        let s = RedbResourceStore::new(accessor, Arc::new(klights_supervisor::SystemWallClock));
+        let s = TestStore {
+            ordinary: RedbOrdinaryResourceStore::new(
+                accessor.clone(),
+                Arc::new(klights_supervisor::SystemWallClock),
+            ),
+            accessor,
+        };
 
         let pod =
             json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"we","namespace":"default"}});
@@ -1233,7 +1429,7 @@ mod tests {
                 "v1",
                 "ConfigMap",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(Some("app=web"), None, Some(1), None),
+                TestQuery::new(Some("app=web"), None, Some(1), None),
             )
             .await
             .unwrap();
@@ -1251,7 +1447,7 @@ mod tests {
                 "v1",
                 "ConfigMap",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
+                TestQuery::new(
                     Some("app=web"),
                     None,
                     Some(1),
@@ -1295,12 +1491,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
-                    Some("tier=frontend"),
-                    None,
-                    Some(2),
-                    None,
-                ),
+                TestQuery::new(Some("tier=frontend"), None, Some(2), None),
             )
             .await
             .unwrap();
@@ -1312,7 +1503,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
+                TestQuery::new(
                     Some("tier=frontend"),
                     None,
                     Some(2),
@@ -1329,7 +1520,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
+                TestQuery::new(
                     Some("tier=frontend"),
                     None,
                     Some(2),
@@ -1390,7 +1581,7 @@ mod tests {
                 "v1",
                 "ConfigMap",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(Some("app=target"), None, Some(10), None),
+                TestQuery::new(Some("app=target"), None, Some(10), None),
             )
             .await
             .unwrap();
@@ -1430,7 +1621,7 @@ mod tests {
                 "v1",
                 "Pod",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(Some("app=web"), None, Some(2), None),
+                TestQuery::new(Some("app=web"), None, Some(2), None),
             )
             .await
             .unwrap();
@@ -1474,12 +1665,7 @@ mod tests {
                 "v1",
                 "Event",
                 Some("default"),
-                crate::datastore::ResourceListQuery::new(
-                    None,
-                    Some("source=kubelet-0"),
-                    Some(1),
-                    None,
-                ),
+                TestQuery::new(None, Some("source=kubelet-0"), Some(1), None),
             )
             .await
             .unwrap();

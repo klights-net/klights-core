@@ -8,5 +8,5 @@
 mod namespaces;
 mod resources;
 
-pub(super) use namespaces::RedbOrdinaryNamespaceStore;
-pub(super) use resources::RedbOrdinaryResourceStore;
+pub use namespaces::RedbOrdinaryNamespaceStore;
+pub use resources::RedbOrdinaryResourceStore;

@@ -1,11 +1,11 @@
 use super::{
-    crud, owner_ref_index, queries, resource_shape, transaction_primitives, use_namespaced_table,
+    mutation_helpers, owner_ref_index, queries, resource_shape, selector_index,
+    transaction_primitives, use_namespaced_table,
 };
-use klights_cluster_datastore::sqlite::selector_index;
 use rusqlite::TransactionBehavior;
 use serde_json::Value;
 
-pub(crate) struct MarkResourceForDeletionInput {
+pub struct MarkResourceForDeletionInput {
     pub api_version: String,
     pub kind: String,
     pub namespace: Option<String>,
@@ -16,7 +16,7 @@ pub(crate) struct MarkResourceForDeletionInput {
     pub deletion_timestamp: String,
 }
 
-pub(crate) fn mark_resource_for_deletion_in_conn(
+pub fn mark_resource_for_deletion_in_conn(
     conn: &mut rusqlite::Connection,
     input: MarkResourceForDeletionInput,
 ) -> tokio_rusqlite::Result<Option<(i64, Vec<u8>)>> {
@@ -62,13 +62,13 @@ pub(crate) fn mark_resource_for_deletion_in_conn(
     }
 
     let mut current: Value =
-        serde_json::from_slice(&current_bytes).map_err(crud::helpers::serde_to_sqlite_error)?;
+        serde_json::from_slice(&current_bytes).map_err(mutation_helpers::serde_to_sqlite_error)?;
     if has_deletion_timestamp(&current) {
         tx.commit()?;
         return Ok(Some((current_rv, current_bytes)));
     }
     ensure_deletion_timestamp(&mut current, grace_seconds, &deletion_timestamp);
-    let merged = serde_json::to_vec(&current).map_err(crud::helpers::serde_to_sqlite_error)?;
+    let merged = serde_json::to_vec(&current).map_err(mutation_helpers::serde_to_sqlite_error)?;
     let new_rv = transaction_primitives::next_resource_version_in_tx(&tx)?;
     let rows = if let Some(namespace) = namespace.as_deref() {
         tx.execute(
@@ -139,7 +139,7 @@ fn has_deletion_timestamp(data: &Value) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-pub(crate) struct UpdateResourceInput {
+pub struct UpdateResourceInput {
     pub api_version: String,
     pub kind: String,
     pub namespace: Option<String>,
@@ -151,7 +151,7 @@ pub(crate) struct UpdateResourceInput {
     pub preserve_latest_status: bool,
 }
 
-pub(crate) fn update_resource_in_conn(
+pub fn update_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: UpdateResourceInput,
 ) -> tokio_rusqlite::Result<(i64, i64, Value)> {
@@ -179,7 +179,7 @@ pub(crate) fn update_resource_in_conn(
             &mut data,
         )?;
     }
-    let data_bytes = serde_json::to_vec(&data).map_err(crud::helpers::serde_to_sqlite_error)?;
+    let data_bytes = serde_json::to_vec(&data).map_err(mutation_helpers::serde_to_sqlite_error)?;
     let new_rv = transaction_primitives::next_resource_version_in_tx(&tx)?;
     let rows = if let Some(namespace) = namespace.as_deref() {
         tx.execute(
@@ -246,9 +246,9 @@ pub(crate) fn update_resource_in_conn(
         &name,
         &data_bytes,
     )?;
-    crud::helpers::insert_watch_event_in_conn(
+    mutation_helpers::insert_watch_event_in_conn(
         &tx,
-        crud::helpers::WatchEventInsert::new(
+        mutation_helpers::WatchEventInsert::new(
             &api_version,
             &kind,
             namespace.as_deref(),
@@ -287,7 +287,7 @@ fn preserve_latest_status_subresource(
         )?
     };
     let current: Value =
-        serde_json::from_slice(&current_bytes).map_err(crud::helpers::serde_to_sqlite_error)?;
+        serde_json::from_slice(&current_bytes).map_err(mutation_helpers::serde_to_sqlite_error)?;
     klights_types::preserve_status_subresource_on_main_update(
         api_version,
         kind,

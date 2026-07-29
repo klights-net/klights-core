@@ -272,9 +272,9 @@ impl DatastoreApplier for Datastore {
                     // Idempotent: at-least-once snapshot replay can deliver
                     // the same WatchEventAppend twice. The shared helper
                     // verifies content equality on UNIQUE conflict.
-                    super::crud::helpers::insert_watch_event_in_conn(
+                    super::mutation_helpers::insert_watch_event_in_conn(
                         conn,
-                        super::crud::helpers::WatchEventInsert::new(
+                        super::mutation_helpers::WatchEventInsert::new(
                             "internal",
                             "StorageCommand",
                             None,

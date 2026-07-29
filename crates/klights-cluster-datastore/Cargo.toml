@@ -19,6 +19,7 @@ sqlcipher = [
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 klights-cluster-core = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-supervisor = { workspace = true }
@@ -31,12 +32,14 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tokio-rusqlite = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 base64 = { workspace = true }
+klights-cluster-store = { workspace = true, features = ["test-support"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

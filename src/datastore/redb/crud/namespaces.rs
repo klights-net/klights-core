@@ -10,9 +10,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::super::ordinary_mutations::RedbOrdinaryNamespaceStore;
 use klights_cluster_core::Resource;
 use klights_cluster_datastore::redb::RedbAccessor;
+use klights_cluster_datastore::redb::RedbOrdinaryNamespaceStore;
 use klights_cluster_datastore::redb::read_core::RedbCollectionScope;
 use klights_cluster_datastore::redb::read_core::RedbListQuery;
 use klights_cluster_datastore::redb::read_core::RedbReadCore;

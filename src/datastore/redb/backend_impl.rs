@@ -213,22 +213,6 @@ impl DatastoreBackend for RedbDatastore {
         let committed = self.resources.create_res(a, k, n, m, d).await?;
         Ok(self.finish_post_commit(committed))
     }
-    #[cfg(test)]
-    async fn apply_replicated_create_resource(
-        &self,
-        a: &str,
-        k: &str,
-        n: Option<&str>,
-        m: &str,
-        d: Value,
-        o: crate::datastore::types::ReplicatedCreateOptions,
-    ) -> Result<Resource> {
-        let committed = self
-            .resources
-            .apply_replicated_create_resource(a, k, n, m, d, o)
-            .await?;
-        Ok(self.finish_post_commits(committed))
-    }
     async fn get_resource(
         &self,
         a: &str,
@@ -1585,7 +1569,7 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
         namespace: Option<&str>,
         name: &str,
         data: Value,
-        options: crate::datastore::types::ReplicatedCreateOptions,
+        options: crate::datastore::ReplicatedCreateOptions,
     ) -> Result<Resource> {
         crate::datastore::DatastoreBackend::apply_replicated_create_resource(
             self,

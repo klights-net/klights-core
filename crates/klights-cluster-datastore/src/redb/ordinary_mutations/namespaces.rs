@@ -6,10 +6,10 @@ use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use super::super::helpers;
+use super::super::RedbAccessor;
+use super::super::mutation_helpers as helpers;
+use super::super::tables;
 use klights_cluster_core::Resource;
-use klights_cluster_datastore::redb::RedbAccessor;
-use klights_cluster_datastore::redb::tables;
 
 #[derive(Clone)]
 pub struct RedbOrdinaryNamespaceStore {
@@ -191,20 +191,64 @@ impl RedbOrdinaryNamespaceStore {
 mod tests {
     use std::sync::Arc;
 
-    use crate::datastore::redb::crud::namespaces::RedbNamespaceStore;
-    use crate::datastore::redb::crud::resources::RedbResourceStore;
-    use klights_cluster_datastore::redb as open_boundary;
-    use klights_cluster_datastore::redb::RedbAccessor;
+    use crate::redb as open_boundary;
+    use crate::redb::{RedbAccessor, RedbOrdinaryNamespaceStore, RedbOrdinaryResourceStore};
+    use anyhow::Result;
+    use klights_cluster_core::Resource;
     use klights_supervisor::TaskSupervisor;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    async fn store() -> RedbNamespaceStore {
+    struct TestStore {
+        accessor: Arc<RedbAccessor>,
+        ordinary: RedbOrdinaryNamespaceStore,
+    }
+
+    impl TestStore {
+        async fn create_ns(
+            &self,
+            name: &str,
+            data: Value,
+        ) -> Result<(Resource, Option<klights_cluster_store::StagedPostCommit>)> {
+            self.ordinary.create_namespace(name, data).await
+        }
+
+        async fn delete_ns_impl(&self, name: &str) -> Result<()> {
+            self.ordinary.delete_namespace(name).await
+        }
+
+        async fn list_namespace_resources_impl(&self, namespace: &str) -> Result<Vec<Resource>> {
+            super::super::super::read_core::RedbReadCore::new(self.accessor.clone())
+                .list_namespace_resources(namespace, None, false)
+                .await
+        }
+
+        async fn count_namespace_resources_impl(&self, namespace: &str) -> Result<i64> {
+            super::super::super::read_core::RedbReadCore::new(self.accessor.clone())
+                .count_namespace_resources(namespace)
+                .await
+        }
+
+        async fn list_namespace_resources_excluding_kind_impl(
+            &self,
+            namespace: &str,
+            kind: &str,
+        ) -> Result<Vec<Resource>> {
+            super::super::super::read_core::RedbReadCore::new(self.accessor.clone())
+                .list_namespace_resources(namespace, Some(kind), true)
+                .await
+        }
+    }
+
+    async fn store() -> TestStore {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let db = open_boundary::open_in_memory(supervisor.as_ref())
             .await
             .unwrap();
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
-        RedbNamespaceStore::new(accessor)
+        TestStore {
+            ordinary: RedbOrdinaryNamespaceStore::new(accessor.clone()),
+            accessor,
+        }
     }
 
     #[tokio::test]
@@ -237,11 +281,11 @@ mod tests {
             .await
             .unwrap();
         // Insert a resource into this namespace via the resource store.
-        let resources = RedbResourceStore::new(
+        let resources = RedbOrdinaryResourceStore::new(
             s.accessor.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         );
-        resources.create_res("v1", "ConfigMap", Some("hascontent"), "cm",
+        resources.create_resource("v1", "ConfigMap", Some("hascontent"), "cm",
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"hascontent"}})).await.unwrap();
         let err = s.delete_ns_impl("hascontent").await.unwrap_err();
         assert!(err.to_string().contains("remaining content"));
@@ -253,12 +297,12 @@ mod tests {
         s.create_ns("cnt", json!({"metadata":{"name":"cnt"}}))
             .await
             .unwrap();
-        let resources = RedbResourceStore::new(
+        let resources = RedbOrdinaryResourceStore::new(
             s.accessor.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         );
         resources
-            .create_res(
+            .create_resource(
                 "v1",
                 "Pod",
                 Some("cnt"),
@@ -268,7 +312,7 @@ mod tests {
             .await
             .unwrap();
         resources
-            .create_res(
+            .create_resource(
                 "v1",
                 "Pod",
                 Some("cnt"),
@@ -286,12 +330,12 @@ mod tests {
         s.create_ns("excl", json!({"metadata":{"name":"excl"}}))
             .await
             .unwrap();
-        let resources = RedbResourceStore::new(
+        let resources = RedbOrdinaryResourceStore::new(
             s.accessor.clone(),
             std::sync::Arc::new(klights_supervisor::SystemWallClock),
         );
         resources
-            .create_res(
+            .create_resource(
                 "v1",
                 "Pod",
                 Some("excl"),
@@ -300,7 +344,7 @@ mod tests {
             )
             .await
             .unwrap();
-        resources.create_res("v1", "ConfigMap", Some("excl"), "cm",
+        resources.create_resource("v1", "ConfigMap", Some("excl"), "cm",
             json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"excl"}})).await.unwrap();
         let excluding = s
             .list_namespace_resources_excluding_kind_impl("excl", "Pod")

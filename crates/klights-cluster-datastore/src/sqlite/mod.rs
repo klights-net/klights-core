@@ -2,7 +2,12 @@
 
 pub mod filters;
 mod fingerprint;
+pub mod mutation_diagnostics;
+pub mod mutation_helpers;
+pub mod mutation_queries;
 mod open;
+pub mod ordinary;
+pub mod owner_ref_index;
 mod ownership;
 mod position_membership;
 pub mod read_helpers;
@@ -10,10 +15,12 @@ pub mod read_queries;
 pub mod read_store;
 mod replay_floor;
 mod resource_read;
+pub mod resource_shape;
 mod schema;
 pub mod scope;
 pub mod selector_index;
 mod snapshot;
+pub mod transaction_primitives;
 
 pub use fingerprint::{META_INSERT, META_SELECT};
 pub use open::{

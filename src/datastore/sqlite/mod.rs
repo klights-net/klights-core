@@ -12,16 +12,10 @@ mod focused_ports;
 mod gc;
 mod live_apply;
 mod merge_patch;
-mod mutation_diagnostics;
-mod ordinary;
 mod outbox_codec;
-pub(super) mod owner_ref_index;
-pub(crate) mod queries;
 mod recovery;
-mod resource_shape;
 mod rv_helpers;
 mod snapshot_capture;
-mod transaction_primitives;
 #[cfg(test)]
 pub(crate) use snapshot_capture::install_snapshot_capture_page_pause;
 #[cfg(test)]
@@ -61,10 +55,12 @@ pub use super::backend::{
 };
 pub use super::types::{
     CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
-    PositionedWatchReplay, PositionedWatchReplayRead, ReplicatedCreateOptions,
-    ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
-    SnapshotAtRv, WatchTarget, WatchTargetScope,
+    PositionedWatchReplay, PositionedWatchReplayRead, ReplicatedMembershipState,
+    ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery, SnapshotAtRv, WatchTarget,
+    WatchTargetScope,
 };
+#[cfg(test)]
+use crate::datastore::ReplicatedCreateOptions;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
     ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
@@ -81,7 +77,15 @@ struct AppliedOutboxLedgerInput<'a> {
     terminal_error: Option<&'a klights_cluster_core::OutboxApplyError>,
 }
 
+use self::mutation_queries as queries;
 use klights_cluster_datastore::sqlite::SqliteReadStore;
+use klights_cluster_datastore::sqlite::mutation_diagnostics;
+use klights_cluster_datastore::sqlite::mutation_helpers;
+use klights_cluster_datastore::sqlite::mutation_queries;
+use klights_cluster_datastore::sqlite::ordinary;
+use klights_cluster_datastore::sqlite::owner_ref_index;
+use klights_cluster_datastore::sqlite::resource_shape;
+use klights_cluster_datastore::sqlite::transaction_primitives;
 use klights_supervisor::DbExecutor;
 use klights_supervisor::sqlite_open as opener;
 pub use watch::create_staged_post_commit;
@@ -626,7 +630,7 @@ impl Datastore {
         resource_version_hint: Option<i64>,
         operation_now: chrono::DateTime<chrono::Utc>,
     ) -> tokio_rusqlite::Result<(klights_cluster_core::LogApplyCommit, i64)> {
-        use crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error;
+        use crate::datastore::sqlite::mutation_helpers::serde_to_sqlite_error;
         use crate::datastore::sqlite::resource_shape::{
             ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
             ensure_pod_status_ip_arrays, ensure_resource_type_meta,
@@ -2569,7 +2573,7 @@ impl Datastore {
                     bytes
                         .map(|bytes| {
                             serde_json::from_slice(&bytes).map_err(
-                                crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error,
+                                crate::datastore::sqlite::mutation_helpers::serde_to_sqlite_error,
                             )
                         })
                         .transpose()
@@ -3012,7 +3016,7 @@ impl Datastore {
             return Ok(None);
         };
         let mut node: Value = serde_json::from_slice(&current_bytes)
-            .map_err(crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error)?;
+            .map_err(crate::datastore::sqlite::mutation_helpers::serde_to_sqlite_error)?;
         let mut changed = false;
         let pod_cidr = tx
             .query_row(queries::NODE_SUBNET_SELECT_BY_NAME, [node_name], |row| {

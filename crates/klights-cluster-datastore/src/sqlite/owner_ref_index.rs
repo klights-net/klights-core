@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::queries;
+use super::mutation_queries as queries;
 
 /// Owner reference extracted from `metadata.ownerReferences`.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +70,7 @@ fn extract_owner_refs(data: &Value) -> Vec<OwnerRef> {
 }
 
 /// Delete all owner ref rows for one resource.
-pub(super) fn delete_owner_refs(
+pub fn delete_owner_refs(
     conn: &rusqlite::Connection,
     api_version: &str,
     kind: &str,
@@ -89,7 +89,7 @@ pub(super) fn delete_owner_refs(
 /// Accepts the serialized `data_bytes` to avoid requiring the caller to
 /// deserialize the JSON — the cost of one extra deserialization per write
 /// is negligible compared to the write itself.
-pub(super) fn upsert_owner_refs(
+pub fn upsert_owner_refs(
     conn: &rusqlite::Connection,
     api_version: &str,
     kind: &str,
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn upsert_and_delete_round_trip() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_owner_refs() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data_v1 = json!({
             "metadata": {
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn cluster_scoped_uses_empty_namespace() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn ordinal_is_array_index() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        klights_cluster_datastore::sqlite::init_schema_in_conn(&mut conn).unwrap();
+        crate::sqlite::init_schema_in_conn(&mut conn).unwrap();
 
         let data = json!({
             "metadata": {

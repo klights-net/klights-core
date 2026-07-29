@@ -616,7 +616,7 @@ mod owner_index_tests {
     #[test]
     fn empty_uid_owner_lookup_has_no_json_text_prefilter() {
         let query =
-            crate::datastore::sqlite::queries::OWNERSHIP_INDEXED_NAMESPACED_EMPTY_UID_BY_IDENTITY;
+            klights_cluster_datastore::sqlite::mutation_queries::OWNERSHIP_INDEXED_NAMESPACED_EMPTY_UID_BY_IDENTITY;
 
         assert!(
             query.contains("resource_owner_refs"),

@@ -1,11 +1,11 @@
 use super::{
-    crud, owner_ref_index, queries, resource_shape, transaction_primitives, use_namespaced_table,
+    mutation_helpers, owner_ref_index, queries, resource_shape, selector_index,
+    transaction_primitives, use_namespaced_table,
 };
 use klights_cluster_core::ResourcePreconditions;
-use klights_cluster_datastore::sqlite::selector_index;
 use rusqlite::TransactionBehavior;
 
-pub(crate) struct DeleteResourceInput {
+pub struct DeleteResourceInput {
     pub api_version: String,
     pub kind: String,
     pub namespace: Option<String>,
@@ -13,7 +13,7 @@ pub(crate) struct DeleteResourceInput {
     pub preconditions: ResourcePreconditions,
 }
 
-pub(crate) enum DeleteResourceAttempt {
+pub enum DeleteResourceAttempt {
     Deleted(i64, Vec<u8>),
     NotFound,
     PreconditionFailed {
@@ -22,7 +22,7 @@ pub(crate) enum DeleteResourceAttempt {
     },
 }
 
-pub(crate) fn delete_resource_in_conn(
+pub fn delete_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: DeleteResourceInput,
 ) -> tokio_rusqlite::Result<DeleteResourceAttempt> {
@@ -96,9 +96,9 @@ pub(crate) fn delete_resource_in_conn(
     let namespace_key = namespace.as_deref().unwrap_or("");
     selector_index::delete_index_entries(&tx, &api_version, &kind, namespace_key, &name)?;
     owner_ref_index::delete_owner_refs(&tx, &api_version, &kind, namespace_key, &name)?;
-    crud::helpers::insert_watch_event_in_conn(
+    mutation_helpers::insert_watch_event_in_conn(
         &tx,
-        crud::helpers::WatchEventInsert::new(
+        mutation_helpers::WatchEventInsert::new(
             &api_version,
             &kind,
             namespace.as_deref(),

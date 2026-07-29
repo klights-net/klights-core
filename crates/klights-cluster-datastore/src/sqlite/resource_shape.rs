@@ -1,6 +1,8 @@
-use super::*;
+use anyhow::Result;
+use klights_cluster_core::ResourcePreconditions;
+use serde_json::Value;
 
-pub(super) fn hydrate_watch_event_data(
+pub fn hydrate_watch_event_data(
     mut data: Value,
     api_version: &str,
     kind: &str,
@@ -44,7 +46,7 @@ pub(super) fn hydrate_watch_event_data(
     data
 }
 
-pub(super) fn ensure_resource_type_meta(data: &mut Value, api_version: &str, kind: &str) {
+pub fn ensure_resource_type_meta(data: &mut Value, api_version: &str, kind: &str) {
     let Some(obj) = data.as_object_mut() else {
         return;
     };
@@ -68,7 +70,7 @@ pub(super) fn ensure_resource_type_meta(data: &mut Value, api_version: &str, kin
     }
 }
 
-pub(super) fn ensure_metadata_identity(data: &mut Value, namespace: Option<&str>, name: &str) {
+pub fn ensure_metadata_identity(data: &mut Value, namespace: Option<&str>, name: &str) {
     let Some(obj) = data.as_object_mut() else {
         return;
     };
@@ -100,7 +102,7 @@ pub(super) fn ensure_metadata_identity(data: &mut Value, namespace: Option<&str>
     }
 }
 
-pub(super) fn ensure_metadata_uid(data: &mut Value) -> String {
+pub fn ensure_metadata_uid(data: &mut Value) -> String {
     let generated = uuid::Uuid::new_v4().to_string();
     let Some(obj) = data.as_object_mut() else {
         return generated;
@@ -127,7 +129,7 @@ pub(super) fn ensure_metadata_uid(data: &mut Value) -> String {
     generated
 }
 
-pub(super) fn ensure_metadata_create_defaults(
+pub fn ensure_metadata_create_defaults(
     data: &mut Value,
     authored_at: chrono::DateTime<chrono::Utc>,
 ) {
@@ -170,13 +172,13 @@ pub(super) fn ensure_metadata_create_defaults(
     }
 }
 
-pub(super) fn metadata_uid(data: &Value) -> Option<&str> {
+pub fn metadata_uid(data: &Value) -> Option<&str> {
     data.pointer("/metadata/uid")
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
 }
 
-pub(super) fn validate_metadata_uid_immutable(incoming: &Value, existing: &Value) -> Result<()> {
+pub fn validate_metadata_uid_immutable(incoming: &Value, existing: &Value) -> Result<()> {
     let Some(incoming_uid) = metadata_uid(incoming) else {
         return Ok(());
     };
@@ -193,13 +195,10 @@ pub(super) fn validate_metadata_uid_immutable(incoming: &Value, existing: &Value
             resource_version: 0,
         }),
     )
-    .map_err(|_| {
-        klights_cluster_datastore::errors::DatastoreError::conflict("metadata.uid is immutable")
-            .into()
-    })
+    .map_err(|_| crate::errors::DatastoreError::conflict("metadata.uid is immutable").into())
 }
 
-pub(super) fn validate_resource_preconditions(
+pub fn validate_resource_preconditions(
     preconditions: &ResourcePreconditions,
     current_uid: Option<&str>,
     current_rv: i64,
@@ -217,24 +216,22 @@ pub(super) fn validate_resource_preconditions(
     )
     .map_err(|violation| match violation {
         klights_cluster_core::ApplyPreconditionViolation::Uid { expected, .. } => {
-            klights_cluster_datastore::errors::DatastoreError::conflict(format!(
+            crate::errors::DatastoreError::conflict(format!(
                 "UID precondition failed: expected {expected}"
             ))
             .into()
         }
         klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { expected, actual } => {
-            klights_cluster_datastore::errors::DatastoreError::conflict(format!(
+            crate::errors::DatastoreError::conflict(format!(
                 "resourceVersion precondition failed: expected {expected} got {actual}"
             ))
             .into()
         }
-        other => {
-            klights_cluster_datastore::errors::DatastoreError::conflict(other.to_string()).into()
-        }
+        other => crate::errors::DatastoreError::conflict(other.to_string()).into(),
     })
 }
 
-pub(super) fn warn_uid_precondition_mismatch(
+pub fn warn_uid_precondition_mismatch(
     operation: &str,
     api_version: &str,
     kind: &str,
@@ -256,7 +253,7 @@ pub(super) fn warn_uid_precondition_mismatch(
     );
 }
 
-pub(super) fn preserve_server_metadata_fields_from_existing(data: &mut Value, existing: &Value) {
+pub fn preserve_server_metadata_fields_from_existing(data: &mut Value, existing: &Value) {
     let Some(meta_obj) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
         return;
     };
@@ -296,9 +293,9 @@ pub(super) fn preserve_server_metadata_fields_from_existing(data: &mut Value, ex
     }
 }
 
-pub(super) use klights_cluster_core::resource_client_owned_state_equal;
+pub use klights_cluster_core::resource_client_owned_state_equal;
 
-pub(super) fn ensure_pod_status_ip_arrays(data: &mut Value, api_version: &str, kind: &str) {
+pub fn ensure_pod_status_ip_arrays(data: &mut Value, api_version: &str, kind: &str) {
     if api_version != "v1" || kind != "Pod" {
         return;
     }

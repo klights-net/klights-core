@@ -14,6 +14,24 @@ use std::borrow::Cow;
 
 use klights_cluster_core::Resource;
 
+/// TO-BE-CLEANUP: legacy replicated `StorageCommand` test support.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedCreateOptions {
+    pub resource_version: i64,
+    pub meta_uid: Option<String>,
+}
+
+#[cfg(test)]
+impl ReplicatedCreateOptions {
+    pub fn new(resource_version: i64, meta_uid: Option<String>) -> Self {
+        Self {
+            resource_version,
+            meta_uid,
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Serialize)]
 struct TestWatchEnvelope<'a> {
@@ -208,21 +226,6 @@ impl<'a> ResourceListQuery<'a> {
 
     pub fn page_request(self) -> Result<ListPageRequest> {
         ListPageRequest::try_new(self.limit, self.continue_token.map(str::to_string))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplicatedCreateOptions {
-    pub resource_version: i64,
-    pub meta_uid: Option<String>,
-}
-
-impl ReplicatedCreateOptions {
-    pub fn new(resource_version: i64, meta_uid: Option<String>) -> Self {
-        Self {
-            resource_version,
-            meta_uid,
-        }
     }
 }
 

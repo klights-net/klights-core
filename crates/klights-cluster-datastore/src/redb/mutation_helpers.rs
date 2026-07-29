@@ -7,14 +7,14 @@ use std::collections::BTreeSet;
 
 use ::redb::ReadableTable;
 use anyhow::Result;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use bytes::Bytes;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use serde::Serialize;
 use serde_json::Value;
 
+use super::tables;
 use klights_cluster_core::{Resource, ResourcePreconditions};
-use klights_cluster_datastore::redb::tables;
 
 #[allow(clippy::too_many_arguments)]
 pub fn log_noop_resource_write(
@@ -50,12 +50,12 @@ pub fn stage_resource_post_commit(
     event_type: &str,
     data: impl Into<std::sync::Arc<Value>>,
 ) -> klights_cluster_store::StagedPostCommit {
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = (name, event_type, data);
         klights_cluster_store::StagedPostCommit::new(api_version, kind, namespace, resource_version)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let mut data = std::sync::Arc::unwrap_or_clone(data.into());
         if let Some(object) = data.as_object_mut() {
@@ -140,7 +140,7 @@ pub fn preserve_server_metadata_fields_from_existing(data: &mut Value, existing:
 }
 
 /// Post-fetch field selector filtering (mirrors SQLite's `filter_by_field_selector`).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Resource> {
     let selector = klights_types::FieldSelector::parse(selector)
         .expect("API validation must reject malformed field selectors before datastore filtering");
@@ -153,7 +153,7 @@ pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Res
 }
 
 /// Resolve a dotted field path inside a JSON resource body.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn resolve_field_path<'a>(data: &'a Value, path: &str) -> Option<std::borrow::Cow<'a, str>> {
     klights_types::resolve_field_value(data, path)
 }
@@ -201,10 +201,7 @@ pub fn validate_uid_immutable(incoming: &Value, current: &Value) -> Result<()> {
             resource_version: 0,
         }),
     )
-    .map_err(|_| {
-        klights_cluster_datastore::errors::DatastoreError::conflict("metadata.uid is immutable")
-            .into()
-    })
+    .map_err(|_| crate::errors::DatastoreError::conflict("metadata.uid is immutable").into())
 }
 
 /// Validate resource preconditions (UID and RV) against current state.
@@ -226,18 +223,12 @@ pub fn validate_resource_preconditions(
     )
     .map_err(|violation| match violation {
         klights_cluster_core::ApplyPreconditionViolation::Uid { .. } => {
-            klights_cluster_datastore::errors::DatastoreError::conflict("UID precondition failed")
-                .into()
+            crate::errors::DatastoreError::conflict("UID precondition failed").into()
         }
         klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { .. } => {
-            klights_cluster_datastore::errors::DatastoreError::conflict(
-                "resourceVersion precondition failed",
-            )
-            .into()
+            crate::errors::DatastoreError::conflict("resourceVersion precondition failed").into()
         }
-        other => {
-            klights_cluster_datastore::errors::DatastoreError::conflict(other.to_string()).into()
-        }
+        other => crate::errors::DatastoreError::conflict(other.to_string()).into(),
     })
 }
 

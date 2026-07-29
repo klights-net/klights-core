@@ -2134,6 +2134,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "klights-cluster-core",
  "klights-cluster-store",
  "klights-supervisor",
@@ -2148,6 +2149,7 @@ dependencies = [
  "tokio",
  "tokio-rusqlite",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

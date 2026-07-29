@@ -1,9 +1,8 @@
 use super::{
-    mutation_diagnostics, owner_ref_index, queries, resource_shape, transaction_primitives,
-    use_namespaced_table,
+    mutation_diagnostics, owner_ref_index, queries, resource_shape, selector_index,
+    transaction_primitives, use_namespaced_table,
 };
 use klights_cluster_core::{PatchKind, Resource, ResourcePatchRequest};
-use klights_cluster_datastore::sqlite::selector_index;
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
@@ -20,7 +19,7 @@ struct PatchKey {
     name: String,
 }
 
-pub(crate) struct PatchResourceInput {
+pub struct PatchResourceInput {
     key: PatchKey,
     patch_kind: PatchKind,
     patch: Value,
@@ -30,7 +29,7 @@ pub(crate) struct PatchResourceInput {
 }
 
 impl PatchResourceInput {
-    pub(crate) fn new(
+    pub fn new(
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
@@ -60,7 +59,7 @@ impl PatchResourceInput {
     }
 }
 
-pub(crate) fn patch_resource_in_conn(
+pub fn patch_resource_in_conn(
     conn: &mut rusqlite::Connection,
     input: PatchResourceInput,
 ) -> tokio_rusqlite::Result<Option<Resource>> {
@@ -394,9 +393,40 @@ pub(crate) fn patch_resource_in_conn(
 
 #[cfg(test)]
 mod tests {
-    use crate::datastore::sqlite::Datastore;
-
     use super::*;
+
+    async fn database() -> klights_supervisor::DbExecutor {
+        crate::sqlite::open_in_memory_with_default_supervisor("ordinary-patch-tests")
+            .await
+            .unwrap()
+    }
+
+    async fn create_config_map(
+        database: &klights_supervisor::DbExecutor,
+        name: &str,
+        data: Value,
+    ) -> i64 {
+        let name = name.to_string();
+        let uid = format!("{name}-uid");
+        let data = serde_json::to_vec(&data).unwrap();
+        database
+            .call_raw("ordinary-patch-test-create", move |connection| {
+                let (_, resource_version) = super::super::create_resource_in_conn(
+                    connection,
+                    super::super::CreateResourceInput {
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name,
+                        uid,
+                        data,
+                    },
+                )?;
+                Ok(resource_version)
+            })
+            .await
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn patch_no_change_branch_preserves_resource_version_and_data() {
@@ -405,29 +435,37 @@ mod tests {
         // preserved (no new RV minted) and the returned data matches the
         // existing row exactly. PatchKey ownership refactor must not
         // alter this behaviour.
-        let db = Datastore::new_in_memory().await.unwrap();
+        let database = database().await;
         let initial = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": {"name": "noop-cm", "namespace": "default"},
+            "metadata": {
+                "name": "noop-cm",
+                "namespace": "default",
+                "uid": "noop-cm-uid"
+            },
             "data": {"k": "v"}
         });
-        let created = db
-            .create_resource("v1", "ConfigMap", Some("default"), "noop-cm", initial)
-            .await
-            .unwrap();
-        let initial_rv = created.resource_version;
+        let initial_rv = create_config_map(&database, "noop-cm", initial).await;
 
         // Apply a merge patch that sets the same value — no-op path.
-        let result = db
-            .patch_resource_latest(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "noop-cm",
-                PatchKind::Merge,
-                serde_json::json!({"data": {"k": "v"}}),
-            )
+        let result = database
+            .call_raw("ordinary-patch-test-noop", move |connection| {
+                patch_resource_in_conn(
+                    connection,
+                    PatchResourceInput::new(
+                        "v1",
+                        "ConfigMap",
+                        Some("default"),
+                        "noop-cm",
+                        ResourcePatchRequest::without_preconditions(
+                            PatchKind::Merge,
+                            serde_json::json!({"data": {"k": "v"}}),
+                        ),
+                        "1970-01-01T00:00:00Z".to_string(),
+                    ),
+                )
+            })
             .await
             .unwrap()
             .expect("resource must exist");
@@ -445,16 +483,24 @@ mod tests {
 
     #[tokio::test]
     async fn patch_missing_resource_returns_none() {
-        let db = Datastore::new_in_memory().await.unwrap();
-        let result = db
-            .patch_resource_latest(
-                "v1",
-                "ConfigMap",
-                Some("default"),
-                "missing-cm",
-                PatchKind::Merge,
-                serde_json::json!({"data": {"k": "v"}}),
-            )
+        let database = database().await;
+        let result = database
+            .call_raw("ordinary-patch-test-missing", move |connection| {
+                patch_resource_in_conn(
+                    connection,
+                    PatchResourceInput::new(
+                        "v1",
+                        "ConfigMap",
+                        Some("default"),
+                        "missing-cm",
+                        ResourcePatchRequest::without_preconditions(
+                            PatchKind::Merge,
+                            serde_json::json!({"data": {"k": "v"}}),
+                        ),
+                        "1970-01-01T00:00:00Z".to_string(),
+                    ),
+                )
+            })
             .await
             .unwrap();
         assert!(result.is_none());

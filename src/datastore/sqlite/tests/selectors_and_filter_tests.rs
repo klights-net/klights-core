@@ -44,9 +44,9 @@ fn spawn_raw_create_with_watch_event(
             &name,
             &row_data,
         )?;
-        crate::datastore::sqlite::crud::helpers::insert_watch_event_in_conn(
+        klights_cluster_datastore::sqlite::mutation_helpers::insert_watch_event_in_conn(
             &tx,
-            crate::datastore::sqlite::crud::helpers::WatchEventInsert::new(
+            klights_cluster_datastore::sqlite::mutation_helpers::WatchEventInsert::new(
                 &api_version,
                 &kind,
                 Some(&namespace),
