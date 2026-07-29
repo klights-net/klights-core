@@ -1,23 +1,28 @@
 //! Temporary root adapters from the legacy datastore to cluster-store ports.
 
 use klights_cluster_core::{CommittedApplyOutcome, LogApplyCommit, LogApplyMutation};
+#[cfg(test)]
 use klights_cluster_store::{
-    AllocatorStateError, AllocatorStateFuture, AppliedOutboxLookup, AuthoritativeSnapshot,
-    AuthoritativeSnapshotCapture, AuthoritativeSnapshotPersistence, ClusterMetadataFuture,
-    ClusterMetadataRead, ClusterMetadataStoreError, ClusterResourceRead, CommittedApplyError,
-    CommittedApplyFuture, CommittedRaftApplyReceipt, CommittedRaftApplyRequest,
-    DurableAllocatorRead, DurableAllocatorState, DurableApplyLedgerRead, DurableReplayFloor,
-    DurableReplayTarget, DurableWatchEvent, DurableWatchHistoryRead, DurableWatchScope,
-    PersistedClusterMetadata, PrivilegedCommittedRaftApply, ResourceCollectionKey,
-    ResourceCollectionScope, ResourceContinuation, ResourceGetRequest, ResourceListPage,
-    ResourceListRead, ResourceListRequest, ResourceListSnapshot, ResourceReadError,
-    ResourceReadFuture, ResourceVersionMatch, SnapshotCaptureHeader, SnapshotCapturePage,
-    SnapshotCapturePageKind, SnapshotCaptureSession, SnapshotMembership, SnapshotPersistenceError,
-    SnapshotPersistenceFuture, WatchHistoryError, WatchHistoryFuture, WatchHistoryPage,
-    WatchHistoryRead, WatchHistoryRequest,
+    AllocatorStateError, AllocatorStateFuture, ClusterResourceRead, DurableAllocatorRead,
+    DurableAllocatorState, DurableReplayFloor, DurableWatchEvent, DurableWatchHistoryRead,
+    DurableWatchScope, ResourceCollectionKey, ResourceCollectionScope, ResourceContinuation,
+    ResourceGetRequest, ResourceListPage, ResourceListRead, ResourceListRequest,
+    ResourceListSnapshot, ResourceReadError, ResourceReadFuture, ResourceVersionMatch,
+    WatchHistoryError, WatchHistoryFuture, WatchHistoryPage, WatchHistoryRead, WatchHistoryRequest,
+};
+use klights_cluster_store::{
+    AppliedOutboxLookup, AuthoritativeSnapshot, AuthoritativeSnapshotCapture,
+    AuthoritativeSnapshotPersistence, ClusterMetadataFuture, ClusterMetadataRead,
+    ClusterMetadataStoreError, CommittedApplyError, CommittedApplyFuture,
+    CommittedRaftApplyReceipt, CommittedRaftApplyRequest, DurableApplyLedgerRead,
+    DurableReplayTarget, PersistedClusterMetadata, PrivilegedCommittedRaftApply,
+    SnapshotCaptureHeader, SnapshotCapturePage, SnapshotCapturePageKind, SnapshotCaptureSession,
+    SnapshotMembership, SnapshotPersistenceError, SnapshotPersistenceFuture,
 };
 
-use super::{DatastoreHandle, ResourceListQuery};
+use super::DatastoreHandle;
+#[cfg(test)]
+use super::ResourceListQuery;
 
 pub(crate) struct DatastoreRaftCommitMaterializer {
     db: DatastoreHandle,
@@ -143,10 +148,12 @@ pub(crate) fn raft_store_ports_for_test(
 ///
 /// REMOVE(Phase 10): concrete cluster datastore adapters implement the
 /// cluster-store ports directly after physical extraction.
+#[cfg(test)]
 pub(crate) struct DatastoreClusterResourceRead {
     db: DatastoreHandle,
 }
 
+#[cfg(test)]
 impl DatastoreClusterResourceRead {
     pub(crate) fn new(db: DatastoreHandle) -> Self {
         Self { db }
@@ -156,8 +163,10 @@ impl DatastoreClusterResourceRead {
 // Packet 6A defines the adapter before a later consumer migration. Keep its
 // complete construction boundary checked without runtime wiring or lint
 // suppression.
+#[cfg(test)]
 const _: fn(DatastoreHandle) -> DatastoreClusterResourceRead = DatastoreClusterResourceRead::new;
 
+#[cfg(test)]
 impl ClusterResourceRead for DatastoreClusterResourceRead {
     fn get_resource(
         &self,
@@ -323,6 +332,7 @@ impl ClusterResourceRead for DatastoreClusterResourceRead {
     }
 }
 
+#[cfg(test)]
 fn normalize_collection_page(
     page: &mut crate::datastore::ResourceList,
     continuation: Option<&ResourceContinuation>,
@@ -353,6 +363,7 @@ fn normalize_collection_page(
     page.remaining_item_count = None;
 }
 
+#[cfg(test)]
 fn map_query_error(error: anyhow::Error) -> ResourceReadError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
@@ -378,6 +389,7 @@ fn map_query_error(error: anyhow::Error) -> ResourceReadError {
     }
 }
 
+#[cfg(test)]
 fn port_page(
     mut page: crate::datastore::ResourceList,
     pinned: Option<ResourceListSnapshot>,
@@ -632,18 +644,22 @@ fn map_committed_apply_error(error: anyhow::Error) -> CommittedApplyError {
 /// This type owns no live watch receiver or broadcast capability.
 /// REMOVE(Phase 10): concrete cluster datastore adapters implement the
 /// cluster-store ports directly after physical extraction.
+#[cfg(test)]
 pub(crate) struct DatastoreDurableWatchHistory {
     db: DatastoreHandle,
 }
 
+#[cfg(test)]
 impl DatastoreDurableWatchHistory {
     pub(crate) fn new(db: DatastoreHandle) -> Self {
         Self { db }
     }
 }
 
+#[cfg(test)]
 const _: fn(DatastoreHandle) -> DatastoreDurableWatchHistory = DatastoreDurableWatchHistory::new;
 
+#[cfg(test)]
 impl DurableWatchHistoryRead for DatastoreDurableWatchHistory {
     fn replay_watch_history(
         &self,
@@ -741,6 +757,7 @@ impl DurableWatchHistoryRead for DatastoreDurableWatchHistory {
     }
 }
 
+#[cfg(test)]
 fn map_watch_history_error(error: anyhow::Error) -> WatchHistoryError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();
@@ -765,18 +782,22 @@ fn map_watch_history_error(error: anyhow::Error) -> WatchHistoryError {
 /// Read-only durable allocator wrapper over the legacy umbrella datastore.
 /// REMOVE(Phase 10): concrete cluster datastore adapters implement the
 /// cluster-store ports directly after physical extraction.
+#[cfg(test)]
 pub(crate) struct DatastoreDurableAllocatorRead {
     db: DatastoreHandle,
 }
 
+#[cfg(test)]
 impl DatastoreDurableAllocatorRead {
     pub(crate) fn new(db: DatastoreHandle) -> Self {
         Self { db }
     }
 }
 
+#[cfg(test)]
 const _: fn(DatastoreHandle) -> DatastoreDurableAllocatorRead = DatastoreDurableAllocatorRead::new;
 
+#[cfg(test)]
 impl DurableAllocatorRead for DatastoreDurableAllocatorRead {
     fn read_allocator_state(&self) -> AllocatorStateFuture<'_, DurableAllocatorState> {
         Box::pin(async move {
@@ -790,6 +811,7 @@ impl DurableAllocatorRead for DatastoreDurableAllocatorRead {
     }
 }
 
+#[cfg(test)]
 fn map_allocator_error(error: anyhow::Error) -> AllocatorStateError {
     let message = format!("{error:#}");
     let lower = message.to_ascii_lowercase();

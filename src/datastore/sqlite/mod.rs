@@ -17,6 +17,7 @@ mod outbox_codec;
 pub(super) mod owner_ref_index;
 mod position_membership;
 pub(crate) mod queries;
+pub mod read_store;
 mod replay_floor;
 mod resource_shape;
 mod rv_helpers;
@@ -87,6 +88,135 @@ struct AppliedOutboxLedgerInput<'a> {
 use klights_supervisor::DbExecutor;
 use klights_supervisor::sqlite_open as opener;
 pub use watch::create_pending_watch_event;
+
+fn focused_watch_targets(
+    targets: &[WatchTarget],
+) -> Vec<klights_cluster_store::DurableWatchTarget> {
+    targets
+        .iter()
+        .map(|target| match &target.scope {
+            WatchTargetScope::Cluster => klights_cluster_store::DurableWatchTarget::cluster(
+                &target.api_version,
+                &target.kind,
+            ),
+            WatchTargetScope::Namespaced(None) => {
+                klights_cluster_store::DurableWatchTarget::namespaced(
+                    &target.api_version,
+                    &target.kind,
+                )
+            }
+            WatchTargetScope::Namespaced(Some(namespace)) => {
+                klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
+                    &target.api_version,
+                    &target.kind,
+                    namespace,
+                )
+            }
+        })
+        .collect()
+}
+
+fn focused_events_to_catchup(
+    events: Vec<klights_cluster_store::DurableWatchEvent>,
+) -> Vec<CatchUpResource> {
+    events
+        .into_iter()
+        .map(|event| {
+            let event_type = event.event_type().to_string();
+            CatchUpResource {
+                resource: event.into_resource(),
+                event_type: std::borrow::Cow::Owned(event_type),
+            }
+        })
+        .collect()
+}
+
+impl Datastore {
+    pub async fn snapshot_resources_at_rv(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        query: ResourceListQuery<'_>,
+        snapshot_rv: i64,
+    ) -> Result<SnapshotAtRv> {
+        let snapshot = klights_cluster_store::ResourceListSnapshot::try_new(
+            WatchReplayPosition::from_resource_version(snapshot_rv),
+        )
+        .map_err(anyhow::Error::new)?;
+        let continuation = query.continue_token.map(|name| {
+            klights_cluster_store::ResourceContinuation::new(
+                klights_cluster_store::ResourceCollectionKey::new(
+                    namespace.map(str::to_string),
+                    name.to_string(),
+                ),
+                snapshot,
+            )
+        });
+        let focused_query = klights_cluster_store::ResourceListQuery::try_new_borrowed(
+            query.label_selector,
+            query.field_selector,
+            query.limit,
+            continuation,
+            klights_cluster_store::ResourceVersionMatch::Exact(snapshot_rv),
+        )
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .snapshot_resources_at_rv(api_version, kind, namespace, focused_query, snapshot_rv)
+            .await?
+        {
+            crud::snapshot::ExactSnapshotRead::Current => Ok(SnapshotAtRv::Current),
+            crud::snapshot::ExactSnapshotRead::Expired => Ok(SnapshotAtRv::Expired),
+            crud::snapshot::ExactSnapshotRead::List(page) => {
+                let position = page.snapshot().position();
+                let continue_token = page
+                    .continuation()
+                    .map(|cursor| cursor.after().name().to_string());
+                let remaining_item_count = page.remaining_item_count();
+                Ok(SnapshotAtRv::List(ResourceList {
+                    items: page.into_items(),
+                    resource_version: position.resource_version,
+                    watch_replay_position: Some(position),
+                    continue_token,
+                    remaining_item_count,
+                }))
+            }
+        }
+    }
+
+    pub async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        match self
+            .focused_reads
+            .snapshot_resources_at_position(
+                &focused_watch_targets(targets),
+                label_selector,
+                field_selector,
+                position,
+            )
+            .await?
+        {
+            klights_cluster_store::ResourceSnapshotRead::Current => Ok(SnapshotAtRv::Current),
+            klights_cluster_store::ResourceSnapshotRead::Expired => Ok(SnapshotAtRv::Expired),
+            klights_cluster_store::ResourceSnapshotRead::Historical(snapshot) => {
+                let position = snapshot.snapshot().position();
+                Ok(SnapshotAtRv::List(ResourceList {
+                    items: snapshot.into_items(),
+                    resource_version: position.resource_version,
+                    watch_replay_position: Some(position),
+                    continue_token: None,
+                    remaining_item_count: None,
+                }))
+            }
+        }
+    }
+}
 #[cfg(test)]
 pub use watch::publish_pending;
 
@@ -149,6 +279,7 @@ struct ResourceMutationPauseRegistration {
 pub struct Datastore {
     executor: DbExecutor,
     read_executor: DbExecutor,
+    focused_reads: std::sync::Arc<read_store::SqliteReadStore>,
     #[cfg(test)]
     commit_sink: std::sync::Arc<dyn CommitObservationSink>,
     outbox_codec: std::sync::Arc<dyn OutboxResponseCodec>,
@@ -157,8 +288,6 @@ pub struct Datastore {
     snapshot_factory: Option<snapshot_capture::SqliteSnapshotFactory>,
     #[cfg(test)]
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    #[cfg(test)]
-    resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     post_commit_publish_pause:
         std::sync::Arc<std::sync::Mutex<Option<cluster_replace::PostCommitPublishPause>>>,
@@ -3435,9 +3564,22 @@ impl Datastore {
         wall_clock: std::sync::Arc<dyn klights_supervisor::WallClock>,
     ) -> Result<Self> {
         // Schema + fingerprint are applied by the cluster-owned open adapter.
+        #[cfg(test)]
+        let resource_get_call_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let fail_next_watch_position_observation =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let focused_reads = std::sync::Arc::new(read_store::SqliteReadStore::new(
+            read_executor.clone(),
+            #[cfg(test)]
+            fail_next_watch_position_observation.clone(),
+            #[cfg(test)]
+            resource_get_call_count.clone(),
+        ));
         Ok(Self {
             executor,
             read_executor,
+            focused_reads,
             #[cfg(test)]
             commit_sink,
             outbox_codec,
@@ -3445,16 +3587,16 @@ impl Datastore {
             snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
             snapshot_factory,
             #[cfg(test)]
-            fail_next_watch_position_observation: std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
-            #[cfg(test)]
-            resource_get_call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fail_next_watch_position_observation,
             #[cfg(test)]
             post_commit_publish_pause: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             resource_mutation_pause: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    pub(crate) fn focused_read_store(&self) -> std::sync::Arc<read_store::SqliteReadStore> {
+        self.focused_reads.clone()
     }
 
     async fn from_executor(
@@ -3652,33 +3794,14 @@ impl DatastoreBackend for Datastore {
     }
 
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
-        self.read_db_call("read_durable_allocator_observation", |conn| {
-            let raw_rv: String = conn.query_row(
-                "SELECT value FROM metadata WHERE key = 'resource_version'",
-                [],
-                |row| row.get(0),
-            )?;
-            let resource_version = raw_rv.parse::<i64>().map_err(|_| {
-                crate::datastore::sqlite::cluster_replace::other_error(format!(
-                    "invalid resource_version metadata {raw_rv:?}"
-                ))
-            })?;
-            let event_id = Datastore::watch_event_allocator_high_water_in_conn(conn)?;
-            if resource_version < 0 || event_id < 0 {
-                return Err(crate::datastore::sqlite::cluster_replace::other_error(
-                    "allocator values must be non-negative",
-                ));
-            }
-            Ok(DurableAllocatorObservation {
-                position: WatchReplayPosition {
-                    resource_version,
-                    event_id,
-                    resource_version_filter_through_event_id: 0,
-                },
-            })
+        let state = self
+            .focused_reads
+            .read_allocator_state()
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok(DurableAllocatorObservation {
+            position: state.position(),
         })
-        .await
-        .map_err(|error| anyhow!("atomic allocator observation failed: {error}"))
     }
 
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
@@ -4289,7 +4412,19 @@ impl DatastoreBackend for Datastore {
         kind: &str,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        Datastore::list_cluster_resources_modified_since(self, api_version, kind, since_rv).await
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        let request = klights_cluster_store::ModifiedClusterResourcesRequest::try_new(
+            api_version,
+            kind,
+            since_rv,
+        )
+        .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_cluster_resources_modified_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
@@ -4303,7 +4438,20 @@ impl DatastoreBackend for Datastore {
         namespace: Option<&str>,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        Datastore::list_resources_modified_since(self, api_version, kind, namespace, since_rv).await
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        let request = klights_cluster_store::ModifiedResourcesRequest::try_new(
+            api_version,
+            kind,
+            namespace.map(str::to_string),
+            since_rv,
+        )
+        .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_resources_modified_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
@@ -4339,7 +4487,18 @@ impl DatastoreBackend for Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        Datastore::list_watch_events_since(self, targets, since_rv).await
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        let request = klights_cluster_store::WatchEventsSinceRequest::try_new(
+            focused_watch_targets(targets),
+            since_rv,
+        )
+        .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_watch_events_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_watch_events_since_checked(
@@ -4365,12 +4524,53 @@ impl DatastoreBackend for Datastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        Datastore::list_watch_events_after_position_checked_bounded(self, targets, position, limit)
+        use klights_cluster_store::DurableWatchHistoryRead as _;
+
+        let request = klights_cluster_store::WatchHistoryRequest::new(
+            focused_watch_targets(targets),
+            position,
+            limit.get(),
+        )
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .replay_watch_history(request)
             .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_cluster_store::WatchHistoryRead::Expired => {
+                Ok(PositionedWatchReplayRead::Expired)
+            }
+            klights_cluster_store::WatchHistoryRead::Events(page) => {
+                let next_position = page.next_position();
+                let events = page
+                    .into_events()
+                    .into_iter()
+                    .map(|event| {
+                        let event_type = event.event.event_type().to_string();
+                        klights_cluster_core::PositionedWatchEvent {
+                            position: event.position,
+                            event: CatchUpResource {
+                                resource: event.event.into_resource(),
+                                event_type: std::borrow::Cow::Owned(event_type),
+                            },
+                        }
+                    })
+                    .collect();
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    events,
+                    next_position,
+                }))
+            }
+        }
     }
 
     async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        Datastore::current_watch_replay_position(self).await
+        self.focused_reads
+            .read_allocator_state()
+            .await
+            .map(|state| state.position())
+            .map_err(anyhow::Error::new)
     }
 
     async fn snapshot_resources_at_position(
@@ -4396,7 +4596,25 @@ impl DatastoreBackend for Datastore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        Datastore::list_raw_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
+        use klights_cluster_store::DurableRawWatchHistoryRead as _;
+
+        let request = klights_cluster_store::RawWatchEventsSinceRequest::try_new(
+            focused_watch_targets(targets),
+            since_rv,
+            limit.get(),
+        )
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .list_raw_watch_events_since_checked_bounded(request)
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_cluster_store::RawWatchHistoryRead::Expired => Ok(WatchReplayRead::Expired),
+            klights_cluster_store::RawWatchHistoryRead::Events(page) => {
+                Ok(WatchReplayRead::Events(page.into_events()))
+            }
+        }
     }
 
     async fn list_raw_watch_events_after_position_checked_bounded(
@@ -4405,18 +4623,52 @@ impl DatastoreBackend for Datastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        Datastore::list_raw_watch_events_after_position_checked_bounded(
-            self, targets, position, limit,
+        use klights_cluster_store::DurableRawWatchHistoryRead as _;
+
+        let request = klights_cluster_store::RawWatchEventsAfterPositionRequest::try_new(
+            focused_watch_targets(targets),
+            position,
+            limit.get(),
         )
-        .await
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .list_raw_watch_events_after_position_checked_bounded(request)
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_cluster_store::PositionedRawWatchHistoryRead::Expired => {
+                Ok(PositionedWatchReplayRead::Expired)
+            }
+            klights_cluster_store::PositionedRawWatchHistoryRead::Events(page) => {
+                let next_position = page.next_position();
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    events: page.into_events(),
+                    next_position,
+                }))
+            }
+        }
     }
 
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
-        Datastore::earliest_watch_event_rv(self).await
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        self.focused_reads
+            .earliest_watch_event_rv()
+            .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        Datastore::list_all_watch_events_since(self, since_rv).await
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        let request = klights_cluster_store::WatchRangeStart::try_new(since_rv)
+            .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_all_watch_events_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_all_watch_events_since_paged(
@@ -4446,7 +4698,43 @@ impl DatastoreBackend for Datastore {
     }
 
     async fn list_watch_replay_floors(&self) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
-        Datastore::list_watch_replay_floors(self).await
+        use klights_cluster_store::DurableWatchHistoryRead as _;
+
+        self.focused_reads
+            .list_replay_floors()
+            .await
+            .map(|floors| {
+                floors
+                    .into_iter()
+                    .map(|floor| {
+                        let (target, floor_resource_version, floor_event_id, position_is_exact) =
+                            floor.into_parts();
+                        let (api_version, kind, namespace_key) = match target {
+                            klights_cluster_store::DurableReplayTarget::All => {
+                                ("*".to_string(), "*".to_string(), "*".to_string())
+                            }
+                            klights_cluster_store::DurableReplayTarget::Cluster {
+                                api_version,
+                                kind,
+                            } => (api_version, kind, "#cluster".to_string()),
+                            klights_cluster_store::DurableReplayTarget::Namespaced {
+                                api_version,
+                                kind,
+                                namespace,
+                            } => (api_version, kind, namespace),
+                        };
+                        crate::datastore::WatchReplayFloor {
+                            api_version,
+                            kind,
+                            namespace_key,
+                            floor_resource_version,
+                            floor_event_id,
+                            position_is_exact,
+                        }
+                    })
+                    .collect()
+            })
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_watch_replay_floors_paged(
@@ -4458,7 +4746,15 @@ impl DatastoreBackend for Datastore {
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        Datastore::list_deleted_watch_events_since(self, since_rv).await
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        let request = klights_cluster_store::WatchRangeStart::try_new(since_rv)
+            .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_deleted_watch_events_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     async fn allocate_node_subnet(

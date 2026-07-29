@@ -1,7 +1,6 @@
 use super::super::queries;
 use super::*;
 use crate::datastore::sqlite::create_pending_watch_event;
-use klights_types::LabelSelector;
 impl Datastore {
     pub async fn create_namespace(&self, name: &str, mut data: Value) -> Result<Resource> {
         ensure_resource_type_meta(&mut data, "v1", "Namespace");
@@ -93,34 +92,7 @@ impl Datastore {
     }
 
     pub async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        let name_owned = name.to_string();
-        let result = self
-            .read_db_call("db_query", move |conn| {
-                let mut stmt = conn.prepare(queries::NAMESPACE_GET)?;
-                let row = stmt.query_row([&name_owned], |row| {
-                    let data_bytes: Vec<u8> = row.get(3)?;
-                    let data: Value = serde_json::from_slice(&data_bytes).ok().unwrap_or_default();
-                    Ok(Resource {
-                        id: 0,
-                        api_version: "v1".to_string(),
-                        kind: "Namespace".to_string(),
-                        namespace: None,
-                        name: row.get(0)?,
-                        resource_version: row.get(1)?,
-                        uid: row.get(2)?,
-                        data: std::sync::Arc::new(data),
-                    })
-                });
-                Ok(row)
-            })
-            .await;
-
-        match result {
-            Ok(Ok(resource)) => Ok(Some(resource)),
-            Ok(Err(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
-            Ok(Err(e)) => Err(anyhow!("Failed to get namespace: {}", e)),
-            Err(e) => Err(anyhow!("Failed to get namespace: {}", e)),
-        }
+        self.focused_reads.get_namespace(name).await
     }
 
     pub async fn list_namespaces(
@@ -128,82 +100,17 @@ impl Datastore {
         label_selector: Option<&str>,
         field_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        let parsed_label_selector = label_selector
-            .map(str::trim)
-            .filter(|selector| !selector.is_empty())
-            .map(LabelSelector::parse)
-            .transpose()
-            .map_err(|e| anyhow!("Invalid label selector: {e}"))?;
-        let parsed_field_selector = field_selector
-            .filter(|selector| !selector.is_empty())
-            .map(klights_types::FieldSelector::parse)
-            .transpose()
-            .map_err(|error| anyhow!("Invalid field selector: {error}"))?;
-
-        self.read_db_call("db_query", move |conn| {
-            let tx = conn.transaction()?;
-            let conn = &tx;
-            let mut query = queries::NAMESPACES_LIST_HEAD.to_string();
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-            if let Some(name_filter) = parsed_field_selector.as_ref().and_then(|selector| {
-                selector.requirements().iter().find_map(|requirement| {
-                    (requirement.field() == "metadata.name"
-                        && requirement.operator() == klights_types::FieldSelectorOperator::Equals
-                        && !requirement.value().is_empty())
-                    .then(|| requirement.value().to_string())
-                })
-            }) {
-                query.push_str(" WHERE name = ?");
-                params.push(Box::new(name_filter));
-            }
-            query.push_str(" ORDER BY name ASC");
-
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let mut stmt = conn.prepare(&query)?;
-            let rows = stmt.query_map(param_refs.as_slice(), |row| {
-                let data_bytes: Vec<u8> = row.get(3)?;
-                let data: Value = serde_json::from_slice(&data_bytes).ok().unwrap_or_default();
-                Ok(Resource {
-                    id: 0,
-                    api_version: "v1".to_string(),
-                    kind: "Namespace".to_string(),
-                    namespace: None,
-                    name: row.get(0)?,
-                    resource_version: row.get(1)?,
-                    uid: row.get(2)?,
-                    data: std::sync::Arc::new(data),
-                })
-            })?;
-
-            let mut items: Vec<Resource> = Vec::new();
-            for row in rows {
-                items.push(row?);
-            }
-            if let Some(selector) = &parsed_label_selector {
-                items.retain(|item| selector.matches_resource(&item.data));
-            }
-            if let Some(selector) = &parsed_field_selector {
-                items.retain(|item| {
-                    selector.matches_resource_with_identity(
-                        &item.api_version,
-                        &item.kind,
-                        &item.data,
-                    )
-                });
-            }
-            let watch_replay_position = Self::current_watch_replay_position_in_tx(&tx)?;
-            Ok(ResourceList {
-                items,
-                resource_version: watch_replay_position.resource_version,
-                watch_replay_position: Some(watch_replay_position),
-                continue_token: None,
-                remaining_item_count: None,
-            })
+        let list = self
+            .focused_reads
+            .list_namespaces(label_selector, field_selector)
+            .await?;
+        Ok(ResourceList {
+            items: list.items,
+            resource_version: list.resource_version,
+            watch_replay_position: list.watch_replay_position,
+            continue_token: list.continue_token,
+            remaining_item_count: list.remaining_item_count,
         })
-        .await
-        .map_err(|e| anyhow!("Failed to list namespaces: {}", e))
     }
 
     pub async fn list_namespaces_page(
@@ -212,8 +119,22 @@ impl Datastore {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        let list = self.list_namespaces(label_selector, field_selector).await?;
-        Ok(page.apply_to_sorted_resource_list(list))
+        let list = self
+            .focused_reads
+            .list_namespaces_page(
+                label_selector,
+                field_selector,
+                page.limit(),
+                page.continue_token(),
+            )
+            .await?;
+        Ok(ResourceList {
+            items: list.items,
+            resource_version: list.resource_version,
+            watch_replay_position: list.watch_replay_position,
+            continue_token: list.continue_token,
+            remaining_item_count: list.remaining_item_count,
+        })
     }
 
     pub async fn update_namespace(
@@ -404,8 +325,7 @@ impl Datastore {
     }
 
     pub async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
-        self.list_namespace_resources_filtered(namespace, NamespaceKindFilter::All)
-            .await
+        self.focused_reads.list_namespace_resources(namespace).await
     }
 
     pub async fn list_namespace_resources_of_kind(
@@ -413,7 +333,8 @@ impl Datastore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        self.list_namespace_resources_filtered(namespace, NamespaceKindFilter::OfKind(kind))
+        self.focused_reads
+            .list_namespace_resources_of_kind(namespace, kind)
             .await
     }
 
@@ -422,85 +343,14 @@ impl Datastore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        self.list_namespace_resources_filtered(namespace, NamespaceKindFilter::ExcludingKind(kind))
+        self.focused_reads
+            .list_namespace_resources_excluding_kind(namespace, kind)
             .await
-    }
-
-    async fn list_namespace_resources_filtered(
-        &self,
-        namespace: &str,
-        kind_filter: NamespaceKindFilter<'_>,
-    ) -> Result<Vec<Resource>> {
-        let ns = namespace.to_string();
-        let (sql, kind_param): (&'static str, Option<String>) = match kind_filter {
-            NamespaceKindFilter::All => (queries::NAMESPACE_RESOURCES_LIST_ALL, None),
-            NamespaceKindFilter::OfKind(k) => (
-                queries::NAMESPACE_RESOURCES_LIST_OF_KIND,
-                Some(k.to_string()),
-            ),
-            NamespaceKindFilter::ExcludingKind(k) => (
-                queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND,
-                Some(k.to_string()),
-            ),
-        };
-        let rows = self
-            .read_db_call("db_query", move |conn| {
-                let mut stmt = conn.prepare(sql)?;
-                let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Resource> {
-                    let data_bytes: Vec<u8> = row.get(7)?;
-                    let data: Value = serde_json::from_slice(&data_bytes).unwrap_or(Value::Null);
-                    Ok(Resource {
-                        id: row.get(0)?,
-                        api_version: row.get(1)?,
-                        kind: row.get(2)?,
-                        namespace: row.get(3)?,
-                        name: row.get(4)?,
-                        resource_version: row.get(5)?,
-                        uid: row.get(6)?,
-                        data: std::sync::Arc::new(data),
-                    })
-                };
-                let mut out = Vec::new();
-                match kind_param {
-                    None => {
-                        let mapped = stmt.query_map(rusqlite::params![&ns], mapper)?;
-                        for item in mapped {
-                            out.push(item?);
-                        }
-                    }
-                    Some(kind) => {
-                        let mapped = stmt.query_map(rusqlite::params![&ns, &kind], mapper)?;
-                        for item in mapped {
-                            out.push(item?);
-                        }
-                    }
-                }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| anyhow!("Failed to list namespace resources: {}", e))?;
-        Ok(rows)
     }
 
     pub async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
-        let ns = namespace.to_string();
-        let count = self
-            .read_db_call("db_query", move |conn| {
-                let n: i64 = conn.query_row(
-                    queries::NAMESPACE_RESOURCES_COUNT,
-                    rusqlite::params![&ns],
-                    |row| row.get(0),
-                )?;
-                Ok(n)
-            })
+        self.focused_reads
+            .count_namespace_resources(namespace)
             .await
-            .map_err(|e| anyhow!("Failed to count namespace resources: {}", e))?;
-        Ok(count)
     }
-}
-
-enum NamespaceKindFilter<'a> {
-    All,
-    OfKind(&'a str),
-    ExcludingKind(&'a str),
 }

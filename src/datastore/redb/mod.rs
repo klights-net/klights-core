@@ -18,7 +18,8 @@ mod backend_impl;
 mod helpers;
 pub mod key_codec;
 pub mod network;
-mod position_membership;
+mod read_core;
+pub mod read_store;
 mod replay_floor;
 pub mod snapshot;
 mod snapshot_capture;
@@ -38,6 +39,7 @@ use crud::namespaces::RedbNamespaceStore;
 use crud::resources::RedbResourceStore;
 use klights_cluster_datastore::redb::{RedbAccessor, RedbOpenOpts};
 use network::RedbNetworkStore;
+use read_store::RedbReadStore;
 use watch::RedbWatchStore;
 
 /// Redb-backed datastore composed from focused domain stores.
@@ -52,6 +54,7 @@ pub struct RedbDatastore {
     namespaces: RedbNamespaceStore,
     watch_store: RedbWatchStore,
     network: RedbNetworkStore,
+    read_store: Arc<RedbReadStore>,
     rv_store: RedbRvStore,
     snapshot_sessions: Arc<tokio::sync::Semaphore>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -76,20 +79,26 @@ impl RedbDatastore {
         snapshot_sessions: Arc<tokio::sync::Semaphore>,
         wall_clock: Arc<dyn klights_supervisor::WallClock>,
     ) -> Self {
+        let resources = RedbResourceStore::new(
+            accessor.clone(),
+            #[cfg(test)]
+            commit_sink.clone(),
+            wall_clock.clone(),
+        );
+        let namespaces = RedbNamespaceStore::new(
+            accessor.clone(),
+            #[cfg(test)]
+            commit_sink.clone(),
+        );
+        let watch_store = RedbWatchStore::new(accessor.clone());
+        let network = RedbNetworkStore::new(accessor.clone());
+        let read_store = Arc::new(RedbReadStore::new(accessor.clone()));
         Self {
-            resources: RedbResourceStore::new(
-                accessor.clone(),
-                #[cfg(test)]
-                commit_sink.clone(),
-                wall_clock.clone(),
-            ),
-            namespaces: RedbNamespaceStore::new(
-                accessor.clone(),
-                #[cfg(test)]
-                commit_sink.clone(),
-            ),
-            watch_store: RedbWatchStore::new(accessor.clone()),
-            network: RedbNetworkStore::new(accessor.clone()),
+            resources,
+            namespaces,
+            watch_store,
+            network,
+            read_store,
             rv_store: RedbRvStore::new(accessor.clone()),
             accessor,
             #[cfg(test)]
@@ -181,5 +190,9 @@ impl RedbDatastore {
             Arc::new(tokio::sync::Semaphore::new(1)),
             Arc::new(klights_supervisor::SystemWallClock),
         ))
+    }
+
+    pub(crate) fn focused_read_store(&self) -> Arc<RedbReadStore> {
+        self.read_store.clone()
     }
 }

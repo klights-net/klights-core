@@ -4,14 +4,20 @@ use crate::datastore::{DatastoreHandle, ResourceListQuery};
 pub(crate) struct DatastoreWatchStreamAdapter {
     db: DatastoreHandle,
     signals: std::sync::Arc<dyn klights_watch::WatchSignalSubscribe>,
+    positioned_watch: klights_watch::PositionedWatchService,
 }
 
 impl DatastoreWatchStreamAdapter {
     pub(crate) fn new(
         db: DatastoreHandle,
         signals: std::sync::Arc<dyn klights_watch::WatchSignalSubscribe>,
+        positioned_watch: klights_watch::PositionedWatchService,
     ) -> Self {
-        Self { db, signals }
+        Self {
+            db,
+            signals,
+            positioned_watch,
+        }
     }
 }
 
@@ -68,11 +74,7 @@ impl WatchStreamSource for DatastoreWatchStreamAdapter {
         &self,
         request: klights_leader_api::WatchRequest,
     ) -> klights_leader_api::LeaderWatchFuture<'_> {
-        let positioned_watch =
-            crate::control_plane::client::local::datastore_positioned_watch_service(
-                self.db.clone(),
-                self.signals.clone(),
-            );
+        let positioned_watch = self.positioned_watch.clone();
         Box::pin(async move {
             klights_leader_api::LeaderWatch::watch_resources(&positioned_watch, request).await
         })
@@ -108,6 +110,7 @@ impl WatchStreamSource for DatastoreHandle {
         let adapter = DatastoreWatchStreamAdapter::new(
             self.clone(),
             crate::watch_commit_observation_adapter::test_signal_source(self),
+            crate::positioned_watch_adapter::for_test(self.clone()),
         );
         Box::pin(async move {
             adapter
@@ -127,10 +130,7 @@ impl WatchStreamSource for DatastoreHandle {
         &self,
         request: klights_leader_api::WatchRequest,
     ) -> klights_leader_api::LeaderWatchFuture<'_> {
-        let positioned = crate::control_plane::client::local::datastore_positioned_watch_service(
-            self.clone(),
-            crate::watch_commit_observation_adapter::test_signal_source(self),
-        );
+        let positioned = crate::positioned_watch_adapter::for_test(self.clone());
         Box::pin(async move {
             klights_leader_api::LeaderWatch::watch_resources(&positioned, request).await
         })

@@ -1,6 +1,8 @@
 use super::super::queries;
 use super::*;
-impl Datastore {
+use crate::datastore::sqlite::read_store::SqliteReadStore;
+
+impl SqliteReadStore {
     /// Find resources owned by a given owner UID via ownerReferences
     pub async fn find_owned_resources(
         &self,
@@ -318,6 +320,42 @@ impl Datastore {
             .collect();
 
         Ok(filtered)
+    }
+}
+
+impl Datastore {
+    pub async fn find_owned_resources(
+        &self,
+        owner_uid: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>> {
+        self.focused_reads
+            .find_owned_resources(owner_uid, namespace)
+            .await
+    }
+
+    pub async fn list_resources_by_owner_uid(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        owner_uid: &str,
+    ) -> Result<Vec<Resource>> {
+        self.focused_reads
+            .list_resources_by_owner_uid(api_version, kind, namespace, owner_uid)
+            .await
+    }
+
+    pub async fn find_owned_by_name_kind_empty_uid(
+        &self,
+        owner_api_version: &str,
+        owner_name: &str,
+        owner_kind: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<Resource>> {
+        self.focused_reads
+            .find_owned_by_name_kind_empty_uid(owner_api_version, owner_name, owner_kind, namespace)
+            .await
     }
 }
 

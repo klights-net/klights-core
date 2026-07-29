@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use ::redb::{ReadableDatabase, ReadableTable};
+use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 #[cfg(test)]
 use crate::datastore::CommitObservationSink;
 use crate::datastore::redb::helpers;
+use crate::datastore::redb::read_core::{RedbCollectionScope, RedbListQuery, RedbReadCore};
 use crate::datastore::sqlite::create_pending_watch_event;
 #[cfg(test)]
 use crate::datastore::sqlite::publish_pending;
@@ -16,6 +17,7 @@ use klights_cluster_core::Resource;
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::tables;
 
+#[derive(Clone)]
 pub struct RedbNamespaceStore {
     pub accessor: Arc<RedbAccessor>,
     #[cfg(test)]
@@ -62,6 +64,39 @@ impl RedbNamespaceStore {
     // -----------------------------------------------------------------------
     // Namespace CRUD
     // -----------------------------------------------------------------------
+
+    pub async fn get_namespace_impl(&self, name: &str) -> Result<Option<Resource>> {
+        RedbReadCore::new(self.accessor.clone())
+            .get_resource("v1", "Namespace", None, name)
+            .await
+    }
+
+    pub async fn list_namespaces_impl(
+        &self,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+    ) -> Result<crate::datastore::ResourceList> {
+        let page = RedbReadCore::new(self.accessor.clone())
+            .list_resources(
+                "v1",
+                "Namespace",
+                RedbCollectionScope::Cluster,
+                RedbListQuery {
+                    label_selector: label_selector.map(str::to_string),
+                    field_selector: field_selector.map(str::to_string),
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .await?;
+        Ok(crate::datastore::ResourceList {
+            resource_version: page.position.resource_version,
+            watch_replay_position: Some(page.position),
+            items: page.items,
+            continue_token: None,
+            remaining_item_count: None,
+        })
+    }
 
     pub async fn create_ns(&self, name: &str, data: Value) -> Result<Resource> {
         let name_owned = name.to_string();
@@ -172,45 +207,15 @@ impl RedbNamespaceStore {
     // -----------------------------------------------------------------------
 
     pub async fn list_namespace_resources_impl(&self, namespace: &str) -> Result<Vec<Resource>> {
-        let namespace_owned = namespace.to_string();
-        self.db_call("list_namespace_resources_impl", move |db| {
-            let namespace: &str = &namespace_owned;
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::RES_NS)?;
-            let mut items = Vec::new();
-            for e in tbl.iter()? {
-                let (k, val) = e?;
-                let (rv, body) = val.value();
-                let body_owned = body.to_vec();
-                if let Some(res) = helpers::resource_in_ns(k.value(), rv, &body_owned)
-                    && res.namespace.as_deref() == Some(namespace)
-                {
-                    items.push(res);
-                }
-            }
-            Ok(items)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .list_namespace_resources(namespace, None, false)
+            .await
     }
 
     pub async fn list_cluster_resources_impl(&self) -> Result<Vec<Resource>> {
-        self.db_call("list_cluster_resources_impl", move |db| {
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::RES_CLUSTER)?;
-            let mut items = Vec::new();
-            for entry in tbl.iter()? {
-                let (_, val) = entry?;
-                let (rv, body) = val.value();
-                let body_owned = body.to_vec();
-                if let Some(resource) = helpers::resource_in_ns(&[], rv, &body_owned)
-                    && resource.namespace.is_none()
-                {
-                    items.push(resource);
-                }
-            }
-            Ok(items)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .list_cluster_resources()
+            .await
     }
 
     pub async fn list_namespace_resources_of_kind_impl(
@@ -218,28 +223,9 @@ impl RedbNamespaceStore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        let kind_owned = kind.to_string();
-        let namespace_owned = namespace.to_string();
-        self.db_call("list_namespace_resources_of_kind_impl", move |db| {
-            let kind: &str = &kind_owned;
-            let namespace: &str = &namespace_owned;
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::RES_NS)?;
-            let mut items = Vec::new();
-            for e in tbl.iter()? {
-                let (k, val) = e?;
-                let (rv, body) = val.value();
-                let body_owned = body.to_vec();
-                if let Some(res) = helpers::resource_in_ns(k.value(), rv, &body_owned)
-                    && res.namespace.as_deref() == Some(namespace)
-                    && res.kind == kind
-                {
-                    items.push(res);
-                }
-            }
-            Ok(items)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .list_namespace_resources(namespace, Some(kind), false)
+            .await
     }
 
     pub async fn list_namespace_resources_excluding_kind_impl(
@@ -247,50 +233,15 @@ impl RedbNamespaceStore {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        let kind_owned = kind.to_string();
-        let namespace_owned = namespace.to_string();
-        self.db_call("list_namespace_resources_excluding_kind_impl", move |db| {
-            let kind: &str = &kind_owned;
-            let namespace: &str = &namespace_owned;
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::RES_NS)?;
-            let mut items = Vec::new();
-            for e in tbl.iter()? {
-                let (k, val) = e?;
-                let (rv, body) = val.value();
-                let body_owned = body.to_vec();
-                if let Some(res) = helpers::resource_in_ns(k.value(), rv, &body_owned)
-                    && res.namespace.as_deref() == Some(namespace)
-                    && res.kind != kind
-                {
-                    items.push(res);
-                }
-            }
-            Ok(items)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .list_namespace_resources(namespace, Some(kind), true)
+            .await
     }
 
     pub async fn count_namespace_resources_impl(&self, namespace: &str) -> Result<i64> {
-        let namespace_owned = namespace.to_string();
-        self.db_call("count_namespace_resources_impl", move |db| {
-            let namespace: &str = &namespace_owned;
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::RES_NS)?;
-            let mut count = 0i64;
-            for e in tbl.iter()? {
-                let (k, val) = e?;
-                let (rv, body) = val.value();
-                let body_owned = body.to_vec();
-                if let Some(res) = helpers::resource_in_ns(k.value(), rv, &body_owned)
-                    && res.namespace.as_deref() == Some(namespace)
-                {
-                    count += 1;
-                }
-            }
-            Ok(count)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .count_namespace_resources(namespace)
+            .await
     }
 
     pub async fn delete_namespace_contents_impl(&self, namespace: &str) -> Result<()> {
@@ -328,38 +279,12 @@ impl RedbNamespaceStore {
         kind: &str,
         namespaced: bool,
     ) -> Result<Vec<(Option<String>, String)>> {
-        let api_version_owned = api_version.to_string();
-        let kind_owned = kind.to_string();
-        self.db_call("list_resource_keys_for_scope_impl", move |db| {
-            let api_version: &str = &api_version_owned;
-            let kind: &str = &kind_owned;
-            let r = db.begin_read()?;
-            let tbl = if namespaced {
-                r.open_table(tables::RES_NS)?
-            } else {
-                r.open_table(tables::RES_CLUSTER)?
-            };
-            let mut result = Vec::new();
-            for e in tbl.iter()? {
-                let (_, val) = e?;
-                let (_, body) = val.value();
-                let body_owned = body.to_vec();
-                if let Some(res) = helpers::resource_in_ns(&[], 0, &body_owned)
-                    && res.api_version == api_version
-                    && res.kind == kind
-                {
-                    if namespaced {
-                        if let Some(ns) = &res.namespace {
-                            result.push((Some(ns.clone()), res.name));
-                        }
-                    } else if res.namespace.is_none() {
-                        result.push((None, res.name));
-                    }
-                }
-            }
-            Ok(result)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .list_resource_keys(api_version, kind, namespaced)
+            .await?
+            .into_iter()
+            .map(|key| (key.namespace().map(str::to_string), key.name().to_string()))
+            .collect())
     }
 }
 

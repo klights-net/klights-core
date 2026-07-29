@@ -5,6 +5,9 @@ use super::super::queries;
 use super::super::selector_index;
 use super::helpers::*;
 use super::*;
+use crate::datastore::sqlite::read_store::{
+    SqliteReadStore, SqliteResourceList, SqliteResourceListQuery,
+};
 
 const MAX_INTERNAL_LIST_PREALLOCATION: usize = 4096;
 
@@ -173,7 +176,7 @@ fn list_response_resource_version(_items: &[Resource], current_rv: i64) -> i64 {
     current_rv
 }
 
-impl Datastore {
+impl SqliteReadStore {
     #[cfg(test)]
     pub(crate) fn resource_get_call_count_for_test(&self) -> u64 {
         self.resource_get_call_count
@@ -338,14 +341,14 @@ impl Datastore {
         }
     }
 
-    pub async fn list_resources(
+    pub(in crate::datastore::sqlite) async fn list_resources(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
-    ) -> Result<ResourceList> {
-        let ResourceListQuery {
+        query: SqliteResourceListQuery<'_>,
+    ) -> Result<SqliteResourceList> {
+        let SqliteResourceListQuery {
             label_selector,
             field_selector,
             limit,
@@ -353,11 +356,7 @@ impl Datastore {
         } = query;
         if api_version == "v1" && kind == "Namespace" && namespace.is_none() {
             return self
-                .list_namespaces_page(
-                    label_selector,
-                    field_selector,
-                    ListPageRequest::try_new(limit, continue_token.map(str::to_string))?,
-                )
+                .list_namespaces_page(label_selector, field_selector, limit, continue_token)
                 .await;
         }
 
@@ -520,7 +519,7 @@ impl Datastore {
                 ..watch_position
             });
 
-            return Ok(ResourceList {
+            return Ok(SqliteResourceList {
                 items,
                 resource_version: response_rv,
                 watch_replay_position,
@@ -1060,7 +1059,7 @@ impl Datastore {
                 ..watch_position
             });
 
-            return Ok(ResourceList {
+            return Ok(SqliteResourceList {
                 items,
                 resource_version: response_rv,
                 watch_replay_position,
@@ -1281,7 +1280,7 @@ impl Datastore {
             next_token = Some(items.last().unwrap().name.clone());
         }
         let response_rv = list_response_resource_version(&items, watch_position.resource_version);
-        Ok(ResourceList {
+        Ok(SqliteResourceList {
             items,
             resource_version: response_rv,
             watch_replay_position: Some(WatchReplayPosition {
@@ -1293,34 +1292,11 @@ impl Datastore {
         })
     }
 
-    pub async fn list_resources_page(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        page: ListPageRequest,
-    ) -> Result<ResourceList> {
-        self.list_resources(
-            api_version,
-            kind,
-            namespace,
-            ResourceListQuery::new(
-                label_selector,
-                field_selector,
-                page.limit(),
-                page.continue_token(),
-            ),
-        )
-        .await
-    }
-
     pub async fn list_resources_for_watch_targets(
         &self,
-        targets: &[WatchTarget],
+        targets: &[klights_cluster_store::DurableWatchTarget],
         label_selector: Option<&str>,
-    ) -> Result<ResourceList> {
+    ) -> Result<klights_cluster_store::ResourceScopeSnapshot> {
         let targets = targets.to_vec();
         let label_requirements = label_selector
             .map(parse_label_selector)
@@ -1333,15 +1309,15 @@ impl Datastore {
             let tx = conn.transaction()?;
             let mut items = Vec::new();
             for target in &targets {
-                match &target.scope {
-                    WatchTargetScope::Cluster => {
+                match target.scope() {
+                    klights_cluster_store::DurableWatchScope::Cluster => {
                         let mut query = "SELECT r.id, r.api_version, r.kind, r.name, \
                              r.resource_version, r.uid, r.data \
                              FROM cluster_resources r \
                              WHERE r.api_version = ?1 AND r.kind = ?2"
                             .to_string();
-                        let api_version = target.api_version.clone();
-                        let kind = target.kind.clone();
+                        let api_version = target.api_version().to_string();
+                        let kind = target.kind().to_string();
                         let mut params: Vec<Box<dyn rusqlite::ToSql>> =
                             vec![Box::new(api_version.clone()), Box::new(kind.clone())];
                         let pushdown = selector_index::build_selector_pushdown(
@@ -1376,14 +1352,14 @@ impl Datastore {
                             }
                         }
                     }
-                    WatchTargetScope::Namespaced(namespace) => {
+                    klights_cluster_store::DurableWatchScope::Namespaced(namespace) => {
                         let mut query = "SELECT r.id, r.api_version, r.kind, r.namespace, \
                              r.name, r.resource_version, r.uid, r.data \
                              FROM namespaced_resources r \
                              WHERE r.api_version = ?1 AND r.kind = ?2"
                             .to_string();
-                        let api_version = target.api_version.clone();
-                        let kind = target.kind.clone();
+                        let api_version = target.api_version().to_string();
+                        let kind = target.kind().to_string();
                         let mut params: Vec<Box<dyn rusqlite::ToSql>> =
                             vec![Box::new(api_version.clone()), Box::new(kind.clone())];
                         if let Some(namespace) = namespace {
@@ -1425,11 +1401,13 @@ impl Datastore {
                 }
                 #[cfg(test)]
                 maybe_pause_list_resources_snapshot_after_rows_for_test(
-                    &target.api_version,
-                    &target.kind,
-                    match &target.scope {
-                        WatchTargetScope::Cluster => None,
-                        WatchTargetScope::Namespaced(namespace) => namespace.as_deref(),
+                    target.api_version(),
+                    target.kind(),
+                    match target.scope() {
+                        klights_cluster_store::DurableWatchScope::Cluster => None,
+                        klights_cluster_store::DurableWatchScope::Namespaced(namespace) => {
+                            namespace.as_deref()
+                        }
                     },
                     label_selector_for_pause.as_deref(),
                     None,
@@ -1442,13 +1420,13 @@ impl Datastore {
             let response_rv =
                 list_response_resource_version(&items, watch_replay_position.resource_version);
             watch_replay_position.resource_version = response_rv;
-            Ok(ResourceList {
-                items,
-                resource_version: response_rv,
-                watch_replay_position: Some(watch_replay_position),
-                continue_token: None,
-                remaining_item_count: None,
-            })
+            klights_cluster_store::ResourceScopeSnapshot::try_new(items, watch_replay_position)
+                .map_err(|error| {
+                    tokio_rusqlite::Error::Other(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error.to_string(),
+                    )))
+                })
         })
         .await
         .map_err(|err| anyhow!("Failed to atomically list watch targets: {err}"))
@@ -1475,12 +1453,15 @@ impl Datastore {
         api_version: String,
         kind: String,
         namespaced: bool,
-    ) -> Result<Vec<(Option<String>, String)>> {
+    ) -> Result<Vec<klights_cluster_store::ResourceCollectionKey>> {
         if namespaced {
             self.read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(queries::NAMESPACED_KEYS_FOR_SCOPE)?;
                 let rows = stmt.query_map([api_version, kind], |row| {
-                    Ok((Some(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
+                    Ok(klights_cluster_store::ResourceCollectionKey::new(
+                        Some(row.get::<_, String>(0)?),
+                        row.get::<_, String>(1)?,
+                    ))
                 })?;
                 let mut out = Vec::new();
                 for row in rows {
@@ -1494,7 +1475,10 @@ impl Datastore {
             self.read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(queries::CLUSTER_KEYS_FOR_SCOPE)?;
                 let rows = stmt.query_map([api_version, kind], |row| {
-                    Ok((None, row.get::<_, String>(0)?))
+                    Ok(klights_cluster_store::ResourceCollectionKey::new(
+                        None::<String>,
+                        row.get::<_, String>(0)?,
+                    ))
                 })?;
                 let mut out = Vec::new();
                 for row in rows {
@@ -1514,6 +1498,163 @@ impl Datastore {
             })
             .await?;
         Ok(rv)
+    }
+}
+
+impl Datastore {
+    #[cfg(test)]
+    pub(crate) fn resource_get_call_count_for_test(&self) -> u64 {
+        self.focused_reads.resource_get_call_count_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_list_resources_snapshot_pause_for_test(
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> std::sync::Arc<ListResourcesSnapshotPause> {
+        SqliteReadStore::install_list_resources_snapshot_pause_for_test(
+            api_version,
+            kind,
+            namespace,
+            label_selector,
+            field_selector,
+            limit,
+            continue_token,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_list_resources_snapshot_after_rows_pause_for_test(
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> std::sync::Arc<ListResourcesSnapshotPause> {
+        SqliteReadStore::install_list_resources_snapshot_after_rows_pause_for_test(
+            api_version,
+            kind,
+            namespace,
+            label_selector,
+            field_selector,
+            limit,
+            continue_token,
+        )
+    }
+
+    pub async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>> {
+        self.focused_reads
+            .get_resource(api_version, kind, namespace, name)
+            .await
+    }
+
+    pub async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        query: ResourceListQuery<'_>,
+    ) -> Result<ResourceList> {
+        let list = self
+            .focused_reads
+            .list_resources(
+                api_version,
+                kind,
+                namespace,
+                SqliteResourceListQuery::new(
+                    query.label_selector,
+                    query.field_selector,
+                    query.limit,
+                    query.continue_token,
+                ),
+            )
+            .await?;
+        Ok(ResourceList {
+            items: list.items,
+            resource_version: list.resource_version,
+            watch_replay_position: list.watch_replay_position,
+            continue_token: list.continue_token,
+            remaining_item_count: list.remaining_item_count,
+        })
+    }
+
+    pub async fn list_resources_page(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> Result<ResourceList> {
+        self.list_resources(
+            api_version,
+            kind,
+            namespace,
+            ResourceListQuery::new(
+                label_selector,
+                field_selector,
+                page.limit(),
+                page.continue_token(),
+            ),
+        )
+        .await
+    }
+
+    pub async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        let snapshot = self
+            .focused_reads
+            .list_resources_for_watch_targets(&focused_watch_targets(targets), label_selector)
+            .await?;
+        let position = snapshot.snapshot().position();
+        Ok(ResourceList {
+            items: snapshot.into_items(),
+            resource_version: position.resource_version,
+            watch_replay_position: Some(position),
+            continue_token: None,
+            remaining_item_count: None,
+        })
+    }
+
+    pub async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
+        self.focused_reads.list_cluster_resources().await
+    }
+
+    pub async fn list_resource_keys_for_scope(
+        &self,
+        api_version: String,
+        kind: String,
+        namespaced: bool,
+    ) -> Result<Vec<(Option<String>, String)>> {
+        self.focused_reads
+            .list_resource_keys_for_scope(api_version, kind, namespaced)
+            .await
+            .map(|keys| {
+                keys.into_iter()
+                    .map(|key| (key.namespace().map(str::to_string), key.name().to_string()))
+                    .collect()
+            })
+    }
+
+    pub async fn get_current_resource_version(&self) -> Result<i64> {
+        self.focused_reads.get_current_resource_version().await
     }
 
     /// Allocate a logical list snapshot resourceVersion without emitting a watch event.

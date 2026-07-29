@@ -1,7 +1,7 @@
 use super::super::queries;
 use super::*;
 use anyhow::Context;
-use klights_cluster_store::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+use klights_cluster_store::DataplanePeerMetadata;
 use klights_types::ClusterCidr;
 use rusqlite::OptionalExtension;
 
@@ -172,18 +172,7 @@ impl Datastore {
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
-        let node_name = node_name.to_string();
-        self.read_db_call("db_query", move |conn| {
-            conn.query_row(
-                queries::NODE_SUBNET_SELECT_BY_NAME,
-                rusqlite::params![node_name],
-                row_to_node_subnet,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("Failed to get node subnet: {}", e))
+        self.focused_reads.get_node_subnet(node_name).await
     }
 
     /// List all node subnets or every peer except one explicitly named node.
@@ -194,17 +183,7 @@ impl Datastore {
         &self,
         request: klights_cluster_store::PeerTopologyRequest,
     ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
-        let excluded_node_name = request
-            .excluded_node_name()
-            .map_or_else(String::new, |node_name| node_name.as_str().to_string());
-        self.read_db_call("db_query", move |conn| {
-            let mut stmt = conn.prepare(queries::NODE_SUBNET_LIST_PEERS)?;
-            stmt.query_map(rusqlite::params![excluded_node_name], row_to_node_subnet)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("Failed to list peer subnets: {}", e))
+        self.focused_reads.list_peer_subnets(request).await
     }
 
     /// F2-04: persist the peer-mode + hostport-range projection from
@@ -268,46 +247,8 @@ impl Datastore {
         &self,
         node_name: &str,
     ) -> Result<Option<DataplanePeerMetadata>> {
-        let node_name = node_name.to_string();
-        self.read_db_call("db_query", move |conn| {
-            conn.query_row(
-                queries::NODE_DATAPLANE_SELECT_BY_NAME,
-                rusqlite::params![node_name],
-                row_to_node_dataplane,
-            )
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("Failed to get node dataplane metadata: {}", e))
+        self.focused_reads.get_node_dataplane(node_name).await
     }
-}
-
-fn row_to_node_dataplane(row: &rusqlite::Row<'_>) -> rusqlite::Result<DataplanePeerMetadata> {
-    let node_name: String = row.get(0)?;
-    let mode: String = row.get(1)?;
-    let encryption: String = row.get(2)?;
-    let public_key: Option<String> = row.get(3)?;
-    let endpoint: String = row.get(4)?;
-    let port: Option<i64> = row.get(5)?;
-    let port = port
-        .map(u16::try_from)
-        .transpose()
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-
-    DataplanePeerMetadata::try_new(
-        node_name,
-        DataplaneMode::parse(&mode).map_err(to_sql_error)?,
-        DataplaneEncryption::parse(Some(&encryption)).map_err(to_sql_error)?,
-        public_key,
-        Some(endpoint),
-        port,
-    )
-    .map_err(to_sql_error)
-}
-
-fn to_sql_error(err: impl std::fmt::Display) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err.to_string())))
 }
 
 #[cfg(test)]

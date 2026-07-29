@@ -85,17 +85,13 @@ impl CronJobSchedulerRuntime for LeaderCronJobSchedulerRuntime {
 
 pub(crate) fn new_leader_scheduler(
     db: DatastoreHandle,
-    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    positioned_watch: klights_watch::PositionedWatchService,
     dispatcher: Arc<ControllerDispatcher>,
     supervisor: Arc<TaskSupervisor>,
 ) -> Arc<CronJobScheduler> {
     CronJobScheduler::new(
         Arc::new(LeaderCronJobSchedulerRuntime {
-            positioned_watch:
-                crate::control_plane::client::local::datastore_positioned_watch_service(
-                    db.clone(),
-                    watch_signals,
-                ),
+            positioned_watch,
             db,
             dispatcher,
         }),
@@ -138,11 +134,7 @@ mod tests {
             ),
         );
         let runtime = LeaderCronJobSchedulerRuntime {
-            positioned_watch:
-                crate::control_plane::client::local::datastore_positioned_watch_service(
-                    db_handle.clone(),
-                    crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
-                ),
+            positioned_watch: crate::positioned_watch_adapter::for_test(db_handle.clone()),
             db: db_handle,
             dispatcher,
         };

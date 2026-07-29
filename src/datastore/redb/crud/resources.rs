@@ -5,14 +5,15 @@
 
 use std::sync::Arc;
 
-use ::redb::{ReadableDatabase, ReadableTable};
+use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 #[cfg(test)]
 use crate::datastore::CommitObservationSink;
 use crate::datastore::redb::helpers;
-use crate::datastore::redb::key_codec::{lex_next, resource_key, resource_prefix};
+use crate::datastore::redb::key_codec::resource_key;
+use crate::datastore::redb::read_core::{RedbCollectionScope, RedbListQuery, RedbReadCore};
 use crate::datastore::sqlite::create_pending_watch_event;
 #[cfg(test)]
 use crate::datastore::sqlite::publish_pending;
@@ -21,6 +22,7 @@ use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::tables;
 
+#[derive(Clone)]
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
     wall_clock: Arc<dyn klights_supervisor::WallClock>,
@@ -43,6 +45,7 @@ impl RedbResourceStore {
     }
 
     /// Run a synchronous redb closure on the DB-category blocking pool.
+    #[cfg(test)]
     async fn db_call<T, F>(&self, label: &str, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -499,35 +502,9 @@ impl RedbResourceStore {
         ns: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        let key = resource_key(av, kind, ns, name);
-        let av_owned = av.to_string();
-        let kind_owned = kind.to_string();
-        let ns_owned = ns.map(|s| s.to_string());
-        let name_owned = name.to_string();
-        self.db_call("get_res", move |db| {
-            let res_tbl = if ns_owned.is_some() {
-                tables::RES_NS
-            } else {
-                tables::RES_CLUSTER
-            };
-            let r = db.begin_read()?;
-            let tbl = r.open_table(res_tbl)?;
-            Ok(tbl.get(key.as_slice())?.map(|g| {
-                let (rv, body) = g.value();
-                let data = helpers::body_val(body);
-                Resource {
-                    id: 0,
-                    api_version: av_owned,
-                    kind: kind_owned,
-                    namespace: ns_owned.clone(),
-                    name: name_owned,
-                    uid: Resource::uid_from_data(&data),
-                    resource_version: rv as i64,
-                    data,
-                }
-            }))
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .get_resource(av, kind, ns, name)
+            .await
     }
 
     pub async fn update_res(
@@ -873,236 +850,35 @@ impl RedbResourceStore {
         ns: Option<&str>,
         query: ResourceListQuery<'_>,
     ) -> Result<ResourceList> {
-        let ResourceListQuery {
-            label_selector,
-            field_selector,
-            limit,
-            continue_token: ct,
-        } = query;
-        let limit = limit.filter(|lim| *lim > 0);
-        let av_owned = av.to_string();
-        let kind_owned = kind.to_string();
-        let ns_owned = ns.map(|s| s.to_string());
-        let ct_owned = ct.map(|s| s.to_string());
-        let ls_owned = label_selector.map(|s| s.to_string());
-        let fs_owned = field_selector.map(|s| s.to_string());
-        let has_selectors = ls_owned.is_some() || fs_owned.is_some();
-
-        let parsed_label_reqs = if let Some(ref sel) = ls_owned {
-            Some(klights_types::parse_label_selector(sel)?)
-        } else {
-            None
-        };
-        let parsed_field_selector = fs_owned
-            .as_deref()
-            .map(klights_types::FieldSelector::parse)
-            .transpose()?;
-
-        let result = self
-            .db_call("list_res", move |db| {
-                let r = db.begin_read()?;
-                let watch_replay_position = helpers::watch_replay_position_in_read(&r)?;
-
-                // Selector path: filter inside the scan loop, stop early
-                // once we have limit+1 matches. No remainingItemCount.
-                if has_selectors {
-                    let target = limit
-                        .map(|lim| {
-                            usize::try_from(lim.max(1))
-                                .unwrap_or(usize::MAX)
-                                .saturating_add(1)
-                        })
-                        .unwrap_or(usize::MAX);
-
-                    let mut matches: Vec<Resource> = Vec::new();
-
-                    let mut scan = |tbl_def: ::redb::TableDefinition<&[u8], (u64, &[u8])>,
-                                    ns_filter: Option<&str>|
-                     -> Result<()> {
-                        let tbl = r.open_table(tbl_def)?;
-                        let start_prefix = resource_prefix(&av_owned, &kind_owned, ns_filter);
-                        let start = ct_owned
-                            .as_deref()
-                            .and_then(|name| {
-                                lex_next(&resource_key(&av_owned, &kind_owned, ns_filter, name))
-                            })
-                            .unwrap_or_else(|| {
-                                let mut k = start_prefix.clone();
-                                k.push(0u8);
-                                k
-                            });
-                        let end = lex_next(&start_prefix).unwrap_or_else(|| {
-                            let mut v = start_prefix;
-                            v.push(0xFF);
-                            v
-                        });
-
-                        for e in tbl.range(start.as_slice()..end.as_slice())? {
-                            if matches.len() >= target {
-                                break;
-                            }
-                            let (_k, val) = e?;
-                            let (rv_u64, body) = val.value();
-
-                            let data: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-
-                            // Label selector filter
-                            if let Some(ref reqs) = parsed_label_reqs {
-                                let labels = data
-                                    .get("metadata")
-                                    .and_then(|m| m.get("labels"))
-                                    .and_then(|l| l.as_object());
-                                if !reqs.iter().all(|req| req.matches(labels)) {
-                                    continue;
-                                }
-                            }
-
-                            // Field selector filter
-                            if let Some(ref selector) = parsed_field_selector
-                                && !selector.matches_resource_with_identity(
-                                    &av_owned,
-                                    &kind_owned,
-                                    &data,
-                                )
-                            {
-                                continue;
-                            }
-
-                            let item_name = data
-                                .get("metadata")
-                                .and_then(|m| m.get("name"))
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("");
-                            matches.push(Resource {
-                                id: 0,
-                                api_version: av_owned.clone(),
-                                kind: kind_owned.clone(),
-                                namespace: ns_owned.clone(),
-                                name: item_name.into(),
-                                uid: Resource::uid_from_data(&data),
-                                resource_version: rv_u64 as i64,
-                                data: Arc::new(data),
-                            });
-                        }
-                        Ok(())
-                    };
-
-                    if let Some(ref ns_val) = ns_owned {
-                        scan(tables::RES_NS, Some(ns_val))?;
-                    } else {
-                        scan(tables::RES_NS, None)?;
-                        scan(tables::RES_CLUSTER, None)?;
-                    }
-
-                    let has_more = limit.is_some_and(|limit| {
-                        i64::try_from(matches.len()).unwrap_or(i64::MAX) > limit
-                    });
-                    if has_more
-                        && let Some(limit) = limit.and_then(|value| usize::try_from(value).ok())
-                    {
-                        matches.truncate(limit);
-                    }
-                    let continue_token = if has_more {
-                        matches.last().map(|r| r.name.clone())
-                    } else {
-                        None
-                    };
-                    // Selector lists omit remainingItemCount — exact count
-                    // would require scanning all rows.
-                    return Ok(ResourceList {
-                        resource_version: watch_replay_position.resource_version,
-                        watch_replay_position: Some(watch_replay_position),
-                        items: matches,
-                        continue_token,
-                        remaining_item_count: None,
-                    });
-                }
-
-                // Non-selector path: original behavior with exact counts.
-                let non_selector_limit =
-                    limit.map(|lim| usize::try_from(lim).unwrap_or(usize::MAX));
-                let mut items: Vec<Resource> = Vec::new();
-                let mut has_more = false;
-                let mut remaining_after_page = 0_i64;
-
-                let mut scan = |tbl_def: ::redb::TableDefinition<&[u8], (u64, &[u8])>,
-                                ns_filter: Option<&str>|
-                 -> Result<()> {
-                    let tbl = r.open_table(tbl_def)?;
-                    let start_prefix = resource_prefix(&av_owned, &kind_owned, ns_filter);
-                    let start = ct_owned
-                        .as_deref()
-                        .and_then(|name| {
-                            lex_next(&resource_key(&av_owned, &kind_owned, ns_filter, name))
-                        })
-                        .unwrap_or_else(|| {
-                            let mut k = start_prefix.clone();
-                            k.push(0u8);
-                            k
-                        });
-                    let end = lex_next(&start_prefix).unwrap_or_else(|| {
-                        let mut v = start_prefix;
-                        v.push(0xFF);
-                        v
-                    });
-                    for e in tbl.range(start.as_slice()..end.as_slice())? {
-                        let (_k, val) = e?;
-                        if let Some(max) = non_selector_limit
-                            && items.len() >= max
-                        {
-                            has_more = true;
-                            remaining_after_page += 1;
-                            continue;
-                        }
-                        let (rv_u64, body) = val.value();
-                        let body_owned = body.to_vec();
-                        let data: Value =
-                            serde_json::from_slice(&body_owned).unwrap_or(Value::Null);
-                        let item_name = data
-                            .get("metadata")
-                            .and_then(|m| m.get("name"))
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("");
-                        items.push(Resource {
-                            id: 0,
-                            api_version: av_owned.clone(),
-                            kind: kind_owned.clone(),
-                            namespace: ns_owned.clone(),
-                            name: item_name.into(),
-                            uid: Resource::uid_from_data(&data),
-                            resource_version: rv_u64 as i64,
-                            data: Arc::new(data),
-                        });
-                    }
-                    Ok(())
-                };
-
-                if let Some(ref ns_val) = ns_owned {
-                    scan(tables::RES_NS, Some(ns_val))?;
-                } else {
-                    scan(tables::RES_NS, None)?;
-                    scan(tables::RES_CLUSTER, None)?;
-                }
-                let continue_token = if has_more {
-                    items.last().map(|item| item.name.clone())
-                } else {
-                    None
-                };
-                Ok(ResourceList {
-                    resource_version: watch_replay_position.resource_version,
-                    watch_replay_position: Some(watch_replay_position),
-                    items,
-                    continue_token,
-                    remaining_item_count: if has_more {
-                        Some(remaining_after_page)
-                    } else {
-                        None
-                    },
-                })
-            })
+        let page = RedbReadCore::new(self.accessor.clone())
+            .list_resources(
+                av,
+                kind,
+                ns.map_or(RedbCollectionScope::LegacyAny, |namespace| {
+                    RedbCollectionScope::Namespace(namespace.to_string())
+                }),
+                RedbListQuery {
+                    label_selector: query.label_selector.map(str::to_string),
+                    field_selector: query.field_selector.map(str::to_string),
+                    limit: query.limit,
+                    cursor: query.continue_token.map(|name| {
+                        klights_cluster_store::ResourceCollectionKey::new(
+                            ns.map(str::to_string),
+                            name.to_string(),
+                        )
+                    }),
+                },
+            )
             .await?;
-
-        Ok(result)
+        Ok(ResourceList {
+            resource_version: page.position.resource_version,
+            watch_replay_position: Some(page.position),
+            items: page.items,
+            continue_token: page
+                .continuation
+                .map(|continuation| continuation.name().to_string()),
+            remaining_item_count: page.remaining_item_count,
+        })
     }
 
     pub async fn list_res_page(
@@ -1133,84 +909,38 @@ impl RedbResourceStore {
         targets: &[WatchTarget],
         label_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        let targets = targets.to_vec();
-        let label_requirements = label_selector
-            .map(klights_types::parse_label_selector)
-            .transpose()?
-            .unwrap_or_default();
-
-        self.db_call("list_resources_for_watch_targets", move |db| {
-            let read = db.begin_read()?;
-            let mut items = Vec::new();
-
-            for target in targets {
-                let target_start = items.len();
-                let (table_definition, namespace_filter) = match &target.scope {
-                    WatchTargetScope::Cluster => (tables::RES_CLUSTER, None),
-                    WatchTargetScope::Namespaced(namespace) => {
-                        (tables::RES_NS, namespace.as_deref())
-                    }
-                };
-
-                let table = read.open_table(table_definition)?;
-                let start_prefix =
-                    resource_prefix(&target.api_version, &target.kind, namespace_filter);
-                let mut start = start_prefix.clone();
-                start.push(0);
-                let end = lex_next(&start_prefix).unwrap_or_else(|| {
-                    let mut end = start_prefix;
-                    end.push(0xFF);
-                    end
-                });
-                for entry in table.range(start.as_slice()..end.as_slice())? {
-                    let (_key, value) = entry?;
-                    let (resource_version, body) = value.value();
-                    let data: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-                    let labels = data
-                        .get("metadata")
-                        .and_then(|metadata| metadata.get("labels"))
-                        .and_then(Value::as_object);
-                    if !label_requirements
-                        .iter()
-                        .all(|requirement| requirement.matches(labels))
-                    {
-                        continue;
-                    }
-                    let namespace = data
-                        .pointer("/metadata/namespace")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let name = data
-                        .pointer("/metadata/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    items.push(Resource {
-                        id: 0,
-                        api_version: target.api_version.clone(),
-                        kind: target.kind.clone(),
-                        namespace,
-                        name,
-                        uid: Resource::uid_from_data(&data),
-                        resource_version: resource_version as i64,
-                        data: Arc::new(data),
-                    });
+        let targets = targets
+            .iter()
+            .map(|target| match &target.scope {
+                WatchTargetScope::Cluster => klights_cluster_store::DurableWatchTarget::cluster(
+                    &target.api_version,
+                    &target.kind,
+                ),
+                WatchTargetScope::Namespaced(None) => {
+                    klights_cluster_store::DurableWatchTarget::namespaced(
+                        &target.api_version,
+                        &target.kind,
+                    )
                 }
-                items[target_start..].sort_by(|left, right| {
-                    (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
-                });
-            }
-
-            let watch_replay_position = helpers::watch_replay_position_in_read(&read)?;
-            Ok(ResourceList {
-                items,
-                resource_version: watch_replay_position.resource_version,
-                watch_replay_position: Some(watch_replay_position),
-                continue_token: None,
-                remaining_item_count: None,
+                WatchTargetScope::Namespaced(Some(namespace)) => {
+                    klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
+                        &target.api_version,
+                        &target.kind,
+                        namespace,
+                    )
+                }
             })
+            .collect::<Vec<_>>();
+        let (items, position) = RedbReadCore::new(self.accessor.clone())
+            .list_resources_for_watch_targets(&targets, label_selector)
+            .await?;
+        Ok(ResourceList {
+            items,
+            resource_version: position.resource_version,
+            watch_replay_position: Some(position),
+            continue_token: None,
+            remaining_item_count: None,
         })
-        .await
     }
 
     // -----------------------------------------------------------------------
@@ -1456,62 +1186,9 @@ impl RedbResourceStore {
         owner_uid: &str,
         ns_filter: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        let owner_uid_owned = owner_uid.to_string();
-        let ns_filter_owned = ns_filter.map(|s| s.to_string());
-        self.db_call("find_owned", move |db| {
-            let owner_uid: &str = &owner_uid_owned;
-            let ns_filter: Option<&str> = ns_filter_owned.as_deref();
-            let prefix = {
-                let mut p = owner_uid.as_bytes().to_vec();
-                p.push(0);
-                p
-            };
-            let end = lex_next(&prefix).unwrap_or_else(|| {
-                let mut v = prefix.clone();
-                v.push(0xFF);
-                v
-            });
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::RESOURCES_BY_OWNER)?;
-            let mut items = Vec::new();
-            for e in tbl.range(prefix.as_slice()..end.as_slice())? {
-                let (_, val) = e?;
-                let (rv_u64, body) = val.value();
-                let body_owned = body.to_vec();
-                let data: Value = serde_json::from_slice(&body_owned).unwrap_or(Value::Null);
-                let item_ns = data
-                    .get("metadata")
-                    .and_then(|m| m.get("namespace"))
-                    .and_then(|n| n.as_str());
-                if let Some(f) = ns_filter
-                    && item_ns != Some(f)
-                {
-                    continue;
-                }
-                let item_name = data
-                    .get("metadata")
-                    .and_then(|m| m.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                let item_av = data
-                    .get("apiVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let item_kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                items.push(Resource {
-                    id: 0,
-                    api_version: item_av.to_string(),
-                    kind: item_kind.to_string(),
-                    namespace: item_ns.map(|s| s.to_string()),
-                    name: item_name.to_string(),
-                    uid: Resource::uid_from_data(&data),
-                    resource_version: rv_u64 as i64,
-                    data: Arc::new(data),
-                });
-            }
-            Ok(items)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .find_owned(owner_uid, ns_filter)
+            .await
     }
 }
 

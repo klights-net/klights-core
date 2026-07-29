@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use klights_reconcile_api::{ControllerStoreError, ControllerStoreResult};
 
 use crate::controllers::scheduler::SchedulerRuntime;
-use crate::datastore::DatastoreHandle;
 use klights_leader_api::{LeaderWatch, LeaderWatchError, WatchRequest, WatchStream};
 
 pub(crate) struct LeaderSchedulerRuntime {
@@ -14,16 +13,11 @@ pub(crate) struct LeaderSchedulerRuntime {
 
 impl LeaderSchedulerRuntime {
     pub(crate) fn new(
-        db: DatastoreHandle,
-        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+        positioned_watch: klights_watch::PositionedWatchService,
         pods: Arc<dyn klights_pod_api::PodScheduling>,
     ) -> Self {
         Self {
-            positioned_watch:
-                crate::control_plane::client::local::datastore_positioned_watch_service(
-                    db.clone(),
-                    watch_signals,
-                ),
+            positioned_watch,
             pods,
         }
     }

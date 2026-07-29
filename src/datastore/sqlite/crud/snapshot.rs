@@ -16,10 +16,12 @@ use rusqlite::{OptionalExtension, ToSql};
 use serde_json::Value;
 
 use super::super::queries;
+use super::super::read_store::SqliteReadStore;
 use super::super::scope::use_namespaced_table;
-use super::*;
-use crate::datastore::types::{ResourceList, ResourceListQuery, SnapshotAtRv};
 use klights_cluster_core::Resource;
+use klights_cluster_store::{
+    ResourceCollectionKey, ResourceListPage, ResourceListQuery, ResourceListSnapshot,
+};
 use klights_types::LabelSelector;
 
 /// Per-key history facts derived from `watch_events`, relative to the requested
@@ -32,13 +34,44 @@ struct NameHistory {
     earliest_gt_n_type: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SnapshotKey {
+    name: String,
+}
+
+impl SnapshotKey {
+    fn new(_namespace: Option<String>, name: String) -> Self {
+        Self { name }
+    }
+}
+
+impl PartialEq for SnapshotKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for SnapshotKey {}
+
+impl std::hash::Hash for SnapshotKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.name, state);
+    }
+}
+
 /// Closure result: the reconstruction either defers to the live list, reports
 /// the rv as unreconstructable, or yields the raw (unfiltered, unpaginated)
 /// snapshot items sorted by name.
 enum RawSnapshot {
     Current,
     Expired,
-    Items(Vec<Resource>),
+    Items(Vec<Resource>, klights_cluster_core::WatchReplayPosition),
+}
+
+pub(in crate::datastore::sqlite) enum ExactSnapshotRead {
+    Current,
+    Expired,
+    List(ResourceListPage),
 }
 
 fn json_from_bytes(bytes: Vec<u8>) -> rusqlite::Result<Value> {
@@ -72,15 +105,15 @@ fn resource_from_event(
     }
 }
 
-impl Datastore {
-    pub async fn snapshot_resources_at_rv(
+impl SqliteReadStore {
+    pub(in crate::datastore::sqlite) async fn snapshot_resources_at_rv(
         &self,
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        query: ResourceListQuery<'_>,
+        query: ResourceListQuery,
         snapshot_rv: i64,
-    ) -> Result<SnapshotAtRv> {
+    ) -> Result<ExactSnapshotRead> {
         let av = api_version.to_string();
         let k = kind.to_string();
         let ns_owned = namespace.map(str::to_string);
@@ -115,7 +148,8 @@ impl Datastore {
                 //    a dedicated table without a created_rv column, so their
                 //    existence at N is derived from watch_events history instead
                 //    (created_rv = None).
-                let mut current: HashMap<String, (i64, Option<i64>, Resource)> = HashMap::new();
+                let mut current: HashMap<SnapshotKey, (i64, Option<i64>, Resource)> =
+                    HashMap::new();
                 if is_namespace {
                     let mut stmt =
                         tx.prepare("SELECT name, resource_version, uid, data FROM namespaces")?;
@@ -141,7 +175,7 @@ impl Datastore {
                     })?;
                     for row in rows {
                         let (name, rv, res) = row?;
-                        current.insert(name, (rv, None, res));
+                        current.insert(SnapshotKey::new(None, name), (rv, None, res));
                     }
                 } else if namespaced {
                     let mut sql =
@@ -181,7 +215,10 @@ impl Datastore {
                     })?;
                     for row in rows {
                         let (name, rv, created_rv, res) = row?;
-                        current.insert(name, (rv, Some(created_rv), res));
+                        current.insert(
+                            SnapshotKey::new(res.namespace.clone(), name),
+                            (rv, Some(created_rv), res),
+                        );
                     }
                 } else {
                     let mut stmt = tx.prepare(
@@ -212,17 +249,18 @@ impl Datastore {
                     })?;
                     for row in rows {
                         let (name, rv, created_rv, res) = row?;
-                        current.insert(name, (rv, Some(created_rv), res));
+                        current.insert(SnapshotKey::new(None, name), (rv, Some(created_rv), res));
                     }
                 }
 
                 // 2. Per-key history facts from watch_events (structure only —
                 //    object bytes are fetched lazily for the keys we need).
-                let mut histories: HashMap<String, NameHistory> = HashMap::new();
+                let mut histories: HashMap<SnapshotKey, NameHistory> = HashMap::new();
                 {
-                    let mut sql = "SELECT name, resource_version, event_type FROM watch_events \
+                    let mut sql =
+                        "SELECT namespace, name, resource_version, event_type FROM watch_events \
                          WHERE api_version = ?1 AND kind = ?2"
-                        .to_string();
+                            .to_string();
                     let mut params: Vec<Box<dyn ToSql>> =
                         vec![Box::new(av.clone()), Box::new(k.clone())];
                     if namespaced {
@@ -239,38 +277,42 @@ impl Datastore {
                     let pref: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
                     let mut stmt = tx.prepare(&sql)?;
                     let rows = stmt.query_map(&pref[..], |row| {
-                        let name: String = row.get(0)?;
-                        let rv: i64 = row.get(1)?;
-                        let etype: String = row.get(2)?;
-                        Ok((name, rv, etype))
+                        let namespace: Option<String> = row.get(0)?;
+                        let name: String = row.get(1)?;
+                        let rv: i64 = row.get(2)?;
+                        let event_type: String = row.get(3)?;
+                        Ok((SnapshotKey::new(namespace, name), rv, event_type))
                     })?;
                     for row in rows {
-                        let (name, rv, etype) = row?;
-                        let h = histories.entry(name).or_default();
+                        let (key, rv, event_type) = row?;
+                        let history = histories.entry(key).or_default();
                         if rv <= n {
                             // Ascending order: the last <= N seen wins.
-                            h.latest_le_n = Some((rv, etype));
-                        } else if h.earliest_gt_n_type.is_none() {
-                            h.earliest_gt_n_type = Some(etype);
+                            history.latest_le_n = Some((rv, event_type));
+                        } else if history.earliest_gt_n_type.is_none() {
+                            history.earliest_gt_n_type = Some(event_type);
                         }
                     }
                 }
 
                 // 3. Decide each key's state at N.
                 let mut result: BTreeMap<String, Resource> = BTreeMap::new();
-                let mut to_apply: Vec<(String, i64)> = Vec::new();
+                let mut to_apply: Vec<(SnapshotKey, i64)> = Vec::new();
                 let mut expired = false;
 
-                for (name, (rv, created_rv, res)) in &current {
+                for (key, (rv, created_rv, res)) in &current {
                     if *rv <= n {
                         // Unchanged since rv <= N: live row is the state at N.
-                        result.insert(name.clone(), res.clone());
+                        result.insert(key.name.clone(), res.clone());
                         continue;
                     }
                     // Changed after N — rebuild from the latest event <= N.
-                    match histories.get(name).and_then(|h| h.latest_le_n.as_ref()) {
+                    match histories
+                        .get(key)
+                        .and_then(|history| history.latest_le_n.as_ref())
+                    {
                         Some((le_rv, etype)) if etype != "DELETED" => {
-                            to_apply.push((name.clone(), *le_rv));
+                            to_apply.push((key.clone(), *le_rv));
                         }
                         Some(_) => { /* deleted at/before N, re-created after: absent */ }
                         None => {
@@ -284,8 +326,8 @@ impl Datastore {
                                 Some(crv) => *crv <= n,
                                 None => {
                                     histories
-                                        .get(name)
-                                        .and_then(|h| h.earliest_gt_n_type.as_deref())
+                                        .get(key)
+                                        .and_then(|history| history.earliest_gt_n_type.as_deref())
                                         != Some("ADDED")
                                 }
                             };
@@ -298,19 +340,19 @@ impl Datastore {
                     }
                 }
 
-                for (name, h) in &histories {
-                    if current.contains_key(name) {
+                for (key, history) in &histories {
+                    if current.contains_key(key) {
                         continue;
                     }
                     // Key absent from live rows → deleted after N (or never lived
                     // past the window).
-                    match h.latest_le_n.as_ref() {
+                    match history.latest_le_n.as_ref() {
                         Some((le_rv, etype)) if etype != "DELETED" => {
-                            to_apply.push((name.clone(), *le_rv));
+                            to_apply.push((key.clone(), *le_rv));
                         }
                         Some(_) => { /* deleted at/before N: absent */ }
                         None => {
-                            if h.earliest_gt_n_type.as_deref() != Some("ADDED") {
+                            if history.earliest_gt_n_type.as_deref() != Some("ADDED") {
                                 // Earliest retained change is a modify/delete, so
                                 // the key existed at N but pre-N state is gone.
                                 expired = true;
@@ -327,11 +369,12 @@ impl Datastore {
 
                 // 4. Fetch object bytes for the rebuilt keys. A raft/etcd-style
                 //    transaction may produce several object events at one RV, so
-                //    historical bytes are keyed by (name, rv), not rv alone.
+                //    historical bytes are keyed by (namespace, name, rv), not rv alone.
                 if !to_apply.is_empty() {
-                    let mut sql = "SELECT name, resource_version, data FROM watch_events \
+                    let mut sql =
+                        "SELECT namespace, name, resource_version, data FROM watch_events \
                          WHERE api_version = ?1 AND kind = ?2"
-                        .to_string();
+                            .to_string();
                     let mut params: Vec<Box<dyn ToSql>> =
                         vec![Box::new(av.clone()), Box::new(k.clone())];
                     if namespaced {
@@ -345,7 +388,7 @@ impl Datastore {
                         sql.push_str(" AND namespace IS NULL");
                     }
                     sql.push_str(" AND (");
-                    for (idx, (name, rv)) in to_apply.iter().enumerate() {
+                    for (idx, (key, rv)) in to_apply.iter().enumerate() {
                         if idx > 0 {
                             sql.push_str(" OR ");
                         }
@@ -354,31 +397,33 @@ impl Datastore {
                             params.len() + 1,
                             params.len() + 2
                         ));
-                        params.push(Box::new(name.clone()));
+                        params.push(Box::new(key.name.clone()));
                         params.push(Box::new(*rv));
                     }
                     sql.push(')');
                     let pref: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
                     let mut stmt = tx.prepare(&sql)?;
                     let rows = stmt.query_map(&pref[..], |row| {
-                        let name: String = row.get(0)?;
-                        let rv: i64 = row.get(1)?;
-                        let data = Arc::new(json_from_bytes(row.get(2)?)?);
-                        Ok((name, rv, data))
+                        let namespace: Option<String> = row.get(0)?;
+                        let name: String = row.get(1)?;
+                        let rv: i64 = row.get(2)?;
+                        let data = Arc::new(json_from_bytes(row.get(3)?)?);
+                        Ok((SnapshotKey::new(namespace, name), rv, data))
                     })?;
-                    let mut data_by_name_rv: HashMap<(String, i64), Arc<Value>> = HashMap::new();
+                    let mut data_by_key_rv: HashMap<(SnapshotKey, i64), Arc<Value>> =
+                        HashMap::new();
                     for row in rows {
-                        let (name, rv, data) = row?;
-                        data_by_name_rv.insert((name, rv), data);
+                        let (key, rv, data) = row?;
+                        data_by_key_rv.insert((key, rv), data);
                     }
-                    for (name, le_rv) in &to_apply {
-                        if let Some(data) = data_by_name_rv.get(&(name.clone(), *le_rv)) {
+                    for (key, le_rv) in &to_apply {
+                        if let Some(data) = data_by_key_rv.get(&(key.clone(), *le_rv)) {
                             result.insert(
-                                name.clone(),
+                                key.name.clone(),
                                 resource_from_event(
                                     &av,
                                     &k,
-                                    name,
+                                    &key.name,
                                     *le_rv,
                                     data.clone(),
                                     namespaced,
@@ -388,20 +433,31 @@ impl Datastore {
                     }
                 }
 
-                Ok(RawSnapshot::Items(result.into_values().collect()))
+                let event_id = tx.query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM watch_events WHERE resource_version <= ?1",
+                    rusqlite::params![n],
+                    |row| row.get(0),
+                )?;
+                let items = result.into_values().collect::<Vec<_>>();
+                Ok(RawSnapshot::Items(
+                    items,
+                    klights_cluster_core::WatchReplayPosition {
+                        resource_version: n,
+                        event_id,
+                        resource_version_filter_through_event_id: 0,
+                    },
+                ))
             })
             .await?;
 
-        let items = match raw {
-            RawSnapshot::Current => return Ok(SnapshotAtRv::Current),
-            RawSnapshot::Expired => return Ok(SnapshotAtRv::Expired),
-            RawSnapshot::Items(items) => items,
+        let (items, position) = match raw {
+            RawSnapshot::Current => return Ok(ExactSnapshotRead::Current),
+            RawSnapshot::Expired => return Ok(ExactSnapshotRead::Expired),
+            RawSnapshot::Items(items, position) => (items, position),
         };
 
-        Ok(SnapshotAtRv::List(paginate_snapshot(
-            items,
-            query,
-            snapshot_rv,
+        Ok(ExactSnapshotRead::List(paginate_snapshot(
+            items, &query, position,
         )?))
     }
 }
@@ -411,16 +467,19 @@ impl Datastore {
 /// paths so Exact and live LISTs agree.
 fn paginate_snapshot(
     items: Vec<Resource>,
-    query: ResourceListQuery<'_>,
-    snapshot_rv: i64,
-) -> Result<ResourceList> {
-    let parsed_label = match query.label_selector.filter(|s| !s.trim().is_empty()) {
+    query: &ResourceListQuery,
+    position: klights_cluster_core::WatchReplayPosition,
+) -> Result<ResourceListPage> {
+    let parsed_label = match query
+        .label_selector()
+        .filter(|selector| !selector.trim().is_empty())
+    {
         Some(s) => Some(LabelSelector::parse(s)?),
         None => None,
     };
     let parsed_field = query
-        .field_selector
-        .filter(|s| !s.trim().is_empty())
+        .field_selector()
+        .filter(|selector| !selector.trim().is_empty())
         .map(klights_types::FieldSelector::parse)
         .transpose()?;
 
@@ -435,38 +494,47 @@ fn paginate_snapshot(
                 })
         })
         .collect();
+    filtered.sort_by(|left, right| left.name.cmp(&right.name));
 
-    // Keyset continuation (items are already sorted by name ascending).
-    if let Some(cont) = query.continue_token.filter(|t| !t.is_empty()) {
-        filtered.retain(|r| r.name.as_str() > cont);
+    if let Some(continuation) = query.continuation() {
+        filtered.retain(|resource| resource.name.as_str() > continuation.after().name());
     }
 
     let total = filtered.len() as i64;
-    let (page, continue_token, remaining_item_count) = match query.limit.filter(|l| *l > 0) {
+    let (page, has_more, remaining_item_count) = match query.limit() {
         Some(limit) if total > limit => {
             let page: Vec<Resource> = filtered
                 .into_iter()
                 .take(usize::try_from(limit).unwrap_or(usize::MAX))
                 .collect();
-            let last = page.last().map(|r| r.name.clone());
-            (page, last, Some(total - limit))
+            (page, true, Some(total - limit))
         }
-        _ => (filtered, None, None),
+        _ => (filtered, false, None),
     };
-
-    Ok(ResourceList {
-        items: page,
-        resource_version: snapshot_rv,
-        watch_replay_position: None,
-        continue_token,
-        remaining_item_count,
-    })
+    let snapshot = ResourceListSnapshot::try_new(position)
+        .map_err(|error| anyhow::anyhow!("invalid exact snapshot position: {error}"))?;
+    let continuation = has_more
+        .then(|| {
+            page.last().map(|resource| {
+                klights_cluster_store::ResourceContinuation::new(
+                    ResourceCollectionKey::new(resource.namespace.clone(), resource.name.clone()),
+                    snapshot,
+                )
+            })
+        })
+        .flatten();
+    ResourceListPage::try_new(page, snapshot, continuation, remaining_item_count)
+        .map_err(|error| anyhow::anyhow!("invalid exact snapshot page: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::datastore::sqlite::Datastore;
+    use crate::datastore::{ResourceList, ResourceListQuery, SnapshotAtRv};
+    use klights_cluster_store::{
+        ResourceCollectionScope, ResourceListRead, ResourceListRequest, ResourceVersionMatch,
+    };
     use serde_json::json;
 
     async fn put(db: &Datastore, name: &str, val: &str) -> i64 {
@@ -492,6 +560,152 @@ mod tests {
         let mut v: Vec<String> = list.items.iter().map(|r| r.name.clone()).collect();
         v.sort();
         v
+    }
+
+    async fn put_in_namespace(db: &Datastore, namespace: &str, name: &str) -> i64 {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some(namespace),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": name, "namespace": namespace}
+            }),
+        )
+        .await
+        .unwrap()
+        .resource_version
+    }
+
+    fn lower_identities(read: &ResourceListRead) -> Vec<(Option<String>, String)> {
+        read.items()
+            .iter()
+            .map(|resource| (resource.namespace.clone(), resource.name.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn all_namespace_current_and_exact_preserve_legacy_name_page_oracle() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        put_in_namespace(&db, "ns-a", "a").await;
+        put_in_namespace(&db, "ns-a", "same").await;
+        put_in_namespace(&db, "ns-b", "same").await;
+        let exact_rv = put_in_namespace(&db, "ns-z", "z").await;
+
+        // Force Exact down the historical reconstruction path without changing
+        // the target collection.
+        db.create_resource(
+            "v1",
+            "Secret",
+            Some("ns-a"),
+            "later",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {"name": "later", "namespace": "ns-a"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Independent copies of the pre-extraction SQLite semantics:
+        // current all-namespace LIST scans ORDER BY name and retains ties;
+        // Exact scans without ordering and materializes a name-keyed BTreeMap,
+        // so equal names collapse to the last row observed.
+        let (current_oracle, exact_oracle) = db
+            .read_db_call("legacy-list-oracle", |connection| {
+                let mut current_stmt = connection.prepare(
+                    "SELECT namespace, name FROM namespaced_resources \
+                     WHERE api_version = 'v1' AND kind = 'ConfigMap' ORDER BY name",
+                )?;
+                let current_oracle = current_stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<(Option<String>, String)>>>()?;
+
+                let mut exact_stmt = connection.prepare(
+                    "SELECT namespace, name FROM namespaced_resources \
+                     WHERE api_version = 'v1' AND kind = 'ConfigMap'",
+                )?;
+                let mut exact_by_name = BTreeMap::new();
+                for row in exact_stmt.query_map([], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+                })? {
+                    let identity = row?;
+                    exact_by_name.insert(identity.1.clone(), identity);
+                }
+                Ok((
+                    current_oracle,
+                    exact_by_name.into_values().collect::<Vec<_>>(),
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(current_oracle.len(), 4);
+        assert_eq!(
+            exact_oracle.len(),
+            3,
+            "the legacy Exact name map collapses equal names across namespaces"
+        );
+
+        let store = db.focused_read_store();
+        for (mode, oracle) in [
+            (ResourceVersionMatch::Any, current_oracle),
+            (ResourceVersionMatch::Exact(exact_rv), exact_oracle),
+        ] {
+            let first = klights_cluster_store::ClusterResourceRead::list_resources(
+                store.as_ref(),
+                ResourceListRequest::new(
+                    "v1",
+                    "ConfigMap",
+                    ResourceCollectionScope::AllNamespaces,
+                    klights_cluster_store::ResourceListQuery::try_new(
+                        None,
+                        None,
+                        Some(2),
+                        None,
+                        mode,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(lower_identities(&first), oracle[..2]);
+            let continuation = first
+                .continuation()
+                .cloned()
+                .expect("legacy first page has a name continuation");
+            assert_eq!(continuation.after().name(), oracle[1].1);
+
+            let after = continuation.after().name().to_string();
+            let second_expected = oracle
+                .iter()
+                .filter(|(_, name)| name > &after)
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>();
+            let second = klights_cluster_store::ClusterResourceRead::list_resources(
+                store.as_ref(),
+                ResourceListRequest::new(
+                    "v1",
+                    "ConfigMap",
+                    ResourceCollectionScope::AllNamespaces,
+                    klights_cluster_store::ResourceListQuery::try_new(
+                        None,
+                        None,
+                        Some(2),
+                        Some(continuation),
+                        mode,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(lower_identities(&second), second_expected);
+        }
     }
 
     #[tokio::test]

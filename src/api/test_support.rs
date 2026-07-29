@@ -97,6 +97,7 @@ pub(crate) async fn build_test_app_state_with_db(
     let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
         crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
+        crate::positioned_watch_adapter::for_test(db_handle.clone()),
         klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor.clone(),
         config.data_root.join("etc").join("ca.crt"),
@@ -150,6 +151,7 @@ pub(crate) async fn build_test_app_state_with_db(
                 crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                     db_handle.clone(),
                     crate::watch_commit_observation_adapter::test_signal_source(&db_handle),
+                    crate::positioned_watch_adapter::for_test(db_handle.clone()),
                     task_supervisor.clone(),
                 ),
             builtin_admission_defaults: generated_handler_adapter.clone(),

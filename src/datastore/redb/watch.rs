@@ -4,13 +4,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::Result;
-use bytes::Bytes;
-use serde::Deserialize;
-use serde_json::{Value, value::RawValue};
+use serde_json::Value;
 
-use crate::datastore::redb::helpers;
+use crate::datastore::redb::read_core::{
+    RedbCheckedWatchRead, RedbPositionedWatchRead, RedbReadCore,
+};
 use crate::datastore::types::*;
-use klights_cluster_core::{PositionedWatchEvent, Resource, WatchReplayPosition};
+use klights_cluster_core::WatchReplayPosition;
 use klights_cluster_datastore::redb::RedbAccessor;
 use klights_cluster_datastore::redb::tables;
 
@@ -18,19 +18,62 @@ const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
 const MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES: usize = 16;
 
-#[derive(Deserialize)]
-struct StoredRawWatchEvent<'a> {
-    #[serde(rename = "apiVersion")]
-    api_version: Option<&'a str>,
-    kind: Option<&'a str>,
-    namespace: Option<&'a str>,
-    name: Option<&'a str>,
-    #[serde(rename = "eventType")]
-    event_type: Option<&'a str>,
-    #[serde(rename = "resourceVersion")]
-    resource_version: Option<i64>,
-    #[serde(borrow)]
-    data: Option<&'a RawValue>,
+fn durable_targets(targets: &[WatchTarget]) -> Vec<klights_cluster_store::DurableWatchTarget> {
+    targets
+        .iter()
+        .map(|target| match &target.scope {
+            WatchTargetScope::Cluster => klights_cluster_store::DurableWatchTarget::cluster(
+                &target.api_version,
+                &target.kind,
+            ),
+            WatchTargetScope::Namespaced(None) => {
+                klights_cluster_store::DurableWatchTarget::namespaced(
+                    &target.api_version,
+                    &target.kind,
+                )
+            }
+            WatchTargetScope::Namespaced(Some(namespace)) => {
+                klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
+                    &target.api_version,
+                    &target.kind,
+                    namespace,
+                )
+            }
+        })
+        .collect()
+}
+
+fn durable_to_catchup(event: klights_cluster_store::DurableWatchEvent) -> CatchUpResource {
+    let event_type = std::borrow::Cow::Owned(event.event_type().to_string());
+    CatchUpResource {
+        resource: event.into_resource(),
+        event_type,
+    }
+}
+
+fn durable_floor_to_legacy(floor: klights_cluster_store::DurableReplayFloor) -> WatchReplayFloor {
+    let (target, floor_resource_version, floor_event_id, position_is_exact) = floor.into_parts();
+    let (api_version, kind, namespace_key) = match target {
+        klights_cluster_store::DurableReplayTarget::All => {
+            ("*".to_string(), "*".to_string(), "*".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
+            (api_version, kind, CLUSTER_NAMESPACE_KEY.to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Namespaced {
+            api_version,
+            kind,
+            namespace,
+        } => (api_version, kind, namespace),
+    };
+    WatchReplayFloor {
+        api_version,
+        kind,
+        namespace_key,
+        floor_resource_version,
+        floor_event_id,
+        position_is_exact,
+    }
 }
 
 fn watch_events_min_scope_rows(max_rows: i64, scope_count: usize) -> usize {
@@ -59,6 +102,7 @@ fn watch_events_batch_cap(batch_cap: i64) -> usize {
     }
 }
 
+#[derive(Clone)]
 pub struct RedbWatchStore {
     pub accessor: Arc<RedbAccessor>,
 }
@@ -81,13 +125,13 @@ impl RedbWatchStore {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        let targets_owned = targets.to_vec();
-        self.db_call("watch_list", move |db| {
-            let targets: &[WatchTarget] = &targets_owned;
-            let r = db.begin_read()?;
-            Self::watch_list_in_read(&r, targets, since_rv)
-        })
-        .await
+        let targets = durable_targets(targets);
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .watch_events_since(&targets, since_rv)
+            .await?
+            .into_iter()
+            .map(durable_to_catchup)
+            .collect())
     }
 
     pub async fn watch_list_checked(
@@ -95,26 +139,18 @@ impl RedbWatchStore {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<WatchReplayRead> {
-        if targets.is_empty() {
-            return Ok(WatchReplayRead::Events(Vec::new()));
-        }
-
-        let targets_owned = targets.to_vec();
-        self.db_call("watch_list_checked", move |db| {
-            let targets: &[WatchTarget] = &targets_owned;
-            let r = db.begin_read()?;
-            if since_rv > 0 {
-                for target in targets {
-                    if let Some(floor_rv) = target_floor(&r, target)?
-                        && since_rv < floor_rv
-                    {
-                        return Ok(WatchReplayRead::Expired);
-                    }
+        let targets = durable_targets(targets);
+        Ok(
+            match RedbReadCore::new(self.accessor.clone())
+                .watch_events_since_checked(&targets, since_rv, None)
+                .await?
+            {
+                RedbCheckedWatchRead::Events(events) => {
+                    WatchReplayRead::Events(events.into_iter().map(durable_to_catchup).collect())
                 }
-            }
-            Self::watch_list_in_read(&r, targets, since_rv).map(WatchReplayRead::Events)
-        })
-        .await
+                RedbCheckedWatchRead::Expired => WatchReplayRead::Expired,
+            },
+        )
     }
 
     pub async fn watch_list_checked_bounded(
@@ -123,13 +159,18 @@ impl RedbWatchStore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead> {
-        match self.watch_list_checked(targets, since_rv).await? {
-            WatchReplayRead::Events(mut events) => {
-                events.truncate(limit.get());
-                Ok(WatchReplayRead::Events(events))
-            }
-            WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
-        }
+        let targets = durable_targets(targets);
+        Ok(
+            match RedbReadCore::new(self.accessor.clone())
+                .watch_events_since_checked(&targets, since_rv, Some(limit))
+                .await?
+            {
+                RedbCheckedWatchRead::Events(events) => {
+                    WatchReplayRead::Events(events.into_iter().map(durable_to_catchup).collect())
+                }
+                RedbCheckedWatchRead::Expired => WatchReplayRead::Expired,
+            },
+        )
     }
 
     pub async fn watch_list_raw_checked_bounded(
@@ -138,27 +179,16 @@ impl RedbWatchStore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        if targets.is_empty() {
-            return Ok(WatchReplayRead::Events(Vec::new()));
-        }
-
-        let targets_owned = targets.to_vec();
-        self.db_call("watch_list_raw_checked_bounded", move |db| {
-            let targets: &[WatchTarget] = &targets_owned;
-            let r = db.begin_read()?;
-            if since_rv > 0 {
-                for target in targets {
-                    if let Some(floor_rv) = target_floor(&r, target)?
-                        && since_rv < floor_rv
-                    {
-                        return Ok(WatchReplayRead::Expired);
-                    }
-                }
-            }
-            Self::watch_list_raw_in_read(&r, targets, since_rv, limit.get())
-                .map(WatchReplayRead::Events)
-        })
-        .await
+        let targets = durable_targets(targets);
+        Ok(
+            match RedbReadCore::new(self.accessor.clone())
+                .raw_watch_events_since_checked(&targets, since_rv, limit)
+                .await?
+            {
+                RedbCheckedWatchRead::Events(events) => WatchReplayRead::Events(events),
+                RedbCheckedWatchRead::Expired => WatchReplayRead::Expired,
+            },
+        )
     }
 
     pub async fn watch_list_positioned_checked_bounded(
@@ -167,112 +197,34 @@ impl RedbWatchStore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        let targets = targets.to_vec();
-        self.db_call("watch_list_positioned", move |db| {
-            let read = db.begin_read()?;
-            let current = helpers::watch_replay_position_in_read(&read)?;
-            let high_water_event_id = current.event_id;
-            if position.event_id > high_water_event_id
-                || (position.event_id == 0 && position.resource_version > current.resource_version)
+        let targets = durable_targets(targets);
+        Ok(
+            match RedbReadCore::new(self.accessor.clone())
+                .positioned_watch_events(&targets, position, limit)
+                .await?
             {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            if position.event_id == 0 {
-                for target in &targets {
-                    if target_floor(&read, target)?
-                        .is_some_and(|floor| position.resource_version < floor)
-                    {
-                        return Ok(PositionedWatchReplayRead::Expired);
-                    }
+                RedbPositionedWatchRead::Expired => PositionedWatchReplayRead::Expired,
+                RedbPositionedWatchRead::Events(page) => {
+                    PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                        events: page
+                            .events
+                            .into_iter()
+                            .map(|event| klights_cluster_core::PositionedWatchEvent {
+                                position: event.position,
+                                event: durable_to_catchup(event.event),
+                            })
+                            .collect(),
+                        next_position: page.next_position,
+                    })
                 }
-            } else if position_expired_for_targets(&read, &targets, position.event_id)? {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            let table = read.open_table(tables::WATCH_EVENTS)?;
-            let start_id = if position.event_id == 0 {
-                0
-            } else {
-                position.event_id.saturating_add(1).max(0) as u64
-            };
-            let mut events = Vec::with_capacity(limit.get().min(4096));
-            for entry in table.range(start_id..=high_water_event_id.max(0) as u64)? {
-                let (id, value) = entry?;
-                let event_id = id.value() as i64;
-                let body = value.value().to_vec();
-                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let rv = event
-                    .get("resourceVersion")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                let rv_filter_through = if position.resource_version_filter_through_event_id > 0 {
-                    position.resource_version_filter_through_event_id
-                } else if position.event_id == 0 {
-                    i64::MAX
-                } else {
-                    0
-                };
-                if event_id <= rv_filter_through && rv <= position.resource_version {
-                    continue;
-                }
-                let av = event
-                    .get("apiVersion")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
-                let namespace = event.get("namespace").and_then(Value::as_str);
-                if !targets
-                    .iter()
-                    .any(|target| watch_event_matches_target(target, av, kind, namespace))
-                {
-                    continue;
-                }
-                let data = event.get("data").cloned().unwrap_or(Value::Null);
-                let name = event.get("name").and_then(Value::as_str).unwrap_or("");
-                let event_type = event
-                    .get("eventType")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                events.push(PositionedWatchEvent {
-                    position: WatchReplayPosition {
-                        resource_version: rv,
-                        event_id,
-                        resource_version_filter_through_event_id: 0,
-                    },
-                    event: CatchUpResource {
-                        resource: Resource {
-                            id: 0,
-                            api_version: av.to_string(),
-                            kind: kind.to_string(),
-                            namespace: namespace.map(str::to_string),
-                            name: name.to_string(),
-                            uid: Resource::uid_from_data(&data),
-                            resource_version: rv,
-                            data: Arc::new(data),
-                        },
-                        event_type: std::borrow::Cow::Owned(event_type),
-                    },
-                });
-                if events.len() == limit.get() {
-                    break;
-                }
-            }
-            let next_position =
-                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
-            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                events,
-                next_position,
-            }))
-        })
-        .await
+            },
+        )
     }
 
     pub async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        self.db_call("current_watch_replay_position", |db| {
-            let read = db.begin_read()?;
-            helpers::watch_replay_position_in_read(&read)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .allocator_position()
+            .await
     }
 
     pub async fn watch_list_raw_positioned_checked_bounded(
@@ -281,291 +233,39 @@ impl RedbWatchStore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        let targets = targets.to_vec();
-        self.db_call("watch_list_raw_positioned", move |db| {
-            let read = db.begin_read()?;
-            let current = helpers::watch_replay_position_in_read(&read)?;
-            let high_water_event_id = current.event_id;
-            if position.event_id > high_water_event_id
-                || (position.event_id == 0 && position.resource_version > current.resource_version)
+        let targets = durable_targets(targets);
+        Ok(
+            match RedbReadCore::new(self.accessor.clone())
+                .positioned_raw_watch_events(&targets, position, limit)
+                .await?
             {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            if position.event_id == 0 {
-                for target in &targets {
-                    if target_floor(&read, target)?
-                        .is_some_and(|floor| position.resource_version < floor)
-                    {
-                        return Ok(PositionedWatchReplayRead::Expired);
-                    }
+                RedbPositionedWatchRead::Expired => PositionedWatchReplayRead::Expired,
+                RedbPositionedWatchRead::Events(page) => {
+                    PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                        events: page.events,
+                        next_position: page.next_position,
+                    })
                 }
-            } else if position_expired_for_targets(&read, &targets, position.event_id)? {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            let table = read.open_table(tables::WATCH_EVENTS)?;
-            let start_id = if position.event_id == 0 {
-                0
-            } else {
-                position.event_id.saturating_add(1).max(0) as u64
-            };
-            let mut events = Vec::with_capacity(limit.get().min(4096));
-            for entry in table.range(start_id..=high_water_event_id.max(0) as u64)? {
-                let (id, value) = entry?;
-                let event_id = id.value() as i64;
-                let Ok(event) = serde_json::from_slice::<StoredRawWatchEvent<'_>>(value.value())
-                else {
-                    continue;
-                };
-                let rv = event.resource_version.unwrap_or_default();
-                let rv_filter_through = if position.resource_version_filter_through_event_id > 0 {
-                    position.resource_version_filter_through_event_id
-                } else if position.event_id == 0 {
-                    i64::MAX
-                } else {
-                    0
-                };
-                if event_id <= rv_filter_through && rv <= position.resource_version {
-                    continue;
-                }
-                let av = event.api_version.unwrap_or("");
-                let kind = event.kind.unwrap_or("");
-                if !targets
-                    .iter()
-                    .any(|target| watch_event_matches_target(target, av, kind, event.namespace))
-                {
-                    continue;
-                }
-                events.push(PositionedWatchEvent {
-                    position: WatchReplayPosition {
-                        resource_version: rv,
-                        event_id,
-                        resource_version_filter_through_event_id: 0,
-                    },
-                    event: klights_cluster_store::DurableRawWatchEvent {
-                        api_version: av.to_string(),
-                        kind: kind.to_string(),
-                        namespace: event.namespace.map(str::to_string),
-                        name: event.name.unwrap_or("").to_string(),
-                        resource_version: rv,
-                        event_type: std::borrow::Cow::Owned(
-                            event.event_type.unwrap_or("").to_string(),
-                        ),
-                        object_json: event.data.map_or_else(
-                            || Bytes::from_static(b"null"),
-                            |data| Bytes::copy_from_slice(data.get().as_bytes()),
-                        ),
-                    },
-                });
-                if events.len() == limit.get() {
-                    break;
-                }
-            }
-            let next_position =
-                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
-            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                events,
-                next_position,
-            }))
-        })
-        .await
-    }
-
-    fn watch_list_raw_in_read(
-        read_txn: &::redb::ReadTransaction,
-        targets: &[WatchTarget],
-        since_rv: i64,
-        limit: usize,
-    ) -> Result<Vec<klights_cluster_store::DurableRawWatchEvent>> {
-        let tbl = read_txn.open_table(tables::WATCH_EVENTS)?;
-        let mut result = Vec::new();
-        for e in tbl.iter()? {
-            let (_, event_ref) = e?;
-            let Ok(event) = serde_json::from_slice::<StoredRawWatchEvent<'_>>(event_ref.value())
-            else {
-                continue;
-            };
-            let rv = event.resource_version.unwrap_or_default();
-            if rv <= since_rv {
-                continue;
-            }
-            let ev_av = event.api_version.unwrap_or("");
-            let ev_kind = event.kind.unwrap_or("");
-            let ev_ns = event.namespace;
-            if !targets
-                .iter()
-                .any(|target| watch_event_matches_target(target, ev_av, ev_kind, ev_ns))
-            {
-                continue;
-            }
-
-            result.push(klights_cluster_store::DurableRawWatchEvent {
-                api_version: ev_av.to_string(),
-                kind: ev_kind.to_string(),
-                namespace: ev_ns.map(str::to_string),
-                name: event.name.unwrap_or("").to_string(),
-                resource_version: rv,
-                event_type: std::borrow::Cow::Owned(event.event_type.unwrap_or("").to_string()),
-                object_json: event.data.map_or_else(
-                    || Bytes::from_static(b"null"),
-                    |data| Bytes::copy_from_slice(data.get().as_bytes()),
-                ),
-            });
-            if result.len() >= limit {
-                break;
-            }
-        }
-        Ok(result)
-    }
-
-    fn watch_list_in_read(
-        read_txn: &::redb::ReadTransaction,
-        targets: &[WatchTarget],
-        since_rv: i64,
-    ) -> Result<Vec<CatchUpResource>> {
-        let tbl = read_txn.open_table(tables::WATCH_EVENTS)?;
-        let mut result = Vec::new();
-        for e in tbl.iter()? {
-            let (_, event_ref) = e?;
-            let body = event_ref.value().to_vec();
-            let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let rv = event
-                .get("resourceVersion")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            if rv <= since_rv {
-                continue;
-            }
-            let ev_av = event
-                .get("apiVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ev_kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            let ev_ns = event.get("namespace").and_then(|v| v.as_str());
-            if !targets
-                .iter()
-                .any(|target| watch_event_matches_target(target, ev_av, ev_kind, ev_ns))
-            {
-                continue;
-            }
-
-            let ev_data = event.get("data").cloned().unwrap_or(Value::Null);
-            let ev_type = event
-                .get("eventType")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ev_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            result.push(CatchUpResource {
-                resource: Resource {
-                    id: 0,
-                    api_version: ev_av.to_string(),
-                    kind: ev_kind.to_string(),
-                    namespace: ev_ns.map(|s| s.to_string()),
-                    name: ev_name.to_string(),
-                    uid: Resource::uid_from_data(&ev_data),
-                    resource_version: rv,
-                    data: std::sync::Arc::new(ev_data),
-                },
-                event_type: std::borrow::Cow::Owned(ev_type.to_string()),
-            });
-        }
-        Ok(result)
+            },
+        )
     }
 
     pub async fn watch_list_deleted_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        self.db_call("watch_list_deleted_since", move |db| {
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let mut result = Vec::new();
-            for e in tbl.iter()? {
-                let (_, event_ref) = e?;
-                let body = event_ref.value().to_vec();
-                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let rv = event
-                    .get("resourceVersion")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                if rv <= since_rv {
-                    continue;
-                }
-                let ev_type = event
-                    .get("eventType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if ev_type != "DELETED" {
-                    continue;
-                }
-                let ev_av = event
-                    .get("apiVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ev_kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                let ev_data = event.get("data").cloned().unwrap_or(Value::Null);
-                let ev_ns = event.get("namespace").and_then(|v| v.as_str());
-                let ev_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                result.push(CatchUpResource {
-                    resource: Resource {
-                        id: 0,
-                        api_version: ev_av.to_string(),
-                        kind: ev_kind.to_string(),
-                        namespace: ev_ns.map(str::to_string),
-                        name: ev_name.to_string(),
-                        uid: Resource::uid_from_data(&ev_data),
-                        resource_version: rv,
-                        data: std::sync::Arc::new(ev_data),
-                    },
-                    event_type: std::borrow::Cow::Borrowed("DELETED"),
-                });
-            }
-            Ok(result)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .all_watch_events_since(since_rv, true)
+            .await?
+            .into_iter()
+            .map(durable_to_catchup)
+            .collect())
     }
 
     pub async fn watch_list_all_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        self.db_call("watch_list_all_since", move |db| {
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let mut result = Vec::new();
-            for e in tbl.iter()? {
-                let (_, event_ref) = e?;
-                let body = event_ref.value().to_vec();
-                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let rv = event
-                    .get("resourceVersion")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                if rv <= since_rv {
-                    continue;
-                }
-                let ev_av = event
-                    .get("apiVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ev_kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                let ev_data = event.get("data").cloned().unwrap_or(Value::Null);
-                let ev_type = event
-                    .get("eventType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ev_ns = event.get("namespace").and_then(|v| v.as_str());
-                let ev_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                result.push(CatchUpResource {
-                    resource: Resource {
-                        id: 0,
-                        api_version: ev_av.to_string(),
-                        kind: ev_kind.to_string(),
-                        namespace: ev_ns.map(str::to_string),
-                        name: ev_name.to_string(),
-                        uid: Resource::uid_from_data(&ev_data),
-                        resource_version: rv,
-                        data: std::sync::Arc::new(ev_data),
-                    },
-                    event_type: std::borrow::Cow::Owned(ev_type.to_string()),
-                });
-            }
-            Ok(result)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .all_watch_events_since(since_rv, false)
+            .await?
+            .into_iter()
+            .map(durable_to_catchup)
+            .collect())
     }
 
     pub async fn watch_list_all_since_paged(
@@ -575,59 +275,12 @@ impl RedbWatchStore {
         after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.db_call("watch_list_all_since_paged", move |db| {
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let limit = limit.get();
-            let mut result = Vec::with_capacity(limit.min(4096));
-            let start = after_id.saturating_add(1).max(0) as u64;
-            for e in tbl.range(start..)? {
-                let (id_guard, event_ref) = e?;
-                let event_id = id_guard.value() as i64;
-                let body = event_ref.value().to_vec();
-                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let rv = event
-                    .get("resourceVersion")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                if rv <= since_rv {
-                    continue;
-                }
-                let ev_av = event
-                    .get("apiVersion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ev_kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                let ev_data = event.get("data").cloned().unwrap_or(Value::Null);
-                let ev_type = event
-                    .get("eventType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ev_ns = event.get("namespace").and_then(|v| v.as_str());
-                let ev_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                result.push((
-                    event_id,
-                    CatchUpResource {
-                        resource: Resource {
-                            id: 0,
-                            api_version: ev_av.to_string(),
-                            kind: ev_kind.to_string(),
-                            namespace: ev_ns.map(str::to_string),
-                            name: ev_name.to_string(),
-                            uid: Resource::uid_from_data(&ev_data),
-                            resource_version: rv,
-                            data: std::sync::Arc::new(ev_data),
-                        },
-                        event_type: std::borrow::Cow::Owned(ev_type.to_string()),
-                    },
-                ));
-                if result.len() >= limit {
-                    break;
-                }
-            }
-            Ok(result)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .all_watch_events_since_paged(since_rv, after_id, None, limit)
+            .await?
+            .into_iter()
+            .map(|(event_id, event)| (event_id, durable_to_catchup(event)))
+            .collect())
     }
 
     pub async fn watch_list_all_after_id_bounded(
@@ -636,102 +289,21 @@ impl RedbWatchStore {
         through_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.db_call("watch_list_all_after_id_bounded", move |db| {
-            let r = db.begin_read()?;
-            let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let mut result = Vec::with_capacity(limit.get().min(4096));
-            let start = after_id.saturating_add(1).max(0) as u64;
-            let end = through_id.max(0) as u64;
-            for entry in tbl.range(start..=end)? {
-                let (id, value) = entry?;
-                let event: Value = serde_json::from_slice(value.value()).unwrap_or(Value::Null);
-                let data = event.get("data").cloned().unwrap_or(Value::Null);
-                result.push((
-                    id.value() as i64,
-                    CatchUpResource {
-                        resource: Resource {
-                            id: 0,
-                            api_version: event
-                                .get("apiVersion")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            kind: event
-                                .get("kind")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            namespace: event
-                                .get("namespace")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            name: event
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            uid: Resource::uid_from_data(&data),
-                            resource_version: event
-                                .get("resourceVersion")
-                                .and_then(Value::as_i64)
-                                .unwrap_or_default(),
-                            data: std::sync::Arc::new(data),
-                        },
-                        event_type: std::borrow::Cow::Owned(
-                            event
-                                .get("eventType")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                        ),
-                    },
-                ));
-                if result.len() == limit.get() {
-                    break;
-                }
-            }
-            Ok(result)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .all_watch_events_since_paged(0, after_id, Some(through_id), limit)
+            .await?
+            .into_iter()
+            .map(|(event_id, event)| (event_id, durable_to_catchup(event)))
+            .collect())
     }
 
     pub async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
-        self.db_call("list_watch_replay_floors", |db| {
-            let read = db.begin_read()?;
-            let table = read.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
-            let mut floors = Vec::new();
-            for entry in table.iter()? {
-                let (key, value) = entry?;
-                let mut parts = key.value().splitn(3, |byte| *byte == 0);
-                let (Some(api_version), Some(kind), Some(namespace_key)) =
-                    (parts.next(), parts.next(), parts.next())
-                else {
-                    continue;
-                };
-                let Some((floor_resource_version, floor_event_id)) =
-                    decode_position_floor(value.value())
-                else {
-                    continue;
-                };
-                floors.push(WatchReplayFloor {
-                    api_version: String::from_utf8_lossy(api_version).into_owned(),
-                    kind: String::from_utf8_lossy(kind).into_owned(),
-                    namespace_key: String::from_utf8_lossy(namespace_key).into_owned(),
-                    floor_resource_version: floor_resource_version as i64,
-                    floor_event_id: floor_event_id as i64,
-                    position_is_exact: true,
-                });
-            }
-            floors.sort_by(|left, right| {
-                (&left.api_version, &left.kind, &left.namespace_key).cmp(&(
-                    &right.api_version,
-                    &right.kind,
-                    &right.namespace_key,
-                ))
-            });
-            Ok(floors)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .replay_floors()
+            .await?
+            .into_iter()
+            .map(durable_floor_to_legacy)
+            .collect())
     }
 
     pub async fn list_watch_replay_floors_paged(
@@ -739,56 +311,12 @@ impl RedbWatchStore {
         after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<WatchReplayFloor>> {
-        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
-            return Err(anyhow::anyhow!(
-                "watch replay-floor page limit {} exceeds {}",
-                limit,
-                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
-            ));
-        }
-        let after = after.map(|cursor| match cursor.target() {
-            klights_cluster_store::DurableReplayTarget::All => floor_key("*", "*", "*"),
-            klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
-                floor_key(api_version, kind, CLUSTER_NAMESPACE_KEY)
-            }
-            klights_cluster_store::DurableReplayTarget::Namespaced {
-                api_version,
-                kind,
-                namespace,
-            } => floor_key(api_version, kind, namespace),
-        });
-        let limit = limit.get();
-        self.db_call("list_watch_replay_floors_paged", move |db| {
-            let read = db.begin_read()?;
-            let table = read.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
-            let mut floors = Vec::with_capacity(limit);
-            if let Some(after) = after.as_ref() {
-                for entry in table.range(after.as_slice()..)? {
-                    let (key, value) = entry?;
-                    if key.value() <= after.as_slice() {
-                        continue;
-                    }
-                    if let Some(floor) = decode_watch_replay_floor(key.value(), value.value()) {
-                        floors.push(floor);
-                        if floors.len() == limit {
-                            break;
-                        }
-                    }
-                }
-            } else {
-                for entry in table.iter()? {
-                    let (key, value) = entry?;
-                    if let Some(floor) = decode_watch_replay_floor(key.value(), value.value()) {
-                        floors.push(floor);
-                        if floors.len() == limit {
-                            break;
-                        }
-                    }
-                }
-            }
-            Ok(floors)
-        })
-        .await
+        Ok(RedbReadCore::new(self.accessor.clone())
+            .replay_floors_paged(after, limit)
+            .await?
+            .into_iter()
+            .map(durable_floor_to_legacy)
+            .collect())
     }
 
     pub async fn modified_since(
@@ -946,72 +474,6 @@ fn watch_gc_candidates(
     candidates
 }
 
-fn watch_event_matches_target(
-    target: &WatchTarget,
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-) -> bool {
-    if target.api_version != api_version || target.kind != kind {
-        return false;
-    }
-    match &target.scope {
-        WatchTargetScope::Cluster => namespace.is_none(),
-        WatchTargetScope::Namespaced(Some(want)) => namespace == Some(want.as_str()),
-        WatchTargetScope::Namespaced(None) => namespace.is_some(),
-    }
-}
-
-fn target_floor(read_txn: &::redb::ReadTransaction, target: &WatchTarget) -> Result<Option<i64>> {
-    let scoped = match &target.scope {
-        WatchTargetScope::Cluster => read_floor(
-            read_txn,
-            &target.api_version,
-            &target.kind,
-            CLUSTER_NAMESPACE_KEY,
-        ),
-        WatchTargetScope::Namespaced(Some(namespace)) => {
-            read_floor(read_txn, &target.api_version, &target.kind, namespace)
-        }
-        WatchTargetScope::Namespaced(None) => {
-            read_namespaced_all_floor(read_txn, &target.api_version, &target.kind)
-        }
-    }?;
-    Ok(super::replay_floor::LegacyReplayFloor::read(read_txn)?
-        .and_then(|legacy| legacy.merge_resource_version(scoped))
-        .or(scoped))
-}
-
-fn position_expired_for_targets(
-    read_txn: &::redb::ReadTransaction,
-    targets: &[WatchTarget],
-    event_id: i64,
-) -> Result<bool> {
-    for target in targets {
-        let scoped = match &target.scope {
-            WatchTargetScope::Cluster => read_position_floor(
-                read_txn,
-                &target.api_version,
-                &target.kind,
-                CLUSTER_NAMESPACE_KEY,
-            )?,
-            WatchTargetScope::Namespaced(Some(namespace)) => {
-                read_position_floor(read_txn, &target.api_version, &target.kind, namespace)?
-            }
-            WatchTargetScope::Namespaced(None) => {
-                read_namespaced_all_position_floor(read_txn, &target.api_version, &target.kind)?
-            }
-        };
-        let floor = super::replay_floor::LegacyReplayFloor::read(read_txn)?
-            .and_then(|legacy| legacy.merge_event_id(scoped))
-            .or(scoped);
-        if floor.is_some_and(|floor| event_id < floor) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn encode_position_floor(resource_version: u64, event_id: u64) -> [u8; 16] {
     let mut encoded = [0_u8; 16];
     encoded[..8].copy_from_slice(&resource_version.to_be_bytes());
@@ -1027,100 +489,6 @@ fn decode_position_floor(encoded: &[u8]) -> Option<(u64, u64)> {
         u64::from_be_bytes(encoded[..8].try_into().ok()?),
         u64::from_be_bytes(encoded[8..].try_into().ok()?),
     ))
-}
-
-fn decode_watch_replay_floor(key: &[u8], value: &[u8]) -> Option<WatchReplayFloor> {
-    let mut parts = key.splitn(3, |byte| *byte == 0);
-    let (Some(api_version), Some(kind), Some(namespace_key)) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    let (floor_resource_version, floor_event_id) = decode_position_floor(value)?;
-    Some(WatchReplayFloor {
-        api_version: String::from_utf8_lossy(api_version).into_owned(),
-        kind: String::from_utf8_lossy(kind).into_owned(),
-        namespace_key: String::from_utf8_lossy(namespace_key).into_owned(),
-        floor_resource_version: floor_resource_version as i64,
-        floor_event_id: floor_event_id as i64,
-        position_is_exact: true,
-    })
-}
-
-fn read_position_floor(
-    read_txn: &::redb::ReadTransaction,
-    api_version: &str,
-    kind: &str,
-    namespace_key: &str,
-) -> Result<Option<i64>> {
-    let floors = read_txn.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
-    let key = floor_key(api_version, kind, namespace_key);
-    Ok(floors
-        .get(key.as_slice())?
-        .and_then(|floor| decode_position_floor(floor.value()).map(|(_, id)| id as i64)))
-}
-
-fn read_namespaced_all_position_floor(
-    read_txn: &::redb::ReadTransaction,
-    api_version: &str,
-    kind: &str,
-) -> Result<Option<i64>> {
-    let floors = read_txn.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
-    let prefix = floor_key_prefix(api_version, kind);
-    let mut floor = None;
-    for entry in floors.iter()? {
-        let (key, value) = entry?;
-        let Some(namespace_key) = key.value().strip_prefix(prefix.as_slice()) else {
-            continue;
-        };
-        if namespace_key.is_empty() || namespace_key == CLUSTER_NAMESPACE_KEY.as_bytes() {
-            continue;
-        }
-        let Some((_, event_id)) = decode_position_floor(value.value()) else {
-            continue;
-        };
-        floor = Some(floor.map_or(event_id as i64, |current: i64| current.max(event_id as i64)));
-    }
-    Ok(floor)
-}
-
-fn read_floor(
-    read_txn: &::redb::ReadTransaction,
-    api_version: &str,
-    kind: &str,
-    namespace_key: &str,
-) -> Result<Option<i64>> {
-    let floors = read_txn.open_table(tables::WATCH_REPLAY_FLOORS)?;
-    let key = floor_key(api_version, kind, namespace_key);
-    Ok(floors
-        .get(key.as_slice())?
-        .map(|floor| floor.value() as i64))
-}
-
-fn read_namespaced_all_floor(
-    read_txn: &::redb::ReadTransaction,
-    api_version: &str,
-    kind: &str,
-) -> Result<Option<i64>> {
-    let floors = read_txn.open_table(tables::WATCH_REPLAY_FLOORS)?;
-    let prefix = floor_key_prefix(api_version, kind);
-    let mut floor = None;
-    for entry in floors.iter()? {
-        let (key, value) = entry?;
-        let key = key.value();
-        let namespace_key = match key.strip_prefix(prefix.as_slice()) {
-            Some(namespace_key) if namespace_key != CLUSTER_NAMESPACE_KEY.as_bytes() => {
-                namespace_key
-            }
-            _ => continue,
-        };
-        if namespace_key.is_empty() {
-            continue;
-        }
-        let rv = value.value() as i64;
-        floor = Some(floor.map_or(rv, |current: i64| current.max(rv)));
-    }
-    Ok(floor)
 }
 
 fn floor_key_for_event(event: &Value) -> Option<Vec<u8>> {

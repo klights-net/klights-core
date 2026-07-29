@@ -56,6 +56,7 @@ pub struct OpenLeaderArgs<'a> {
 pub struct DatastorePhase {
     pub db_handle: DatastoreHandle,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    pub positioned_watch: klights_watch::PositionedWatchService,
     pub leader_ports: crate::control_plane::client::LeaderClientPorts,
     pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     /// The concrete leader-side LocalApiClient that the outbox dispatcher
@@ -134,7 +135,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     validate_raft_backend_capability(config.datastore_backend)?;
 
     let watch_commit_wiring = crate::watch_commit_observation_adapter::new_wiring();
-    let passive_backend = crate::datastore::selector::open_with_sink(
+    let opened_passive = crate::datastore::selector::open_with_sink(
         passive_store_open_request(config),
         supervisor.clone(),
         #[cfg(test)]
@@ -143,6 +144,8 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     )
     .await
     .context("Failed to open datastore")?;
+    let passive_backend = opened_passive.backend;
+    let passive_read_ports = opened_passive.read_ports;
 
     // T1.6: joining controlplanes get their initial cluster.db
     // contents from raft (install_snapshot or AppendEntries from index 0
@@ -229,7 +232,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // (quorum = 1). Workers do not enter this composition path and route
     // writes through the outbox/leader proxy.
     let member_feature_probe;
-    let (raft_node, db_handle, local_api_client, leader_proxy, leader_ports) = match (
+    let (raft_node, db_handle, local_services, leader_proxy, leader_ports) = match (
         role,
         leader_node_local.as_ref(),
     ) {
@@ -381,14 +384,20 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     Arc::new(klights_supervisor::SystemWallClock),
                 ),
             );
+            let positioned_watch =
+                crate::positioned_watch_adapter::datastore_positioned_watch_service(
+                    &passive_read_ports,
+                    db_handle.clone(),
+                    watch_commit_wiring.signals.clone(),
+                );
             // The local command client is built only from the fully constructed
             // sequenced facade. It never receives the passive backend used by
             // Raft proposal materialization and committed apply.
             let local_api_client = Arc::new(
                 crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_namespace_signing_key_and_file_process(
-                    crate::control_plane::client::local::LocalApiPersistencePorts::new(
+                    crate::control_plane::client::local::LocalApiPersistencePorts::new_with_positioned_watch(
                         db_handle.clone(),
-                        watch_commit_wiring.signals.clone(),
+                        positioned_watch.clone(),
                     ),
                     config.node_name.clone(),
                     config.containerd_namespace.clone(),
@@ -821,7 +830,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             (
                 Some(raft),
                 db_handle,
-                local_api_client,
+                (local_api_client, positioned_watch),
                 leader_proxy,
                 leader_ports,
             )
@@ -954,6 +963,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         }
         ob
     };
+    let (local_api_client, positioned_watch) = local_services;
 
     match crate::node_admin::start_node_admin(
         node_local.clone(),
@@ -972,6 +982,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     Ok(DatastorePhase {
         db_handle,
         watch_signals: watch_commit_wiring.signals,
+        positioned_watch,
         leader_ports,
         remote_api_client: remote_parts.remote_api_client,
         local_api_client,

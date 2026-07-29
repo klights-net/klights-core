@@ -207,6 +207,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     .await?;
     let db_handle = ds.db_handle;
     let watch_signals = ds.watch_signals;
+    let positioned_watch = ds.positioned_watch;
     let db: &dyn datastore::DatastoreBackend = &*db_handle;
     let leader_ports = ds.leader_ports;
     let remote_api_client = ds.remote_api_client;
@@ -359,6 +360,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
         db_handle: &db_handle,
         watch_signals: watch_signals.clone(),
+        positioned_watch: positioned_watch.clone(),
         node_local: node_local.clone(),
         worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
@@ -409,7 +411,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         config: &config,
         leader_coordination: controller_coordination,
         db_handle: &db_handle,
-        watch_signals: watch_signals.clone(),
+        positioned_watch,
         node_local: node_local.clone(),
         task_supervisor: &task_supervisor,
         dispatcher_for_worker: &dispatcher_for_worker,

@@ -4,19 +4,19 @@ use klights_leader_api::{
     LeaderCacheReadiness, LeaderNetworkTopologyCommand, LeaderNetworkTopologyQuery,
     LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus, LeaderNodeSubnetAllocation,
     LeaderOutboxDelivery, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
-    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
-    NetworkDataplane, NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery,
-    NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest,
-    NodeLeaseRenewalResult, NodeLifecycleStatusError, NodeLifecycleStatusFuture,
-    NodeLifecycleStatusRequest, NodeLifecycleStatusResult, NodeSubnetAllocationError,
-    NodeSubnetAllocationFuture, NodeSubnetAllocationRequest, NodeSubnetAllocationResult,
-    NodeSubnetQuery, NodeSubnetResult, OutboxDeliveryError, OutboxDeliveryFuture,
-    OutboxDeliveryRequest, OutboxDeliveryResult, PeerSubnetsQuery, PeerSubnetsResult,
-    PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError, PodCleanupIntentFuture,
-    PodCleanupIntentListRequest, ProjectedServiceAccountTokenError,
-    ProjectedServiceAccountTokenFuture, ProjectedServiceAccountTokenRequest, ResourceCommandError,
-    ResourceCommandFuture, ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest,
-    ResourceListRequest, ResourceListResult, ResourceQueryFuture, WatchRequest,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchFuture, NetworkDataplane,
+    NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
+    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    NodeLifecycleStatusError, NodeLifecycleStatusFuture, NodeLifecycleStatusRequest,
+    NodeLifecycleStatusResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
+    NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
+    OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest, OutboxDeliveryResult,
+    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
+    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
+    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
+    ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
+    ResourceListResult, ResourceQueryFuture, WatchRequest,
 };
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -27,9 +27,6 @@ use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::controllers::ControllerDispatcher;
-use crate::datastore::cluster_store_adapter::{
-    DatastoreClusterResourceRead, DatastoreDurableAllocatorRead, DatastoreDurableWatchHistory,
-};
 use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::node_outbox::OutboxApplyError;
@@ -130,15 +127,30 @@ fn test_watch_signals(db: &DatastoreHandle) -> Arc<dyn klights_watch::WatchSigna
 
 pub(crate) struct LocalApiPersistencePorts {
     db: DatastoreHandle,
-    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    positioned_watch: klights_watch::PositionedWatchService,
 }
 
 impl LocalApiPersistencePorts {
+    #[cfg(test)]
     pub(crate) fn new(
         db: DatastoreHandle,
-        watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+        _watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
     ) -> Self {
-        Self { db, watch_signals }
+        let positioned_watch = crate::positioned_watch_adapter::for_test(db.clone());
+        Self {
+            db,
+            positioned_watch,
+        }
+    }
+
+    pub(crate) fn new_with_positioned_watch(
+        db: DatastoreHandle,
+        positioned_watch: klights_watch::PositionedWatchService,
+    ) -> Self {
+        Self {
+            db,
+            positioned_watch,
+        }
     }
 }
 
@@ -408,9 +420,11 @@ impl LocalApiClient {
         is_leader_rx: watch::Receiver<bool>,
         file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        let LocalApiPersistencePorts { db, watch_signals } = persistence;
+        let LocalApiPersistencePorts {
+            db,
+            positioned_watch,
+        } = persistence;
         let pod_store = Arc::new(crate::pod_repository_composition::new_pod_store(db.clone()));
-        let positioned_watch = datastore_positioned_watch_service(db.clone(), watch_signals);
         let crypto = file_process.crypto_executor();
         Self {
             outbox_apply: crate::bootstrap::outbox_apply_adapter::RootOutboxApplyAdapter::new(
@@ -494,110 +508,6 @@ impl LocalApiClient {
     #[cfg(test)]
     pub async fn last_raft_commit_index_for_test(&self) -> i64 {
         self.outbox_apply.last_commit_index().await
-    }
-}
-
-pub(crate) fn datastore_positioned_watch_service(
-    db: DatastoreHandle,
-    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
-) -> klights_watch::PositionedWatchService {
-    klights_watch::PositionedWatchService::new(
-        Arc::new(DatastoreClusterResourceRead::new(db.clone())),
-        Arc::new(DatastoreDurableWatchHistory::new(db.clone())),
-        Arc::new(DatastoreDurableAllocatorRead::new(db.clone())),
-        watch_signals,
-        Arc::new(DatastoreWatchScopes { db }),
-    )
-}
-
-struct DatastoreWatchScopes {
-    db: DatastoreHandle,
-}
-
-pub(crate) async fn datastore_watch_resource_scope(
-    db: &dyn crate::datastore::DatastoreBackend,
-    api_version: &str,
-    kind: &str,
-) -> Result<klights_watch::WatchResourceScope, LeaderWatchError> {
-    if crate::datastore::sqlite::scope::is_builtin_api_version(api_version) {
-        return Ok(if crate::datastore::sqlite::scope::is_namespaced(kind) {
-            klights_watch::WatchResourceScope::Namespaced
-        } else {
-            klights_watch::WatchResourceScope::Cluster
-        });
-    }
-
-    let Some((group, version)) = api_version.rsplit_once('/') else {
-        return Err(LeaderWatchError::invalid_request(
-            "apiVersion",
-            format!("custom resource apiVersion {api_version:?} must contain group/version"),
-        ));
-    };
-    let crds = db
-        .list_resources(
-            "apiextensions.k8s.io/v1",
-            "CustomResourceDefinition",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await
-        .map_err(|error| {
-            LeaderWatchError::unavailable(format!(
-                "failed to resolve custom resource watch scope: {error:#}"
-            ))
-        })?;
-    for crd in crds.items {
-        let spec = crd.data.get("spec").unwrap_or(&serde_json::Value::Null);
-        if spec.get("group").and_then(serde_json::Value::as_str) != Some(group)
-            || spec
-                .pointer("/names/kind")
-                .and_then(serde_json::Value::as_str)
-                != Some(kind)
-        {
-            continue;
-        }
-        let serves_version = spec
-            .get("versions")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|versions| {
-                versions.iter().any(|candidate| {
-                    candidate.get("name").and_then(serde_json::Value::as_str) == Some(version)
-                        && candidate
-                            .get("served")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(true)
-                })
-            });
-        if !serves_version {
-            continue;
-        }
-        return match spec.get("scope").and_then(serde_json::Value::as_str) {
-            Some("Namespaced") => Ok(klights_watch::WatchResourceScope::Namespaced),
-            Some("Cluster") => Ok(klights_watch::WatchResourceScope::Cluster),
-            scope => Err(LeaderWatchError::invalid_request(
-                "kind",
-                format!("CRD for {api_version} {kind} has invalid scope {scope:?}"),
-            )),
-        };
-    }
-    Err(LeaderWatchError::invalid_request(
-        "kind",
-        format!("no served CRD defines {api_version} {kind}"),
-    ))
-}
-
-impl klights_watch::WatchScopeResolver for DatastoreWatchScopes {
-    fn resource_scope<'a>(
-        &'a self,
-        api_version: &'a str,
-        kind: &'a str,
-    ) -> futures::future::BoxFuture<'a, Result<klights_watch::WatchResourceScope, LeaderWatchError>>
-    {
-        Box::pin(datastore_watch_resource_scope(
-            self.db.as_ref(),
-            api_version,
-            kind,
-        ))
     }
 }
 

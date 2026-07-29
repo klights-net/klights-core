@@ -85,12 +85,8 @@ impl CrdRegistryRuntime for LeaderCrdRegistryRuntime {
 
 pub(crate) fn new_runtime(
     db: DatastoreHandle,
-    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    positioned_watch: klights_watch::PositionedWatchService,
 ) -> Arc<dyn CrdRegistryRuntime> {
-    let positioned_watch = crate::control_plane::client::local::datastore_positioned_watch_service(
-        db.clone(),
-        watch_signals,
-    );
     Arc::new(LeaderCrdRegistryRuntime {
         db,
         positioned_watch,

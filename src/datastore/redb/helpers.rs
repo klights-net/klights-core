@@ -9,7 +9,7 @@ use ::redb::ReadableTable;
 use anyhow::Result;
 use serde_json::Value;
 
-use klights_cluster_core::{Resource, ResourcePreconditions, WatchReplayPosition};
+use klights_cluster_core::{Resource, ResourcePreconditions};
 use klights_cluster_datastore::redb::tables;
 
 /// Deserialize a redb value body into an Arc<Value>.
@@ -58,6 +58,7 @@ pub fn preserve_server_metadata_fields_from_existing(data: &mut Value, existing:
 }
 
 /// Post-fetch field selector filtering (mirrors SQLite's `filter_by_field_selector`).
+#[cfg(test)]
 pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Resource> {
     let selector = klights_types::FieldSelector::parse(selector)
         .expect("API validation must reject malformed field selectors before datastore filtering");
@@ -291,41 +292,6 @@ pub fn read_rv_meta(w: &::redb::WriteTransaction) -> Result<i64> {
         })
     };
     Ok(guard.unwrap_or(0))
-}
-
-/// Read the resource-version and durable watch-log high-water mark from one
-/// Redb read snapshot so LIST can resume without a list/watch race.
-pub fn watch_replay_position_in_read(
-    read: &::redb::ReadTransaction,
-) -> Result<WatchReplayPosition> {
-    let resource_version = {
-        let meta = read.open_table(tables::META)?;
-        let value = meta.get("rv")?;
-        value
-            .map(|value| {
-                std::str::from_utf8(value.value())
-                    .unwrap_or("0")
-                    .parse::<i64>()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0)
-    };
-    let event_id = watch_event_high_water_in_read(read)?;
-    Ok(WatchReplayPosition {
-        resource_version,
-        event_id,
-        resource_version_filter_through_event_id: 0,
-    })
-}
-
-/// Return the monotonic watch-event allocator high-water, which remains valid
-/// after retention removes the last materialized event row.
-pub fn watch_event_high_water_in_read(read: &::redb::ReadTransaction) -> Result<i64> {
-    let meta = read.open_table(tables::META)?;
-    Ok(meta
-        .get("watch_event_id")?
-        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<i64>().ok())
-        .unwrap_or(0))
 }
 
 /// Parse a `Resource` from a namespaced resource body.

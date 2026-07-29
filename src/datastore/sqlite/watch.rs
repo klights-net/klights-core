@@ -105,22 +105,6 @@ pub fn create_pending_watch_event(
 }
 
 impl Datastore {
-    pub(super) fn watch_row_to_raw_watch_event(
-        row: &rusqlite::Row<'_>,
-    ) -> rusqlite::Result<klights_cluster_store::DurableRawWatchEvent> {
-        let data_bytes: Vec<u8> = row.get(6)?;
-        let event_type: String = row.get(5)?;
-        Ok(klights_cluster_store::DurableRawWatchEvent {
-            api_version: row.get(0)?,
-            kind: row.get(1)?,
-            namespace: row.get(2)?,
-            name: row.get(3)?,
-            resource_version: row.get(4)?,
-            event_type: catchup_event_type_from_db(event_type),
-            object_json: bytes::Bytes::from(data_bytes),
-        })
-    }
-
     pub(super) fn watch_row_to_catchup_resource(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<CatchUpResource> {

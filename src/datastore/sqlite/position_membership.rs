@@ -4,22 +4,24 @@ use anyhow::{Result, anyhow};
 use rusqlite::ToSql;
 use serde_json::Value;
 
-use super::{Datastore, ResourceList, SnapshotAtRv, WatchTarget};
-use crate::datastore::WatchTargetScope;
+use super::read_store::SqliteReadStore;
 use crate::datastore::position_membership::{
     MembershipHistoryEvent, MembershipReconstructor, ReconstructedMembership,
-    apply_membership_selectors, resource_from_history, sort_for_watch_targets,
+    apply_membership_selectors, resource_from_history, sort_for_durable_watch_targets,
 };
 use klights_cluster_core::{Resource, WatchReplayPosition};
+use klights_cluster_store::{
+    DurableWatchScope, DurableWatchTarget, ResourceScopeSnapshot, ResourceSnapshotRead,
+};
 
-impl Datastore {
-    pub async fn snapshot_resources_at_position(
+impl SqliteReadStore {
+    pub(crate) async fn snapshot_resources_at_position(
         &self,
-        targets: &[WatchTarget],
+        targets: &[DurableWatchTarget],
         label_selector: Option<&str>,
         field_selector: Option<&str>,
         position: WatchReplayPosition,
-    ) -> Result<SnapshotAtRv> {
+    ) -> Result<ResourceSnapshotRead> {
         let sort_targets = targets.to_vec();
         let targets = sort_targets.clone();
         let label_selector = label_selector.map(str::to_string);
@@ -57,21 +59,18 @@ impl Datastore {
             .map_err(|error| anyhow!("failed to reconstruct watch-position snapshot: {error}"))?;
 
         let mut items = match raw {
-            PositionRawSnapshot::Expired => return Ok(SnapshotAtRv::Expired),
+            PositionRawSnapshot::Expired => return Ok(ResourceSnapshotRead::Expired),
             PositionRawSnapshot::Items(items) => apply_membership_selectors(
                 items,
                 label_selector.as_deref(),
                 field_selector.as_deref(),
             )?,
         };
-        sort_for_watch_targets(&mut items, &sort_targets);
-        Ok(SnapshotAtRv::List(ResourceList {
-            items,
-            resource_version: position.resource_version,
-            watch_replay_position: Some(position),
-            continue_token: None,
-            remaining_item_count: None,
-        }))
+        sort_for_durable_watch_targets(&mut items, &sort_targets);
+        Ok(ResourceSnapshotRead::Historical(
+            ResourceScopeSnapshot::try_new(items, position)
+                .map_err(|error| anyhow!("invalid watch-position snapshot: {error}"))?,
+        ))
     }
 }
 
@@ -91,12 +90,17 @@ fn cursor_covers_current(position: WatchReplayPosition, current: WatchReplayPosi
 
 fn position_expired(
     conn: &rusqlite::Connection,
-    targets: &[WatchTarget],
+    targets: &[DurableWatchTarget],
     position: WatchReplayPosition,
 ) -> rusqlite::Result<bool> {
     for target in targets {
         if klights_cluster_store::ReplayRetentionBoundary::classify_all(
-            super::replay_floor::target_replay_boundaries(conn, target)?,
+            super::replay_floor::target_replay_boundaries(
+                conn,
+                target.api_version(),
+                target.kind(),
+                target.scope(),
+            )?,
             position,
         ) == klights_cluster_store::ReplayAvailability::Expired
         {
@@ -108,13 +112,13 @@ fn position_expired(
 
 fn read_current_targets(
     conn: &rusqlite::Connection,
-    targets: &[WatchTarget],
+    targets: &[DurableWatchTarget],
 ) -> rusqlite::Result<Vec<Resource>> {
     let mut resources = Vec::new();
     for target in targets {
-        if target.api_version == "v1"
-            && target.kind == "Namespace"
-            && matches!(&target.scope, WatchTargetScope::Cluster)
+        if target.api_version() == "v1"
+            && target.kind() == "Namespace"
+            && matches!(target.scope(), DurableWatchScope::Cluster)
         {
             let mut stmt = conn.prepare(
                 "SELECT name, uid, resource_version, data FROM namespaces ORDER BY name",
@@ -134,12 +138,12 @@ fn read_current_targets(
             resources.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
             continue;
         }
-        let (mut sql, namespace) = match &target.scope {
-            WatchTargetScope::Cluster => (
+        let (mut sql, namespace) = match target.scope() {
+            DurableWatchScope::Cluster => (
                 "SELECT id, api_version, kind, NULL, name, resource_version, uid, data FROM cluster_resources WHERE api_version = ?1 AND kind = ?2".to_string(),
                 None,
             ),
-            WatchTargetScope::Namespaced(namespace) => {
+            DurableWatchScope::Namespaced(namespace) => {
                 let mut sql = "SELECT id, api_version, kind, namespace, name, resource_version, uid, data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2".to_string();
                 if namespace.is_some() {
                     sql.push_str(" AND namespace = ?3");
@@ -150,8 +154,8 @@ fn read_current_targets(
         sql.push_str(" ORDER BY 4, 5");
         let mut stmt = conn.prepare(&sql)?;
         let mut params: Vec<Box<dyn ToSql>> = vec![
-            Box::new(target.api_version.clone()),
-            Box::new(target.kind.clone()),
+            Box::new(target.api_version().to_string()),
+            Box::new(target.kind().to_string()),
         ];
         if let Some(namespace) = namespace {
             params.push(Box::new(namespace.to_string()));
@@ -179,7 +183,7 @@ fn read_current_targets(
 
 fn reconstruct_in_conn(
     conn: &rusqlite::Connection,
-    targets: &[WatchTarget],
+    targets: &[DurableWatchTarget],
     current: Vec<Resource>,
     position: WatchReplayPosition,
 ) -> rusqlite::Result<ReconstructedMembership> {
@@ -197,15 +201,15 @@ fn reconstruct_in_conn(
             params.len() + 1,
             params.len() + 2
         ));
-        params.push(Box::new(target.api_version.clone()));
-        params.push(Box::new(target.kind.clone()));
-        match &target.scope {
-            WatchTargetScope::Cluster => sql.push_str(" AND namespace IS NULL"),
-            WatchTargetScope::Namespaced(Some(namespace)) => {
+        params.push(Box::new(target.api_version().to_string()));
+        params.push(Box::new(target.kind().to_string()));
+        match target.scope() {
+            DurableWatchScope::Cluster => sql.push_str(" AND namespace IS NULL"),
+            DurableWatchScope::Namespaced(Some(namespace)) => {
                 sql.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
                 params.push(Box::new(namespace.clone()));
             }
-            WatchTargetScope::Namespaced(None) => sql.push_str(" AND namespace IS NOT NULL"),
+            DurableWatchScope::Namespaced(None) => sql.push_str(" AND namespace IS NOT NULL"),
         }
         sql.push(')');
     }

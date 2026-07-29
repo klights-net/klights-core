@@ -47,25 +47,19 @@ impl Datastore {
         kind: &str,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        let api_version = api_version.to_string();
-        let kind = kind.to_string();
+        use klights_cluster_store::DurableWatchRangeRead as _;
 
-        let items = self
-            .db_call("list_cluster_resources_modified_since", move |conn| {
-                let mut stmt = conn.prepare(queries::WATCH_EVENTS_LIST_CLUSTER_SINCE)?;
-                let rows = stmt.query_map(
-                    rusqlite::params![api_version, kind, since_rv],
-                    Self::watch_row_to_catchup_resource,
-                )?;
-                let mut items = Vec::new();
-                for row in rows {
-                    items.push(row?);
-                }
-                Ok(items)
-            })
-            .await?;
-
-        Ok(items)
+        let request = klights_cluster_store::ModifiedClusterResourcesRequest::try_new(
+            api_version,
+            kind,
+            since_rv,
+        )
+        .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_cluster_resources_modified_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     /// List namespaced watch events of a given kind after `since_rv`
@@ -77,36 +71,20 @@ impl Datastore {
         namespace: Option<&str>,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        let api_version = api_version.to_string();
-        let kind = kind.to_string();
-        let namespace_owned = namespace.map(str::to_string);
+        use klights_cluster_store::DurableWatchRangeRead as _;
 
-        let items = self
-            .db_call("list_resources_modified_since", move |conn| {
-                let mut query = queries::WATCH_EVENTS_LIST_NAMESPACED_SINCE_HEAD.to_string();
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                    vec![Box::new(api_version), Box::new(kind), Box::new(since_rv)];
-
-                if let Some(ref ns) = namespace_owned {
-                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
-                    params.push(Box::new(ns.clone()));
-                }
-
-                query.push_str(" ORDER BY resource_version ASC, id ASC");
-
-                let param_refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                let mut stmt = conn.prepare(&query)?;
-                let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_catchup_resource)?;
-                let mut items = Vec::new();
-                for row in rows {
-                    items.push(row?);
-                }
-                Ok(items)
-            })
-            .await?;
-
-        Ok(items)
+        let request = klights_cluster_store::ModifiedResourcesRequest::try_new(
+            api_version,
+            kind,
+            namespace.map(str::to_string),
+            since_rv,
+        )
+        .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_resources_modified_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     /// Total `watch_events` rows currently held. Used by GC tests and could
@@ -188,18 +166,12 @@ impl Datastore {
     /// has fallen outside the replay window and must be answered with
     /// `410 Gone` so the client reflector relists.
     pub async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
-        let rv = self
-            .db_call("earliest_watch_event_rv", move |conn| {
-                let mut stmt = conn.prepare(queries::WATCH_EVENTS_MIN_RV)?;
-                let mut rows = stmt.query([])?;
-                match rows.next()? {
-                    Some(row) => Ok(Some(row.get::<_, i64>(0)?)),
-                    None => Ok(None),
-                }
-            })
+        use klights_cluster_store::DurableWatchRangeRead as _;
+
+        self.focused_reads
+            .earliest_watch_event_rv()
             .await
-            .map_err(|e| anyhow!("Failed to read earliest watch_event rv: {}", e))?;
-        Ok(rv)
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn list_watch_events_since(
@@ -207,20 +179,18 @@ impl Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        if targets.is_empty() {
-            return Ok(Vec::new());
-        }
+        use klights_cluster_store::DurableWatchRangeRead as _;
 
-        let targets = targets.to_vec();
-        let items = self
-            .db_call("list_watch_events_since", move |conn| {
-                Ok(Self::list_watch_events_since_in_conn(
-                    conn, &targets, since_rv,
-                )?)
-            })
-            .await?;
-
-        Ok(items)
+        let request = klights_cluster_store::WatchEventsSinceRequest::try_new(
+            focused_watch_targets(targets),
+            since_rv,
+        )
+        .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_watch_events_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     /// Atomically check the retained watch history floor and read a replay
@@ -232,22 +202,17 @@ impl Datastore {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<WatchReplayRead> {
-        if targets.is_empty() {
-            return Ok(WatchReplayRead::Events(Vec::new()));
-        }
-
-        let targets = targets.to_vec();
-        self.read_db_call("list_watch_events_since_checked", move |conn| {
-            if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
-                return Ok(WatchReplayRead::Expired);
+        match self
+            .focused_reads
+            .replay_watch_events_since_checked(&focused_watch_targets(targets), since_rv, None)
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            super::read_store::SqliteCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
+            super::read_store::SqliteCheckedWatchRead::Events(events) => {
+                Ok(WatchReplayRead::Events(focused_events_to_catchup(events)))
             }
-            Ok(
-                Self::list_watch_events_since_in_conn(conn, &targets, since_rv)
-                    .map(WatchReplayRead::Events)?,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to checked-list watch_events: {}", e))
+        }
     }
 
     pub async fn list_watch_events_since_checked_bounded(
@@ -256,25 +221,21 @@ impl Datastore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead> {
-        if targets.is_empty() {
-            return Ok(WatchReplayRead::Events(Vec::new()));
-        }
-
-        let targets = targets.to_vec();
-        self.read_db_call("list_watch_events_since_checked_bounded", move |conn| {
-            if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
-                return Ok(WatchReplayRead::Expired);
-            }
-            Ok(Self::list_watch_events_since_in_conn_with_limit(
-                conn,
-                &targets,
+        match self
+            .focused_reads
+            .replay_watch_events_since_checked(
+                &focused_watch_targets(targets),
                 since_rv,
                 Some(limit),
             )
-            .map(WatchReplayRead::Events)?)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to bounded checked-list watch_events: {}", e))
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            super::read_store::SqliteCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
+            super::read_store::SqliteCheckedWatchRead::Events(events) => {
+                Ok(WatchReplayRead::Events(focused_events_to_catchup(events)))
+            }
+        }
     }
 
     pub async fn list_watch_events_after_position_checked_bounded(
@@ -283,79 +244,53 @@ impl Datastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        if targets.is_empty() {
-            return Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                events: Vec::new(),
-                next_position: position,
-            }));
+        use klights_cluster_store::DurableWatchHistoryRead as _;
+
+        let request = klights_cluster_store::WatchHistoryRequest::new(
+            focused_watch_targets(targets),
+            position,
+            limit.get(),
+        )
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .replay_watch_history(request)
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_cluster_store::WatchHistoryRead::Expired => {
+                Ok(PositionedWatchReplayRead::Expired)
+            }
+            klights_cluster_store::WatchHistoryRead::Events(page) => {
+                let next_position = page.next_position();
+                let events = page
+                    .into_events()
+                    .into_iter()
+                    .map(|event| {
+                        let event_type = event.event.event_type().to_string();
+                        PositionedWatchEvent {
+                            position: event.position,
+                            event: CatchUpResource {
+                                resource: event.event.into_resource(),
+                                event_type: std::borrow::Cow::Owned(event_type),
+                            },
+                        }
+                    })
+                    .collect();
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    events,
+                    next_position,
+                }))
+            }
         }
-        let targets = targets.to_vec();
-        self.read_db_call("list_watch_events_after_position", move |conn| {
-            let high_water_event_id = Self::watch_event_allocator_high_water_in_conn(conn)?;
-            let current_resource_version = Self::current_resource_version_in_conn(conn)?;
-            if position.event_id > high_water_event_id
-                || (position.event_id == 0 && position.resource_version > current_resource_version)
-            {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            if position.event_id == 0
-                && position.resource_version_filter_through_event_id == 0
-                && watch_replay_expired_for_targets(conn, &targets, position.resource_version)?
-            {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            let cursor_covers_current = position.event_id >= high_water_event_id
-                || (position.resource_version_filter_through_event_id >= high_water_event_id
-                    && position.resource_version >= current_resource_version);
-            if (position.event_id > 0 || position.resource_version_filter_through_event_id > 0)
-                && !cursor_covers_current
-                && watch_position_expired_for_targets(conn, &targets, position)?
-            {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            let rows = Self::list_positioned_watch_events_in_conn(
-                conn,
-                &targets,
-                position,
-                high_water_event_id,
-                limit,
-            )?;
-            let events: Vec<_> = rows
-                .into_iter()
-                .map(|(position, event)| PositionedWatchEvent { position, event })
-                .collect();
-            let next_position =
-                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
-            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                events,
-                next_position,
-            }))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to position-list watch_events: {}", e))
     }
 
     pub async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        #[cfg(test)]
-        if self
-            .fail_next_watch_position_observation
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(anyhow::anyhow!(
-                "injected watch-position observation failure"
-            ));
-        }
-        self.read_db_call("current_watch_replay_position", |conn| {
-            let resource_version = Self::current_resource_version_in_conn(conn)?;
-            let event_id = Self::watch_event_allocator_high_water_in_conn(conn)?;
-            Ok(WatchReplayPosition {
-                resource_version,
-                event_id,
-                resource_version_filter_through_event_id: 0,
-            })
-        })
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to read watch replay position: {err}"))
+        self.focused_reads
+            .read_allocator_state()
+            .await
+            .map(|state| state.position())
+            .map_err(anyhow::Error::new)
     }
 
     #[cfg(test)]
@@ -370,25 +305,25 @@ impl Datastore {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        if targets.is_empty() {
-            return Ok(WatchReplayRead::Events(Vec::new()));
-        }
+        use klights_cluster_store::DurableRawWatchHistoryRead as _;
 
-        let targets = targets.to_vec();
-        self.read_db_call("list_raw_watch_events_since_checked_bounded", move |conn| {
-            if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
-                return Ok(WatchReplayRead::Expired);
+        let request = klights_cluster_store::RawWatchEventsSinceRequest::try_new(
+            focused_watch_targets(targets),
+            since_rv,
+            limit.get(),
+        )
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .list_raw_watch_events_since_checked_bounded(request)
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_cluster_store::RawWatchHistoryRead::Expired => Ok(WatchReplayRead::Expired),
+            klights_cluster_store::RawWatchHistoryRead::Events(page) => {
+                Ok(WatchReplayRead::Events(page.into_events()))
             }
-            Ok(Self::list_raw_watch_events_since_in_conn_with_limit(
-                conn,
-                &targets,
-                since_rv,
-                Some(limit),
-            )
-            .map(WatchReplayRead::Events)?)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to raw bounded checked-list watch_events: {}", e))
+        }
     }
 
     pub async fn list_raw_watch_events_after_position_checked_bounded(
@@ -397,304 +332,43 @@ impl Datastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        if targets.is_empty() {
-            return Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                events: Vec::new(),
-                next_position: position,
-            }));
-        }
-        let targets = targets.to_vec();
-        self.read_db_call("list_raw_watch_events_after_position", move |conn| {
-            let high_water_event_id = Self::watch_event_allocator_high_water_in_conn(conn)?;
-            let current_resource_version = Self::current_resource_version_in_conn(conn)?;
-            if position.event_id > high_water_event_id
-                || (position.event_id == 0 && position.resource_version > current_resource_version)
-            {
-                return Ok(PositionedWatchReplayRead::Expired);
+        use klights_cluster_store::DurableRawWatchHistoryRead as _;
+
+        let request = klights_cluster_store::RawWatchEventsAfterPositionRequest::try_new(
+            focused_watch_targets(targets),
+            position,
+            limit.get(),
+        )
+        .map_err(anyhow::Error::new)?;
+        match self
+            .focused_reads
+            .list_raw_watch_events_after_position_checked_bounded(request)
+            .await
+            .map_err(anyhow::Error::new)?
+        {
+            klights_cluster_store::PositionedRawWatchHistoryRead::Expired => {
+                Ok(PositionedWatchReplayRead::Expired)
             }
-            if position.event_id == 0
-                && position.resource_version_filter_through_event_id == 0
-                && watch_replay_expired_for_targets(conn, &targets, position.resource_version)?
-            {
-                return Ok(PositionedWatchReplayRead::Expired);
+            klights_cluster_store::PositionedRawWatchHistoryRead::Events(page) => {
+                let next_position = page.next_position();
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    events: page.into_events(),
+                    next_position,
+                }))
             }
-            let cursor_covers_current = position.event_id >= high_water_event_id
-                || (position.resource_version_filter_through_event_id >= high_water_event_id
-                    && position.resource_version >= current_resource_version);
-            if (position.event_id > 0 || position.resource_version_filter_through_event_id > 0)
-                && !cursor_covers_current
-                && watch_position_expired_for_targets(conn, &targets, position)?
-            {
-                return Ok(PositionedWatchReplayRead::Expired);
-            }
-            let rows = Self::list_positioned_raw_watch_events_in_conn(
-                conn,
-                &targets,
-                position,
-                high_water_event_id,
-                limit,
-            )?;
-            let events: Vec<_> = rows
-                .into_iter()
-                .map(|(position, event)| PositionedWatchEvent { position, event })
-                .collect();
-            let next_position =
-                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
-            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
-                events,
-                next_position,
-            }))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to raw position-list watch_events: {}", e))
-    }
-
-    fn positioned_watch_query(
-        targets: &[WatchTarget],
-        position: WatchReplayPosition,
-        high_water_event_id: i64,
-        limit: std::num::NonZeroUsize,
-    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-        let mut query = "SELECT api_version, kind, namespace, name, resource_version, event_type, data, id FROM watch_events WHERE ".to_string();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>>;
-        if position.resource_version_filter_through_event_id > 0 {
-            query.push_str("id > ?1 AND id <= ?2 AND (id > ?3 OR resource_version > ?4) AND (");
-            params = vec![
-                Box::new(position.event_id),
-                Box::new(high_water_event_id),
-                Box::new(position.resource_version_filter_through_event_id),
-                Box::new(position.resource_version),
-            ];
-        } else {
-            let boundary = if position.event_id == 0 {
-                position.resource_version
-            } else {
-                position.event_id
-            };
-            query.push_str(if position.event_id == 0 {
-                "resource_version > ?1 AND id <= ?2 AND ("
-            } else {
-                "id > ?1 AND id <= ?2 AND ("
-            });
-            params = vec![Box::new(boundary), Box::new(high_water_event_id)];
         }
-        for (idx, target) in targets.iter().enumerate() {
-            if idx > 0 {
-                query.push_str(" OR ");
-            }
-            query.push('(');
-            query.push_str(&format!(
-                "api_version = ?{} AND kind = ?{}",
-                params.len() + 1,
-                params.len() + 2
-            ));
-            params.push(Box::new(target.api_version.clone()));
-            params.push(Box::new(target.kind.clone()));
-            match &target.scope {
-                WatchTargetScope::Cluster => query.push_str(" AND namespace IS NULL"),
-                WatchTargetScope::Namespaced(Some(namespace)) => {
-                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
-                    params.push(Box::new(namespace.clone()));
-                }
-                WatchTargetScope::Namespaced(None) => {
-                    query.push_str(" AND namespace IS NOT NULL");
-                }
-            }
-            query.push(')');
-        }
-        query.push_str(&format!(") ORDER BY id ASC LIMIT ?{}", params.len() + 1));
-        params.push(Box::new(limit.get() as i64));
-        (query, params)
-    }
-
-    fn list_positioned_watch_events_in_conn(
-        conn: &rusqlite::Connection,
-        targets: &[WatchTarget],
-        position: WatchReplayPosition,
-        high_water_event_id: i64,
-        limit: std::num::NonZeroUsize,
-    ) -> rusqlite::Result<Vec<(WatchReplayPosition, CatchUpResource)>> {
-        let (query, params) =
-            Self::positioned_watch_query(targets, position, high_water_event_id, limit);
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&query)?;
-        stmt.query_map(&refs[..], |row| {
-            let event_id = row.get(7)?;
-            let event = Self::watch_row_to_catchup_resource(row)?;
-            Ok((
-                WatchReplayPosition {
-                    resource_version: event.resource.resource_version,
-                    event_id,
-                    resource_version_filter_through_event_id: 0,
-                },
-                event,
-            ))
-        })?
-        .collect()
-    }
-
-    fn list_positioned_raw_watch_events_in_conn(
-        conn: &rusqlite::Connection,
-        targets: &[WatchTarget],
-        position: WatchReplayPosition,
-        high_water_event_id: i64,
-        limit: std::num::NonZeroUsize,
-    ) -> rusqlite::Result<
-        Vec<(
-            WatchReplayPosition,
-            klights_cluster_store::DurableRawWatchEvent,
-        )>,
-    > {
-        let (query, params) =
-            Self::positioned_watch_query(targets, position, high_water_event_id, limit);
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&query)?;
-        stmt.query_map(&refs[..], |row| {
-            let event_id = row.get(7)?;
-            let event = Self::watch_row_to_raw_watch_event(row)?;
-            Ok((
-                WatchReplayPosition {
-                    resource_version: event.resource_version,
-                    event_id,
-                    resource_version_filter_through_event_id: 0,
-                },
-                event,
-            ))
-        })?
-        .collect()
-    }
-
-    fn list_watch_events_since_in_conn(
-        conn: &rusqlite::Connection,
-        targets: &[WatchTarget],
-        since_rv: i64,
-    ) -> rusqlite::Result<Vec<CatchUpResource>> {
-        Self::list_watch_events_since_in_conn_with_limit(conn, targets, since_rv, None)
-    }
-
-    fn list_watch_events_since_in_conn_with_limit(
-        conn: &rusqlite::Connection,
-        targets: &[WatchTarget],
-        since_rv: i64,
-        limit: Option<std::num::NonZeroUsize>,
-    ) -> rusqlite::Result<Vec<CatchUpResource>> {
-        let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
-
-        for (idx, target) in targets.iter().enumerate() {
-            if idx > 0 {
-                query.push_str(" OR ");
-            }
-            query.push('(');
-            query.push_str(&format!(
-                "api_version = ?{} AND kind = ?{}",
-                params.len() + 1,
-                params.len() + 2
-            ));
-            params.push(Box::new(target.api_version.clone()));
-            params.push(Box::new(target.kind.clone()));
-
-            match &target.scope {
-                WatchTargetScope::Cluster => {
-                    query.push_str(" AND namespace IS NULL");
-                }
-                WatchTargetScope::Namespaced(Some(namespace)) => {
-                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
-                    params.push(Box::new(namespace.clone()));
-                }
-                WatchTargetScope::Namespaced(None) => {
-                    query.push_str(" AND namespace IS NOT NULL");
-                }
-            }
-            query.push(')');
-        }
-
-        query.push_str(") ORDER BY resource_version ASC, id ASC");
-        if let Some(limit) = limit {
-            query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
-            params.push(Box::new(limit.get() as i64));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|param| param.as_ref()).collect();
-        let mut stmt = conn.prepare(&query)?;
-        let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_catchup_resource)?;
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
-    }
-
-    fn list_raw_watch_events_since_in_conn_with_limit(
-        conn: &rusqlite::Connection,
-        targets: &[WatchTarget],
-        since_rv: i64,
-        limit: Option<std::num::NonZeroUsize>,
-    ) -> rusqlite::Result<Vec<klights_cluster_store::DurableRawWatchEvent>> {
-        let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
-
-        for (idx, target) in targets.iter().enumerate() {
-            if idx > 0 {
-                query.push_str(" OR ");
-            }
-            query.push('(');
-            query.push_str(&format!(
-                "api_version = ?{} AND kind = ?{}",
-                params.len() + 1,
-                params.len() + 2
-            ));
-            params.push(Box::new(target.api_version.clone()));
-            params.push(Box::new(target.kind.clone()));
-
-            match &target.scope {
-                WatchTargetScope::Cluster => {
-                    query.push_str(" AND namespace IS NULL");
-                }
-                WatchTargetScope::Namespaced(Some(namespace)) => {
-                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
-                    params.push(Box::new(namespace.clone()));
-                }
-                WatchTargetScope::Namespaced(None) => {
-                    query.push_str(" AND namespace IS NOT NULL");
-                }
-            }
-            query.push(')');
-        }
-
-        query.push_str(") ORDER BY resource_version ASC, id ASC");
-        if let Some(limit) = limit {
-            query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
-            params.push(Box::new(limit.get() as i64));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> =
-            params.iter().map(|param| param.as_ref()).collect();
-        let mut stmt = conn.prepare(&query)?;
-        let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_raw_watch_event)?;
-        let mut items = Vec::new();
-        for row in rows {
-            items.push(row?);
-        }
-        Ok(items)
     }
 
     pub async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
-        let items = self
-            .db_call("list_all_watch_events_since", move |conn| {
-                let mut stmt = conn.prepare(queries::WATCH_EVENTS_LIST_ALL_SINCE)?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![since_rv],
-                        Self::watch_row_to_catchup_resource,
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await?;
+        use klights_cluster_store::DurableWatchRangeRead as _;
 
-        Ok(items)
+        let request = klights_cluster_store::WatchRangeStart::try_new(since_rv)
+            .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_all_watch_events_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
     }
 
     /// memory-improvement.md §10 P1: keyset-paginated form of
@@ -756,27 +430,18 @@ impl Datastore {
     pub async fn list_watch_replay_floors(
         &self,
     ) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
-        Ok(self
-            .read_db_call("list_watch_replay_floors", |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id,
-                         floor_position_exact
-                 FROM watch_replay_floors
-                 ORDER BY api_version, kind, namespace_key",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok(crate::datastore::WatchReplayFloor {
-                        api_version: row.get(0)?,
-                        kind: row.get(1)?,
-                        namespace_key: row.get(2)?,
-                        floor_resource_version: row.get(3)?,
-                        floor_event_id: row.get(4)?,
-                        position_is_exact: row.get(5)?,
-                    })
-                })?;
-                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        use klights_cluster_store::DurableWatchHistoryRead as _;
+
+        self.focused_reads
+            .list_replay_floors()
+            .await
+            .map(|floors| {
+                floors
+                    .into_iter()
+                    .map(focused_replay_floor_to_legacy)
+                    .collect()
             })
-            .await?)
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn list_watch_replay_floors_paged(
@@ -845,20 +510,42 @@ impl Datastore {
         &self,
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        let items = self
-            .db_call("list_deleted_watch_events_since", move |conn| {
-                let mut stmt = conn.prepare(queries::WATCH_EVENTS_LIST_DELETED_SINCE)?;
-                let rows = stmt
-                    .query_map(
-                        rusqlite::params![since_rv],
-                        Self::watch_row_to_catchup_resource,
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .await?;
+        use klights_cluster_store::DurableWatchRangeRead as _;
 
-        Ok(items)
+        let request = klights_cluster_store::WatchRangeStart::try_new(since_rv)
+            .map_err(anyhow::Error::new)?;
+        self.focused_reads
+            .list_deleted_watch_events_since(request)
+            .await
+            .map(focused_events_to_catchup)
+            .map_err(anyhow::Error::new)
+    }
+}
+
+fn focused_replay_floor_to_legacy(
+    floor: klights_cluster_store::DurableReplayFloor,
+) -> crate::datastore::WatchReplayFloor {
+    let (target, floor_resource_version, floor_event_id, position_is_exact) = floor.into_parts();
+    let (api_version, kind, namespace_key) = match target {
+        klights_cluster_store::DurableReplayTarget::All => {
+            ("*".to_string(), "*".to_string(), "*".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
+            (api_version, kind, "#cluster".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Namespaced {
+            api_version,
+            kind,
+            namespace,
+        } => (api_version, kind, namespace),
+    };
+    crate::datastore::WatchReplayFloor {
+        api_version,
+        kind,
+        namespace_key,
+        floor_resource_version,
+        floor_event_id,
+        position_is_exact,
     }
 }
 
@@ -918,44 +605,6 @@ pub(super) fn gc_watch_events_in_tx(
     );
     delete.push(')');
     tx.execute(&delete, rusqlite::params_from_iter(ids.iter()))
-}
-
-fn watch_replay_expired_for_targets(
-    conn: &rusqlite::Connection,
-    targets: &[WatchTarget],
-    since_rv: i64,
-) -> rusqlite::Result<bool> {
-    if since_rv <= 0 {
-        return Ok(false);
-    }
-
-    for target in targets {
-        if klights_cluster_store::ReplayRetentionBoundary::classify_all(
-            super::replay_floor::target_replay_boundaries(conn, target)?,
-            WatchReplayPosition::from_resource_version(since_rv),
-        ) == klights_cluster_store::ReplayAvailability::Expired
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn watch_position_expired_for_targets(
-    conn: &rusqlite::Connection,
-    targets: &[WatchTarget],
-    position: WatchReplayPosition,
-) -> rusqlite::Result<bool> {
-    for target in targets {
-        if klights_cluster_store::ReplayRetentionBoundary::classify_all(
-            super::replay_floor::target_replay_boundaries(conn, target)?,
-            position,
-        ) == klights_cluster_store::ReplayAvailability::Expired
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 #[cfg(test)]

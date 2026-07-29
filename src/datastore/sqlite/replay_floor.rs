@@ -1,6 +1,5 @@
 use super::queries;
-use crate::datastore::{WatchTarget, WatchTargetScope};
-use klights_cluster_store::ReplayRetentionBoundary;
+use klights_cluster_store::{DurableWatchScope, ReplayRetentionBoundary};
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const LEGACY_WILDCARD: (&str, &str, &str) = ("*", "*", "*");
@@ -12,21 +11,16 @@ const LEGACY_WILDCARD: (&str, &str, &str) = ("*", "*", "*");
 /// honored by one replay path and ignored by another.
 pub(super) fn target_replay_boundaries(
     conn: &rusqlite::Connection,
-    target: &WatchTarget,
+    api_version: &str,
+    kind: &str,
+    scope: &DurableWatchScope,
 ) -> rusqlite::Result<Vec<ReplayRetentionBoundary>> {
-    let mut boundaries = match &target.scope {
-        WatchTargetScope::Cluster => read_scope(
-            conn,
-            &target.api_version,
-            &target.kind,
-            CLUSTER_NAMESPACE_KEY,
-        ),
-        WatchTargetScope::Namespaced(Some(namespace)) => {
-            read_scope(conn, &target.api_version, &target.kind, namespace)
+    let mut boundaries = match scope {
+        DurableWatchScope::Cluster => read_scope(conn, api_version, kind, CLUSTER_NAMESPACE_KEY),
+        DurableWatchScope::Namespaced(Some(namespace)) => {
+            read_scope(conn, api_version, kind, namespace)
         }
-        WatchTargetScope::Namespaced(None) => {
-            read_namespaced_all(conn, &target.api_version, &target.kind)
-        }
+        DurableWatchScope::Namespaced(None) => read_namespaced_all(conn, api_version, kind),
     }?;
     boundaries.extend(read_scope(
         conn,
@@ -65,7 +59,7 @@ fn row_to_boundary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplayRetentionB
     let event_id = row.get(1)?;
     let position_is_exact: bool = row.get(2)?;
     Ok(if position_is_exact {
-        ReplayRetentionBoundary::Exact(crate::datastore::WatchReplayPosition {
+        ReplayRetentionBoundary::Exact(klights_cluster_core::WatchReplayPosition {
             resource_version,
             event_id,
             resource_version_filter_through_event_id: 0,

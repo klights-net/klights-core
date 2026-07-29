@@ -7,9 +7,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
+use klights_cluster_core::{Resource, WatchReplayPosition};
+use klights_cluster_store::{DurableWatchScope, DurableWatchTarget};
 use serde_json::Value;
 
-use super::{Resource, WatchReplayPosition, WatchTarget, WatchTargetScope};
+#[cfg(test)]
+use super::{WatchTarget, WatchTargetScope};
 use klights_types::LabelSelector;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -137,6 +140,36 @@ impl MembershipReconstructor {
     }
 }
 
+pub(crate) fn sort_for_durable_watch_targets(
+    items: &mut [Resource],
+    targets: &[DurableWatchTarget],
+) {
+    items.sort_unstable_by(|left, right| {
+        let order = |resource: &Resource| {
+            targets
+                .iter()
+                .position(|target| {
+                    target.api_version() == resource.api_version
+                        && target.kind() == resource.kind
+                        && match target.scope() {
+                            DurableWatchScope::Cluster => resource.namespace.is_none(),
+                            DurableWatchScope::Namespaced(Some(namespace)) => {
+                                resource.namespace.as_deref() == Some(namespace.as_str())
+                            }
+                            DurableWatchScope::Namespaced(None) => resource.namespace.is_some(),
+                        }
+                })
+                .unwrap_or(usize::MAX)
+        };
+        (order(left), &left.namespace, &left.name).cmp(&(
+            order(right),
+            &right.namespace,
+            &right.name,
+        ))
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn sort_for_watch_targets(items: &mut [Resource], targets: &[WatchTarget]) {
     items.sort_unstable_by(|left, right| {
         let order = |resource: &Resource| {

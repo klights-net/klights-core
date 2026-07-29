@@ -25,7 +25,7 @@ pub struct LeaderStart<'a> {
     /// (not the raft leader), controller startup is skipped cleanly.
     pub leader_coordination: Option<Arc<dyn ControllerCoordination>>,
     pub db_handle: &'a DatastoreHandle,
-    pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    pub positioned_watch: klights_watch::PositionedWatchService,
     pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub task_supervisor: &'a Arc<TaskSupervisor>,
     pub dispatcher_for_worker: &'a Arc<crate::controllers::ControllerDispatcher>,
@@ -41,7 +41,7 @@ pub struct LeaderStart<'a> {
 struct LeaderScopedTaskContext {
     config: Arc<KlightsConfig>,
     db_handle: DatastoreHandle,
-    watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    positioned_watch: klights_watch::PositionedWatchService,
     node_local: crate::datastore::node_local::NodeLocalHandle,
     task_supervisor: Arc<TaskSupervisor>,
     dispatcher_for_worker: Arc<crate::controllers::ControllerDispatcher>,
@@ -57,7 +57,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         config,
         leader_coordination,
         db_handle,
-        watch_signals,
+        positioned_watch,
         node_local,
         task_supervisor,
         dispatcher_for_worker,
@@ -77,7 +77,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     let leader_context = LeaderScopedTaskContext {
         config: config.clone(),
         db_handle: db_handle.clone(),
-        watch_signals,
+        positioned_watch,
         node_local: node_local.clone(),
         task_supervisor: task_supervisor.clone(),
         dispatcher_for_worker: dispatcher_for_worker.clone(),
@@ -201,7 +201,7 @@ async fn start_leader_scoped_tasks(
     let LeaderScopedTaskContext {
         config,
         db_handle,
-        watch_signals,
+        positioned_watch,
         node_local,
         task_supervisor,
         dispatcher_for_worker,
@@ -221,7 +221,7 @@ async fn start_leader_scoped_tasks(
 
     let scheduler = crate::cronjob_scheduler_adapter::new_leader_scheduler(
         db_handle.clone(),
-        watch_signals.clone(),
+        positioned_watch.clone(),
         dispatcher_for_cronjobs,
         task_supervisor.clone(),
     );
@@ -280,8 +280,7 @@ async fn start_leader_scoped_tasks(
 
     let scheduler_runtime: Arc<dyn crate::controllers::scheduler::SchedulerRuntime> = Arc::new(
         crate::bootstrap::scheduler_adapter::LeaderSchedulerRuntime::new(
-            db_handle.clone(),
-            watch_signals,
+            positioned_watch,
             pod_scheduling,
         ),
     );

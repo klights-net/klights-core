@@ -22,6 +22,7 @@ impl GeneratedHandlerAdapter {
     pub(crate) fn new(
         db: DatastoreHandle,
         watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+        positioned_watch: klights_watch::PositionedWatchService,
         file_process: klights_supervisor::FileProcessExecutor,
         task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         ca_cert_path: std::path::PathBuf,
@@ -31,6 +32,7 @@ impl GeneratedHandlerAdapter {
                 crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
                     db.clone(),
                     watch_signals,
+                    positioned_watch,
                 ),
             ),
             db,

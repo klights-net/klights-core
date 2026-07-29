@@ -13,7 +13,10 @@ use tokio::sync::broadcast;
 use ::redb::{ReadableDatabase, ReadableTable};
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::redb::helpers;
+use crate::datastore::redb::read_core::{
+    RedbCheckedWatchRead, RedbCollectionScope, RedbListQuery, RedbPositionedWatchRead,
+    RedbSnapshotRead,
+};
 use crate::datastore::types::*;
 use klights_cluster_core::{
     PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
@@ -27,6 +30,57 @@ use klights_types::NodePeerMode;
 use klights_watch::{WatchSignal, WatchTopic};
 
 use super::RedbDatastore;
+
+fn legacy_target_to_durable(target: &WatchTarget) -> klights_cluster_store::DurableWatchTarget {
+    match &target.scope {
+        WatchTargetScope::Cluster => {
+            klights_cluster_store::DurableWatchTarget::cluster(&target.api_version, &target.kind)
+        }
+        WatchTargetScope::Namespaced(None) => {
+            klights_cluster_store::DurableWatchTarget::namespaced(&target.api_version, &target.kind)
+        }
+        WatchTargetScope::Namespaced(Some(namespace)) => {
+            klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(
+                &target.api_version,
+                &target.kind,
+                namespace,
+            )
+        }
+    }
+}
+
+fn durable_to_catchup(event: klights_cluster_store::DurableWatchEvent) -> CatchUpResource {
+    let event_type = std::borrow::Cow::Owned(event.event_type().to_string());
+    CatchUpResource {
+        resource: event.into_resource(),
+        event_type,
+    }
+}
+
+fn durable_floor_to_legacy(floor: klights_cluster_store::DurableReplayFloor) -> WatchReplayFloor {
+    let (target, floor_resource_version, floor_event_id, position_is_exact) = floor.into_parts();
+    let (api_version, kind, namespace_key) = match target {
+        klights_cluster_store::DurableReplayTarget::All => {
+            ("*".to_string(), "*".to_string(), "*".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Cluster { api_version, kind } => {
+            (api_version, kind, "#cluster".to_string())
+        }
+        klights_cluster_store::DurableReplayTarget::Namespaced {
+            api_version,
+            kind,
+            namespace,
+        } => (api_version, kind, namespace),
+    };
+    WatchReplayFloor {
+        api_version,
+        kind,
+        namespace_key,
+        floor_resource_version,
+        floor_event_id,
+        position_is_exact,
+    }
+}
 
 fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Vec<u8>> {
     if client_id.is_empty() || client_id.contains('\0') || stream_id <= 0 {
@@ -78,36 +132,15 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
-        self.accessor
-            .call("redb_atomic_allocator_observation", |db| {
-                let read = db.begin_read()?;
-                let meta = read.open_table(tables::META)?;
-                let parse_meta = |key: &str| -> Result<i64> {
-                    match meta.get(key)? {
-                        None => Ok(0),
-                        Some(value) => {
-                            let raw = std::str::from_utf8(value.value()).map_err(|error| {
-                                anyhow!("invalid UTF-8 {key} metadata: {error}")
-                            })?;
-                            raw.parse::<i64>()
-                                .map_err(|_| anyhow!("invalid numeric {key} metadata {raw:?}"))
-                        }
-                    }
-                };
-                let resource_version = parse_meta("rv")?;
-                let event_id = parse_meta("watch_event_id")?;
-                if resource_version < 0 || event_id < 0 {
-                    return Err(anyhow!("allocator values must be non-negative"));
-                }
-                Ok(DurableAllocatorObservation {
-                    position: WatchReplayPosition {
-                        resource_version,
-                        event_id,
-                        resource_version_filter_through_event_id: 0,
-                    },
-                })
-            })
+        use klights_cluster_store::DurableAllocatorRead;
+        let state = self
+            .focused_read_store()
+            .read_allocator_state()
             .await
+            .map_err(anyhow::Error::from)?;
+        Ok(DurableAllocatorObservation {
+            position: state.position(),
+        })
     }
 
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
@@ -289,7 +322,7 @@ impl DatastoreBackend for RedbDatastore {
         n: Option<&str>,
         m: &str,
     ) -> Result<Option<Resource>> {
-        self.resources.get_res(a, k, n, m).await
+        self.read_store.core().get_resource(a, k, n, m).await
     }
     async fn update_resource(
         &self,
@@ -375,7 +408,38 @@ impl DatastoreBackend for RedbDatastore {
         n: Option<&str>,
         query: ResourceListQuery<'_>,
     ) -> Result<ResourceList> {
-        self.resources.list_res(a, k, n, query).await
+        let cursor = query.continue_token.map(|name| {
+            klights_cluster_store::ResourceCollectionKey::new(
+                n.map(str::to_string),
+                name.to_string(),
+            )
+        });
+        let page = self
+            .read_store
+            .core()
+            .list_resources(
+                a,
+                k,
+                n.map_or(RedbCollectionScope::LegacyAny, |namespace| {
+                    RedbCollectionScope::Namespace(namespace.to_string())
+                }),
+                RedbListQuery {
+                    label_selector: query.label_selector.map(str::to_string),
+                    field_selector: query.field_selector.map(str::to_string),
+                    limit: query.limit,
+                    cursor,
+                },
+            )
+            .await?;
+        Ok(ResourceList {
+            resource_version: page.position.resource_version,
+            watch_replay_position: Some(page.position),
+            items: page.items,
+            continue_token: page
+                .continuation
+                .map(|continuation| continuation.name().to_string()),
+            remaining_item_count: page.remaining_item_count,
+        })
     }
     async fn list_resources_page(
         &self,
@@ -468,77 +532,31 @@ impl DatastoreBackend for RedbDatastore {
         self.namespaces.create_ns(n, d).await
     }
     async fn get_namespace(&self, n: &str) -> Result<Option<Resource>> {
-        let n_owned = n.to_string();
-        self.accessor
-            .call("get_namespace", move |db| {
-                let n: &str = &n_owned;
-                let r = db.begin_read()?;
-                let t = r.open_table(tables::NAMESPACES)?;
-                Ok(t.get(n)?.map(|g| {
-                    let data = helpers::body_val(g.value());
-                    Resource {
-                        id: 0,
-                        api_version: "v1".into(),
-                        kind: "Namespace".into(),
-                        namespace: None,
-                        name: n.into(),
-                        uid: Resource::uid_from_data(&data),
-                        resource_version: 0,
-                        data,
-                    }
-                }))
-            })
+        self.read_store
+            .core()
+            .get_resource("v1", "Namespace", None, n)
             .await
     }
     async fn list_namespaces(&self, ls: Option<&str>, fs: Option<&str>) -> Result<ResourceList> {
-        let ls_owned = ls.map(|s| s.to_string());
-        let fs_owned = fs.map(|s| s.to_string());
-        let parsed_label_reqs = if let Some(ref sel) = ls_owned {
-            Some(klights_types::parse_label_selector(sel)?)
-        } else {
-            None
-        };
-        let (mut items, watch_replay_position) = self
-            .accessor
-            .call("list_namespaces", move |db| {
-                let r = db.begin_read()?;
-                let watch_replay_position = helpers::watch_replay_position_in_read(&r)?;
-                let t = r.open_table(tables::NAMESPACES)?;
-                let items: Vec<_> = t
-                    .iter()?
-                    .filter_map(|e| e.ok())
-                    .map(|(k, v)| Resource {
-                        id: 0,
-                        api_version: "v1".into(),
-                        kind: "Namespace".into(),
-                        namespace: None,
-                        name: k.value().into(),
-                        uid: Resource::uid_from_data(&helpers::body_val(v.value())),
-                        resource_version: 0,
-                        data: helpers::body_val(v.value()),
-                    })
-                    .collect();
-                Ok((items, watch_replay_position))
-            })
+        let page = self
+            .read_store
+            .core()
+            .list_resources(
+                "v1",
+                "Namespace",
+                RedbCollectionScope::Cluster,
+                RedbListQuery {
+                    label_selector: ls.map(str::to_string),
+                    field_selector: fs.map(str::to_string),
+                    limit: None,
+                    cursor: None,
+                },
+            )
             .await?;
-
-        if let Some(reqs) = &parsed_label_reqs {
-            items.retain(|item| {
-                let labels = item
-                    .data
-                    .get("metadata")
-                    .and_then(|m| m.get("labels"))
-                    .and_then(|l| l.as_object());
-                reqs.iter().all(|req| req.matches(labels))
-            });
-        }
-        if let Some(fs) = fs_owned.as_deref() {
-            items = helpers::filter_by_field_selector(items, fs);
-        }
         Ok(ResourceList {
-            resource_version: watch_replay_position.resource_version,
-            watch_replay_position: Some(watch_replay_position),
-            items,
+            resource_version: page.position.resource_version,
+            watch_replay_position: Some(page.position),
+            items: page.items,
             continue_token: None,
             remaining_item_count: None,
         })
@@ -562,7 +580,7 @@ impl DatastoreBackend for RedbDatastore {
         self.namespaces.delete_ns_impl(n).await
     }
     async fn find_owned_resources(&self, o: &str, ns: Option<&str>) -> Result<Vec<Resource>> {
-        self.resources.find_owned(o, ns).await
+        self.read_store.core().find_owned(o, ns).await
     }
     async fn list_resources_by_owner_uid(
         &self,
@@ -571,7 +589,7 @@ impl DatastoreBackend for RedbDatastore {
         ns: Option<&str>,
         o: &str,
     ) -> Result<Vec<Resource>> {
-        let mut resources = self.resources.find_owned(o, ns).await?;
+        let mut resources = self.read_store.core().find_owned(o, ns).await?;
         resources.retain(|r| r.api_version == a && r.kind == k);
         Ok(resources)
     }
@@ -582,7 +600,7 @@ impl DatastoreBackend for RedbDatastore {
         owner_kind: &str,
         ns: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        let candidates = self.resources.find_owned("", ns).await?;
+        let candidates = self.read_store.core().find_owned("", ns).await?;
         let filtered: Vec<Resource> = candidates
             .into_iter()
             .filter(|r| {
@@ -614,10 +632,17 @@ impl DatastoreBackend for RedbDatastore {
         k: &str,
         s: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.watch_store.modified_since(a, k, None, s).await
+        self.read_store
+            .core()
+            .watch_events_since(
+                &[klights_cluster_store::DurableWatchTarget::cluster(a, k)],
+                s,
+            )
+            .await
+            .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
-        self.namespaces.list_cluster_resources_impl().await
+        self.read_store.core().list_cluster_resources().await
     }
     async fn list_resources_modified_since(
         &self,
@@ -626,17 +651,31 @@ impl DatastoreBackend for RedbDatastore {
         ns: Option<&str>,
         s: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.watch_store.modified_since(a, k, ns, s).await
+        let target = ns.map_or_else(
+            || klights_cluster_store::DurableWatchTarget::cluster(a, k),
+            |namespace| {
+                klights_cluster_store::DurableWatchTarget::namespaced_in_namespace(a, k, namespace)
+            },
+        );
+        self.read_store
+            .core()
+            .watch_events_since(&[target], s)
+            .await
+            .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
         self.rv_store.advance_rv(min_rv).await
     }
     async fn list_namespace_resources(&self, ns: &str) -> Result<Vec<Resource>> {
-        self.namespaces.list_namespace_resources_impl(ns).await
+        self.read_store
+            .core()
+            .list_namespace_resources(ns, None, false)
+            .await
     }
     async fn list_namespace_resources_of_kind(&self, ns: &str, k: &str) -> Result<Vec<Resource>> {
-        self.namespaces
-            .list_namespace_resources_of_kind_impl(ns, k)
+        self.read_store
+            .core()
+            .list_namespace_resources(ns, Some(k), false)
             .await
     }
     async fn list_namespace_resources_excluding_kind(
@@ -644,26 +683,43 @@ impl DatastoreBackend for RedbDatastore {
         ns: &str,
         k: &str,
     ) -> Result<Vec<Resource>> {
-        self.namespaces
-            .list_namespace_resources_excluding_kind_impl(ns, k)
+        self.read_store
+            .core()
+            .list_namespace_resources(ns, Some(k), true)
             .await
     }
     async fn count_namespace_resources(&self, ns: &str) -> Result<i64> {
-        self.namespaces.count_namespace_resources_impl(ns).await
+        self.read_store.core().count_namespace_resources(ns).await
     }
     async fn list_watch_events_since(
         &self,
         t: &[WatchTarget],
         s: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        self.watch_store.watch_list(t, s).await
+        let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
+        self.read_store
+            .core()
+            .watch_events_since(&targets, s)
+            .await
+            .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn list_watch_events_since_checked(
         &self,
         t: &[WatchTarget],
         s: i64,
     ) -> Result<WatchReplayRead> {
-        self.watch_store.watch_list_checked(t, s).await
+        let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
+        match self
+            .read_store
+            .core()
+            .watch_events_since_checked(&targets, s, None)
+            .await?
+        {
+            RedbCheckedWatchRead::Events(events) => Ok(WatchReplayRead::Events(
+                events.into_iter().map(durable_to_catchup).collect(),
+            )),
+            RedbCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
+        }
     }
     async fn list_watch_events_since_checked_bounded(
         &self,
@@ -671,9 +727,18 @@ impl DatastoreBackend for RedbDatastore {
         s: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead> {
-        self.watch_store
-            .watch_list_checked_bounded(t, s, limit)
-            .await
+        let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
+        match self
+            .read_store
+            .core()
+            .watch_events_since_checked(&targets, s, Some(limit))
+            .await?
+        {
+            RedbCheckedWatchRead::Events(events) => Ok(WatchReplayRead::Events(
+                events.into_iter().map(durable_to_catchup).collect(),
+            )),
+            RedbCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
+        }
     }
     async fn list_watch_events_after_position_checked_bounded(
         &self,
@@ -681,12 +746,31 @@ impl DatastoreBackend for RedbDatastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
-        self.watch_store
-            .watch_list_positioned_checked_bounded(targets, position, limit)
-            .await
+        let targets: Vec<_> = targets.iter().map(legacy_target_to_durable).collect();
+        match self
+            .read_store
+            .core()
+            .positioned_watch_events(&targets, position, limit)
+            .await?
+        {
+            RedbPositionedWatchRead::Expired => Ok(PositionedWatchReplayRead::Expired),
+            RedbPositionedWatchRead::Events(page) => {
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    events: page
+                        .events
+                        .into_iter()
+                        .map(|event| klights_cluster_core::PositionedWatchEvent {
+                            position: event.position,
+                            event: durable_to_catchup(event.event),
+                        })
+                        .collect(),
+                    next_position: page.next_position,
+                }))
+            }
+        }
     }
     async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
-        self.watch_store.current_watch_replay_position().await
+        self.read_store.core().allocator_position().await
     }
     async fn snapshot_resources_at_position(
         &self,
@@ -695,14 +779,24 @@ impl DatastoreBackend for RedbDatastore {
         field_selector: Option<&str>,
         position: WatchReplayPosition,
     ) -> Result<SnapshotAtRv> {
-        RedbDatastore::snapshot_resources_at_position(
-            self,
-            targets,
-            label_selector,
-            field_selector,
-            position,
-        )
-        .await
+        let targets: Vec<_> = targets.iter().map(legacy_target_to_durable).collect();
+        match self
+            .read_store
+            .core()
+            .snapshot_at_position(&targets, label_selector, field_selector, position)
+            .await?
+        {
+            RedbSnapshotRead::Expired => Ok(SnapshotAtRv::Expired),
+            RedbSnapshotRead::Historical { items, position } => {
+                Ok(SnapshotAtRv::List(ResourceList {
+                    items,
+                    resource_version: position.resource_version,
+                    watch_replay_position: Some(position),
+                    continue_token: None,
+                    remaining_item_count: None,
+                }))
+            }
+        }
     }
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
@@ -710,9 +804,16 @@ impl DatastoreBackend for RedbDatastore {
         s: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        self.watch_store
-            .watch_list_raw_checked_bounded(t, s, limit)
-            .await
+        let targets: Vec<_> = t.iter().map(legacy_target_to_durable).collect();
+        match self
+            .read_store
+            .core()
+            .raw_watch_events_since_checked(&targets, s, limit)
+            .await?
+        {
+            RedbCheckedWatchRead::Events(events) => Ok(WatchReplayRead::Events(events)),
+            RedbCheckedWatchRead::Expired => Ok(WatchReplayRead::Expired),
+        }
     }
     async fn list_raw_watch_events_after_position_checked_bounded(
         &self,
@@ -720,12 +821,28 @@ impl DatastoreBackend for RedbDatastore {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<klights_cluster_store::DurableRawWatchEvent>> {
-        self.watch_store
-            .watch_list_raw_positioned_checked_bounded(targets, position, limit)
-            .await
+        let targets: Vec<_> = targets.iter().map(legacy_target_to_durable).collect();
+        match self
+            .read_store
+            .core()
+            .positioned_raw_watch_events(&targets, position, limit)
+            .await?
+        {
+            RedbPositionedWatchRead::Expired => Ok(PositionedWatchReplayRead::Expired),
+            RedbPositionedWatchRead::Events(page) => {
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    events: page.events,
+                    next_position: page.next_position,
+                }))
+            }
+        }
     }
     async fn list_all_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
-        self.watch_store.watch_list_all_since(s).await
+        self.read_store
+            .core()
+            .all_watch_events_since(s, false)
+            .await
+            .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn list_all_watch_events_since_paged(
         &self,
@@ -734,9 +851,17 @@ impl DatastoreBackend for RedbDatastore {
         after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.watch_store
-            .watch_list_all_since_paged(s, after_resource_version, after_id, limit)
+        let _ = after_resource_version;
+        self.read_store
+            .core()
+            .all_watch_events_since_paged(s, after_id, None, limit)
             .await
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|(id, event)| (id, durable_to_catchup(event)))
+                    .collect()
+            })
     }
     async fn list_all_watch_events_after_id_bounded(
         &self,
@@ -744,12 +869,23 @@ impl DatastoreBackend for RedbDatastore {
         through_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        self.watch_store
-            .watch_list_all_after_id_bounded(after_id, through_id, limit)
+        self.read_store
+            .core()
+            .all_watch_events_since_paged(0, after_id, Some(through_id), limit)
             .await
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|(id, event)| (id, durable_to_catchup(event)))
+                    .collect()
+            })
     }
     async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
-        self.watch_store.list_watch_replay_floors().await
+        self.read_store
+            .core()
+            .replay_floors()
+            .await
+            .map(|floors| floors.into_iter().map(durable_floor_to_legacy).collect())
     }
 
     async fn list_watch_replay_floors_paged(
@@ -757,12 +893,18 @@ impl DatastoreBackend for RedbDatastore {
         after: Option<&klights_cluster_store::SnapshotReplayFloorCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<WatchReplayFloor>> {
-        self.watch_store
-            .list_watch_replay_floors_paged(after, limit)
+        self.read_store
+            .core()
+            .replay_floors_paged(after, limit)
             .await
+            .map(|floors| floors.into_iter().map(durable_floor_to_legacy).collect())
     }
     async fn list_deleted_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
-        self.watch_store.watch_list_deleted_since(s).await
+        self.read_store
+            .core()
+            .all_watch_events_since(s, true)
+            .await
+            .map(|events| events.into_iter().map(durable_to_catchup).collect())
     }
     async fn allocate_node_subnet(
         &self,
@@ -790,19 +932,19 @@ impl DatastoreBackend for RedbDatastore {
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
-        self.network.get_node_dataplane(node_name).await
+        self.read_store.core().get_node_dataplane(node_name).await
     }
     async fn get_node_subnet(
         &self,
         n: &str,
     ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
-        self.network.get_node_subnet(n).await
+        self.read_store.core().get_node_subnet(n).await
     }
     async fn list_peer_subnets(
         &self,
         request: klights_cluster_store::PeerTopologyRequest,
     ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
-        self.network.list_peer_subnets(request).await
+        self.read_store.core().list_peer_subnets(request).await
     }
     async fn delete_node_subnet(&self, n: &str) -> Result<()> {
         self.network.delete_node_subnet(n).await

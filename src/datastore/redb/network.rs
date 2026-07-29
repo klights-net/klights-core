@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use ::redb::{ReadableDatabase, ReadableTable};
+use ::redb::ReadableTable;
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 
@@ -14,6 +14,9 @@ use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
 use klights_types::{ClusterCidr, NodeName, PodSubnet};
 
+use super::read_core::RedbReadCore;
+
+#[derive(Clone)]
 pub struct RedbNetworkStore {
     pub accessor: Arc<RedbAccessor>,
 }
@@ -191,43 +194,18 @@ impl RedbNetworkStore {
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::StoredNodeSubnet>> {
-        let node_name_owned = node_name.to_string();
-        self.db_call("get_node_subnet_impl", move |db| {
-            let node_name: &str = &node_name_owned;
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::NODE_SUBNETS)?;
-            match t.get(node_name)? {
-                Some(g) => Ok(Some(parse_node_subnet_value(node_name, g.value())?)),
-                None => Ok(None),
-            }
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .get_node_subnet(node_name)
+            .await
     }
 
     pub async fn list_peer_subnets(
         &self,
         request: klights_cluster_store::PeerTopologyRequest,
     ) -> Result<Vec<klights_cluster_store::StoredNodeSubnet>> {
-        let excluded_node_name = request
-            .excluded_node_name()
-            .map(|node_name| node_name.as_str().to_string());
-        self.db_call("list_peer_subnets_impl", move |db| {
-            let r = db.begin_read()?;
-            let t = r.open_table(tables::NODE_SUBNETS)?;
-            let mut items = Vec::new();
-            for e in t.iter()? {
-                let (k, val) = e?;
-                let name = k.value();
-                if (excluded_node_name.is_none() && name.is_empty())
-                    || excluded_node_name.as_deref() == Some(name)
-                {
-                    continue;
-                }
-                items.push(parse_node_subnet_value(name, val.value())?);
-            }
-            Ok(items)
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .list_peer_subnets(request)
+            .await
     }
 
     pub async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
@@ -273,39 +251,9 @@ impl RedbNetworkStore {
         &self,
         node_name: &str,
     ) -> Result<Option<klights_cluster_store::DataplanePeerMetadata>> {
-        let node_name_owned = node_name.to_string();
-        self.db_call("get_node_dataplane_impl", move |db| {
-            let r = db.begin_read()?;
-            let t = match r.open_table(tables::NODE_DATAPLANE) {
-                Ok(t) => t,
-                Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(err) => return Err(err.into()),
-            };
-            match t.get(node_name_owned.as_str())? {
-                Some(value) => {
-                    let body: Value = serde_json::from_slice(value.value()).map_err(|error| {
-                        anyhow!("malformed persisted node dataplane JSON: {error}")
-                    })?;
-                    let mode = required_persisted_string(&body, "node dataplane", "mode")?;
-                    let encryption =
-                        required_persisted_string(&body, "node dataplane", "encryption")?;
-                    let public_key =
-                        optional_persisted_string(&body, "node dataplane", "public_key")?;
-                    let endpoint = optional_persisted_string(&body, "node dataplane", "endpoint")?;
-                    let port = optional_persisted_port(&body, "port")?;
-                    Ok(Some(klights_cluster_store::DataplanePeerMetadata::try_new(
-                        node_name_owned,
-                        klights_cluster_store::DataplaneMode::parse(mode)?,
-                        klights_cluster_store::DataplaneEncryption::parse(Some(encryption))?,
-                        public_key,
-                        endpoint,
-                        port,
-                    )?))
-                }
-                None => Ok(None),
-            }
-        })
-        .await
+        RedbReadCore::new(self.accessor.clone())
+            .get_node_dataplane(node_name)
+            .await
     }
 }
 
@@ -315,6 +263,7 @@ struct PersistedNodeSubnet {
     subnet: PodSubnet,
     subnet_base_int: u32,
     gateway_ip: Ipv4Addr,
+    #[cfg(test)]
     node_ip: Ipv4Addr,
     mode: NodePeerMode,
     hostport_range: Option<HostPortRange>,
@@ -345,9 +294,11 @@ fn parse_persisted_node_subnet(body: &[u8]) -> Result<PersistedNodeSubnet> {
             "persisted node subnet gateway compatibility field does not match its CIDR"
         ));
     }
-    let node_ip = required_persisted_string(&value, "node subnet", "node_ip")?
+    let node_ip: Ipv4Addr = required_persisted_string(&value, "node subnet", "node_ip")?
         .parse()
         .map_err(|error| anyhow!("bad node_ip: {error}"))?;
+    #[cfg(not(test))]
+    let _ = node_ip;
     let mode = parse_persisted_peer_mode(&value)?;
     let hostport_range = parse_persisted_hostport_range(&value)?;
     match (&mode, &hostport_range) {
@@ -367,12 +318,14 @@ fn parse_persisted_node_subnet(body: &[u8]) -> Result<PersistedNodeSubnet> {
         subnet,
         subnet_base_int,
         gateway_ip,
+        #[cfg(test)]
         node_ip,
         mode,
         hostport_range,
     })
 }
 
+#[cfg(test)]
 fn parse_node_subnet_value(
     name: &str,
     body: &[u8],
@@ -403,31 +356,6 @@ fn required_persisted_u32(value: &Value, record: &str, field: &str) -> Result<u3
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("{record} field {field} must be a non-negative integer"))?;
     u32::try_from(raw).map_err(|error| anyhow!("{record} field {field} outside u32: {error}"))
-}
-
-fn optional_persisted_string(value: &Value, record: &str, field: &str) -> Result<Option<String>> {
-    match value.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(_) => Err(anyhow!("{record} field {field} must be a string or null")),
-    }
-}
-
-fn optional_persisted_port(value: &Value, field: &str) -> Result<Option<u16>> {
-    let Some(raw) = value.get(field) else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
-    }
-    let raw = raw
-        .as_i64()
-        .ok_or_else(|| anyhow!("node dataplane field {field} must be an integer"))?;
-    u16::try_from(raw)
-        .ok()
-        .filter(|port| *port != 0)
-        .map(Some)
-        .ok_or_else(|| anyhow!("node dataplane field {field} outside 1..=65535"))
 }
 
 fn parse_persisted_hostport_range(value: &Value) -> Result<Option<HostPortRange>> {

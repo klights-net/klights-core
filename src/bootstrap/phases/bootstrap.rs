@@ -52,6 +52,7 @@ pub struct BootstrapRunArgs<'a> {
     pub skip_seed_bootstrap: bool,
     pub db_handle: &'a DatastoreHandle,
     pub watch_signals: Arc<dyn klights_watch::WatchSignalSubscribe>,
+    pub positioned_watch: klights_watch::PositionedWatchService,
     pub node_local: crate::datastore::node_local::NodeLocalHandle,
     pub worker_store_adapter:
         Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
@@ -298,6 +299,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         skip_seed_bootstrap,
         db_handle,
         watch_signals,
+        positioned_watch,
         node_local,
         worker_store_adapter,
         kubelet_uses_worker_store_adapter,
@@ -915,6 +917,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let generated_handler_adapter = crate::generated_handler_adapter::GeneratedHandlerAdapter::new(
         db_handle.clone(),
         watch_signals.clone(),
+        positioned_watch.clone(),
         klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         supervisor.clone(),
         api_runtime_paths.ca_cert.clone(),
@@ -949,6 +952,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
                     db_handle.clone(),
                     watch_signals.clone(),
+                    positioned_watch.clone(),
                 ),
             ),
             #[cfg(not(test))]
@@ -979,6 +983,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
                     db_handle.clone(),
                     watch_signals.clone(),
+                    positioned_watch.clone(),
                     supervisor.clone(),
                 ),
             builtin_admission_defaults: generated_handler_adapter.clone(),
@@ -1400,7 +1405,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let crd_registry_watch_handle = {
         let dbh = db_handle.clone();
         let registry = crd_registry.clone();
-        let crd_runtime = crate::crd_registry_adapter::new_runtime(dbh, watch_signals.clone());
+        let crd_runtime = crate::crd_registry_adapter::new_runtime(dbh, positioned_watch.clone());
         let cancel = shutdown_token.clone();
         supervisor
             .spawn_async(
@@ -1673,6 +1678,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             crate::watch_stream_adapter::DatastoreWatchStreamAdapter::new(
                 db_handle.clone(),
                 watch_signals.clone(),
+                positioned_watch.clone(),
             ),
         ),
         namespace_lifecycle_store,
@@ -1689,6 +1695,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         crate::custom_resource_read_adapter::CustomResourceReadAdapter::new(
             db_handle.clone(),
             watch_signals.clone(),
+            positioned_watch,
             supervisor.clone(),
         ),
         generated_handler_adapter.clone(),

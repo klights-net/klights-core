@@ -71,6 +71,7 @@ pub(crate) mod pod_repository_composition;
 mod pod_scheduler_service;
 pub(crate) mod pod_subresource_service;
 pub mod portforward;
+mod positioned_watch_adapter;
 mod remote_informer_cache_adapter;
 mod replicaset_store_adapter;
 pub mod replication;
