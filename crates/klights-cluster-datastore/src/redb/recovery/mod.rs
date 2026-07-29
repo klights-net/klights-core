@@ -11,7 +11,12 @@ use crate::redb::{RedbAccessor, tables};
 use ::redb::ReadableDatabase;
 use anyhow::{Result, anyhow};
 use klights_cluster_core::{ClusterMembership, ClusterMetadata};
-use klights_cluster_store::SnapshotMembership;
+use klights_cluster_store::{
+    AuthoritativeSnapshot, AuthoritativeSnapshotCapture, AuthoritativeSnapshotPersistence,
+    ClusterMetadataFuture, ClusterMetadataRead, ClusterMetadataStoreError,
+    PersistedClusterMetadata, SnapshotCaptureRequest, SnapshotCaptureSession, SnapshotMembership,
+    SnapshotPersistenceError, SnapshotPersistenceFuture,
+};
 
 mod backend_snapshot;
 mod capture;
@@ -123,5 +128,68 @@ impl RedbRecoveryStore {
                     .map(|value| value.value().to_string()))
             })
             .await
+    }
+}
+
+impl AuthoritativeSnapshotCapture for RedbRecoveryStore {
+    fn begin_capture(
+        &self,
+        request: SnapshotCaptureRequest,
+    ) -> SnapshotPersistenceFuture<'_, Box<dyn SnapshotCaptureSession>> {
+        Box::pin(async move {
+            let fence = klights_cluster_store::SnapshotExclusiveFence::new(
+                self.accessor.acquire_snapshot_exclusive().await,
+            );
+            self.begin_snapshot(request, fence)
+                .await
+                .map_err(map_snapshot_persistence_error)
+        })
+    }
+}
+
+impl AuthoritativeSnapshotPersistence for RedbRecoveryStore {
+    fn restore_authoritative_snapshot(
+        &self,
+        _snapshot: AuthoritativeSnapshot,
+    ) -> SnapshotPersistenceFuture<'_> {
+        Box::pin(async {
+            Err(SnapshotPersistenceError::UnsupportedMode {
+                message: "redb backend does not support atomic authoritative snapshot replacement"
+                    .to_string(),
+            })
+        })
+    }
+}
+
+impl ClusterMetadataRead for RedbRecoveryStore {
+    fn read_cluster_metadata(&self) -> ClusterMetadataFuture<'_, PersistedClusterMetadata> {
+        Box::pin(async move {
+            RedbRecoveryStore::read_cluster_metadata(self)
+                .await
+                .map(|observed| {
+                    PersistedClusterMetadata::new(observed.metadata, observed.membership)
+                })
+                .map_err(map_cluster_metadata_error)
+        })
+    }
+}
+
+fn map_snapshot_persistence_error(error: anyhow::Error) -> SnapshotPersistenceError {
+    error
+        .downcast_ref::<SnapshotPersistenceError>()
+        .cloned()
+        .unwrap_or_else(|| SnapshotPersistenceError::PersistenceFailed {
+            message: format!("{error:#}"),
+        })
+}
+
+fn map_cluster_metadata_error(error: anyhow::Error) -> ClusterMetadataStoreError {
+    let message = format!("{error:#}");
+    if message.contains("missing") || message.contains("empty") || message.contains("incomplete") {
+        ClusterMetadataStoreError::Incomplete { message }
+    } else if message.contains("invalid") {
+        ClusterMetadataStoreError::CorruptData { message }
+    } else {
+        ClusterMetadataStoreError::PersistenceFailed { message }
     }
 }

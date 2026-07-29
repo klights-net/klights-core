@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use super::RedbAccessor;
+use super::RedbReadStore;
 use super::key_codec::resource_key;
 use super::mutation_helpers as helpers;
 use super::read_core::RedbReadCore;
@@ -19,10 +20,10 @@ use super::tables;
 use klights_cluster_core::{
     LogApplyAppliedOutboxRow, OutboxApplyError, OutboxStreamWatermark, Resource,
 };
-use klights_cluster_store::SnapshotOutboxWatermarkCursor;
 use klights_cluster_store::{
-    CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
-    CommittedRaftApplyRequest, PrivilegedCommittedRaftApply,
+    AppliedOutboxLookup, CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
+    CommittedRaftApplyRequest, DurableAllocatorRead, DurableApplyLedgerRead,
+    PrivilegedCommittedRaftApply, SnapshotOutboxWatermarkCursor,
 };
 
 #[derive(Clone)]
@@ -476,6 +477,69 @@ impl PrivilegedCommittedRaftApply for RedbLiveCommittedApplyStore {
                 }
             })
         })
+    }
+}
+
+impl DurableApplyLedgerRead for RedbLiveCommittedApplyStore {
+    fn current_apply_position(
+        &self,
+    ) -> CommittedApplyFuture<'_, klights_cluster_core::WatchReplayPosition> {
+        Box::pin(async move {
+            RedbReadStore::new(self.accessor.clone())
+                .read_allocator_state()
+                .await
+                .map(|state| state.position())
+                .map_err(|error| CommittedApplyError::PersistenceFailed {
+                    message: error.to_string(),
+                })
+        })
+    }
+
+    fn get_applied_outbox(
+        &self,
+        lookup: AppliedOutboxLookup,
+    ) -> CommittedApplyFuture<'_, Option<LogApplyAppliedOutboxRow>> {
+        Box::pin(async move {
+            let bytes = self
+                .get_applied_outbox_bytes(lookup.idempotency_key())
+                .await
+                .map_err(|error| CommittedApplyError::PersistenceFailed {
+                    message: format!("{error:#}"),
+                })?;
+            bytes
+                .map(|bytes| {
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        CommittedApplyError::CorruptData {
+                            message: format!("invalid redb applied-outbox row: {error}"),
+                        }
+                    })
+                })
+                .transpose()
+        })
+    }
+
+    fn list_outbox_watermarks(&self) -> CommittedApplyFuture<'_, Vec<OutboxStreamWatermark>> {
+        Box::pin(async move {
+            RedbLiveCommittedApplyStore::list_outbox_watermarks(self)
+                .await
+                .map_err(map_ledger_read_error)
+        })
+    }
+}
+
+fn map_ledger_read_error(error: anyhow::Error) -> CommittedApplyError {
+    let message = format!("{error:#}");
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("corrupt") || lower.contains("decode") || lower.contains("invalid data") {
+        CommittedApplyError::CorruptData { message }
+    } else if lower.contains("cancel") {
+        CommittedApplyError::Cancelled
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        CommittedApplyError::Timeout
+    } else if lower.contains("busy") || lower.contains("locked") {
+        CommittedApplyError::Retryable { message }
+    } else {
+        CommittedApplyError::PersistenceFailed { message }
     }
 }
 
