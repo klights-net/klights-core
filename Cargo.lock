@@ -2154,10 +2154,15 @@ dependencies = [
 name = "klights-cluster-store"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "klights-cluster-core",
  "klights-types",
+ "serde",
+ "sha2 0.11.0",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

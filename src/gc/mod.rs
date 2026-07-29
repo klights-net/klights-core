@@ -177,7 +177,7 @@ mod tests {
         let expired_ms = now_ms - applied_outbox_gc::APPLIED_OUTBOX_GC_TTL_MS - 1;
         let recent_ms = now_ms - applied_outbox_gc::APPLIED_OUTBOX_GC_TTL_MS + 60_000;
 
-        db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "expired-pod-status".to_string(),
             subject_key: "v1/Pod/default/expired/uid-expired".to_string(),
             operation: "PodStatus".to_string(),
@@ -188,7 +188,7 @@ mod tests {
         })
         .await
         .unwrap();
-        db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "recent-pod-status".to_string(),
             subject_key: "v1/Pod/default/recent/uid-recent".to_string(),
             operation: "PodStatus".to_string(),
@@ -199,7 +199,7 @@ mod tests {
         })
         .await
         .unwrap();
-        db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "expired-event-create".to_string(),
             subject_key: "events.k8s.io/v1/Event/default/event/uid-event".to_string(),
             operation: "EventCreate".to_string(),

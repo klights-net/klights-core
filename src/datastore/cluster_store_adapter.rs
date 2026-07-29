@@ -675,7 +675,6 @@ impl DurableApplyLedgerRead for DatastoreCommittedRaftApply {
             self.db
                 .get_applied_outbox(lookup.idempotency_key())
                 .await
-                .map(|record| record.map(Into::into))
                 .map_err(map_committed_apply_error)
         })
     }
@@ -916,15 +915,21 @@ fn map_allocator_error(error: anyhow::Error) -> AllocatorStateError {
 pub(crate) struct DatastoreAuthoritativeSnapshotPersistence {
     db: DatastoreHandle,
     recovery: std::sync::Arc<dyn crate::datastore::DurableRecoveryStore>,
+    lifecycle: std::sync::Arc<dyn crate::datastore::BackendLifecycleStore>,
 }
 
 impl DatastoreAuthoritativeSnapshotPersistence {
     pub(crate) fn new(
         db: DatastoreHandle,
         recovery: std::sync::Arc<dyn crate::datastore::DurableRecoveryStore>,
+        lifecycle: std::sync::Arc<dyn crate::datastore::BackendLifecycleStore>,
         _authority: crate::datastore::raft::SnapshotInstallAuthority,
     ) -> Self {
-        Self { db, recovery }
+        Self {
+            db,
+            recovery,
+            lifecycle,
+        }
     }
 
     #[cfg(test)]
@@ -937,7 +942,14 @@ impl DatastoreAuthoritativeSnapshotPersistence {
         let recovery = std::sync::Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
             db.clone(),
         ));
-        Self { db, recovery }
+        let lifecycle = std::sync::Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(
+            db.clone(),
+        ));
+        Self {
+            db,
+            recovery,
+            lifecycle,
+        }
     }
 
     pub(crate) async fn restore_authoritative_raft_snapshot(
@@ -1149,9 +1161,17 @@ impl AuthoritativeSnapshotCapture for DatastoreAuthoritativeSnapshotPersistence 
         request: klights_cluster_store::SnapshotCaptureRequest,
     ) -> SnapshotPersistenceFuture<'_, Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
         Box::pin(async move {
+            let fence = self
+                .lifecycle
+                .acquire_snapshot_exclusive_fence()
+                .await
+                .map_err(map_snapshot_persistence_error)?
+                .ok_or_else(|| SnapshotPersistenceError::PersistenceFailed {
+                    message: "backend does not provide a snapshot capture fence".to_string(),
+                })?;
             let session = self
                 .recovery
-                .begin_pinned_snapshot_capture(request)
+                .begin_pinned_snapshot_capture(request, fence)
                 .await
                 .map_err(map_snapshot_persistence_error)?;
             Ok(Box::new(NormalizingSnapshotCaptureSession::new(

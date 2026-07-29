@@ -1,28 +1,27 @@
 //! `DatastoreBackend` implementation for `RedbDatastore`.
 //!
 //! Every trait method delegates to the appropriate composed domain store.
-//! Methods that need combined logic (preconditions + delete, get_namespace, etc.)
-//! are implemented inline.
+//! Root datastore contracts are adapted here, while canonical reads and Redb
+//! persistence algorithms remain owned by the focused lower modules.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 #[cfg(test)]
 use tokio::sync::broadcast;
 
-use ::redb::{ReadableDatabase, ReadableTable};
-
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::*;
 use klights_cluster_core::{
-    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
-    WatchReplayPosition,
+    LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
+    ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
 use klights_cluster_datastore::redb::read_core::RedbCheckedWatchRead;
 use klights_cluster_datastore::redb::read_core::RedbCollectionScope;
 use klights_cluster_datastore::redb::read_core::RedbListQuery;
 use klights_cluster_datastore::redb::read_core::RedbPositionedWatchRead;
 use klights_cluster_datastore::redb::read_core::RedbSnapshotRead;
+#[cfg(test)]
 use klights_cluster_datastore::redb::tables;
 #[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
@@ -84,45 +83,8 @@ fn durable_floor_to_legacy(floor: klights_cluster_store::DurableReplayFloor) -> 
     }
 }
 
-fn outbox_watermark_key(client_id: &str, stream_id: i64) -> Result<Vec<u8>> {
-    if client_id.is_empty() || client_id.contains('\0') || stream_id <= 0 {
-        return Err(anyhow!(
-            "outbox watermark requires a non-empty NUL-free client ID and positive stream ID"
-        ));
-    }
-    let mut key = Vec::with_capacity(client_id.len() + 9);
-    key.extend_from_slice(client_id.as_bytes());
-    key.push(0);
-    key.extend_from_slice(&(stream_id as u64).to_be_bytes());
-    Ok(key)
-}
-
-pub(super) fn decode_outbox_watermark_key(
-    key: &[u8],
-    stream_seq: i64,
-) -> Result<klights_cluster_core::OutboxStreamWatermark> {
-    if key.len() < 10 || key[key.len() - 9] != 0 {
-        return Err(anyhow!("corrupt redb outbox-watermark key"));
-    }
-    let client_id = std::str::from_utf8(&key[..key.len() - 9])
-        .map_err(|error| anyhow!("corrupt redb outbox-watermark client ID: {error}"))?
-        .to_string();
-    let stream_id = u64::from_be_bytes(
-        key[key.len() - 8..]
-            .try_into()
-            .expect("watermark key suffix is eight bytes"),
-    );
-    let stream_id =
-        i64::try_from(stream_id).map_err(|_| anyhow!("redb outbox stream ID exceeds i64"))?;
-    if stream_seq <= 0 {
-        return Err(anyhow!("corrupt redb outbox stream sequence {stream_seq}"));
-    }
-    Ok(klights_cluster_core::OutboxStreamWatermark {
-        client_id,
-        stream_id,
-        stream_seq,
-    })
-}
+#[cfg(test)]
+use super::live_committed_apply::outbox_watermark_key;
 
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {
@@ -146,95 +108,36 @@ impl DatastoreBackend for RedbDatastore {
     }
 
     async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
-        self.accessor
-            .call("redb_atomic_cluster_metadata_observation", |db| {
-                let read = db.begin_read()?;
-                let klights = read.open_table(tables::KLIGHTS_META)?;
-                let get = |key: &str| -> Result<Option<String>> {
-                    Ok(klights.get(key)?.map(|value| value.value().to_string()))
-                };
-                let cluster_id = get(klights_cluster_store::CLUSTER_ID_META_KEY)?
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("cluster_id is missing or empty"))?;
-                let raw_epoch = get(klights_cluster_store::LEADER_EPOCH_META_KEY)?
-                    .ok_or_else(|| anyhow!("leader_epoch is missing"))?;
-                let leader_epoch = raw_epoch
-                    .parse::<i64>()
-                    .map_err(|_| anyhow!("invalid leader_epoch {raw_epoch:?}"))?;
-                let meta = read.open_table(tables::META)?;
-                let current_rv = match meta.get("rv")? {
-                    None => 0,
-                    Some(value) => {
-                        let raw = std::str::from_utf8(value.value())
-                            .map_err(|error| anyhow!("invalid resource_version UTF-8: {error}"))?;
-                        raw.parse::<i64>()
-                            .map_err(|_| anyhow!("invalid resource_version {raw:?}"))?
-                    }
-                };
-                if leader_epoch < 0 || current_rv < 0 {
-                    return Err(anyhow!(
-                        "cluster metadata numeric values must be non-negative"
-                    ));
-                }
-                let membership = match (
-                    get(klights_cluster_store::RAFT_VOTERS_META_KEY)?,
-                    get(klights_cluster_store::RAFT_TERM_META_KEY)?,
-                    get(klights_cluster_store::RAFT_LEADER_HINT_META_KEY)?,
-                ) {
-                    (None, None, None) => ReplicatedMembershipState::AuthoritativeAbsent,
-                    (Some(raw_voters), Some(raw_term), Some(raw_hint)) => {
-                        let voters: Vec<String> = serde_json::from_str(&raw_voters)?;
-                        let term = raw_term
-                            .parse::<i64>()
-                            .map_err(|_| anyhow!("invalid raft term {raw_term:?}"))?;
-                        let mut unique = std::collections::HashSet::with_capacity(voters.len());
-                        if term < 0
-                            || voters.is_empty()
-                            || voters
-                                .iter()
-                                .any(|voter| voter.is_empty() || !unique.insert(voter.as_str()))
-                        {
-                            return Err(anyhow!(
-                                "membership contains an invalid term or voter set"
-                            ));
-                        }
-                        ReplicatedMembershipState::Present(
-                            klights_cluster_core::ClusterMembership {
-                                cluster_id: cluster_id.clone(),
-                                voters,
-                                term,
-                                leader_hint: (!raw_hint.is_empty()).then_some(raw_hint),
-                            },
-                        )
-                    }
-                    _ => return Err(anyhow!("membership metadata is incomplete")),
-                };
-                Ok(ClusterMetadataObservation {
-                    metadata: klights_cluster_core::ClusterMetadata {
-                        cluster_id,
-                        leader_epoch,
-                        current_rv,
-                    },
-                    membership,
-                })
-            })
-            .await
+        let observed = self.recovery.read_cluster_metadata().await?;
+        let membership = match observed.membership {
+            klights_cluster_store::SnapshotMembership::LegacyOmitted => {
+                ReplicatedMembershipState::LegacyOmitted
+            }
+            klights_cluster_store::SnapshotMembership::AuthoritativeAbsent => {
+                ReplicatedMembershipState::AuthoritativeAbsent
+            }
+            klights_cluster_store::SnapshotMembership::Present(membership) => {
+                ReplicatedMembershipState::Present(membership)
+            }
+        };
+        Ok(ClusterMetadataObservation {
+            metadata: observed.metadata,
+            membership,
+        })
     }
 
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
-        Ok(Some(
-            crate::datastore::backend::SnapshotExclusiveFence::new(
-                self.accessor.acquire_snapshot_exclusive().await,
-            ),
-        ))
+        Ok(Some(klights_cluster_store::SnapshotExclusiveFence::new(
+            self.accessor.acquire_snapshot_exclusive().await,
+        )))
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
-        Ok(Some(crate::datastore::backend::SnapshotMutationFence::new(
+        Ok(Some(klights_cluster_store::SnapshotMutationFence::new(
             self.accessor.acquire_snapshot_mutation().await,
         )))
     }
@@ -242,16 +145,9 @@ impl DatastoreBackend for RedbDatastore {
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
+        fence: klights_cluster_store::SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        self.begin_redb_snapshot(request, None).await
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        self.begin_redb_snapshot(request, Some(anchor)).await
+        self.recovery.begin_snapshot(request, fence).await
     }
 
     fn close(&self) {
@@ -284,13 +180,26 @@ impl DatastoreBackend for RedbDatastore {
         );
     }
 
+    async fn apply_log_apply_commit(
+        &self,
+        _commit: klights_cluster_core::LogApplyCommit,
+    ) -> Result<()> {
+        self.live_committed_apply.apply_log_apply_commit()
+    }
+
     async fn apply_raft_log_apply_commit(
         &self,
         _commit: klights_cluster_core::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        Err(anyhow!(
-            "redb backend does not support raft log-apply commit replay"
-        ))
+        self.live_committed_apply.apply_raft_log_apply_commit()
+    }
+
+    async fn apply_raft_log_apply_commit_receipt(
+        &self,
+        _commit: klights_cluster_core::LogApplyCommit,
+    ) -> Result<klights_cluster_store::CommittedRaftApplyReceipt> {
+        self.live_committed_apply
+            .apply_raft_log_apply_commit_receipt()
     }
 
     async fn create_resource(
@@ -369,32 +278,10 @@ impl DatastoreBackend for RedbDatastore {
         m: &str,
         p: ResourcePreconditions,
     ) -> Result<()> {
-        if p.uid.is_some() || p.resource_version.is_some() {
-            let Some(resource) = self.resources.get_res(a, k, n, m).await? else {
-                return Err(anyhow!("not found"));
-            };
-            if let Some(expected_uid) = p.uid.as_deref() {
-                let actual_uid = resource
-                    .data
-                    .pointer("/metadata/uid")
-                    .and_then(|v| v.as_str());
-                if actual_uid != Some(expected_uid) {
-                    return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                        "UID precondition failed",
-                    )
-                    .into());
-                }
-            }
-            if let Some(expected_rv) = p.resource_version
-                && resource.resource_version != expected_rv
-            {
-                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                    "resourceVersion precondition failed",
-                )
-                .into());
-            }
-        }
-        let committed = self.resources.delete_res(a, k, n, m).await?;
+        let committed = self
+            .resources
+            .delete_res_with_preconditions(a, k, n, m, p)
+            .await?;
         self.finish_post_commit(committed);
         Ok(())
     }
@@ -509,42 +396,19 @@ impl DatastoreBackend for RedbDatastore {
         s: Value,
         p: ResourcePreconditions,
     ) -> Result<Resource> {
-        if let Some(expected_uid) = p.uid.as_deref() {
-            let Some(resource) = self.resources.get_res(a, k, n, m).await? else {
-                return Err(anyhow!("not found"));
-            };
-            let actual_uid = resource
-                .data
-                .pointer("/metadata/uid")
-                .and_then(|v| v.as_str());
-            if actual_uid != Some(expected_uid) {
-                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                    "UID precondition failed",
-                )
-                .into());
-            }
-        }
         let committed = self
             .resources
-            .update_status_only_impl(a, k, n, m, s, p.resource_version)
+            .update_status_only_with_preconditions_impl(a, k, n, m, s, p)
             .await?;
         Ok(self.finish_post_commit(committed))
     }
     async fn get_current_resource_version(&self) -> Result<i64> {
-        self.accessor
-            .call("get_current_resource_version", move |db| {
-                let r = db.begin_read()?;
-                let m = r.open_table(tables::META)?;
-                Ok(m.get("rv")?
-                    .map(|g| {
-                        std::str::from_utf8(g.value())
-                            .unwrap_or("0")
-                            .parse()
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0))
-            })
+        use klights_cluster_store::DurableAllocatorRead;
+        self.focused_read_store()
+            .read_allocator_state()
             .await
+            .map(|state| state.position().resource_version)
+            .map_err(anyhow::Error::from)
     }
     async fn create_namespace(&self, n: &str, d: Value) -> Result<Resource> {
         let committed = self.namespaces.create_ns(n, d).await?;
@@ -988,39 +852,11 @@ impl DatastoreBackend for RedbDatastore {
         n: &str,
         request: ResourcePatchRequest,
     ) -> Result<Option<Resource>> {
-        let ResourcePatchRequest {
-            patch_kind,
-            patch,
-            preconditions,
-            strict_resource_version: _,
-        } = request;
-        if preconditions.uid.is_some() || preconditions.resource_version.is_some() {
-            let Some(resource) = self.resources.get_res(a, k, ns, n).await? else {
-                return Ok(None);
-            };
-            if let Some(expected_uid) = preconditions.uid.as_deref() {
-                let actual_uid = resource
-                    .data
-                    .pointer("/metadata/uid")
-                    .and_then(|v| v.as_str());
-                if actual_uid != Some(expected_uid) {
-                    return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                        "UID precondition failed",
-                    )
-                    .into());
-                }
-            }
-            if let Some(expected_rv) = preconditions.resource_version
-                && resource.resource_version != expected_rv
-            {
-                return Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                    "resourceVersion precondition failed",
-                )
-                .into());
-            }
-        }
-        self.patch_resource_latest(a, k, ns, n, patch_kind, patch)
-            .await
+        let committed = self
+            .resources
+            .patch_with_preconditions(a, k, ns, n, request)
+            .await?;
+        Ok(self.finish_post_commit(committed))
     }
     async fn watch_events_gc_prunable_count(&self, m: i64, b: i64) -> Result<usize> {
         self.watch_store.gc_watch_prunable_count(m, b).await
@@ -1029,47 +865,15 @@ impl DatastoreBackend for RedbDatastore {
         self.watch_store.gc_watch(m, b).await
     }
     async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
-        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
-        self.accessor
-            .call("redb_applied_outbox_prunable_count", move |db| {
-                let read_txn = db
-                    .begin_read()
-                    .map_err(|e| anyhow::anyhow!("redb read: {}", e))?;
-                let table = read_txn
-                    .open_table(APPLIED_OUTBOX)
-                    .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e))?;
-                let mut count = 0usize;
-                for row in table
-                    .iter()
-                    .map_err(|e| anyhow::anyhow!("redb applied_outbox iter: {}", e))?
-                {
-                    let (_, value) =
-                        row.map_err(|e| anyhow::anyhow!("redb applied_outbox row: {}", e))?;
-                    let record: AppliedOutboxRecord = serde_json::from_slice(value.value())?;
-                    if record.first_seen_ms < cutoff_ms {
-                        count += 1;
-                    }
-                }
-                Ok(count)
-            })
+        self.live_committed_apply
+            .applied_outbox_prunable_count(cutoff_ms)
             .await
     }
 
     async fn list_outbox_stream_watermarks(
         &self,
     ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
-        self.accessor
-            .call("redb_outbox_stream_watermarks_list_all", |db| {
-                let read = db.begin_read()?;
-                let table = read.open_table(tables::OUTBOX_STREAM_WATERMARKS)?;
-                let mut rows = Vec::new();
-                for entry in table.iter()? {
-                    let (key, value) = entry?;
-                    rows.push(decode_outbox_watermark_key(key.value(), value.value())?);
-                }
-                Ok(rows)
-            })
-            .await
+        self.live_committed_apply.list_outbox_watermarks().await
     }
 
     async fn list_outbox_stream_watermarks_paged(
@@ -1077,231 +881,58 @@ impl DatastoreBackend for RedbDatastore {
         after: Option<&klights_cluster_store::SnapshotOutboxWatermarkCursor>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<klights_cluster_core::OutboxStreamWatermark>> {
-        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
-            return Err(anyhow::anyhow!(
-                "outbox-watermark page limit {} exceeds {}",
-                limit,
-                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
-            ));
-        }
-        let after = after
-            .map(|cursor| outbox_watermark_key(cursor.client_id(), cursor.stream_id()))
-            .transpose()?;
-        let limit = limit.get();
-        self.accessor
-            .call("redb_outbox_stream_watermarks_list_paged", move |db| {
-                let read = db.begin_read()?;
-                let table = read.open_table(tables::OUTBOX_STREAM_WATERMARKS)?;
-                let mut rows = Vec::with_capacity(limit);
-                if let Some(after) = after.as_ref() {
-                    for entry in table.range(after.as_slice()..)? {
-                        let (key, value) = entry?;
-                        if key.value() <= after.as_slice() {
-                            continue;
-                        }
-                        rows.push(decode_outbox_watermark_key(key.value(), value.value())?);
-                        if rows.len() == limit {
-                            break;
-                        }
-                    }
-                } else {
-                    for entry in table.iter()? {
-                        let (key, value) = entry?;
-                        rows.push(decode_outbox_watermark_key(key.value(), value.value())?);
-                        if rows.len() == limit {
-                            break;
-                        }
-                    }
-                }
-                Ok(rows)
-            })
+        self.live_committed_apply
+            .list_outbox_watermarks_paged(after, limit)
             .await
     }
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        use klights_cluster_datastore::redb::tables::KLIGHTS_META;
-        let key_owned = key.to_string();
-        self.accessor
-            .call("redb_get_klights_meta", move |db| {
-                let read_txn = db
-                    .begin_read()
-                    .map_err(|e| anyhow::anyhow!("redb read: {}", e))?;
-                let table = read_txn
-                    .open_table(KLIGHTS_META)
-                    .map_err(|e| anyhow::anyhow!("redb open meta table: {}", e))?;
-                let result = table
-                    .get(key_owned.as_str())
-                    .map_err(|e| anyhow::anyhow!("redb meta get: {}", e))?;
-                Ok(result.map(|v| v.value().to_string()))
-            })
-            .await
+        self.recovery.get_klights_meta(key).await
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        use klights_cluster_datastore::redb::tables::KLIGHTS_META;
-        let key_owned = key.to_string();
-        let value_owned = value.to_string();
-        self.accessor
-            .call("redb_set_klights_meta", move |db| {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| anyhow::anyhow!("redb write: {}", e))?;
-                {
-                    let mut table = write_txn
-                        .open_table(KLIGHTS_META)
-                        .map_err(|e| anyhow::anyhow!("redb open meta table: {}", e,))?;
-                    table
-                        .insert(key_owned.as_str(), value_owned.as_str())
-                        .map_err(|e| anyhow::anyhow!("redb meta insert: {}", e))?;
-                }
-                write_txn
-                    .commit()
-                    .map_err(|e| anyhow::anyhow!("redb commit: {}", e))?;
-                Ok(())
-            })
-            .await
+        self.live_committed_apply.set_klights_meta(key, value).await
     }
 
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> anyhow::Result<Option<AppliedOutboxRecord>> {
-        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
-        let key = idempotency_key.to_string();
-        self.accessor
-            .call("redb_get_applied_outbox", move |db| {
-                let read_txn = db
-                    .begin_read()
-                    .map_err(|e| anyhow::anyhow!("redb read: {}", e))?;
-                let table = read_txn
-                    .open_table(APPLIED_OUTBOX)
-                    .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e,))?;
-                let Some(record) = table
-                    .get(key.as_str())
-                    .map_err(|e| anyhow::anyhow!("redb applied_outbox get: {}", e))?
-                else {
-                    return Ok(None);
-                };
-                Ok(Some(serde_json::from_slice(record.value())?))
-            })
+    ) -> anyhow::Result<Option<LogApplyAppliedOutboxRow>> {
+        self.live_committed_apply
+            .get_applied_outbox_bytes(idempotency_key)
+            .await?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(anyhow::Error::from))
+            .transpose()
+    }
+
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
+        let idempotency_key = record.idempotency_key.clone();
+        let bytes = serde_json::to_vec(&record)?;
+        self.live_committed_apply
+            .insert_applied_outbox_bytes(idempotency_key, bytes)
             .await
     }
 
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
-        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
-        self.accessor
-            .call("redb_insert_applied_outbox", move |db| {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| anyhow::anyhow!("redb write: {}", e))?;
-                let inserted = {
-                    let mut table = write_txn
-                        .open_table(APPLIED_OUTBOX)
-                        .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e,))?;
-                    if table
-                        .get(record.idempotency_key.as_str())
-                        .map_err(|e| anyhow::anyhow!("redb applied_outbox get: {}", e))?
-                        .is_some()
-                    {
-                        false
-                    } else {
-                        let bytes = serde_json::to_vec(&record)?;
-                        table
-                            .insert(record.idempotency_key.as_str(), bytes.as_slice())
-                            .map_err(|e| anyhow::anyhow!("redb applied_outbox insert: {}", e,))?;
-                        true
-                    }
-                };
-                write_txn
-                    .commit()
-                    .map_err(|e| anyhow::anyhow!("redb commit: {}", e))?;
-                Ok(inserted)
-            })
-            .await
-    }
-
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
-        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
-        self.accessor
-            .call("redb_list_applied_outbox", move |db| {
-                let read_txn = db
-                    .begin_read()
-                    .map_err(|e| anyhow::anyhow!("redb read: {}", e))?;
-                let table = read_txn
-                    .open_table(APPLIED_OUTBOX)
-                    .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e))?;
-                let mut rows = Vec::new();
-                for row in table
-                    .iter()
-                    .map_err(|e| anyhow::anyhow!("redb applied_outbox iter: {}", e))?
-                {
-                    let (_key, value) =
-                        row.map_err(|e| anyhow::anyhow!("redb applied_outbox row: {}", e))?;
-                    rows.push(serde_json::from_slice(value.value())?);
-                }
-                rows.sort_by(|a: &AppliedOutboxRecord, b| {
-                    a.idempotency_key.cmp(&b.idempotency_key)
-                });
-                Ok(rows)
-            })
-            .await
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
+        self.live_committed_apply
+            .list_applied_outbox_bytes()
+            .await?
+            .into_iter()
+            .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(anyhow::Error::from))
+            .collect()
     }
 
     async fn list_applied_outbox_paged(
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
-        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
-        if limit.get() > klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE {
-            return Err(anyhow::anyhow!(
-                "applied-outbox page limit {} exceeds {}",
-                limit,
-                klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE
-            ));
-        }
-        let after_key = after_key.map(str::to_owned);
-        let limit = limit.get();
-        self.accessor
-            .call("redb_list_applied_outbox_paged", move |db| {
-                let read_txn = db
-                    .begin_read()
-                    .map_err(|error| anyhow::anyhow!("redb read: {error}"))?;
-                let table = read_txn
-                    .open_table(APPLIED_OUTBOX)
-                    .map_err(|error| anyhow::anyhow!("redb open applied_outbox table: {error}"))?;
-                let mut rows = Vec::with_capacity(limit);
-                if let Some(after_key) = after_key.as_deref() {
-                    for row in table
-                        .range(after_key..)
-                        .map_err(|error| anyhow::anyhow!("redb applied_outbox range: {error}"))?
-                    {
-                        let (key, value) = row
-                            .map_err(|error| anyhow::anyhow!("redb applied_outbox row: {error}"))?;
-                        if key.value() <= after_key {
-                            continue;
-                        }
-                        rows.push(serde_json::from_slice(value.value())?);
-                        if rows.len() == limit {
-                            break;
-                        }
-                    }
-                } else {
-                    for row in table
-                        .iter()
-                        .map_err(|error| anyhow::anyhow!("redb applied_outbox iter: {error}"))?
-                    {
-                        let (_, value) = row
-                            .map_err(|error| anyhow::anyhow!("redb applied_outbox row: {error}"))?;
-                        rows.push(serde_json::from_slice(value.value())?);
-                        if rows.len() == limit {
-                            break;
-                        }
-                    }
-                }
-                Ok(rows)
-            })
-            .await
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
+        self.live_committed_apply
+            .list_applied_outbox_bytes_paged(after_key, limit)
+            .await?
+            .into_iter()
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(anyhow::Error::from))
+            .collect()
     }
 
     async fn apply_outbox_transactionally(
@@ -1314,9 +945,47 @@ impl DatastoreBackend for RedbDatastore {
         klights_cluster_core::OutboxApplyOutcome,
         klights_cluster_core::OutboxApplyError,
     > {
-        Err(klights_cluster_core::OutboxApplyError::Retryable(
-            "redb: apply_outbox_transactionally not implemented".to_string(),
-        ))
+        self.live_committed_apply.apply_outbox_transactionally()
+    }
+
+    async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        _idempotency_key: &str,
+        _operation: &str,
+        _command: klights_cluster_core::command::StorageCommand,
+        _authoring_node: &str,
+        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        klights_cluster_core::OutboxApplyOutcome,
+        klights_cluster_core::OutboxApplyError,
+    > {
+        self.live_committed_apply
+            .apply_outbox_transactionally_with_watermark()
+    }
+
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        _idempotency_key: &str,
+        _operation: &str,
+        _command: klights_cluster_core::command::StorageCommand,
+        _authoring_node: &str,
+        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::datastore::CommittedOutboxApply,
+        klights_cluster_core::OutboxApplyError,
+    > {
+        self.live_committed_apply
+            .apply_outbox_transactionally_with_watermark_effect()
+    }
+
+    async fn build_log_apply_commit_for_command(
+        &self,
+        _command: klights_cluster_core::command::StorageCommand,
+        _operation: &str,
+        _authoring_node: &str,
+    ) -> Result<klights_cluster_core::LogApplyCommit> {
+        self.live_committed_apply
+            .build_log_apply_commit_for_command()
     }
 
     async fn build_log_apply_commit_for_outbox(
@@ -1329,55 +998,28 @@ impl DatastoreBackend for RedbDatastore {
         klights_cluster_core::BuildOutboxOutcome,
         klights_cluster_core::OutboxApplyError,
     > {
-        Err(klights_cluster_core::OutboxApplyError::Retryable(
-            "redb: build_log_apply_commit_for_outbox not implemented".to_string(),
-        ))
+        self.live_committed_apply
+            .build_log_apply_commit_for_outbox()
+    }
+
+    async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        _idempotency_key: &str,
+        _operation: &str,
+        _command: klights_cluster_core::command::StorageCommand,
+        _authoring_node: &str,
+        _watermark: Option<klights_cluster_core::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        klights_cluster_core::BuildOutboxOutcome,
+        klights_cluster_core::OutboxApplyError,
+    > {
+        self.live_committed_apply
+            .build_log_apply_commit_for_outbox_with_watermark()
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        use klights_cluster_datastore::redb::tables::APPLIED_OUTBOX;
-
-        let cutoff = now_ms.saturating_sub(ttl_ms);
-        self.accessor
-            .call("redb_applied_outbox_gc", move |db| {
-                let write_txn = db
-                    .begin_write()
-                    .map_err(|e| anyhow::anyhow!("redb write: {}", e))?;
-                let keys_to_remove = {
-                    let table = write_txn
-                        .open_table(APPLIED_OUTBOX)
-                        .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e))?;
-                    let mut keys = Vec::new();
-                    for row in table
-                        .iter()
-                        .map_err(|e| anyhow::anyhow!("redb applied_outbox iter: {}", e))?
-                    {
-                        let (key, value) =
-                            row.map_err(|e| anyhow::anyhow!("redb applied_outbox row: {}", e))?;
-                        let record: AppliedOutboxRecord = serde_json::from_slice(value.value())?;
-                        if record.first_seen_ms < cutoff {
-                            keys.push(key.value().to_string());
-                        }
-                    }
-                    keys
-                };
-                let removed = {
-                    let mut table = write_txn
-                        .open_table(APPLIED_OUTBOX)
-                        .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e))?;
-                    let removed = keys_to_remove.len();
-                    for key in keys_to_remove {
-                        table
-                            .remove(key.as_str())
-                            .map_err(|e| anyhow::anyhow!("redb applied_outbox remove: {}", e))?;
-                    }
-                    removed
-                };
-                write_txn
-                    .commit()
-                    .map_err(|e| anyhow::anyhow!("redb commit: {}", e))?;
-                Ok(removed)
-            })
+        self.live_committed_apply
+            .gc_applied_outbox(now_ms, ttl_ms)
             .await
     }
 }
@@ -1975,19 +1617,10 @@ impl crate::datastore::DurableRecoveryStore for RedbDatastore {
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
+        fence: klights_cluster_store::SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
-            self, request, anchor,
-        )
-        .await
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request, fence)
+            .await
     }
 }
 
@@ -2253,7 +1886,7 @@ impl crate::datastore::PodCleanupStore for RedbDatastore {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         crate::datastore::DatastoreBackend::list_pod_cleanup_intents_for_node(self, node_name).await
     }
 
@@ -2301,15 +1934,15 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
+    ) -> Result<Option<LogApplyAppliedOutboxRow>> {
         crate::datastore::DatastoreBackend::get_applied_outbox(self, idempotency_key).await
     }
 
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
         crate::datastore::DatastoreBackend::insert_applied_outbox(self, record).await
     }
 
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         crate::datastore::DatastoreBackend::list_applied_outbox(self).await
     }
 
@@ -2317,7 +1950,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         crate::datastore::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
     }
 

@@ -6,16 +6,16 @@ use klights_cluster_core::LogApplyNamespaceRow;
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
 
-pub(in crate::datastore::sqlite) struct NamespaceStateApplier<'tx, 'conn> {
+pub(super) struct NamespaceStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
 impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
-    pub(in crate::datastore::sqlite) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
+    pub(super) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
         Self { tx }
     }
 
-    pub(in crate::datastore::sqlite) fn put_namespace(
+    pub(super) fn put_namespace(
         &self,
         row: LogApplyNamespaceRow,
         emit_watch_events: bool,
@@ -70,7 +70,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         )))
     }
 
-    pub(in crate::datastore::sqlite) fn delete_namespace(
+    pub(super) fn delete_namespace(
         &self,
         resource_version: i64,
         name: &str,
@@ -117,10 +117,7 @@ impl<'tx, 'conn> NamespaceStateApplier<'tx, 'conn> {
         )))
     }
 
-    pub(in crate::datastore::sqlite) fn delete_namespace_contents(
-        &self,
-        name: &str,
-    ) -> tokio_rusqlite::Result<()> {
+    pub(super) fn delete_namespace_contents(&self, name: &str) -> tokio_rusqlite::Result<()> {
         let mut stmt = self
             .tx
             .prepare(queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND)?;

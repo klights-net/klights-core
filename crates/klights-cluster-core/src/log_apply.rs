@@ -116,6 +116,44 @@ pub struct SnapshotRestoreOperation {
     mutations: Vec<LogApplyMutation>,
 }
 
+/// Build the exact authoritative restore operation for one live resource.
+///
+/// Both persistent backends use this canonical conversion so Namespace table
+/// identity and ordinary resource row fields cannot drift across snapshots.
+pub fn resource_snapshot_restore_operation(resource: &Resource) -> SnapshotRestoreOperation {
+    let mutation = if resource.api_version == "v1"
+        && resource.kind == "Namespace"
+        && resource.namespace.is_none()
+    {
+        ClusterMutation::Namespace(NamespaceMutation::PutNamespace(LogApplyNamespaceRow {
+            name: resource.name.clone(),
+            uid: resource.uid.clone(),
+            resource_version: resource.resource_version,
+            data: (*resource.data).clone(),
+        }))
+    } else {
+        ClusterMutation::Resource(ResourceMutation::PutResource(LogApplyResourceRow {
+            api_version: resource.api_version.clone(),
+            kind: resource.kind.clone(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
+            uid: resource.uid.clone(),
+            resource_version: resource.resource_version,
+            data: (*resource.data).clone(),
+            require_absent: false,
+            require_existing: false,
+            precondition_uid: None,
+            precondition_resource_version: None,
+            status_only: false,
+        }))
+    };
+    SnapshotRestoreOperation::new(
+        resource.resource_version,
+        None,
+        vec![mutation.into_log_apply_mutation()],
+    )
+}
+
 /// A live committed-apply template contains a pre-assigned public RV.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveCommitResourceVersionError {

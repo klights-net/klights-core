@@ -1,6 +1,6 @@
 use super::super::queries;
 
-pub(in crate::datastore::sqlite) struct ClusterMetaStateApplier<'tx, 'conn> {
+pub(super) struct ClusterMetaStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
@@ -9,7 +9,7 @@ impl<'tx, 'conn> ClusterMetaStateApplier<'tx, 'conn> {
         Self { tx }
     }
 
-    pub(in crate::datastore::sqlite) fn put_klights_meta(
+    pub(super) fn put_klights_meta(
         &self,
         key: String,
         value: String,

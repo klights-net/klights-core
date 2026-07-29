@@ -16,7 +16,10 @@ pub mod advance;
 mod applier;
 mod backend_impl;
 mod helpers;
+mod live_committed_apply;
 pub mod network;
+mod ordinary_mutations;
+mod recovery;
 pub mod snapshot;
 mod snapshot_capture;
 pub mod watch;
@@ -34,7 +37,9 @@ use advance::RedbRvStore;
 use crud::namespaces::RedbNamespaceStore;
 use crud::resources::RedbResourceStore;
 use klights_cluster_datastore::redb::{RedbAccessor, RedbOpenOpts, RedbReadStore};
+use live_committed_apply::RedbLiveCommittedApplyStore;
 use network::RedbNetworkStore;
+use recovery::RedbRecoveryStore;
 use watch::RedbWatchStore;
 
 /// Redb-backed datastore composed from focused domain stores.
@@ -49,6 +54,8 @@ pub struct RedbDatastore {
     namespaces: RedbNamespaceStore,
     watch_store: RedbWatchStore,
     network: RedbNetworkStore,
+    live_committed_apply: RedbLiveCommittedApplyStore,
+    recovery: RedbRecoveryStore,
     read_store: Arc<RedbReadStore>,
     rv_store: RedbRvStore,
     snapshot_sessions: Arc<tokio::sync::Semaphore>,
@@ -78,12 +85,16 @@ impl RedbDatastore {
         let namespaces = RedbNamespaceStore::new(accessor.clone());
         let watch_store = RedbWatchStore::new(accessor.clone());
         let network = RedbNetworkStore::new(accessor.clone());
+        let live_committed_apply = RedbLiveCommittedApplyStore::new(accessor.clone());
+        let recovery = RedbRecoveryStore::new(accessor.clone(), snapshot_sessions.clone());
         let read_store = Arc::new(RedbReadStore::new(accessor.clone()));
         Self {
             resources,
             namespaces,
             watch_store,
             network,
+            live_committed_apply,
+            recovery,
             read_store,
             rv_store: RedbRvStore::new(accessor.clone()),
             accessor,

@@ -27,11 +27,12 @@ use crate::control_plane::client::{
     focused_dataplane, focused_node_subnet, query_error, query_list_result,
 };
 use crate::controllers::ControllerDispatcher;
-use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
+use crate::datastore::{DatastoreHandle, Resource};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::node_outbox::OutboxApplyError;
 #[cfg(test)]
 use crate::node_outbox::payload::OutboxOperationExt as _;
+use klights_cluster_core::LogApplyPodCleanupIntentRow as StoredPodCleanupIntent;
 use klights_cluster_core::command::StorageCommand;
 
 #[cfg(test)]

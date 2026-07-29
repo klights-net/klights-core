@@ -36,7 +36,7 @@ pub use log_apply::{
     OutboxWatermarkDecision, PodCleanupMutation, ResourceMutation, SnapshotRestoreOperation,
     UnsupportedClusterMutationVersion, VersionedClusterMutation, WatchHistoryMutation,
     commit_with_outbox_rows_only, decide_outbox_watermark, is_stamped_pod_status_outbox_operation,
-    stamped_pod_status_subject_and_stamp,
+    resource_snapshot_restore_operation, stamped_pod_status_subject_and_stamp,
 };
 pub use membership::{
     ClusterMembership, NodeId, RaftShape, merge_controlplane_join_membership_metadata,

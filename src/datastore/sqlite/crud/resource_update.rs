@@ -2,15 +2,12 @@
 //! precondition validation, deduplication, and status-only atomic updates.
 
 use anyhow::Context;
-use rusqlite::TransactionBehavior;
 
-use super::super::owner_ref_index;
-use super::super::queries;
+use super::super::ordinary;
 use super::helpers::*;
 use super::*;
-use klights_cluster_datastore::sqlite::selector_index;
 
-use crate::datastore::sqlite::create_staged_post_commit;
+use super::super::{create_staged_post_commit, mutation_diagnostics};
 
 struct ResourceUpdateWithPreconditions<'a> {
     api_version: &'a str,
@@ -33,37 +30,6 @@ struct MainUpdatePreconditionCheck<'a> {
 }
 
 impl Datastore {
-    fn ensure_deletion_timestamp_in_mark_data(
-        data: &mut Value,
-        grace_seconds: i64,
-        deletion_timestamp: &str,
-    ) {
-        let Some(meta) = data
-            .get_mut("metadata")
-            .and_then(|value| value.as_object_mut())
-        else {
-            return;
-        };
-        if meta
-            .get("deletionTimestamp")
-            .and_then(|value| value.as_str())
-            .is_none_or(str::is_empty)
-        {
-            meta.insert(
-                "deletionTimestamp".to_string(),
-                Value::String(deletion_timestamp.to_string()),
-            );
-        }
-        meta.entry("deletionGracePeriodSeconds".to_string())
-            .or_insert_with(|| Value::from(grace_seconds));
-    }
-
-    fn has_deletion_timestamp_in_data(data: &Value) -> bool {
-        data.pointer("/metadata/deletionTimestamp")
-            .and_then(|value| value.as_str())
-            .is_some_and(|value| !value.is_empty())
-    }
-
     pub async fn mark_resource_for_deletion_without_watch(
         &self,
         api_version: &str,
@@ -81,135 +47,24 @@ impl Datastore {
         let deletion_timestamp =
             klights_cluster_core::k8s_time::format_legacy_timestamp(self.wall_clock.now_utc());
 
-        let mark_outcome = if use_namespaced_table(api_version, kind, &namespace) {
-            let ns = namespace.unwrap_or("default").to_string();
-            let expected_uid = expected_uid.clone();
-            self.db_call("db_query", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (_id, current_rv, current_uid, current_bytes): (i64, i64, String, Vec<u8>) = tx
-                    .query_row(
-                        queries::NAMESPACED_SELECT_STATUS_ROW,
-                        rusqlite::params![&av, &k, &ns, &n],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )?;
-                if let Some(expected_uid) = expected_uid.as_deref()
-                    && expected_uid != current_uid.as_str()
-                {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                if let Some(expected_rv) = expected_rv
-                    && expected_rv != current_rv
-                {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-
-                let mut current: Value =
-                    serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
-                if Self::has_deletion_timestamp_in_data(&current) {
-                    tx.commit()?;
-                    return Ok(Some((current_rv, current_bytes)));
-                }
-
-                Self::ensure_deletion_timestamp_in_mark_data(
-                    &mut current,
-                    grace_seconds,
-                    &deletion_timestamp,
-                );
-                let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
-                let new_rv = Self::next_resource_version_in_tx(&tx)?;
-                let rows = tx.execute(
-                    queries::NAMESPACED_UPDATE_BY_RV,
-                    rusqlite::params![
-                        new_rv,
-                        &current_uid,
-                        &merged,
-                        &av,
-                        &k,
-                        &ns,
-                        &n,
-                        expected_rv,
-                        expected_uid.as_deref(),
-                    ],
-                )?;
-                if rows == 0 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                selector_index::upsert_index_entries(&tx, &av, &k, &ns, &n, &merged)?;
-                owner_ref_index::upsert_owner_refs(&tx, &av, &k, &ns, &n, &merged)?;
-                tx.commit()?;
-                Ok(Some((new_rv, merged)))
+        let namespace_owned = namespace.map(str::to_string);
+        let mark_outcome = self
+            .db_call("db_query", move |conn| {
+                ordinary::mark_resource_for_deletion_in_conn(
+                    conn,
+                    ordinary::MarkResourceForDeletionInput {
+                        api_version: av,
+                        kind: k,
+                        namespace: namespace_owned,
+                        name: n,
+                        expected_resource_version: expected_rv,
+                        expected_uid,
+                        grace_seconds,
+                        deletion_timestamp,
+                    },
+                )
             })
-            .await
-        } else {
-            let expected_uid = expected_uid.clone();
-            self.db_call("db_query", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (_id, current_rv, current_uid, current_bytes): (i64, i64, String, Vec<u8>) = tx
-                    .query_row(
-                        queries::CLUSTER_SELECT_STATUS_ROW,
-                        rusqlite::params![&av, &k, &n],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )?;
-                if let Some(expected_uid) = expected_uid.as_deref()
-                    && expected_uid != current_uid.as_str()
-                {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                if let Some(expected_rv) = expected_rv
-                    && expected_rv != current_rv
-                {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-
-                let mut current: Value =
-                    serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
-                if Self::has_deletion_timestamp_in_data(&current) {
-                    tx.commit()?;
-                    return Ok(Some((current_rv, current_bytes)));
-                }
-
-                Self::ensure_deletion_timestamp_in_mark_data(
-                    &mut current,
-                    grace_seconds,
-                    &deletion_timestamp,
-                );
-                let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
-                let new_rv = Self::next_resource_version_in_tx(&tx)?;
-                let rows = tx.execute(
-                    queries::CLUSTER_UPDATE_BY_RV,
-                    rusqlite::params![
-                        new_rv,
-                        &current_uid,
-                        &merged,
-                        &av,
-                        &k,
-                        &n,
-                        expected_rv,
-                        expected_uid.as_deref(),
-                    ],
-                )?;
-                if rows == 0 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                selector_index::upsert_index_entries(&tx, &av, &k, "", &n, &merged)?;
-                owner_ref_index::upsert_owner_refs(&tx, &av, &k, "", &n, &merged)?;
-                tx.commit()?;
-                Ok(Some((new_rv, merged)))
-            })
-            .await
-        };
+            .await;
 
         let (resource_version, data) = match mark_outcome {
             Ok(Some(resource_data)) => resource_data,
@@ -235,43 +90,6 @@ impl Datastore {
                 serde_json::from_slice(&data).context("deserialize marked delete payload")?,
             ),
         }))
-    }
-
-    fn preserve_latest_status_subresource_in_tx(
-        tx: &rusqlite::Transaction<'_>,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        proposed: &mut Value,
-    ) -> tokio_rusqlite::Result<()> {
-        if !klights_types::has_builtin_status_subresource(api_version, kind) {
-            return Ok(());
-        }
-
-        let current_bytes: Vec<u8> = if use_namespaced_table(api_version, kind, &namespace) {
-            tx.query_row(
-                queries::NAMESPACED_SELECT_STATUS_ROW,
-                rusqlite::params![api_version, kind, namespace.unwrap_or("default"), name],
-                |row| row.get(3),
-            )?
-        } else {
-            tx.query_row(
-                queries::CLUSTER_SELECT_STATUS_ROW,
-                rusqlite::params![api_version, kind, name],
-                |row| row.get(3),
-            )?
-        };
-        let current: Value =
-            serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
-        klights_types::preserve_status_subresource_on_main_update(
-            api_version,
-            kind,
-            &current,
-            proposed,
-        );
-        preserve_server_metadata_fields_from_existing(proposed, &current);
-        Ok(())
     }
 
     pub async fn update_resource(
@@ -457,8 +275,8 @@ impl Datastore {
             // is metadata.resourceVersion. Compare structurally without
             // cloning either side.
             if resource_data_equal_ignoring_rv(&existing_resource.data, &data) {
-                crate::datastore::diagnostics::log_noop_resource_write(
-                    crate::datastore::diagnostics::NoopResourceWrite {
+                mutation_diagnostics::log_noop_resource_write(
+                    mutation_diagnostics::NoopResourceWrite {
                         operation: "update_resource",
                         api_version,
                         kind,
@@ -482,106 +300,26 @@ impl Datastore {
         let expected_uid_for_log = effective_preconditions.uid.clone();
         let expected_uid = effective_preconditions.uid;
 
-        let result = if use_namespaced_table(api_version, kind, &namespace) {
-            let ns = namespace.unwrap_or("default").to_string();
-            let expected_uid = expected_uid.clone();
-            let uid = uid.clone();
-            let mut data = data.clone();
-            self.db_call("db_query", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                if preserve_latest_status {
-                    Self::preserve_latest_status_subresource_in_tx(
-                        &tx,
-                        &av,
-                        &k,
-                        Some(&ns),
-                        &n,
-                        &mut data,
-                    )?;
-                }
-                let data_bytes = serde_json::to_vec(&data).map_err(serde_to_sqlite_error)?;
-                let new_rv = Self::next_resource_version_in_tx(&tx)?;
-                let rows = tx.execute(
-                    queries::NAMESPACED_UPDATE_BY_RV,
-                    rusqlite::params![
-                        new_rv,
-                        &uid,
-                        &data_bytes,
-                        &av,
-                        &k,
-                        &ns,
-                        &n,
-                        expected_rv,
-                        expected_uid.as_deref()
-                    ],
-                )?;
-                if rows == 0 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                let id: i64 = tx.query_row(
-                    queries::NAMESPACED_SELECT_ID,
-                    rusqlite::params![&av, &k, &ns, &n],
-                    |row| row.get(0),
-                )?;
-                selector_index::upsert_index_entries(&tx, &av, &k, &ns, &n, &data_bytes)?;
-                owner_ref_index::upsert_owner_refs(&tx, &av, &k, &ns, &n, &data_bytes)?;
-                insert_watch_event_in_conn(
-                    &tx,
-                    WatchEventInsert::new(&av, &k, Some(&ns), &n, new_rv, "MODIFIED", &data_bytes),
-                )?;
-                tx.commit()?;
-                Ok((id, new_rv, data))
+        let namespace_owned = namespace.map(str::to_string);
+        let uid_for_update = uid.clone();
+        let result = self
+            .db_call("db_query", move |conn| {
+                ordinary::update_resource_in_conn(
+                    conn,
+                    ordinary::UpdateResourceInput {
+                        api_version: av,
+                        kind: k,
+                        namespace: namespace_owned,
+                        name: n,
+                        uid: uid_for_update,
+                        data,
+                        expected_resource_version: expected_rv,
+                        expected_uid,
+                        preserve_latest_status,
+                    },
+                )
             })
-            .await
-        } else {
-            let expected_uid = expected_uid.clone();
-            let uid = uid.clone();
-            let mut data = data.clone();
-            self.db_call("db_query", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                if preserve_latest_status {
-                    Self::preserve_latest_status_subresource_in_tx(
-                        &tx, &av, &k, None, &n, &mut data,
-                    )?;
-                }
-                let data_bytes = serde_json::to_vec(&data).map_err(serde_to_sqlite_error)?;
-                let new_rv = Self::next_resource_version_in_tx(&tx)?;
-                let rows = tx.execute(
-                    queries::CLUSTER_UPDATE_BY_RV,
-                    rusqlite::params![
-                        new_rv,
-                        &uid,
-                        &data_bytes,
-                        &av,
-                        &k,
-                        &n,
-                        expected_rv,
-                        expected_uid.as_deref()
-                    ],
-                )?;
-                if rows == 0 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                let id: i64 = tx.query_row(
-                    queries::CLUSTER_SELECT_ID,
-                    rusqlite::params![&av, &k, &n],
-                    |row| row.get(0),
-                )?;
-                selector_index::upsert_index_entries(&tx, &av, &k, "", &n, &data_bytes)?;
-                owner_ref_index::upsert_owner_refs(&tx, &av, &k, "", &n, &data_bytes)?;
-                insert_watch_event_in_conn(
-                    &tx,
-                    WatchEventInsert::new(&av, &k, None, &n, new_rv, "MODIFIED", &data_bytes),
-                )?;
-                tx.commit()?;
-                Ok((id, new_rv, data))
-            })
-            .await
-        };
+            .await;
 
         match result {
             Ok((id, new_rv, data)) => {
@@ -626,257 +364,6 @@ impl Datastore {
                 .into())
             }
             Err(e) => Err(anyhow!("Failed to update resource: {}", e)),
-        }
-    }
-
-    /// Update only the `.status` subtree of a resource atomically inside SQLite.
-    ///
-    /// Uses `json_set(data, '$.status', json(?))` so `.spec`, `.metadata`, and any
-    /// other top-level fields are preserved verbatim — there is no read-modify-write
-    /// race window where a concurrent `.spec` edit could be lost.
-    ///
-    /// `expected_rv = Some(rv)` enables compare-and-swap (returns 409 Conflict on
-    /// mismatch). `expected_rv = None` skips the check and unconditionally writes.
-    pub async fn update_status_only(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource> {
-        self.update_status_only_with_preconditions(
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            ResourcePreconditions {
-                uid: None,
-                resource_version: expected_rv,
-            },
-        )
-        .await
-    }
-
-    pub async fn update_status_only_with_preconditions(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
-        let av = api_version.to_string();
-        let k = kind.to_string();
-        let n = name.to_string();
-        let expected_rv = preconditions.resource_version;
-        let expected_uid_for_log = preconditions.uid.clone();
-        let expected_uid = preconditions.uid;
-
-        struct StatusUpdateOutcome {
-            id: i64,
-            resource_version: i64,
-            data: Vec<u8>,
-            changed: bool,
-        }
-
-        let result = if use_namespaced_table(api_version, kind, &namespace) {
-            let ns = namespace.unwrap_or("default").to_string();
-            let expected_uid = expected_uid.clone();
-            let status = status.clone();
-            self.db_call("db_query", move |conn| {
-                let (id, current_rv, live_uid, current_bytes): (i64, i64, String, Vec<u8>) = conn
-                    .query_row(
-                    queries::NAMESPACED_SELECT_STATUS_ROW,
-                    rusqlite::params![&av, &k, &ns, &n],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )?;
-                if expected_rv.is_some_and(|expected| expected != current_rv)
-                    || expected_uid
-                        .as_deref()
-                        .is_some_and(|expected| expected != live_uid)
-                {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-
-                let mut current: Value =
-                    serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
-                if current.get("status") == Some(&status) {
-                    crate::datastore::diagnostics::log_noop_resource_write(
-                        crate::datastore::diagnostics::NoopResourceWrite {
-                            operation: "update_status_only",
-                            api_version: &av,
-                            kind: &k,
-                            namespace: Some(&ns),
-                            name: &n,
-                            uid: &live_uid,
-                            resource_version: current_rv,
-                            reason: "status unchanged",
-                        },
-                    );
-                    return Ok(StatusUpdateOutcome {
-                        id,
-                        resource_version: current_rv,
-                        data: current_bytes,
-                        changed: false,
-                    });
-                }
-                if let Some(obj) = current.as_object_mut() {
-                    obj.insert("status".to_string(), status);
-                } else {
-                    current = serde_json::json!({ "status": status });
-                }
-                let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
-                let new_rv = Self::next_resource_version_in_conn(conn)?;
-                let rows = conn.execute(
-                    queries::NAMESPACED_UPDATE_STATUS_BY_ID,
-                    rusqlite::params![new_rv, &merged, id, current_rv, &live_uid],
-                )?;
-                if rows == 0 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                selector_index::upsert_index_entries(conn, &av, &k, &ns, &n, &merged)?;
-                owner_ref_index::upsert_owner_refs(conn, &av, &k, &ns, &n, &merged)?;
-                insert_watch_event_in_conn(
-                    conn,
-                    WatchEventInsert::new(&av, &k, Some(&ns), &n, new_rv, "MODIFIED", &merged),
-                )?;
-                Ok(StatusUpdateOutcome {
-                    id,
-                    resource_version: new_rv,
-                    data: merged,
-                    changed: true,
-                })
-            })
-            .await
-        } else {
-            let expected_uid = expected_uid.clone();
-            self.db_call("db_query", move |conn| {
-                let (id, current_rv, live_uid, current_bytes): (i64, i64, String, Vec<u8>) = conn
-                    .query_row(
-                    queries::CLUSTER_SELECT_STATUS_ROW,
-                    rusqlite::params![&av, &k, &n],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )?;
-                if expected_rv.is_some_and(|expected| expected != current_rv)
-                    || expected_uid
-                        .as_deref()
-                        .is_some_and(|expected| expected != live_uid)
-                {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-
-                let mut current: Value =
-                    serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
-                if current.get("status") == Some(&status) {
-                    crate::datastore::diagnostics::log_noop_resource_write(
-                        crate::datastore::diagnostics::NoopResourceWrite {
-                            operation: "update_status_only",
-                            api_version: &av,
-                            kind: &k,
-                            namespace: None,
-                            name: &n,
-                            uid: &live_uid,
-                            resource_version: current_rv,
-                            reason: "status unchanged",
-                        },
-                    );
-                    return Ok(StatusUpdateOutcome {
-                        id,
-                        resource_version: current_rv,
-                        data: current_bytes,
-                        changed: false,
-                    });
-                }
-                if let Some(obj) = current.as_object_mut() {
-                    obj.insert("status".to_string(), status);
-                } else {
-                    current = serde_json::json!({ "status": status });
-                }
-                let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
-                let new_rv = Self::next_resource_version_in_conn(conn)?;
-                let rows = conn.execute(
-                    queries::CLUSTER_UPDATE_STATUS_BY_ID,
-                    rusqlite::params![new_rv, &merged, id, current_rv, &live_uid],
-                )?;
-                if rows == 0 {
-                    return Err(tokio_rusqlite::Error::Rusqlite(
-                        rusqlite::Error::QueryReturnedNoRows,
-                    ));
-                }
-                selector_index::upsert_index_entries(conn, &av, &k, "", &n, &merged)?;
-                owner_ref_index::upsert_owner_refs(conn, &av, &k, "", &n, &merged)?;
-                insert_watch_event_in_conn(
-                    conn,
-                    WatchEventInsert::new(&av, &k, None, &n, new_rv, "MODIFIED", &merged),
-                )?;
-                Ok(StatusUpdateOutcome {
-                    id,
-                    resource_version: new_rv,
-                    data: merged,
-                    changed: true,
-                })
-            })
-            .await
-        };
-
-        match result {
-            Ok(outcome) => {
-                let data: Value = serde_json::from_slice(&outcome.data)
-                    .context("deserialize merged status payload")?;
-
-                if outcome.changed {
-                    let _pending = create_staged_post_commit(
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        outcome.resource_version,
-                        "MODIFIED",
-                        data.clone(),
-                    );
-                    #[cfg(test)]
-                    self.publish_watch_event(_pending);
-                };
-
-                Ok(Resource {
-                    id: outcome.id,
-                    api_version: api_version.to_string(),
-                    kind: kind.to_string(),
-                    namespace: namespace.map(str::to_string),
-                    name: name.to_string(),
-                    uid: Resource::uid_from_data(&data),
-                    resource_version: outcome.resource_version,
-                    data: std::sync::Arc::new(data),
-                })
-            }
-            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
-                if let Some(expected_uid) = expected_uid_for_log.as_deref() {
-                    self.warn_uid_precondition_mismatch_if_live(
-                        "update_status_only",
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        expected_uid,
-                    )
-                    .await;
-                }
-                Err(klights_cluster_datastore::errors::DatastoreError::conflict(
-                    "Resource not found or version conflict",
-                )
-                .into())
-            }
-            Err(e) => Err(anyhow!("Failed to update status: {}", e)),
         }
     }
 }

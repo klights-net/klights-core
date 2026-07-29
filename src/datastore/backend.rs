@@ -127,36 +127,20 @@ use klights_watch::WatchTopic;
 #[cfg(test)]
 use super::types::ReplicatedCreateOptions;
 use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, PodCleanupIntent, PositionedWatchReplayRead, ReplicatedSnapshotMetadata,
-    ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
+    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 #[cfg(test)]
 use klights_cluster_core::command::CommandMeta;
 use klights_cluster_core::{
-    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
-    WatchReplayPosition,
+    LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
+    ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
 #[cfg(test)]
 use klights_cluster_store::StagedPostCommit;
 
-/// Exclusive guard held while a logical snapshot walks multiple bounded read
-/// pages. Backends without this coordination return `None`.
-pub struct SnapshotExclusiveFence {
-    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
-}
-
-impl SnapshotExclusiveFence {
-    pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
-        Self { _guard: guard }
-    }
-}
-
-/// Shared guard held by authoritative Raft state-machine mutations so apply
-/// and install cannot overlap an exclusive snapshot capture.
-pub struct SnapshotMutationFence {
-    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
-}
+pub use klights_cluster_store::{SnapshotExclusiveFence, SnapshotMutationFence};
 
 /// Synchronous, nonblocking post-commit observation port. Implementations are
 /// injected by root composition and must not perform datastore work.
@@ -165,17 +149,6 @@ pub trait CommitObservationSink: Send + Sync {
     fn observe(&self, observations: &[StagedPostCommit]);
     #[cfg(test)]
     fn as_any(&self) -> &dyn Any;
-}
-
-#[async_trait]
-pub trait SnapshotCaptureAnchor: Send + Sync {
-    async fn pin_under_snapshot_fence(&self) -> Result<()>;
-}
-
-impl SnapshotMutationFence {
-    pub(crate) fn new(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
-        Self { _guard: guard }
-    }
 }
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -214,18 +187,11 @@ pub trait DatastoreBackend: Send + Sync {
     async fn begin_pinned_snapshot_capture(
         &self,
         _request: klights_cluster_store::SnapshotCaptureRequest,
+        _fence: SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
         Err(anyhow::anyhow!(
             "datastore backend does not implement pinned snapshot capture"
         ))
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        _anchor: &dyn SnapshotCaptureAnchor,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        self.begin_pinned_snapshot_capture(request).await
     }
 
     /// Release backend-specific resources (file locks, connections, etc.)
@@ -1008,7 +974,7 @@ pub trait DatastoreBackend: Send + Sync {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         let _ = node_name;
         Ok(Vec::new())
     }
@@ -1108,11 +1074,11 @@ pub trait DatastoreBackend: Send + Sync {
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>>;
+    ) -> Result<Option<LogApplyAppliedOutboxRow>>;
 
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool>;
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool>;
 
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         Err(anyhow::anyhow!(
             "backend does not support applied_outbox listing"
         ))
@@ -1126,14 +1092,14 @@ pub trait DatastoreBackend: Send + Sync {
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         // memory-improvement.md §10 P1: default fallback — load the full
         // ledger and filter by `idempotency_key` in memory. Production sqlite
         // overrides with a real keyset query; this preserves pre-P1 behavior
         // for backends that don't.
         let limit = limit.get();
         let rows = self.list_applied_outbox().await?;
-        let mut out: Vec<AppliedOutboxRecord> = Vec::with_capacity(rows.len().min(limit));
+        let mut out: Vec<LogApplyAppliedOutboxRow> = Vec::with_capacity(rows.len().min(limit));
         for record in rows {
             let past_cursor = after_key.is_none_or(|k| record.idempotency_key.as_str() > k);
             if past_cursor {
@@ -1836,11 +1802,7 @@ pub trait DurableRecoveryStore: Send + Sync {
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>>;
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn SnapshotCaptureAnchor,
+        fence: SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>>;
 }
 
@@ -1857,17 +1819,10 @@ impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        self.as_ref().begin_pinned_snapshot_capture(request).await
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn SnapshotCaptureAnchor,
+        fence: SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
         self.as_ref()
-            .begin_pinned_snapshot_capture_with_anchor(request, anchor)
+            .begin_pinned_snapshot_capture(request, fence)
             .await
     }
 }
@@ -1907,21 +1862,9 @@ impl DurableRecoveryStore for DatastoreDurableRecoveryPort {
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
+        fence: SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        DatastoreBackend::begin_pinned_snapshot_capture(self.db.as_ref(), request).await
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn SnapshotCaptureAnchor,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
-            self.db.as_ref(),
-            request,
-            anchor,
-        )
-        .await
+        DatastoreBackend::begin_pinned_snapshot_capture(self.db.as_ref(), request, fence).await
     }
 }
 
@@ -2074,7 +2017,7 @@ pub trait PodCleanupStore: Send + Sync {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>>;
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>>;
     async fn delete_pod_cleanup_intent(
         &self,
         node_name: &str,
@@ -2101,14 +2044,14 @@ pub trait AppliedOutboxStore: Send + Sync {
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>>;
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool>;
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>>;
+    ) -> Result<Option<LogApplyAppliedOutboxRow>>;
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool>;
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>>;
     async fn list_applied_outbox_paged(
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>>;
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>>;
     async fn apply_outbox_transactionally(
         &self,
         idempotency_key: &str,

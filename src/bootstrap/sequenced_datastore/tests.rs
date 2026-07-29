@@ -749,7 +749,7 @@ mod cases {
             .unwrap_or_default()
             .as_millis() as i64;
 
-        ds.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        ds.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "old-legacy-row".into(),
             subject_key: "v1:Pod:default:old".into(),
             operation: "PodStatus".into(),
@@ -760,7 +760,7 @@ mod cases {
         })
         .await
         .expect("seed legacy outbox row");
-        ds.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        ds.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: "recent-legacy-row".into(),
             subject_key: "v1:Pod:default:recent".into(),
             operation: "PodStatus".into(),

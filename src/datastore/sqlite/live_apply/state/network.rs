@@ -7,7 +7,7 @@ use rusqlite::OptionalExtension;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
-pub(in crate::datastore::sqlite) struct NetworkStateApplier<'tx, 'conn> {
+pub(super) struct NetworkStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
@@ -16,10 +16,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         Self { tx }
     }
 
-    pub(in crate::datastore::sqlite) fn put_node_subnet(
-        &self,
-        row: LogApplyNodeSubnetRow,
-    ) -> tokio_rusqlite::Result<()> {
+    pub(super) fn put_node_subnet(&self, row: LogApplyNodeSubnetRow) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
             queries::NODE_SUBNET_UPSERT_EXACT,
             rusqlite::params![
@@ -35,7 +32,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn allocate_node_subnet(
+    pub(super) fn allocate_node_subnet(
         &self,
         allocation: LogApplyNodeSubnetAllocation,
     ) -> tokio_rusqlite::Result<()> {
@@ -43,16 +40,13 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         self.put_node_subnet(row)
     }
 
-    pub(in crate::datastore::sqlite) fn delete_node_subnet(
-        &self,
-        node_name: String,
-    ) -> tokio_rusqlite::Result<()> {
+    pub(super) fn delete_node_subnet(&self, node_name: String) -> tokio_rusqlite::Result<()> {
         self.tx
             .execute(queries::NODE_SUBNET_DELETE, rusqlite::params![node_name])?;
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn put_node_dataplane(
+    pub(super) fn put_node_dataplane(
         &self,
         row: LogApplyNodeDataplaneRow,
     ) -> tokio_rusqlite::Result<()> {
@@ -71,10 +65,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn delete_node_dataplane(
-        &self,
-        node_name: String,
-    ) -> tokio_rusqlite::Result<()> {
+    pub(super) fn delete_node_dataplane(&self, node_name: String) -> tokio_rusqlite::Result<()> {
         self.tx
             .execute(queries::NODE_DATAPLANE_DELETE, rusqlite::params![node_name])?;
         Ok(())
@@ -85,25 +76,19 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
         allocation: LogApplyNodeSubnetAllocation,
     ) -> tokio_rusqlite::Result<LogApplyNodeSubnetRow> {
         let node_name_typed = NodeName::parse(&allocation.node_name).map_err(|err| {
-            super::super::cluster_replace::other_error(format!(
-                "Invalid node name {}: {err}",
-                allocation.node_name
-            ))
+            super::super::other_error(format!("Invalid node name {}: {err}", allocation.node_name))
         })?;
         let node_ip_typed: Ipv4Addr = allocation.node_ip.parse().map_err(|err| {
-            super::super::cluster_replace::other_error(format!(
-                "Invalid node IP {}: {err}",
-                allocation.node_ip
-            ))
+            super::super::other_error(format!("Invalid node IP {}: {err}", allocation.node_ip))
         })?;
         let cluster = ClusterCidr::parse(&allocation.cluster_cidr).map_err(|err| {
-            super::super::cluster_replace::other_error(format!(
+            super::super::other_error(format!(
                 "Invalid cluster CIDR {}: {err}",
                 allocation.cluster_cidr
             ))
         })?;
         if cluster.prefix() > 24 {
-            return Err(super::super::cluster_replace::other_error(format!(
+            return Err(super::super::other_error(format!(
                 "cluster CIDR prefix must be <= /24 (got /{})",
                 cluster.prefix()
             )));

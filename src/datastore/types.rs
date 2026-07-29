@@ -8,6 +8,7 @@ use anyhow::{Result, anyhow};
 #[cfg(test)]
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use std::borrow::Cow;
 
@@ -109,48 +110,6 @@ fn hydrate_staged_test_resource(
 }
 
 pub const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PodCleanupIntent {
-    pub node_name: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub reason: String,
-    pub resource_version: i64,
-    pub created_at_ms: i64,
-    pub pod_data: Value,
-}
-
-impl From<PodCleanupIntent> for klights_cluster_core::LogApplyPodCleanupIntentRow {
-    fn from(row: PodCleanupIntent) -> Self {
-        Self {
-            node_name: row.node_name,
-            namespace: row.namespace,
-            pod_name: row.pod_name,
-            pod_uid: row.pod_uid,
-            reason: row.reason,
-            resource_version: row.resource_version,
-            created_at_ms: row.created_at_ms,
-            pod_data: row.pod_data,
-        }
-    }
-}
-
-impl From<klights_cluster_core::LogApplyPodCleanupIntentRow> for PodCleanupIntent {
-    fn from(row: klights_cluster_core::LogApplyPodCleanupIntentRow) -> Self {
-        Self {
-            node_name: row.node_name,
-            namespace: row.namespace,
-            pod_name: row.pod_name,
-            pod_uid: row.pod_uid,
-            reason: row.reason,
-            resource_version: row.resource_version,
-            created_at_ms: row.created_at_ms,
-            pod_data: row.pod_data,
-        }
-    }
-}
 
 /// Leader metadata stamped into a replica backup during full snapshot restore.
 ///
@@ -478,45 +437,5 @@ impl ListPageRequest {
             list.continue_token = list.items.last().map(|item| item.name.clone());
         }
         list
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AppliedOutboxRecord {
-    pub idempotency_key: String,
-    pub subject_key: String,
-    pub operation: String,
-    pub first_seen_ms: i64,
-    pub applied_rv: Option<i64>,
-    pub result_proto: Vec<u8>,
-    #[serde(default)]
-    pub status_stamp: Option<i64>,
-}
-
-impl From<AppliedOutboxRecord> for klights_cluster_core::LogApplyAppliedOutboxRow {
-    fn from(record: AppliedOutboxRecord) -> Self {
-        Self {
-            idempotency_key: record.idempotency_key,
-            subject_key: record.subject_key,
-            operation: record.operation,
-            first_seen_ms: record.first_seen_ms,
-            applied_rv: record.applied_rv,
-            result_proto: record.result_proto,
-            status_stamp: record.status_stamp,
-        }
-    }
-}
-
-impl From<klights_cluster_core::LogApplyAppliedOutboxRow> for AppliedOutboxRecord {
-    fn from(row: klights_cluster_core::LogApplyAppliedOutboxRow) -> Self {
-        Self {
-            idempotency_key: row.idempotency_key,
-            subject_key: row.subject_key,
-            operation: row.operation,
-            first_seen_ms: row.first_seen_ms,
-            applied_rv: row.applied_rv,
-            result_proto: row.result_proto,
-            status_stamp: row.status_stamp,
-        }
     }
 }

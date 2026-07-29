@@ -5,9 +5,9 @@ use async_trait::async_trait;
 #[cfg(test)]
 use klights_cluster_core::CommandMeta;
 use klights_cluster_core::{
-    OutboxApplyError as OutboxDeliveryError, OutboxApplyOutcome as OutboxDeliveryResult, PatchKind,
-    Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, StorageCommand,
-    WatchReplayPosition,
+    LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, OutboxApplyError as OutboxDeliveryError,
+    OutboxApplyOutcome as OutboxDeliveryResult, PatchKind, Resource, ResourceBatchOperation,
+    ResourcePatchRequest, ResourcePreconditions, StorageCommand, WatchReplayPosition,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -19,9 +19,8 @@ use crate::datastore::backend::DatastoreBackend;
 #[cfg(test)]
 use crate::datastore::types::ReplicatedCreateOptions;
 use crate::datastore::types::{
-    AppliedOutboxRecord, CatchUpResource, ListPageRequest, PodCleanupIntent,
-    PositionedWatchReplayRead, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
-    SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
+    CatchUpResource, ListPageRequest, PositionedWatchReplayRead, ReplicatedSnapshotMetadata,
+    ResourceList, ResourceListQuery, SnapshotAtRv, WatchReplayFloor, WatchReplayRead, WatchTarget,
 };
 use klights_cluster_datastore::errors::DatastoreError;
 #[cfg(test)]
@@ -971,7 +970,7 @@ impl DatastoreBackend for SequencedDatastore {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         self.passive
             .list_pod_cleanup_intents_for_node(node_name)
             .await
@@ -1109,15 +1108,15 @@ impl DatastoreBackend for SequencedDatastore {
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
+    ) -> Result<Option<LogApplyAppliedOutboxRow>> {
         self.passive.get_applied_outbox(idempotency_key).await
     }
 
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
         self.passive.insert_applied_outbox(record).await
     }
 
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         self.passive.list_applied_outbox().await
     }
 
@@ -1851,19 +1850,10 @@ impl crate::datastore::DurableRecoveryStore for SequencedDatastore {
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
+        fence: klights_cluster_store::SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request).await
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture_with_anchor(
-            self, request, anchor,
-        )
-        .await
+        crate::datastore::DatastoreBackend::begin_pinned_snapshot_capture(self, request, fence)
+            .await
     }
 }
 
@@ -2129,7 +2119,7 @@ impl crate::datastore::PodCleanupStore for SequencedDatastore {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         crate::datastore::DatastoreBackend::list_pod_cleanup_intents_for_node(self, node_name).await
     }
 
@@ -2177,15 +2167,15 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
+    ) -> Result<Option<LogApplyAppliedOutboxRow>> {
         crate::datastore::DatastoreBackend::get_applied_outbox(self, idempotency_key).await
     }
 
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
         crate::datastore::DatastoreBackend::insert_applied_outbox(self, record).await
     }
 
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         crate::datastore::DatastoreBackend::list_applied_outbox(self).await
     }
 
@@ -2193,7 +2183,7 @@ impl crate::datastore::AppliedOutboxStore for SequencedDatastore {
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         crate::datastore::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
     }
 

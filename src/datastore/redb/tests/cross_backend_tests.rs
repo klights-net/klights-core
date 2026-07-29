@@ -10,7 +10,9 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::RedbDatastore;
 use crate::datastore::sqlite::Datastore as SqliteDs;
 use crate::datastore::types::*;
-use klights_cluster_core::{PatchKind, ResourcePreconditions, WatchReplayPosition};
+use klights_cluster_core::{
+    LogApplyAppliedOutboxRow, PatchKind, ResourcePreconditions, WatchReplayPosition,
+};
 
 async fn sqlite_db() -> SqliteDs {
     SqliteDs::new_in_memory().await.unwrap()
@@ -91,7 +93,7 @@ parametrize_backends!(
     |db| {
         let row_count = klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE + 1;
         for index in 0..row_count {
-            db.insert_applied_outbox(AppliedOutboxRecord {
+            db.insert_applied_outbox(LogApplyAppliedOutboxRow {
                 idempotency_key: format!("snapshot-page-{index:03}"),
                 subject_key: format!("subject-{index:03}"),
                 operation: "Update".to_string(),
@@ -334,7 +336,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
     let expired_ms = now_ms - ttl_ms - 1;
     let recent_ms = now_ms - 60_000;
 
-    db.insert_applied_outbox(AppliedOutboxRecord {
+    db.insert_applied_outbox(LogApplyAppliedOutboxRow {
         idempotency_key: "expired-pod-status".to_string(),
         subject_key: "v1/Pod/default/web/uid-1".to_string(),
         operation: "PodStatus".to_string(),
@@ -345,7 +347,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
     })
     .await
     .unwrap();
-    db.insert_applied_outbox(AppliedOutboxRecord {
+    db.insert_applied_outbox(LogApplyAppliedOutboxRow {
         idempotency_key: "recent-pod-status".to_string(),
         subject_key: "v1/Pod/default/web/uid-1".to_string(),
         operation: "PodStatus".to_string(),
@@ -356,7 +358,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
     })
     .await
     .unwrap();
-    db.insert_applied_outbox(AppliedOutboxRecord {
+    db.insert_applied_outbox(LogApplyAppliedOutboxRow {
         idempotency_key: "expired-event-create".to_string(),
         subject_key: "v1/Event/default/web.1/uid-event".to_string(),
         operation: "EventCreate".to_string(),
@@ -367,7 +369,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
     })
     .await
     .unwrap();
-    db.insert_applied_outbox(AppliedOutboxRecord {
+    db.insert_applied_outbox(LogApplyAppliedOutboxRow {
         idempotency_key: "expired-future-operation".to_string(),
         subject_key: "example.io/v1/Future/default/name/uid-future".to_string(),
         operation: "FutureOperation".to_string(),

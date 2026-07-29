@@ -4,7 +4,12 @@
 pub const CLUSTER_ID_META_KEY: &str = "cluster_id";
 /// Durable metadata key for the current leader epoch.
 pub const LEADER_EPOCH_META_KEY: &str = "leader_epoch";
+/// Durable metadata key recording exact activation of command codec v3.
+pub const COMMAND_CODEC_ACTIVATION_VERSION_META_KEY: &str = "command_codec_activation_version";
+/// The only accepted persisted command codec activation value.
+pub const COMMAND_CODEC_V3_ACTIVATION_VALUE: &str = "3";
 
+mod backend_snapshot;
 mod committed_apply;
 mod durable_recovery;
 mod namespace_content;
@@ -20,6 +25,10 @@ mod response_codec;
 mod topology;
 mod watch_range;
 
+pub use backend_snapshot::{
+    DatastoreSnapshotter, SnapshotEntry, SnapshotEnvelope, SnapshotExclusiveFence,
+    SnapshotMutationFence, SnapshotRestoreError, SnapshotTable, compute_schema_fingerprint,
+};
 pub use committed_apply::{
     AppliedOutboxLookup, CommittedApplyError, CommittedApplyFuture, CommittedRaftApplyReceipt,
     CommittedRaftApplyRequest, DurableApplyLedgerRead, PrivilegedCommittedRaftApply,

@@ -320,6 +320,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         SqliteRaftSnapshotBuilder {
             recovery: self.recovery.clone(),
+            lifecycle: self.lifecycle.clone(),
             applied_state: self.applied_state.clone(),
             supervisor: self.supervisor.clone(),
         }

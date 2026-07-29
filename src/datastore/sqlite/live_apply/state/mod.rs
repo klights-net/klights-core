@@ -4,7 +4,7 @@ mod network;
 mod outbox;
 mod pod_cleanup;
 mod resource;
-mod watch_history;
+pub(super) mod watch_history;
 
 use klights_cluster_core::ClusterMutation;
 use klights_cluster_store::StagedPostCommit;
@@ -53,37 +53,38 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
         }
     }
 
-    pub(super) fn cluster_meta_mut(
-        &mut self,
-    ) -> &mut cluster_meta::ClusterMetaStateApplier<'tx, 'conn> {
+    fn cluster_meta_mut(&mut self) -> &mut cluster_meta::ClusterMetaStateApplier<'tx, 'conn> {
         &mut self.cluster_meta
     }
 
-    pub(super) fn namespace_mut(&mut self) -> &mut namespace::NamespaceStateApplier<'tx, 'conn> {
+    fn namespace_mut(&mut self) -> &mut namespace::NamespaceStateApplier<'tx, 'conn> {
         &mut self.namespace
     }
 
-    pub(super) fn network_mut(&mut self) -> &mut network::NetworkStateApplier<'tx, 'conn> {
+    fn network_mut(&mut self) -> &mut network::NetworkStateApplier<'tx, 'conn> {
         &mut self.network
     }
 
-    pub(super) fn outbox_mut(&mut self) -> &mut outbox::OutboxLedgerStateApplier<'tx, 'conn> {
+    fn outbox_mut(&mut self) -> &mut outbox::OutboxLedgerStateApplier<'tx, 'conn> {
         &mut self.outbox
     }
 
-    pub(super) fn pod_cleanup_mut(
+    pub(super) fn put_applied_outbox(
         &mut self,
-    ) -> &mut pod_cleanup::PodCleanupStateApplier<'tx, 'conn> {
+        row: klights_cluster_core::LogApplyAppliedOutboxRow,
+    ) -> tokio_rusqlite::Result<()> {
+        self.outbox_mut().put_applied_outbox(row)
+    }
+
+    fn pod_cleanup_mut(&mut self) -> &mut pod_cleanup::PodCleanupStateApplier<'tx, 'conn> {
         &mut self.pod_cleanup
     }
 
-    pub(super) fn resource_mut(&mut self) -> &mut resource::ClusterStateApplier<'tx, 'conn> {
+    fn resource_mut(&mut self) -> &mut resource::ClusterStateApplier<'tx, 'conn> {
         &mut self.resource
     }
 
-    pub(super) fn watch_history_mut(
-        &mut self,
-    ) -> &mut watch_history::WatchHistoryStateApplier<'tx, 'conn> {
+    fn watch_history_mut(&mut self) -> &mut watch_history::WatchHistoryStateApplier<'tx, 'conn> {
         &mut self.watch_history
     }
 
@@ -98,7 +99,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
             ClusterMutation::Resource(mutation) => match mutation {
                 klights_cluster_core::ResourceMutation::PutResource(row) => {
                     if row.resource_version != commit_resource_version {
-                        return Err(super::cluster_replace::other_error(
+                        return Err(super::other_error(
                             "resource row RV does not match commit RV",
                         ));
                     }
@@ -111,7 +112,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
                 }
                 klights_cluster_core::ResourceMutation::PatchResourceLatest(patch) => {
                     if patch.resource_version != commit_resource_version {
-                        return Err(super::cluster_replace::other_error(
+                        return Err(super::other_error(
                             "resource patch RV does not match commit RV",
                         ));
                     }
@@ -132,7 +133,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
                     }
                 }
                 klights_cluster_core::ResourceMutation::FinalizeBoundPod(_) => {
-                    return Err(super::cluster_replace::other_error(
+                    return Err(super::other_error(
                         "bound Pod finalization was not resolved before state-machine apply",
                     ));
                 }
@@ -140,7 +141,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
             ClusterMutation::Namespace(mutation) => match mutation {
                 klights_cluster_core::NamespaceMutation::PutNamespace(row) => {
                     if row.resource_version != commit_resource_version {
-                        return Err(super::cluster_replace::other_error(
+                        return Err(super::other_error(
                             "namespace row RV does not match commit RV",
                         ));
                     }
@@ -219,7 +220,7 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
             ClusterMutation::PodCleanup(mutation) => match mutation {
                 klights_cluster_core::PodCleanupMutation::PutPodCleanupIntent(row) => {
                     if row.resource_version != commit_resource_version {
-                        return Err(super::cluster_replace::other_error(
+                        return Err(super::other_error(
                             "pod cleanup intent RV does not match commit RV",
                         ));
                     }

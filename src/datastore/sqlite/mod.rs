@@ -7,17 +7,21 @@
 #[cfg(test)]
 mod applier;
 mod cluster_replace;
-mod cluster_state_apply;
 mod crud;
 mod focused_ports;
 mod gc;
+mod live_apply;
 mod merge_patch;
+mod mutation_diagnostics;
+mod ordinary;
 mod outbox_codec;
 pub(super) mod owner_ref_index;
 pub(crate) mod queries;
+mod recovery;
 mod resource_shape;
 mod rv_helpers;
 mod snapshot_capture;
+mod transaction_primitives;
 #[cfg(test)]
 pub(crate) use snapshot_capture::install_snapshot_capture_page_pause;
 #[cfg(test)]
@@ -56,14 +60,14 @@ pub use super::backend::{
     DatastoreBackend, DatastoreHandle, NamespaceStore, ResourceStore, WatchStore,
 };
 pub use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
-    ListPageRequest, PodCleanupIntent, PositionedWatchReplay, PositionedWatchReplayRead,
-    ReplicatedCreateOptions, ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList,
-    ResourceListQuery, SnapshotAtRv, WatchTarget, WatchTargetScope,
+    CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation, ListPageRequest,
+    PositionedWatchReplay, PositionedWatchReplayRead, ReplicatedCreateOptions,
+    ReplicatedMembershipState, ReplicatedSnapshotMetadata, ResourceList, ResourceListQuery,
+    SnapshotAtRv, WatchTarget, WatchTargetScope,
 };
 use klights_cluster_core::{
-    PatchKind, Resource, ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions,
-    WatchReplayPosition,
+    LogApplyAppliedOutboxRow, LogApplyPodCleanupIntentRow, PatchKind, Resource,
+    ResourceBatchOperation, ResourcePatchRequest, ResourcePreconditions, WatchReplayPosition,
 };
 use klights_cluster_store::OutboxResponseCodec;
 pub use klights_cluster_store::StagedPostCommit;
@@ -310,7 +314,7 @@ enum OutboxTxnOutcome {
         pod_endpoint_effect: klights_cluster_core::PodEndpointEffect,
         committed_resource: Option<crate::datastore::Resource>,
     },
-    AlreadyApplied(Option<AppliedOutboxRecord>),
+    AlreadyApplied(Option<LogApplyAppliedOutboxRow>),
 }
 
 use klights_cluster_core::BuildOutboxOutcome;
@@ -321,7 +325,7 @@ enum BuildOutboxTxnOutcome {
         rv: i64,
         terminal_error: Option<klights_cluster_core::OutboxApplyError>,
     },
-    AlreadyApplied(Option<AppliedOutboxRecord>),
+    AlreadyApplied(Option<LogApplyAppliedOutboxRow>),
 }
 
 #[cfg(test)]
@@ -429,10 +433,10 @@ impl Datastore {
     fn completed_outbox_record_in_tx(
         tx: &rusqlite::Transaction<'_>,
         idempotency_key: &str,
-    ) -> tokio_rusqlite::Result<Option<AppliedOutboxRecord>> {
+    ) -> tokio_rusqlite::Result<Option<LogApplyAppliedOutboxRow>> {
         let existing = tx
             .query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
-                Ok(AppliedOutboxRecord {
+                Ok(LogApplyAppliedOutboxRow {
                     idempotency_key: row.get(0)?,
                     subject_key: row.get(1)?,
                     operation: row.get(2)?,
@@ -469,7 +473,7 @@ impl Datastore {
     fn append_applied_outbox_ledger_mutation(
         commit: &mut klights_cluster_core::LogApplyCommit,
         input: AppliedOutboxLedgerInput<'_>,
-        context: &outbox_codec::TransactionContext<'_>,
+        context: &live_apply::TransactionContext<'_>,
     ) {
         use klights_cluster_core::StorageResponse;
         use klights_cluster_core::{
@@ -916,7 +920,7 @@ impl Datastore {
                 // boundary (raft-fix.md): the prior `apply_against_latest ||
                 // kind == "Node"` gate skipped generic workload kinds, so a
                 // stale status commit carried clobbered status (only recovered
-                // later by the raft-apply safety net in cluster_state_apply).
+                // later by the raft-apply safety net in live_apply).
                 // The merge is a no-op for a fresh non-Pod apply, so merging
                 // unconditionally is safe; Pod (`apply_against_latest`) and
                 // Node stay typed-merged regardless of freshness.
@@ -1767,11 +1771,11 @@ impl Datastore {
     pub async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
+    ) -> Result<Option<LogApplyAppliedOutboxRow>> {
         let idempotency_key = idempotency_key.to_string();
         self.read_db_call("db_applied_outbox_get", move |conn| {
             conn.query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
-                Ok(AppliedOutboxRecord {
+                Ok(LogApplyAppliedOutboxRow {
                     idempotency_key: row.get(0)?,
                     subject_key: row.get(1)?,
                     operation: row.get(2)?,
@@ -1788,7 +1792,7 @@ impl Datastore {
         .map_err(|e| anyhow!("applied outbox get failed: {e}"))
     }
 
-    pub async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+    pub async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
         self.db_call("db_applied_outbox_insert", move |conn| {
             let changed = conn.execute(
                 queries::APPLIED_OUTBOX_INSERT,
@@ -1872,12 +1876,12 @@ impl Datastore {
         .map_err(|e| anyhow!("list paged outbox stream watermarks failed: {e}"))
     }
 
-    pub async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+    pub async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         self.read_db_call("db_applied_outbox_list_all", move |conn| {
             let rows = conn
                 .prepare(queries::APPLIED_OUTBOX_LIST_ALL)?
                 .query_map([], |row| {
-                    Ok(AppliedOutboxRecord {
+                    Ok(LogApplyAppliedOutboxRow {
                         idempotency_key: row.get(0)?,
                         subject_key: row.get(1)?,
                         operation: row.get(2)?,
@@ -1904,14 +1908,14 @@ impl Datastore {
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         let after = after_key.unwrap_or("").to_string();
         let limit_i64 = limit.get() as i64;
         self.read_db_call("db_applied_outbox_list_all_paged", move |conn| {
             let rows = conn
                 .prepare(queries::APPLIED_OUTBOX_LIST_ALL_PAGED)?
                 .query_map(rusqlite::params![after, limit_i64], |row| {
-                    Ok(AppliedOutboxRecord {
+                    Ok(LogApplyAppliedOutboxRow {
                         idempotency_key: row.get(0)?,
                         subject_key: row.get(1)?,
                         operation: row.get(2)?,
@@ -1944,7 +1948,7 @@ impl Datastore {
         // same transaction that writes the rows.
         let _pending = self
             .db_call("db_apply_resource_batch", move |conn| {
-                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -1988,7 +1992,7 @@ impl Datastore {
         let operation_now = self.wall_clock.now_utc();
         let _pending = self
             .db_call("db_move_pod_to_cleanup_intent", move |conn| {
-                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -2015,7 +2019,7 @@ impl Datastore {
     pub async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         let node_name = node_name.to_string();
         self.read_db_call("db_list_pod_cleanup_intents_for_node", move |conn| {
             let rows = conn
@@ -2029,7 +2033,7 @@ impl Datastore {
                             Box::new(err),
                         )
                     })?;
-                    Ok(PodCleanupIntent {
+                    Ok(LogApplyPodCleanupIntentRow {
                         node_name: row.get(0)?,
                         namespace: row.get(1)?,
                         pod_name: row.get(2)?,
@@ -2085,7 +2089,7 @@ impl Datastore {
         let operation_now = self.wall_clock.now_utc();
         let _pending = self
             .db_call("db_apply_cluster_maintenance_command", move |conn| {
-                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -2175,7 +2179,7 @@ impl Datastore {
 
         let outcome = self
             .db_call("db_build_log_apply_commit_for_outbox", move |conn| {
-                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if let Some(existing) = Self::completed_outbox_record_in_tx(&tx, &claim_key)? {
                     tx.commit()?;
@@ -2233,7 +2237,7 @@ impl Datastore {
                 terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
-                let context = outbox_codec::TransactionContext::new(self.outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(self.outbox_codec.as_ref());
                 if let Some(message) =
                     Self::cached_outbox_terminal_error(record.as_ref(), &context)?
                 {
@@ -2288,7 +2292,7 @@ impl Datastore {
 
         let outcome = self
             .db_call("db_build_log_apply_commit_for_outbox_watermark", move |conn| {
-                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 if let Some(existing) =
                     Self::completed_outbox_record_in_tx(&tx, &claim_key)?
@@ -2465,7 +2469,7 @@ impl Datastore {
                 terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
-                let context = outbox_codec::TransactionContext::new(self.outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(self.outbox_codec.as_ref());
                 let committed_resource =
                     Self::cached_outbox_committed_resource(record.as_ref(), &context)?;
                 Ok(BuildOutboxOutcome::AlreadyApplied {
@@ -2540,7 +2544,7 @@ impl Datastore {
         let outbox_codec = self.outbox_codec.clone();
         let outcome = self
             .db_call("db_apply_outbox_atomic", move |conn| {
-                let context = outbox_codec::TransactionContext::new(outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(outbox_codec.as_ref());
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let pod_state = |tx: &rusqlite::Transaction<'_>| {
                     let Some((namespace, name)) = pod_target.as_ref() else {
@@ -2572,9 +2576,9 @@ impl Datastore {
                 };
                 let pod_before = pod_state(&tx)?;
 
-                let mut existing: Option<AppliedOutboxRecord> = tx
+                let mut existing: Option<LogApplyAppliedOutboxRow> = tx
                     .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
-                        Ok(AppliedOutboxRecord {
+                        Ok(LogApplyAppliedOutboxRow {
                             idempotency_key: row.get(0)?,
                             subject_key: row.get(1)?,
                             operation: row.get(2)?,
@@ -2637,7 +2641,7 @@ impl Datastore {
                 if tx.changes() == 0 {
                     existing = tx
                         .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
-                            Ok(AppliedOutboxRecord {
+                            Ok(LogApplyAppliedOutboxRow {
                                 idempotency_key: row.get(0)?,
                                 subject_key: row.get(1)?,
                                 operation: row.get(2)?,
@@ -2687,7 +2691,7 @@ impl Datastore {
                 .with_committed_resource(committed_resource))
             }
             OutboxTxnOutcome::AlreadyApplied(record) => {
-                let context = outbox_codec::TransactionContext::new(self.outbox_codec.as_ref());
+                let context = live_apply::TransactionContext::new(self.outbox_codec.as_ref());
                 if let Some(message) =
                     Self::cached_outbox_terminal_error(record.as_ref(), &context)?
                 {
@@ -2720,7 +2724,7 @@ impl Datastore {
         command: klights_cluster_core::command::StorageCommand,
         operation: &str,
         authoring_node: &str,
-        context: &outbox_codec::TransactionContext<'_>,
+        context: &live_apply::TransactionContext<'_>,
         operation_now: chrono::DateTime<chrono::Utc>,
     ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
         use klights_cluster_core::StorageResponse;
@@ -2777,7 +2781,7 @@ impl Datastore {
         authoring_node: &str,
     ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
         let codec = crate::outbox_response_codec_adapter::new_codec();
-        let context = outbox_codec::TransactionContext::new(codec.as_ref());
+        let context = live_apply::TransactionContext::new(codec.as_ref());
         Self::apply_outbox_command_in_tx_with_context(
             tx,
             command,
@@ -2796,38 +2800,14 @@ impl Datastore {
         name: &str,
         resource_version: i64,
     ) -> tokio_rusqlite::Result<Option<Value>> {
-        let earliest: Option<i64> = tx
-            .query_row(queries::WATCH_EVENTS_MIN_RV, [], |row| row.get(0))
-            .optional()?;
-        match earliest {
-            Some(earliest) if resource_version + 1 >= earliest => {}
-            _ => return Ok(None),
-        }
-
-        let namespace_key = namespace.unwrap_or("#cluster");
-        let row: Option<(String, Vec<u8>)> = tx
-            .query_row(
-                "SELECT event_type, data FROM watch_events \
-                 WHERE api_version = ?1 \
-                   AND kind = ?2 \
-                   AND COALESCE(namespace, '#cluster') = ?3 \
-                   AND name = ?4 \
-                   AND resource_version <= ?5 \
-                 ORDER BY resource_version DESC, id DESC \
-                 LIMIT 1",
-                rusqlite::params![api_version, kind, namespace_key, name, resource_version],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((event_type, bytes)) = row else {
-            return Ok(None);
-        };
-        if event_type == "DELETED" {
-            return Ok(None);
-        }
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error)
+        transaction_primitives::resource_snapshot_for_key_at_rv(
+            tx,
+            api_version,
+            kind,
+            namespace,
+            name,
+            resource_version,
+        )
     }
 
     fn rebase_stale_pod_metadata_update(
@@ -3309,8 +3289,8 @@ impl Datastore {
     }
 
     fn cached_outbox_terminal_error(
-        record: Option<&AppliedOutboxRecord>,
-        context: &outbox_codec::TransactionContext<'_>,
+        record: Option<&LogApplyAppliedOutboxRow>,
+        context: &live_apply::TransactionContext<'_>,
     ) -> std::result::Result<Option<String>, klights_cluster_core::OutboxApplyError> {
         let Some(record) = record else {
             return Ok(None);
@@ -3330,8 +3310,8 @@ impl Datastore {
     }
 
     fn cached_outbox_committed_resource(
-        record: Option<&AppliedOutboxRecord>,
-        context: &outbox_codec::TransactionContext<'_>,
+        record: Option<&LogApplyAppliedOutboxRow>,
+        context: &live_apply::TransactionContext<'_>,
     ) -> std::result::Result<
         Option<crate::datastore::Resource>,
         klights_cluster_core::OutboxApplyError,
@@ -3902,17 +3882,15 @@ impl DatastoreBackend for Datastore {
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
-        Ok(Some(
-            crate::datastore::backend::SnapshotExclusiveFence::new(
-                self.snapshot_fence.clone().write_owned().await,
-            ),
-        ))
+        Ok(Some(klights_cluster_store::SnapshotExclusiveFence::new(
+            self.snapshot_fence.clone().write_owned().await,
+        )))
     }
 
     async fn acquire_snapshot_mutation_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
-        Ok(Some(crate::datastore::backend::SnapshotMutationFence::new(
+        Ok(Some(klights_cluster_store::SnapshotMutationFence::new(
             self.snapshot_fence.clone().read_owned().await,
         )))
     }
@@ -3920,32 +3898,14 @@ impl DatastoreBackend for Datastore {
     async fn begin_pinned_snapshot_capture(
         &self,
         request: klights_cluster_store::SnapshotCaptureRequest,
+        fence: klights_cluster_store::SnapshotExclusiveFence,
     ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
         let factory = self
             .snapshot_factory
             .as_ref()
             .ok_or_else(|| anyhow!("pinned SQLite capture requires a snapshot-only disk lane"))?;
-        let fence = crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self)
-            .await?
-            .expect("SQLite provides a snapshot fence");
         let prepared = factory.open(request).await?;
-        prepared.pin(fence, None).await
-    }
-
-    async fn begin_pinned_snapshot_capture_with_anchor(
-        &self,
-        request: klights_cluster_store::SnapshotCaptureRequest,
-        anchor: &dyn crate::datastore::backend::SnapshotCaptureAnchor,
-    ) -> Result<Box<dyn klights_cluster_store::SnapshotCaptureSession>> {
-        let factory = self
-            .snapshot_factory
-            .as_ref()
-            .ok_or_else(|| anyhow!("pinned SQLite capture requires a snapshot-only disk lane"))?;
-        let fence = crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self)
-            .await?
-            .expect("SQLite provides a snapshot fence");
-        let prepared = factory.open(request).await?;
-        prepared.pin(fence, Some(anchor)).await
+        prepared.pin(fence).await
     }
 
     #[cfg(test)]
@@ -4820,7 +4780,7 @@ impl DatastoreBackend for Datastore {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         Datastore::list_pod_cleanup_intents_for_node(self, node_name).await
     }
 
@@ -4937,15 +4897,15 @@ impl DatastoreBackend for Datastore {
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
+    ) -> Result<Option<LogApplyAppliedOutboxRow>> {
         Datastore::get_applied_outbox(self, idempotency_key).await
     }
 
-    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+    async fn insert_applied_outbox(&self, record: LogApplyAppliedOutboxRow) -> Result<bool> {
         Datastore::insert_applied_outbox(self, record).await
     }
 
-    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+    async fn list_applied_outbox(&self) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         Datastore::list_applied_outbox(self).await
     }
 
@@ -4953,7 +4913,7 @@ impl DatastoreBackend for Datastore {
         &self,
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
+    ) -> Result<Vec<LogApplyAppliedOutboxRow>> {
         Datastore::list_applied_outbox_paged(self, after_key, limit).await
     }
 

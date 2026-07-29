@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 use super::super::DatastoreHandle;
-use super::super::DurableRecoveryStore;
+use super::super::{BackendLifecycleStore, DurableRecoveryStore};
 use super::types::{NodeId, TypeConfig};
 
 /// Self-describing snapshot envelope. Carries the `last_applied`
@@ -132,8 +132,11 @@ impl RaftSnapshotData {
         membership: &StoredMembership<NodeId, super::types::RaftMemberNode>,
     ) -> Result<Cursor<Vec<u8>>> {
         let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(Default::default()));
+        let recovery = Arc::new(super::super::DatastoreDurableRecoveryPort::new(db.clone()));
+        let lifecycle = Arc::new(super::super::DatastoreBackendLifecyclePort::new(db));
         let (snapshot, _, _) = Self::serialize_from_backend_to_cursor_inner(
-            Arc::new(super::super::DatastoreDurableRecoveryPort::new(db)),
+            recovery,
+            lifecycle,
             RaftSnapshotAppliedStateSource::Fixed {
                 last_applied,
                 membership: membership.clone(),
@@ -146,6 +149,7 @@ impl RaftSnapshotData {
 
     async fn serialize_from_backend_to_cursor_inner(
         recovery: Arc<dyn DurableRecoveryStore>,
+        lifecycle: Arc<dyn BackendLifecycleStore>,
         applied_state_source: RaftSnapshotAppliedStateSource,
         supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<(
@@ -153,28 +157,21 @@ impl RaftSnapshotData {
         Option<LogId<NodeId>>,
         StoredMembership<NodeId, super::types::RaftMemberNode>,
     )> {
-        let anchor = RaftSnapshotCaptureAnchor::new(applied_state_source);
         let request = klights_cluster_store::SnapshotCaptureRequest::try_new(
             klights_cluster_store::SnapshotPageLimit::try_new(
                 klights_cluster_store::MAX_SNAPSHOT_CAPTURE_PAGE,
             )?,
             std::time::Duration::from_secs(300),
         )?;
-        let session = recovery
-            .begin_pinned_snapshot_capture_with_anchor(request, &anchor)
-            .await;
-        let captured = anchor.take();
+        let fence = lifecycle
+            .acquire_snapshot_exclusive_fence()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("backend does not provide a snapshot capture fence"))?;
+        let captured = applied_state_source.load().await?;
+        let session = recovery.begin_pinned_snapshot_capture(request, fence).await;
         let (mut session, captured) = match session {
-            Ok(session) => (
-                session,
-                captured.ok_or_else(|| {
-                    anyhow::anyhow!("snapshot capture omitted applied-state anchor")
-                })?,
-            ),
+            Ok(session) => (session, captured),
             Err(error) => {
-                let Some(captured) = captured else {
-                    return Err(error);
-                };
                 if !is_pristine_raft_state(&captured) || !is_missing_cluster_identity_error(&error)
                 {
                     return Err(error);
@@ -339,33 +336,6 @@ impl RaftSnapshotAppliedStateSource {
             })?
             .unwrap_or_default();
         Ok((last_applied, membership))
-    }
-}
-
-struct RaftSnapshotCaptureAnchor {
-    source: RaftSnapshotAppliedStateSource,
-    captured: std::sync::Mutex<Option<CapturedRaftAppliedState>>,
-}
-
-impl RaftSnapshotCaptureAnchor {
-    fn new(source: RaftSnapshotAppliedStateSource) -> Self {
-        Self {
-            source,
-            captured: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn take(&self) -> Option<CapturedRaftAppliedState> {
-        self.captured.lock().unwrap().take()
-    }
-}
-
-#[async_trait::async_trait]
-impl super::super::backend::SnapshotCaptureAnchor for RaftSnapshotCaptureAnchor {
-    async fn pin_under_snapshot_fence(&self) -> anyhow::Result<()> {
-        let captured = self.source.load().await?;
-        *self.captured.lock().unwrap() = Some(captured);
-        Ok(())
     }
 }
 
@@ -617,6 +587,7 @@ fn snapshot_write_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
 #[derive(Clone)]
 pub struct SqliteRaftSnapshotBuilder {
     pub(crate) recovery: Arc<dyn DurableRecoveryStore>,
+    pub(crate) lifecycle: Arc<dyn BackendLifecycleStore>,
     pub(crate) applied_state: Arc<dyn RaftAppliedStateDurability>,
     pub(crate) supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
@@ -628,6 +599,7 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
         let (snapshot, last_applied, membership) =
             RaftSnapshotData::serialize_from_backend_to_cursor_inner(
                 self.recovery.clone(),
+                self.lifecycle.clone(),
                 RaftSnapshotAppliedStateSource::Durable(self.applied_state.clone()),
                 self.supervisor.clone(),
             )
@@ -784,8 +756,14 @@ mod tests {
             let reached = reached.clone();
             let resume = resume.clone();
             async move {
+                let recovery = Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(
+                    handle.clone(),
+                ));
+                let lifecycle =
+                    Arc::new(crate::datastore::DatastoreBackendLifecyclePort::new(handle));
                 RaftSnapshotData::serialize_from_backend_to_cursor_inner(
-                    Arc::new(crate::datastore::DatastoreDurableRecoveryPort::new(handle)),
+                    recovery,
+                    lifecycle,
                     RaftSnapshotAppliedStateSource::Durable(Arc::new(BlockingAppliedState {
                         reached,
                         resume,

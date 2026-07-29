@@ -9,7 +9,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::bootstrap::sequenced_datastore::DatastoreApplier;
-use crate::datastore::backend::DatastoreBackend;
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_types::HostPortRange;
 use klights_types::NodePeerMode;
@@ -66,14 +65,17 @@ impl DatastoreApplier for RedbDatastore {
                 name,
                 preconditions,
             } => {
-                self.delete_resource_with_preconditions(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
-                    preconditions,
-                )
-                .await?;
+                let committed = self
+                    .resources
+                    .delete_res_with_preconditions(
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        preconditions,
+                    )
+                    .await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::DeleteResourceWithTombstone {
                 api_version,
@@ -83,15 +85,18 @@ impl DatastoreApplier for RedbDatastore {
                 preconditions,
                 grace_seconds,
             } => {
-                self.delete_resource_without_watch_with_tombstone(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
-                    preconditions,
-                    grace_seconds,
-                )
-                .await?;
+                let committed = self
+                    .resources
+                    .delete_res_with_tombstone(
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        preconditions,
+                        grace_seconds,
+                    )
+                    .await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::PatchResource {
                 api_version,
@@ -103,19 +108,22 @@ impl DatastoreApplier for RedbDatastore {
                 preconditions,
                 strict_resource_version,
             } => {
-                self.patch_resource_latest_with_preconditions(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
-                    crate::datastore::ResourcePatchRequest {
-                        patch_kind,
-                        patch,
-                        preconditions,
-                        strict_resource_version,
-                    },
-                )
-                .await?;
+                let committed = self
+                    .resources
+                    .patch_with_preconditions(
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        klights_cluster_core::ResourcePatchRequest {
+                            patch_kind,
+                            patch,
+                            preconditions,
+                            strict_resource_version,
+                        },
+                    )
+                    .await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::UpdateStatus {
                 api_version,
@@ -132,7 +140,8 @@ impl DatastoreApplier for RedbDatastore {
                     && api_version == "v1"
                     && kind == "Pod"
                     && let Some(current) = self
-                        .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                        .resources
+                        .get_res(&api_version, &kind, namespace.as_deref(), &name)
                         .await?
                 {
                     klights_cluster_core::merge_status_for_apply(
@@ -148,15 +157,18 @@ impl DatastoreApplier for RedbDatastore {
                 if preconditions.resource_version.is_none() {
                     preconditions.resource_version = expected_rv;
                 }
-                self.update_status_only_with_preconditions(
-                    &api_version,
-                    &kind,
-                    namespace.as_deref(),
-                    &name,
-                    status,
-                    preconditions,
-                )
-                .await?;
+                let committed = self
+                    .resources
+                    .update_status_only_with_preconditions_impl(
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        status,
+                        preconditions,
+                    )
+                    .await?;
+                self.finish_post_commit(committed);
             }
             StorageCommand::CreateNamespace { name, data } => {
                 let committed = self.namespaces.create_ns(&name, data).await?;

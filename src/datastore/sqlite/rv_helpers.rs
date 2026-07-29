@@ -1,65 +1,25 @@
 use super::Datastore;
-use super::queries;
+use super::transaction_primitives;
 
 impl Datastore {
-    pub(super) fn watch_event_allocator_high_water_in_conn(
-        conn: &rusqlite::Connection,
-    ) -> rusqlite::Result<i64> {
-        conn.query_row(
-            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'watch_events'), 0)",
-            [],
-            |row| row.get(0),
-        )
-    }
-
-    /// Set the watch allocator to an authoritative snapshot boundary.
-    /// Unlike the upgrade helper above, replacement must be allowed to move a
-    /// divergent follower's local sequence back to the leader's exact value.
-    pub(super) fn set_watch_event_allocator_in_conn(
-        conn: &rusqlite::Connection,
-        high_water: i64,
-    ) -> rusqlite::Result<()> {
-        let updated = conn.execute(
-            "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'watch_events'",
-            rusqlite::params![high_water],
-        )?;
-        if updated == 0 {
-            conn.execute(
-                "INSERT INTO sqlite_sequence(name, seq) VALUES ('watch_events', ?1)",
-                rusqlite::params![high_water],
-            )?;
-        }
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub(super) fn next_resource_version_in_conn(
         conn: &rusqlite::Connection,
     ) -> rusqlite::Result<i64> {
-        conn.execute(queries::METADATA_INCREMENT_RV, [])?;
-        conn.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))
-    }
-
-    pub(super) fn next_resource_version_in_tx(
-        tx: &rusqlite::Transaction<'_>,
-    ) -> rusqlite::Result<i64> {
-        tx.execute(queries::METADATA_INCREMENT_RV, [])?;
-        tx.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))
+        transaction_primitives::next_resource_version_in_tx(conn)
     }
 
     pub(super) fn current_resource_version_in_tx(
         tx: &rusqlite::Transaction<'_>,
     ) -> rusqlite::Result<i64> {
-        tx.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))
+        transaction_primitives::current_resource_version(tx)
     }
 
     pub(super) fn advance_resource_version_after_in_conn(
         conn: &rusqlite::Connection,
         min_rv: i64,
     ) -> rusqlite::Result<i64> {
-        let current: i64 = conn.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))?;
-        let next = current.saturating_add(1).max(min_rv.saturating_add(1));
-        conn.execute(queries::METADATA_SET_RV, [next.to_string()])?;
-        Ok(next)
+        transaction_primitives::advance_resource_version_after(conn, min_rv)
     }
 
     /// Normalize namespace for SQLite storage: None (cluster-scoped) → "" to allow UNIQUE constraint

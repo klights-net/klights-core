@@ -1,14 +1,10 @@
 //! Resource create — public Kubernetes create path with metadata injection,
 //! ServiceAccount volume injection, and UID precondition warning helper.
 
-use super::super::owner_ref_index;
-use super::super::queries;
-use super::helpers::*;
+use super::super::ordinary;
 use super::*;
-use klights_cluster_datastore::sqlite::selector_index;
-use rusqlite::TransactionBehavior;
 
-use crate::datastore::sqlite::create_staged_post_commit;
+use super::super::create_staged_post_commit;
 
 impl Datastore {
     pub(super) async fn warn_uid_precondition_mismatch_if_live(
@@ -91,54 +87,23 @@ impl Datastore {
         let k = kind.to_string();
         let n = name.to_string();
 
-        let result = if use_namespaced_table(api_version, kind, &namespace) {
-            // Namespaced resource - namespace defaults to "default" if None
-            let ns = namespace.unwrap_or("default").to_string();
-            let uid = uid.clone();
-            self.db_call("db_query", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let rv = Self::next_resource_version_in_tx(&tx)?;
-                // created_rv = rv: records the INSERT rv so watch catch-up can
-                // distinguish ADDED (created after watch rv) from MODIFIED.
-                tx.execute(
-                    queries::NAMESPACED_INSERT,
-                    rusqlite::params![&av, &k, &ns, &n, &uid, rv, &data_bytes],
-                )?;
-                selector_index::upsert_index_entries(&tx, &av, &k, &ns, &n, &data_bytes)?;
-                owner_ref_index::upsert_owner_refs(&tx, &av, &k, &ns, &n, &data_bytes)?;
-                insert_watch_event_in_conn(
-                    &tx,
-                    WatchEventInsert::new(&av, &k, Some(&ns), &n, rv, "ADDED", &data_bytes),
-                )?;
-                let rowid = tx.last_insert_rowid();
-                tx.commit()?;
-                Ok((rowid, rv))
+        let namespace_for_db = namespace.map(str::to_string);
+        let uid_for_insert = uid.clone();
+        let result = self
+            .db_call("db_query", move |conn| {
+                ordinary::create_resource_in_conn(
+                    conn,
+                    ordinary::CreateResourceInput {
+                        api_version: av,
+                        kind: k,
+                        namespace: namespace_for_db,
+                        name: n,
+                        uid: uid_for_insert,
+                        data: data_bytes,
+                    },
+                )
             })
-            .await
-        } else {
-            // Cluster-scoped resource - no namespace column
-            let uid = uid.clone();
-            self.db_call("db_query", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let rv = Self::next_resource_version_in_tx(&tx)?;
-                // created_rv = rv: records the INSERT rv so watch catch-up can
-                // distinguish ADDED (created after watch rv) from MODIFIED.
-                tx.execute(
-                    queries::CLUSTER_INSERT,
-                    rusqlite::params![&av, &k, &n, &uid, rv, &data_bytes],
-                )?;
-                selector_index::upsert_index_entries(&tx, &av, &k, "", &n, &data_bytes)?;
-                owner_ref_index::upsert_owner_refs(&tx, &av, &k, "", &n, &data_bytes)?;
-                insert_watch_event_in_conn(
-                    &tx,
-                    WatchEventInsert::new(&av, &k, None, &n, rv, "ADDED", &data_bytes),
-                )?;
-                let rowid = tx.last_insert_rowid();
-                tx.commit()?;
-                Ok((rowid, rv))
-            })
-            .await
-        };
+            .await;
 
         match result {
             Ok((id, rv)) => {

@@ -1,7 +1,7 @@
 use super::super::queries;
 use klights_cluster_core::LogApplyAppliedOutboxRow;
 
-pub(in crate::datastore::sqlite) struct OutboxLedgerStateApplier<'tx, 'conn> {
+pub(super) struct OutboxLedgerStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
@@ -10,7 +10,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
         Self { tx }
     }
 
-    pub(in crate::datastore::sqlite) fn put_applied_outbox(
+    pub(super) fn put_applied_outbox(
         &self,
         row: LogApplyAppliedOutboxRow,
     ) -> tokio_rusqlite::Result<()> {
@@ -29,7 +29,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn delete_applied_outbox(
+    pub(super) fn delete_applied_outbox(
         &self,
         idempotency_key: String,
     ) -> tokio_rusqlite::Result<()> {
@@ -40,10 +40,7 @@ impl<'tx, 'conn> OutboxLedgerStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn gc_applied_outbox(
-        &self,
-        cutoff_ms: i64,
-    ) -> tokio_rusqlite::Result<()> {
+    pub(super) fn gc_applied_outbox(&self, cutoff_ms: i64) -> tokio_rusqlite::Result<()> {
         self.tx.execute(
             queries::APPLIED_OUTBOX_DELETE_EXPIRED,
             rusqlite::params![cutoff_ms],

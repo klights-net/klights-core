@@ -34,8 +34,10 @@ use super::types::{
     NodeId, RaftMemberLogId, RaftMemberNode, RaftShape, StorageCommandPayload, TypeConfig,
 };
 
-pub(crate) const KEY_COMMAND_CODEC_ACTIVATION_VERSION: &str = "command_codec_activation_version";
-pub(crate) const COMMAND_CODEC_ACTIVATION_VALUE: &str = "3";
+pub(crate) use klights_cluster_store::{
+    COMMAND_CODEC_ACTIVATION_VERSION_META_KEY as KEY_COMMAND_CODEC_ACTIVATION_VERSION,
+    COMMAND_CODEC_V3_ACTIVATION_VALUE as COMMAND_CODEC_ACTIVATION_VALUE,
+};
 const RAFT_MEMBER_ADMISSION_META_PREFIX: &str = "raft_member_admission/";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

@@ -712,8 +712,8 @@ mod parity_tests {
     //! `LogApplyMutation` without a matching sample below, because the
     //! exhaustive `match` on `variant_name` will not compile.
     use super::*;
-    use crate::datastore::AppliedOutboxRecord;
     use klights_cluster_core::ClusterMutation;
+    use klights_cluster_core::LogApplyAppliedOutboxRow;
     use serde_json::json;
 
     fn sample(name: &'static str) -> (String, LogApplyMutation) {
@@ -1111,7 +1111,7 @@ mod parity_tests {
 
     #[test]
     fn snapshot_roundtrip_preserves_applied_outbox_status_stamp() {
-        let record = AppliedOutboxRecord {
+        let record = LogApplyAppliedOutboxRow {
             idempotency_key: "status-key".to_string(),
             subject_key: "v1:Pod:default:web:uid-1".to_string(),
             operation: "PodStatus".to_string(),
@@ -1124,7 +1124,7 @@ mod parity_tests {
         let row: LogApplyAppliedOutboxRow = record.into();
         assert_eq!(row.status_stamp, Some(99));
 
-        let restored: AppliedOutboxRecord = row.into();
+        let restored: LogApplyAppliedOutboxRow = row.into();
         assert_eq!(restored.status_stamp, Some(99));
     }
 

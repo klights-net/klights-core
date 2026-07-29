@@ -1,7 +1,7 @@
 use super::super::queries;
 use klights_cluster_core::{LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow};
 
-pub(in crate::datastore::sqlite) struct PodCleanupStateApplier<'tx, 'conn> {
+pub(super) struct PodCleanupStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
@@ -10,7 +10,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
         Self { tx }
     }
 
-    pub(in crate::datastore::sqlite) fn put_pod_cleanup_intent(
+    pub(super) fn put_pod_cleanup_intent(
         &self,
         row: LogApplyPodCleanupIntentRow,
     ) -> tokio_rusqlite::Result<()> {
@@ -32,7 +32,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn delete_pod_cleanup_intent(
+    pub(super) fn delete_pod_cleanup_intent(
         &self,
         key: LogApplyPodCleanupIntentKey,
     ) -> tokio_rusqlite::Result<()> {
@@ -49,7 +49,7 @@ impl<'tx, 'conn> PodCleanupStateApplier<'tx, 'conn> {
         Ok(())
     }
 
-    pub(in crate::datastore::sqlite) fn delete_pod_cleanup_intents_for_node(
+    pub(super) fn delete_pod_cleanup_intents_for_node(
         &self,
         node_name: String,
     ) -> tokio_rusqlite::Result<()> {

@@ -5,10 +5,10 @@
 //! normalized payload so raft members cannot diverge by recomputing local state
 //! while applying the same committed entry.
 
-use super::super::cluster_replace::{ApplyConflictCode, apply_conflict_error, other_error};
 use super::super::crud::helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
+use super::super::{ApplyConflictCode, apply_conflict_error, other_error};
 use super::super::{create_staged_post_commit, owner_ref_index, queries};
 use klights_cluster_core::PatchKind;
 use klights_cluster_core::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
@@ -16,7 +16,7 @@ use klights_cluster_datastore::sqlite::selector_index;
 use klights_cluster_store::StagedPostCommit;
 use rusqlite::OptionalExtension;
 
-pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {
+pub(super) struct ClusterStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
@@ -176,11 +176,11 @@ impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
 }
 
 impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
-    pub(in crate::datastore::sqlite) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
+    pub(super) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
         Self { tx }
     }
 
-    pub(in crate::datastore::sqlite) fn apply_put_resource(
+    pub(super) fn apply_put_resource(
         &self,
         mut row: LogApplyResourceRow,
         emit_watch_events: bool,
@@ -234,7 +234,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         )
     }
 
-    pub(in crate::datastore::sqlite) fn apply_patch_resource_latest(
+    pub(super) fn apply_patch_resource_latest(
         &self,
         patch: LogApplyResourcePatch,
         emit_watch_events: bool,
@@ -284,7 +284,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         )
     }
 
-    pub(in crate::datastore::sqlite) fn apply_delete_resource(
+    pub(super) fn apply_delete_resource(
         &self,
         resource_version: i64,
         key: LogApplyResourceKey,
@@ -497,28 +497,25 @@ fn apply_latest_patch_to_current_resource(
             .to_string();
         klights_types::mark_terminating_pod_unready_at(&mut patched, &transition_time);
     }
-    crate::datastore::sqlite::resource_shape::validate_metadata_uid_immutable(&patched, &current)
-        .map_err(|err| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            err.to_string(),
-        )))
-    })?;
-    crate::datastore::sqlite::resource_shape::ensure_metadata_identity(
-        &mut patched,
-        namespace,
-        &patch.name,
-    );
-    crate::datastore::sqlite::resource_shape::preserve_server_metadata_fields_from_existing(
+    super::super::resource_shape::validate_metadata_uid_immutable(&patched, &current).map_err(
+        |err| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )))
+        },
+    )?;
+    super::super::resource_shape::ensure_metadata_identity(&mut patched, namespace, &patch.name);
+    super::super::resource_shape::preserve_server_metadata_fields_from_existing(
         &mut patched,
         &current,
     );
-    crate::datastore::sqlite::resource_shape::ensure_resource_type_meta(
+    super::super::resource_shape::ensure_resource_type_meta(
         &mut patched,
         &patch.api_version,
         &patch.kind,
     );
-    if crate::datastore::sqlite::resource_shape::metadata_uid(&patched).is_none()
+    if super::super::resource_shape::metadata_uid(&patched).is_none()
         && let Some(metadata) = patched
             .get_mut("metadata")
             .and_then(serde_json::Value::as_object_mut)
@@ -528,7 +525,7 @@ fn apply_latest_patch_to_current_resource(
             serde_json::Value::String(current_uid.to_string()),
         );
     }
-    patched = crate::datastore::sqlite::resource_shape::hydrate_watch_event_data(
+    patched = super::super::resource_shape::hydrate_watch_event_data(
         patched,
         &patch.api_version,
         &patch.kind,
@@ -536,7 +533,7 @@ fn apply_latest_patch_to_current_resource(
         &patch.name,
         patch.resource_version,
     );
-    crate::datastore::sqlite::resource_shape::ensure_pod_status_ip_arrays(
+    super::super::resource_shape::ensure_pod_status_ip_arrays(
         &mut patched,
         &patch.api_version,
         &patch.kind,
@@ -584,7 +581,7 @@ fn merge_status_only_row_with_existing(
         ));
     };
     live_obj.insert("status".to_string(), status);
-    live = crate::datastore::sqlite::resource_shape::hydrate_watch_event_data(
+    live = super::super::resource_shape::hydrate_watch_event_data(
         live,
         &row.api_version,
         &row.kind,
@@ -592,7 +589,7 @@ fn merge_status_only_row_with_existing(
         &row.name,
         row.resource_version,
     );
-    crate::datastore::sqlite::resource_shape::ensure_pod_status_ip_arrays(
+    super::super::resource_shape::ensure_pod_status_ip_arrays(
         &mut live,
         &row.api_version,
         &row.kind,
@@ -629,8 +626,7 @@ fn preserve_newer_same_uid_row_on_stale_committed_put(
     } else {
         Some(row.uid.as_str())
     };
-    let incoming_uid =
-        crate::datastore::sqlite::resource_shape::metadata_uid(&row.data).or(fallback_uid);
+    let incoming_uid = super::super::resource_shape::metadata_uid(&row.data).or(fallback_uid);
     if incoming_uid != Some(current_uid.as_str()) {
         return Ok(());
     }
@@ -658,7 +654,7 @@ fn preserve_newer_same_uid_row_on_stale_committed_put(
         return Ok(());
     }
 
-    existing_data = crate::datastore::sqlite::resource_shape::hydrate_watch_event_data(
+    existing_data = super::super::resource_shape::hydrate_watch_event_data(
         existing_data,
         &row.api_version,
         &row.kind,
@@ -666,7 +662,7 @@ fn preserve_newer_same_uid_row_on_stale_committed_put(
         &row.name,
         row.resource_version,
     );
-    crate::datastore::sqlite::resource_shape::ensure_pod_status_ip_arrays(
+    super::super::resource_shape::ensure_pod_status_ip_arrays(
         &mut existing_data,
         &row.api_version,
         &row.kind,
@@ -693,15 +689,14 @@ fn preserve_same_uid_server_metadata_from_existing(
     } else {
         Some(row.uid.as_str())
     };
-    let incoming_uid =
-        crate::datastore::sqlite::resource_shape::metadata_uid(&row.data).or(fallback_uid);
+    let incoming_uid = super::super::resource_shape::metadata_uid(&row.data).or(fallback_uid);
     if incoming_uid != Some(current_uid.as_str()) {
         return Ok(());
     }
 
     let existing_data: serde_json::Value =
         serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
-    crate::datastore::sqlite::resource_shape::preserve_server_metadata_fields_from_existing(
+    super::super::resource_shape::preserve_server_metadata_fields_from_existing(
         &mut row.data,
         &existing_data,
     );

@@ -3743,7 +3743,7 @@ async fn raft_outbox_build_rejects_incomplete_durable_ledger_row() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "fresh-raft-placeholder-key".to_string(),
         subject_key: String::new(),
         operation: "PodMetadata".to_string(),
@@ -8846,7 +8846,7 @@ async fn list_applied_outbox_paged_matches_full_list_across_batch_boundaries() {
         .unwrap()
         .as_millis() as i64;
     for i in 0..7u16 {
-        db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: format!("key-{i:03}"),
             subject_key: format!("subj-{i}"),
             operation: "PodMetadata".to_string(),
@@ -8862,7 +8862,7 @@ async fn list_applied_outbox_paged_matches_full_list_across_batch_boundaries() {
     let full = db.list_applied_outbox().await.unwrap();
     assert_eq!(full.len(), 7);
 
-    let mut paged: Vec<crate::datastore::AppliedOutboxRecord> = Vec::new();
+    let mut paged: Vec<klights_cluster_core::LogApplyAppliedOutboxRow> = Vec::new();
     let mut after_key: Option<String> = None;
     let page_size = std::num::NonZeroUsize::new(3).unwrap();
     loop {

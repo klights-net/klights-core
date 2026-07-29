@@ -682,7 +682,7 @@ async fn outbox_apply_rejects_incomplete_ledger_row_without_age_based_recovery()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "stale-placeholder-key".to_string(),
         subject_key: String::new(),
         operation: "PodStatus".to_string(),
@@ -747,7 +747,7 @@ async fn outbox_apply_rejects_fresh_incomplete_ledger_row_without_consuming_it()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "fresh-placeholder-key".to_string(),
         subject_key: String::new(),
         operation: "PodStatus".to_string(),
@@ -862,7 +862,7 @@ async fn applied_outbox_gc_prunes_ttl_expired() {
         .as_millis() as i64;
     let old_ms = now_ms - 13 * 60 * 60 * 1000;
 
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "old-key".to_string(),
         subject_key: "v1/Pod/default/web/uid-1".to_string(),
         operation: "PodStatus".to_string(),
@@ -875,7 +875,7 @@ async fn applied_outbox_gc_prunes_ttl_expired() {
     .expect("insert old record");
 
     let recent_ms = now_ms - 3_600_000;
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "recent-key".to_string(),
         subject_key: "v1/Pod/default/web/uid-1".to_string(),
         operation: "PodStatus".to_string(),
@@ -912,7 +912,7 @@ async fn applied_outbox_gc_does_not_touch_recent() {
         .as_millis() as i64;
 
     for i in 0..10 {
-        db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
             idempotency_key: format!("recent-{}", i),
             subject_key: format!("v1/Pod/default/web-{}/uid-{}", i, i),
             operation: "PodStatus".to_string(),
@@ -952,7 +952,7 @@ async fn applied_outbox_gc_prunes_event_create_and_unknown_operations() {
         .as_millis() as i64;
     let old_ms = now_ms - 13 * 60 * 60 * 1000;
 
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "event-key".to_string(),
         subject_key: "events.k8s.io/v1/Event/default/web.1/uid-event".to_string(),
         operation: "EventCreate".to_string(),
@@ -963,7 +963,7 @@ async fn applied_outbox_gc_prunes_event_create_and_unknown_operations() {
     })
     .await
     .expect("insert event record");
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "future-key".to_string(),
         subject_key: "example.io/v1/Future/default/name/uid-future".to_string(),
         operation: "FutureOperation".to_string(),
@@ -1035,7 +1035,7 @@ async fn idempotency_survives_gc_replay() {
 
     // Insert an applied_outbox record with an OLD timestamp directly.
     let old_ms = now_ms - 100 * 86_400_000i64; // 100 days ago
-    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+    db.insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
         idempotency_key: "gc-replay-key".to_string(),
         subject_key: "v1/Pod/default/web/uid-gc".to_string(),
         operation: "PodStatus".to_string(),

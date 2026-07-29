@@ -25,12 +25,11 @@ use anyhow::Result;
 use klights_cluster_core::Resource;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::types::PodCleanupIntent;
 use klights_cluster_core::{
     ClusterMutation, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
-    LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
-    NamespaceMutation, NetworkMutation, PodCleanupMutation, ResourceMutation,
-    SnapshotRestoreOperation, WatchHistoryMutation,
+    LogApplyNodeSubnetRow, LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourceRow,
+    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, PodCleanupMutation,
+    ResourceMutation, SnapshotRestoreOperation, WatchHistoryMutation,
 };
 
 /// memory-improvement.md §10 P1: page size for keyset-paginated reads inside
@@ -261,7 +260,7 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
                 sink.push(SnapshotRestoreOperation::new(
                     current_rv,
                     None,
-                    vec![LogApplyMutation::PutAppliedOutbox(row.into())],
+                    vec![LogApplyMutation::PutAppliedOutbox(row)],
                 ))
                 .await?;
             }
@@ -408,7 +407,7 @@ fn live_resource_order(resource: &Resource) -> u8 {
 }
 
 pub(crate) fn resource_restore_operation(resource: &Resource) -> SnapshotRestoreOperation {
-    snapshot_commit_from_family(resource.resource_version, live_resource_mutation(resource))
+    klights_cluster_core::resource_snapshot_restore_operation(resource)
 }
 
 fn snapshot_operation(
@@ -527,9 +526,9 @@ fn cluster_network_mutation_from_dataplane(
 }
 
 pub(crate) fn cluster_pod_cleanup_mutation_from_intent(
-    intent: PodCleanupIntent,
+    intent: LogApplyPodCleanupIntentRow,
 ) -> ClusterMutation {
-    ClusterMutation::PodCleanup(PodCleanupMutation::PutPodCleanupIntent(intent.into()))
+    ClusterMutation::PodCleanup(PodCleanupMutation::PutPodCleanupIntent(intent))
 }
 
 #[cfg(test)]
@@ -965,7 +964,7 @@ mod tests {
             .unwrap();
         assert!(leader.get_current_resource_version().await.unwrap() > 0);
         leader
-            .insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+            .insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
                 idempotency_key: "legacy-snapshot-key".to_string(),
                 subject_key: "legacy-subject".to_string(),
                 operation: "PodStatus".to_string(),
@@ -1637,7 +1636,7 @@ mod tests {
                 .as_millis() as i64;
             for i in 0..n_outbox {
                 leader
-                    .insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+                    .insert_applied_outbox(klights_cluster_core::LogApplyAppliedOutboxRow {
                         idempotency_key: format!("key-{case}-{i:05}"),
                         subject_key: format!("subj-{case}-{i}"),
                         operation: "PodMetadata".to_string(),

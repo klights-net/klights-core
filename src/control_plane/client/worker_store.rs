@@ -13,13 +13,14 @@ use crate::control_plane::client::{
     legacy_dataplane, legacy_list_response, legacy_node_subnet, legacy_watch_event,
 };
 use crate::datastore::{
-    CatchUpResource, ListPageRequest, PodCleanupIntent, PositionedWatchEvent,
-    PositionedWatchReplay, PositionedWatchReplayRead, Resource, ResourceList,
-    ResourcePreconditions, WatchReplayPosition, WatchStore, WatchTarget, WatchTargetScope,
+    CatchUpResource, ListPageRequest, PositionedWatchEvent, PositionedWatchReplay,
+    PositionedWatchReplayRead, Resource, ResourceList, ResourcePreconditions, WatchReplayPosition,
+    WatchStore, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::watch::{EventType, WatchBus, WatchEvent};
+use klights_cluster_core::LogApplyPodCleanupIntentRow;
 #[cfg(test)]
 use klights_cluster_core::command::{CommandMeta, StorageCommand};
 use klights_cluster_store::{ReplayAvailability, ReplayRetentionBoundary};
@@ -34,11 +35,13 @@ use klights_watch::{WatchSignal, WatchTopic};
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
 
-fn legacy_pod_cleanup_intent(intent: klights_leader_api::PodCleanupIntent) -> PodCleanupIntent {
+fn legacy_pod_cleanup_intent(
+    intent: klights_leader_api::PodCleanupIntent,
+) -> LogApplyPodCleanupIntentRow {
     let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
         intent.into_parts();
     let pod_data = Arc::try_unwrap(pod.data).unwrap_or_else(|shared| (*shared).clone());
-    PodCleanupIntent {
+    LogApplyPodCleanupIntentRow {
         node_name,
         namespace,
         pod_name,
@@ -1512,7 +1515,7 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+    ) -> Result<Vec<LogApplyPodCleanupIntentRow>> {
         self.cleanup_intents
             .list_pod_cleanup_intents(
                 PodCleanupIntentListRequest::try_new(node_name).map_err(anyhow::Error::new)?,
