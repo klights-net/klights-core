@@ -82,45 +82,82 @@ async fn resource_command_result_or_current(
     let query_current = expects_resource
         && !result.public_resource_changed
         && result.error_message.is_none()
-        && result.applied_mutation.is_none()
-        && matches!(command, StorageCommand::UpdateStatus { .. });
+        && result.applied_mutation.is_none();
     if query_current {
-        let StorageCommand::UpdateStatus {
-            api_version,
-            kind,
-            namespace,
-            name,
-            ..
-        } = command
-        else {
-            unreachable!("query_current is restricted to UpdateStatus")
-        };
-        let request = ResourceGetRequest::try_new(
-            ResourceKey::new(
-                api_version.clone(),
-                kind.clone(),
-                namespace.clone(),
-                name.clone(),
-            ),
-            ResourceQueryConsistency::LeaderFresh,
-        )
-        .map_err(|error| ResourceCommandError::corrupt_response(error.to_string()))?;
+        let key = resource_command_key(command).ok_or_else(|| {
+            ResourceCommandError::corrupt_response(format!(
+                "resource-returning {} command has no singular resource identity",
+                command.variant_name()
+            ))
+        })?;
+        let request = ResourceGetRequest::try_new(key, ResourceQueryConsistency::LeaderFresh)
+            .map_err(|error| ResourceCommandError::corrupt_response(error.to_string()))?;
         return resource_query
             .get_resource(request)
             .await
             .map_err(|error| {
                 ResourceCommandError::retryable(format!(
-                    "read current resource after no-op status commit: {error}"
+                    "read current resource after no-op resource commit: {error}"
                 ))
             })?
             .map(ResourceCommandResult::Resource)
             .ok_or_else(|| {
                 ResourceCommandError::corrupt_response(
-                    "no-op status commit target disappeared before current-resource delivery",
+                    "no-op resource commit target disappeared before current-resource delivery",
                 )
             });
     }
     resource_command_result(result, expects_resource)
+}
+
+fn resource_command_key(command: &StorageCommand) -> Option<ResourceKey> {
+    match command {
+        StorageCommand::CreateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        }
+        | StorageCommand::UpdateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        }
+        | StorageCommand::PatchResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        }
+        | StorageCommand::UpdateStatus {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        }
+        | StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } => Some(ResourceKey::new(
+            api_version.clone(),
+            kind.clone(),
+            namespace.clone(),
+            name.clone(),
+        )),
+        StorageCommand::CreateNamespace { name, .. }
+        | StorageCommand::UpdateNamespace { name, .. } => {
+            Some(ResourceKey::new("v1", "Namespace", None, name.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn resource_command_submission_error(error: anyhow::Error) -> ResourceCommandError {
@@ -835,6 +872,71 @@ mod tests {
         let result = service
             .submit_resource_command(
                 ResourceCommandRequest::try_new(command).expect("valid no-op status command"),
+            )
+            .await;
+        assert_eq!(result, Ok(ResourceCommandResult::Resource(current)));
+        assert_eq!(query.gets.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn noop_status_patch_returns_current_resource_from_focused_query() {
+        let current = sample_resource();
+        let query = Arc::new(FixedResourceQuery {
+            resource: current.clone(),
+            gets: AtomicUsize::new(0),
+        });
+        let command = StorageCommand::PatchResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            patch_kind: PatchKind::Merge,
+            patch: serde_json::json!({"status": {}}),
+            preconditions: ResourcePreconditions::from_resource(&current),
+            strict_resource_version: false,
+        };
+        let service = EmbeddedLeaderResourceCommand::new(
+            Arc::new(FixedProposal {
+                result: command_result(Some(current.resource_version), None, None, None),
+            }),
+            query.clone(),
+            tokio::sync::watch::channel(true).1,
+        );
+        let result = service
+            .submit_resource_command(
+                ResourceCommandRequest::try_new(command).expect("valid no-op status patch"),
+            )
+            .await;
+        assert_eq!(result, Ok(ResourceCommandResult::Resource(current)));
+        assert_eq!(query.gets.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn noop_graceful_delete_returns_current_resource_from_focused_query() {
+        let current = sample_resource();
+        let query = Arc::new(FixedResourceQuery {
+            resource: current.clone(),
+            gets: AtomicUsize::new(0),
+        });
+        let command = StorageCommand::DeleteResourceWithTombstone {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            preconditions: ResourcePreconditions::from_resource(&current),
+            grace_seconds: 30,
+        };
+        let service = EmbeddedLeaderResourceCommand::new(
+            Arc::new(FixedProposal {
+                result: command_result(Some(current.resource_version), None, None, None),
+            }),
+            query.clone(),
+            tokio::sync::watch::channel(true).1,
+        );
+        let result = service
+            .submit_resource_command(
+                ResourceCommandRequest::try_new(command)
+                    .expect("valid no-op graceful delete command"),
             )
             .await;
         assert_eq!(result, Ok(ResourceCommandResult::Resource(current)));
