@@ -4242,8 +4242,8 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
         .unwrap();
     let app = crate::api::build_router(state);
 
-    let token =
-        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
+    let token = crate::api::test_support::generate_sa_token_with_bound_pod(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
@@ -4253,8 +4253,9 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
                 sa_uid: Some(sa_uid),
                 ..klights_auth::BoundServiceAccountToken::default()
             },
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
 
     let req_body = json!({
         "apiVersion": "authentication.k8s.io/v1",
@@ -4352,8 +4353,8 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
         "successful TokenReview JSON and protobuf objects must be identical"
     );
 
-    let other_audience_token =
-        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
+    let other_audience_token = crate::api::test_support::generate_sa_token_with_bound_pod(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
@@ -4363,8 +4364,9 @@ async fn test_tokenreview_create_validates_serviceaccount_jwt() {
                 sa_uid: Some(sa_uid),
                 ..klights_auth::BoundServiceAccountToken::default()
             },
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let response = app
         .oneshot(
             Request::builder()
@@ -4607,8 +4609,8 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
 
     let app = crate::api::build_router(state);
 
-    let token =
-        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
+    let token = crate::api::test_support::generate_sa_token_with_bound_pod(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
@@ -4620,8 +4622,9 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
                 sa_uid: Some(sa_uid),
                 ..klights_auth::BoundServiceAccountToken::default()
             },
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
 
     let req_body = json!({
         "apiVersion": "authentication.k8s.io/v1",
@@ -5391,8 +5394,8 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
 
     let app = crate::api::build_router(state);
 
-    let token =
-        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
+    let token = crate::api::test_support::generate_sa_token_with_bound_pod(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
@@ -5406,8 +5409,9 @@ async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
                 sa_uid: Some(sa_uid),
                 ..klights_auth::BoundServiceAccountToken::default()
             },
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
 
     let req_body = json!({
         "apiVersion": "authentication.k8s.io/v1",
@@ -5500,8 +5504,8 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
         .unwrap();
     let app = crate::api::build_router(state);
 
-    let token =
-        crate::auth::generate_sa_token_with_bound_pod(klights_auth::ServiceAccountTokenRequest {
+    let token = crate::api::test_support::generate_sa_token_with_bound_pod(
+        klights_auth::ServiceAccountTokenRequest {
             ca_key_pem: &ca_key_pem,
             service_account: "default",
             namespace: "kube-system",
@@ -5513,8 +5517,9 @@ async fn test_tokenreview_rejects_token_bound_to_deleted_pod() {
                 sa_uid: Some(sa_uid),
                 ..klights_auth::BoundServiceAccountToken::default()
             },
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
 
     let req_body = json!({
         "apiVersion": "authentication.k8s.io/v1",

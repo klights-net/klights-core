@@ -11,11 +11,11 @@ use klights_auth::{AuthenticationError, ImpersonationError};
 use klights_types::TlsClientCertificate;
 
 use super::{ApiState, AppError};
-use crate::auth::middleware::{
+use klights_auth::AuthenticatedIdentity;
+use klights_auth::authentication::{
     AuthnRuntime, authenticate_forwarded_client_cert, authenticate_parts,
     client_cert_is_trusted_proxy, resolve_request_identity,
 };
-use klights_auth::AuthenticatedIdentity;
 use klights_auth::clock::SnapshotClock;
 use klights_auth::cluster_identity::{BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider};
 use klights_auth::impersonation::ImpersonationRequest;
@@ -121,7 +121,7 @@ async fn validate_sa_token_bindings(
     state: &ApiState,
     claims: &klights_auth::SaTokenClaims,
 ) -> Result<(), AppError> {
-    crate::auth::validate_sa_token_bindings(&ApiAuthResources { state }, claims)
+    klights_auth::authentication::validate_sa_token_bindings(&ApiAuthResources { state }, claims)
         .await
         .map_err(AppError::from)
 }
@@ -130,7 +130,7 @@ pub(in crate::api) async fn authenticate_token_for_review(
     state: &ApiState,
     token: &str,
     audiences: &[String],
-) -> Result<crate::auth::middleware::ReviewedTokenIdentity, AuthenticationError> {
+) -> Result<klights_auth::authentication::ReviewedTokenIdentity, AuthenticationError> {
     let resources = ApiAuthResources { state };
     let clock = SnapshotClock::new(state.operational().clock.now());
     let auth_policy = state.auth_policy();
@@ -144,7 +144,7 @@ pub(in crate::api) async fn authenticate_token_for_review(
         &state.operational().task_supervisor,
         false,
     );
-    crate::auth::middleware::authenticate_token_for_review(&runtime, token, audiences).await
+    klights_auth::authentication::authenticate_token_for_review(&runtime, token, audiences).await
 }
 
 pub(in crate::api) async fn authenticate_request(

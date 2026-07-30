@@ -178,14 +178,14 @@ pub async fn create_token_review(
     )
     .await
     {
-        Ok(crate::auth::middleware::ReviewedTokenIdentity::ServiceAccount {
+        Ok(klights_auth::authentication::ReviewedTokenIdentity::ServiceAccount {
             claims,
             audiences,
         }) => Ok(crate::api::response::K8sResponse::new(
             authenticated_token_review(req_body, tokenreview_user_from_claims(&claims), audiences),
             &headers,
         )),
-        Ok(crate::auth::middleware::ReviewedTokenIdentity::Other {
+        Ok(klights_auth::authentication::ReviewedTokenIdentity::Other {
             identity,
             audiences,
         }) => Ok(crate::api::response::K8sResponse::new(

@@ -10,7 +10,6 @@ mod api_state_adapter;
 mod api_state_adapter_test_owner;
 mod apiservice_side_effect_adapter;
 pub mod audit;
-pub mod auth;
 mod authority_adapter;
 pub mod cli;
 pub(crate) mod cluster_store_replication_adapter;

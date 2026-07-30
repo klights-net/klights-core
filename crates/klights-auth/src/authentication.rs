@@ -3,21 +3,21 @@
 //! The API layer extracts HTTP credentials and adapts failures. This module
 //! consumes only focused authentication capabilities and scalar policy input.
 
-use klights_auth::AuthenticatedIdentity;
-use klights_auth::clock::Clock;
-use klights_auth::cluster_identity::{
+use crate::AuthenticatedIdentity;
+use crate::clock::Clock;
+use crate::cluster_identity::{
     BootstrapTokenAuthenticator, BoundTokenSubjectLookup, ServiceAccountSigningKeyProvider,
 };
-use klights_auth::{AuthenticationError, validate_bound_object_uid};
+use crate::{AuthenticationError, validate_bound_object_uid};
 use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::TlsClientCertificate;
 
-pub(crate) struct AuthnRuntime<'a> {
+pub struct AuthnRuntime<'a> {
     bootstrap_tokens: &'a dyn BootstrapTokenAuthenticator,
     service_account_signing_keys: &'a dyn ServiceAccountSigningKeyProvider,
     bound_token_subjects: &'a dyn BoundTokenSubjectLookup,
-    oidc_authenticator: Option<&'a dyn klights_auth::oidc::OidcValidator>,
-    webhook_authenticator: Option<&'a dyn klights_auth::webhook_auth::WebhookAuthenticator>,
+    oidc_authenticator: Option<&'a dyn crate::oidc::OidcValidator>,
+    webhook_authenticator: Option<&'a dyn crate::webhook_auth::WebhookAuthenticator>,
     clock: &'a dyn Clock,
     task_supervisor: &'a TaskSupervisor,
     anonymous_auth: bool,
@@ -25,12 +25,12 @@ pub(crate) struct AuthnRuntime<'a> {
 
 impl<'a> AuthnRuntime<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         bootstrap_tokens: &'a dyn BootstrapTokenAuthenticator,
         service_account_signing_keys: &'a dyn ServiceAccountSigningKeyProvider,
         bound_token_subjects: &'a dyn BoundTokenSubjectLookup,
-        oidc_authenticator: Option<&'a dyn klights_auth::oidc::OidcValidator>,
-        webhook_authenticator: Option<&'a dyn klights_auth::webhook_auth::WebhookAuthenticator>,
+        oidc_authenticator: Option<&'a dyn crate::oidc::OidcValidator>,
+        webhook_authenticator: Option<&'a dyn crate::webhook_auth::WebhookAuthenticator>,
         clock: &'a dyn Clock,
         task_supervisor: &'a TaskSupervisor,
         anonymous_auth: bool,
@@ -48,7 +48,7 @@ impl<'a> AuthnRuntime<'a> {
     }
 }
 
-pub(crate) async fn authenticate_parts(
+pub async fn authenticate_parts(
     runtime: &AuthnRuntime<'_>,
     extension_user: Option<AuthenticatedIdentity>,
     client_cert: Option<TlsClientCertificate>,
@@ -64,7 +64,7 @@ pub(crate) async fn authenticate_parts(
             .run_blocking(
                 TaskCategory::Others,
                 "authenticate-client-certificate",
-                move || klights_auth::user::user_from_cert(&cert.0),
+                move || crate::user::user_from_cert(&cert.0),
             )
             .await
             .map_err(|error| {
@@ -93,7 +93,7 @@ pub(crate) async fn authenticate_parts(
     authenticate_bearer_token(runtime, token).await.map(Some)
 }
 
-pub(crate) fn resolve_request_identity(
+pub fn resolve_request_identity(
     runtime: &AuthnRuntime<'_>,
     identity: Option<AuthenticatedIdentity>,
 ) -> Result<AuthenticatedIdentity, AuthenticationError> {
@@ -118,11 +118,9 @@ async fn authenticate_bearer_token(
         {
             Ok(identity) => Ok(identity),
             Err(bootstrap_error) => {
-                if let Some(result) = klights_auth::webhook_auth::try_webhook_auth(
-                    runtime.webhook_authenticator,
-                    token,
-                )
-                .await
+                if let Some(result) =
+                    crate::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token)
+                        .await
                 {
                     return result
                         .map_err(|error| preferred_authentication_error(bootstrap_error, error));
@@ -133,19 +131,16 @@ async fn authenticate_bearer_token(
         3 => match validate_sa_token(runtime, token).await {
             Ok(identity) => Ok(identity),
             Err(service_account_error) => {
-                if let Some(result) = klights_auth::oidc::try_oidc_auth(
-                    runtime.oidc_authenticator,
-                    token,
-                    runtime.clock,
-                )
-                .await
+                if let Some(result) =
+                    crate::oidc::try_oidc_auth(runtime.oidc_authenticator, token, runtime.clock)
+                        .await
                 {
                     match result {
                         Ok(identity) => return Ok(identity),
                         Err(error) => {
                             let selected =
                                 preferred_authentication_error(service_account_error, error);
-                            if let Some(result) = klights_auth::webhook_auth::try_webhook_auth(
+                            if let Some(result) = crate::webhook_auth::try_webhook_auth(
                                 runtime.webhook_authenticator,
                                 token,
                             )
@@ -159,11 +154,9 @@ async fn authenticate_bearer_token(
                         }
                     }
                 }
-                if let Some(result) = klights_auth::webhook_auth::try_webhook_auth(
-                    runtime.webhook_authenticator,
-                    token,
-                )
-                .await
+                if let Some(result) =
+                    crate::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token)
+                        .await
                 {
                     return result.map_err(|error| {
                         preferred_authentication_error(service_account_error, error)
@@ -174,8 +167,7 @@ async fn authenticate_bearer_token(
         },
         _ => {
             if let Some(result) =
-                klights_auth::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token)
-                    .await
+                crate::webhook_auth::try_webhook_auth(runtime.webhook_authenticator, token).await
             {
                 return result;
             }
@@ -215,7 +207,7 @@ async fn validate_sa_token_claims(
     runtime: &AuthnRuntime<'_>,
     token: &str,
     audiences: &[String],
-) -> Result<klights_auth::SaTokenClaims, AuthenticationError> {
+) -> Result<crate::SaTokenClaims, AuthenticationError> {
     let signing_key_pem = runtime
         .service_account_signing_keys
         .service_account_signing_key_pem()
@@ -235,7 +227,7 @@ async fn validate_sa_token_claims(
                         self.0
                     }
                 }
-                klights_auth::decode_serviceaccount_token_with_clock(
+                crate::decode_serviceaccount_token_with_clock(
                     &token,
                     &signing_key_pem,
                     Some(&audiences),
@@ -258,17 +250,17 @@ async fn validate_sa_token_claims(
     Ok(claims)
 }
 
-fn service_account_identity(claims: &klights_auth::SaTokenClaims) -> AuthenticatedIdentity {
+fn service_account_identity(claims: &crate::SaTokenClaims) -> AuthenticatedIdentity {
     AuthenticatedIdentity::service_account(
         claims.sub.clone(),
-        klights_auth::serviceaccount_groups_from_claims(claims),
-        klights_auth::serviceaccount_uid_from_claims(claims),
+        crate::serviceaccount_groups_from_claims(claims),
+        crate::serviceaccount_uid_from_claims(claims),
     )
 }
 
-pub(crate) enum ReviewedTokenIdentity {
+pub enum ReviewedTokenIdentity {
     ServiceAccount {
-        claims: klights_auth::SaTokenClaims,
+        claims: crate::SaTokenClaims,
         audiences: Vec<String>,
     },
     Other {
@@ -277,7 +269,7 @@ pub(crate) enum ReviewedTokenIdentity {
     },
 }
 
-pub(crate) async fn authenticate_token_for_review(
+pub async fn authenticate_token_for_review(
     runtime: &AuthnRuntime<'_>,
     token: &str,
     audiences: &[String],
@@ -333,7 +325,7 @@ pub(crate) async fn authenticate_token_for_review(
             match bootstrap_result {
                 Ok(reviewed) => Ok(reviewed),
                 Err(bootstrap_error) => {
-                    if let Some(result) = klights_auth::webhook_auth::try_webhook_auth_for_review(
+                    if let Some(result) = crate::webhook_auth::try_webhook_auth_for_review(
                         runtime.webhook_authenticator,
                         token,
                         audiences,
@@ -370,7 +362,7 @@ pub(crate) async fn authenticate_token_for_review(
             }
             Err(service_account_error) => {
                 let mut selected = service_account_error;
-                if let Some(result) = klights_auth::oidc::try_oidc_auth_for_review(
+                if let Some(result) = crate::oidc::try_oidc_auth_for_review(
                     runtime.oidc_authenticator,
                     token,
                     runtime.clock,
@@ -394,7 +386,7 @@ pub(crate) async fn authenticate_token_for_review(
                         }
                     }
                 }
-                if let Some(result) = klights_auth::webhook_auth::try_webhook_auth_for_review(
+                if let Some(result) = crate::webhook_auth::try_webhook_auth_for_review(
                     runtime.webhook_authenticator,
                     token,
                     audiences,
@@ -418,7 +410,7 @@ pub(crate) async fn authenticate_token_for_review(
             }
         },
         _ => {
-            if let Some(result) = klights_auth::webhook_auth::try_webhook_auth_for_review(
+            if let Some(result) = crate::webhook_auth::try_webhook_auth_for_review(
                 runtime.webhook_authenticator,
                 token,
                 audiences,
@@ -445,7 +437,7 @@ pub(crate) async fn authenticate_token_for_review(
 /// with matching UIDs.
 pub async fn validate_sa_token_bindings(
     subjects: &dyn BoundTokenSubjectLookup,
-    claims: &klights_auth::SaTokenClaims,
+    claims: &crate::SaTokenClaims,
 ) -> Result<(), AuthenticationError> {
     let Some((namespace, service_account_name)) = claims
         .sub
@@ -455,16 +447,17 @@ pub async fn validate_sa_token_bindings(
         return Ok(());
     };
 
-    if let Some(token_uid) = klights_auth::serviceaccount_uid_from_claims(claims) {
+    if let Some(token_uid) = crate::serviceaccount_uid_from_claims(claims) {
         let stored_uid = subjects
             .service_account_uid(namespace, service_account_name)
             .await?;
-        klights_auth::validate_service_account_uid(Some(&token_uid), stored_uid.as_deref())
-            .map_err(|error| {
+        crate::validate_service_account_uid(Some(&token_uid), stored_uid.as_deref()).map_err(
+            |error| {
                 AuthenticationError::unauthenticated(format!(
                     "invalid serviceaccount token UID: {error}"
                 ))
-            })?;
+            },
+        )?;
     }
 
     if let Some(kubernetes) = claims.kubernetes_io.as_ref() {
@@ -498,7 +491,7 @@ pub async fn validate_sa_token_bindings(
 
 /// Re-authenticate a forwarded client certificate against explicitly supplied
 /// cluster trust material.
-pub(crate) async fn authenticate_forwarded_client_cert(
+pub async fn authenticate_forwarded_client_cert(
     cluster_ca_pem: Option<&str>,
     cert_der: &[u8],
     task_supervisor: &TaskSupervisor,
@@ -515,7 +508,7 @@ pub(crate) async fn authenticate_forwarded_client_cert(
         .run_blocking(
             TaskCategory::Others,
             "authenticate-forwarded-client-certificate",
-            move || klights_auth::user::verify_client_cert_signed_by_ca(&cert_der, &ca_pem),
+            move || crate::user::verify_client_cert_signed_by_ca(&cert_der, &ca_pem),
         )
         .await
         .map_err(|error| {
@@ -536,7 +529,7 @@ pub(crate) async fn authenticate_forwarded_client_cert(
 
 /// A connection may delegate identity only when its presented client
 /// certificate is an internal API proxy certificate.
-pub(crate) async fn client_cert_is_trusted_proxy(
+pub async fn client_cert_is_trusted_proxy(
     client_cert: Option<&TlsClientCertificate>,
     task_supervisor: &TaskSupervisor,
 ) -> Result<bool, AuthenticationError> {
@@ -548,7 +541,7 @@ pub(crate) async fn client_cert_is_trusted_proxy(
         .run_blocking(
             TaskCategory::Others,
             "classify-api-proxy-certificate",
-            move || klights_auth::user::user_from_cert(&cert.0),
+            move || crate::user::user_from_cert(&cert.0),
         )
         .await
         .map_err(|error| {
@@ -567,7 +560,7 @@ pub(crate) async fn client_cert_is_trusted_proxy(
 fn is_trusted_api_proxy_identity(identity: &AuthenticatedIdentity) -> bool {
     let Some(node_name) = identity
         .username
-        .strip_prefix(klights_auth::cert::API_PROXY_COMMON_NAME_PREFIX)
+        .strip_prefix(crate::cert::API_PROXY_COMMON_NAME_PREFIX)
     else {
         return false;
     };
@@ -585,8 +578,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use klights_auth::clock::{FixedClock, SystemMonotonicClock};
-    use klights_auth::webhook_auth::{
+    use crate::clock::{FixedClock, SystemMonotonicClock};
+    use crate::webhook_auth::{
         TokenReviewStatus, TokenReviewUser, WebhookAuth, WebhookTokenReviewer,
     };
 
@@ -710,16 +703,22 @@ mod tests {
 
     #[tokio::test]
     async fn service_account_authentication_uses_injected_signer_without_host_state() {
-        let signing_key = klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
+        let signing_key = crate::cert::generate_ca_full_at(time::OffsetDateTime::now_utc())
             .unwrap()
             .3;
-        let token = crate::auth::generate_sa_token_with_sa_uid(
-            &signing_key,
-            "default",
-            "default",
-            &["https://kubernetes.default.svc.cluster.local"],
-            3600,
-            "sa-uid",
+        let token = crate::generate_sa_token_with_bound_pod_and_clock(
+            crate::ServiceAccountTokenRequest {
+                ca_key_pem: &signing_key,
+                service_account: "default",
+                namespace: "default",
+                audiences: &["https://kubernetes.default.svc.cluster.local"],
+                expiration_seconds: Some(3600),
+                bound: crate::BoundServiceAccountToken {
+                    sa_uid: Some("sa-uid"),
+                    ..crate::BoundServiceAccountToken::default()
+                },
+            },
+            &crate::clock::SystemClock,
         )
         .unwrap();
         let mut subjects = Subjects::default();
@@ -735,7 +734,7 @@ mod tests {
             &subjects,
             None,
             None,
-            &klights_auth::clock::SystemClock,
+            &crate::clock::SystemClock,
             &supervisor,
             false,
         );
@@ -748,7 +747,7 @@ mod tests {
         supervisor.shutdown(Duration::from_secs(1)).await;
     }
 
-    fn claims(value: serde_json::Value) -> klights_auth::SaTokenClaims {
+    fn claims(value: serde_json::Value) -> crate::SaTokenClaims {
         serde_json::from_value(value).expect("valid service account claims")
     }
 
@@ -990,13 +989,10 @@ mod tests {
     #[tokio::test]
     async fn forwarded_cert_requires_explicit_cluster_ca() {
         let (ca_cert, ca_key, _, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (admin_pem, _) = klights_auth::cert::generate_admin_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            crate::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (admin_pem, _) =
+            crate::cert::generate_admin_cert_at(&ca_cert, &ca_key, time::OffsetDateTime::now_utc())
+                .unwrap();
         let der = pem_to_der(&admin_pem);
         let supervisor = TaskSupervisor::new(Default::default());
         assert!(
@@ -1009,13 +1005,10 @@ mod tests {
     #[tokio::test]
     async fn forwarded_admin_cert_preserves_system_masters() {
         let (ca_cert, ca_key, ca_pem, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (admin_pem, _) = klights_auth::cert::generate_admin_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+            crate::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (admin_pem, _) =
+            crate::cert::generate_admin_cert_at(&ca_cert, &ca_key, time::OffsetDateTime::now_utc())
+                .unwrap();
         let supervisor = TaskSupervisor::new(Default::default());
         let identity =
             authenticate_forwarded_client_cert(Some(&ca_pem), &pem_to_der(&admin_pem), &supervisor)
@@ -1033,8 +1026,8 @@ mod tests {
     #[tokio::test]
     async fn only_internal_proxy_certificate_can_delegate() {
         let (ca_cert, ca_key, _, _) =
-            klights_auth::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
-        let (proxy_pem, _) = klights_auth::cert::generate_api_proxy_cert(
+            crate::cert::generate_ca_full_at(time::OffsetDateTime::now_utc()).unwrap();
+        let (proxy_pem, _) = crate::cert::generate_api_proxy_cert(
             &ca_cert,
             &ca_key,
             "cp1",
@@ -1049,12 +1042,9 @@ mod tests {
                 .unwrap()
         );
 
-        let (admin_pem, _) = klights_auth::cert::generate_admin_cert_at(
-            &ca_cert,
-            &ca_key,
-            time::OffsetDateTime::now_utc(),
-        )
-        .unwrap();
+        let (admin_pem, _) =
+            crate::cert::generate_admin_cert_at(&ca_cert, &ca_key, time::OffsetDateTime::now_utc())
+                .unwrap();
         let admin = TlsClientCertificate(pem_to_der(&admin_pem));
         assert!(
             !client_cert_is_trusted_proxy(Some(&admin), &supervisor)
@@ -1071,7 +1061,7 @@ mod tests {
     #[test]
     fn proxy_with_system_masters_cannot_delegate() {
         let elevated_proxy = AuthenticatedIdentity::client_cert(
-            klights_auth::cert::api_proxy_common_name("cp1"),
+            crate::cert::api_proxy_common_name("cp1"),
             vec!["system:masters".to_string()],
         );
         assert!(!is_trusted_api_proxy_identity(&elevated_proxy));

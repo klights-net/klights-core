@@ -302,15 +302,17 @@ pub(crate) async fn init_certificates(
     .await?;
     ensure_apiservice_proxy_certificate(task_supervisor, etc_dir, authority, valid_at).await?;
 
-    let kubeconfig = crate::auth::generate_kubeconfig(crate::auth::KubeconfigParams {
-        ca_cert: &ca_cert_pem,
-        admin_cert: &admin_cert_pem,
-        admin_key: &admin_key_pem,
-        tls_port,
-        context_name,
-        host_ip: host_ip.as_deref(),
-        pod_subnet,
-    })?;
+    let kubeconfig = klights_auth::kubeconfig::generate_kubeconfig(
+        klights_auth::kubeconfig::KubeconfigParams {
+            ca_cert: &ca_cert_pem,
+            admin_cert: &admin_cert_pem,
+            admin_key: &admin_key_pem,
+            tls_port,
+            context_name,
+            host_ip: host_ip.as_deref(),
+            pod_subnet,
+        },
+    )?;
 
     let kubeconfig_path = etc_dir.join("kubeconfig.yaml");
     write_file_keyed(

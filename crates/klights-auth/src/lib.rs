@@ -1,6 +1,7 @@
 //! Framework-neutral authentication and authorization contracts for klights.
 
 use std::{error::Error, fmt};
+pub mod authentication;
 pub mod authorizer;
 pub mod bootstrap_authorizer;
 pub mod ca_transport;
@@ -11,6 +12,7 @@ pub mod csr_policy;
 pub mod csr_signer;
 pub mod identity;
 pub mod impersonation;
+pub mod kubeconfig;
 pub mod kubelet_client_cert;
 pub mod node_authorizer;
 pub mod node_policy_store;

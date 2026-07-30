@@ -40,7 +40,7 @@ pub fn generate_kubeconfig(params: KubeconfigParams<'_>) -> Result<String> {
 
     let server_ip = host_ip
         .map(ToString::to_string)
-        .unwrap_or_else(|| klights_auth::cert::derive_gateway_ip(pod_subnet));
+        .unwrap_or_else(|| crate::cert::derive_gateway_ip(pod_subnet));
 
     Ok(format!(
         r#"apiVersion: v1

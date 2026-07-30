@@ -1,4 +1,22 @@
 #[cfg(test)]
+pub(crate) fn test_admin(username: impl Into<String>) -> klights_auth::AuthenticatedIdentity {
+    klights_auth::AuthenticatedIdentity::client_cert(
+        username.into(),
+        vec!["system:masters".to_string()],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn generate_sa_token_with_bound_pod(
+    request: klights_auth::ServiceAccountTokenRequest<'_>,
+) -> anyhow::Result<String> {
+    klights_auth::generate_sa_token_with_bound_pod_and_clock(
+        request,
+        &klights_auth::clock::SystemClock,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn resource_query_for_test_datastore(
     db: crate::datastore::sqlite::Datastore,
 ) -> std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> {
